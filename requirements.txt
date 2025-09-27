@@ -135,9 +135,12 @@ notebook_shim
 numcodecs
 numexpr
 numpy
+openai
 pandas
+pillow
 plotly
 python-dotenv
 pyvo
+requests
 scipy
 streamlit
