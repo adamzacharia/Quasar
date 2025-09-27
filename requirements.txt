@@ -13,7 +13,6 @@ arrow==1.3.0
 arxiv==2.2.0
 asciitree==0.3.3
 astroid==3.2.4
-astropy==5.2.2
 astropy-healpix==0.7
 astroquery==0.4.7
 asttokens==3.0.0
@@ -32,7 +31,6 @@ blinker==1.8.2
 blosc2==2.0.0
 cachetools==5.5.2
 casa-formats-io==0.2.3
-casadata==2025.9.15
 casatasks==6.5.1.23
 casatools==6.5.1.23
 celery==5.5.3
@@ -247,3 +245,4 @@ xarray==2023.1.0
 yarl==1.15.2
 zarr==2.16.1
 zipp==3.20.2
+astropy>=6.1.0
