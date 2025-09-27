@@ -1,4 +1,7 @@
-streamlit
+Cython
+GitPython
+Jinja2
+MarkupSafe
 aiofiles
 aiohappyeyeballs
 aiohttp
@@ -14,8 +17,8 @@ arrow
 arxiv
 asciitree
 astroid
-astropy>=6.1.0
 astropy-healpix
+astropy>=6.1.0
 astroquery
 asttokens
 async-lru
@@ -44,7 +47,6 @@ contourpy
 coverage
 cryptography
 cycler
-Cython
 dask
 debugpy
 decorator
@@ -63,7 +65,6 @@ fqdn
 frozenlist
 fsspec
 gitdb
-GitPython
 greenlet
 h11
 h5py
@@ -87,7 +88,6 @@ jaraco.context
 jaraco.functools
 jedi
 jeepney
-Jinja2
 jiter
 joblib
 json5
@@ -112,7 +112,6 @@ kombu
 lazy_loader
 locket
 markdown-it-py
-MarkupSafe
 matplotlib
 matplotlib-inline
 mccabe
@@ -137,5 +136,8 @@ numcodecs
 numexpr
 numpy
 pandas
-scipy
 plotly
+python-dotenv
+pyvo
+scipy
+streamlit
