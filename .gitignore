@@ -1,0 +1,145 @@
+# Environment
+.env
+.env.local
+.env.*.local
+venv/
+env/
+ENV/
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Data directories (contains downloaded data)
+data/
+cache/
+logs/
+downloads/
+output/
+results/
+*.fits
+*.ms
+*.tar
+*.tar.gz
+*.zip
+
+# CASA
+*.log
+*.last
+casa*.log
+ipython*.log
+*.flagversions/
+*.ms.flagversions/
+
+# CARTA
+carta_sessions/
+.carta/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Documentation
+docs/_build/
+site/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Secrets (be extra careful)
+*_key*
+*_secret*
+*.pem
+*.key
+credentials.json
+token.json
+
+# Model outputs
+models/
+checkpoints/
+*.pkl
+*.h5
+*.pt
+*.pth
+
+# Large files
+*.hdf5
+*.h5
+*.npy
+*.npz
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Redis
+dump.rdb
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Custom
+quasar_results*.csv
+session_*.json
+workspace/
