@@ -73,6 +73,7 @@ httpcore
 httpx
 humanize
 idna
+imghdr
 imageio
 imagesize
 importlib_metadata
