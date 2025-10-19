@@ -73,7 +73,6 @@ httpcore
 httpx
 humanize
 idna
-imghdr
 imageio
 imagesize
 importlib_metadata
@@ -144,4 +143,4 @@ python-dotenv
 pyvo
 requests
 scipy
-streamlit
+streamlit>=1.28.0
