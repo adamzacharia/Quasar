@@ -7,16 +7,15 @@ Quasar is an intelligent assistant that bridges natural language queries with th
 
 ## Features
 
-- 🔍 **Natural Language Archive Search** - Query VLA, VLBA, ALMA, and GBT observations using plain English
-- 📊 **Automated Data Processing** - End-to-end pipeline from raw FITS to calibrated images
-- 🎨 **Smart Visualization** - CARTA integration for publication-ready figures
-- 🤖 **AI-Powered Workflow** - OpenAI GPT models interpret intent and execute complex pipelines
+- 🔍 **Natural Language Archive Search** - Query ALMA observations using plain English
 - 📚 **Literature Integration** - NASA ADS API for finding related publications
+- 📊 **Automated Data Processing** - End-to-end pipeline from raw FITS to calibrated images (coming soon)
+- 🎨 **Smart Visualization** - CARTA integration for publication-ready figures (coming soon)
+- 🤖 **AI-Powered Workflow** - Interpret intent and execute complex pipeline (coming soon)
 
 ## Prerequisites
 
 - Python 3.9+
-- WSL2 (Ubuntu 20.04+ recommended)
 - OpenAI API key
 - NASA ADS API key (optional)
 
@@ -185,4 +184,5 @@ For questions or support, please open an issue on GitHub.
 ---
 
 *"Exploring the radio universe, one query at a time"* 🔭
+
 
