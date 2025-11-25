@@ -17,7 +17,7 @@ Quasar is an intelligent assistant that bridges natural language queries with th
 - WSL2 (Ubuntu 20.04+ recommended)
 - OpenAI API key
 - NASA ADS API key (optional)
-- 16GB+ RAM recommended for CASA processing
+
 
 ## Installation
 
@@ -181,4 +181,5 @@ MIT License - see LICENSE file for details
 For questions or support, please open an issue on GitHub.
 
 ---
+
 *"Exploring the radio universe, one query at a time"* 🔭
