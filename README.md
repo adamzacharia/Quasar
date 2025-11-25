@@ -9,7 +9,7 @@ Quasar is an intelligent assistant that bridges natural language queries with th
 
 - 🔍 **Natural Language Archive Search** - Query ALMA observations using plain English
 - 📚 **Literature Integration** - NASA ADS API for finding related publications
-- 📊 **Automated Data Processing** - End-to-end pipeline from raw FITS to calibrated images (coming soon)
+- 📊 **Automated Data Processing** - End to end pipeline from raw FITS to calibrated images (coming soon)
 - 🎨 **Smart Visualization** - CARTA integration for publication-ready figures (coming soon)
 - 🤖 **AI-Powered Workflow** - Interpret intent and execute complex pipeline (coming soon)
 
@@ -184,5 +184,6 @@ For questions or support, please open an issue on GitHub.
 ---
 
 *"Exploring the radio universe, one query at a time"* 🔭
+
 
 
