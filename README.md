@@ -1,7 +1,7 @@
 # Quasar 🌌
 <img width="1897" height="783" alt="image" src="https://github.com/user-attachments/assets/f38936a3-c8f2-4aad-a00a-145327aaf0bb" />
 
-## AI-Powered Radio Astronomy Data Discovery & Processing
+## AI Powered Radio Astronomy Data Discovery & Processing
 
 Quasar is an intelligent assistant that bridges natural language queries with the National Radio Astronomy Observatory (NRAO) archives, enabling seamless discovery, calibration, and visualization of radio astronomy data.
 
@@ -184,6 +184,7 @@ For questions or support, please open an issue on GitHub.
 ---
 
 *"Exploring the radio universe, one query at a time"* 🔭
+
 
 
 
