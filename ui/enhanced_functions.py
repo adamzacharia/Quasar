@@ -1,7 +1,3 @@
-"""
-Enhanced UI Functions for Quasar
-Add these functions to your ui/app.py to enable real NRAO data fetching
-"""
 
 import re
 from typing import Optional
