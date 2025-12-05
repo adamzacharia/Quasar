@@ -1,0 +1,29 @@
+C:\Users\Asus\anaconda3\envs\quasar\lib\site-packages\astroquery\alma\core.py:12: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_filename
+C:\Users\Asus\Desktop\Quasar-main\services\memory_service.py:27: LangChainDeprecationWarning: The class `Chroma` was deprecated in LangChain 0.2.9 and will be removed in 1.0. An updated version of the class exists in the `langchain-chroma package and should be used instead. To use it run `pip install -U `langchain-chroma` and import as `from `langchain_chroma import Chroma``.
+  self.vector_store = Chroma(
+
+Setting dummy OPENAI_API_KEY for testing...
+Testing Auth and Memory Isolation...
+
+1. Testing AuthService...
+Register Alice: True - Registration successful
+Login Alice: True - ID: 7b7f86a8-c2e2-47aa-b751-81c2ecfe518a
+Register Bob: True - Registration successful
+Login Bob: True - ID: 98222783-2486-49cd-8ab4-29337fcb500e
+
+2. Testing Memory Isolation...
+MemoryService initialized at C:\Users\Asus\Desktop\Quasar-main\chroma_db
+Adding memory for Alice (7b7f86a8-c2e2-47aa-b751-81c2ecfe518a)...
+DEBUG: Entering add_memory. Vector store: <langchain_community.vectorstores.chroma.Chroma object at 0x000001484713F940>
+DEBUG: Vector store is None!
+Adding memory for Bob (98222783-2486-49cd-8ab4-29337fcb500e)...
+DEBUG: Entering add_memory. Vector store: <langchain_community.vectorstores.chroma.Chroma object at 0x000001484713F940>
+DEBUG: Vector store is None!
+Searching Alice's memory...
+Alice's memories: []
+[FAIL] Alice's memory check failed
+Searching Bob's memory...
+Bob's memories: []
+[FAIL] Bob's memory check failed
+

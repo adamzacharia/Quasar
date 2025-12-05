@@ -1,0 +1,53 @@
+Starting verify_intent_internal.py...
+Loading .env...
+Importing QuasarAgent...
+C:\Users\Asus\anaconda3\envs\quasar\lib\site-packages\astroquery\alma\core.py:12: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_filename
+QuasarAgent imported.
+Initializing Agent...
+DEBUG: Agent init start
+DEBUG: Init OpenAI
+DEBUG: Init Memory
+DEBUG: Init ToolRegistry
+DEBUG: Init TAP Client
+✅ Connected to NRAO TAP: https://data-query.nrao.edu/tap
+⚠️ Could not determine ObsCore table name, using 'obscore' as default
+✅ ALMA interface ready
+DEBUG: Init Search Service
+DEBUG: Init Analysis Service
+DEBUG: Register Tools
+DEBUG: Build Prompt
+DEBUG: Agent init done
+Agent initialized.
+
+--- Testing Intent Classification ---
+
+Query: Find ALMA data for Sz65
+Intent classification failed: '\n    "intent"'
+Result: {'intent': 'QUESTION', 'confidence': 0.0}
+
+Query: How do I visualize FITS files?
+Intent classification failed: '\n    "intent"'
+Result: {'intent': 'QUESTION', 'confidence': 0.0}
+
+Query: Search for Band 6 data
+Intent classification failed: '\n    "intent"'
+Result: {'intent': 'QUESTION', 'confidence': 0.0}
+
+Query: What is the sensitivity of ALMA?
+Intent classification failed: '\n    "intent"'
+Result: {'intent': 'QUESTION', 'confidence': 0.0}
+
+--- Testing Entity Extraction ---
+
+Query: Find ALMA data for Sz65 in Band 6
+Entity extraction failed: '\n    "source_name"'
+Result: {}
+
+Query: Search for high resolution data of M31
+Entity extraction failed: '\n    "source_name"'
+Result: {}
+
+Query: Find data for project 2019.1.00123.S
+Entity extraction failed: '\n    "source_name"'
+Result: {}

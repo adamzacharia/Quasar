@@ -1,0 +1,30 @@
+C:\Users\Asus\anaconda3\envs\quasar\lib\site-packages\astroquery\alma\core.py:12: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_filename
+
+--- Testing: Complex Query ---
+Query: 'Make a table of different ALMA datasets for Sz65, sorted by best sensitivity and angular resolution'
+Raw Content: {
+    "source_name": "Sz65",
+    "band": null,
+    "project_code": null,
+    "science_keyword": null,
+    "angular_resolution": null,
+    "sensitivity": "best sensitivity"
+}
+Result: {'source_name': 'Sz65', 'band': None, 'project_code': None, 'science_keyword': None, 'angular_resolution': None, 'sensitivity': 'best sensitivity'}
+Γ£à SUCCESS: Extracted 'Sz65'
+
+--- Testing: Clarification Response ---
+Query: 'the source is Sz65'
+Raw Content: {
+    "source_name": "Sz65",
+    "band": null,
+    "project_code": null,
+    "science_keyword": null,
+    "angular_resolution": null,
+    "sensitivity": null
+}
+Result: {'source_name': 'Sz65', 'band': None, 'project_code': None, 'science_keyword': None, 'angular_resolution': None, 'sensitivity': None}
+Γ£à SUCCESS: Extracted 'Sz65'
+
+

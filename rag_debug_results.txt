@@ -1,0 +1,60 @@
+Found 5 documents:
+
+--- Document 1 (Score: 0.4180) ---
+could be a bright quasar or a Solar System object (when requested in the Observing Tool at proposal submission).
+About 40 bright quasar sources, called grid sources, are frequently monitored by the observatory so as to track
+their flux densities, which may vary over time. These monitoring observations are typically performed in Band 3
+and in either Band 6 or Band 7, which allows for calculating a spectral index for these sources. In earlier cycles,
+grid sources were used as flux calibrators whenever a Solar System object was not available. In later cycles,
+thanks to the monitoring efforts of grid sources, these are now principally used as secondary flux calibrators in
+science observations. These sources are also normally used as bandpass calibrators.
+The flux accuracy of ALMA data is estimated to be better than 5% for Bands 1 and 3-5, 10% for Bands 6-8,
+and 20% for Bands 9 and 10. More details on ALMA flux calibration can be found in Appendix A of the ALMA
+
+--- Document 2 (Score: 0.4428) ---
+Figure 5.1: Examples of good and bad bandpass calibration coloured by correlation (XX in purple, YY in orange).
+In the left panel, the amplitudes vary smoothly versus channel (and versus frequency) for all antennas and for
+both correlations. In the right panel, the YY data for a few baselines jump in amplitude for channels 480-909
+and should be flagged. (These plots were produced from manually calibrated ALMA data and are not from the
+ASA.)
+(see for example Figure 5.1). Are the phases versus frequency smooth and continuous, or do they exhibit
+any sharp jumps or severe scatter that require to be flagged?
+• Flux calibration: Is the absolute flux scale accurate, and is it compatible with the flux reported in the
+ALMA Calibrator Source Catalogue for observations near in time (see also Section 11.2)? For observations
+that include Solar System objects for flux calibration, are the latest models (Butler-JPL-Horizons 2012)
+used for scaling the fluxes?
+
+--- Document 3 (Score: 0.4470) ---
+5.3.2 Data using band-to-band (B2B) phase referencing for calibration
+Some observations, particularly high frequency observations, will use a technique called band-to-band (B2B)
+phase referencing to improve the calibration of the data. These observations will typically include not only a
+bandpass/amplitude calibration source and a phase calibration source but also a third calibration source for
+phase referencing. The phase calibrator would be observed in a lower frequency band than the science target,
+and then the phase calibration tables from those data would be applied to higher frequencies using the phase
+gain offset derived from the phase referencing source data acquired in both the lower and higher frequency bands.
+In general, the WebLogs for B2B observations will look similar to the WebLogs from other data except that
+the graphs and tables produced by the various tasks will include data from both the lower frequency and higher
+
+--- Document 4 (Score: 0.4681) ---
+5.3.1 7-m Array data using TP antennas for calibration
+It has been common policy for ACA observations in Bands 8, 9, and 10 to include the TP antennas as part of
+the array. Such a configuration can be identified when viewing the antenna setup on the overview page for an
+individual EB. In terms of the output from the tasks that appears in the WebLogs, this produces a few changes
+from standard WebLogs for ACA data. In particular, the TP antennas may use different spectral windows with
+slightly different spectral setups from the ACA antennas, andhifa_wvrgcalflag will be executed for the data
+from the TP antennas. However, most other data from arrays using this configuration are otherwise similar to
+what is produced from normal ACA observations.
+5.3.2 Data using band-to-band (B2B) phase referencing for calibration
+Some observations, particularly high frequency observations, will use a technique called band-to-band (B2B)
+
+--- Document 5 (Score: 0.4827) ---
+Figure 5.15: An example of a WebLog measurement set overview webpage for SB PN_Hb_5_d_06_TM1
+(2022.1.00401.S).
+Figure 5.16: An example of a WebLog “By Topic” page for SB PN_Hb_5_d_06_TM1 (2022.1.00401.S).
+QA Score Colour Comment
+0.90-1.00 Green No issues identified
+0.66-0.90 Blue No serious issues identified, but a note has been added
+0.33-0.66 Yellow QA warning triggered; carefully inspect the results for this stage
+0.00-0.33 Red Serious issue; may not meet quality standards
+Table 5.1: The WebLog QA scores.
+54
