@@ -1,0 +1,746 @@
+
+============================================================
+NOTEBOOK: nb0_ALMA_notebook_introduction.ipynb
+============================================================
+[MD]: Queries in [TAP](http://www.ivoa.net/documents/TAP/) are written in the SQL-like Astronomical Data Query Language ([ADQL](https://www.ivoa.net/documen
+[MD]: <a href="nb1_ALMA_Query_one_source.ipynb"><h3> 1. Query one source</h3> </a>
+[MD]: <a href="nb2_ALMA_Query_public_catalogue.ipynb"><h3> 2. Query a catalogue of sources</h3></a>
+[MD]:  <a href="nb3_ALMA_Query_by_proposal_or_publisher_id.ipynb"><h3> 3. Query by proposal and IDs</h3> </a>
+[MD]:  <a href="nb4_ALMA_Query_by_science_keyword.ipynb"><h3> 4. Query by science keyword</h3></a>
+[MD]:  <a href="nb5_ALMA_Query_by_spatial_resolution.ipynb"><h3> 5. Query by spatial resolution</h3></a>
+[MD]:  <a href="nb6_ALMA_Query_by_frequency.ipynb"><h3> 6. Query by covered frequency range</h3></a>
+[MD]:  <a href="nb7_ALMA_Query_by_sensitivity.ipynb"><h3> 7. Query by Sensitivity</h3> </a>
+[MD]:  <a href="nb8_ALMA_Query_using_astroquery.ipynb"><h3> 8. Query using Astroquery.ALMA</h3></a>
+[MD]: <a href="nb9_ALMA_Download_data.ipynb"><h3> 9. Download data after query</h3></a>
+[MD]: pip3 install --upgrade --pre astroquery
+[MD]: #### Troubleshooting
+[CODE Cell 12]:
+import pyvo
+import pandas as pd
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## Example 0a: Query by coordinate and request the entire result table
+[MD]: Find all ALMA observations where the footprint of the observation (stored in the VO column 's_region') intersects with our search circle where RA, Dec
+[CODE Cell 16]:
+query = f"""
+        SELECT *  
+        FROM ivoa.obscore 
+        WHERE INTERSECTS(CIRCLE('ICRS',201.365063,-43.019112,0.006),s_region)=1  
+        """
+
+result = service.search(query)
+output = result.to_table().to_pandas()
+
+[CODE Cell 18]:
+pd.set_option('display.max_columns', None)
+output.head(5)
+
+[CODE Cell 20]:
+print(*sorted([f"{fieldname:28s} {result.getdesc(fieldname).unit if result.getdesc(fieldname).unit else ''}" for fieldname in result.fieldnames]), sep='\n')
+
+[MD]: ## Example 0b: Query by coordinate and request only few columns
+[MD]: The query returns all ALMA observations where the footprint (s_region) intersects with the search circle specified by RA, Dec and the search radius, a
+[CODE Cell 22]:
+query = f"""   
+        SELECT target_name, s_ra, s_dec   
+        FROM ivoa.obscore   
+        WHERE INTERSECTS(CIRCLE('ICRS',201.365063,-43.019112,0.006),s_region)=1
+        """
+output = service.search(query).to_table().to_pandas() 
+
+[CODE Cell 23]:
+pd.set_option('display.max_columns', None)
+output.head(5)
+
+
+============================================================
+NOTEBOOK: nb1_ALMA_Query_one_source.ipynb
+============================================================
+[MD]:             <h1> nb1. Query one source</h1>
+[MD]: In this notebook we query one source in three modes: 
+[CODE Cell 3]:
+import numpy as np
+import astropy
+import astropy.coordinates
+import pyvo
+import pandas as pd
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## By coordinate
+[MD]: The most basic search of a source is based on its coordinates. To do this we use the INTERSECT function to find all observations where the footprint (
+[CODE Cell 6]:
+def query_coordinate(service, ra, dec, radius):
+    """Queries ALMA footprints that intersect the search circle
+    
+       service        pyvo TAPService instance           
+       ra             Right Ascension in decimal degrees
+       dec            Declination in decimal degrees
+       radius         Search radius in decimal degrees
+           
+       returns        pandas table
+       """    
+    
+    query = f"""
+            SELECT * 
+            FROM ivoa.obscore   
+            WHERE INTERSECTS(CIRCLE('ICRS',{ra},{dec},{radius}),s_region)=1  """
+    
+    return service.search(query).to
+... (truncated)
+
+[MD]: ## By coordinate: Display and sort by distance
+[MD]: It is also possible to add a column to the ADQL output. For example we can now display the distance of the positions in the archive catalogue to the s
+[CODE Cell 9]:
+def query_coordinate_display_distance(service, ra, dec, radius):
+    """Queries ALMA footprints that intersect the search circle
+    
+       service        pyvo TAPService instance           
+       ra             Right Ascension in decimal degrees
+       dec            Declination in decimal degrees
+       radius         Search radius in decimal degrees
+           
+       returns        pandas table including the distance column
+       """    
+
+    query = f""" 
+            SELECT DISTANCE(POINT('ICRS', s_ra, s_dec), POINT('ICRS',{ra},{dec})) AS dist, * 
+            FROM ivoa.obscore 
+       
+... (truncated)
+
+[MD]: ## By the resolved source name
+[MD]: Astropy comes with functionality to resolve astronomical source names into coordinates using the [Sesame](http://cds.u-strasbg.fr/cgi-bin/Sesame) serv
+[CODE Cell 12]:
+coordinates = astropy.coordinates.SkyCoord.from_name("Cen A")
+print(coordinates.ra.degree, coordinates.dec.degree)
+
+[MD]: ## By the ALMA source name
+[MD]: These two functions encapsulate the search for a source name **as given by the PI in the proposal to ALMA** (for a search using a name-resolver, see a
+[CODE Cell 15]:
+def query_alma_source_name_exact(service, source_name):
+    """ queries the ALMA source name as given by the PI
+    
+       service        pyvo TAPService instance           
+       source_name    complete source name 
+           
+       returns        pandas table
+    """
+    
+    query = f"""  
+            SELECT *  
+            FROM ivoa.obscore  
+            WHERE target_name = '{source_name}' """
+    
+    return service.search(query).to_table().to_pandas()
+
+
+def query_alma_source_name_included(service, source_name):
+    """ queries a portion of the ALMA source name as given by the PI
+    
+... (truncated)
+
+[MD]: ## Example 1a: Find sources at coordinate RA: 201.365, DEC: -43.019
+[CODE Cell 17]:
+results = query_coordinate(service, 201.365, -43.019, 0.006)
+results.head(5)
+
+[MD]: The same query but now adding the distance column:
+[CODE Cell 19]:
+pd.set_option('display.max_columns', None)
+
+results = query_coordinate_display_distance(service, 201.365, -43.019, 0.006)
+results.head(5)
+
+[MD]: ## Example 1b: Query the source Centaurus A using Sesame
+[MD]: Many sources have a number of names and you can not be sure that the source name the PI placed into the ALMA proposal is the source name you have in m
+[CODE Cell 22]:
+coordinates = astropy.coordinates.SkyCoord.from_name("Cen A")
+
+[CODE Cell 23]:
+query_coordinate(service, coordinates.ra.degree, coordinates.dec.degree, 0.006).head(5)
+
+[MD]: ## Example 1c: Query the ALMA source name "Centaurus"
+[MD]: Although in most cases, using the name resolver as above is the best way to search for source names, there can be occasions where searching for the na
+[CODE Cell 26]:
+query_alma_source_name_exact(service, "Centaurus A")
+
+[MD]: ## Example 1d: Query the source name "Centaurus"
+[MD]: Since source names in the ALMA proposals might be spelled differently it can be useful to search for parts of the name.
+[CODE Cell 28]:
+table = query_alma_source_name_included(service, "ntaur")
+table.head(5) ### showing only first 5 rows
+
+
+============================================================
+NOTEBOOK: nb2_ALMA_Query_public_catalogue.ipynb
+============================================================
+[MD]:             <h1> nb2. Query a catalogue</h1>
+[MD]: In this notebook three functions are presented which query a (moderately long) list of sources from a catalogue: 
+[MD]: For lists with a very large number of sources, run one query per block of 100 sources. See Example 2b and Example 2d.
+[CODE Cell 2]:
+import astropy
+import astropy.coordinates
+import pandas as pd
+pd.set_option('display.max_columns', None)
+import numpy as np
+import pyvo
+import matplotlib.pyplot as plt
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## Query list of coordinates
+[CODE Cell 4]:
+def query_coordinate_list(service, ra_list, dec_list, radius):
+    """Runs a single query for an entire list of coordinates. Query only 100 or less coordinates in one go.
+    
+       service        pyvo TAPService instance           
+       ra_list        List of Right Ascension values in decimal degrees
+       dec            List of Declination values in decimal degrees
+       radius         Search radius in decimal degrees
+           
+       returns        pandas table
+    """
+    
+    conditionlist = [f"INTERSECTS(CIRCLE('ICRS',{c[0]},{c[1]},{radius}),s_region)=1" for c in zip(ra_list, dec_
+... (truncated)
+
+[MD]: ## Query list of resolved names
+[CODE Cell 6]:
+def query_resolved_source_name_list(service, source_name_list, radius):
+    """Resolves the list of source names with Sesame and runs a coordinate search on them
+    
+       service           pyvo TAPService instance           
+       source_name_list  list with source names
+           
+       returns           pandas table
+    """
+    
+    coordinates = []
+    for source in source_name_list:
+        try:
+            coordinates.append(astropy.coordinates.SkyCoord.from_name(source))
+        except astropy.coordinates.name_resolve.NameResolveError:
+            print(f"Warning: source '{source}'
+... (truncated)
+
+[MD]: ## Query list of ALMA source names
+[CODE Cell 8]:
+def query_alma_source_name_list(service, source_name_list):
+    """queries for list of source names as given by the PI in the ALMA proposals
+    
+       service            pyvo TAPService instance           
+       source_name_lis    complete source name 
+           
+       returns            pandas table
+    """
+    
+    query = f"""  
+            SELECT *  
+            FROM ivoa.obscore  
+            WHERE target_name in ('{"','".join(source_name_list)}') """
+    
+    return service.search(query).to_table().to_pandas()
+
+[MD]: ## Example 2a: Query a catalogue of high-z quasars
+[MD]: First we import a catalogue of high redshift quasars from [VizieR](https://vizier.u-strasbg.fr/viz-bin/VizieR), using astroquery:
+[CODE Cell 11]:
+from astroquery.vizier import Vizier
+catalog_list = Vizier.get_catalogs('J/ApJS/227/11')
+highzqso_catalog = catalog_list['J/ApJS/227/11/highzqso']
+print(f"Number of (limited) rows in the catalog: {len(highzqso_catalog)}")
+
+[MD]: Note: VizieR limits the number of catalogue entries to 50 per default. We will now use the RA and Dec coordinates in the catalogue to do the search in
+[CODE Cell 13]:
+ra_list = highzqso_catalog['RAJ2000']
+dec_list = highzqso_catalog['DEJ2000']
+
+[MD]: We now query the ALMA archive:
+[CODE Cell 15]:
+results = query_coordinate_list(service, ra_list, dec_list, 0.01)
+results.head(5) ### show only 5, for visualization purposes
+
+[CODE Cell 17]:
+plt.rcParams["figure.figsize"] = (15,10)
+
+plt.plot(ra_list, dec_list, ls='', marker='.', ms=9, label='all')
+plt.plot(results['s_ra'],results['s_dec'], ls='', marker='o', ms=12, fillstyle='none', label='observed by ALMA')
+plt.legend()
+
+[MD]: ## Example 2b: Query a large catalogue with many sources
+[MD]: Not more than 100 sources should be submitted in a single query. For large catalogues, several queries should be submitted consecutively. Explicitly t
+[CODE Cell 21]:
+Vizier.ROW_LIMIT=999999999
+
+catalog_list = Vizier.get_catalogs('J/ApJS/227/11')
+highzqso_catalog = catalog_list['J/ApJS/227/11/highzqso']
+print(f"Number of (unlimited) rows in the catalog: {len(highzqso_catalog)}")
+ra_list = highzqso_catalog['RAJ2000']
+dec_list = highzqso_catalog['DEJ2000']
+
+[MD]: We will now use the RA and Dec coordinates in the catalogue to do the search in the ALMA archive in chunks of 100 results. These results are then comb
+[CODE Cell 23]:
+result = pd.concat([query_coordinate_list(service, ra_list[i:i+100], dec_list[i:i+100], 0.01) for i in range(0, len(ra_list), 100)])
+
+[CODE Cell 24]:
+print(f"Number of ALMA rows returned for the {len(highzqso_catalog)} catalog entries: {len(result)}")
+results.head(5) ### show only 5, for visualization purposes
+
+[MD]: ## Example 2c: Query a list of sources using a name resolver
+[MD]: The function query_resolved_source_name_list will query Sesame for each source name and then query the ALMA TAP service with the returned coordinates.
+[CODE Cell 28]:
+source_name_list = ['CenA', 'M83', 'ALESS73.1', 'unknownsourcename'] 
+query_resolved_source_name_list(service, source_name_list, 0.01).head(5)
+
+[MD]: ## Example 2d: Query a long list of sources using a name resolver
+[MD]: We query a lisf of many sources in groups of 100 sources at a time and combine the result into a single pandas dataframe.
+[CODE Cell 31]:
+query = """SELECT DISTINCT(target_name) from ivoa.obscore where target_name like 'NGC____'"""
+source_name_list = list(service.search(query).to_table().to_pandas()['(target_name)'].values)
+
+[CODE Cell 32]:
+result = pd.concat([query_resolved_source_name_list(service, source_name_list[i:i+100], 0.006) for i in range(0, len(source_name_list), 100)])
+print(f"Number of ALMA rows returned for the {len(source_name_list)} sources in the list: {len(result)}")
+results.head(5)
+
+[MD]: ## Example 2e: Query a list of sources using the ALMA source name
+[MD]: Although in most cases the coordinate query or the source name resolving queries should be preferred, there may be occasions where it is useful to que
+[CODE Cell 35]:
+source_name_list = ['CenA', 'M83', 'ALESS73.1'] 
+results = query_alma_source_name_list(service, source_name_list)
+
+results.head(5)
+
+[MD]: ## Example 2f: Query a long list of sources using the ALMA source 
+[MD]: We query a lisf of many sources in groups of 100 sources at a time and combine the result into a single pandas dataframe.
+[CODE Cell 38]:
+query = """SELECT DISTINCT(target_name) from ivoa.obscore where target_name like 'NGC____'"""
+source_name_list = list(service.search(query).to_table().to_pandas()['(target_name)'].values)
+
+[CODE Cell 39]:
+result = pd.concat([query_alma_source_name_list(service, source_name_list[i:i+100]) for i in range(0, len(source_name_list), 100)])
+print(f"Number of ALMA rows returned for the {len(source_name_list)} sources in the list: {len(result)}")
+results.head(5)
+
+
+============================================================
+NOTEBOOK: nb3_ALMA_Query_by_proposal_or_publisher_id.ipynb
+============================================================
+[MD]:             <h1> nb3. Query objects by proposal id or bibliography code</h1>
+[CODE Cell 3]:
+import numpy as np
+import pyvo
+import pandas as pd
+pd.set_option('display.max_columns', None)
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## Query a proposal ID
+[CODE Cell 5]:
+def query_proposal_id(service, proposal_id):
+    """Queries for an ALMA project code
+    
+       service         pyvo TAPService instance
+       proposal_id     ALMA proposal id in the form "2012.1.00123.S" or in the form "ADS/JAO.ALMA#2012.1.00123.S"
+       
+       returns         pandas table
+       """
+
+    query = f""" 
+            SELECT *  
+            FROM ivoa.obscore  
+            WHERE obs_publisher_did like '%{proposal_id}%' 
+            """    
+    
+    return service.search(query).to_table().to_pandas()
+
+[MD]: ## Query a bibliography code
+[CODE Cell 7]:
+def query_bib_reference(service, bibcode):
+    """Queries for ALMA observations that have been used in a particular observation
+    
+       service         pyvo TAPService instance
+       bibcode         BibCode in the NASA ADS format, e.g. "2017ApJ...834..140R. ""
+                       Also supports part of the BibCode, e.g. "Natur"
+       
+       returns         pandas table
+    """
+    
+    query = f""" 
+            SELECT *  
+            FROM ivoa.obscore  
+            WHERE bib_reference like '%{bibcode}%' 
+            """
+
+    return service.search(query).to_table().to_pandas()
+
+[MD]: ## Query a Member OUS ID
+[CODE Cell 9]:
+def query_member_ous(service, member_ous_id):
+    """Queries for an ALMA Member OUS dataset
+    
+       service         pyvo TAPService instance
+       member_ous_id   ALMA Member OUS dataset ID in the form "uid://A001/X123/X456" 
+                       or in the form "uid___A001_X123_X456"
+                       
+       returns         pandas table
+    """                       
+    
+    query = f""" 
+            SELECT * 
+            FROM ivoa.obscore  
+            WHERE member_ous_uid = '{member_ous_id.replace("___","://").replace("_","/")}'  
+            """
+    
+    return service.search(
+... (truncated)
+
+[MD]: ## Query a publication ID and a specific source
+[CODE Cell 11]:
+def query_proposal_id_and_alma_source_name(service, proposal_id, source_name):
+    """queries for a an ALMA project code and also for an ALMA source name
+    
+       service         pyvo TAPService instance
+       proposal_id     ALMA proposal id in the form "2012.1.00123.S" or 
+                       in the form "ADS/JAO.ALMA#2012.1.00123.S"
+       source_name     ALMA source name as given by the PI in the proposal                
+       
+       returns         pandas table
+    """    
+    
+    query = f"""  
+            SELECT  *  
+            FROM ivoa.obscore  
+            WHERE obs_publis
+... (truncated)
+
+[MD]: ## Example 3a: List all observations carried on under a proposal ID
+[CODE Cell 13]:
+output = query_proposal_id(service, '2016.1.01308.S')
+output.head(5) ### showing only 5 rows
+
+[CODE Cell 15]:
+np.unique(output[output['science_observation']=='T']['target_name'])
+
+[CODE Cell 17]:
+np.unique(output[output['science_observation']=='F']['target_name'])
+
+[MD]: ## Example 3b: Search for one specific source (J1229+0203, calibrator) in a list of proposal IDs
+[MD]: Query the ASDM UIDs associated with a specific source observed multiple times within different observation sets.
+[CODE Cell 19]:
+source_name = 'J1229+0203'
+
+# List of data sets where this source might be included
+proposal_id_list =['ADS/JAO.ALMA#2015.1.00129.S', 'ADS/JAO.ALMA#2015.1.00329.S', 'ADS/JAO.ALMA#2015.1.00587.S', 'ADS/JAO.ALMA#2015.1.01012.S', 'ADS/JAO.ALMA#2016.1.00972.S', 'ADS/JAO.ALMA#2016.1.01308.S']
+
+uids = []
+for proposal_id in proposal_id_list:
+    output = query_proposal_id_and_alma_source_name(service, proposal_id, source_name)
+    if len(output) > 0:
+       print(f"source {source_name} found in {proposal_id}")
+       print(f"Is a science observation? {output['science_observation'].values}")
+       ui
+... (truncated)
+
+
+============================================================
+NOTEBOOK: nb4_ALMA_Query_by_science_keyword.ipynb
+============================================================
+[MD]:             <h1> nb4. Query by scientific category</h1>
+[CODE Cell 2]:
+import numpy as np
+from astropy.table import Table
+import pyvo
+import sys
+import matplotlib.pyplot as plt
+import pandas as pd
+import sklearn.cluster
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## Query scientific category
+[CODE Cell 4]:
+def query_scientific_category(service, scientific_category):
+    """Query for all science observations of a given scientific category. To reduce the memory
+       requirements, rather than using *, it is often useful to select the columns of interest.
+    
+       service               pyvo TAPService instance
+       scientific_category   one of the categories shown at the top of this notebook
+       
+       returns               pandas table    
+    """
+    
+    query = f"""  
+            SELECT target_name, science_keyword, s_ra, s_dec, band_list
+            FROM ivoa.obscore  
+            WH
+... (truncated)
+
+[MD]: ## Query science keyword and data type
+[CODE Cell 6]:
+def query_science_keyword(service, science_keyword):
+    """ALMA has a long list of scientific keywords in the Observing Tool from whch PIs need to select
+       one or two in their proposals. This query returns all science observations for a given science 
+       keyword (or part of it).
+       
+       service               pyvo TAPService instance
+       science_keyword       one of the science keywords of ALMA or a substring
+       
+       returns               pandas table       
+       """
+    
+    query = f"""  
+            SELECT s_ra, s_dec, target_name, band_list, t_exptime
+          
+... (truncated)
+
+[CODE Cell 7]:
+def query_science_keyword_datatype(service, science_keyword, datatype):
+    """This function shows how to combine several constraints. Here the science keyword as well 
+       as the datatype and science_observations
+    
+       service               pyvo TAPService instance
+       science_keyword       one of the science keywords of ALMA or a substring
+       datatype              "image" or "cube"
+       
+       returns               pandas table    
+    """
+    
+    query = f"""   
+            SELECT s_ra, s_dec, target_name, band_list, t_exptime
+            FROM ivoa.obscore  
+            
+... (truncated)
+
+[MD]: ## Example 4a: How many active galaxies (science category) have been observed with ALMA? 
+[CODE Cell 9]:
+output_agn = query_scientific_category(service, 'Active galaxies')
+
+[CODE Cell 10]:
+print(f"There are {len(np.unique(output_agn['target_name']))} unique target names within the list of {len(output_agn)} results.")
+
+[CODE Cell 12]:
+np.set_printoptions(threshold=sys.maxsize)
+np.array(np.unique(output_agn['target_name']))[0:30]
+
+[CODE Cell 14]:
+plt.rcParams["figure.figsize"] = (10,5)
+output_agn['band_list'].hist(bins = 16)
+
+[CODE Cell 16]:
+plt.rcParams["figure.figsize"] = (20,15)
+output_agn.plot(x='s_ra',y='s_dec', linestyle='', ms=7, marker='o', alpha=0.03, label='AGN (science category) observed with ALMA')
+plt.xlabel('RA')
+plt.ylabel('Dec')
+
+[CODE Cell 18]:
+flattened_science_keywords = [item.strip() for sublist in [keyword.split(',') for keyword in output_agn['science_keyword']] for item in sublist]
+pd.DataFrame({'science_keyword':flattened_science_keywords})['science_keyword'].value_counts().plot.pie()
+pd.DataFrame({'science_keyword':flattened_science_keywords})['science_keyword'].value_counts()
+
+[CODE Cell 20]:
+query = f"""SELECT DISTINCT(science_keyword) from ivoa.obscore"""
+flattened_science_keywords = sorted(list(set([item.strip() for sublist in [keyword.split(',') for keyword in service.search(query).to_table().to_pandas()['(science_keyword)']] for item in sublist])))
+print(*flattened_science_keywords, sep="\n")
+
+[MD]: ## Example 4b : How many sub-mm galaxies (science keyword) have been observed?
+[CODE Cell 22]:
+output_smgs_scikey = query_science_keyword(service, 'Sub-mm Galaxies (SMG)')
+print(f"There are {len(output_smgs_scikey)} observations with keyword 'Sub-mm Galaxies (SMG)'.")
+
+[CODE Cell 24]:
+query = """
+        SELECT s_ra, s_dec, target_name, t_exptime
+        FROM ivoa.obscore
+        WHERE proposal_abstract like '%SMG%'
+        OR proposal_abstract like '%ub-mm galax%'
+        AND science_observation = 'T'
+        GROUP BY s_ra, s_dec, target_name, t_exptime
+        """           
+
+output_smgs_abstract = service.search(query).to_table().to_pandas()
+
+[CODE Cell 25]:
+print(f"There are {len(output_smgs_abstract)} observations where the proposal abstract mentions strings related to SMGs.")
+
+[CODE Cell 27]:
+plt.rcParams["figure.figsize"] = (20,15)
+ax = output_smgs_scikey.plot(x='s_ra',y='s_dec', linestyle='', ms=5, marker='o', label='ALMA observed SMGs', alpha=0.02)
+output_smgs_abstract.plot(x='s_ra',y='s_dec', linestyle='', ms=5, marker='o', label='ALMA observed SMGs', alpha=0.02, ax=ax)
+
+[MD]: ## Example 4c : Which sub-mm galaxies have been observed the longest with ALMA?
+[CODE Cell 30]:
+# link recursively all observations together where the centre distance of any observation pair is less than 30 arcsec. 
+eps = 30/60/60*3.1415927/180
+cluster = sklearn.cluster.DBSCAN(eps=eps, min_samples=3, algorithm='ball_tree', metric='haversine').fit(np.radians(output_smgs_scikey[['s_ra', 's_dec']].to_numpy()))
+output_smgs_scikey['galaxylabels'] = cluster.labels_
+
+[CODE Cell 32]:
+output_clustered_and_sorted = output_smgs_scikey.groupby(['galaxylabels'])['t_exptime'].agg('sum').reset_index().sort_values('t_exptime', ascending=False)
+
+plotarray = []
+for i, row in output_clustered_and_sorted.iloc[1:51].iterrows():
+    galaxylabel = int(row['galaxylabels'])    
+    galaxygroup = output_smgs_scikey.loc[(output_smgs_scikey['galaxylabels']==galaxylabel)]
+    plotarray.append([row['t_exptime']/3600, galaxygroup['target_name'].values[0]])
+    print(f"Group number {galaxylabel} with ")
+    print(f"    - {len(galaxygroup['s_ra'])} observations \n    - total exposure time {row['t_
+... (truncated)
+
+[CODE Cell 34]:
+plt.bar(np.arange(len(plotarray)),np.array([p[0] for p in plotarray]), align='center', label='The ALMA SMGs with the largest total observing time')
+
+for i in range(len(plotarray)):
+    plt.text(i, plotarray[i][0]+0.5 , plotarray[i][1], color='black', fontweight='bold', rotation=45 )
+
+plt.ylim(0,25)
+plt.ylabel('Total exposure time [hrs]')
+plt.legend(fontsize=15)
+
+[MD]: ## Example 4d : How many quasars have been observed with ALMA?
+[CODE Cell 36]:
+output_qsos_cube = query_science_keyword_datatype(service, 'Quasars', 'cube' )
+output_qsos_image = query_science_keyword_datatype(service, 'Quasars', 'image' )
+print(f"There are {len(np.unique(output_qsos_cube['target_name']))} line observations (cube) and {len(np.unique(output_qsos_image['target_name']))} continuum observations (line) in the ALMA database.")
+
+
+============================================================
+NOTEBOOK: nb5_ALMA_Query_by_spatial_resolution.ipynb
+============================================================
+[MD]:             <h1> nb5. Query by spatial resolution</h1>
+[CODE Cell 3]:
+import numpy as np
+import pandas as pd
+import pyvo
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## Query a given spatial resolution within a science keyword and data type
+[CODE Cell 5]:
+def query_science_keyword_data_type_spatial_resolution(service, science_keyword, datatype, res_min, res_max):
+    """Queries in a single query for the keyword, datatype (cube or image) and resolutions of science observations
+    
+       service               pyvo TAPService instance
+       science_keyword       one of the science keywords (see Notebook 4, Example 4a or the ALMA Science Archive query interface)
+       datatype              "cube" or "image"
+       res_min               minimum spatial resolution in arcsec (see Notebook 0, Example 0a for the list of columns and their units)
+    
+... (truncated)
+
+[MD]: ## Example 5a: Query all continuum observations of "starburst galaxies" (science keyword) with spatial resolution <0.1 arcsec
+[CODE Cell 7]:
+output_cont = query_science_keyword_data_type_spatial_resolution(service, 'Starburst galaxies', 'image', 0, 0.1)
+output_cont.head(5)
+
+[CODE Cell 9]:
+output_cont['spatial_resolution'].plot.hist(bins=10)
+
+[CODE Cell 11]:
+len(np.unique(output_cont['target_name'])), np.unique(output_cont['target_name'])
+
+[MD]: ## Example 5b: Query all line observations of starburst galaxies with spatial resolution <0.1 arcsec
+[CODE Cell 13]:
+output_spec = query_science_keyword_data_type_spatial_resolution(service, 'Starburst galaxies', 'cube', 0, 0.1)
+
+[CODE Cell 15]:
+output_spec['spatial_resolution'].plot.hist(bins=10)
+
+[CODE Cell 17]:
+len(np.unique(output_spec['target_name'])), np.unique(output_spec['target_name'])
+
+
+============================================================
+NOTEBOOK: nb6_ALMA_Query_by_frequency.ipynb
+============================================================
+[MD]:             <h1> nb6. Query by frequency</h1>
+[CODE Cell 3]:
+import numpy as np
+import astropy
+import pyvo
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+service = pyvo.dal.TAPService("https://almascience.eso.org/tap")      # for the EU ALMA TAP service
+
+# service = pyvo.dal.TAPService("https://almascience.nao.ac.jp/tap")  # for the EA ALMA TAP service
+# service = pyvo.dal.TAPService("https://almascience.nrao.edu/tap")   # for the NA ALMA TAP service
+
+[MD]: ## Query observations covering a frequency range
+[CODE Cell 5]:
+def query_spectral_range(service, science_category, freq_min, freq_max):
+    """Returns all observations that have (a portion of) their spectral coverage overlapping the range freq_min to freq_max
+        
+       service               pyvo TAPService instance
+       science_category      (substring of) one of the ALMA science science categories (see +Notebook 4)
+       freq_min              minimum frequency of the requested coverage (GHz)
+       freq_max              maximum frequency of the requested coverage (GHz)
+              
+       returns               pandas table with frequency (GHz)
+... (truncated)
+
+[MD]: ## Plot all frequency ranges covered by one source
+[CODE Cell 7]:
+def plot_all_frequencies(output_table):
+    """Plots the frequencies and bandwidths for all of the observations in the output table
+    
+    output_table      pandas output table with frequency (GHz) and bandwidth (Hz) column
+    
+    returns           None   
+    """
+
+    plt.rcParams["figure.figsize"] = (20,20)
+    fig, ax = plt.subplots()
+    ax.plot([0,len(output_table['frequency'])],[84,480], alpha = 0)
+    
+    for i in range(len(output_table['frequency'])):
+        freq_min = output_table['frequency'][i] - output_table['bandwidth'][i]/1e9/2
+        freq_max = output_table['frequency'][i
+... (truncated)
+
+[MD]: ## Example 6a: Query all 'active galaxies' (science category) with frequencies between 200-400 GHz
+[CODE Cell 9]:
+output = query_spectral_range(service, 'Active galaxies', 200, 400)
+
+[CODE Cell 10]:
+plt.rcParams["figure.figsize"] = (20,10)
+plt.errorbar(np.arange(len(output['frequency'])), output['frequency'], yerr=output['bandwidth']/1e9/2, 
+    elinewidth = 10,marker = '',ls = '')
+plt.ylabel('Frequency (GHz)')
+plt.xlabel('Objects')
+
+[MD]: ## Example 6b: Display all frequencies covered for one source
+[MD]: We first need to query all observations available for one specific source. In this example we use the sub-mm galaxy SPT0311-58. This galaxy is not in 
+[CODE Cell 13]:
+query = f"""SELECT * FROM ivoa.obscore WHERE target_name = 'SPT0311-58'"""
+result = service.search(query)
+output = result.to_table().to_pandas()
+
+[CODE Cell 15]:
+plot_all_frequencies(output)
+
+
+============================================================
+NOTEBOOK: nb7_ALMA_Query_by_sensitivity.ipynb
+============================================================
+Error reading nb7_ALMA_Query_by_sensitivity.ipynb: Notebook does not appear to be JSON: '{\n "cells": [\n  {\n   "cell_type": "m...

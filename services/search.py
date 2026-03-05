@@ -1,6 +1,17 @@
 # services/search.py
 """
-Search service for NRAO archives
+Search Service — Facade over ALminerClient for all ALMA archive searches.
+
+CALLED BY: core/agent.py (tool execution: search_by_target, search_by_position, etc.)
+CALLS:     integrations/alminer_client.py (ALminerClient)
+
+DATA FLOW:
+    agent._search_by_target(name) → SearchService.search_by_target(name)
+    → ALminerClient.search_by_target(name) → alminer.target(name)
+    → Returns pd.DataFrame of matching observations
+
+Also provides: plot generation, data download, line coverage checks,
+and catalog search — all delegated to ALminerClient.
 """
 
 from typing import Optional, Dict, Any, List, Tuple
@@ -61,11 +72,11 @@ class SearchService:
             print(f"Keyword search failed: {e}")
             return pd.DataFrame()
 
-    def plot_alma_results(self, df: pd.DataFrame, plot_type: str = "sky") -> str:
+    def plot_alma_results(self, df: pd.DataFrame, plot_type: str = "sky") -> bytes:
         """
         Generate plots for ALMA results
         plot_type: 'sky', 'frequency', 'overview'
-        Returns path to image file
+        Returns image as bytes (Fix 5)
         """
         if plot_type == "sky":
             return self.alminer_client.plot_sky_distribution(df)
@@ -73,7 +84,7 @@ class SearchService:
             return self.alminer_client.plot_freq_coverage(df)
         elif plot_type == "overview":
             return self.alminer_client.plot_overview(df)
-        return ""
+        return b""
 
     def download_alma_data(self, df: pd.DataFrame, dry_run: bool = True) -> str:
         """Download data"""

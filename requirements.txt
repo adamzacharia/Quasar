@@ -136,7 +136,8 @@ notebook_shim
 numcodecs
 numexpr
 numpy
-openai
+openai>=1.50.0
+mem0ai
 pandas
 pillow
 plotly
@@ -147,3 +148,11 @@ scipy
 streamlit>=1.28.0
 
 rich
+
+# RAG Dependencies
+langchain
+langchain-community
+langchain-openai
+chromadb
+pypdf
+tiktoken

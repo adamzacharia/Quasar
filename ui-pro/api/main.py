@@ -1,0 +1,819 @@
+"""
+QUASAR Professional Chat Interface — FastAPI Backend
+
+Provides RESTful + SSE endpoints wrapping the existing QuasarAgent.
+Run with:  uvicorn api.main:app --reload --port 8000
+"""
+
+import sys, os, json, asyncio, uuid
+
+# ── Windows fix: langchain_community.document_loaders.pebblo imports 'pwd' (Unix-only) ──
+if sys.platform == "win32" and "pwd" not in sys.modules:
+    import types
+    _pwd_stub = types.ModuleType("pwd")
+    _pwd_stub.getpwuid = lambda uid: type("pw", (), {"pw_name": "user"})()
+    sys.modules["pwd"] = _pwd_stub
+from pathlib import Path
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import List as PyList
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+# Add project root to path so we can import Quasar modules
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Load .env from project root so OPENAI_API_KEY etc. are available
+from dotenv import load_dotenv
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
+app = FastAPI(
+    title="QUASAR API",
+    description="Backend API for the QUASAR Professional Chat Interface",
+    version="2.0.0",
+)
+
+# CORS — allow the Next.js dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Thread pool for running synchronous agent calls
+_executor = ThreadPoolExecutor(max_workers=4)
+
+# ── Channel Routers ──────────────────────────────────────────
+try:
+    from api.channels.telegram import router as telegram_router
+    app.include_router(telegram_router)
+    print("[INFO] Telegram channel router registered at /channels/telegram")
+except ImportError as e:
+    print(f"[WARNING] Telegram channel not loaded: {e}")
+
+
+# ── Models ───────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+    model: Optional[str] = "gpt-4o"
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
+# ── Auth Service Instance ──
+from services.auth import AuthService
+auth_service = AuthService()
+
+def get_current_user(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.split(" ")[1]
+    payload = auth_service.verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return payload
+
+
+class ConversationCreate(BaseModel):
+    title: Optional[str] = "New Chat"
+
+
+# ── Lazy-load the Quasar agent ───────────────────────────────
+
+_agent = None
+
+def get_agent():
+    """Lazy-load QuasarAgent to avoid import errors during dev."""
+    global _agent
+    if _agent is None:
+        try:
+            from core.agent import QuasarAgent, AgentConfig
+            config = AgentConfig()
+            _agent = QuasarAgent(config)
+            print("[INFO] QuasarAgent loaded successfully.")
+        except Exception as e:
+            print(f"[WARN] Could not load QuasarAgent: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    return _agent
+
+
+# ── Endpoints ────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "QUASAR API", "version": "2.0.0"}
+
+
+@app.get("/api/models")
+async def list_models():
+    return {
+        "models": [
+            # ── OpenAI ─────────────────
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-3.5-turbo",
+            # ── Gemini (free tier) ─────
+            "gemini-2.5-flash-preview-05-20",
+            "gemini-2.5-flash-lite-preview-06-17",
+            "gemini-3-flash",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            # ── Gemini Pro (paid/limited)
+            "gemini-3-pro",
+            "gemini-3.1-pro",
+            "gemini-2.5-pro-preview-06-05",
+        ]
+    }
+
+# ── Auth Endpoints ──────────────────────────────────────────
+
+@app.post("/api/auth/register")
+async def register(req: RegisterRequest):
+    success, msg, token = auth_service.register_user(
+        req.username, req.password, req.email, req.display_name
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail=msg)
+    
+    # We verify token to get full payload for frontend
+    payload = auth_service.verify_token(token)
+    return {
+        "token": token,
+        "user": {
+            "id": payload["sub"],
+            "username": payload.get("email") or req.username,
+            "display_name": payload.get("name") or req.username,
+            "auth_provider": "local"
+        }
+    }
+
+@app.post("/api/auth/login")
+async def login(req: LoginRequest):
+    success, user_id, email, display_name, msg = auth_service.login_user(req.username, req.password)
+    if not success:
+        raise HTTPException(status_code=401, detail=msg)
+        
+    token = auth_service.generate_token(user_id, email, display_name)
+    return {
+        "token": token,
+        "user": {
+            "id": user_id,
+            "username": email or req.username,
+            "display_name": display_name or req.username,
+            "auth_provider": "local"
+        }
+    }
+
+@app.post("/api/auth/google")
+async def google_login(req: GoogleLoginRequest):
+    try:
+        # Verify the Google ID token
+        client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        if not client_id:
+            raise HTTPException(status_code=500, detail="Google authentication is not configured on the server")
+            
+        idinfo = id_token.verify_oauth2_token(
+            req.credential, google_requests.Request(), client_id
+        )
+        
+        email = idinfo.get("email")
+        name = idinfo.get("name")
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Google account has no email")
+            
+        success, user_id, msg, token = auth_service.register_or_login_google_user(email, name)
+        
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+            
+        return {
+            "token": token,
+            "user": {
+                "id": user_id,
+                "username": email,
+                "display_name": name,
+                "auth_provider": "google"
+            }
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+
+@app.get("/api/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    return {
+        "user": {
+            "id": current_user["sub"],
+            "username": current_user.get("email"),
+            "display_name": current_user.get("name")
+        }
+    }
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest, authorization: str = Header(None)):
+    """Stream a chat response via SSE using the real QuasarAgent."""
+    agent = get_agent()
+
+    # ── Resolve user from optional token (for personal RAG) ──
+    _current_user = None
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            _current_user = auth_service.verify_token(authorization.split(" ")[1])
+        except Exception:
+            pass
+
+    async def generate():
+        if agent is None:
+            mock_response = (
+                f"I received your query: **{request.message}**\n\n"
+                "The QUASAR backend is running in **mock mode** because the "
+                "QuasarAgent could not be loaded. Please ensure:\n\n"
+                "1. All Python dependencies are installed (`pip install -r requirements.txt`)\n"
+                "2. `OPENAI_API_KEY` is set in your `.env` file\n"
+                "3. You're running from the `Quasar-main` directory\n"
+            )
+            for word in mock_response.split(" "):
+                data = json.dumps({"type": "token", "content": word + " "})
+                yield f"data: {data}\n\n"
+                await asyncio.sleep(0.02)
+            yield "data: [DONE]\n\n"
+            return
+
+        # Helper to emit status events
+        def _status(step: str, state: str = "running"):
+            return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
+
+        # ── Personal RAG retrieval (authenticated users only) ──────────────
+        enriched_message = request.message
+        if _current_user:
+            user_id = _current_user.get("sub")
+            if user_id:
+                try:
+                    yield _status("Searching personal knowledge base", "running")
+                    loop2 = asyncio.get_event_loop()
+                    def _rag_search():
+                        from services.rag_service import RAGService
+                        svc = RAGService(user_id=user_id)
+                        docs = svc.search(request.message, k=4, include_personal=True)
+                        return docs
+                    rag_docs = await loop2.run_in_executor(_executor, _rag_search)
+                    if rag_docs:
+                        ctx_lines = []
+                        for d in rag_docs:
+                            src = d.metadata.get("source_file", "personal doc")
+                            ctx_lines.append(f"[From: {src}]\n{d.page_content.strip()}")
+                        context_block = "\n\n---\n".join(ctx_lines)
+                        enriched_message = (
+                            f"The user has the following relevant documents in their personal knowledge base:\n\n"
+                            f"{context_block}\n\n"
+                            f"---\nUser's question: {request.message}"
+                        )
+                        yield _status("Searching personal knowledge base", "completed")
+                    else:
+                        yield _status("Searching personal knowledge base", "completed")
+                except Exception as e:
+                    print(f"[WARN] Personal RAG search failed: {e}")
+                    yield _status("Searching personal knowledge base", "completed")
+
+        # Use enriched message for the rest of the pipeline
+        effective_request = ChatRequest(
+            message=enriched_message,
+            conversation_id=request.conversation_id,
+            model=request.model
+        )
+
+        # ── Gemini model routing ──────────────────────────────────────────
+        model_name = request.model or "gpt-4o"
+        if model_name.startswith("gemini-"):
+            try:
+                from google import genai as ggenai
+                gemini_client = ggenai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+                yield _status(f"Routing to {model_name}", "running")
+
+                def _gemini_call():
+                    return gemini_client.models.generate_content_stream(
+                        model=model_name,
+                        contents=effective_request.message,
+                    )
+
+                loop = asyncio.get_event_loop()
+                stream = await loop.run_in_executor(_executor, _gemini_call)
+
+                yield _status(f"Routing to {model_name}", "completed")
+
+                for chunk in stream:
+                    text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
+                    if text:
+                        data = json.dumps({"type": "token", "content": text})
+                        yield f"data: {data}\n\n"
+
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                err = json.dumps({"type": "error", "content": f"Gemini error: {e}"})
+                yield f"data: {err}\n\n"
+                yield "data: [DONE]\n\n"
+            return
+
+        # ── Real OpenAI agent execution ────────────────────────────────────
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            # ── Step 1: Complexity Analysis ──
+            yield _status("Analyzing prompt complexity")
+            await asyncio.sleep(0.05)
+
+            try:
+                should_rlm, complexity = await loop.run_in_executor(
+                    _executor,
+                    lambda: agent.rlm.should_use_rlm(effective_request.message)
+                )
+                score_str = f" (score: {complexity.score:.2f})" if hasattr(complexity, 'score') else ""
+            except Exception as e:
+                print(f"[RLM Check Error] {e}")
+                should_rlm = False
+                score_str = ""
+
+            yield _status("Analyzing prompt complexity", "completed")
+
+            if should_rlm:
+                # ── RLM Path ──
+                print(f"[INFO] Routing query to RLM Engine{score_str}")
+                yield _status("Routing to RLM Engine")
+                await asyncio.sleep(0.05)
+                yield _status("Routing to RLM Engine", "completed")
+
+                queue = asyncio.Queue()
+
+                def rlm_status(step: str, state: str):
+                    asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
+
+                def rlm_token(token: str):
+                    if token:
+                        asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+
+                def _run_rlm():
+                    try:
+                        res = agent.rlm.execute(
+                            effective_request.message,
+                            status_callback=rlm_status,
+                            on_token=rlm_token
+                        )
+                        asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                    except Exception as e:
+                        print(f"RLM Agent error: {e}")
+                        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+
+                rlm_task = loop.run_in_executor(_executor, _run_rlm)
+
+                response_text = ""
+                has_streamed_tokens = False
+                
+                while True:
+                    msg = await queue.get()
+                    msg_type = msg[0]
+
+                    if msg_type == "done":
+                        response_text = msg[1]
+                        if not has_streamed_tokens and response_text:
+                            data = json.dumps({"type": "token", "content": response_text})
+                            yield f"data: {data}\n\n"
+                        break
+                    elif msg_type == "error":
+                        response_text = f"An error occurred in RLM: {msg[1]}"
+                        data = json.dumps({"type": "token", "content": response_text})
+                        yield f"data: {data}\n\n"
+                        break
+                    elif msg_type == "status":
+                        yield _status(msg[1], msg[2])
+                    elif msg_type == "token":
+                        has_streamed_tokens = True
+                        data = json.dumps({"type": "token", "content": msg[1]})
+                        yield f"data: {data}\n\n"
+
+                # Manually add to agent memory
+                agent.memory.add_message("user", effective_request.message)
+                agent.memory.add_message("assistant", response_text)
+
+            else:
+                # ── Standard Agent Path ──
+                print("[INFO] Routing query to standard Response API")
+                yield _status("Routing to standard agent")
+                await asyncio.sleep(0.05)
+                yield _status("Routing to standard agent", "completed")
+
+                # Prefer the model name requested by the user, fallback to config
+                model_name = request.model or getattr(agent.config, 'model', 'GPT-4o') or 'GPT-4o'
+                yield _status(f"Calling {model_name}")
+
+                queue = asyncio.Queue()
+                
+                def on_token(token: str):
+                    if token:
+                        asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+                        
+                def _run_agent():
+                    try:
+                        # Use authenticated user_id for mem0 isolation.
+                        # Anonymous users get a sentinel — no stored long-term memory.
+                        _uid = (_current_user.get("sub") if _current_user else None) or "anonymous"
+
+                        def _on_status(step: str, state: str):
+                            asyncio.run_coroutine_threadsafe(
+                                queue.put(("status", step, state)), loop
+                            )
+
+                        res = agent.stream_response_api(
+                            effective_request.message,
+                            message_placeholder=None,
+                            user_id=_uid,
+                            on_token=on_token,
+                            on_status=_on_status,
+                        )
+                        asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                    except Exception as e:
+                        print(f"Agent error: {e}")
+                        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+
+                agent_task = loop.run_in_executor(_executor, _run_agent)
+
+                yield _status(f"Calling {model_name}", "completed")
+
+                first_token = True
+                response_text = ""
+                
+                while True:
+                    msg = await queue.get()
+                    if isinstance(msg, tuple) and len(msg) == 3:
+                        msg_type, step, state = msg
+                        if msg_type == "status":
+                            yield _status(step, state)
+                            continue
+                    msg_type, payload = msg[0], msg[1]
+                    if msg_type == "done":
+                        response_text = payload
+                        break
+                    elif msg_type == "error":
+                        response_text = f"An error occurred: {payload}"
+                        break
+                    elif msg_type == "token":
+                        if first_token:
+                            yield _status("Generating response", "completed")
+                            first_token = False
+                        data = json.dumps({"type": "token", "content": payload})
+                        yield f"data: {data}\n\n"
+
+            # ── Tool call results ──
+            last_run_result = getattr(agent, 'last_run_result', None)
+
+            if last_run_result:
+                result_type = last_run_result.get("type", "")
+                tool_name_raw = last_run_result.get("tool_name", "search_alma_archive")
+                tool_display = tool_name_raw.replace("_", " ").title()
+
+                # Emit tool call event
+                tool_event = json.dumps({
+                    "type": "tool_call",
+                    "name": tool_name_raw,
+                    "displayName": tool_display,
+                    "status": "completed",
+                    "input": last_run_result.get("params", {}),
+                    "output": "Found results"
+                })
+                yield f"data: {tool_event}\n\n"
+                await asyncio.sleep(0.05)
+
+                # Emit data table if we have structured data
+                if result_type == "data":
+                    df = last_run_result.get("data")
+                    if df is not None and hasattr(df, 'to_dict'):
+                        try:
+                            rows = df.head(50).to_dict("records")
+                            columns = list(df.columns)
+                            source = last_run_result.get("source", "ALMA")
+                            metrics = [
+                                {"label": "Total Obs", "value": len(df), "color": "text-primary"},
+                                {"label": "Columns", "value": len(columns), "color": "text-indigo-400"},
+                            ]
+                            data_event = json.dumps({
+                                "type": "data",
+                                "content": {
+                                    "sourceName": source,
+                                    "metrics": metrics,
+                                    "columns": columns,
+                                    "rows": rows,
+                                }
+                            })
+                            yield f"data: {data_event}\n\n"
+                            await asyncio.sleep(0.05)
+                        except Exception as e:
+                            print(f"[WARN] Failed to serialize data table: {e}")
+
+                elif result_type == "papers":
+                    papers = last_run_result.get("papers")
+                    
+                    # Backwards compatibility: if papers is missing, try to read from 'data' DataFrame
+                    if papers is None and "data" in last_run_result:
+                        df = last_run_result["data"]
+                        if hasattr(df, "to_dict"):
+                            papers = df.to_dict("records")
+                            
+                    papers = papers or []
+                    
+                    if papers:
+                        papers_event = json.dumps({
+                            "type": "papers",
+                            "content": papers
+                        })
+                        yield f"data: {papers_event}\n\n"
+                        await asyncio.sleep(0.05)
+
+            # Clear last_run_result
+            agent.last_run_result = None
+
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_data = json.dumps({"type": "error", "content": str(e)})
+            yield f"data: {error_data}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/chat/upload")
+async def chat_with_files(
+    message: str = Form(""),
+    conversation_id: Optional[str] = Form(None),
+    model: Optional[str] = Form("gpt-4o"),
+    files: PyList[UploadFile] = File(default=[]),
+):
+    """Stream a chat response with attached files (images/documents) via SSE."""
+    import base64, io
+
+    # Split files into images vs documents
+    image_contents = []   # OpenAI vision content dicts
+    enriched_text = message.strip()
+
+    for f in files:
+        content_type = f.content_type or ""
+        raw = await f.read()
+
+        if content_type.startswith("image/"):
+            # Build vision content block
+            b64 = base64.b64encode(raw).decode("utf-8")
+            image_contents.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{content_type};base64,{b64}", "detail": "auto"},
+            })
+
+        elif content_type == "application/pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(raw))
+                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                enriched_text += f"\n\n### Attached PDF: {f.filename}\n{text[:8000]}"
+            except ImportError:
+                enriched_text += f"\n\n[PDF: {f.filename} — install pypdf to extract text]"
+            except Exception as e:
+                enriched_text += f"\n\n[PDF: {f.filename} — extraction failed: {e}]"
+
+        elif content_type in ("text/plain", "text/csv", "text/markdown", "application/json") or \
+             (f.filename and any(f.filename.endswith(ext) for ext in [".fits", ".csv", ".txt", ".md", ".json"])):
+            try:
+                text = raw.decode("utf-8", errors="replace")[:8000]
+                enriched_text += f"\n\n### Attached file: {f.filename}\n```\n{text}\n```"
+            except Exception:
+                enriched_text += f"\n\n[Binary file: {f.filename} ({len(raw)/1024:.1f} KB)]"
+        else:
+            enriched_text += f"\n\n[Attached file: {f.filename} ({len(raw)/1024:.1f} KB)]"
+
+    # ── If there are images, use OpenAI vision directly (streaming) ─────────
+    if image_contents:
+        import openai as _openai
+        client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        # Build the multimodal content array
+        content_parts = []
+        if enriched_text:
+            content_parts.append({"type": "text", "text": enriched_text})
+        content_parts.extend(image_contents)
+
+        async def vision_stream():
+            def _vstatus(step: str, state: str = "running") -> str:
+                return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
+            try:
+                yield _vstatus("Analyzing image with vision model", "running")
+                # Run the blocking OpenAI call in a thread
+                loop = asyncio.get_event_loop()
+
+                def _call():
+                    return client.chat.completions.create(
+                        model=model or "gpt-4o",
+                        messages=[{"role": "user", "content": content_parts}],
+                        stream=True,
+                        max_tokens=1024,
+                    )
+
+                stream = await loop.run_in_executor(_executor, _call)
+                yield _vstatus("Analyzing image with vision model", "completed")
+
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if delta:
+                        data = json.dumps({"type": "token", "content": delta})
+                        yield f"data: {data}\n\n"
+
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                err = json.dumps({"type": "error", "content": str(e)})
+                yield f"data: {err}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            vision_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    # ── No images — delegate to regular chat endpoint ────────────────────────
+    req = ChatRequest(message=enriched_text or message, conversation_id=conversation_id, model=model)
+    return await chat(req)
+
+
+# ── Personalization Endpoints ────────────────────────────────────────────────
+
+import sqlite3, tempfile, datetime as _dt
+from pathlib import Path as _Path
+
+_PERS_DB = _Path(__file__).resolve().parent.parent / "data" / "personalization.db"
+
+def _get_pers_db():
+    """Return a connection to the personalization metadata SQLite DB."""
+    _PERS_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(_PERS_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            uploaded_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+@app.post("/api/personalization/upload")
+async def personalization_upload(
+    files: PyList[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upload and index documents into the user's personal RAG collection."""
+    user_id = current_user["sub"]
+    results = []
+
+    for f in files:
+        raw = await f.read()
+        ext = (_Path(f.filename or "file").suffix or ".txt").lower()
+
+        # Write to a temp file so RAGService can read it
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _ingest():
+                from services.rag_service import RAGService
+                svc = RAGService(user_id=user_id)
+                return svc.ingest_document(tmp_path, personal=True)
+
+            result = await loop.run_in_executor(_executor, _ingest)
+
+            if result.get("success"):
+                doc_id = str(uuid.uuid4())
+                conn = _get_pers_db()
+                conn.execute(
+                    "INSERT INTO documents VALUES (?,?,?,?,?,?)",
+                    (doc_id, user_id, f.filename, len(raw),
+                     result.get("chunks", 0), _dt.datetime.utcnow().isoformat())
+                )
+                conn.commit()
+                conn.close()
+                results.append({"filename": f.filename, "success": True, "chunks": result.get("chunks", 0)})
+            else:
+                results.append({"filename": f.filename, "success": False, "error": result.get("error", "Unknown error")})
+        except Exception as e:
+            results.append({"filename": f.filename, "success": False, "error": str(e)})
+        finally:
+            try: _Path(tmp_path).unlink()
+            except: pass
+
+    successes = sum(1 for r in results if r["success"])
+    return {"message": f"{successes}/{len(results)} documents indexed successfully.", "results": results}
+
+
+@app.get("/api/personalization/documents")
+async def personalization_list(current_user: dict = Depends(get_current_user)):
+    """List all documents in the user's personal knowledge base."""
+    user_id = current_user["sub"]
+    conn = _get_pers_db()
+    rows = conn.execute(
+        "SELECT id, filename, size_bytes, uploaded_at, chunk_count FROM documents WHERE user_id=? ORDER BY uploaded_at DESC",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "filename": r[1], "size_bytes": r[2], "uploaded_at": r[3], "chunk_count": r[4]}
+        for r in rows
+    ]
+
+
+@app.delete("/api/personalization/document/{doc_id}")
+async def personalization_delete(doc_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete a document from the user's personal knowledge base."""
+    user_id = current_user["sub"]
+    conn = _get_pers_db()
+    row = conn.execute("SELECT filename FROM documents WHERE id=? AND user_id=?", (doc_id, user_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    filename = row[0]
+
+    # Remove from vector store
+    try:
+        loop = asyncio.get_event_loop()
+        def _delete():
+            from services.rag_service import RAGService
+            svc = RAGService(user_id=user_id)
+            svc.delete_personal_document(filename)
+        await loop.run_in_executor(_executor, _delete)
+    except Exception as e:
+        print(f"[WARN] Vector delete failed: {e}")
+
+    conn.execute("DELETE FROM documents WHERE id=? AND user_id=?", (doc_id, user_id))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+
+@app.get("/api/conversations")
+
+async def list_conversations():
+    """Return conversation list — placeholder for future DB integration."""
+    return {"conversations": []}
+
+
+@app.post("/api/conversations")
+async def create_conversation(req: ConversationCreate):
+    """Create a new conversation."""
+    return {"id": str(uuid.uuid4()), "title": req.title}
+
+
+# ── Health check ─────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    agent = get_agent()
+    return {
+        "status": "healthy",
+        "agent_loaded": agent is not None,
+    }

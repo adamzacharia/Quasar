@@ -8,11 +8,11 @@ print(f"API Key present: {bool(api_key)}")
 
 try:
     client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": "Hello"}],
-        max_tokens=5
+        input="Hello",
+        max_output_tokens=5
     )
-    print("Response:", response.choices[0].message.content)
+    print("Response:", response.output_text)
 except Exception as e:
     print("Error:", e)

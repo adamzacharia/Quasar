@@ -15,6 +15,13 @@ from astroquery.simbad import Simbad
 import warnings
 warnings.filterwarnings('ignore')
 
+
+def _sanitize_adql(value: str) -> str:
+    """Escape user input for safe ADQL interpolation."""
+    # Remove/escape characters that could break ADQL string literals
+    return value.replace("'", "''").replace("\\", "\\\\").replace(";", "").replace("--", "")
+
+
 class NRAOTapClient:
     """Fixed client for interacting with NRAO's TAP service - Version 2"""
 
@@ -154,13 +161,14 @@ class NRAOTapClient:
                 print(f"🔍 Coordinate resolution failed, searching by name pattern: {source_name}")
                 
                 # Handle different name formats
+                safe_name = _sanitize_adql(source_name)
                 name_patterns = [
-                    source_name,
-                    source_name.replace(' ', ''),
-                    source_name.replace(' ', '_'),
-                    source_name.replace('_', ' '),
-                    source_name.upper(),
-                    source_name.replace(' ', '%')
+                    safe_name,
+                    safe_name.replace(' ', ''),
+                    safe_name.replace(' ', '_'),
+                    safe_name.replace('_', ' '),
+                    safe_name.upper(),
+                    safe_name.replace(' ', '%')
                 ]
                 
                 conditions = " OR ".join([f"target_name LIKE '%{p}%'" for p in name_patterns])
@@ -188,7 +196,7 @@ class NRAOTapClient:
                     SELECT TOP {max_results}
                         *
                     FROM {self.obscore_table}
-                    WHERE target_name LIKE '%{source_name}%'
+                    WHERE target_name LIKE '%{_sanitize_adql(source_name)}%'
                     """
                     results = self.nrao_tap.search(query)
             
@@ -325,11 +333,36 @@ class NRAOTapClient:
         else:
             return f"https://data.nrao.edu/portal/#/search/{obs_id}"
 
+    def get_observation_details(self, obs_id: str) -> Dict[str, Any]:
+        """
+        Get detailed information about a specific observation.
+        """
+        safe_id = _sanitize_adql(obs_id)
+        if not self.nrao_tap or not self.obscore_table:
+            return {"error": "TAP service not connected"}
+
+        try:
+            query = f"""
+            SELECT *
+            FROM {self.obscore_table}
+            WHERE obs_publisher_did = '{safe_id}'
+               OR obs_publisher_did LIKE '%{safe_id}%'
+            """
+            results = self.nrao_tap.search(query)
+            if results and len(results) > 0:
+                df = results.to_table().to_pandas()
+                if not df.empty:
+                    return df.iloc[0].to_dict()
+            return {"message": f"No observation found with ID: {obs_id}"}
+        except Exception as e:
+            return {"error": str(e)}
+
     def test_connection(self) -> Dict[str, Any]:
         """
         Test connections to all services
         """
         results = {
+            "status": "disconnected",
             "nrao_tap": "disconnected",
             "alma": "disconnected",
             "obscore_table": self.obscore_table
@@ -339,18 +372,21 @@ class NRAOTapClient:
         if self.nrao_tap and self.obscore_table:
             try:
                 test_query = f"SELECT TOP 1 obs_publisher_did FROM {self.obscore_table}"
-                result = self.nrao_tap.search(test_query)
+                self.nrao_tap.search(test_query)
                 results["nrao_tap"] = "connected"
-            except:
+            except Exception:
                 pass
         
         # Test ALMA
         try:
-            # Just try to access the ALMA help
             self.alma.help()
             results["alma"] = "connected"
-        except:
+        except Exception:
             pass
+
+        # Overall status
+        if results["nrao_tap"] == "connected" or results["alma"] == "connected":
+            results["status"] = "connected"
             
         return results
 

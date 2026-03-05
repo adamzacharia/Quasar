@@ -15,13 +15,13 @@ def test_extraction(query, description):
     prompt = ENTITY_EXTRACTION_PROMPT.format(query=query)
     
     try:
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
+            input=prompt,
+            text={"format": {"type": "json_object"}},
             temperature=0.1
         )
-        raw_content = response.choices[0].message.content
+        raw_content = response.output_text
         print(f"Raw Content: {raw_content}")
         result = json.loads(raw_content)
         print(f"Result: {result}")

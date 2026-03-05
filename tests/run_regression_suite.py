@@ -156,8 +156,8 @@ def run_suite():
                 
                 # Mock LLM response
                 mock_chunk = MagicMock()
-                mock_chunk.choices[0].delta.content = f"Sure. {tool_call_str}"
-                agent.client.chat.completions.create.return_value = [mock_chunk]
+                mock_chunk.output_text = f"Sure. {tool_call_str}"
+                agent.client.responses.create.return_value = mock_chunk
                 
                 resp1 = agent.stream_general_response(q1)
                 
@@ -167,13 +167,13 @@ def run_suite():
                 
                 # 2. Ask Q2 (Follow-up)
                 mock_chunk_2 = MagicMock()
-                mock_chunk_2.choices[0].delta.content = "Based on the results, the answer is..."
-                agent.client.chat.completions.create.return_value = [mock_chunk_2]
+                mock_chunk_2.output_text = "Based on the results, the answer is..."
+                agent.client.responses.create.return_value = mock_chunk_2
                 
                 resp2 = agent.stream_general_response(q2)
                 
                 # Inspect calls
-                call_args = agent.client.chat.completions.create.call_args
+                call_args = agent.client.responses.create.call_args
                 # call_args is (args, kwargs)
                 # Ensure we check both, though usually it's kwargs['messages']
                 messages_sent = []

@@ -61,3 +61,85 @@ Instructions:
 - If the user performed a search, summarize the results and suggest next steps (e.g., "Would you like to see a table of these datasets?" or "Should we filter by sensitivity?").
 - If you need more information, ask for it politely.
 """
+
+# Fix 7: ALMA TAP Schema for SQL/ADQL query generation
+ALMA_TAP_SCHEMA = """
+ALMA TAP Database Schema (ivoa.ObsCore compatible):
+
+TABLE: ivoa.obscore
+===================
+| Column Name           | Type    | Description                              |
+|-----------------------|---------|------------------------------------------|
+| target_name           | VARCHAR | Name of the observed target              |
+| s_ra                  | DOUBLE  | Right Ascension (degrees, J2000)         |
+| s_dec                 | DOUBLE  | Declination (degrees, J2000)             |
+| s_resolution          | DOUBLE  | Angular resolution (arcseconds)          |
+| t_exptime             | DOUBLE  | Total integration time (seconds)         |
+| t_min                 | DOUBLE  | Observation start time (MJD)             |
+| t_max                 | DOUBLE  | Observation end time (MJD)               |
+| em_min                | DOUBLE  | Minimum wavelength (meters)              |
+| em_max                | DOUBLE  | Maximum wavelength (meters)              |
+| band_list             | VARCHAR | ALMA band number(s), e.g., '6'           |
+| frequency             | DOUBLE  | Central frequency (GHz)                  |
+| bandwidth             | DOUBLE  | Total bandwidth (GHz)                    |
+| proposal_id           | VARCHAR | ALMA project code (e.g., 2019.1.00123.S) |
+| obs_publisher_did     | VARCHAR | Unique dataset identifier                |
+| member_ous_uid        | VARCHAR | Unique MOUS UID                          |
+| access_url            | VARCHAR | Data download URL                        |
+| cont_sens_bandwidth   | DOUBLE  | Continuum sensitivity (mJy/beam)         |
+| velocity_resolution   | DOUBLE  | Velocity resolution (km/s)               |
+| pol_states            | VARCHAR | Polarization states (e.g., 'XX YY')      |
+| science_observation   | VARCHAR | Science observation flag                 |
+
+Example Queries:
+- Find Band 6 data: SELECT * FROM ivoa.obscore WHERE band_list = '6'
+- Resolution < 0.1": SELECT * FROM ivoa.obscore WHERE s_resolution < 0.1
+- Frequency range: SELECT * FROM ivoa.obscore WHERE frequency BETWEEN 230 AND 240
+- Target search: SELECT * FROM ivoa.obscore WHERE target_name LIKE '%M31%'
+"""
+
+
+# ---------------------------------------------------------------------------
+# RLM (Recursive Language Model) Prompts
+# ---------------------------------------------------------------------------
+
+RLM_DECOMPOSITION_PROMPT = """
+You are a task-decomposition engine for a radio astronomy research assistant.
+
+Given a complex user query, break it into the smallest possible ordered sub-tasks
+that can each be solved independently (with context from previous steps).
+
+Rules:
+- Each sub-task should be a SINGLE, concrete action (look up a value, compute, search, etc.).
+- Sub-tasks must be in execution order — later tasks may depend on earlier results.
+- Return at most 8 sub-tasks.
+- If the query is simple enough to answer directly, return an empty list.
+
+Prior context (from earlier steps, if any):
+{context}
+
+User query: "{query}"
+
+Respond with JSON only:
+{{
+    "subtasks": ["sub-task 1 description", "sub-task 2 description", ...],
+    "reasoning": "Brief explanation of the decomposition"
+}}
+"""
+
+RLM_AGGREGATION_PROMPT = """
+You are a senior astronomer synthesizing research results.
+
+The user asked: "{query}"
+
+Below are the results of each step that was executed to answer this query:
+
+{sub_results}
+
+Instructions:
+- Combine the above into a single, coherent, and informative answer.
+- Cite specific values (frequencies, redshifts, observation counts) from the sub-results.
+- If any step failed or returned insufficient data, note that clearly.
+- Be concise but thorough.
+- Use markdown formatting for readability.
+"""

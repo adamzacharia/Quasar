@@ -1,0 +1,495 @@
+
+=== PAGE 1 ===
+RECURSIVE LANGUAGE MODELS
+AlexL.Zhang TimKraska OmarKhattab
+MITCSAIL MITCSAIL MITCSAIL
+altzhang@mit.edu kraska@mit.edu okhattab@mit.edu
+ABSTRACT
+We study allowing large language models (LLMs) to process arbitrarily long
+promptsthroughthelensofinference-timescaling. WeproposeRecursiveLan-
+guage Models (RLMs), a general inference strategy that treats long prompts as
+partofanexternalenvironmentandallowstheLLMtoprogrammaticallyexamine,
+decompose, and recursively call itself over snippets of the prompt. We find that
+RLMs successfully handle inputs up to two orders of magnitude beyond model
+contextwindowsand,evenforshorterprompts,dramaticallyoutperformthequal-
+ity of base LLMs and common long-context scaffolds across four diverse long-
+contexttasks,whilehavingcomparable(orcheaper)costperquery.
+1 INTRODUCTION
+100
+80
+60
+40
+20
+0
+8k 16k 33k 66k 131k 262k 524k 1 M
+Input Context Length (log scale)
+)%(
+erocS
+GPT-5 RLM(GPT-5)
+100
+S-NIAH S-NIAH
+80
+60 OOLONG-Pairs
+40 OOLONG
+OOLONG 20
+OOLONG-Pairs
+0
+8k 16k 33k 66k 131k 262k 524k 1 M
+Input Context Length (log scale)
+Figure1: AcomparisonofGPT-5andacorrespondingRLMonthreelong-contexttasksofincreas-
+ing complexity: S-NIAH, OOLONG, and OOLONG-Pairs. For each task, we scale the input
+lengthfrom213to218. GPT-5performancedegradessignificantlyasafunctionofbothinputlength
+and task complexity, while the RLM maintains strong performance. Inputs beyond the red region
+donotfitinGPT-5’scontextwindowof272Ktokens,buttheRLMhandlesthemeffectively. Addi-
+tionalexperimentsacrossothermodels,methods,andbenchmarksarein§2.
+Despiterapidprogressinreasoningandtooluse,modernlanguagemodelsstillhavelimitedcontext
+lengthsand,evenwithintheselimits,appeartoinevitablyexhibitcontextrot(Hongetal.,2025),the
+phenomenonillustratedintheleft-handsideofFigure1wherethequalityofevenfrontiermodels
+like GPT-5degrades quickly as contextgets longer. Though we expect contextlengths to steadily
+risethroughimprovementstotraining,architecture,andinfrastructure,weareinterestedinwhether
+itpossibletodramaticallyscalethecontextsizeofgeneral-purposeLLMsbyordersofmagnitude.
+This is increasingly urgent as LLMs begin to be widely adopted for long-horizon tasks, in which
+theymustroutinelyprocesstensifnothundredsofmillionsoftokens.
+We study this question through the lens of scaling inference-time compute. We draw broad inspi-
+ration from out-of-core algorithms, in which data-processing systems with a small but fast main
+memory can process far larger datasets by cleverly managing how data is fetched into memory.
+Inference-timemethodsfordealingwithwhatareinessencelong-contextproblemsareverycom-
+mon,thoughtypicallytask-specific. Onegeneralandincreasinglypopularinference-timeapproach
+in this space is context condensation or compaction (Khattab et al., 2021; Smith, 2025; OpenAI,
+2025; Wu et al., 2025), in which the context is repeatedly summarized once it exceeds a length
+threshold. Unfortunately,compactionisrarelyexpressiveenoughfortasksthatrequiredenseaccess
+1
+5202
+ceD
+13
+]IA.sc[
+1v10642.2152:viXra
+
+=== PAGE 2 ===
+Figure2: ARecursiveLanguageModel(RLM)treatspromptsaspartoftheenvironment. Itloads
+theinputpromptasavariableinsideaPythonREPLenvironmentE andwritescodetopeekinto,
+decompose,andinvokeitselfrecursivelyoverprogrammaticsnippetsofthevariable.
+tomanypartsoftheprompt,asitpresumesineffectthatsomedetailsthatappearearlyintheprompt
+cansafelybeforgottentomakeroomfornewcontent.
+We introduce Recursive Language Models (RLMs), a general-purpose inference paradigm for
+dramatically scaling the effective input and output lengths of modern LLMs. The key insight is
+thatlongpromptsshouldnotbefedintotheneuralnetwork(e.g.,Transformer)directlybutshould
+insteadbetreatedaspartoftheenvironmentthattheLLMcansymbolicallyinteractwith.
+AsFigure2illustrates,anRLMexposesthesameexternalinterfaceasanLLM:itacceptsastring
+promptofarbitrarystructureandproducesastringresponse. GivenapromptP,theRLMinitializes
+a Read-Eval-Print Loop (REPL) programming environment in which P is set as the value of a
+variable. ItthenofferstheLLMgeneralcontextabouttheREPLenvironment(e.g.,thelengthofthe
+stringP),andpermitsittowritecodethatpeeksintoanddecomposesP,andtoiterativelyobserve
+any side effects from execution. Crucially, RLMs encourage the LLM, in the code it produces, to
+programmaticallyconstructsub-tasksonwhichtheycaninvokethemselvesrecursively.
+Bytreatingthepromptasanobjectintheexternalenvironment,thissimpledesignofRLMstackles
+afoundationallimitationinthemanypriorapproaches(Anthropic,2025;Sentient,2025;Schroeder
+etal.,2025;Sunetal.,2025),whichfocusonrecursivedecompositionofthetasksbutcannotallow
+theirinputtoscalebeyondthecontextwindowoftheunderlyingLLM.
+WeevaluateRLMsusingafrontierclosedmodel(GPT-5;OpenAI2025)andafrontieropenmodel
+(Qwen3-Coder-480B-A35B;Team2025)acrossfourdiversetaskswithvaryinglevelsofcomplexity
+fordeepresearch(Chenetal.,2025),informationaggregation(Bertschetal.,2025),coderepository
+understanding(Baietal.,2025),andasyntheticpairwisereasoningtaskwhereevenfrontiermodels
+fail catastrophically. We compare RLMs against direct LLM calls as well as context compaction,
+retrieval tool-use agents, and code-generation agents. We find that RLMs demonstrate extremely
+strongperformanceevenatthe10M+tokenscale,anddramaticallyoutperformallotherapproaches
+atlong-contextprocessing,inmostcasesbydouble-digitpercentagegainswhilemaintainingacom-
+parableorlowercost. Inparticular,asdemonstratedinFigure1exhibitfarlessseveredegradation
+forlongercontextsandmoresophisticatedtasks.
+2
+
+=== PAGE 3 ===
+2 SCALING LONG CONTEXT TASKS
+Recentwork(Hsiehetal.,2024;Goldmanetal.,2025;Hongetal.,2025)hassuccessfullyargued
+thattheeffectivecontextwindowofLLMscanoftenbemuchshorterthanamodel’sphysicalmaxi-
+mumnumberoftokens.Goingfurther,wehypothesizethattheeffectivecontextwindowofanLLM
+cannot be understood independently of the specific task. That is, more “complex” problems will
+exhibitdegradationatevenshorterlengthsthansimplerones. Becauseofthis,wemustcharacterize
+tasksintermsofhowtheircomplexityscaleswithpromptlength.
+For example, needle-in-a-haystack (NIAH) problems generally keep ‘needles’ constant as prompt
+length is scaled. As a result, while previous generations of models struggled with NIAH tasks,
+frontiermodelscanreliablysolvethesetasksinRULER(Hsiehetal.,2024)eveninthe1M+token
+settings.Nonetheless,thesamemodelsstruggleevenatshorterlengthsonOOLONG(Bertschetal.,
+2025),whichisataskwheretheanswerdependsexplicitlyonalmosteverylineintheprompt.1
+2.1 TASKS
+Grounded in this intuition, we design our empirical evaluation around tasks where we are able to
+vary not just the lengths of the prompts, but also consider different scaling patterns for problem
+complexity. Welooselycharacterizeeachtaskbyinformationdensity, i.e. howmuchinformation
+anagentisrequiredtoprocesstoanswerthetask,andhowthisscaleswithdifferentinputsizes.
+S-NIAH.Followingthesingleneedle-in-the-haystacktaskinRULER(Hsiehetal.,2024),wecon-
+siderasetof50singleneedle-in-the-haystacktasksthatrequirefindingaspecificphraseornumber
+inalargesetofunrelatedtext. Thesetasksrequirefindingasingleanswerregardlessofinputsize,
+andasaresultscaleroughlyconstantinprocessingcostswithrespecttoinputlength.
+BrowseComp-Plus(1Kdocuments)(Chenetal.,2025). Amulti-hopquestion-answeringbench-
+mark for DeepResearch (OpenAI, 2025) questions that requires reasoning over multiple different
+documents. Thebenchmarkprovidesaverifiedofflinecorpusof100Kdocumentsthatisguaranteed
+tocontaingold,evidence,andhardnegativedocumentsforeachtask. FollowingSunetal.(2025),
+weuse150randomlysampledtasksasourevaluationset; weprovide1000randomlychosendoc-
+uments to the model or agent, in which the gold and evidence documents are guaranteed to exist.
+Wereportthepercentageofcorrectanswers. Theanswertoeachtaskrequirespiecingtogetherin-
+formationfromseveraldocuments,makingthesetasksmorecomplicatedthanS-NIAHdespitealso
+requiringaconstantnumberofdocumentstoanswer.
+OOLONG(Bertschetal.,2025). Alongreasoningbenchmarkthatrequiresexaminingandtrans-
+forming chunks of the input semantically, then aggregating these chunks to form a final answer.
+We report scoring based on the original paper, which scores numerical answers as score(yˆ) =
+0.75|y−yˆ| and other answers as exact match. We focus specifically on the trec coarse split,
+whichisasetof50tasksoveradatasetofquestionswithsemanticlabels. Eachtaskrequiresusing
+nearlyallentriesofthedataset,andthereforescaleslinearlyinprocessingcostsrelativetotheinput
+length.
+OOLONG-Pairs. We manually modify the trec coarse split of OOLONG to include 20 new
+queries that specifically require aggregating pairs of chunks to construct the final answer. In Ap-
+pendixE.1,weexplicitlyprovideallqueriesinthisbenchmark.WereportF1scoresovertheanswer.
+Eachtaskrequiresusingnearlyallpairsofentriesofthedataset,andthereforescalesquadratically
+inprocessingcostsrelativetotheinputlength.
+LongBench-v2CodeQA(Baietal.,2025).Amulti-choicecoderepositoryunderstandingsplitfrom
+LongBench-v2thatischallengingformodernfrontiermodels.Wereportthescoreasthepercentage
+ofcorrectanswers. Eachtaskrequiresreasoningoverafixednumberoffilesinacodebasetofind
+therightanswer.
+1ThisintuitionhelpsexplainthepatternsseeninFigure1earlier: GPT-5scaleseffectivelyontheS-NIAH
+task, where the needle size is constant despite longer prompts, but shows faster degradation at increasingly
+shortercontextlengthsonthelinearcomplexityOOLONGandthequadraticcomplexityOOLONG-Pairs.
+3
+
+=== PAGE 4 ===
+2.2 METHODSANDBASELINES
+We compare RLMs against other commonly used task-agnostic methods. For each of the follow-
+ing methods, we use two contemporary LMs, GPT-5 with medium reasoning (OpenAI, 2025) and
+defaultsamplingparametersandQwen3-Coder-480B-A35B(Yangetal.,2025)usingthesampling
+parametersdescribedinTeam(2025),chosentoprovideresultsforacommercialandopenfrontier
+model respectively. For Qwen3-Coder, we compute costs based on the Fireworks provider (Fire-
+works,2025). Inadditiontoevaluatingthebasemodelonalltasks,wealsoevaluatethefollowing
+methodsandbaselines:
+RLM with REPL. We implement an RLM that loads its context as a string in the memory of a
+PythonREPLenvironment. TheREPLenvironmentalsoloadsinamodulethatallowsittoquery
+a sub-LM inside the environment. The system prompt is fixed across all experiments (see Ap-
+pendixD).FortheGPT-5experiments,weuseGPT-5-minifortherecursiveLMsandGPT-5forthe
+rootLM,aswefoundthischoicetostrikeapowerfultradeoffbetweenthecapabilitiesofRLMsand
+thecostoftherecursivecalls.
+RLMwithREPL,nosub-calls.Weprovideanablationofourmethod.Init,theREPLenvironment
+loadsinthecontext,butisnotabletousesub-LMcalls. Inthissetting,theLMcanstillinteractwith
+itscontextinaREPLenvironmentbeforeprovidingafinalanswer.
+Summary agent. Following Sun et al. (2025); Wu et al. (2025); Yu et al. (2025), we consider an
+iterative agent that invokes a summary of the context as it is filled. For example, given a corpus
+ofdocuments,itwilliterativelyviewthedocumentsandsummarizewhenfull. Incaseswherethe
+providedcontextexceedsthemodelwindow,theagentwillchunkstheinputtofitwithinthemodel
+contextwindowandinvokethesamestrategyoverthesechunks. ForGPT-5, duetotheextremely
+highcostofhandlinglargetokeninputs,weuseGPT-5-nanoforcompactionandGPT-5toprovide
+thefinalanswer.
+CodeAct(+BM25). WecomparedirectlytoaCodeAct(Wangetal.,2024)agentthatcanexecute
+code inside of a ReAct (Yao et al., 2023) loop. Unlike an RLM, it does not offload its prompt to
+thecodeenvironment, andinsteadprovidesitdirectlytotheLM.Furthermore, followingJimenez
+etal.(2024);Chenetal.(2025), weequipthisagentwithaBM25(Robertson&Zaragoza,2009)
+retrieverthatindexestheinputcontextfortaskswherethisisappropriate.
+3 RESULTS AND DISCUSSION
+WefocusourmainexperimentsinTable1onthebenchmarksdescribedin§2.1. Furthermore,we
+explorehowfrontiermodelandRLMperformancedegradesasinputcontextsgrowinFigure1.
+Table1: Performancecomparisonofdifferentmethodsacrosslong-contextbenchmarksofvarying
+complexity. IngrayistheaverageAPIcost±thestandarddeviationofeachmethodoneachtask. ∗
+indicatesrunswherethemethodranintoinputcontextlimits.
+Model CodeQA BrowseComp+(1K) OOLONG OOLONG-Pairs
+TaskLengthN (tokens) 23K-4.2M 6M-11M 131K 32K
+Qwen3-Coder-480B
+BaseModel 20.00∗ ($0.13±$0.08) 0.00∗ (N/A)±(N/A) 36.00($0.06±$0.00) 0.06($0.05±$0.01)
+CodeAct(+BM25) 24.00∗ ($0.17±$0.08) 12.66($0.39±$0.50) 38.00($1.51±$1.09) 0.28($1.54±$0.35)
+Summaryagent 50.00($1.26±$1.50) 38.00($8.98±$2.12) 44.06($0.15±$0.01) 0.31($0.05±$0.00)
+RLM 56.00($0.92±$1.23) 44.66($0.84±$0.63) 48.00($0.61±$0.49) 23.11($1.02±$0.52)
+RLM(nosub-calls) 66.00($0.18±$0.58) 46.00($0.82±$0.69) 43.50($0.32±$0.13) 17.34($1.77±$1.23)
+GPT-5
+BaseModel 24.00∗ ($0.13±$0.07) 0.00∗ (N/A)±(N/A) 44.00($0.14±$0.02) 0.04($0.16±$0.10)
+CodeAct(+BM25) 22.00∗ ($0.06±$0.08) 51.00($0.71±$1.20) 38.00($0.61±$1.06) 24.67($0.75±$0.43)
+Summaryagent 58.00($1.31±$1.46) 70.47($0.57±$0.10) 46.00($0.13±$0.01) 0.01($0.13±$0.09)
+RLM 62.00($0.11±$0.10) 91.33($0.99±$1.22) 56.50($0.43±$0.85) 58.00($0.33±$0.20)
+RLM(nosub-calls) 58.00($0.18±$0.56) 88.00($0.44±$0.90) 36.00($0.37±$0.42) 43.93($0.69±$1.16)
+4
+
+=== PAGE 5 ===
+Observation1: RLMscanscaletothe10M+tokenregimeandcanoutperformbaseLMsand
+existingtask-agnosticagentscaffoldsonlongcontexttasks. Acrossalltasks,RLMsdemonstrate
+strongperformanceoninputtaskswellbeyondtheeffectivecontextwindowofafrontierLM,out-
+performing base models and common long-context scaffolds by up to 2× the performance while
+maintainingcomparableorcheaperaveragetokencosts. Notably, RLMsscalewelltothetheoret-
+ical costs of extending a base model’s context window – on BrowseComp-Plus (1K), the cost of
+GPT-5-miniingesting6-11Minputtokensis$1.50−$2.75,whileRLM(GPT-5)hasanaveragecost
+of$0.99andoutperformsboththesummarizationandretrievalbaselinesbyover29%.
+Furthermore,ontaskswhereprocessingcostsscalewiththeinputcontext,RLMsmakesignificant
+improvements over the base model on tasks that fit well within the model’s context window. On
+OOLONG,theRLMwithGPT-5andQwen3-Coderoutperformthebasemodelby28.4%and33.3%
+respectively.OnOOLONG-Pairs,bothGPT-5andQwen3-CodermakelittleprogresswithF1scores
+of<0.1%,whiletheRLMusingthesemodelsachieveF1scoresof58.00%and23.11%respectively,
+highlightingtheemergentcapabilityofRLMstohandleextremelyinformation-densetasks.
+Observation 2: The REPL environment is necessary for handling long inputs, while the re-
+cursivesub-callingofRLMsprovidesstrongbenefitsoninformation-denseinputs. Akeychar-
+acteristic of RLMs is offloading the context as a variable in an environment E that the model can
+interactwith. Evenwithoutsub-callingcapabilities,ourablationoftheRLMisabletoscalebeyond
+the context limit of the model, and outperform the base model and other task-agnostic baselines
+on most long context settings. On the CodeQA and BrowseComp+ tasks with Qwen3-Coder, this
+ablationisabletooutperformtheRLMby17.9%and3%respectively.
+On information-dense tasks like OOLONG or OOLONG-Pairs, we observed several cases where
+recursiveLMsub-callingisnecessary. In§3.1,weseeRLM(Qwen3-Coder)performthenecessary
+semantic transformation line-by-line through recursive sub-calls, while the ablation without sub-
+calls is forced to use keyword heuristics to solve these tasks. Across all information-dense tasks,
+RLMsoutperformtheablationwithoutsub-callingby10%-59%.
+Figure 3: Cost of RLM and baselines described in §2.2 plotted at the 25th, 50th, 75th, and 95th
+percentile of total API cost. We observe comparable or even lower costs for RLMs at the 50th
+percentile,butsharpincreasesatthetailendduetopotentiallylongRLMtrajectories.
+Observation3:LMperformancedegradesasafunctionofinputlengthandproblemcomplex-
+ity,whileRLMperformancescalesbetter. ThebenchmarksS-NIAH,OOLONG,andOOLONG-
+Pairscontainafixednumberoftasksoveracontextwithlengthsrangingfrom213 to218. Further-
+more,eachbenchmarkcanbelooselycategorizedbydifferentprocessingcostsoftheinputcontext
+withrespecttolength(roughlyconstant,linear,andquadraticrespectively). InFigure1,wedirectly
+compareanRLMusingGPT-5tobaseGPT-5oneachtask–wefindthatGPT-5performancede-
+gradessignificantlyfasterformorecomplextasks,whileRLMperformancedegradesbutatamuch
+slower rate, which aligns with the findings of Goldman et al. (2025). For context lengths beyond
+214,theRLMconsistentlyoutperformsGPT-5.
+Furthermore,RLMcostsscaleproportionallytothethecomplexityofthetask,whilestillremaining
+inthesameorderofmagnitudeofcostasGPT-5(seeFigure9inAppendixC).In§3.1,weexplore
+whatchoicestheRLMmakesinthesesettingsthatcausesthesedifferencesincost. Lastly, inthis
+setting,wealsoobservethatthebaseLMoutperformsRLMinthesmallinputcontextregime. By
+construction,anRLMhasstrictlymorerepresentationcapacitythananLM:thechoiceofanenvi-
+ronmentthatcallstherootLMisequivalenttothebaseLM;inpractice,however,weobservethat
+5
+
+=== PAGE 6 ===
+RLM performance is slightly worse on smaller input lengths, suggesting a tradeoff point between
+whentouseabaseLMandwhentouseanRLM.
+Observation4: TheinferencecostofRLMsremaincomparabletoabasemodelcallbutare
+highvarianceduetodifferencesintrajectorylengths.RLMsiterativelyinteractwiththeircontext
+until they find a suitable answer, leading to large differences in iteration length depending on task
+complexity. InFigure3,weplotthequartilecostsforeachmethodacrossallexperimentsinTable1
+excludingBrowseComp-Plus(1K),asthebasemodelscannotfitanyofthesetasksincontext. For
+GPT-5,themedianRLMrunischeaperthanthemedianbasemodelrun,butmanyoutlierRLMruns
+aresignificantlymoreexpensivethananybasemodelquery. However,comparedtothesummariza-
+tionbaselinewhichingeststheentireinputcontext,RLMsareupto3×cheaperwhilemaintaining
+strongerperformanceacrossalltasksbecausethemodelisabletoselectivelyviewcontext.
+WeadditionallyreportruntimenumbersofeachmethodinFigures5,6inAppendixC,butwenote
+severalimportantcaveats. UnlikeAPIcosts,thesenumbersareheavilydependentonimplementa-
+tiondetailssuchasthemachineused,APIrequestlatency,andtheasynchronyofLMcalls. Inour
+implementation of the baselines and RLMs, all LM calls are blocking / sequential. Nevertheless,
+similartocosts,weobserveawiderangeofruntimes,especiallyforRLMs.
+Observation 5: RLMs are a model-agnostic inference strategy, but different models exhibit
+differentoveralldecisionsoncontextmanagementandsub-calling. WhileGPT-5andQwen3-
+Coder-480BbothexhibitstrongperformanceasRLMsrelativetotheirbasemodelandotherbase-
+lines,theyalsoexhibitdifferentperformanceandbehavioracrossalltasks.OnBrowseComp-Plusin
+particular,RLM(GPT-5)nearlysolvesalltaskswhileRLM(Qwen3-Coder)strugglestosolvehalf.
+We note that the RLM system prompt is fixed for each model across all experiments and is not
+tunedforanyparticularbenchmark. BetweenGPT-5andQwen3-Coder,theonlydifferenceinthe
+prompt is an extra line in the RLM(Qwen3-Coder) prompt warning against using too many sub-
+calls (see Appendix D). We provide an explicit example of this difference in example B.3, where
+RLM(Qwen3-Coder)performsthesemantictransformationinOOLONGasaseparatesub-LMcall
+perlinewhileGPT-5isconservativeaboutsub-queryingLMs.
+3.1 EMERGENTPATTERNSINRLMTRAJECTORIES
+Evenwithoutexplicittraining,RLMsexhibitinterestingcontextmanagementandproblemdecom-
+positionbehavior. WeselectseveralexamplesofsnippetsfromRLMtrajectoriestounderstandhow
+theysolvelongcontextproblemsandwheretheycanimprove. Wediscussparticularexamplesof
+interestingbehaviorhere,withadditionalexamplesinAppendixB.
+Filteringinputinformationusingcodeexecutionbasedonmodelpriors.Akeyintuitionforwhy
+theRLMabstractioncanmaintainstrongperformanceonhugeinputswithoutexplodingcostsisthe
+LM’sabilitytofilterinputcontextwithoutexplicitlyseeingit. Furthermore,modelpriorsenablethe
+RLMtonarrowthesearchspaceandprocessfewerinputtokens. Asanexample,inFigure4a,we
+observedRLM(GPT-5)usingregexqueriessearchforchunkscontainingkeywordsintheoriginal
+prompt(e.g. “festival”)andphrasesithasapriorabout(e.g. “LaUnion”). Acrossmosttrajectories,
+a common strategy we observed was probing the context by printing a few lines back to the root
+LM,thenfilteringbasedonitsobservations.
+Chunking and recursively sub-calling LMs. RLMs defer essentially unbounded-length reason-
+ing chains to sub-(R)LM calls. The choice of decomposition can greatly affect task performance,
+especially for information-dense problems. In our experiments, we did not observe complicated
+partitioningstrategiesbeyonduniformchunkingorkeywordsearches. InFigure4b,RLM(Qwen3-
+Coder)chunksbynewlineina1000+linecontextfromOOLONG.
+Answer verification through sub-LM calls with small contexts. We observed several instances
+of answer verification made by RLMs through sub-LM calls. Some of these strategies implicitly
+avoidcontextrotbyusingsub-LMstoperformverification(seeexampleB.1), whileotherssolely
+usecodeexecutiontoprogrammaticallyverifyanswersarecorrect. Insomeinstances,however,the
+answerverificationisredundantandsignificantlyincreasesthecostpertask—inexampleB.3,we
+observedatrajectoryonOOLONGwherethemodeltriestoreproduceitscorrectanswermorethan
+fivetimesbeforechoosingtheincorrectanswerintheend.
+6
+
+=== PAGE 7 ===
+Figure4: RLMshavecommonpatternsintheirtrajectorieswhensolvingtasks. (a)Wefrequently
+observed RLMs filtering and interacting with their context through code like regex queries. (b)
+We found that RLMs can effectively decompose their context through recursive sub-calls (c) On
+long-output tasks, RLMs are able to solve sub-problems using recursive sub-LM calls and stitch
+theiroutputstoformafinaloutput.
+PassingrecursiveLMoutputsthroughvariablesforlongoutputtasks. RLMsareabletopro-
+duceessentiallyunboundedtokenswellbeyondthelimitofthebaseLMbyreturningvariablesin
+the REPL as output. Through the REPL, the RLM can iteratively construct these variables as a
+mixture of programmatic and sub-(R)LM output calls. We observed this strategy used heavily in
+OOLONG-Pairs trajectories, where the RLM stored the output of sub-LM calls over the input in
+variablesandstitchedthemtogethertoformafinalanswer(seeFigure4c).
+4 RELATED WORKS
+LongContextLMSystems. Therehaveprimarilybeentwoorthogonaldirectionsforlongcontext
+managementinlanguagemodelsystems: 1)directlychangingthearchitectureofandretrainingthe
+base LM to handle longer contexts (Press et al., 2022; Gu et al., 2022; Munkhdalai et al., 2024),
+and2)buildingascaffoldaroundtheLMthatimplicitlyhandlesthecontext–RLMsfocusonthe
+latter. Onepopularclassofsuchstrategiesislossycontextmanagement,whichusessummarization
+ortruncationtocompresstheinputcontextatthecostofpotentiallylosingfine-grainedinformation.
+Forexample,MemWalker(Chenetal.,2023)constructsatree-likedatastructureoftheinputthatthe
+LMcannavigatewhenansweringlongcontextquestions. ReSum(Wuetal.,2025)isanotherwork
+thataddsasummarizationtooltoperiodicallycompressthecontextofamulti-turnagent. Another
+classofstrategiesimplementanexplicitmemoryhierarchyintheagentscaffold(Packeretal.,2024;
+Chhikara et al., 2025; Zhang et al., 2025). RLMs are different from prior work in that all context
+windowmanagementisimplicitlyhandledbytheLMitself.
+TaskDecompositionthroughsub-LMcalls. ManyLM-basedagents(Guoetal.,2024;Anthropic,
+2025) use multiple, well-placed LM calls to solve a problem, however many of these calls are
+placedbasedonhuman-engineeredworkflows. SeveralmethodslikeViperGPTSur´ısetal.(2023),
+THREAD(Schroederetal.,2025),DisCIPL(Grandetal.,2025),ReDelZhuetal.(2024),Context
+7
+
+=== PAGE 8 ===
+Folding (Sun et al., 2025), and AgentFold (Ye et al., 2025) have explored deferring the choice of
+sub-LM calls to the LM. These techniques emphasize task decomposition through recursive LM
+calls, but are unable to handle long context inputs beyond the length of the base LM. RLMs, on
+theotherhand,areenabledbyanextremelysimpleintuition(i.e.,placingthepromptaspartofthe
+external environment) to symbolically manipulate arbitrarily long strings and to iteratively refine
+theirrecursionviaexecutionfeedbackfromthepersistentREPLenvironment.
+5 LIMITATIONS AND FUTURE WORK
+WhileRLMsshowstrongperformanceontasksbeyondthecontextwindowlimitationsofexisting
+LMsatreasonableinferencecosts,theoptimalmechanismforimplementingRLMsremainsunder-
+explored. Wefocusedonsynchronoussub-callsinsideofaPythonREPLenvironment,butwenote
+that alternative strategies involving asynchronous sub-calls and sandboxed REPLs can potentially
+significantlyreducetheruntimeandinferencecostofRLMs. Furthermore,wechosetouseamax
+recursion depth of one (i.e. sub-calls are LMs); while we found strong performance on existing
+long-contextbenchmarks,webelievethatfutureworkshouldinvestigatedeeperlayersofrecursion.
+Lastly,wefocusedourexperimentsonevaluatingRLMsusingexistingfrontiermodels. Explicitly
+training models to be used as RLMs (e.g. as root or sub-LMs) could provide additional perfor-
+mance improvements – as we found in §3.1, current models are inefficient decision makers over
+their context. We hypothesize that RLM trajectories can be viewed as a form of reasoning (Ope-
+nAIetal.,2024;DeepSeek-AIetal.,2025),whichcanbetrainedbybootstrappingexistingfrontier
+models(Zelikmanetal.,2022;2024).
+6 CONCLUSION
+We introduced Recursive Language Models (RLMs), a general inference framework for language
+models that offloads the input context and enables language models to recursively sub-query lan-
+guage models before providing an output. We explored an instantiation of this framework that
+offloads the context into a Python REPL environment as a variable in memory, enabling the LM
+to reason over its context in code and recursive LM calls, rather than purely in token space. Our
+resultsacrossmultiplesettingsandmodelsdemonstratedthatRLMsareaneffectivetask-agnostic
+paradigmforbothlong-contextproblemsandgeneralreasoning. Weareexcitedtoseefuturework
+thatexplicitlytrainsmodelstoreasonasRLMs,whichcouldresultinanotheraxisofscaleforthe
+nextgenerationoflanguagemodelsystems.
+ACKNOWLEDGMENTS
+ThisresearchispartiallysupportedbytheLaudeInstitute. WethankNoahZiems,JacobLi,James
+Moore,andtheMITOASYSandMITDSGlabsforinsightfuldiscussionsthroughoutthisproject.
+We also thank Matej Sirovatka, Ofir Press, Sebastian Mu¨ller, Simon Guo, and Zed Li for helpful
+feedback.
+REFERENCES
+Anthropic. Claude code: Subagents — modular ai workflows with isolated agent contexts, 2025.
+URLhttps://docs.anthropic.com/en/docs/claude-code/sub-agents.
+YushiBai,ShangqingTu,JiajieZhang,HaoPeng,XiaozhiWang,XinLv,ShulinCao,JiazhengXu,
+LeiHou, YuxiaoDong, JieTang, andJuanziLi. Longbenchv2: Towardsdeeperunderstanding
+andreasoningonrealisticlong-contextmultitasks,2025. URLhttps://arxiv.org/abs/
+2412.15204.
+Amanda Bertsch, Adithya Pratapa, Teruko Mitamura, Graham Neubig, and Matthew R. Gormley.
+Oolong: Evaluating long context reasoning and aggregation capabilities, 2025. URL https:
+//arxiv.org/abs/2511.02817.
+8
+
+=== PAGE 9 ===
+HowardChen,RamakanthPasunuru,JasonWeston,andAsliCelikyilmaz. Walkingdownthemem-
+ory maze: Beyond context limit through interactive reading, 2023. URL https://arxiv.
+org/abs/2310.05029.
+Zijian Chen, Xueguang Ma, Shengyao Zhuang, Ping Nie, Kai Zou, Andrew Liu, Joshua Green,
+Kshama Patel, Ruoxi Meng, Mingyi Su, Sahel Sharifymoghaddam, Yanxi Li, Haoran Hong,
+XinyuShi,XuyeLiu,NandanThakur,CrystinaZhang,LuyuGao,WenhuChen,andJimmyLin.
+Browsecomp-plus: A more fair and transparent evaluation benchmark of deep-research agent,
+2025. URLhttps://arxiv.org/abs/2508.06600.
+PrateekChhikara,DevKhant,SaketAryan,TaranjeetSingh,andDeshrajYadav. Mem0: Building
+production-ready ai agents with scalable long-term memory, 2025. URL https://arxiv.
+org/abs/2504.19413.
+DeepSeek-AI, Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Ruoyu Zhang, Runxin Xu,
+QihaoZhu,ShirongMa,PeiyiWang,XiaoBi,XiaokangZhang,XingkaiYu,YuWu,Z.F.Wu,
+ZhibinGou,ZhihongShao,ZhuoshuLi,ZiyiGao,AixinLiu,BingXue,BingxuanWang,Bochao
+Wu, Bei Feng, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan,
+DamaiDai,DeliChen,DongjieJi,ErhangLi,FangyunLin,FucongDai,FuliLuo,GuangboHao,
+Guanting Chen, Guowei Li, H. Zhang, Han Bao, Hanwei Xu, Haocheng Wang, Honghui Ding,
+Huajian Xin, Huazuo Gao, Hui Qu, Hui Li, Jianzhong Guo, Jiashi Li, Jiawei Wang, Jingchang
+Chen, Jingyang Yuan, Junjie Qiu, Junlong Li, J. L. Cai, Jiaqi Ni, Jian Liang, Jin Chen, Kai
+Dong, Kai Hu, Kaige Gao, Kang Guan, Kexin Huang, Kuai Yu, Lean Wang, Lecong Zhang,
+LiangZhao,LitongWang,LiyueZhang,LeiXu,LeyiXia,MingchuanZhang,MinghuaZhang,
+MinghuiTang,MengLi,MiaojunWang,MingmingLi,NingTian,PanpanHuang,PengZhang,
+QianchengWang,QinyuChen,QiushiDu,RuiqiGe,RuisongZhang,RuizhePan,RunjiWang,
+R. J. Chen, R. L. Jin, Ruyi Chen, Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shengfeng
+Ye, Shiyu Wang, Shuiping Yu, Shunfeng Zhou, Shuting Pan, S. S. Li, Shuang Zhou, Shaoqing
+Wu,ShengfengYe,TaoYun,TianPei,TianyuSun,T.Wang,WangdingZeng,WanjiaZhao,Wen
+Liu, Wenfeng Liang, Wenjun Gao, Wenqin Yu, Wentao Zhang, W. L. Xiao, Wei An, Xiaodong
+Liu,XiaohanWang,XiaokangChen,XiaotaoNie,XinCheng,XinLiu,XinXie,XingchaoLiu,
+XinyuYang,XinyuanLi,XuechengSu,XuhengLin,X.Q.Li,XiangyueJin,XiaojinShen,Xi-
+aosha Chen, Xiaowen Sun, Xiaoxiang Wang, Xinnan Song, Xinyi Zhou, Xianzu Wang, Xinxia
+Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Yang Zhang, Yanhong Xu, Yao Li, Yao Zhao, Yaofeng
+Sun,YaohuiWang,YiYu,YichaoZhang,YifanShi,YiliangXiong,YingHe,YishiPiao,Yisong
+Wang,YixuanTan,YiyangMa,YiyuanLiu,YongqiangGuo,YuanOu,YuduanWang,YueGong,
+Yuheng Zou, Yujia He, Yunfan Xiong, Yuxiang Luo, Yuxiang You, Yuxuan Liu, Yuyang Zhou,
+Y.X.Zhu,YanhongXu,YanpingHuang,YaohuiLi,YiZheng,YuchenZhu,YunxianMa,Ying
+Tang, Yukun Zha, Yuting Yan, Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhenda
+Xie,ZhengyanZhang,ZhewenHao,ZhichengMa,ZhigangYan,ZhiyuWu,ZihuiGu,ZijiaZhu,
+ZijunLiu, ZilinLi, ZiweiXie, ZiyangSong, ZizhengPan, ZhenHuang, ZhipengXu, Zhongyu
+Zhang, andZhenZhang. Deepseek-r1: Incentivizingreasoningcapabilityinllmsviareinforce-
+mentlearning,2025. URLhttps://arxiv.org/abs/2501.12948.
+Fireworks. Qwen3 coder 480b a35b instruct. https://fireworks.ai/models/
+fireworks/qwen3-coder-480b-a35b-instruct,2025.
+OmerGoldman,AlonJacovi,AvivSlobodkin,AviyaMaimon,IdoDagan,andReutTsarfaty. Isit
+reallylongcontextifallyouneedisretrieval? towardsgenuinelydifficultlongcontextnlp,2025.
+URLhttps://arxiv.org/abs/2407.00402.
+GabrielGrand,JoshuaBTenenbaum,VikashKMansinghka,AlexanderKLew,andJacobAndreas.
+Self-steeringlanguagemodels. arXivpreprintarXiv:2504.07081,2025.
+Albert Gu, Karan Goel, and Christopher Re´. Efficiently modeling long sequences with structured
+statespaces,2022. URLhttps://arxiv.org/abs/2111.00396.
+TaichengGuo,XiuyingChen,YaqiWang,RuidiChang,ShichaoPei,NiteshV.Chawla,OlafWiest,
+and Xiangliang Zhang. Large language model based multi-agents: A survey of progress and
+challenges,2024. URLhttps://arxiv.org/abs/2402.01680.
+9
+
+=== PAGE 10 ===
+Kelly Hong, Anton Troynikov, and Jeff Huber. Context rot: How context degradation affects llm
+performance,2025. URLhttps://research.trychroma.com/context-rot.
+Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, Yang
+Zhang, and Boris Ginsburg. Ruler: What’s the real context size of your long-context language
+models?,2024. URLhttps://arxiv.org/abs/2404.06654.
+CarlosE.Jimenez, JohnYang, AlexanderWettig, ShunyuYao, KexinPei, OfirPress, andKarthik
+Narasimhan. Swe-bench: Can language models resolve real-world github issues?, 2024. URL
+https://arxiv.org/abs/2310.06770.
+OmarKhattab,ChristopherPotts,andMateiZaharia. Baleen: Robustmulti-hopreasoningatscale
+viacondensedretrieval. AdvancesinNeuralInformationProcessingSystems,34:27670–27682,
+2021.
+TsendsurenMunkhdalai,ManaalFaruqui,andSiddharthGopal. Leavenocontextbehind: Efficient
+infinite context transformers with infini-attention, 2024. URL https://arxiv.org/abs/
+2404.07143.
+OpenAI. Deep research, 2025. URL https://openai.com/index/
+introducing-deep-research/. AI-poweredresearchassistanttool.
+OpenAI. Gpt-5 system card. Online; August 7, 2025, 2025. URL https://openai.com/
+blog/gpt-5-system-card/.
+OpenAI. Codex cli: A lightweight coding agent for your terminal, 2025. URL https:
+//developers.openai.com/codex/cli/.
+OpenAI, :, Aaron Jaech, Adam Kalai, Adam Lerer, Adam Richardson, Ahmed El-Kishky, Aiden
+Low, Alec Helyar, Aleksander Madry, Alex Beutel, Alex Carney, Alex Iftimie, Alex Karpenko,
+AlexTachardPassos, AlexanderNeitz, AlexanderProkofiev,AlexanderWei, AllisonTam, Ally
+Bennett,AnanyaKumar,AndreSaraiva,AndreaVallone,AndrewDuberstein,AndrewKondrich,
+AndreyMishchenko,AndyApplebaum,AngelaJiang,AshvinNair,BarretZoph,BehroozGhor-
+bani,BenRossen,BenjaminSokolowsky,BoazBarak,BobMcGrew,BorysMinaiev,BotaoHao,
+BowenBaker,BrandonHoughton,BrandonMcKinzie,BrydonEastman,CamilloLugaresi,Cary
+Bassin,CaryHudson,ChakMingLi,CharlesdeBourcy,ChelseaVoss,ChenShen,ChongZhang,
+ChrisKoch,ChrisOrsinger,ChristopherHesse,ClaudiaFischer,CliveChan,DanRoberts,Daniel
+Kappler,DanielLevy,DanielSelsam,DavidDohan,DavidFarhi,DavidMely,DavidRobinson,
+Dimitris Tsipras, Doug Li, Dragos Oprica, Eben Freeman, Eddie Zhang, Edmund Wong, Eliz-
+abeth Proehl, Enoch Cheung, Eric Mitchell, Eric Wallace, Erik Ritter, Evan Mays, Fan Wang,
+Felipe Petroski Such, Filippo Raso, Florencia Leoni, Foivos Tsimpourlas, Francis Song, Fred
+von Lohmann, Freddie Sulit, Geoff Salmon, Giambattista Parascandolo, Gildas Chabot, Grace
+Zhao, Greg Brockman, Guillaume Leclerc, Hadi Salman, Haiming Bao, Hao Sheng, Hart An-
+drin,HessamBagherinezhad,HongyuRen,HunterLightman,HyungWonChung,IanKivlichan,
+IanO’Connell,IanOsband,IgnasiClaveraGilaberte,IlgeAkkaya,IlyaKostrikov,IlyaSutskever,
+IrinaKofman,JakubPachocki,JamesLennon,JasonWei,JeanHarb,JerryTwore,JiachengFeng,
+JiahuiYu,JiayiWeng,JieTang,JieqiYu,JoaquinQuin˜oneroCandela,JoePalermo,JoelParish,
+Johannes Heidecke, John Hallman, John Rizzo, Jonathan Gordon, Jonathan Uesato, Jonathan
+Ward, Joost Huizinga, Julie Wang, Kai Chen, Kai Xiao, Karan Singhal, Karina Nguyen, Karl
+Cobbe, Katy Shi, Kayla Wood, Kendra Rimbach, Keren Gu-Lemberg, Kevin Liu, Kevin Lu,
+Kevin Stone, Kevin Yu, Lama Ahmad, Lauren Yang, Leo Liu, Leon Maksin, Leyton Ho, Liam
+Fedus, Lilian Weng, Linden Li, Lindsay McCallum, Lindsey Held, Lorenz Kuhn, Lukas Kon-
+draciuk,LukaszKaiser,LukeMetz,MadelaineBoyd,MajaTrebacz,ManasJoglekar,MarkChen,
+MarkoTintor, MasonMeyer, MattJones,MattKaufer,MaxSchwarzer, MeghanShah, Mehmet
+Yatbaz, Melody Y. Guan, Mengyuan Xu, Mengyuan Yan, Mia Glaese, Mianna Chen, Michael
+Lampe, Michael Malek, Michele Wang, Michelle Fradin, Mike McClay, Mikhail Pavlov, Miles
+Wang, MingxuanWang, MiraMurati, MoBavarian, MostafaRohaninejad, NatMcAleese, Neil
+Chowdhury, Neil Chowdhury, Nick Ryder, Nikolas Tezak, Noam Brown, Ofir Nachum, Oleg
+Boiko,OlegMurk,OliviaWatkins,PatrickChao,PaulAshbourne,PavelIzmailov,PeterZhokhov,
+RachelDias,RahulArora,RandallLin,RaphaGontijoLopes,RazGaon,ReahMiyara,Reimar
+Leike, Renny Hwang, Rhythm Garg, Robin Brown, Roshan James, Rui Shu, Ryan Cheu, Ryan
+10

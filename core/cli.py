@@ -78,10 +78,16 @@ class QuasarCLI(cmd.Cmd):
                     break
 
                 with console.status("[cyan]Thinking...[/cyan]"):
-                    response = self.agent.process_query(query)
+                    result = self.agent.process_query(query)
+
+                # process_query returns (data, response_text, intent)
+                if isinstance(result, tuple):
+                    _data, response_text, _intent = result
+                else:
+                    response_text = str(result)
 
                 console.print("\n[bold green]Quasar:[/bold green]")
-                console.print(Markdown(response))
+                console.print(Markdown(response_text))
 
             except KeyboardInterrupt:
                 break
@@ -184,6 +190,10 @@ class QuasarCLI(cmd.Cmd):
             return
 
         try:
+            if not hasattr(self.tap_client, 'get_observation_details'):
+                console.print("[yellow]Observation details not supported by this TAP client[/yellow]")
+                return
+
             with console.status("[cyan]Fetching details...[/cyan]"):
                 details = self.tap_client.get_observation_details(arg)
 
@@ -231,7 +241,7 @@ class QuasarCLI(cmd.Cmd):
 
         # TAP status
         tap_status = "Connected" if self.tap_client else "Not Connected"
-        tap_details = self.tap_client.service_url if self.tap_client else "Connection failed"
+        tap_details = getattr(self.tap_client, 'nrao_url', 'Connected') if self.tap_client else "Connection failed"
         table.add_row("TAP Service", tap_status, tap_details)
 
         # Results status

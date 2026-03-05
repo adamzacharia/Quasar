@@ -1,3 +1,15 @@
+# services/memory_service.py
+"""
+Memory Service — Long-term user memory using ChromaDB vector store.
+
+CALLED BY: core/agent.py (_update_memory, context retrieval)
+CALLS:     ChromaDB (langchain_community.vectorstores.Chroma)
+
+Stores implicit user facts extracted from conversations (e.g.,
+"User is interested in protoplanetary disks") and retrieves them
+via semantic search to personalize future responses.
+"""
+
 import os
 import uuid
 from typing import List, Dict, Any, Optional

@@ -1,6 +1,17 @@
 """
-QuasarAgent - Core AI agent for radio astronomy operations
-Handles natural language processing and tool orchestration
+QuasarAgent — Central orchestrator for Quasar AI.
+
+CALLED BY: ui/app.py (Streamlit), ui-pro/api/main.py (FastAPI SSE),
+           core/cli.py (terminal REPL), telegram.py (webhook)
+CALLS:     All services/* modules, integrations/*, core/rlm.py,
+           OpenAI API (GPT-4o), mem0 (long-term memory)
+
+This is the heart of Quasar. The QuasarAgent class:
+  1. Registers 27+ tools as OpenAI function-calling schemas
+  2. Routes user queries through RLM complexity detection
+  3. Manages RAG context, conversation memory, and long-term memory
+  4. Streams responses via Chat Completions API or Responses API
+  5. Caches search results (DataFrames) for follow-up operations
 """
 
 import os
@@ -18,7 +29,8 @@ from core.tools import ToolRegistry, Tool
 from core.prompts import (
     INTENT_CLASSIFICATION_PROMPT,
     ENTITY_EXTRACTION_PROMPT,
-    RESPONSE_GENERATION_PROMPT
+    RESPONSE_GENERATION_PROMPT,
+    ALMA_TAP_SCHEMA
 )
 # from integrations.tap import NRAOTapClient
 from integrations.datalink import DataLinkClient
@@ -27,6 +39,21 @@ from services.search import SearchService
 from services.analysis import RadioAnalysisService
 from services.rag_service import RAGService
 from services.memory_service import MemoryService
+from core.rlm import RecursiveLanguageModel
+from services.browser import BrowserService
+from services.plotting import PlottingService
+from services.splatalogue import SplatalogueTool
+from services.multi_archive import MultiArchiveMatcher
+from services.casa_generator import CASAScriptGenerator
+from services.gcn_monitor import GCNAlertMonitor
+
+# Import mem0 for long-term memory (optional - graceful fallback)
+try:
+    from mem0 import Memory as Mem0Memory
+    MEM0_AVAILABLE = True
+except ImportError:
+    MEM0_AVAILABLE = False
+    print("[WARNING] mem0 not installed. Long-term memory disabled.")
 
 
 
@@ -40,6 +67,10 @@ class AgentConfig:
     max_tokens: int = 2000
     max_memory_turns: int = 10
     verbose: bool = False
+    # Responses API configuration
+    use_responses_api: bool = False  # Toggle for Responses API vs Chat Completions
+    mcp_server_url: str = "http://localhost:8000/sse"  # MCP server SSE endpoint
+    enable_mcp: bool = False  # Enable MCP tool connection
 
 class QuasarAgent:
     """Main AI agent for radio astronomy operations"""
@@ -71,8 +102,9 @@ class QuasarAgent:
         print("DEBUG: Init Memory Service (Long-Term)")
         self.memory_service = MemoryService()
         print("DEBUG: Init ADS Client")
-        ads_key = getattr(self.config, 'ads_api_key', None)
-        self.ads_client = ADSService(ads_key) if ads_key else None
+        import os as _os
+        ads_key = getattr(self.config, 'ads_api_key', None) or _os.getenv("NASA_ADS_API_KEY")
+        self.ads_client = ADSService(ads_key) if ads_key else ADSService()  # ADSService handles missing key gracefully
 
         # Register tools
         print("DEBUG: Register Tools")
@@ -87,11 +119,89 @@ class QuasarAgent:
         
         self.last_run_result = None
         self.last_search_results = None
+        
+        # Responses API state tracking
+        self.last_response_id = None  # For conversation continuity
+        self._session_token_estimate = 0  # Running token count estimate
+        self._session_token_limit = 90000  # Prune if over ~90k tokens (GPT-4o limit: 128k)
+        
+        # Initialize mem0 long-term memory (if available)
+        self.long_term_memory = None
+        if MEM0_AVAILABLE:
+            try:
+                print("DEBUG: Init mem0 Long-Term Memory")
+                self.long_term_memory = Mem0Memory()
+            except Exception as e:
+                print(f"[WARNING] mem0 initialization failed: {e}")
+        
+        # Initialize BrowserService for web browsing capabilities
+        print("DEBUG: Init BrowserService")
+        self.browser_service = BrowserService()
+
+        # Initialize new science services
+        print("DEBUG: Init PlottingService")
+        self.plotting_service = PlottingService()
+        print("DEBUG: Init SplatalogueTool")
+        self.splatalogue_tool = SplatalogueTool()
+        print("DEBUG: Init MultiArchiveMatcher")
+        self.multi_archive = MultiArchiveMatcher()
+        print("DEBUG: Init CASAScriptGenerator")
+        self.casa_generator = CASAScriptGenerator()
+        print("DEBUG: Init GCNAlertMonitor")
+        self.gcn_monitor = GCNAlertMonitor()
+
+        # Initialize RLM (Recursive Language Model) for complex queries
+        print("DEBUG: Init RLM")
+        self.rlm = RecursiveLanguageModel(
+            client=self.client,
+            model=self.config.model,
+            tool_executor=self._rlm_tool_executor,
+            verbose=self.config.verbose,
+        )
+        
         print("DEBUG: Agent init done")
+
+    def set_model(self, model_name: str):
+        """Dynamically change the model"""
+        self.config.model = model_name
+        if self.config.verbose:
+            print(f"[yellow]Model changed to: {model_name}[/yellow]")
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimate: ~4 chars per token for English text."""
+        return len(text) // 4
+
+    def _prune_session_if_needed(self, query: str, user_id: str):
+        """
+        If the running token estimate exceeds the threshold, save context to 
+        long-term memory and reset the session (clear previous_response_id).
+        This is transparent to the user — they see no interruption.
+        """
+        self._session_token_estimate += self._estimate_tokens(query)
+        
+        if self._session_token_estimate >= self._session_token_limit:
+            print(f"[SESSION PRUNING] Token estimate {self._session_token_estimate} exceeded limit. Pruning session and saving to Mem0.")
+            
+            # Distill recent conversation topics into Mem0 before clearing
+            if self.long_term_memory:
+                try:
+                    summary_text = f"Long research session on: {query[:200]}. Session context pruned to stay within context limits."
+                    self.long_term_memory.add(
+                        [{"role": "system", "content": summary_text}],
+                        user_id=user_id
+                    )
+                    print("[SESSION PRUNING] Saved context summary to Mem0.")
+                except Exception as e:
+                    print(f"[SESSION PRUNING] Failed to save to Mem0: {e}")
+            
+            # Reset the session — new conversation thread starts fresh
+            self.last_response_id = None
+            self._session_token_estimate = 0
+            print("[SESSION PRUNING] Session reset. Fresh context window started.")
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the agent"""
-        return """You are Quasar, an expert AI assistant for radio astronomy.
+        return f"""You are Quasar, an expert AI assistant for radio astronomy.
 
 You have access to the ALMA Science Archive via the 'alminer' library.
 Your goal is to help users find, visualize, and analyze ALMA data.
@@ -103,12 +213,15 @@ GUIDELINES:
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
 - **DO NOT** output raw tool usage strings like `[TOOL: ...]` or JSON. Just use the Native Tool Calling feature.
-
-- If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
+- **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
+- **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
+- **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
 Current Context:
-Date: {date}
-""".format(date=datetime.now().strftime("%Y-%m-%d"))
+Date: {datetime.now().strftime("%Y-%m-%d")}
+
+{ALMA_TAP_SCHEMA}
+"""
 
 
     def _register_tools(self):
@@ -328,6 +441,474 @@ Date: {date}
             }
         ))
 
+        # NEW: Fix 3 - Target name resolution using SIMBAD
+        self.tool_registry.register(Tool(
+            name="resolve_target",
+            description="Resolve a target name to RA/Dec coordinates using SIMBAD. Use this if search_by_target returns empty for a valid target name.",
+            function=self._resolve_target,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "The astronomical target name to resolve (e.g., RXJ1347-1145, M31)"}
+                },
+                "required": ["target_name"]
+            }
+        ))
+
+        # NEW: Fix 2 - Deterministic filtering tool
+        self.tool_registry.register(Tool(
+            name="filter_results",
+            description="Apply numeric filters to the LAST search results. Use this when user asks for specific constraints like 'resolution < 0.05 arcsec' or 'sensitivity > 10 mJy'.",
+            function=self._filter_results,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "column": {"type": "string", "description": "Column name to filter (e.g., 'resolution', 'sensitivity', 'Band')"},
+                    "operator": {"type": "string", "enum": ["<", ">", "<=", ">=", "==", "!="], "description": "Comparison operator"},
+                    "value": {"type": "number", "description": "Numeric value to compare against"}
+                },
+                "required": ["column", "operator", "value"]
+            }
+        ))
+
+        # ── Browser Control Tools ──────────────────────────────────
+        self.tool_registry.register(Tool(
+            name="web_search",
+            description="Search the web for astronomy papers, portal data, or any external information. Use this for NASA ADS, arXiv, VizieR, CADC, ESO, or any web resource.",
+            function=lambda **kw: self.browser_service.web_search(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query string (e.g., 'ALMA observations M87 CO line 2022')"}
+                },
+                "required": ["query"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="navigate_to_url",
+            description="Navigate to a specific URL and return its page content. Use for ALMA archive, NASA ADS, ESO portal, VizieR, arXiv paper pages, etc.",
+            function=lambda **kw: self.browser_service.navigate_to_url(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to navigate to (must start with http:// or https://)"}
+                },
+                "required": ["url"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="read_page",
+            description="Read the text content of the currently open browser page. Call after navigate_to_url to get the full page content.",
+            function=lambda **kw: self.browser_service.read_page(**kw),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="click_element",
+            description="Click a button, link, or other element on the current browser page by CSS selector.",
+            function=lambda **kw: self.browser_service.click_element(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector for the element to click (e.g., 'button.search', '#submit', 'a.download-link')"},
+                    "wait_after_ms": {"type": "integer", "description": "Milliseconds to wait after clicking (default: 1500)"}
+                },
+                "required": ["selector"]
+            }
+        ))
+
+        # ── Publication Plotting Tools ─────────────────────────────
+        self.tool_registry.register(Tool(
+            name="plot_alma_results",
+            description="Generate a publication-quality scatter plot (ApJ/MNRAS style, 300 DPI, colorblind-safe) from the last ALMA search results. Use after any search to visualize data.",
+            function=lambda **kw: self.plotting_service.plot_alma_results(
+                data_records=(self.last_search_results.to_dict("records") if self.last_search_results is not None and not self.last_search_results.empty else []),
+                **kw
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "x_column": {"type": "string", "description": "Column for x-axis (e.g. 'frequency', 'spatial_resolution', 'band')"},
+                    "y_column": {"type": "string", "description": "Column for y-axis"},
+                    "color_by": {"type": "string", "description": "Column to color-code points by (e.g. 'band', 'facility')"},
+                    "title": {"type": "string", "description": "Plot title"},
+                    "dark_mode": {"type": "boolean", "description": "Use dark background for presentations/posters"},
+                },
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="plot_sky_map",
+            description="Generate a publication-quality RA/Dec sky distribution map from the last ALMA search results.",
+            function=lambda **kw: self.plotting_service.plot_sky_map(
+                data_records=(self.last_search_results.to_dict("records") if self.last_search_results is not None and not self.last_search_results.empty else []),
+                **kw
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ra_col": {"type": "string", "description": "Column name for Right Ascension"},
+                    "dec_col": {"type": "string", "description": "Column name for Declination"},
+                    "color_by": {"type": "string", "description": "Column for color coding"},
+                    "title": {"type": "string", "description": "Plot title"},
+                },
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="plot_spectrum",
+            description="Generate a publication-quality 1D spectral line profile plot with optional error bars and molecular line ID labels.",
+            function=lambda **kw: self.plotting_service.plot_spectrum(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "frequencies": {"type": "array", "items": {"type": "number"}, "description": "Frequency values (GHz)"},
+                    "fluxes": {"type": "array", "items": {"type": "number"}, "description": "Flux density values (Jy)"},
+                    "title": {"type": "string", "description": "Plot title"},
+                    "errors": {"type": "array", "items": {"type": "number"}, "description": "Optional error bars (same length as fluxes)"},
+                },
+                "required": ["frequencies", "fluxes"]
+            }
+        ))
+
+        # ── Splatalogue Line ID Tools ───────────────────────────────
+        self.tool_registry.register(Tool(
+            name="identify_spectral_line",
+            description="Identify molecular spectral lines near a given rest frequency using the Splatalogue database. Essential for ALMA/VLA spectral line identification.",
+            function=lambda **kw: self.splatalogue_tool.identify_spectral_line(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "frequency_ghz": {"type": "number", "description": "Rest frequency to search around (GHz), e.g. 230.538"},
+                    "tolerance_ghz": {"type": "number", "description": "Search window ± around the frequency in GHz (default: 0.01 = 10 MHz)"},
+                    "top_n": {"type": "integer", "description": "Max candidate lines to return (default: 5)"},
+                },
+                "required": ["frequency_ghz"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="search_lines_by_molecule",
+            description="Search Splatalogue for all known spectral line transitions of a specific molecule (e.g., 'CO', 'HCN', 'CH3OH', 'H2O').",
+            function=lambda **kw: self.splatalogue_tool.search_lines_by_molecule(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "molecule_name": {"type": "string", "description": "Molecule name (e.g., 'CO', 'HCN', 'CH3OH', 'SiO')"},
+                    "freq_min_ghz": {"type": "number", "description": "Minimum frequency filter (GHz)"},
+                    "freq_max_ghz": {"type": "number", "description": "Maximum frequency filter (GHz)"},
+                },
+                "required": ["molecule_name"]
+            }
+        ))
+
+        # ── Multi-archive Cross-matcher Tools ─────────────────────
+        self.tool_registry.register(Tool(
+            name="cross_match_source",
+            description="Query multiple astronomical archives (Simbad, NED, MAST, VizieR, Fermi 4FGL) in parallel for a source. Returns a unified multi-wavelength summary.",
+            function=lambda **kw: self.multi_archive.cross_match_source(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Source name recognized by Simbad (e.g., 'M87', 'HL Tau', 'NGC 1275')"},
+                    "archives": {"type": "array", "items": {"type": "string"}, "description": "Specific archives to query, e.g. ['simbad', 'ned', 'mast']. Defaults to all."},
+                },
+                "required": ["target_name"]
+            }
+        ))
+
+        # ── CASA Script Generator Tools ────────────────────────────
+        self.tool_registry.register(Tool(
+            name="generate_casa_imaging_script",
+            description="Generate a complete CASA tclean imaging script for ALMA/VLA data. Returns ready-to-run Python code for radio interferometry imaging.",
+            function=lambda **kw: self.casa_generator.generate_casa_imaging_script(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Target source field name (as in the MS)"},
+                    "vis": {"type": "string", "description": "Path to calibrated Measurement Set (.ms)"},
+                    "band": {"type": "string", "description": "ALMA band number (e.g. '6', '3', '7')"},
+                    "cell": {"type": "string", "description": "Cell size, e.g. '0.02arcsec'"},
+                    "imsize": {"type": "integer", "description": "Square image size in pixels"},
+                    "weighting": {"type": "string", "enum": ["briggs", "natural", "uniform"], "description": "Visibility weighting scheme"},
+                    "robust": {"type": "number", "description": "Briggs robust parameter (-2 to +2)"},
+                    "threshold": {"type": "string", "description": "Clean stopping threshold (e.g. '0.1mJy')"},
+                    "specmode": {"type": "string", "enum": ["mfs", "cube"], "description": "'mfs' for continuum, 'cube' for spectral line"},
+                },
+                "required": ["target", "vis"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="generate_casa_calibration_script",
+            description="Generate a CASA manual calibration script for ALMA/VLA data reduction. Returns ready-to-run Python code for bandpass, gain, and flux calibration.",
+            function=lambda **kw: self.casa_generator.generate_casa_calibration_script(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Science target field name"},
+                    "vis": {"type": "string", "description": "Input Measurement Set path"},
+                    "flux_cal": {"type": "string", "description": "Flux calibrator field name"},
+                    "phase_cal": {"type": "string", "description": "Phase calibrator field name"},
+                    "refant": {"type": "string", "description": "Reference antenna name (e.g. 'DA41')"},
+                },
+                "required": ["target", "vis", "flux_cal", "phase_cal", "refant"]
+            }
+        ))
+
+        # ── GCN / GW Alert Tools ───────────────────────────────────
+        self.tool_registry.register(Tool(
+            name="get_latest_gw_events",
+            description="Get the latest gravitational wave events from the GWOSC (Gravitational Wave Open Science Center) catalog. Use for multi-messenger astronomy queries.",
+            function=lambda **kw: self.gcn_monitor.get_latest_gcn_alerts(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer", "description": "Number of recent events to return (default: 10)"},
+                    "event_type": {"type": "string", "description": "Filter by type: 'BBH', 'BNS', 'NSBH', or None for all"},
+                },
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="search_gwtc_catalog",
+            description="Search the GWTC gravitational wave transient catalog with mass, distance, and type filters.",
+            function=lambda **kw: self.gcn_monitor.search_gwtc_catalog(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mass_min_solar": {"type": "number", "description": "Minimum total mass in solar masses"},
+                    "mass_max_solar": {"type": "number", "description": "Maximum total mass in solar masses"},
+                    "distance_max_mpc": {"type": "number", "description": "Maximum luminosity distance (Mpc)"},
+                    "event_type": {"type": "string", "description": "Event type: 'BBH', 'BNS', 'NSBH'"},
+                },
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="summarize_gcn_circular",
+            description="Fetch and parse a NASA GCN (Gamma-ray Coordinates Network) circular by number. Extracts key parameters: event name, trigger time, coordinates, and summary.",
+            function=lambda **kw: self.gcn_monitor.summarize_gcn_circular(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "circular_number": {"type": "integer", "description": "GCN circular number (e.g., 33000)"},
+                },
+                "required": ["circular_number"]
+            }
+        ))
+
+        # ── NASA ADS Literature Tools ──────────────────────────────────────
+        _ads = self.ads_client  # may be None if no key
+
+        self.tool_registry.register(Tool(
+            name="search_papers",
+            description=(
+                "Search the NASA ADS database for astronomical papers. "
+                "Returns titles, authors, abstracts, citation counts, DOIs, and a direct link to each paper on NASA ADS. "
+                "IMPORTANT: Use valid ADS field syntax in the query:\n"
+                "- For telescope/instrument names (ALMA, VLA, JWST, Hubble, VLBI, etc): use abstract:\"ALMA\" AND abstract:\"topic\"\n"
+                "- For astronomical objects: object:\"M87\" or title:\"black hole\"\n"
+                "- For authors: author:\"Last, First\"\n"
+                "- For year range: year:2020-2024\n"
+                "- Combine with AND, OR operators\n"
+                "Examples:\n"
+                "- 'recent ALMA molecular cloud papers' → query: abstract:\"ALMA\" AND abstract:\"molecular cloud\"\n"
+                "- 'VLA AGN observations 2022-2024' → query: abstract:\"VLA\" AND abstract:\"AGN\" AND year:2022-2024\n"
+                "- 'black hole accretion disk' → query: title:\"black hole\" AND abstract:\"accretion disk\""
+            ),
+            function=lambda query, max_results=10, sort="date desc", **kw: (
+                self._search_papers(query, max_results=max_results, sort=sort)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "ADS search query using field syntax (abstract:, title:, author:, object:, year:)"},
+                    "max_results": {"type": "integer", "description": "Number of results to return (default 10, max 50)"},
+                    "sort": {"type": "string", "description": "Sort order: 'date desc' (newest first), 'citation_count desc' (most cited), 'score desc' (relevance). Default: 'date desc'"},
+                },
+                "required": ["query"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_author_papers",
+            description="Find all papers published by a specific author. Use 'Last, First' format for best results.",
+            function=lambda author, max_results=20, **kw: (
+                self.ads_client.get_author_papers(author, max_results=max_results)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "author": {"type": "string", "description": "Author name, e.g. 'Accomazzi, Alberto'"},
+                    "max_results": {"type": "integer", "description": "Max papers to return (default 20)"},
+                },
+                "required": ["author"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_paper_metrics",
+            description="Get citation count, read statistics, and impact metrics for a specific paper by its ADS bibcode.",
+            function=lambda bibcode, **kw: (
+                self.ads_client.get_paper_metrics(bibcode)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bibcode": {"type": "string", "description": "ADS bibcode, e.g. '2020PASP..132c5001L'"},
+                },
+                "required": ["bibcode"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_author_metrics",
+            description="Calculate scholarly impact metrics for an author: h-index, i10-index, total citations, refereed citations.",
+            function=lambda author, **kw: (
+                self.ads_client.get_author_metrics(author)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "author": {"type": "string", "description": "Author name, e.g. 'Accomazzi, Alberto'"},
+                },
+                "required": ["author"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="export_bibtex",
+            description="Export properly formatted BibTeX citations for one or more papers given their ADS bibcodes. Use when the user asks to cite papers or needs BibTeX.",
+            function=lambda bibcodes, **kw: (
+                self.ads_client.export_bibtex(bibcodes if isinstance(bibcodes, list) else [bibcodes])
+                if self.ads_client else "% ADS client not configured"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bibcodes": {
+                        "oneOf": [
+                            {"type": "string", "description": "Single bibcode"},
+                            {"type": "array", "items": {"type": "string"}, "description": "List of bibcodes"}
+                        ],
+                        "description": "ADS bibcode(s) to export"
+                    },
+                },
+                "required": ["bibcodes"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_paper_abstract",
+            description="Get the full abstract and detailed metadata (keywords, affiliations) for a specific paper by bibcode.",
+            function=lambda bibcode, **kw: (
+                self.ads_client.get_paper_details(bibcode)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bibcode": {"type": "string", "description": "ADS bibcode of the paper"},
+                },
+                "required": ["bibcode"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="list_ads_libraries",
+            description="List all personal ADS paper libraries for the authenticated ADS user.",
+            function=lambda **kw: (
+                self.ads_client.list_libraries()
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_ads_library_papers",
+            description="Get papers stored in a specific personal ADS library by library ID.",
+            function=lambda library_id, max_results=50, **kw: (
+                self.ads_client.get_library_papers(library_id, max_results=max_results)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "library_id": {"type": "string", "description": "ADS library ID"},
+                    "max_results": {"type": "integer", "description": "Max papers to return"},
+                },
+                "required": ["library_id"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="create_ads_library",
+            description="Create a new personal ADS paper library to organize papers by topic or project.",
+            function=lambda name, description="", public=False, **kw: (
+                self.ads_client.create_library(name, description=description, public=public)
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Library name"},
+                    "description": {"type": "string", "description": "Library description"},
+                    "public": {"type": "boolean", "description": "Whether the library is public"},
+                },
+                "required": ["name"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="add_to_ads_library",
+            description="Add papers to an existing personal ADS library by their bibcodes.",
+            function=lambda library_id, bibcodes, **kw: (
+                self.ads_client.add_to_library(library_id, bibcodes if isinstance(bibcodes, list) else [bibcodes])
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "library_id": {"type": "string", "description": "ADS library ID to add to"},
+                    "bibcodes": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ],
+                        "description": "Bibcode(s) to add"
+                    },
+                },
+                "required": ["library_id", "bibcodes"]
+            },
+            category="literature"
+        ))
+
+
+
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
                            facility: Optional[str] = None,
                            max_results: int = 100) -> Dict[str, Any]:
@@ -452,40 +1033,51 @@ Date: {date}
             return {"success": False, "error": str(e)}
 
     def _plot_alma_results(self, plot_type: str = "sky") -> Dict[str, Any]:
-        """Generate plots. Uses the LAST search results."""
+        """Generate plots. Uses the LAST search results. Returns image as bytes (Fix 5)."""
         try:
             if not hasattr(self, 'last_search_results') or self.last_search_results is None or self.last_search_results.empty:
                  return {"success": False, "error": "No results available to plot. Please run a search first."}
             
-            path = self.search_service.plot_alma_results(self.last_search_results, plot_type)
-            if path:
-                self.last_run_result = {"type": "image", "path": path, "caption": f"ALMA {plot_type.capitalize()} Plot"}
-                return {"success": True, "path": path}
-            return {"success": False, "error": "Plot generation returned empty path"}
+            image_bytes = self.search_service.plot_alma_results(self.last_search_results, plot_type)
+            if image_bytes:
+                self.last_run_result = {
+                    "type": "image", 
+                    "image_bytes": image_bytes, 
+                    "caption": f"ALMA {plot_type.capitalize()} Plot"
+                }
+                return {"success": True, "message": f"Generated {plot_type} plot successfully"}
+            return {"success": False, "error": "Plot generation returned empty"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def _search_papers(self, query: str, sort: str = "date desc") -> Dict[str, Any]:
-        """Search NASA ADS for papers"""
+    def _search_papers(self, query: str, max_results: int = 10, sort: str = "date desc") -> Dict[str, Any]:
+        """Search NASA ADS for papers.
+        
+        The calling LLM already produces valid ADS fielded-syntax queries
+        (e.g. author:"Torrey" AND abstract:"galaxy formation"), so we call
+        search_papers() directly — no extra LLM query builder needed.
+        """
         try:
             if not self.ads_client:
-                 return {"success": False, "error": "NASA ADS Client not initialized (check API Key)"}
-            
-            # Use the smart natural language search from the new client
-            # This uses LLM to build the optimal ADS query
-            result_pkg = self.ads_client.search_natural_language(query, max_results=20, sort=sort)
-            results = pd.DataFrame(result_pkg['papers'])
-            
-            # Standardize output for UI
+                return {"success": False, "error": "NASA ADS Client not initialized (check API Key)"}
+
+            # Call ADS API directly with the query the agent already formatted
+            papers_list = self.ads_client.search_papers(
+                query, max_results=max_results, sort=sort
+            )
+
+            # Store result for the UI backend to pick up
             self.last_run_result = {
-                "type": "papers", 
-                "data": results, 
-                "source": f"ADS: {result_pkg['query']}"
+                "type": "papers",
+                "papers": papers_list,
+                "source": f"ADS: {query}",
             }
             return {
-                "success": True, 
-                "count": len(results), 
-                "top_title": results.iloc[0]['title'] if not results.empty else "No results"
+                "success": True,
+                "count": len(papers_list),
+                "ads_query": query,
+                "papers": papers_list,
+                "top_title": papers_list[0]["title"] if papers_list else "No results",
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -567,21 +1159,129 @@ Date: {date}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _resolve_target(self, target_name: str) -> Dict[str, Any]:
+        """Resolve target name to RA/Dec using SIMBAD (Fix 3)"""
+        try:
+            from astroquery.simbad import Simbad
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            
+            result = Simbad.query_object(target_name)
+            
+            if result is None or len(result) == 0:
+                return {
+                    "success": False, 
+                    "error": f"SIMBAD could not resolve '{target_name}'. Check spelling or try alternate designation."
+                }
+            
+            # Get coordinates from first match
+            ra_str = result['RA'][0]   # Format: "HH MM SS.ss"
+            dec_str = result['DEC'][0]  # Format: "+DD MM SS.s"
+            
+            # Convert to decimal degrees
+            coord = SkyCoord(ra_str, dec_str, unit=(u.hourangle, u.deg))
+            
+            return {
+                "success": True,
+                "target_name": target_name,
+                "ra_deg": round(coord.ra.deg, 6),
+                "dec_deg": round(coord.dec.deg, 6),
+                "message": f"Resolved '{target_name}' to RA={coord.ra.deg:.4f}°, Dec={coord.dec.deg:.4f}°. Use search_by_position with these coordinates."
+            }
+        except ImportError:
+            return {"success": False, "error": "astroquery not installed. Cannot resolve target names."}
+        except Exception as e:
+            return {"success": False, "error": f"Resolution failed: {str(e)}"}
+
+    def _filter_results(self, column: str, operator: str, value: float) -> Dict[str, Any]:
+        """Apply deterministic numeric filter to last search results (Fix 2)"""
+        if self.last_search_results is None or self.last_search_results.empty:
+            return {"success": False, "error": "No search results to filter. Run a search first."}
+        
+        try:
+            df = self.last_search_results.copy()
+            
+            # Find the actual column name (case-insensitive match)
+            actual_column = None
+            for col in df.columns:
+                if col.lower() == column.lower():
+                    actual_column = col
+                    break
+            
+            if actual_column is None:
+                # Try common aliases
+                aliases = {
+                    'resolution': ['resolution', 's_resolution', 'angular_resolution'],
+                    'sensitivity': ['sensitivity', 'sensitivity_10kms', 'cont_sens_bandwidth'],
+                    'frequency': ['freq_min', 'freq_max', 'frequency', 'min_freq_ghz', 'max_freq_ghz'],
+                    'band': ['Band', 'band_number', 'band_list']
+                }
+                for alias_key, alias_list in aliases.items():
+                    if column.lower() == alias_key:
+                        for alias in alias_list:
+                            if alias in df.columns:
+                                actual_column = alias
+                                break
+                        break
+            
+            if actual_column is None:
+                return {
+                    "success": False, 
+                    "error": f"Column '{column}' not found. Available: {list(df.columns)}"
+                }
+            
+            # Apply filter using operator
+            original_count = len(df)
+            if operator == "<":
+                df = df[df[actual_column] < value]
+            elif operator == ">":
+                df = df[df[actual_column] > value]
+            elif operator == "<=":
+                df = df[df[actual_column] <= value]
+            elif operator == ">=":
+                df = df[df[actual_column] >= value]
+            elif operator == "==":
+                df = df[df[actual_column] == value]
+            elif operator == "!=":
+                df = df[df[actual_column] != value]
+            else:
+                return {"success": False, "error": f"Unknown operator: {operator}"}
+            
+            # Update cached results
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", 
+                "data": df, 
+                "source": f"Filtered: {actual_column} {operator} {value}"
+            }
+            
+            return {
+                "success": True,
+                "original_count": original_count,
+                "filtered_count": len(df),
+                "filter_applied": f"{actual_column} {operator} {value}",
+                "results": df.to_dict("records") if len(df) < 100 else f"[{len(df)} rows - too large to display]"
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Filter failed: {str(e)}"}
 
 
     def determine_intent(self, query: str) -> Dict[str, Any]:
-        """Determine the user's intent from the query"""
+        """Determine the user's intent from the query using Responses API"""
         try:
             prompt = INTENT_CLASSIFICATION_PROMPT.format(query=query)
             
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.config.model,
-                messages=[{"role": "user", "content": prompt}],
+                input=prompt,
+                instructions="You are an intent classification system. Always respond with valid JSON.",
                 temperature=0.1,
-                response_format={"type": "json_object"}
+                text={"format": {"type": "json_object"}}
             )
             
-            result = json.loads(response.choices[0].message.content)
+            # Extract text from Responses API output
+            output_text = self._extract_response_text(response)
+            result = json.loads(output_text)
             if self.config.verbose:
                 print(f"[cyan]Intent Detected: {result.get('intent')} ({result.get('confidence')})[/cyan]")
             return result
@@ -590,32 +1290,99 @@ Date: {date}
             return {"intent": "QUESTION", "confidence": 0.0}
 
     def extract_entities(self, query: str) -> Dict[str, Any]:
-        """Extract search entities from the query"""
+        """Extract search entities from the query using Responses API"""
         try:
             prompt = ENTITY_EXTRACTION_PROMPT.format(query=query)
             
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.config.model,
-                messages=[{"role": "user", "content": prompt}],
+                input=prompt,
+                instructions="You are an entity extraction system. Always respond with valid JSON.",
                 temperature=0.1,
-                response_format={"type": "json_object"}
+                text={"format": {"type": "json_object"}}
             )
             
-            result = json.loads(response.choices[0].message.content)
+            output_text = self._extract_response_text(response)
+            result = json.loads(output_text)
             if self.config.verbose:
                 print(f"[cyan]Entities Extracted: {result}[/cyan]")
             return result
         except Exception as e:
             print(f"[red]Entity extraction failed: {e}[/red]")
             return {}
+    
+    def _extract_response_text(self, response) -> str:
+        """Helper to extract text from Responses API response object"""
+        if hasattr(response, 'output_text'):
+            return response.output_text
+        elif hasattr(response, 'output'):
+            for item in response.output:
+                if hasattr(item, 'content') and getattr(item, 'type', None) == "text":
+                    return item.content
+        return str(response)
 
     def analyze_query_intent(self, query: str) -> Dict[str, Any]:
         """Alias for determine_intent to match UI expectation"""
         return self.determine_intent(query)
 
+    # --- RLM helpers -------------------------------------------------------
+
+    def _rlm_tool_executor(self, subtask: str, context: str) -> Optional[str]:
+        """
+        Callback used by the RLM engine to execute domain-specific sub-tasks.
+        Routes sub-task descriptions to the appropriate agent tools.
+        Returns a string answer or None to let the RLM fall back to LLM.
+        """
+        st = subtask.lower()
+
+        # Search archive for a target
+        if any(kw in st for kw in ["search", "find observations", "query archive"]):
+            # Try to extract target name from the subtask
+            entities = self.extract_entities(subtask)
+            target = entities.get("source_name")
+            if target:
+                try:
+                    results = self.search_service.search_by_target(
+                        target_name=target, facility="ALMA", max_results=20
+                    )
+                    if results is not None and not results.empty:
+                        self.last_search_results = results
+                        return f"Found {len(results)} ALMA observations for {target}."
+                    return f"No ALMA observations found for {target}."
+                except Exception as e:
+                    return f"Search error: {e}"
+
+        # Resolve target coordinates
+        if "resolve" in st or "coordinates" in st:
+            entities = self.extract_entities(subtask)
+            target = entities.get("source_name")
+            if target:
+                result = self._resolve_target(target)
+                return str(result)
+
+        # Frequency / sensitivity calculation
+        if "sensitivity" in st or "noise" in st:
+            return None  # Let LLM answer from the accumulated context
+
+        # Default: let RLM LLM handle it
+        return None
+
     def process_query(self, query: str, user_id: str = "user") -> Tuple[Optional[Any], str, str]:
         """Process a user query and return (result, source_name, result_type)"""
         self.memory.add_message("user", query)
+
+        # --- RLM: check if this is a complex multi-hop query ---
+        try:
+            should_rlm, complexity = self.rlm.should_use_rlm(query)
+            if should_rlm:
+                if self.config.verbose:
+                    print(f"[RLM] Complex query detected (score={complexity.score:.2f}): {complexity.reasoning}")
+                answer = self.rlm.execute(query)
+                self.memory.add_message("assistant", answer)
+                return None, answer, "rlm"  # answer goes in response_text slot
+        except Exception as e:
+            if self.config.verbose:
+                print(f"[RLM] Failed, falling back to normal flow: {e}")
 
         # 1. Determine Intent
         intent_data = self.determine_intent(query)
@@ -664,184 +1431,234 @@ Date: {date}
             return None, "", "general"
 
     def stream_general_response(self, query: str, message_placeholder=None, user_id: str = "user") -> str:
-        """Stream a general response using RAG and LLM with Native Tool Support"""
+        """
+        DEPRECATED: This method now redirects to stream_response_api().
+        Kept for backward compatibility with existing callers.
+        """
+        return self.stream_response_api(query, message_placeholder, user_id)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # RESPONSES API METHOD (New Architecture)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    def stream_response_api(self, query: str, message_placeholder=None, user_id: str = "user", on_token=None, on_status=None) -> str:
+        """
+        Stream a response using OpenAI Responses API with:
+        - Native conversation state (via previous_response_id)
+        - Optional MCP tool connection
+        - mem0 long-term memory for cross-session facts
+        - Token streaming via `on_token` callback
+        """
         
-        # Helper to check for simple confirmations
-        def is_simple_confirmation(q):
-            clean = q.strip().lower()
-            return clean in ["yes", "proceed", "ok", "go ahead", "sure", "please", "confirm"] or len(clean.split()) < 3
-            
-        # Skip RAG for simple confirmations OR direct commands that don't need manual lookup
-        clean_q = query.strip().lower()
-        skip_rag = is_simple_confirmation(query) or clean_q.startswith(("@archive", "@paper"))
-        
-        # Retrieve context from RAG service
+        # 0. Session Pruning — reset context if token count is too high
+        self._prune_session_if_needed(query, user_id)
+
+        # 1. Retrieve RAG context (from ALMA Manual - ChromaDB)
         rag_context = ""
-        if not skip_rag:
-            try:
-                docs = self.rag_service.search(query)
-                if docs:
-                    # Enrich context with citation metadata
-                    context_pieces = []
-                    for d in docs:
-                        source = d.metadata.get('source', 'ALMA Manual')
-                        page = d.metadata.get('page', 'Unknown')
-                        context_pieces.append(f"Content: {d.page_content}\n[Citation: {source}, Page: {page}]")
-                    
-                    rag_context = "\n\nRelevant Information from ALMA Manual:\n" + "\n---\n".join(context_pieces)
-                    
-                    if message_placeholder:
-                        message_placeholder.markdown("📘 Consulting ALMA Manual...")
-            except Exception as e:
-                print(f"RAG search failed: {e}")
-
-        # Retrieve Long-Term Memory
-        ltm_context = ""
-        if not skip_rag:
-            try:
-                memories = self.memory_service.search_memories(query, user_id=user_id)
-                if memories:
-                    ltm_context = "\nRelevant User Facts:\n" + "\n".join([f"- {m}" for m in memories])
-            except Exception as e:
-                print(f"Memory search failed: {e}")
-
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "system", "content": "You are answering the user's LATEST question. Do not assume you need to continue a previous task unless explicitly asked."},
-            {"role": "system", "content": RESPONSE_GENERATION_PROMPT.format(context=f"Relevant Technical Context:\n{rag_context}\n{ltm_context}", query=query)}
-        ]
-        
-        # COMMAND HANDLING
-        tool_choice = "auto"
-        clean_query = query.strip().lower()
-        
-        if clean_query.startswith("@archive"):
-            messages.append({"role": "system", "content": "USER COMMAND: @Archive detected. You MUST use a search tool (search_by_target, etc.) IMMEDIATELY. DO NOT OUTPUT ANY TEXT. DO NOT SAY 'I will search'. ARTIFACTS OR TABLES WILL APPEAR AUTOMATICALLY. JUST CALL THE FUNCTION."})
-            tool_choice = "required" 
-            
-        if clean_query.startswith("@search"):
-            messages.append({"role": "system", "content": "USER COMMAND: @search detected. FORCE RAG/LLM ONLY. Do NOT use any external search tools. Answer strictly from the provided 'Relevant Technical Context'. You MUST cite the Source and Page Number for every claim. Example: (ALMA Cycle 10 Handbook, Page 42)."})
-            tool_choice = "none"
-
-        if clean_query.startswith("@paper"):
-             messages.append({"role": "system", "content": "USER COMMAND: @paper detected. You MUST use the 'search_papers' tool. Do not use ALMA data search."})
-             tool_choice = "required" # Force a tool, and prompt implies search_papers preference
-        
-        # Add conversation history
-        # Add conversation history only if NOT in strict search mode
-        # This prevents "memory leakage" where previous data searches confuse the RAG answer
-        if not clean_query.startswith("@search"):
-            for msg in self.memory.get_history():
-                messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-            
         try:
-            # Prepare tools and choice
-            tools = self.tool_registry.get_openai_tools()
+            docs = self.rag_service.search(query)
+            if docs:
+                context_pieces = []
+                for d in docs[:3]:
+                    src = d.metadata.get("source", d.metadata.get("source_file", "Unknown"))
+                    if "/" in src or "\\" in src:
+                        src = src.replace("\\", "/").split("/")[-1]
+                    page = d.metadata.get("page", "?")
+                    context_pieces.append(f"[Source: {src}, p.{page}]\n{d.page_content}")
+                rag_context = "\n\nRelevant Technical Context:\n" + "\n---\n".join(context_pieces)
+        except Exception as e:
+            print(f"[WARNING] RAG search failed: {e}")
+        
+        # 2. Retrieve long-term memories (from mem0) — only for authenticated users
+        memory_context = ""
+        _is_anonymous = (not user_id or user_id == "anonymous")
+        if self.long_term_memory and not _is_anonymous:
+            try:
+                memories = self.long_term_memory.search(query=query, user_id=user_id, limit=5)
+                if memories and memories.get("results"):
+                    memory_pieces = [f"- {m['memory']}" for m in memories["results"]]
+                    memory_context = "\n\nUser Memories:\n" + "\n".join(memory_pieces)
+            except Exception as e:
+                print(f"[WARNING] mem0 search failed: {e}")
+        
+        # 3. Build tools list
+        tools = self._build_tools_for_responses_api()
+        
+        # 4. Build the full input
+        citation_note = ""
+        if rag_context:
+            citation_note = (
+                "\n\nIMPORTANT: When your answer uses information from the "
+                "Relevant Technical Context above, cite the source at the end "
+                "of the relevant sentence in brackets, e.g. "
+                "[Source: ALMA_Technical_Handbook.pdf, p.42]. "
+                "This helps users verify the information."
+            )
+        full_input = f"{memory_context}{rag_context}{citation_note}\n\nUser: {query}"
+        
+        try:
+            if message_placeholder:
+                message_placeholder.markdown("🔄 Processing...")
             
-            # If command forced "none", explicitly remove tools to avoid API errors
-            # and prevent any chance of tool usage (Pure RAG)
-            if tool_choice == "none":
-                tools = None
-                tool_choice = None
+            MAX_TOOL_ROUNDS = 5
+            last_id = self.last_response_id
+            output_text = ""
             
-            # Safety check: if registry empty, cannot use tools
-            if not tools:
-                tools = None
-                tool_choice = None 
-
-            if tools:
-                # Standard call WITH tools
-                stream = self.client.chat.completions.create(
+            # 5. Call Responses API with manual streaming loop
+            for _round in range(MAX_TOOL_ROUNDS):
+                response_stream = self.client.responses.create(
                     model=self.config.model,
-                    messages=messages,
+                    input=full_input if _round == 0 else tool_results,
+                    instructions=self.system_prompt,
+                    previous_response_id=last_id,
                     tools=tools,
-                    tool_choice=tool_choice,
                     temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
+                    max_output_tokens=self.config.max_tokens,
                     stream=True
                 )
-            else:
-                # Clean call WITHOUT tools (Prevention of Error 400)
-                # Used for @search or when no tools are available.
-                stream = self.client.chat.completions.create(
-                    model=self.config.model,
-                    messages=messages,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
-                    stream=True
-                )
-            
-            full_response = ""
-            tool_calls = [] # List of dicts to build up tool calls
-            
-            for chunk in stream:
-                delta = chunk.choices[0].delta
                 
-                # 1. Content Streaming
-                if delta.content is not None:
-                    full_response += delta.content
-                    if message_placeholder:
-                        message_placeholder.markdown(full_response + "▌")
-                        
-                # 2. Tool Call Streaming
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        if len(tool_calls) <= tc.index:
-                            tool_calls.append({"id": tc.id, "function": {"name": "", "arguments": ""}})
-                        
-                        if tc.function.name:
-                            tool_calls[tc.index]["function"]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+                function_calls = {} # call_id -> dict
+                
+                for event in response_stream:
+                    if event.type == "response.created":
+                        last_id = event.response.id
+                        self.last_response_id = last_id
+                    elif event.type == "response.output_text.delta":
+                        output_text += event.delta
+                        if on_token:
+                            on_token(event.delta)
+                    elif event.type == "response.output_item.added":
+                        # Check if it's a function_call item
+                        item = event.item
+                        if getattr(item, 'type', None) == 'function_call':
+                            # Get call_id from either call_id or id
+                            cid = getattr(item, 'call_id', getattr(item, 'id', None))
+                            name = getattr(item, 'name', 'unknown')
+                            if cid:
+                                function_calls[cid] = {"name": name, "arguments": "", "call_id": cid}
+                    elif event.type == "response.function_call_arguments.delta":
+                        cid = getattr(event, 'call_id', getattr(event, 'item_id', None))
+                        if cid and cid in function_calls:
+                            function_calls[cid]["arguments"] += event.delta
+                
+                if not function_calls:
+                    break  # No tool calls — we have the final text
+                
+                # Execute each function call and collect results
+                tool_results = []
+                for fc in function_calls.values():
+                    tool_name = fc["name"]
+                    try:
+                        args_str = fc["arguments"]
+                        args = json.loads(args_str) if args_str else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    
+                    print(f"[TOOL CALL] {tool_name}({args})")
+
+                    # Emit tool call status to Processing Pipeline
+                    query_hint = args.get("query", args.get("author", args.get("bibcode", "")))
+                    step_label = f"Calling tool: {tool_name}"
+                    if query_hint:
+                        step_label += f' ("{str(query_hint)[:60]}")'
+                    if on_status:
+                        on_status(step_label, "running")
+
+                    tool = self.tool_registry.get_tool(tool_name)
+                    if tool:
+                        try:
+                            result = tool.execute(**args)
+                            result_str = json.dumps(result, default=str)[:4000]
+                        except Exception as te:
+                            result_str = json.dumps({"error": str(te)})
+                    else:
+                        result_str = json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+                    if on_status:
+                        on_status(step_label, "completed")
+                    
+                    tool_results.append({
+                        "type": "function_call_output",
+                        "call_id": fc["call_id"],
+                        "output": result_str,
+                    })
+            
+            if not output_text:
+                output_text = "I processed your query but didn't generate a text response. Please try rephrasing."
+                if on_token:
+                    on_token(output_text)
+            
+            print(f"[DEBUG] Response text length: {len(output_text)}")
             
             if message_placeholder:
-                message_placeholder.markdown(full_response)
-                
-            self.memory.add_message("assistant", full_response)
+                message_placeholder.markdown(output_text)
             
-            # EXECUTE TOOLS
-            for tc in tool_calls:
-                tool_name = tc["function"]["name"]
-                args_str = tc["function"]["arguments"]
-                
+            # 8. Update long-term memory — only for authenticated users
+            if self.long_term_memory and not _is_anonymous:
                 try:
-                    params = json.loads(args_str)
-                    if self.config.verbose:
-                        print(f"Executing Tool: {tool_name} with {params}")
-                    
-                    tool_def = self.tool_registry.get_tool(tool_name)
-                    if tool_def:
-                        result = tool_def.function(**params)
-                        
-                        if self.config.verbose:
-                            print(f"Tool Result: {result}")
-                        
-                        # Feed result back into memory
-                        summary = self._summarize_tool_output(tool_name, result)
-                        self.memory.add_message("system", f"Tool '{tool_name}' executed. Output: {summary}")
-                        
-                        # Optionally: append tool output to UI if needed, or rely on next turn
-                        # For now, we just update memory so the next turn knows.
-                        
-                except json.JSONDecodeError:
-                    print(f"Failed to parse arguments for {tool_name}: {args_str}")
-                except Exception as tool_err:
-                    print(f"Tool Execution Failed: {tool_err}")
-                    self.memory.add_message("system", f"Tool execution failed: {tool_err}")
-
-            # Async Memory Update
-            self._update_memory(query, user_id=user_id)
+                    messages = [
+                        {"role": "user", "content": query},
+                        {"role": "assistant", "content": output_text}
+                    ]
+                    self.long_term_memory.add(messages, user_id=user_id)
+                except Exception as e:
+                    print(f"[WARNING] mem0 memory add failed: {e}")
             
-            return full_response
+            return output_text
             
-        except Exception as e:
-            error_msg = f"Error generating response: {str(e)}"
+        except AttributeError as ae:
+            # Responses API not available in this OpenAI version
+            error_msg = f"Responses API not available: {ae}. Please upgrade the openai package."
+            print(f"[ERROR] {error_msg}")
             if message_placeholder:
                 message_placeholder.error(error_msg)
             return error_msg
+            
+        except Exception as e:
+            error_msg = f"Error with Responses API: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            if message_placeholder:
+                message_placeholder.error(error_msg)
+            return error_msg
+    
+    def _build_tools_for_responses_api(self) -> list:
+        """
+        Build tools list for Responses API.
+        Includes function tools and optionally MCP server connection.
+        
+        NOTE: Responses API uses a flat tool schema:
+          {"type": "function", "name": "...", "description": "...", "parameters": {...}}
+        NOT the nested Chat Completions format:
+          {"type": "function", "function": {"name": "...", ...}}
+        """
+        tools = []
+        
+        # Convert from Chat Completions format to Responses API format
+        for tool in self.tool_registry.list_tools():
+            tools.append({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })
+        
+        # Add MCP server connection if enabled
+        if self.config.enable_mcp and self.config.mcp_server_url:
+            tools.append({
+                "type": "mcp",
+                "server_label": "alma",
+                "server_url": self.config.mcp_server_url,
+                "require_approval": "never"
+            })
+        
+        return tools if tools else None
+    
+    def reset_conversation_state(self):
+        """Reset conversation state for new chat session"""
+        self.last_response_id = None
+        self.memory.clear()
+        if self.config.verbose:
+            print("[yellow]Conversation state reset[/yellow]")
 
     def _summarize_tool_output(self, tool_name: str, result: Any) -> str:
         """Summarize tool output for context window efficiency"""
@@ -873,65 +1690,79 @@ Date: {date}
         return str(result)[:500]
 
     def generate_summary(self, df: pd.DataFrame, source_name: str) -> str:
-        """Generate a natural language summary of the search results"""
+        """Generate a DETERMINISTIC summary of the search results using Pandas stats.
+        
+        This avoids LLM hallucination of 'empty' data by computing actual values.
+        """
         try:
             if df.empty:
                 return f"No observations found for {source_name}."
 
-            # Prepare a summary of the data for the LLM
-            total_obs = len(df)
-            unique_projects = df['project_code'].nunique() if 'project_code' in df.columns else 0
+            # === DETERMINISTIC STATS ===
+            total_rows = len(df)
             
+            # Unique counts (addressing ambiguous terminology issue)
+            unique_mous = df['member_ous_uid'].nunique() if 'member_ous_uid' in df.columns else None
+            unique_projects = df['project_code'].nunique() if 'project_code' in df.columns else None
+            
+            # Band information - check multiple possible column names
             bands = []
-            # Check for standardized 'Band' column first, then fallback
-            if 'Band' in df.columns:
-                bands = sorted(df['Band'].dropna().unique().tolist())
-            elif 'band_number' in df.columns:
-                bands = sorted(df['band_number'].dropna().unique().tolist())
-            elif 'band' in df.columns:
-                bands = sorted(df['band'].dropna().unique().tolist())
-                
-            # Check for standardized freq columns
-            min_freq = 0
-            max_freq = 0
+            for band_col in ['Band', 'band_number', 'band', 'band_list']:
+                if band_col in df.columns:
+                    band_values = df[band_col].dropna().unique().tolist()
+                    if band_values:
+                        bands = sorted([str(b) for b in band_values])
+                        break
             
-            if 'freq_min' in df.columns:
-                min_freq = df['freq_min'].min()
-            elif 'freq_min_ghz' in df.columns:
-                min_freq = df['freq_min_ghz'].min()
-                
-            if 'freq_max' in df.columns:
-                max_freq = df['freq_max'].max()
-            elif 'freq_max_ghz' in df.columns:
-                max_freq = df['freq_max_ghz'].max()
+            # Frequency range - check multiple possible column names
+            min_freq, max_freq = None, None
+            for min_col in ['freq_min', 'freq_min_ghz', 'min_freq_ghz', 'frequency']:
+                if min_col in df.columns:
+                    min_freq = df[min_col].min()
+                    break
+            for max_col in ['freq_max', 'freq_max_ghz', 'max_freq_ghz', 'frequency']:
+                if max_col in df.columns:
+                    max_freq = df[max_col].max()
+                    break
             
-            context = f"""
-            Search Results for {source_name}:
-            - Total Observations: {total_obs}
-            - Unique Projects: {unique_projects}
-            - Bands Covered: {bands}
-            - Frequency Range: {min_freq:.1f} - {max_freq:.1f} GHz
-            """
+            # Resolution range
+            resolution_col = None
+            for res_col in ['resolution', 's_resolution', 'angular_resolution']:
+                if res_col in df.columns:
+                    resolution_col = res_col
+                    break
             
-            prompt = f"""
-            Summarize these ALMA observation results for the source {source_name}. 
-            Highlight the key available data, such as the bands, frequency coverage, and the volume of data.
-            Keep it concise (2-3 sentences).
+            min_res, max_res = None, None
+            if resolution_col:
+                min_res = df[resolution_col].min()
+                max_res = df[resolution_col].max()
             
-            Data Context:
-            {context}
-            """
+            # Sensitivity range
+            sens_col = None
+            for s_col in ['sensitivity', 'sensitivity_10kms', 'cont_sens_bandwidth']:
+                if s_col in df.columns:
+                    sens_col = s_col
+                    break
             
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7
-            )
+            # === BUILD SUMMARY STRING ===
+            summary_parts = [f"**{source_name} - ALMA Archive Summary**"]
+            summary_parts.append(f"- **Total Execution Blocks**: {total_rows}")
             
-            return response.choices[0].message.content
+            if unique_mous is not None:
+                summary_parts.append(f"- **Unique MOUS UIDs**: {unique_mous}")
+            if unique_projects is not None:
+                summary_parts.append(f"- **Unique Projects**: {unique_projects}")
+            
+            if bands:
+                summary_parts.append(f"- **Bands**: {', '.join(bands)}")
+            
+            if min_freq is not None and max_freq is not None:
+                summary_parts.append(f"- **Frequency Range**: {min_freq:.2f} - {max_freq:.2f} GHz")
+            
+            if min_res is not None and max_res is not None:
+                summary_parts.append(f"- **Resolution Range**: {min_res:.4f}\" - {max_res:.4f}\"")
+            
+            return "\n".join(summary_parts)
             
         except Exception as e:
             print(f"[red]Summary generation failed: {e}[/red]")
@@ -954,7 +1785,7 @@ Date: {date}
             print(f"[cyan]Model changed to: {model}[/cyan]")
 
     def _update_memory(self, query: str, user_id: str = "user"):
-        """Extract and save new memories from user interaction"""
+        """Extract and save new memories from user interaction using Responses API"""
         try:
             # Simple extraction prompt
             prompt = f"""
@@ -967,14 +1798,14 @@ Date: {date}
             Example: "User is interested in protoplanetary disks."
             """
             
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini", # Use cheaper model for background tasks
-                messages=[{"role": "user", "content": prompt}],
+            response = self.client.responses.create(
+                model="gpt-4o-mini",  # Use cheaper model for background tasks
+                input=prompt,
                 temperature=0.1,
-                max_tokens=50
+                max_output_tokens=50
             )
             
-            fact = response.choices[0].message.content.strip()
+            fact = self._extract_response_text(response).strip()
             
             if fact != "NONE" and len(fact) > 5:
                 if self.config.verbose:

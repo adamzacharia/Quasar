@@ -1,0 +1,72 @@
+{
+    "scale": 0,
+    "locale": "en-US",
+    "userThemeMode": "system",
+    "quickWindowPosition": {
+        "absolutePointInWorkspace": {
+            "x": 464,
+            "y": 196
+        },
+        "monitor": {
+            "accelerometerSupport": "unknown",
+            "bounds": {
+                "x": 0,
+                "y": 0,
+                "width": 1536,
+                "height": 864
+            },
+            "colorDepth": 24,
+            "colorSpace": "{primaries:BT709, transfer:SRGB, matrix:RGB, range:FULL}",
+            "depthPerComponent": 8,
+            "detected": true,
+            "displayFrequency": 144,
+            "id": 1907664188,
+            "internal": true,
+            "label": "",
+            "maximumCursorSize": {
+                "width": 0,
+                "height": 0
+            },
+            "monochrome": false,
+            "nativeOrigin": {
+                "x": 0,
+                "y": 0
+            },
+            "rotation": 0,
+            "scaleFactor": 1.25,
+            "size": {
+                "width": 1536,
+                "height": 864
+            },
+            "workArea": {
+                "x": 0,
+                "y": 0,
+                "width": 1536,
+                "height": 864
+            },
+            "workAreaSize": {
+                "width": 1536,
+                "height": 864
+            },
+            "touchSupport": "unknown"
+        },
+        "relativePointFromMonitor": {
+            "x": 464,
+            "y": 196
+        }
+    },
+    "dxt:allowlistEnabled": false,
+    "dxt:allowlistLastUpdated": "2026-01-05T08:48:07.263Z",
+    "dxt:allowlistCache": "djEwqcLlHPTZWF1GoLTVMpf9yn/eMRNTF2rvDaJQikZAiOqobAh/Et9ehum8jtNwP6u5dra2hxw3OV3b9ThKyFUE1z1po6OLc/LCdUpIQlz9mCYqeS3QiBCDFewEWe/3DoEw+HaZxQvuTDsrAydZZhHKsMulbq99+YCLEnEv/A5gxpaqFsha/fn/IfyNreGMFNnsVVlYqd5re+BP96jNPLdsaxq55W8Wc967M3MU+Y4CSmfpxlEDytZDO4k+kGEvjO1QDGjWI/AfZpaO2tw07YtlAFnhIdryi3XsaL+3b0lpmWVfklQ3O9o5sY1gG5M3/SpPzXkCmJRX44T5du0zq/5l5qP0FAPxMgR5EIYfn57fRW8o5hZJ7Yn3h2fvz/dPxmVa/f0OSwhVKerTGfU5rpItzlrgnuV6c3vpe7YaqtPtX39waHjrOYpJ7JwW/QevTpb3pRhTKKFd0Qfoy1xwoWMf4TlbvkBghF706FxJjmjdRYweho8qN80rWSBd5b1AhosUy2i6ofwtK/tIJOi1zdrONt15Q0A/fKfJzS75SXJjgzfcsy0v/mZuyi591b3iY2f13WlTwJm9OyM4xlUccFnTG5srvpe2/zMpHDi4y95VsjPRLyyUgzjOfCTUB/mdL5I5OhHFCzpMaScYfbJkNklMna9xHH5O3vLU6Jdx4kbCPpE8c7FfpWSiSGsVUb4oQ4epL3kOG+l7/yGSGFPzyPymnvhjXK5Q4GstnLNNjYh9hyrj/mf6IHVcUGRNS74UpSsQNsuDTyYWcwmpcsvbn8OwzgIYIrg78tR+85nIlZZbjl89Q26HcYyjfY6i6NejoHrmm5/5Z+7spgj8auRRf0oGjgeMC6qHlKkRe2r9bThwfxyYhPRChko6SNn3wGqxU3rVnzHqwL916G4cGseipJH1bIoxvTJbO5ZeDO35qy/nJBS2kZBIpum7s8fQMj8=",
+    "hasTrackedInitialActivation": true,
+    "mcpServers": {
+        "Alma": {
+            "command": "C:/Users/Asus/anaconda3/envs/mcp/python.exe",
+            "args": [
+                "C:/Users/Asus/Desktop/Quasar-main/ALMA_MCP/server.py"
+            ],
+            "cwd": "C:/Users/Asus/Desktop/Quasar-main/ALMA_MCP",
+            "env": {}
+        }
+    }
+}

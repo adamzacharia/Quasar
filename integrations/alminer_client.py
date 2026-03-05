@@ -37,31 +37,100 @@ class ALminerClient:
             
     def search_by_target(self, target_name: str, public: bool = True) -> pd.DataFrame:
         """
-        Search ALMA archive by target name
+        Search ALMA archive by target name.
+        Strategy: 
+        1. Resolve name to RA/Dec via SIMBAD
+        2. Race TAP and ALminer in parallel - return whichever succeeds first
         """
-        if not ALMINER_AVAILABLE:
-            return pd.DataFrame()
-
+        print(f"[ALMA] Starting search for '{target_name}'")
+        
+        # Step 1: Resolve target name to coordinates using SIMBAD
         try:
-            # ALminer's target search
-            # print_targets=False to avoid cluttering stdout
-            df = alminer.target(target_name, public=public, print_targets=False)
+            from astroquery.simbad import Simbad
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
             
-            # Filter by target name to avoid neighbors/project siblings
-            if not df.empty and 'target_name' in df.columns:
-                # Normalize names for comparison (remove spaces, lowercase)
-                clean_target = target_name.lower().replace(" ", "")
-                
-                # Create a mask for matching targets
-                # We check if the requested target is in the returned target name
-                mask = df['target_name'].apply(
-                    lambda x: clean_target in str(x).lower().replace(" ", "") if pd.notna(x) else False
-                )
-                df = df[mask]
+            print(f"[ALMA] Resolving '{target_name}' with SIMBAD...")
+            result = Simbad.query_object(target_name)
             
-            return self._standardize_columns(df)
+            if result is None or len(result) == 0:
+                print(f"[ALMA] SIMBAD could not resolve '{target_name}'")
+                return pd.DataFrame()
+            
+            ra_str = result['RA'][0]
+            dec_str = result['DEC'][0]
+            coord = SkyCoord(ra_str, dec_str, unit=(u.hourangle, u.deg))
+            ra_deg = coord.ra.deg
+            dec_deg = coord.dec.deg
+            print(f"[ALMA] Resolved to RA={ra_deg:.4f}, Dec={dec_deg:.4f}")
+            
         except Exception as e:
-            print(f"ALminer target search error: {e}")
+            print(f"[ALMA] SIMBAD resolution failed: {e}")
+            return pd.DataFrame()
+        
+        # Step 2: Race TAP and ALminer in parallel
+        return self._parallel_search(ra_deg, dec_deg, radius=0.05, target_name=target_name)
+    
+    def _parallel_search(self, ra: float, dec: float, radius: float = 0.05, target_name: str = "") -> pd.DataFrame:
+        """
+        Run TAP and ALminer searches in parallel.
+        Returns whichever succeeds first with results.
+        """
+        import threading
+        import queue
+        
+        result_queue = queue.Queue()
+        
+        def tap_search():
+            try:
+                import pyvo
+                print("[ALMA] TAP search starting...")
+                tap_url = 'https://almascience.nrao.edu/tap'
+                service = pyvo.dal.TAPService(tap_url)
+                query = f'''
+                SELECT target_name, s_ra, s_dec, band_list, proposal_id, 
+                       t_exptime, s_resolution, bandwidth, frequency,
+                       member_ous_uid, obs_publisher_did, access_url
+                FROM ivoa.obscore 
+                WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1
+                '''
+                res = service.search(query)
+                df = res.to_table().to_pandas()
+                if not df.empty:
+                    print(f"[ALMA] TAP found {len(df)} results - WINNING!")
+                    result_queue.put(("TAP", df))
+            except ImportError:
+                print("[ALMA] pyVO not available")
+            except Exception as e:
+                print(f"[ALMA] TAP failed: {e}")
+        
+        def alminer_search():
+            try:
+                import alminer
+                print("[ALMA] ALminer search starting...")
+                df = alminer.conesearch(ra, dec, search_radius=radius, print_targets=False)
+                if df is not None and not df.empty:
+                    print(f"[ALMA] ALminer found {len(df)} results - WINNING!")
+                    result_queue.put(("ALminer", df))
+            except ImportError:
+                print("[ALMA] ALminer not available")
+            except Exception as e:
+                print(f"[ALMA] ALminer failed: {e}")
+        
+        # Start both threads (daemon so they die if main thread exits)
+        tap_thread = threading.Thread(target=tap_search, daemon=True)
+        alminer_thread = threading.Thread(target=alminer_search, daemon=True)
+        
+        tap_thread.start()
+        alminer_thread.start()
+        
+        # Wait for first result (max 2 minutes)
+        try:
+            winner, df = result_queue.get(timeout=120)
+            print(f"[ALMA] Winner: {winner} with {len(df)} results")
+            return self._standardize_columns(df)
+        except queue.Empty:
+            print("[ALMA] Both TAP and ALminer timed out!")
             return pd.DataFrame()
 
     def search_by_position(self, ra: float, dec: float, radius: float = 0.016, public: bool = True) -> pd.DataFrame:
@@ -70,14 +139,46 @@ class ALminerClient:
         radius is in degrees (default ~1 arcmin)
         """
         if not ALMINER_AVAILABLE:
+            print("[ALminer] ERROR: alminer not available")
             return pd.DataFrame()
 
         try:
-            # ALminer uses coordinates in degrees
-            df = alminer.conesearch(ra, dec, search_radius=radius, public=public, print_targets=False)
+            print(f"[ALminer] Starting conesearch: RA={ra}, Dec={dec}, radius={radius}°")
+            print("[ALminer] Connecting to ALMA archive (this may take 30-60 seconds)...")
+            
+            # Use threading with timeout to prevent infinite hang
+            import threading
+            result_holder = [None]
+            error_holder = [None]
+            
+            def do_search():
+                try:
+                    result_holder[0] = alminer.conesearch(ra, dec, search_radius=radius, public=public, print_targets=False)
+                except Exception as e:
+                    error_holder[0] = e
+            
+            search_thread = threading.Thread(target=do_search, daemon=True)
+            search_thread.start()
+            search_thread.join(timeout=120)  # 2 minute timeout
+            
+            if search_thread.is_alive():
+                print("[ALminer] ERROR: Search timed out after 2 minutes!")
+                return pd.DataFrame()
+            
+            if error_holder[0]:
+                raise error_holder[0]
+            
+            df = result_holder[0]
+            if df is None:
+                print("[ALminer] Search returned None")
+                return pd.DataFrame()
+                
+            print(f"[ALminer] Search complete! Found {len(df)} results")
             return self._standardize_columns(df)
         except Exception as e:
-            print(f"ALminer position search error: {e}")
+            print(f"[ALminer] Position search error: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
 
     def search_by_keywords(self, keywords: Dict[str, Any], public: bool = True) -> pd.DataFrame:
@@ -128,13 +229,33 @@ class ALminerClient:
             return pd.DataFrame()
             
         try:
-            # Construct a TAP query for frequency overlap
-            # ALMA TAP has min_freq and max_freq columns? Usually it's frequency_support
-            # Simpler approach: usage of alminer features might be best.
-            # But let's return empty for now as requested in original code, 
-            # or try to use search_by_keywords if there's params.
+            import pyvo
+            tap_url = 'https://almascience.nrao.edu/tap'
+            service = pyvo.dal.TAPService(tap_url)
+            
+            query = f'''
+            SELECT target_name, s_ra, s_dec, band_list, proposal_id,
+                   t_exptime, s_resolution, bandwidth, frequency,
+                   member_ous_uid, obs_publisher_did, access_url
+            FROM ivoa.obscore
+            WHERE frequency >= {min_freq_ghz}
+              AND frequency <= {max_freq_ghz}
+            '''
+            res = service.search(query)
+            df = res.to_table().to_pandas()
+            
+            if not df.empty:
+                print(f"[ALMA] Frequency search found {len(df)} results")
+                return self._standardize_columns(df)
+            else:
+                print("[ALMA] Frequency search returned no results")
+                return pd.DataFrame()
+                
+        except ImportError:
+            print("[ALMA] pyvo not available for frequency search")
             return pd.DataFrame()
-        except Exception:
+        except Exception as e:
+            print(f"[ALMA] Frequency search error: {e}")
             return pd.DataFrame()
 
     def get_run_summary(self, df: pd.DataFrame) -> str:
@@ -155,60 +276,91 @@ class ALminerClient:
         
         return summary
 
-    def plot_sky_distribution(self, df: pd.DataFrame, filename: str = "alma_sky_plot.png") -> str:
+    def plot_sky_distribution(self, df: pd.DataFrame, filename: str = "alma_sky_plot.png") -> bytes:
         """
         Generate sky distribution plot
-        Returns absolute path to saved image
+        Returns image as bytes (Fix 5 - prevents MediaFileStorageError)
         """
         if not ALMINER_AVAILABLE or not MATPLOTLIB_AVAILABLE or df.empty:
-            return ""
+            return b""
 
         try:
-            # Determine save path in artifacts or temp location
-            # Using current directory or a standard cache
-            save_path = os.path.abspath(f"./{filename}")
+            import tempfile
+            # Save to temp file, read bytes, cleanup
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp_path = tmp.name
             
-            # alminer.plot_sky(df) creates the plot
-            # We assume it uses the current figure
-            alminer.plot_sky(df, savefig=save_path)
+            alminer.plot_sky(df, savefig=tmp_path)
             
-            return save_path
+            with open(tmp_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            # Cleanup temp file
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+            
+            return image_bytes
         except Exception as e:
             print(f"Error plotting sky distribution: {e}")
-            return ""
+            return b""
 
-    def plot_freq_coverage(self, df: pd.DataFrame, filename: str = "alma_freq_plot.png") -> str:
+    def plot_freq_coverage(self, df: pd.DataFrame, filename: str = "alma_freq_plot.png") -> bytes:
         """
         Generate frequency coverage plot
+        Returns image as bytes (Fix 5 - prevents MediaFileStorageError)
         """
         if not ALMINER_AVAILABLE or not MATPLOTLIB_AVAILABLE or df.empty:
-            return ""
+            return b""
 
         try:
-            save_path = os.path.abspath(f"./{filename}")
-            # alminer.plot_bands(df) plots standard bands
-            # alminer.plot_frequency_cover(df) might be what we want
-            # Let's use plot_bands which is standard
-            alminer.plot_bands(df, savefig=save_path)
-            return save_path
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            alminer.plot_bands(df, savefig=tmp_path)
+            
+            with open(tmp_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+            
+            return image_bytes
         except Exception as e:
             print(f"Error plotting frequency coverage: {e}")
-            return ""
+            return b""
 
-    def plot_overview(self, df: pd.DataFrame, filename: str = "alma_overview_plot.png") -> str:
+    def plot_overview(self, df: pd.DataFrame, filename: str = "alma_overview_plot.png") -> bytes:
         """
         Generate overview plot (Integration time vs Sensitivity usually)
+        Returns image as bytes (Fix 5 - prevents MediaFileStorageError)
         """
         if not ALMINER_AVAILABLE or not MATPLOTLIB_AVAILABLE or df.empty:
-            return ""
+            return b""
 
         try:
-            save_path = os.path.abspath(f"./{filename}")
-            alminer.plot_overview(df, savefig=save_path)
-            return save_path
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            alminer.plot_overview(df, savefig=tmp_path)
+            
+            with open(tmp_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+            
+            return image_bytes
         except Exception as e:
             print(f"Error plotting overview: {e}")
-            return ""
+            return b""
 
     def download_data(self, df: pd.DataFrame, dry_run: bool = True) -> str:
         """
@@ -256,6 +408,12 @@ class ALminerClient:
         # Ensure standard columns exist
         df['telescope'] = 'ALMA'
         df['instrument_name'] = 'ALMA'
+        
+        # Add frequency aliases for CLI display compatibility
+        if 'freq_min' in df.columns and 'freq_min_ghz' not in df.columns:
+            df['freq_min_ghz'] = df['freq_min']
+        if 'freq_max' in df.columns and 'freq_max_ghz' not in df.columns:
+            df['freq_max_ghz'] = df['freq_max']
         
         # Construct useful Archive URL
         if 'member_ous_uid' in df.columns:

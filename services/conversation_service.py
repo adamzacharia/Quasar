@@ -1,0 +1,314 @@
+# services/conversation_service.py
+"""
+Conversation Storage Service
+Manages multiple chat conversations per user using SQLite
+"""
+
+import sqlite3
+import json
+import os
+from datetime import datetime
+from typing import List, Dict, Optional
+import uuid
+
+class ConversationService:
+    """
+    Manages conversation storage and retrieval per user.
+    Uses SQLite for persistent storage.
+    """
+    
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            db_path = os.path.join(root_dir, "conversations.db")
+        
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize database tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Conversations table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        
+        # Messages table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_type TEXT DEFAULT 'general',
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            )
+        ''')
+        
+        # Index for faster queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_conv_user 
+            ON conversations(user_id, updated_at DESC)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_msg_conv 
+            ON messages(conversation_id, created_at)
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def create_conversation(self, user_id: str, title: str = None) -> str:
+        """Create a new conversation, returns conversation ID"""
+        conv_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO conversations (id, user_id, title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (conv_id, user_id, title or "New Chat", now, now))
+        
+        conn.commit()
+        conn.close()
+        
+        return conv_id
+    
+    def save_message(self, conversation_id: str, role: str, content: str, 
+                     message_type: str = "general", metadata: Dict = None):
+        """Save a message to a conversation"""
+        now = datetime.now().isoformat()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO messages (conversation_id, role, content, message_type, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (conversation_id, role, content, message_type, 
+              json.dumps(metadata) if metadata else None, now))
+        
+        # Update conversation timestamp
+        cursor.execute('''
+            UPDATE conversations SET updated_at = ? WHERE id = ?
+        ''', (now, conversation_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def save_full_conversation(self, conversation_id: str, messages: List[Dict]):
+        """Save all messages for a conversation (replaces existing)
+        
+        Properly serializes DataFrames and all message fields.
+        """
+        import pandas as pd
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Delete existing messages
+        cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
+        
+        # Insert all messages
+        now = datetime.now().isoformat()
+        for msg in messages:
+            # Serialize content
+            content = msg.get("content", "")
+            
+            # Store extra fields in metadata
+            metadata = msg.get("metadata", {}) or {}
+            
+            # Handle DataFrame data
+            if "data" in msg:
+                data = msg["data"]
+                if hasattr(data, 'to_dict'):  # It's a DataFrame
+                    try:
+                        metadata["data_json"] = data.to_dict(orient='records')
+                        metadata["data_columns"] = list(data.columns)
+                    except Exception:
+                        metadata["data_json"] = str(data)
+                else:
+                    metadata["data_json"] = data
+            
+            # Store source name
+            if "source" in msg:
+                metadata["source"] = msg["source"]
+            
+            # Store image (if bytes, skip - too large; if path, store path)
+            if "image" in msg:
+                if isinstance(msg["image"], str):  # Path
+                    metadata["image_path"] = msg["image"]
+                # Skip bytes - images won't persist across sessions
+            
+            # Store caption
+            if "caption" in msg:
+                metadata["caption"] = msg["caption"]
+            
+            cursor.execute('''
+                INSERT INTO messages (conversation_id, role, content, message_type, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                conversation_id, 
+                msg.get("role", "user"),
+                content,
+                msg.get("type", "general"),
+                json.dumps(metadata) if metadata else None,
+                now
+            ))
+        
+        # Update conversation timestamp
+        cursor.execute('UPDATE conversations SET updated_at = ? WHERE id = ?', (now, conversation_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_conversation_messages(self, conversation_id: str) -> List[Dict]:
+        """Get all messages for a conversation
+        
+        Properly deserializes DataFrames and restores all message fields.
+        """
+        import pandas as pd
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT role, content, message_type, metadata, created_at
+            FROM messages 
+            WHERE conversation_id = ?
+            ORDER BY created_at
+        ''', (conversation_id,))
+        
+        messages = []
+        for row in cursor.fetchall():
+            msg = {
+                "role": row[0],
+                "content": row[1] or "",
+                "type": row[2] or "general"
+            }
+            
+            # Parse metadata and restore fields
+            if row[3]:
+                try:
+                    metadata = json.loads(row[3])
+                    
+                    # Restore DataFrame data
+                    if "data_json" in metadata:
+                        try:
+                            if isinstance(metadata["data_json"], list):
+                                msg["data"] = pd.DataFrame(metadata["data_json"])
+                            else:
+                                msg["data"] = metadata["data_json"]
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Restore source
+                    if "source" in metadata:
+                        msg["source"] = metadata["source"]
+                    
+                    # Restore image path
+                    if "image_path" in metadata:
+                        msg["image"] = metadata["image_path"]
+                    
+                    # Restore caption
+                    if "caption" in metadata:
+                        msg["caption"] = metadata["caption"]
+                    
+                    # Keep any other metadata
+                    remaining_meta = {k: v for k, v in metadata.items() 
+                                     if k not in ["data_json", "data_columns", "source", "image_path", "caption"]}
+                    if remaining_meta:
+                        msg["metadata"] = remaining_meta
+                        
+                except Exception as e:
+                    print(f"Failed to parse message metadata: {e}")
+            
+            messages.append(msg)
+        
+        conn.close()
+        return messages
+    
+    def get_user_conversations(self, user_id: str, limit: int = 20) -> List[Dict]:
+        """Get list of conversations for a user, most recent first"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, title, created_at, updated_at
+            FROM conversations 
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        
+        conversations = []
+        for row in cursor.fetchall():
+            conversations.append({
+                "id": row[0],
+                "title": row[1],
+                "created_at": row[2],
+                "updated_at": row[3]
+            })
+        
+        conn.close()
+        return conversations
+    
+    def update_conversation_title(self, conversation_id: str, title: str):
+        """Update conversation title"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE conversations SET title = ? WHERE id = ?
+        ''', (title, conversation_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def generate_title_from_message(self, first_message: str) -> str:
+        """Generate a short title from the first message"""
+        # Take first 40 chars, clean it up
+        title = first_message[:40].strip()
+        
+        # Remove command prefixes
+        for prefix in ["@archive", "@search", "@paper"]:
+            if title.lower().startswith(prefix):
+                title = title[len(prefix):].strip()
+        
+        # Add ellipsis if truncated
+        if len(first_message) > 40:
+            title += "..."
+        
+        return title or "New Chat"
+    
+    def delete_conversation(self, conversation_id: str):
+        """Delete a conversation and all its messages"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
+        cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_or_create_current(self, user_id: str) -> str:
+        """Get most recent conversation or create new one"""
+        conversations = self.get_user_conversations(user_id, limit=1)
+        
+        if conversations:
+            return conversations[0]["id"]
+        else:
+            return self.create_conversation(user_id)

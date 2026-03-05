@@ -70,8 +70,8 @@ class TestAgentMemory(unittest.TestCase):
             tool_call_response = 'I will search for HL Tau. [TOOL: search_by_target {"target_name": "HL Tau"}]'
             
             mock_chunk = MagicMock()
-            mock_chunk.choices[0].delta.content = tool_call_response
-            self.agent.client.chat.completions.create.return_value = [mock_chunk]
+            mock_chunk.output_text = tool_call_response
+            self.agent.client.responses.create.return_value = mock_chunk
             
             # Execute
             response = self.agent.stream_general_response("Search for HL Tau")

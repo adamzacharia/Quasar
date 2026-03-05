@@ -59,8 +59,8 @@ def test_agent_tool_execution():
     # Mock OpenAI client
     mock_client = MagicMock()
     mock_response = MagicMock()
-    mock_response.choices[0].message.content = 'I will search for it. [TOOL: search_by_target {"target_name": "Sz65", "facility": "ALMA"}]'
-    mock_client.chat.completions.create.return_value = mock_response
+    mock_response.output_text = 'I will search for it. [TOOL: search_by_target {"target_name": "Sz65", "facility": "ALMA"}]'
+    mock_client.responses.create.return_value = mock_response
     
     # Initialize agent with mocked client
     config = AgentConfig(api_key="fake-key")
@@ -71,14 +71,14 @@ def test_agent_tool_execution():
     agent.tool_registry.execute = MagicMock(return_value={"status": "success", "data": "mock data"})
     
     # We want to test process_query but we need to control the loop.
-    # The loop calls chat.completions.create.
+    # The loop calls responses.create.
     # First call returns tool call.
     # Second call (after tool execution) should return final answer.
     
     mock_response_final = MagicMock()
-    mock_response_final.choices[0].message.content = "I found the data."
+    mock_response_final.output_text = "I found the data."
     
-    mock_client.chat.completions.create.side_effect = [mock_response, mock_response_final]
+    mock_client.responses.create.side_effect = [mock_response, mock_response_final]
     
     # Run process_query
     result = agent.process_query("Find Sz65")

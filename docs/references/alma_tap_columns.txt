@@ -1,0 +1,295 @@
+ALMA TAP ivoa.obscore - 73 columns
+================================================================================
+
+access_estsize
+  Type: int, Unit: kbyte
+  Estimated size of datasets in kilobytes
+
+access_format
+  Type: char, Unit: 
+  Content format of the data
+
+access_url
+  Type: char, Unit: 
+  URL to download the data
+
+antenna_arrays
+  Type: char, Unit: 
+  Blank-separated list of Pad:Antenna pairs, i.e., A109:DV09 J504:DV02 J505:DV05 for antennas DV09, DV02 and DV05 sitting on pads A109, J504, and J505, respectively.
+
+asdm_uid
+  Type: char, Unit: 
+  UID of the ASDM containing this Field.
+
+authors
+  Type: char, Unit: 
+  Full list of first author and all co-authors
+
+band_list
+  Type: char, Unit: 
+  Space delimited list of bands
+
+bandwidth
+  Type: double, Unit: Hz
+  Total Bandwidth
+
+bib_reference
+  Type: char, Unit: 
+  Bibliography code
+
+calib_level
+  Type: int, Unit: 
+  calibration level (2 or 3). 2 if product_type = MOUS, 3 if product_type = GOUS
+
+collections
+  Type: char, Unit: 
+  Indicates that there are external products
+
+cont_sensitivity_bandwidth
+  Type: double, Unit: mJy/beam
+  Estimated noise in the aggregated continuum bandwidth. Note this is an indication only, it does not include the effects of flagging or dynamic range limitations.
+
+data_rights
+  Type: char, Unit: 
+  Access to data.
+
+dataproduct_type
+  Type: char, Unit: 
+  type of product
+
+em_max
+  Type: double, Unit: m
+  stop spectral coordinate value
+
+em_min
+  Type: double, Unit: m
+  start spectral coordinate value
+
+em_res_power
+  Type: double, Unit: 
+  typical spectral resolution
+
+em_resolution
+  Type: double, Unit: m
+  Estimated frequency resolution from all the spectral windows, using median values of channel widths.
+
+em_xel
+  Type: int, Unit: 
+  Number of elements along the spectral axis
+
+facility_name
+  Type: char, Unit: 
+  telescope name
+
+first_author
+  Type: char, Unit: 
+  The first author as provided by <a href="http://telbib.eso.org">telbib.eso.org</a>.
+
+frequency
+  Type: double, Unit: GHz
+  Observed (tuned) reference frequency on the sky.
+
+frequency_support
+  Type: char, Unit: GHz
+  All frequency ranges used by the field
+
+gal_latitude
+  Type: double, Unit: deg
+  Galactic latitude of the observation for RA/Dec. Estimated using PyEphem and RA/Dec.
+
+gal_longitude
+  Type: double, Unit: deg
+  Galactic longitude of the observation for RA/Dec. Estimated using PyEphem and RA/Dec.
+
+group_ous_uid
+  Type: char, Unit: 
+  Group OUS ID
+
+instrument_name
+  Type: char, Unit: 
+  instrument name
+
+is_mosaic
+  Type: char, Unit: 
+  Flag to indicate if this ASDM represents a mosaic or not.
+
+lastModified
+  Type: char, Unit: 
+  Time stamp of last modification of the metadata
+
+member_ous_uid
+  Type: char, Unit: 
+  Member OUS ID
+
+o_ucd
+  Type: char, Unit: 
+  UCD describing the observable axis (pixel values)
+
+obs_collection
+  Type: char, Unit: 
+  short name for the data collection
+
+obs_creator_name
+  Type: char, Unit: 
+  case-insensitive partial match over the full PI name. Wildcards can be used
+
+obs_id
+  Type: char, Unit: 
+  internal dataset identifier
+
+obs_publisher_did
+  Type: char, Unit: 
+  publisher dataset identifier
+
+obs_release_date
+  Type: char, Unit: 
+  timestamp of date the data becomes publicly available
+
+obs_title
+  Type: char, Unit: 
+  Case-insensitive search over the project title
+
+pi_name
+  Type: char, Unit: 
+  
+
+pi_userid
+  Type: char, Unit: 
+  
+
+pol_states
+  Type: char, Unit: 
+  polarization states present in the data
+
+pol_xel
+  Type: int, Unit: 
+  Number of polarization samples
+
+proposal_abstract
+  Type: char, Unit: 
+  Text search on the proposal abstract. Only abstracts will be returned which contain the given text. The search is case-insensitive.
+
+proposal_authors
+  Type: char, Unit: 
+  Full name of CoIs .
+
+proposal_id
+  Type: char, Unit: 
+  Identifier of proposal to which NO observation belongs.
+
+pub_abstract
+  Type: char, Unit: 
+  Case insensitive text search through the abstract of the publication.
+
+pub_title
+  Type: char, Unit: 
+  Case insensitive search through the title of the publication.
+
+publication_year
+  Type: int, Unit: 
+  The year the publication did appear in the printed version of the refereed journal.
+
+pwv
+  Type: float, Unit: mm
+  Estimated precipitable water vapour from the XML_CALWVR_ENTITIES table.
+
+qa2_passed
+  Type: char, Unit: 
+  Quality Assessment 2 status: does the Member / Group OUS fulfil the PI's requirements?
+
+s_dec
+  Type: double, Unit: deg
+  DEC of central coordinates
+
+s_fov
+  Type: double, Unit: deg
+  size of the region covered (~diameter of minimum bounding circle)
+
+s_ra
+  Type: double, Unit: deg
+  RA of central coordinates
+
+s_region
+  Type: char, Unit: 
+  region bounded by observation
+
+s_resolution
+  Type: double, Unit: arcsec
+  typical spatial resolution
+
+s_xel1
+  Type: int, Unit: 
+  Number of elements along the first spatial axis
+
+s_xel2
+  Type: int, Unit: 
+  Number of elements along the second spatial axis
+
+scan_intent
+  Type: char, Unit: 
+  Scan intent list for the observed field.
+
+schedblock_name
+  Type: char, Unit: 
+  Name of the Scheduling Block used as a template for executing the ASDM containing this Field.
+
+science_keyword
+  Type: char, Unit: 
+  
+
+science_observation
+  Type: char, Unit: 
+  Flag to indicate whether this is a science observation.
+
+scientific_category
+  Type: char, Unit: 
+  
+
+sensitivity_10kms
+  Type: double, Unit: mJy/beam
+  Estimated noise in an nominal 10km/s bandwidth. Note this is an indication only, it does not include the effects of flagging or Hanning smoothing, and a 10km/s bandwidth may not be achievable with the data as taken.
+
+spatial_resolution
+  Type: double, Unit: arcsec
+  Average of the maximum and minimum spatial resolution values of all spectral windows
+
+spatial_scale_max
+  Type: double, Unit: arcsec
+  Due to the fact that radio antennas can not be placed infinitely close, measurements do have a smallest separation which translates into a maximal angular distance beyond which features can not be resolved reliably any more. Adding observations with the ALMA Total Power array can add those missing largest scales.
+
+spectral_resolution
+  Type: double, Unit: kHz
+  
+
+t_exptime
+  Type: double, Unit: s
+  exposure time of observation
+
+t_max
+  Type: double, Unit: d
+  end time of observation (MJD)
+
+t_min
+  Type: double, Unit: d
+  start time of observation (MJD)
+
+t_resolution
+  Type: double, Unit: s
+  typical temporal resolution
+
+t_xel
+  Type: int, Unit: 
+  Number of elements along the time axis
+
+target_name
+  Type: char, Unit: 
+  name of intended target
+
+type
+  Type: char, Unit: 
+  Type flags.
+
+velocity_resolution
+  Type: double, Unit: m/s
+  Estimated velocity resolution from all the spectral windows, from frequency resolution.
+

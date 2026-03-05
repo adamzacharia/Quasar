@@ -31,8 +31,23 @@ if str(root_path) not in sys.path:
     sys.path.append(str(root_path))
 
 from core.prompts import ENTITY_EXTRACTION_PROMPT
-from core.prompts import ENTITY_EXTRACTION_PROMPT
 from services.rag_service import RAGService
+from services.conversation_service import ConversationService
+
+# Import visualization components
+try:
+    from ui.visualization_components import render_visualization_panel, render_quick_visualization_buttons
+    VIZ_COMPONENTS_AVAILABLE = True
+except ImportError:
+    VIZ_COMPONENTS_AVAILABLE = False
+
+# Import advanced query components
+try:
+    from ui.advanced_query_components import render_advanced_query_panel
+    ADV_QUERY_AVAILABLE = True
+except ImportError:
+    ADV_QUERY_AVAILABLE = False
+
 from services.auth import AuthService
 
 # Load environment variables
@@ -43,8 +58,9 @@ st.set_page_config(
     page_title="Quasar - Radio Astronomy Assistant",
     page_icon="🔭",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"  # Show document upload sidebar
 )
+
 
 # ... (rest of the file) ...
 
@@ -59,235 +75,321 @@ hide_st_style = """
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
-</style>
-"""
-st.markdown(hide_st_style, unsafe_allow_html=True)
-
-# YOUR BEAUTIFUL CSS WITH ALL ANIMATIONS
-st.markdown("""
-<style>
-    /* Dark gradient background */
+    
+    /* ============================================================
+       PLAYGROUND-STYLE THEME - Solid Dark Teal
+       ============================================================ */
+    
+    /* Main background - solid dark navy */
     .stApp {
-        background: linear-gradient(to bottom, #0a0e27 0%, #1a1e3a 100%);
-    }
-
-    /* Add stars as pseudo-element */
-    .stApp::after {
-        content: '';
-        position: fixed;
-        width: 100%;
-        height: 100%;
-        top: 0;
-        left: 0;
-        background-image:
-            radial-gradient(2px 2px at 20% 30%, white, transparent),
-            radial-gradient(2px 2px at 60% 70%, white, transparent),
-            radial-gradient(1px 1px at 50% 50%, white, transparent),
-            radial-gradient(3px 3px at 80% 10%, white, transparent),
-            radial-gradient(2px 2px at 90% 60%, white, transparent),
-            radial-gradient(1px 1px at 30% 80%, white, transparent),
-            radial-gradient(2px 2px at 70% 40%, white, transparent),
-            radial-gradient(1px 1px at 15% 15%, white, transparent),
-            radial-gradient(1px 1px at 85% 85%, white, transparent),
-            radial-gradient(2px 2px at 45% 25%, white, transparent),
-            radial-gradient(1px 1px at 25% 65%, white, transparent),
-            radial-gradient(3px 3px at 55% 45%, white, transparent),
-            radial-gradient(1px 1px at 65% 90%, white, transparent),
-            radial-gradient(2px 2px at 35% 15%, white, transparent),
-            radial-gradient(1px 1px at 95% 35%, white, transparent);
-        background-size: 200% 200%;
-        animation: twinkle 20s ease-in-out infinite;
-        pointer-events: none;
-        z-index: -1;
-    }
-
-    @keyframes twinkle {
-        0%, 100% { opacity: 0.5; }
-        50% { opacity: 1; }
-    }
-
-    /* Ensure content is visible above stars */
-    .main > div {
-        position: relative;
-        z-index: 2;
-    }
-
-    /* Force chat input to be on top */
-    .stChatInput {
-        z-index: 1000 !important;
-        position: relative;
+        background: #0a1628 !important;
     }
     
-    /* Fix for bottom container */
-    .stBottom {
-        z-index: 1000 !important;
+    /* Remove any pseudo-elements */
+    .stApp::before, .stApp::after {
+        display: none !important;
     }
-
-    /* Header styling */
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        background: linear-gradient(90deg, #00d4ff 0%, #7a5fff 50%, #ff006e 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        padding: 1rem;
-        position: relative;
-        z-index: 10;
+    
+    /* SIDEBAR STYLING - 1.5x wider, lighter navy */
+    [data-testid="stSidebar"] {
+        display: block !important;
+        min-width: 350px !important;
+        width: 350px !important;
+        background: #112340 !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
     }
-
-    /* Make text visible */
+    
+    /* Hide collapse button */
+    [data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] {
+        display: none !important;
+    }
+    
+    /* Sidebar content */
+    [data-testid="stSidebar"] > div {
+        background: transparent !important;
+        padding: 0.5rem 1rem !important;
+    }
+    
+    /* Sidebar text */
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #f472b6 !important;
+    }
+    
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] label {
+        color: #94a3b8 !important;
+    }
+    
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255, 255, 255, 0.1) !important;
+    }
+    
+    /* New Chat button - pink accent */
+    [data-testid="stSidebar"] button[kind="primary"] {
+        background: #f472b6 !important;
+        color: #0a1628 !important;
+        border: none !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+    }
+    
+    /* Regular buttons */
+    [data-testid="stSidebar"] button {
+        background: transparent !important;
+        color: #94a3b8 !important;
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        border-radius: 8px !important;
+    }
+    
+    /* MAIN AREA */
+    .main > div {
+        background: transparent !important;
+    }
+    
+    /* Text colors */
     .stMarkdown {
-        color: #e0e0e0;
+        color: #e2e8f0 !important;
     }
-
+    
     h1, h2, h3, h4, h5, h6 {
         color: #ffffff !important;
     }
-
-    /* Chat message styling */
+    
+    p {
+        color: #ffffff !important;
+    }
+    
+    /* Model selector dropdown */
+    [data-testid="stSelectbox"] {
+        max-width: 250px !important;
+    }
+    
+    [data-testid="stSelectbox"] > div > div {
+        background: #1a3a5c !important;
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        border-radius: 8px !important;
+        color: white !important;
+    }
+    
+    /* Tool calling card */
+    .tool-card {
+        background: rgba(255, 255, 255, 0.02) !important;
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 12px !important;
+        padding: 1.5rem !important;
+        max-width: 400px !important;
+        margin: 1rem auto !important;
+    }
+    
+    /* Chat input - floating modern style */
+    [data-testid="stBottom"] {
+        background: transparent !important;
+        padding: 1rem 2rem !important;
+    }
+    
+    [data-testid="stBottom"] > div {
+        background: transparent !important;
+    }
+    
+    [data-testid="stChatInput"] {
+        background: rgba(26, 58, 92, 0.8) !important;
+        border: 1px solid rgba(255, 255, 255, 0.15) !important;
+        border-radius: 28px !important;
+        backdrop-filter: blur(10px) !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3) !important;
+    }
+    
+    [data-testid="stChatInput"]:focus-within {
+        border-color: #f472b6 !important;
+        box-shadow: 0 4px 25px rgba(244, 114, 182, 0.2) !important;
+    }
+    
+    [data-testid="stChatInput"] textarea {
+        background: transparent !important;
+        color: white !important;
+    }
+    
+    [data-testid="stChatInput"] textarea::placeholder {
+        color: #64748b !important;
+    }
+    
+    /* Chat messages */
     .stChatMessage {
-        background: rgba(255, 255, 255, 0.05);
-        backdrop-filter: blur(10px);
-        border-radius: 10px;
-    }
-
-    /* Button styling */
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea, #764ba2);
-        color: white;
-        border: none;
-        padding: 0.5rem 1rem;
-        border-radius: 10px;
-    }
-
-    /* Paper type badges */
-    .arxiv-badge {
-        background: linear-gradient(135deg, #FF6B6B, #C44569);
-        color: white;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.85em;
-        display: inline-block;
-        margin-right: 5px;
-    }
-
-    .published-badge {
-        background: linear-gradient(135deg, #4ECDC4, #44A08D);
-        color: white;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.85em;
-        display: inline-block;
-        margin-right: 5px;
-    }
-
-    /* Shooting stars */
-    .shooting-star {
-        position: fixed;
-        width: 2px;
-        height: 2px;
-        background: white;
-        box-shadow: 0 0 6px 2px white;
-        animation: shoot 3s linear infinite;
-        z-index: 0;
-        pointer-events: none;
-    }
-
-    @keyframes shoot {
-        0% {
-            transform: translateX(0) translateY(0);
-            opacity: 1;
-        }
-        100% {
-            transform: translateX(300px) translateY(300px);
-            opacity: 0;
-        }
-    }
-
-    /* Supernova effect */
-    .supernova {
-        position: fixed;
-        width: 10px;
-        height: 10px;
-        background: white;
-        border-radius: 50%;
-        animation: explode 10s ease-out infinite;
-        z-index: 0;
-        pointer-events: none;
-    }
-
-    @keyframes explode {
-        0% {
-            width: 10px;
-            height: 10px;
-            opacity: 0;
-        }
-        5% {
-            width: 20px;
-            height: 20px;
-            opacity: 1;
-            box-shadow: 0 0 30px 10px rgba(255, 255, 255, 0.8);
-        }
-        20% {
-            width: 40px;
-            height: 40px;
-            opacity: 0.5;
-            box-shadow: 0 0 50px 20px rgba(255, 200, 100, 0.5);
-        }
-        100% {
-            width: 10px;
-            height: 10px;
-            opacity: 0;
-        }
+        background: rgba(255, 255, 255, 0.03) !important;
+        border-radius: 12px !important;
     }
     
-    /* Command Tags */
-    .cmd-tag {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.9em;
-        font-weight: bold;
-        color: white;
-        margin-right: 5px;
+    /* Links */
+    a {
+        color: #f472b6 !important;
+        text-decoration: none !important;
     }
     
-    .archive-tag {
-        background: linear-gradient(135deg, #FF6B6B, #EE5253);
-        box-shadow: 0 2px 4px rgba(255, 107, 107, 0.3);
+    a:hover {
+        text-decoration: underline !important;
     }
     
-    .search-tag {
-        background: linear-gradient(135deg, #4834d4, #686de0);
-        box-shadow: 0 2px 4px rgba(72, 52, 212, 0.3);
+    /* Expander styling */
+    .stExpander {
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 8px !important;
+        background: rgba(255, 255, 255, 0.02) !important;
     }
     
-    .paper-tag {
-        background: linear-gradient(135deg, #6ab04c, #badc58);
-        text-shadow: 0 1px 1px rgba(0,0,0,0.2);
+    /* File uploader styling - make visible */
+    [data-testid="stFileUploader"] {
+        background: rgba(255, 255, 255, 0.03) !important;
+        border: 1px dashed rgba(255, 255, 255, 0.2) !important;
+        border-radius: 8px !important;
+        padding: 0.75rem !important;
+    }
+    
+    [data-testid="stFileUploader"] label {
+        color: #94a3b8 !important;
+    }
+    
+    [data-testid="stFileUploader"] button {
+        background: #f472b6 !important;
+        color: #0a1628 !important;
+    }
+    
+    /* External links styling */
+    .external-link {
+        color: #f472b6 !important;
+        font-size: 1.1rem !important;
+        padding: 0.25rem 0 !important;
+        display: block !important;
+    }
+    
+    /* Logo text */
+    .logo-text {
+        color: #f472b6 !important;
+        font-size: 1.5rem !important;
+        font-weight: 600 !important;
+        margin-top: 0.5rem !important;
+    }
+    
+    /* Footer text */
+    .footer-text {
+        color: #64748b !important;
+        font-size: 0.75rem !important;
+        text-align: center !important;
     }
 </style>
+"""
 
-<!-- Add shooting stars -->
-<div class="shooting-star" style="top: 10%; left: 10%; animation-delay: 0s;"></div>
-<div class="shooting-star" style="top: 30%; left: 80%; animation-delay: 1s;"></div>
-<div class="shooting-star" style="top: 60%; left: 20%; animation-delay: 2s;"></div>
+st.markdown(hide_st_style, unsafe_allow_html=True)
 
-<!-- Add supernovae -->
-<div class="supernova" style="top: 25%; left: 65%; animation-delay: 0s;"></div>
-<div class="supernova" style="top: 70%; left: 35%; animation-delay: 5s;"></div>
-""", unsafe_allow_html=True)
-
-def render_header():
-    """Render application header with animation"""
-    header_html = """
-    <div style='position: relative; z-index: 20; padding: 0.5rem 0;'>
-        <div class="main-header">🌌 QUASAR 🔭</div>
-        <center><p style='color: #00d4ff; font-size: 1rem; margin-top: -0.5rem;'>Radio Astronomy Intelligence System</p></center>
-    </div>
+def render_sidebar_logo():
+    """Render logo and QUASAR text in sidebar using SVG"""
+    # SVG Logo (Quasar stylized Q)
+    logo_svg = """
+    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+            <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" style="stop-color:#f472b6;stop-opacity:1" />
+                <stop offset="100%" style="stop-color:#c084fc;stop-opacity:1" />
+            </linearGradient>
+            <filter id="glow">
+                <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
+                <feMerge>
+                    <feMergeNode in="coloredBlur"/>
+                    <feMergeNode in="SourceGraphic"/>
+                </feMerge>
+            </filter>
+        </defs>
+        <circle cx="50" cy="50" r="35" stroke="url(#grad1)" stroke-width="6" fill="transparent" filter="url(#glow)"/>
+        <line x1="68" y1="68" x2="88" y2="88" stroke="url(#grad1)" stroke-width="6" stroke-linecap="round" filter="url(#glow)"/>
+        <circle cx="50" cy="50" r="15" fill="#f472b6" opacity="0.8">
+            <animate attributeName="opacity" values="0.8;0.4;0.8" dur="3s" repeatCount="indefinite" />
+        </circle>
+    </svg>
     """
-    st.markdown(header_html, unsafe_allow_html=True)
+    
+    st.markdown(f"""
+    <div style='text-align: center; padding: 0.5rem 0 1rem 0;'>
+        <div style="width: 80px; height: 80px; margin: 0 auto;">
+            {logo_svg}
+        </div>
+        <div style='color: #f472b6; font-size: 1.8rem; font-weight: 700; margin-top: 0.5rem; letter-spacing: 3px; text-shadow: 0 0 10px rgba(244, 114, 182, 0.3);'>QUASAR</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_model_selector_top():
+    """Render model selector at top left of main area (like Playground)"""
+    available_models = [
+        "gpt-4o",
+        "gpt-4o-mini", 
+        "gpt-4.1",
+        "gpt-3.5-turbo"
+    ]
+    
+    selected_model = st.selectbox(
+        "Model:",
+        available_models,
+        index=0,
+        key="model_selector",
+        label_visibility="collapsed"
+    )
+    
+    # Update agent if exists
+    if 'agent' in st.session_state:
+        if st.session_state.agent.config.model != selected_model:
+            st.session_state.agent.config.model = selected_model
+            st.session_state.agent.set_model(selected_model)
+    
+    return selected_model
+
+def render_main_content_center():
+    """Render center content with logo and welcome message"""
+    import base64
+    from pathlib import Path
+    
+    # Load logo
+    logo_path = Path(__file__).parent / "assets" / "quasar_logo.png"
+    logo_b64 = ""
+    if logo_path.exists():
+        with open(logo_path, "rb") as f:
+            logo_b64 = base64.b64encode(f.read()).decode()
+    
+    # Get selected model
+    selected_model = st.session_state.get('model_selector', 'gpt-4o')
+    
+    # Center content with logo
+    st.markdown("<div style='height: 60px;'></div>", unsafe_allow_html=True)
+    
+    if logo_b64:
+        st.markdown(f"""
+        <div style='text-align: center;'>
+            <img src="data:image/png;base64,{logo_b64}" style="width: 100px; height: 100px;" />
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='text-align: center; font-size: 5rem;'>🔭</div>", unsafe_allow_html=True)
+    
+    # Welcome text with examples (no model link)
+    st.markdown("""
+    <div style='text-align: center; max-width: 500px; margin: 1.5rem auto;'>
+        <p style='color: #94a3b8; font-size: 0.95rem; line-height: 1.6;'>
+            Your AI assistant for radio astronomy research.<br><br>
+            Try: <span style='color: #f472b6;'>@archive</span> Find ALMA data for Sz65<br>
+            Or: <span style='color: #f472b6;'>@paper</span> Papers on protoplanetary disks
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_footer():
+    """Render footer text"""
+    st.markdown("""
+    <div style='text-align: center; color: #64748b; font-size: 0.75rem; padding: 1rem 0;'>
+        Always fact-check your results. Quasar is designed for radio astronomy research.
+    </div>
+    """, unsafe_allow_html=True)
+
 
 def format_message_with_tags(content):
     """Format message content to replace command prefixes with visual tags"""
@@ -310,7 +412,6 @@ def format_message_with_tags(content):
 
 from core.agent import QuasarAgent, AgentConfig
 
-from core.agent import QuasarAgent, AgentConfig
 
 
 
@@ -318,10 +419,35 @@ from core.agent import QuasarAgent, AgentConfig
 
 
 
-
+def auto_save_conversation():
+    """Auto-save current conversation to database"""
+    try:
+        if 'conv_service' in st.session_state and 'current_conv_id' in st.session_state:
+            if st.session_state.messages:
+                st.session_state.conv_service.save_full_conversation(
+                    st.session_state.current_conv_id,
+                    st.session_state.messages
+                )
+                # Update title from first user message (only if "New Chat")
+                first_msg = next((m for m in st.session_state.messages if m.get("role") == "user"), None)
+                if first_msg:
+                    convs = st.session_state.conv_service.get_user_conversations(
+                        st.session_state.get('user_id', ''), limit=1
+                    )
+                    if convs and convs[0]["id"] == st.session_state.current_conv_id:
+                        if convs[0]["title"] == "New Chat":
+                            title = st.session_state.conv_service.generate_title_from_message(
+                                first_msg.get("content", "")
+                            )
+                            st.session_state.conv_service.update_conversation_title(
+                                st.session_state.current_conv_id, title
+                            )
+    except Exception as e:
+        pass  # Silent fail for background save
 
 
 def display_papers(papers_df, source_name):
+
     """Enhanced display with arXiv/published differentiation"""
 
     if papers_df is None or papers_df.empty:
@@ -535,6 +661,14 @@ def display_results_with_summary(df, source_name, agent):
         summary = agent.generate_summary(df, source_name)
         st.info(summary)
 
+    # =========================================================================
+    # ADVANCED VISUALIZATIONS PANEL
+    # =========================================================================
+    if VIZ_COMPONENTS_AVAILABLE:
+        st.markdown("---")
+        with st.expander("📈 **Advanced Visualizations** (click to expand)", expanded=False):
+            render_visualization_panel(df, key_prefix=f"viz_{source_name.replace(' ', '_')}")
+    
     # Download button
     csv = df.to_csv(index=False)
     st.download_button(
@@ -570,7 +704,19 @@ def render_chat_interface():
 
     # Chat input
     if prompt := st.chat_input("Ask me anything about radio astronomy..."):
+        # Fix 6: Clear any previous error state
+        if 'error_message' in st.session_state:
+            st.session_state.error_message = None
+        if 'last_error' in st.session_state:
+            st.session_state.last_error = None
+        
+        # SYNC: Ensure agent memory matches UI before processing
+        if hasattr(st.session_state, 'agent') and hasattr(st.session_state.agent, 'memory'):
+            if hasattr(st.session_state.agent.memory, 'sync_from_ui'):
+                st.session_state.agent.memory.sync_from_ui(st.session_state.messages)
+            
         st.session_state.messages.append({"role": "user", "content": prompt})
+
 
         with st.chat_message("user"):
             st.markdown(format_message_with_tags(prompt), unsafe_allow_html=True)
@@ -588,13 +734,16 @@ def render_chat_interface():
                 # Use the same robust extraction as the main query to handle "the source is Sz65"
                 try:
                     extraction_prompt = ENTITY_EXTRACTION_PROMPT.format(query=prompt)
-                    response = st.session_state.agent.client.chat.completions.create(
+                    response = st.session_state.agent.client.responses.create(
                         model="gpt-4o",
-                        messages=[{"role": "user", "content": extraction_prompt}],
-                        response_format={"type": "json_object"},
+                        input=extraction_prompt,
+                        instructions="Extract entities from the user's message. Respond with JSON only.",
+                        text={"format": {"type": "json_object"}},
                         temperature=0.1
                     )
-                    result = json.loads(response.choices[0].message.content)
+                    # Extract text from Responses API
+                    output_text = response.output_text if hasattr(response, 'output_text') else str(response)
+                    result = json.loads(output_text)
                     extracted_name = result.get("source_name")
                     
                     # Use extracted name if found, otherwise fallback to raw input (cleaned)
@@ -659,13 +808,37 @@ def render_chat_interface():
                     intent = "general"
 
             if intent == "general":
-                # Stream general responses
+                # === THINKING BUBBLE FEATURE ===
+                # Create a placeholder for the thinking bubble that we can clear
+                thinking_placeholder = st.empty()
+                
+                with thinking_placeholder.container():
+                    with st.expander("🧠 **Thinking...**", expanded=True):
+                        # Show planning steps
+                        if prompt.lower().startswith("@archive"):
+                            st.markdown("📡 **Command detected:** `@archive`")
+                            st.markdown("🔍 Planning to search ALMA archive...")
+                        elif prompt.lower().startswith("@search"):
+                            st.markdown("🧠 **Command detected:** `@search`")
+                            st.markdown("📚 Consulting ALMA Manual (RAG)...")
+                        elif prompt.lower().startswith("@paper"):
+                            st.markdown("📚 **Command detected:** `@paper`")
+                            st.markdown("🔎 Will search NASA ADS for papers...")
+                        else:
+                            st.markdown("💭 Analyzing query intent...")
+                
+                # Stream general responses - ALWAYS use Responses API
                 message_placeholder = st.empty()
-                full_response = st.session_state.agent.stream_general_response(
+                
+                # Use Responses API method (default and only path)
+                full_response = st.session_state.agent.stream_response_api(
                     prompt, 
                     message_placeholder,
                     user_id=st.session_state.get('user_id', 'user')
                 )
+                
+                # Clear the thinking bubble once response is complete
+                thinking_placeholder.empty()
 
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -676,18 +849,24 @@ def render_chat_interface():
                 # Check for side-effects (Tool results)
                 # Use getattr to prevent AttributeError if agent is stale
                 last_run_result = getattr(st.session_state.agent, 'last_run_result', None)
+                
+                # Handle tool results
                 if last_run_result:
+
                     result = last_run_result
                     
                     if result.get("type") == "image":
-                        st.image(result["path"], caption=result.get("caption", "Generated Plot"))
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": "",
-                            "image": result["path"],
-                            "caption": result.get("caption"),
-                            "type": "image"
-                        })
+                        # Fix 5: Handle both bytes (new) and path (legacy) image data
+                        image_data = result.get("image_bytes") or result.get("path")
+                        if image_data:
+                            st.image(image_data, caption=result.get("caption", "Generated Plot"))
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": "",
+                                "image": image_data,  # Store bytes or path
+                                "caption": result.get("caption"),
+                                "type": "image"
+                            })
                     
                     elif result.get("type") == "papers":
                         # Render the papers table
@@ -779,8 +958,12 @@ def render_chat_interface():
                         "content": response,
                         "type": "general"
                     })
+        
+        # Auto-save conversation after each interaction
+        auto_save_conversation()
 
 def render_login_page():
+
     """Render the login/registration page"""
     st.markdown("""
     <div style='text-align: center; padding: 2rem;'>
@@ -835,23 +1018,187 @@ def main():
         render_login_page()
         return
 
-    # Sidebar with user info and logout
+    # Initialize session state for uploads
+    if 'upload_status' not in st.session_state:
+        st.session_state.upload_status = None
+    
+    # Get user's RAG service (with personal collection)
+    user_id = st.session_state.user_id
+    
+    # Sidebar FIRST (always show) - Playground style
     with st.sidebar:
-        st.title("User Profile")
-        st.write(f"Logged in as: **{st.session_state.username}**")
-        if st.button("Logout", type="primary"):
+        # Logo and QUASAR text at top
+        render_sidebar_logo()
+        
+        st.divider()
+        
+        # New Chat button
+        if st.button("+ New chat", use_container_width=True, type="primary"):
+            # Save current conversation first
+            if st.session_state.messages:
+                conv_service = st.session_state.get('conv_service')
+                if conv_service:
+                    conv_service.save_full_conversation(
+                        st.session_state.current_conv_id, 
+                        st.session_state.messages
+                    )
+            
+            # Create new conversation
+            if 'conv_service' in st.session_state:
+                new_id = st.session_state.conv_service.create_conversation(user_id)
+                st.session_state.current_conv_id = new_id
+            st.session_state.messages = []
+            if hasattr(st.session_state, 'agent') and hasattr(st.session_state.agent, 'memory'):
+                st.session_state.agent.memory.clear()
+            st.rerun()
+        
+        st.divider()
+        
+        # Thread History section
+        with st.expander("Thread history", expanded=False):
+            # Initialize conversation service
+            if 'conv_service' not in st.session_state:
+                st.session_state.conv_service = ConversationService()
+            conv_service = st.session_state.conv_service
+            
+            # Initialize current conversation if needed
+            if 'current_conv_id' not in st.session_state:
+                st.session_state.current_conv_id = conv_service.get_or_create_current(user_id)
+            
+            # List recent conversations
+            conversations = conv_service.get_user_conversations(user_id, limit=10)
+            
+            if conversations:
+                for conv in conversations:
+                    is_current = conv["id"] == st.session_state.get("current_conv_id")
+                    label = f"{'▶ ' if is_current else ''}{conv['title'][:30]}"
+                    
+                    if st.button(label, key=f"conv_{conv['id']}", use_container_width=True, 
+                                disabled=is_current):
+                        # Save current before switching
+                        if st.session_state.messages:
+                            conv_service.save_full_conversation(
+                                st.session_state.current_conv_id,
+                                st.session_state.messages
+                            )
+                        
+                        # Load selected conversation
+                        st.session_state.current_conv_id = conv["id"]
+                        st.session_state.messages = conv_service.get_conversation_messages(conv["id"])
+                        st.rerun()
+            else:
+                st.caption("No conversations yet")
+        
+        st.divider()
+        
+        # =====================================================================
+        # ADD CUSTOM TOOLS
+        # =====================================================================
+        with st.expander("Add Tools", expanded=False):
+            st.markdown("Add your own function tools:")
+            
+            tool_name = st.text_input("Tool name", placeholder="my_custom_tool", key="tool_name_input")
+            tool_desc = st.text_area("Description", placeholder="What does this tool do?", 
+                                     height=60, key="tool_desc_input")
+            tool_code = st.text_area("Python code", height=120, key="tool_code_input",
+                                     placeholder='''def my_custom_tool(param1: str) -> dict:
+    """Your tool logic here"""
+    return {"result": "success"}''')
+            
+            if st.button("+ Add Tool", use_container_width=True):
+                if tool_name and tool_code:
+                    # Save tool definition to file
+                    tools_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "user_tools", user_id)
+                    os.makedirs(tools_dir, exist_ok=True)
+                    tool_file = os.path.join(tools_dir, f"{tool_name}.py")
+                    with open(tool_file, "w") as f:
+                        f.write(f'"""{tool_desc}"""\n\n{tool_code}')
+                    st.success(f"✓ Tool '{tool_name}' saved!")
+                    st.info("Restart app to load new tools")
+                else:
+                    st.warning("Please fill in name and code")
+        
+        st.divider()
+
+        # =====================================================================
+        # DOCUMENT UPLOAD (Personal RAG)
+        # =====================================================================
+        st.markdown("**My Documents**")
+        
+        # Initialize RAG service
+        rag_service = None
+        try:
+            if 'rag_service' not in st.session_state or st.session_state.get('rag_user_id') != user_id:
+                st.session_state.rag_service = RAGService(user_id=user_id)
+                st.session_state.rag_user_id = user_id
+            rag_service = st.session_state.rag_service
+        except:
+            try:
+                st.session_state.rag_service = RAGService()
+                rag_service = st.session_state.rag_service
+            except:
+                pass
+        
+        if rag_service:
+            uploaded_file = st.file_uploader("Add to your knowledge base", type=["pdf", "txt"], 
+                                             label_visibility="collapsed", key="doc_upload")
+            
+            if uploaded_file is not None:
+                if st.button("Upload", use_container_width=True):
+                    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "user_uploads", user_id)
+                    os.makedirs(upload_dir, exist_ok=True)
+                    file_path = os.path.join(upload_dir, uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    try:
+                        result = rag_service.ingest_document(file_path, personal=True)
+                        if result.get("success"):
+                            st.success(f"✓ Added {uploaded_file.name}")
+                        else:
+                            st.error("Upload failed")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        
+        st.divider()
+        
+        # =====================================================================
+        # LINKS AND LOG OUT
+        # =====================================================================
+        st.markdown("""
+        <div style='font-size: 0.9rem; margin-bottom: 0.5rem;'>
+            <a href='/documentation' target='_self' style='color: #f472b6; text-decoration: none;'>Documentation</a>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Log out button
+        if st.button("Log out", use_container_width=True):
             del st.session_state.user_id
             del st.session_state.username
             st.rerun()
+
             
-    render_header()
+    # Model selector at top left (Playground style)
+    # Model selector at top left (Playground style)
+    # Side-by-side layout: "Model:" label + Dropdown
+    top_cols = st.columns([2, 5])
+    with top_cols[0]:
+        sub_c1, sub_c2 = st.columns([1, 3])
+        with sub_c1:
+             st.markdown("<div style='padding-top: 10px; font-weight: 600; white-space: nowrap;'>Model:</div>", unsafe_allow_html=True)
+        with sub_c2:
+             selected_model = render_model_selector_top()
+    
+    # Enable Responses API by default (no toggle needed)
+    st.session_state['use_responses_api'] = True
 
     # Initialize session state
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
     # API key setup
-    AGENT_VERSION = "3.6"  # Bump to force re-init (UI Text Update)
+    AGENT_VERSION = "3.9"  # Bump to force re-init (Chat History)
+
+
     
     # Check if agent exists AND has the new attributes
     agent_is_stale = False
@@ -877,13 +1224,6 @@ def main():
         # Manually set ADS key if provided, to avoid init issues if class definition is stale
         if ads_key and hasattr(config, 'ads_api_key'):
             config.ads_api_key = ads_key
-            
-        # Initialize RAG service with caching
-        @st.cache_resource
-        def get_rag_service():
-            return RAGService()
-            
-        rag_service = get_rag_service()
         
         try:
             # Try new signature with rag_service
@@ -894,23 +1234,13 @@ def main():
             
         st.session_state.agent_version = AGENT_VERSION
 
-    # Sidebar removed as requested
-
-    # Welcome message
+    # Welcome message (Playground style - logo in center, tool card)
     if not st.session_state.messages:
-        st.markdown("""
-        <div style='text-align: center; padding: 1rem;'>
-            <h3 style='color: #00d4ff;'>Welcome to Quasar! 🌟</h3>
-            <p style='color: #a0a0a0;'>
-                Your Radio Astronomy Intelligence System<br><br>
-                I can search data archives, find papers, generate code, and answer questions.<br><br>
-                <b>Try:</b> <span class="cmd-tag archive-tag">@archive</span> Please make a table of the different (ALMA) datasets that exist for Sz65, so we can select the one with the best sensitivity and angular resolution.<br>
-                <b>or</b> <span class="cmd-tag search-tag">@search</span> How long is the proprietary period for Principal Investigator data?
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
+        # Render centered content with logo and tool card
+        render_main_content_center()
 
     render_chat_interface()
+
 
 if __name__ == "__main__":
     main()

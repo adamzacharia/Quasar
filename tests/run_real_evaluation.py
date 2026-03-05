@@ -84,12 +84,12 @@ def get_judge_verdict(client, question, answer, context=""):
     Output ONLY: [PASS] or [FAIL] followed by a 1-sentence reason.
     """
     try:
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model="gpt-3.5-turbo", # Use cheaper model for eval
-            messages=[{"role": "user", "content": prompt}],
+            input=prompt,
             temperature=0
         )
-        return response.choices[0].message.content
+        return response.output_text
     except Exception as e:
         return f"[ERROR] {str(e)}"
 

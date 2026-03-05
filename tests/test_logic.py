@@ -1,13 +1,13 @@
 import json
 
-# Mock classes
+# Mock classes — updated for Responses API shape
 class MockOpenAI:
     def __init__(self):
-        self.chat = self
-        self.completions = self
+        self.responses = self
 
-    def create(self, model, messages, temperature, response_format=None, max_tokens=None):
-        content = messages[0]['content']
+    def create(self, model, input, temperature=0.1, instructions=None,
+               text=None, max_output_tokens=None, **kwargs):
+        content = input
         if "INTENT_CLASSIFICATION" in content or "classify the user's intent" in content:
             if "Search for ALMA data" in content and "Sz65" not in content:
                 return MockResponse('{"intent": "SEARCH", "confidence": 0.9}')
@@ -24,15 +24,7 @@ class MockOpenAI:
 
 class MockResponse:
     def __init__(self, content):
-        self.choices = [MockChoice(content)]
-
-class MockChoice:
-    def __init__(self, content):
-        self.message = MockMessage(content)
-
-class MockMessage:
-    def __init__(self, content):
-        self.content = content
+        self.output_text = content
 
 class MockMemory:
     def __init__(self):
@@ -47,22 +39,22 @@ class AgentLogicTest:
         self.config = type('Config', (), {'model': 'gpt-4', 'verbose': True})()
 
     def determine_intent(self, query):
-        # Simplified logic from agent.py
-        response = self.client.chat.completions.create(
+        # Simplified logic from agent.py — Responses API
+        response = self.client.responses.create(
             model=self.config.model,
-            messages=[{"role": "user", "content": "classify the user's intent: " + query}],
+            input="classify the user's intent: " + query,
             temperature=0.1
         )
-        return json.loads(response.choices[0].message.content)
+        return json.loads(response.output_text)
 
     def extract_entities(self, query):
-        # Simplified logic from agent.py
-        response = self.client.chat.completions.create(
+        # Simplified logic from agent.py — Responses API
+        response = self.client.responses.create(
             model=self.config.model,
-            messages=[{"role": "user", "content": "Extract the following entities: " + query}],
+            input="Extract the following entities: " + query,
             temperature=0.1
         )
-        return json.loads(response.choices[0].message.content)
+        return json.loads(response.output_text)
 
     def process_query(self, query):
         print(f"Processing: {query}")

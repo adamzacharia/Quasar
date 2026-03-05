@@ -1,16 +1,22 @@
-# Quasar 🌌
+# Quasar
+
+![Python Version](https://img.shields.io/badge/python-3.9%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=streamlit&logoColor=white)
+![OpenAI](https://img.shields.io/badge/OpenAI-412991?logo=openai&logoColor=white)
+
 <img width="1897" height="783" alt="image" src="https://github.com/user-attachments/assets/f38936a3-c8f2-4aad-a00a-145327aaf0bb" />
 
-## AI Powered Radio Astronomy Data Discovery & Processing
+## AI-Powered Radio Astronomy Data Discovery and Processing
 
 Quasar is an intelligent assistant that bridges natural language queries with the National Radio Astronomy Observatory (NRAO) archives, enabling seamless discovery, calibration, and visualization of radio astronomy data.
 
 ## Features
 
-- 🔍 **Natural Language Archive Search** - Query ALMA observations using plain English (powered by `alminer`)
-- 📚 **Literature Integration** - NASA ADS API for finding related publications
-- 🧠 **Technical RAG** - Intelligent Q&A based on the ALMA Proposer's Guide
-- 🤖 **AI-Powered Workflow** - Interpret intent and execute complex queries
+- **Natural Language Archive Search** - Query ALMA observations using standard English (powered by `alminer`)
+- **Literature Integration** - NASA ADS API for identifying related publications
+- **Technical RAG** - Intelligent Q&A based on the ALMA Proposer's Guide
+- **AI-Powered Workflow** - Interpret user intent and execute complex queries
 
 ## Prerequisites
 
@@ -40,15 +46,34 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
-## Quick Start
+## Getting Started
 
-### Web Interface
+### 1. Start the Backend API (Required for UI-Pro)
+The backend service powers the core Quasar agent operations and connects to the ALMA Science Archive.
+```bash
+# From the root quasar directory
+conda activate quasar
+uvicorn ui-pro.api.main:app --reload --port 8000
+```
+*The backend will be available at `http://localhost:8000`*
+
+### 2. Start the Frontend (UI-Pro)
+The modern web interface provides a chat-like experience for interacting with the Quasar agent.
+```bash
+# In a new terminal, navigate to the ui-pro directory
+cd ui-pro
+npm install
+npm run dev
+```
+*Navigate to `http://localhost:3000` in your web browser.*
+
+### Alternative: Streamlit Interface (Legacy)
 ```bash
 streamlit run ui/app.py
 ```
-Navigate to http://localhost:8501
+*Navigate to `http://localhost:8501`*
 
-### Python API
+### Alternative: Python API
 ```python
 from quasar import QuasarAgent
 
@@ -96,14 +121,14 @@ Edit `config/settings.py` to customize query limits and default search parameter
 ## API Documentation
 
 ### QuasarAgent
-Main agent class for orchestrating searches.
+The main agent class for orchestrating searches.
 
 ```python
 agent = QuasarAgent(api_key="your-openai-key")
 results = agent.search("Find ALMA observations of Sz65", max_results=100)
 ```
 
-## Troubleshooting
+## Troubleshooting Guide
 
 ### Common Issues
 
@@ -118,7 +143,7 @@ results = agent.search("Find ALMA observations of Sz65", max_results=100)
 
 MIT License - see LICENSE file for details
 
-## Acknowledgments
+## Acknowledgements
 
 - National Radio Astronomy Observatory for archive access
 - OpenAI for GPT API
@@ -128,11 +153,3 @@ MIT License - see LICENSE file for details
 ## Contact
 
 For questions or support, please open an issue on GitHub.
-
----
-
-*"Exploring the radio universe, one query at a time"* 🔭
-
-
-
-

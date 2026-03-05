@@ -22,9 +22,25 @@ wheels/
 .installed.cfg
 *.egg
 
+# Virtual environments
+.venv/
+
+# Cache
+.pytest_cache/
+
 # Quasar specific
 .env
 .gemini/
 data/
 *.log
 tmp/
+
+# Databases (local state)
+*.db
+
+# Large binary files
+*.pdf
+
+# Sensitive keys
+config/key_export.txt
+config/key_temp.pub

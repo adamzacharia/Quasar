@@ -1,4 +1,18 @@
-"""NASA ADS Integration Service used by Quasar."""
+"""
+NASA ADS Integration Service — Paper search via NASA ADS API.
+
+CALLED BY: core/agent.py (tool: search_papers → _search_papers)
+CALLS:     NASA ADS REST API (https://api.adsabs.harvard.edu/v1)
+           OpenAI API (via ADSQueryBuilder for natural language → ADS query)
+
+KEY CLASSES:
+    ADSService      — Main service: search_papers(), search_natural_language(),
+                      search_by_target(), search_by_facility(), search_by_frequency()
+    ADSQueryBuilder — LLM-backed helper that converts free-text questions into
+                      structured ADS query syntax (e.g. object:"M87" AND ALMA)
+
+FALLBACK: If no NASA_ADS_API_KEY is set, returns hardcoded example papers.
+"""
 
 from __future__ import annotations
 
@@ -240,6 +254,153 @@ class ADSService:
         if docs:
             return self._format_paper_details(docs[0])
         return None
+
+    # ------------------------------------------------------------------
+    # ── nasa-ads-mcp equivalent tools ─────────────────────────────────
+    # ------------------------------------------------------------------
+
+    def get_author_papers(self, author: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Find all publications by a specific author (last, first format preferred)."""
+        if not self.api_key:
+            return []
+        query = f'author:"{author}"'
+        return self.search_papers(query, max_results=max_results, sort="date desc")
+
+    def get_paper_metrics(self, bibcode: str) -> Dict[str, Any]:
+        """Get citation count, read count, and impact metrics for a specific paper."""
+        if not self.api_key:
+            return {"error": "No API key configured"}
+        try:
+            data = self._perform_post(
+                "/metrics",
+                {"bibcodes": [bibcode], "types": ["citations", "reads"]}
+            )
+            citation_stats = data.get("citation stats", {})
+            usage_stats = data.get("usage stats", {})
+            return {
+                "bibcode": bibcode,
+                "total_citations": citation_stats.get("total number of citations", 0),
+                "refereed_citations": citation_stats.get("total number of refereed citations", 0),
+                "reads_last_90_days": usage_stats.get("recent number of reads", 0),
+                "total_reads": usage_stats.get("total number of reads", 0),
+                "normalized_citations": citation_stats.get("normalized number of citations", 0),
+            }
+        except ADSServiceError as exc:
+            logger.error("Metrics fetch failed: %s", exc)
+            return {"error": str(exc)}
+
+    def get_author_metrics(self, author: str) -> Dict[str, Any]:
+        """Get h-index, citation counts, and scholarly impact for an author."""
+        if not self.api_key:
+            return {"error": "No API key configured"}
+        # First get author's bibcodes
+        papers = self.get_author_papers(author, max_results=200)
+        if not papers:
+            return {"error": f"No papers found for author: {author}"}
+        bibcodes = [p["bibcode"] for p in papers if p.get("bibcode")][:200]
+        try:
+            data = self._perform_post(
+                "/metrics",
+                {"bibcodes": bibcodes, "types": ["indicators", "citations"]}
+            )
+            indicators = data.get("indicators", {})
+            citation_stats = data.get("citation stats", {})
+            return {
+                "author": author,
+                "paper_count": len(bibcodes),
+                "h_index": indicators.get("h", 0),
+                "m_index": indicators.get("m", 0),
+                "i10_index": indicators.get("i10", 0),
+                "total_citations": citation_stats.get("total number of citations", 0),
+                "refereed_citations": citation_stats.get("total number of refereed citations", 0),
+                "normalized_h_index": indicators.get("normalized h", 0),
+            }
+        except ADSServiceError as exc:
+            logger.error("Author metrics failed: %s", exc)
+            return {"error": str(exc)}
+
+    def export_bibtex(self, bibcodes: List[str]) -> str:
+        """Export properly formatted BibTeX citations for one or more bibcodes."""
+        if not self.api_key:
+            return "% No API key configured"
+        if not bibcodes:
+            return "% No bibcodes provided"
+        try:
+            payload = {"bibcode": bibcodes}
+            data = self._perform_post("/export/bibtex", payload)
+            return data.get("export", "% No BibTeX returned")
+        except ADSServiceError as exc:
+            logger.error("BibTeX export failed: %s", exc)
+            return f"% Export failed: {exc}"
+
+    # ── Library Management ─────────────────────────────────────────────
+
+    def list_libraries(self) -> List[Dict[str, Any]]:
+        """List all personal ADS libraries for the authenticated user."""
+        if not self.api_key:
+            return []
+        try:
+            data = self._perform_get("/biblib/libraries", {})
+            libraries = data.get("libraries", [])
+            return [
+                {
+                    "id": lib.get("id", ""),
+                    "name": lib.get("name", ""),
+                    "description": lib.get("description", ""),
+                    "num_documents": lib.get("num_documents", 0),
+                    "date_created": lib.get("date_created", ""),
+                    "public": lib.get("public", False),
+                }
+                for lib in libraries
+            ]
+        except ADSServiceError as exc:
+            logger.error("List libraries failed: %s", exc)
+            return []
+
+    def get_library_papers(self, library_id: str, max_results: int = 50) -> List[Dict[str, Any]]:
+        """Get papers from a specific personal ADS library."""
+        if not self.api_key:
+            return []
+        try:
+            data = self._perform_get(
+                f"/biblib/libraries/{library_id}",
+                {"rows": max_results, "fl": ",".join(self._DEFAULT_FIELDS)}
+            )
+            docs = data.get("documents", [])
+            return self._format_papers(docs) if docs else []
+        except ADSServiceError as exc:
+            logger.error("Get library papers failed: %s", exc)
+            return []
+
+    def create_library(self, name: str, description: str = "", public: bool = False) -> Dict[str, Any]:
+        """Create a new personal ADS library."""
+        if not self.api_key:
+            return {"error": "No API key configured"}
+        try:
+            data = self._perform_post(
+                "/biblib/libraries",
+                {"name": name, "description": description, "public": public, "bibcode": []}
+            )
+            return {"id": data.get("id", ""), "name": name, "success": True}
+        except ADSServiceError as exc:
+            logger.error("Create library failed: %s", exc)
+            return {"error": str(exc)}
+
+    def add_to_library(self, library_id: str, bibcodes: List[str]) -> Dict[str, Any]:
+        """Add papers to an existing personal ADS library by bibcode."""
+        if not self.api_key:
+            return {"error": "No API key configured"}
+        try:
+            data = self._perform_post(
+                f"/biblib/documents/{library_id}",
+                {"bibcode": bibcodes, "action": "add"}
+            )
+            return {"success": True, "added": len(bibcodes), "response": data}
+        except ADSServiceError as exc:
+            logger.error("Add to library failed: %s", exc)
+            return {"error": str(exc)}
+
+
     
     def _format_papers(self, papers: List[Dict]) -> List[Dict[str, Any]]:
         """Format raw ADS response to standardized format"""
@@ -389,6 +550,24 @@ class ADSService:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
+    def _perform_post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST helper for ADS metrics/export/library endpoints."""
+        url = f"{self.base_url.rstrip('/')}{endpoint}"
+        headers = self._build_headers()
+        headers["Content-Type"] = "application/json"
+        try:
+            response = self.session.post(url, headers=headers, json=payload, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise ADSServiceError(f"ADS POST error: {exc}") from exc
+        if response.status_code >= 400:
+            snippet = response.text.strip()[:500]
+            raise ADSServiceError(f"ADS API error {response.status_code}: {snippet or 'No details'}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            # Some endpoints (BibTeX) return plain text
+            return {"export": response.text}
+
     def _heuristic_query(
         self,
         question: str,
@@ -462,10 +641,26 @@ class ADSQueryBuilder:
         client = self._get_client()
 
         system_prompt = (
-            "You convert natural-language astronomy questions into NASA ADS search "
-            "queries. Return JSON with keys: query, rows, sort, filters (optional array of filter strings). "
-            "Use fielded ADS syntax such as object:\"\", title:\"\", abstract:\"\"."
+            "You are an expert at converting natural-language astronomy questions into "
+            "valid NASA ADS (Astrophysics Data System) search queries.\n"
+            "Return JSON with exactly these keys: query (string), rows (int), sort (string), "
+            "filters (array of strings, optional).\n\n"
+            "IMPORTANT ADS field syntax rules:\n"
+            "- title:\"word\" — search in paper title\n"
+            "- abstract:\"word\" — search in paper abstract\n"
+            "- author:\"Last, First\" — search by author name\n"
+            "- year:2020-2024 — filter by year range\n"
+            "- bibcode:\"...\" — specific bibcode\n"
+            "- object:\"M87\" — known SIMBAD astronomical object (NOT for telescope/instrument names)\n"
+            "- Combine with AND, OR operators\n"
+            "- For telescope/instrument names (ALMA, VLA, Hubble, VLBI, etc.) use title: or abstract:\n\n"
+            "Examples:\n"
+            "- 'ALMA papers on molecular clouds' => abstract:\"ALMA\" AND abstract:\"molecular cloud\"\n"
+            "- 'VLA observations of AGN 2020-2023' => abstract:\"VLA\" AND abstract:\"AGN\" AND year:2020-2023\n"
+            "- 'black hole jets' => title:\"black hole\" AND abstract:\"jet\"\n"
+            "- 'papers by Accomazzi' => author:\"Accomazzi\"\n"
         )
+
 
         user_payload = {
             "question": question,
@@ -478,29 +673,28 @@ class ADSQueryBuilder:
 
         response = client.chat.completions.create(
             model=self.model,
-            temperature=0.2,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload)
-                    ),
-                },
+                {"role": "user", "content": "Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload)},
             ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
         )
 
         return response.choices[0].message.content or ""
+
+
 
     def _parse_response(self, content: str) -> Dict[str, Any]:
         if not content:
             raise ADSQueryBuilderError("Empty response from model")
 
         content = content.strip()
-        if content.startswith("```"):
-            content = content.strip("`")
-            if content.lower().startswith("json"):
-                content = content[4:]
+        # Remove code fences properly (only at boundaries, not arbitrary backticks)
+        import re
+        fence_match = re.match(r'^```(?:json)?\s*\n?(.*?)\n?```$', content, re.DOTALL)
+        if fence_match:
+            content = fence_match.group(1).strip()
         try:
             data = json.loads(content)
         except json.JSONDecodeError as exc:

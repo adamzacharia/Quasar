@@ -1,0 +1,147 @@
+Vector Store Stats: {'status': 'ready', 'count': 2732}
+================================================================================
+
+================================================================================
+Testing: ALMA Technical Handbook
+Query: What frequency does ALMA Band 6 cover?
+--------------------------------------------------------------------------------
+
+[Result 1]
+  Source File: alma-technical-handbook.pdf
+  Page Number: 28
+  All Metadata: {'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.24 (TeX Live 2022) kpathsea version 6.3.4', 'trapped': '/False', 'moddate': '2024-03-18T01:26:21+00:00', 'subject': '', 'producer': 'pdfTeX-1.40.24', 'creationdate': '2024-03-18T01:26:21+00:00', 'title': '', 'creator': 'LaTeX with hyperref', 'keywords': '', 'page_label': '29', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-technical-handbook.pdf', 'author': 'ALMA', 'total_pages': 235, 'page': 28, 'source_file': 'alma-technical-handbook.pdf'}
+  Content Preview: Chapter 4
+Receivers
+The ALMA front end can accommodate up to 10 receiver bands covering most of the wavelength range from
+8.5 to 0.32 mm (35–950 GHz). Each band is designed to cover a tuning range which is approximately tailored
+to the atmospheric transmission windows. These windows and the tuning ranges are outlined in Figure 4.1.
+This illustrates the broad, deep absorption features, mostly due t...
+
+[Result 2]
+  Source File: alma-technical-handbook.pdf
+  Page Number: 213
+  All Metadata: {'page_label': '214', 'producer': 'pdfTeX-1.40.24', 'creator': 'LaTeX with hyperref', 'total_pages': 235, 'trapped': '/False', 'moddate': '2024-03-18T01:26:21+00:00', 'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.24 (TeX Live 2022) kpathsea version 6.3.4', 'subject': '', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-technical-handbook.pdf', 'page': 213, 'keywords': '', 'author': 'ALMA', 'creationdate': '2024-03-18T01:26:21+00:00', 'title': '', 'source_file': 'alma-technical-handbook.pdf'}
+  Content Preview: 4-12 GHz. This wide range is needed to cover the IFs of all the ALMA bands, since the mixers for Bands
+3, 4, 7 and 8 have an output IF of 4-8 GHz, Band 6 a range of 4.5-10 GHz and Bands 9 and 10 a range of
+4-12 GHz. Over most of the front-end tuning range, LO1 and the front-end mixer can be used in upper or
+lower sideband; although at the edges of the tuning band, only one sideband is possible. LO...
+
+================================================================================
+Testing: ALMA Proposer's Guide
+Query: How do I submit an ALMA proposal?
+--------------------------------------------------------------------------------
+
+[Result 1]
+  Source File: alma-user-policies.pdf
+  Page Number: 5
+  All Metadata: {'moddate': "D:20250226025644Z00'00'", 'page_label': '6', 'creator': 'PyPDF', 'page': 5, 'total_pages': 25, 'creationdate': "D:20250226025644Z00'00'", 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-user-policies.pdf', 'producer': 'macOS Version 14.7 (Build 23H124) Quartz PDFContext', 'source_file': 'alma-user-policies.pdf'}
+  Content Preview: proceeds via the ALMA Helpdesk at a dedicated department.  5 ALMA Proposal Preparation and Submission This section details policies that govern proposal preparation and submission and time assignment.  5.1 Eligibility and responsibility Any registered user may submit ALMA proposals. All registered users agree to act according to the ALMA policies and procedures, as defined in this document and in ...
+
+[Result 2]
+  Source File: alma-proposers-guide.pdf
+  Page Number: 5
+  All Metadata: {'page_label': '6', 'subject': '', 'author': '', 'producer': 'pdfTeX-1.40.21', 'creator': 'LaTeX with hyperref', 'ptex.fullbanner': 'This is pdfTeX, Version 3.14159265-2.6-1.40.21 (TeX Live 2020) kpathsea version 6.3.2', 'source_file': 'alma-proposers-guide.pdf', 'creationdate': '2025-03-05T11:04:00-05:00', 'page': 5, 'keywords': '', 'title': '', 'trapped': '/False', 'total_pages': 69, 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-proposers-guide.pdf', 'moddate': '2025-03-05T11:04:00-05:00'}
+  Content Preview: Proposal reviews will be conducted via a dual-anonymous process. While proposers will still enter their names
+and aﬃliations in the ALMA OT, their identities will be concealed from the science reviewers. It will be the
+responsibility of the investigators to write their proposals such that anonymity is preserved. In addition, ALMA
+is using distributed peer review for proposals requesting less than ...
+
+================================================================================
+Testing: ALMA OT Quickstart
+Query: How do I install the ALMA Observing Tool?
+--------------------------------------------------------------------------------
+
+[Result 1]
+  Source File: alma-ot-usermanual.pdf
+  Page Number: 10
+  All Metadata: {'creationdate': '2025-02-25T11:11:59+01:00', 'source_file': 'alma-ot-usermanual.pdf', 'creator': 'LaTeX with hyperref', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-ot-usermanual.pdf', 'author': '', 'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.24 (TeX Live 2022) kpathsea version 6.3.4', 'total_pages': 82, 'producer': 'pdfTeX-1.40.24', 'trapped': '/False', 'subject': '', 'page_label': '9', 'page': 10, 'moddate': '2025-02-25T11:11:59+01:00', 'title': '', 'keywords': ''}
+  Content Preview: Chapter 2
+Install and Run the Observing Tool
+The ALMA OT is written in Java and for Cycle 12 can only be installed using the traditional tarball distribution.
+Users are given the option to increase the amount of heap space (memory) made available to the OT – this can
+be very helpful when processing large proposals.
+If problems are encountered during installation and/or operation of the OT, users a...
+
+[Result 2]
+  Source File: alma-ot-usermanual.pdf
+  Page Number: 11
+  All Metadata: {'moddate': '2025-02-25T11:11:59+01:00', 'title': '', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-ot-usermanual.pdf', 'creationdate': '2025-02-25T11:11:59+01:00', 'creator': 'LaTeX with hyperref', 'source_file': 'alma-ot-usermanual.pdf', 'keywords': '', 'author': '', 'total_pages': 82, 'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.24 (TeX Live 2022) kpathsea version 6.3.4', 'page_label': '10', 'subject': '', 'producer': 'pdfTeX-1.40.24', 'trapped': '/False', 'page': 11}
+  Content Preview: 2. After downloading the JRE software package. Double click on the file and it will open an installer appli-
+cation. Follow the instructions in the installer to complete the installation of JRE.
+3. Download the ALMA OT
+4. Open a terminal and extract the ALMA OT tarball
+> tar xf alma-ot-c12.tgz
+5. Change directory into the setup directory and execute the setup-unix.sh shell script
+> cd alma-ot-c12/...
+
+================================================================================
+Testing: ALMA Pipeline Guide
+Query: What are the steps in the ALMA calibration pipeline?
+--------------------------------------------------------------------------------
+
+[Result 1]
+  Source File: unknown
+  Page Number: 38
+  All Metadata: {'producer': 'pdfTeX-1.40.26', 'trapped': '/False', 'page_label': '37', 'moddate': '2025-03-01T18:07:46+00:00', 'title': '', 'creator': 'LaTeX with hyperref', 'creationdate': '2025-03-01T18:07:46+00:00', 'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024) kpathsea version 6.4.0', 'keywords': '', 'page': 38, 'source': 'c:/Users/Asus/Desktop/archive-primer.pdf', 'total_pages': 116, 'author': 'ALMA', 'subject': ''}
+  Content Preview: calibration and imaging have been become standard. Note that the ALMA Pipeline is being continuously developed and im-
+proved. The ALMA Science Pipeline website (for various CASA versions) is available athttps://almascience.org/processing/
+science-pipeline.
+2ALMA QA2 documentation can be found athttps://almascience.org/processing/qa2-data-products.
+37...
+
+[Result 2]
+  Source File: alma-technical-handbook.pdf
+  Page Number: 183
+  All Metadata: {'page_label': '184', 'keywords': '', 'moddate': '2024-03-18T01:26:21+00:00', 'trapped': '/False', 'producer': 'pdfTeX-1.40.24', 'author': 'ALMA', 'subject': '', 'page': 183, 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-technical-handbook.pdf', 'title': '', 'total_pages': 235, 'creationdate': '2024-03-18T01:26:21+00:00', 'creator': 'LaTeX with hyperref', 'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.24 (TeX Live 2022) kpathsea version 6.3.4', 'source_file': 'alma-technical-handbook.pdf'}
+  Content Preview: ALMA Pipeline (see the ALMA Science Pipeline Reference Manual on the Science Portal10) will be used for
+the calibration and imaging of the data. The ALMA Pipeline contains sophisticated and consistently applied
+flagging and calibration heuristics, and calculates detailed quality assessment metrics at each stage of calibration
+and imaging. The script generator is simpler, and relies on a data analy...
+
+================================================================================
+Testing: ALMA User Policies
+Query: What is the proprietary period for ALMA data?
+--------------------------------------------------------------------------------
+
+[Result 1]
+  Source File: alma-user-policies.pdf
+  Page Number: 15
+  All Metadata: {'total_pages': 25, 'source_file': 'alma-user-policies.pdf', 'page_label': '16', 'creator': 'PyPDF', 'page': 15, 'producer': 'macOS Version 14.7 (Build 23H124) Quartz PDFContext', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-user-policies.pdf', 'moddate': "D:20250226025644Z00'00'", 'creationdate': "D:20250226025644Z00'00'"}
+  Content Preview: and if requested by the PI at the time of proposal submission, the ALMA Director may grant a proprietary period of up to 6 months. PIs cannot voluntarily waive the proprietary period in their proposal. ALMA will not reduce or remove the proprietary period of any approved proposal that requests it. Successful proposers will have exclusive access to their project’s observational data for the proprie...
+
+[Result 2]
+  Source File: alma-proposers-guide.pdf
+  Page Number: 36
+  All Metadata: {'source_file': 'alma-proposers-guide.pdf', 'moddate': '2025-03-05T11:04:00-05:00', 'page_label': '37', 'subject': '', 'title': '', 'producer': 'pdfTeX-1.40.21', 'keywords': '', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-proposers-guide.pdf', 'total_pages': 69, 'trapped': '/False', 'creationdate': '2025-03-05T11:04:00-05:00', 'page': 36, 'author': '', 'creator': 'LaTeX with hyperref', 'ptex.fullbanner': 'This is pdfTeX, Version 3.14159265-2.6-1.40.21 (TeX Live 2020) kpathsea version 6.3.2'}
+  Content Preview: they must submit a Quality Assurance Level 3 (QA3) request to the ALMA Helpdesk as soon as possible,
+since such problems will have implications for re-observations and the proprietary period. For a more detailed
+description of the QA process, see the ALMA Users’ Policies and Chapter 11 of the Technical Handbook.
+By default, data obtained as part of an ALMA science program are subject to a propriet...
+
+================================================================================
+Testing: ALMA Large Program
+Query: What is an ALMA large program?
+--------------------------------------------------------------------------------
+
+[Result 1]
+  Source File: alma-proposers-guide.pdf
+  Page Number: 11
+  All Metadata: {'keywords': '', 'moddate': '2025-03-05T11:04:00-05:00', 'page_label': '12', 'subject': '', 'creationdate': '2025-03-05T11:04:00-05:00', 'page': 11, 'title': '', 'source': 'C:\\Users\\Asus\\Desktop\\Quasar-main\\alma-proposers-guide.pdf', 'ptex.fullbanner': 'This is pdfTeX, Version 3.14159265-2.6-1.40.21 (TeX Live 2020) kpathsea version 6.3.2', 'producer': 'pdfTeX-1.40.21', 'trapped': '/False', 'total_pages': 69, 'source_file': 'alma-proposers-guide.pdf', 'author': '', 'creator': 'LaTeX with hyperref'}
+  Content Preview: conducted during computing and engineering time blocks. PIs should not be discouraged from triggering
+observations during these time windows and are encouraged to work with their Contact Scientist via the
+ALMA Helpdesk to coordinate their observations/triggers.
+Further instructions on how to trigger a project are available at the ToO Activation page on the Science Portal.
+Upon receiving a trigger,...
+
+[Result 2]
+  Source File: unknown
+  Page Number: 8
+  All Metadata: {'creationdate': '2025-03-01T18:07:46+00:00', 'page_label': '7', 'author': 'ALMA', 'source': 'c:/Users/Asus/Desktop/archive-primer.pdf', 'keywords': '', 'ptex.fullbanner': 'This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024) kpathsea version 6.4.0', 'total_pages': 116, 'subject': '', 'moddate': '2025-03-01T18:07:46+00:00', 'creator': 'LaTeX with hyperref', 'title': '', 'trapped': '/False', 'producer': 'pdfTeX-1.40.26', 'page': 8}
+  Content Preview: org/alma-science.
+3The ALMA Science Archive is accessible athttp://almascience.org/asax/.
+4A complete list of Large Programs as well as abstracts and links to the primary science articles, team websites and data deliveries
+can be found athttps://almascience.org/alma-data/lp.
+7...
+
+================================================================================
+METADATA CHECK COMPLETE

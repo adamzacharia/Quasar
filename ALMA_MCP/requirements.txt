@@ -1,0 +1,17 @@
+# ALMA MCP Server Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core MCP framework
+fastmcp>=2.0.0
+
+# ALMA data access
+# Note: alminer has strict pyvo dependency, let pip resolve versions
+alminer
+pyvo
+
+# Astronomical utilities
+astroquery
+astropy
+
+# Data handling
+pandas

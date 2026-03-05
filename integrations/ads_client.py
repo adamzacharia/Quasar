@@ -476,21 +476,22 @@ class ADSQueryBuilder:
             },
         }
 
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model=self.model,
+            input="Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload),
+            instructions=system_prompt,
             temperature=0.2,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload)
-                    ),
-                },
-            ],
+            text={"format": {"type": "json_object"}}
         )
 
-        return response.choices[0].message.content or ""
+        # Extract text from Responses API
+        if hasattr(response, 'output_text'):
+            return response.output_text
+        elif hasattr(response, 'output'):
+            for item in response.output:
+                if hasattr(item, 'content') and getattr(item, 'type', None) == "text":
+                    return item.content
+        return str(response)
 
     def _parse_response(self, content: str) -> Dict[str, Any]:
         if not content:
