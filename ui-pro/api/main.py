@@ -52,10 +52,10 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS — allow the Next.js dev server and Vercel domains
+# CORS — allow the Next.js dev server and deployed domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|http://localhost:3000|http://127\.0\.0\.1:3000",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
