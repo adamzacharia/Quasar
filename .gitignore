@@ -47,3 +47,6 @@ ISSUES.md
 # Sensitive keys
 config/key_export.txt
 config/key_temp.pub
+
+# Deployment docs
+fixes.md
