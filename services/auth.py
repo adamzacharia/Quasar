@@ -22,7 +22,9 @@ JWT_EXPIRATION_HOURS = 24 * 7  # 1 week
 def _default_db_path() -> str:
     """Return a stable DB path relative to the project root."""
     root = Path(__file__).resolve().parent.parent
-    return str(root / "users.db")
+    data_dir = root / "data"
+    data_dir.mkdir(exist_ok=True)
+    return str(data_dir / "users.db")
 
 
 class AuthService:

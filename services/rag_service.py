@@ -53,6 +53,10 @@ class RAGService:
         self.personal_dir = os.path.join(persist_directory, f"user_{user_id}") if user_id else None
         self.personal_store = None
         
+        # Rubrics collection (TAC guidelines)
+        self.rubrics_dir = os.path.join(persist_directory, "proposal_rubrics")
+        self.rubrics_store = None
+        
         # Initialize stores
         self._init_stores()
     
@@ -73,6 +77,16 @@ class RAGService:
             try:
                 self.personal_store = Chroma(
                     persist_directory=self.personal_dir,
+                    embedding_function=self.embeddings
+                )
+            except:
+                pass
+
+        # Rubrics store
+        if os.path.exists(self.rubrics_dir):
+            try:
+                self.rubrics_store = Chroma(
+                    persist_directory=self.rubrics_dir,
                     embedding_function=self.embeddings
                 )
             except:
@@ -229,7 +243,47 @@ class RAGService:
                 print(f"Personal search failed: {e}")
         
         return results
-    
+
+    def ingest_rubric(self, file_path: str, progress_callback: Optional[Callable[[str, int], None]] = None) -> Dict[str, Any]:
+        """Ingest a proposal rubric document into the rubrics collection"""
+        try:
+            filename = os.path.basename(file_path)
+            if progress_callback: progress_callback(f"Loading {filename}...", 10)
+            documents = self._load_document(file_path)
+            if progress_callback: progress_callback(f"Splitting {len(documents)} pages...", 30)
+            
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
+            chunks = text_splitter.split_documents(documents)
+            
+            for chunk in chunks:
+                chunk.metadata['source_file'] = filename
+                chunk.metadata['type'] = 'rubric'
+            
+            if progress_callback: progress_callback(f"Creating embeddings...", 50)
+            
+            if not os.path.exists(self.rubrics_dir):
+                os.makedirs(self.rubrics_dir, exist_ok=True)
+            
+            if self.rubrics_store is None:
+                self.rubrics_store = Chroma.from_documents(chunks, self.embeddings, persist_directory=self.rubrics_dir)
+            else:
+                self.rubrics_store.add_documents(chunks)
+                
+            if progress_callback: progress_callback(f"✓ Ingested rubric {filename}", 100)
+            return {"success": True, "filename": filename, "chunks": len(chunks)}
+        except Exception as e:
+            if progress_callback: progress_callback(f"✗ Failed: {str(e)}", 0)
+            return {"success": False, "error": str(e)}
+
+    def search_rubrics(self, query: str, k: int = 5) -> List[Document]:
+        """Search the proposal rubrics collection"""
+        if self.rubrics_store:
+            try:
+                return self.rubrics_store.similarity_search(query, k=k)
+            except Exception as e:
+                print(f"Rubrics search failed: {e}")
+        return []
+
     def get_collection_stats(self) -> Dict[str, Any]:
         """Get statistics about both vector stores"""
         stats = {

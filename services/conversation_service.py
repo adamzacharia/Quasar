@@ -20,7 +20,9 @@ class ConversationService:
     def __init__(self, db_path: str = None):
         if db_path is None:
             root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            db_path = os.path.join(root_dir, "conversations.db")
+            data_dir = os.path.join(root_dir, "data")
+            os.makedirs(data_dir, exist_ok=True)
+            db_path = os.path.join(data_dir, "conversations.db")
         
         self.db_path = db_path
         self._init_db()

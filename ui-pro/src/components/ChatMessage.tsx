@@ -143,7 +143,13 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
                     {/* Content — rendered BELOW thinking */}
                     {hasContent && (
-                        <div className="text-slate-200 prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent">
+                        <div className={`text-slate-200 prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent ${message.type === 'critique' ? 'border-l-4 border-red-500 pl-4 py-1 bg-red-950/10 rounded-r-xl' : ''}`}>
+                            {message.type === 'critique' && (
+                                <div className="text-red-400 font-bold mb-2 flex items-center gap-2">
+                                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                                    Red Team TAC Critique
+                                </div>
+                            )}
                             <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
                                 code({ className, children, ...props }) {
                                     const match = /language-(\w+)/.exec(className || "");
@@ -163,8 +169,43 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
                     {/* Papers */}
                     {message.papers && message.papers.length > 0 && (
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {message.papers.map((paper) => (<PaperCard key={paper.id} paper={paper} />))}
+                        <div className="grid grid-flow-col auto-cols-[100%] md:auto-cols-[calc(50%-0.5rem)] gap-4 overflow-x-auto snap-x snap-mandatory pb-4 hide-scrollbar">
+                            {message.papers.map((paper) => (
+                                <div key={paper.id} className="snap-start w-full">
+                                    <PaperCard paper={paper} />
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {/* Notebook payload */}
+                    {message.type === "notebook" && message.notebookData && (
+                        <div className="mt-4 p-4 rounded-xl border border-indigo-500/30 bg-indigo-950/20 flex flex-col sm:flex-row items-center justify-between gap-4">
+                            <div className="flex items-center gap-3">
+                                <div className="p-2 bg-indigo-500/20 rounded-lg shrink-0">
+                                    <svg className="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                </div>
+                                <div className="min-w-0">
+                                    <h4 className="text-sm font-semibold text-slate-200 truncate">{message.notebookData.title || "Data Analysis Notebook"}</h4>
+                                    <p className="text-xs text-slate-400">Ready to run in Jupyter (.ipynb)</p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={() => {
+                                    const blob = new Blob([JSON.stringify(message.notebookData?.data, null, 2)], { type: "application/json" });
+                                    const url = URL.createObjectURL(blob);
+                                    const a = document.createElement('a');
+                                    a.href = url;
+                                    a.download = `${(message.notebookData?.title || 'analysis').replace(/\s+/g, '_').toLowerCase()}.ipynb`;
+                                    document.body.appendChild(a);
+                                    a.click();
+                                    document.body.removeChild(a);
+                                    URL.revokeObjectURL(url);
+                                }}
+                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg transition-colors shadow-lg shadow-indigo-500/20 whitespace-nowrap"
+                            >
+                                Download Notebook
+                            </button>
                         </div>
                     )}
                 </div>

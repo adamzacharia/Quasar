@@ -240,6 +240,33 @@ class ADSService:
         if docs:
             return self._format_paper_details(docs[0])
         return None
+
+    def get_arxiv_pdf_url(self, identifier: str) -> Optional[str]:
+        """
+        Get the direct arXiv PDF URL for a given bibcode or arXiv ID.
+        If an arXiv ID is provided directly, it returns the URL.
+        If a bibcode is provided, it queries ADS to find the associated arXiv ID.
+        """
+        # If it looks like an arXiv ID (e.g., 1812.04040 or arXiv:1812.04040)
+        import re
+        arxiv_match = re.search(r'(?:arxiv:)?(\d{4}\.\d{4,5}(?:v\d+)?)', identifier.lower())
+        if arxiv_match:
+            arxiv_id = arxiv_match.group(1)
+            return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            
+        # Otherwise, treat as bibcode and query ADS
+        details = self.get_paper_details(identifier)
+        if not details:
+            return None
+            
+        identifiers = details.get('identifiers', [])
+        for id_str in identifiers:
+            arxiv_match = re.search(r'(?:arxiv:)?(\d{4}\.\d{4,5}(?:v\d+)?)', id_str.lower())
+            if arxiv_match:
+                arxiv_id = arxiv_match.group(1)
+                return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                
+        return None
     
     def _format_papers(self, papers: List[Dict]) -> List[Dict[str, Any]]:
         """Format raw ADS response to standardized format"""

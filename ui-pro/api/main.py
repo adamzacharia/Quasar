@@ -13,6 +13,18 @@ if sys.platform == "win32" and "pwd" not in sys.modules:
     _pwd_stub = types.ModuleType("pwd")
     _pwd_stub.getpwuid = lambda uid: type("pw", (), {"pw_name": "user"})()
     sys.modules["pwd"] = _pwd_stub
+
+# ── Python 3.13 fix for 'cgi' module missing (needed by older pyvo) ──
+if "cgi" not in sys.modules:
+    import email.message
+    import types
+    _cgi_stub = types.ModuleType("cgi")
+    def _parse_header(line):
+        m = email.message.EmailMessage()
+        m['content-type'] = line
+        return m.get_content_type(), m.get_params() or {}
+    _cgi_stub.parse_header = _parse_header
+    sys.modules["cgi"] = _cgi_stub
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -40,10 +52,10 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS — allow the Next.js dev server
+# CORS — allow the Next.js dev server and Vercel domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -494,7 +506,7 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
 
             if last_run_result:
                 result_type = last_run_result.get("type", "")
-                tool_name_raw = last_run_result.get("tool_name", "search_alma_archive")
+                tool_name_raw = last_run_result.get("tool_name", "search_nasa_ads")
                 tool_display = tool_name_raw.replace("_", " ").title()
 
                 # Emit tool call event
@@ -552,6 +564,20 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                             "content": papers
                         })
                         yield f"data: {papers_event}\n\n"
+                        await asyncio.sleep(0.05)
+
+                elif result_type == "notebook":
+                    notebook_data = last_run_result.get("notebook_data")
+                    title = last_run_result.get("title", "notebook")
+                    if notebook_data:
+                        nb_event = json.dumps({
+                            "type": "notebook",
+                            "content": {
+                                "title": title,
+                                "data": notebook_data
+                            }
+                        })
+                        yield f"data: {nb_event}\n\n"
                         await asyncio.sleep(0.05)
 
             # Clear last_run_result
@@ -613,8 +639,35 @@ async def chat_with_files(
             except Exception as e:
                 enriched_text += f"\n\n[PDF: {f.filename} — extraction failed: {e}]"
 
+        elif f.filename and (f.filename.endswith(".fits") or f.filename.endswith(".fit")):
+            try:
+                from services.fits_processing import FITSProcessingService
+                
+                # Extract header text
+                metadata = FITSProcessingService.extract_metadata(raw)
+                header_str = "\n".join([f"{k}: {v}" for k, v in metadata.items() if k != "error"])
+                err = metadata.get("error", "")
+                
+                if hdrs := header_str.strip():
+                    enriched_text += f"\n\n### Attached FITS: {f.filename}\n**Header Metadata:**\n```yaml\n{hdrs}\n```\n"
+                if err:
+                    enriched_text += f"\n[FITS Metadata Error: {err}]"
+                    
+                # Render visual preview
+                b64_img = FITSProcessingService.generate_preview(raw)
+                if b64_img:
+                    image_contents.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_img}", "detail": "high"}
+                    })
+                    enriched_text += f"*(A 2D visual representation of this FITS file has been attached as an image for your analysis.)*\n"
+                else:
+                    enriched_text += f"*(Could not generate a 2D preview image for this FITS data.)*\n"
+            except Exception as e:
+                enriched_text += f"\n\n[FITS: {f.filename} — extraction failed: {e}]"
+
         elif content_type in ("text/plain", "text/csv", "text/markdown", "application/json") or \
-             (f.filename and any(f.filename.endswith(ext) for ext in [".fits", ".csv", ".txt", ".md", ".json"])):
+             (f.filename and any(f.filename.endswith(ext) for ext in [".csv", ".txt", ".md", ".json"])):
             try:
                 text = raw.decode("utf-8", errors="replace")[:8000]
                 enriched_text += f"\n\n### Attached file: {f.filename}\n```\n{text}\n```"
@@ -806,6 +859,86 @@ async def list_conversations():
 async def create_conversation(req: ConversationCreate):
     """Create a new conversation."""
     return {"id": str(uuid.uuid4()), "title": req.title}
+
+
+# ── Red Team TAC (Proposal Critic) Endpoint ────────────────
+
+@app.post("/api/proposals/review")
+async def review_proposal(file: UploadFile = File(...)):
+    """Upload a proposal PDF and stream a Red Team TAC critique."""
+    import tempfile
+    from pathlib import Path
+
+    async def generate():
+        def _status(step: str, state: str = "running"):
+            return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
+            
+        tmp_path = None
+        try:
+            raw = await file.read()
+            ext = (Path(file.filename or "file.pdf").suffix or ".pdf").lower()
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+
+            loop = asyncio.get_event_loop()
+            queue = asyncio.Queue()
+            
+            def progress_callback(msg: str, pct: int):
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("status", msg, "running" if pct < 100 else "completed")), loop
+                )
+            
+            def _run_critic():
+                try:
+                    from services.proposal_critic import ProposalCriticService
+                    from services.rag_service import RAGService
+                    critic = ProposalCriticService()
+                    rag = RAGService()
+                    res = critic.review_proposal(tmp_path, rag, progress_callback=progress_callback)
+                    asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                except Exception as e:
+                    asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+            
+            # Start execution in thread
+            loop.run_in_executor(_executor, _run_critic)
+            
+            yield _status("Initializing Proposal Critic...", "running")
+            
+            while True:
+                msg = await queue.get()
+                if msg[0] == "status":
+                    yield _status(msg[1], msg[2])
+                elif msg[0] == "done":
+                    res = msg[1]
+                    if res.get("success"):
+                        yield _status("Critique generated", "completed")
+                        # Emitting the critique text as tokens so it can render immediately
+                        critique_text = res.get('critique', '')
+                        data_event = json.dumps({'type': 'critique', 'content': critique_text})
+                        yield f"data: {data_event}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'error', 'content': res.get('error', 'Unknown Error')})}\n\n"
+                    break
+                elif msg[0] == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'content': msg[1]})}\n\n"
+                    break
+                    
+            yield "data: [DONE]\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            if tmp_path:
+                try: Path(tmp_path).unlink()
+                except: pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
 
 
 # ── Health check ─────────────────────────────────────────────

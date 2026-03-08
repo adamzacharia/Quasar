@@ -4,6 +4,8 @@ import { useState, useEffect } from "react";
 import { useAuthStore } from "@/lib/auth-store";
 import { Loader2, Mail, Lock, User as UserIcon, X, Chrome } from "lucide-react";
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export function AuthModal() {
     const { isAuthModalOpen, closeAuthModal, setAuth } = useAuthStore();
     const [isLogin, setIsLogin] = useState(true);
@@ -59,7 +61,7 @@ export function AuthModal() {
         setIsLoading(true);
         setError(null);
         try {
-            const res = await fetch("http://localhost:8000/api/auth/google", {
+            const res = await fetch(`${API_BASE}/api/auth/google`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ credential: response.credential }),
@@ -87,7 +89,7 @@ export function AuthModal() {
             : { username: email, password, email, display_name: displayName };
 
         try {
-            const res = await fetch(`http://localhost:8000${endpoint}`, {
+            const res = await fetch(`${API_BASE}${endpoint}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),

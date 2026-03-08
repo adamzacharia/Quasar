@@ -105,6 +105,19 @@ Features are grouped by discipline. Items marked ✅ are implemented.
 
 ---
 
+## 🤯 Next-Generation "Wow-Factor" Features
+
+| # | Feature | Status | Priority |
+|---|---|---|---|
+| W1 | **The "Red Team" TAC (Proposal Critic)** — Simulates a rigorous Time Allocation Committee reviewing uploaded proposal drafts | ✅ Built | 🔴 Critical |
+| W2 | **Dynamic "Paper-Ready" Jupyter Notebook Generation** — Generate fully functional `.ipynb` files containing downloaded data, AstroPy analysis, and ApJ-style plotting from natural language | 🔲 Planned | 🔴 Critical |
+| W3 | **"Chat with your Data Cube" (Visual VLM Integration)** — Upload FITS cubes/spectra; backend parses to 2D PNG map + metadata for GPT-4o Vision inference | 🔲 Planned | 🔴 Critical |
+| W4 | **Autonomous "Target of Opportunity" (ToO) Agent** — Triggers off GCN alerts, cross-matches sky map, pre-generates CASA observing scripts, requests user approval via Telegram | 🔲 Planned | 🟠 High |
+| W5 | **"Find Similar" Morphological Archive Search** — Embedding-based image search against the ALMA archive: *"Find objects with this disk gap morphology"* | 🔲 Planned | 🟡 Medium |
+| W6 | **Theory vs. Reality Bridge (Observation Simulators)** — Sandboxed `simalma` or `Mirage` runs converting hydro-simulations to realistic UV-sampled telescope data | 🔲 Planned | 🟡 Medium |
+
+---
+
 ## 📊 Implementation Progress
 
 | Category | Total Features | Built | % Complete |

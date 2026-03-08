@@ -3,11 +3,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { PanelLeft, Star } from "lucide-react";
 import { useChatStore } from "@/lib/store";
-import { sendChatMessage } from "@/lib/api";
+import { sendChatMessage, reviewProposal } from "@/lib/api";
 import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
-import type { Message, DataTableResult, Paper, ToolCall } from "@/lib/types";
+import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "@/lib/types";
 import { useAuthStore } from "@/lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
@@ -83,69 +83,19 @@ export function ChatArea() {
         }
 
         try {
-            await sendChatMessage(
-                {
-                    message: messageWithContext,
-                    conversation_id: activeConversationId || undefined,
-                    model: selectedModel,
-                    attachments: attachments?.map(a => a.file),
-                    token: tokenRef.current || undefined,  // always reads current auth state
-                },
-                {
+            // Check for proposal review special case
+            const isReviewRequest = text.toLowerCase().includes("review proposal");
+            const firstPdf = attachments?.find(a => a.file.type === "application/pdf" || a.file.name.endsWith(".pdf"))?.file;
+
+            if (isReviewRequest && firstPdf) {
+                // RED TEAM TAC Workflow
+                await reviewProposal(firstPdf, {
                     onToken: (token: string) => {
                         accumulated += token;
                         updateLastAssistantMessage(accumulated);
                     },
-                    onToolCall: (toolName: string, input: string) => {
-                        const displayName = toolName.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-                        addThinkingStep(`Calling tool: ${displayName}`, "completed");
-                        const toolCall: ToolCall = {
-                            id: generateId(),
-                            name: toolName,
-                            displayName,
-                            status: "completed",
-                            input: (() => { try { return JSON.parse(input); } catch { return { raw: input }; } })(),
-                            output: "Completed",
-                        };
-                        addMessage({
-                            id: generateId(),
-                            role: "assistant",
-                            content: "",
-                            type: "tool_call",
-                            timestamp: new Date(),
-                            toolCall,
-                        });
-                    },
-                    onStatus: (() => {
-                        let connected = false;
-                        return (step: string, state: string) => {
-                            if (!connected) {
-                                connected = true;
-                                addThinkingStep("Connecting to QUASAR engine", "completed");
-                            }
-                            addThinkingStep(step, state as "running" | "completed");
-                        };
-                    })(),
-                    onData: (data: Record<string, unknown>) => {
-                        const tableData = data as unknown as DataTableResult;
-                        addMessage({
-                            id: generateId(),
-                            role: "assistant",
-                            content: "",
-                            type: "data",
-                            timestamp: new Date(),
-                            dataTable: tableData,
-                        });
-                    },
-                    onPapers: (papers: Record<string, unknown>[]) => {
-                        addMessage({
-                            id: generateId(),
-                            role: "assistant",
-                            content: "Here are the relevant papers I found:",
-                            type: "papers",
-                            timestamp: new Date(),
-                            papers: papers as unknown as Paper[],
-                        });
+                    onStatus: (step: string, state: string) => {
+                        addThinkingStep(step, state as "running" | "completed");
                     },
                     onComplete: () => {
                         attachThinkingToLastMessage();
@@ -153,11 +103,98 @@ export function ChatArea() {
                     },
                     onError: (error: string) => {
                         attachThinkingToLastMessage();
-                        updateLastAssistantMessage(`Error: ${error}\n\nPlease ensure the backend is running.`);
+                        updateLastAssistantMessage(`Error: ${error}`);
                         setStreaming(false);
+                    }
+                });
+            } else {
+                // Standard workflow
+                await sendChatMessage(
+                    {
+                        message: messageWithContext,
+                        conversation_id: activeConversationId || undefined,
+                        model: selectedModel,
+                        attachments: attachments?.map(a => a.file),
+                        token: tokenRef.current || undefined,  // always reads current auth state
                     },
-                }
-            );
+                    {
+                        onToken: (token: string) => {
+                            accumulated += token;
+                            updateLastAssistantMessage(accumulated);
+                        },
+                        onToolCall: (toolName: string, input: string) => {
+                            const displayName = toolName.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+                            addThinkingStep(`Calling tool: ${displayName}`, "completed");
+                            const toolCall: ToolCall = {
+                                id: generateId(),
+                                name: toolName,
+                                displayName,
+                                status: "completed",
+                                input: (() => { try { return JSON.parse(input); } catch { return { raw: input }; } })(),
+                                output: "Completed",
+                            };
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: "",
+                                type: "tool_call",
+                                timestamp: new Date(),
+                                toolCall,
+                            });
+                        },
+                        onStatus: (() => {
+                            let connected = false;
+                            return (step: string, state: string) => {
+                                if (!connected) {
+                                    connected = true;
+                                    addThinkingStep("Connecting to QUASAR engine", "completed");
+                                }
+                                addThinkingStep(step, state as "running" | "completed");
+                            };
+                        })(),
+                        onData: (data: Record<string, unknown>) => {
+                            const tableData = data as unknown as DataTableResult;
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: "",
+                                type: "data",
+                                timestamp: new Date(),
+                                dataTable: tableData,
+                            });
+                        },
+                        onPapers: (papers: Record<string, unknown>[]) => {
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: "Here are the relevant papers I found:",
+                                type: "papers",
+                                timestamp: new Date(),
+                                papers: papers as unknown as Paper[],
+                            });
+                        },
+                        onNotebook: (notebook: Record<string, unknown>) => {
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: `I've generated a Jupyter Notebook for your analysis: **${notebook.title || 'Dynamic Notebook'}**`,
+                                type: "notebook",
+                                timestamp: new Date(),
+                                notebookData: notebook as unknown as NotebookData,
+                            });
+                        },
+                        onComplete: () => {
+                            attachThinkingToLastMessage();
+                            setStreaming(false);
+                        },
+                        onError: (error: string) => {
+                            attachThinkingToLastMessage();
+                            updateLastAssistantMessage(`Error: ${error}\n\nPlease ensure the backend is running.`);
+                            setStreaming(false);
+                        },
+                    }
+                );
+            } // end if-else
         } catch (err) {
             updateLastAssistantMessage(`Connection failed. Is the backend running?\n\nStart it with:\n\`\`\`bash\ncd Quasar-main\nuvicorn api.main:app --reload --port 8000\n\`\`\``);
             setStreaming(false);

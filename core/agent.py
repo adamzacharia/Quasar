@@ -46,6 +46,9 @@ from services.splatalogue import SplatalogueTool
 from services.multi_archive import MultiArchiveMatcher
 from services.casa_generator import CASAScriptGenerator
 from services.gcn_monitor import GCNAlertMonitor
+from services.notebook_gen import generate_analysis_notebook
+from services.pdf_processing import PDFProcessingService
+from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
 
 # Import mem0 for long-term memory (optional - graceful fallback)
 try:
@@ -149,6 +152,8 @@ class QuasarAgent:
         self.casa_generator = CASAScriptGenerator()
         print("DEBUG: Init GCNAlertMonitor")
         self.gcn_monitor = GCNAlertMonitor()
+        print("DEBUG: Init PDFProcessingService")
+        self.pdf_service = PDFProcessingService(self.config.api_key)
 
         # Initialize RLM (Recursive Language Model) for complex queries
         print("DEBUG: Init RLM")
@@ -209,7 +214,8 @@ Your goal is to help users find, visualize, and analyze ALMA data.
 GUIDELINES:
 - **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
-- After a tool runs, summarize the output concisely.
+- **PAPER SEARCH**: When you use the `search_papers` tool, do NOT write any text listing the papers. Output NOTHING after the tool call. The UI renders the papers as interactive cards automatically.
+- After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
 - **DO NOT** output raw tool usage strings like `[TOOL: ...]` or JSON. Just use the Native Tool Calling feature.
@@ -347,18 +353,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        self.tool_registry.register(Tool(
-            name="plot_alma_results",
-            description="Generate visualization for valid ALMA search results. Must have searched first.",
-            function=self._plot_alma_results,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "plot_type": {"type": "string", "enum": ["sky", "frequency", "overview"], "description": "Type of plot"}
-                },
-                 "required": ["plot_type"]
-            }
-        ))
+        # plot_alma_results is registered once below under "Publication Plotting Tools"
         
         self.tool_registry.register(Tool(
             name="download_alma_data",
@@ -842,7 +837,25 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 self.ads_client.list_libraries()
                 if self.ads_client else {"error": "ADS client not configured"}
             ),
-            parameters={"type": "object", "properties": {}, "required": []},
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": []
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="reproduce_paper_methods",
+            description="Extract the methodology from a published paper (by arXiv ID or ADS bibcode) and construct a Python/CASA data reduction script that replicates its steps. Use when a user asks 'how did they reduce the data for this paper' or 'reproduce this paper'.",
+            function=self._reproduce_paper_methods,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "identifier": {"type": "string", "description": "arXiv ID (e.g. '1812.04040') or ADS bibcode (e.g. '2018ApJ...869L..41A')"}
+                },
+                "required": ["identifier"]
+            },
             category="literature"
         ))
 
@@ -905,6 +918,32 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "required": ["library_id", "bibcodes"]
             },
             category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="generate_jupyter_notebook",
+            description="Generate a runnable Jupyter Notebook (.ipynb) for data analysis workflows. Use this when the user asks for code to analyze data, make maps, or perform reductions.",
+            function=lambda title, steps, **kw: self._generate_notebook(title, steps),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Title of the notebook"},
+                    "steps": {
+                        "type": "array",
+                        "description": "List of notebook cells (markdown or code)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["markdown", "code"]},
+                                "content": {"type": "string", "description": "The exact cell content. Use complete astropy/spectral-cube/numpy code for code cells."}
+                            },
+                            "required": ["type", "content"]
+                        }
+                    }
+                },
+                "required": ["title", "steps"]
+            },
+            category="analysis"
         ))
 
 
@@ -1047,6 +1086,19 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 }
                 return {"success": True, "message": f"Generated {plot_type} plot successfully"}
             return {"success": False, "error": "Plot generation returned empty"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _generate_notebook(self, title: str, steps: list) -> Dict[str, Any]:
+        """Generate a Jupyter Notebook and store in last_run_result for UI delivery."""
+        try:
+            nb_dict = generate_analysis_notebook(title, steps)
+            self.last_run_result = {
+                "type": "notebook",
+                "notebook_data": nb_dict,
+                "title": title
+            }
+            return {"success": True, "message": "Notebook generated successfully. Let the user know it is ready to download."}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1518,6 +1570,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 )
                 
                 function_calls = {} # call_id -> dict
+                item_id_to_call_id = {}  # item.id -> call_id mapping
                 
                 for event in response_stream:
                     if event.type == "response.created":
@@ -1531,13 +1584,22 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         # Check if it's a function_call item
                         item = event.item
                         if getattr(item, 'type', None) == 'function_call':
-                            # Get call_id from either call_id or id
-                            cid = getattr(item, 'call_id', getattr(item, 'id', None))
+                            call_id = getattr(item, 'call_id', None)
+                            item_id = getattr(item, 'id', None)
                             name = getattr(item, 'name', 'unknown')
+                            cid = call_id or item_id
                             if cid:
                                 function_calls[cid] = {"name": name, "arguments": "", "call_id": cid}
+                                # Map item_id to call_id so argument deltas can find the right entry
+                                if item_id and item_id != cid:
+                                    item_id_to_call_id[item_id] = cid
+                                if call_id and call_id != item_id:
+                                    item_id_to_call_id[call_id] = cid
                     elif event.type == "response.function_call_arguments.delta":
-                        cid = getattr(event, 'call_id', getattr(event, 'item_id', None))
+                        # Try all possible ID fields the API might use
+                        raw_id = getattr(event, 'call_id', None) or getattr(event, 'item_id', None)
+                        # Resolve to the canonical call_id we stored
+                        cid = item_id_to_call_id.get(raw_id, raw_id)
                         if cid and cid in function_calls:
                             function_calls[cid]["arguments"] += event.delta
                 
@@ -1823,7 +1885,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         # Use NASA ADS if available
         if self.ads_client:
-            papers = self.ads_client.search_radio_papers(source_name)
+            papers = self.ads_client.search_by_target(source_name)
             if papers:
                 return pd.DataFrame(papers)
         

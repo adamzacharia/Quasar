@@ -146,7 +146,9 @@ function SettingsContent({ selectedModel, availableModels, onSelectModel }: {
                     <div className="w-2.5 h-2.5 rounded-full bg-emerald-accent animate-pulse" />
                     <div>
                         <p className="text-sm text-white font-medium">Backend Connected</p>
-                        <p className="text-[10px] text-slate-500">http://localhost:8000</p>
+                        <p className="text-[10px] text-slate-500">
+                            {process.env.NEXT_PUBLIC_API_URL ? new URL(process.env.NEXT_PUBLIC_API_URL).host : "localhost:8000"}
+                        </p>
                     </div>
                 </div>
             </div>
