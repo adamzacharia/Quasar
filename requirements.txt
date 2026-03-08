@@ -156,3 +156,8 @@ langchain-openai
 chromadb
 pypdf
 tiktoken
+fastapi
+uvicorn
+python-multipart
+google-auth
+PyJWT
