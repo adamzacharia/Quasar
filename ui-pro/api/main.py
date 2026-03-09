@@ -114,22 +114,27 @@ class ConversationCreate(BaseModel):
 # ── Lazy-load the Quasar agent ───────────────────────────────
 
 _agent = None
+_agent_error = None
 
 def get_agent():
     """Lazy-load QuasarAgent to avoid import errors during dev."""
-    global _agent
-    if _agent is None:
+    global _agent, _agent_error
+    if _agent is None and _agent_error is None:
         try:
             from core.agent import QuasarAgent, AgentConfig
             config = AgentConfig()
             _agent = QuasarAgent(config)
             print("[INFO] QuasarAgent loaded successfully.")
         except Exception as e:
-            print(f"[WARN] Could not load QuasarAgent: {e}")
             import traceback
+            _agent_error = traceback.format_exc()
+            print(f"[WARN] Could not load QuasarAgent: {e}")
             traceback.print_exc()
             return None
     return _agent
+
+def get_agent_error():
+    return _agent_error
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -261,16 +266,15 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
 
     async def generate():
         if agent is None:
+            err = get_agent_error() or "Unknown initialization error"
             mock_response = (
-                f"I received your query: **{request.message}**\n\n"
-                "The QUASAR backend is running in **mock mode** because the "
-                "QuasarAgent could not be loaded. Please ensure:\n\n"
-                "1. All Python dependencies are installed (`pip install -r requirements.txt`)\n"
-                "2. `OPENAI_API_KEY` is set in your `.env` file\n"
-                "3. You're running from the `Quasar-main` directory\n"
+                f"🚨 **BACKEND CRASH TRACE** 🚨\n\n"
+                f"QuasarAgent failed to load. Here is the exact Python error:\n\n"
+                f"```python\n{err}\n```\n"
             )
-            for word in mock_response.split(" "):
-                data = json.dumps({"type": "token", "content": word + " "})
+            # Stream chunk by chunk so it looks like typing and renders markdown correctly
+            for chunk in mock_response.split("\n"):
+                data = json.dumps({"type": "token", "content": chunk + "\n"})
                 yield f"data: {data}\n\n"
                 await asyncio.sleep(0.02)
             yield "data: [DONE]\n\n"
