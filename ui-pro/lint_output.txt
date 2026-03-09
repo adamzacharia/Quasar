@@ -1,0 +1,156 @@
+
+> ui-pro@0.1.0 lint
+> eslint
+
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\app\help\page.tsx
+   15:9    error  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\app\help\page.tsx:15:9
+  13 |
+  14 |     useEffect(() => {
+> 15 |         setMounted(true);
+     |         ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  16 |     }, []);
+  17 |
+  18 |     if (!mounted) return null; // Prevent hydration mismatch Flash  react-hooks/set-state-in-effect
+  109:98   error  `"` can be escaped with `&quot;`, `&ldquo;`, `&#34;`, `&rdquo;`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                react/no-unescaped-entities
+  109:104  error  `"` can be escaped with `&quot;`, `&ldquo;`, `&#34;`, `&rdquo;`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                react/no-unescaped-entities
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\app\page.tsx
+  14:5  error  Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\app\page.tsx:14:5
+  12 |
+  13 |   useEffect(() => {
+> 14 |     setMounted(true);
+     |     ^^^^^^^^^^ Avoid calling setState() directly within an effect
+  15 |   }, []);
+  16 |
+  17 |   if (!mounted) return null; // Prevent hydration mismatch Flash  react-hooks/set-state-in-effect
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\AuthModal.tsx
+    5:52  warning  'Chrome' is defined but never used                                                                                       @typescript-eslint/no-unused-vars
+   56:8   warning  React Hook useEffect has a missing dependency: 'handleGoogleResponse'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+   60:51  error    Unexpected any. Specify a different type                                                                                 @typescript-eslint/no-explicit-any
+   74:23  error    Unexpected any. Specify a different type                                                                                 @typescript-eslint/no-explicit-any
+  103:23  error    Unexpected any. Specify a different type                                                                                 @typescript-eslint/no-explicit-any
+  241:18  error    Unexpected any. Specify a different type                                                                                 @typescript-eslint/no-explicit-any
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\ChatArea.tsx
+   20:36  warning  'streamingContent' is assigned a value but never used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              @typescript-eslint/no-unused-vars
+   21:9   warning  'sidebarOpen' is assigned a value but never used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   @typescript-eslint/no-unused-vars
+   33:5   error    Error: Cannot access refs during render
+
+React refs are values that are not needed for rendering. Refs should only be accessed outside of render, such as in event handlers or effects. Accessing a ref value (the `current` property) during render can cause your component not to update as expected (https://react.dev/reference/react/useRef).
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\ChatArea.tsx:33:5
+  31 |     // Use a ref so handleSend always reads the CURRENT token (avoids stale closure)
+  32 |     const tokenRef = useRef<string | null>(null);
+> 33 |     tokenRef.current = token ?? null;
+     |     ^^^^^^^^^^^^^^^^ Cannot update ref during render
+  34 |
+  35 |     const messagesEndRef = useRef<HTMLDivElement>(null);
+  36 |     const [inputValue, setInputValue] = useState("");  react-hooks/refs
+   35:11  warning  'messagesEndRef' is assigned a value but never used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                @typescript-eslint/no-unused-vars
+  198:18  warning  'err' is defined but never used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    @typescript-eslint/no-unused-vars
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\ChatInput.tsx
+   4:50  warning  'ImageIcon' is defined but never used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  @typescript-eslint/no-unused-vars
+  24:43  error    Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\ChatInput.tsx:24:43
+  22 |     const fileInputRef = useRef<HTMLInputElement>(null);
+  23 |
+> 24 |     useEffect(() => { if (initialValue) { setValue(initialValue); inputRef.current?.focus(); } }, [initialValue]);
+     |                                           ^^^^^^^^ Avoid calling setState() directly within an effect
+  25 |
+  26 |     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  27 |         const files = Array.from(e.target.files || []);  react-hooks/set-state-in-effect
+  78:45  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                @next/next/no-img-element
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\ChatMessage.tsx
+  67:41  warning  Using `<img>` could result in slower LCP and higher bandwidth. Consider using `<Image />` from `next/image` or a custom image loader to automatically optimize images. This may incur additional usage or cost from your provider. See: https://nextjs.org/docs/messages/no-img-element  @next/next/no-img-element
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\SettingsModal.tsx
+  39:35  error    Compilation Skipped: Existing memoization could not be preserved
+
+React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was `authHeaders`, but the source dependencies were [token]. Inferred different dependency than source.
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\SettingsModal.tsx:39:35
+  37 |     const authHeaders = { Authorization: `Bearer ${token}` };
+  38 |
+> 39 |     const fetchDocs = useCallback(async () => {
+     |                                   ^^^^^^^^^^^^^
+> 40 |         if (!token) return;
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 41 |         setLoading(true);
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 42 |         try {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 43 |             const res = await fetch(`${API_BASE}/api/personalization/documents`, { headers: authHeaders });
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 44 |             if (res.ok) setDocs(await res.json());
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 45 |         } catch { /* noop */ }
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 46 |         setLoading(false);
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 47 |     }, [token]);
+     | ^^^^^^ Could not preserve existing manual memoization
+  48 |
+  49 |     useEffect(() => { if (isAuthenticated) fetchDocs(); }, [isAuthenticated, fetchDocs]);
+  50 |  react-hooks/preserve-manual-memoization
+  47:8   warning  React Hook useCallback has a missing dependency: 'authHeaders'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     react-hooks/exhaustive-deps
+  49:44  error    Error: Calling setState synchronously within an effect can trigger cascading renders
+
+Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:
+* Update external systems with the latest state from React.
+* Subscribe for updates from some external system, calling setState in a callback function when external state changes.
+
+Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\SettingsModal.tsx:49:44
+  47 |     }, [token]);
+  48 |
+> 49 |     useEffect(() => { if (isAuthenticated) fetchDocs(); }, [isAuthenticated, fetchDocs]);
+     |                                            ^^^^^^^^^ Avoid calling setState() directly within an effect
+  50 |
+  51 |     const uploadFiles = async (files: FileList | File[]) => {
+  52 |         if (!token) return;                                                                                                                                                                                                                                                                                                                                                                                                    react-hooks/set-state-in-effect
+  68:18  warning  'e' is defined but never used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        @typescript-eslint/no-unused-vars
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\components\Sidebar.tsx
+   10:26  warning  'ExternalLink' is defined but never used     @typescript-eslint/no-unused-vars
+   10:40  warning  'Github' is defined but never used           @typescript-eslint/no-unused-vars
+   10:48  warning  'BookOpen' is defined but never used         @typescript-eslint/no-unused-vars
+   10:58  warning  'Search' is defined but never used           @typescript-eslint/no-unused-vars
+   11:5   warning  'Telescope' is defined but never used        @typescript-eslint/no-unused-vars
+   11:16  warning  'FileText' is defined but never used         @typescript-eslint/no-unused-vars
+   11:26  warning  'Zap' is defined but never used              @typescript-eslint/no-unused-vars
+  115:10  warning  'SettingsContent' is defined but never used  @typescript-eslint/no-unused-vars
+
+C:\Users\adama\Desktop\Quasar-main\ui-pro\src\lib\store.ts
+  35:10  warning  'generateId' is defined but never used  @typescript-eslint/no-unused-vars
+  39:53  warning  'get' is defined but never used         @typescript-eslint/no-unused-vars
+
+✖ 33 problems (12 errors, 21 warnings)
+

@@ -2,7 +2,7 @@
 
 import { Sidebar } from "@/components/Sidebar";
 import { ChatArea } from "@/components/ChatArea";
-import { useChatStore } from "@/lib/store";
+import { useChatStore } from "../lib/store";
 import { AuthModal } from "@/components/AuthModal";
 import { useEffect, useState } from "react";
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { Sidebar } from "@/components/Sidebar";
-import { useChatStore } from "@/lib/store";
+import { useChatStore } from "../../lib/store";
 import { AuthModal } from "@/components/AuthModal";
 import { useEffect, useState } from "react";
 import { Telescope, FileText, Search, Zap, Github, BookOpen, ExternalLink, Bot, X } from "lucide-react";

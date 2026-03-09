@@ -1,8 +1,8 @@
 "use client";
 
-import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink } from "lucide-react";
+import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Cpu } from "lucide-react";
 import { useState } from "react";
-import type { Paper } from "@/lib/types";
+import type { Paper } from "../lib/types";
 
 const TYPE_STYLES: Record<string, string> = {
     journal: "bg-emerald-500/10 text-emerald-400",

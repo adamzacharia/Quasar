@@ -2,13 +2,13 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { PanelLeft, Star } from "lucide-react";
-import { useChatStore } from "@/lib/store";
-import { sendChatMessage, reviewProposal } from "@/lib/api";
+import { useChatStore } from "../lib/store";
+import { sendChatMessage, reviewProposal } from "../lib/api";
 import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
-import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "@/lib/types";
-import { useAuthStore } from "@/lib/auth-store";
+import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "../lib/types";
+import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
 

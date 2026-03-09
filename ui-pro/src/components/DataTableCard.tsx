@@ -1,7 +1,7 @@
 "use client";
 
-import { Download, BarChart3 } from "lucide-react";
-import type { DataTableResult } from "@/lib/types";
+import { ChevronLeft, ChevronRight, FileText, Download, BarChart3 } from "lucide-react";
+import type { DataTableResult } from "../lib/types";
 
 interface DataTableCardProps { data: DataTableResult; }
 
