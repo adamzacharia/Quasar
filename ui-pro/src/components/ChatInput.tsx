@@ -21,6 +21,7 @@ export function ChatInput({ onSend, isStreaming, initialValue = "" }: ChatInputP
     const inputRef = useRef<HTMLInputElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (initialValue) { setValue(initialValue); inputRef.current?.focus(); } }, [initialValue]);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {

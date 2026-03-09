@@ -34,18 +34,17 @@ function PersonalizationPanel() {
     const [dragging, setDragging] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const authHeaders = { Authorization: `Bearer ${token}` };
-
     const fetchDocs = useCallback(async () => {
         if (!token) return;
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/personalization/documents`, { headers: authHeaders });
+            const res = await fetch(`${API_BASE}/api/personalization/documents`, { headers: { Authorization: `Bearer ${token}` } });
             if (res.ok) setDocs(await res.json());
         } catch { /* noop */ }
         setLoading(false);
     }, [token]);
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (isAuthenticated) fetchDocs(); }, [isAuthenticated, fetchDocs]);
 
     const uploadFiles = async (files: FileList | File[]) => {
@@ -56,7 +55,7 @@ function PersonalizationPanel() {
         Array.from(files).forEach(f => form.append("files", f));
         try {
             const res = await fetch(`${API_BASE}/api/personalization/upload`, {
-                method: "POST", headers: authHeaders, body: form,
+                method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form,
             });
             const data = await res.json();
             if (res.ok) {
@@ -77,7 +76,7 @@ function PersonalizationPanel() {
         if (!confirm(`Remove "${filename}" from your personal knowledge base?`)) return;
         try {
             const res = await fetch(`${API_BASE}/api/personalization/document/${encodeURIComponent(docId)}`, {
-                method: "DELETE", headers: authHeaders,
+                method: "DELETE", headers: { Authorization: `Bearer ${token}` },
             });
             if (res.ok) setDocs(prev => prev.filter(d => d.id !== docId));
         } catch { /* noop */ }

@@ -1,0 +1,153 @@
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+export interface ChatRequest {
+    message: string;
+    conversation_id?: string;
+    model?: string;
+    attachments?: File[];
+    token?: string;  // auth token for personal RAG
+}
+
+export interface StreamCallbacks {
+    onToken: (token: string) => void;
+    onToolCall?: (toolName: string, input: string) => void;
+    onData?: (data: Record<string, unknown>) => void;
+    onPapers?: (papers: Record<string, unknown>[]) => void;
+    onNotebook?: (notebook: Record<string, unknown>) => void;
+    onStatus?: (step: string, state: string) => void;
+    onComplete: (fullResponse: string) => void;
+    onError: (error: string) => void;
+}
+
+export async function sendChatMessage(request: ChatRequest, callbacks: StreamCallbacks): Promise<void> {
+    try {
+        let response: Response;
+
+        if (request.attachments && request.attachments.length > 0) {
+            // Multipart upload for attachments
+            const form = new FormData();
+            form.append("message", request.message);
+            if (request.conversation_id) form.append("conversation_id", request.conversation_id);
+            if (request.model) form.append("model", request.model);
+            request.attachments.forEach(f => form.append("files", f));
+            const headers: Record<string, string> = {};
+            if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
+            response = await fetch(`${API_BASE}/api/chat/upload`, { method: "POST", headers, body: form });
+        } else {
+            const headers: Record<string, string> = { "Content-Type": "application/json" };
+            if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
+            response = await fetch(`${API_BASE}/api/chat`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({ message: request.message, conversation_id: request.conversation_id, model: request.model }),
+            });
+        }
+
+        if (!response.ok) { callbacks.onError(`API error: ${response.status}`); return; }
+        const reader = response.body?.getReader();
+        if (!reader) { callbacks.onError("No response body"); return; }
+        const decoder = new TextDecoder();
+        let fullText = "";
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+                if (line.startsWith("data: ")) {
+                    const data = line.slice(6);
+                    if (data === "[DONE]") { callbacks.onComplete(fullText); return; }
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.type === "token") {
+                            fullText += parsed.content;
+                            callbacks.onToken(parsed.content);
+                        } else if (parsed.type === "status" && callbacks.onStatus) {
+                            callbacks.onStatus(parsed.step, parsed.state);
+                        } else if (parsed.type === "tool_call" && callbacks.onToolCall) {
+                            callbacks.onToolCall(parsed.name || parsed.displayName, JSON.stringify(parsed.input || {}));
+                        } else if (parsed.type === "data" && callbacks.onData) {
+                            callbacks.onData(parsed.content);
+                        } else if (parsed.type === "papers" && callbacks.onPapers) {
+                            callbacks.onPapers(parsed.content);
+                        } else if (parsed.type === "notebook" && callbacks.onNotebook) {
+                            callbacks.onNotebook(parsed.content);
+                        } else if (parsed.type === "error") {
+                            callbacks.onError(parsed.content);
+                            return;
+                        }
+                    } catch {
+                        // Non-JSON data, treat as token
+                        fullText += data;
+                        callbacks.onToken(data);
+                    }
+                }
+            }
+        }
+        callbacks.onComplete(fullText);
+    } catch (error) {
+        callbacks.onError(error instanceof Error ? error.message : "Failed to connect to backend. Is the server running?");
+    }
+}
+
+export async function getModels(): Promise<string[]> {
+    try { const res = await fetch(`${API_BASE}/api/models`); const data = await res.json(); return data.models; }
+    catch { return ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"]; }
+}
+
+export async function reviewProposal(file: File, callbacks: StreamCallbacks): Promise<void> {
+    try {
+        const form = new FormData();
+        form.append("file", file);
+
+        const response = await fetch(`${API_BASE}/api/proposals/review`, {
+            method: "POST",
+            body: form,
+        });
+
+        if (!response.ok) { callbacks.onError(`API error: ${response.status}`); return; }
+        const reader = response.body?.getReader();
+        if (!reader) { callbacks.onError("No response body"); return; }
+        const decoder = new TextDecoder();
+        let fullText = "";
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+                if (line.startsWith("data: ")) {
+                    const data = line.slice(6);
+                    if (data === "[DONE]") { callbacks.onComplete(fullText); return; }
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.type === "critique") {
+                            fullText += parsed.content;
+                            callbacks.onToken(parsed.content);
+                        } else if (parsed.type === "status" && callbacks.onStatus) {
+                            callbacks.onStatus(parsed.step, parsed.state);
+                        } else if (parsed.type === "error") {
+                            callbacks.onError(parsed.content);
+                            return;
+                        }
+                    } catch {
+                        // ignore
+                    }
+                }
+            }
+        }
+        callbacks.onComplete(fullText);
+    } catch (error) {
+        callbacks.onError(error instanceof Error ? error.message : "Failed to connect to backend for proposal review.");
+    }
+}

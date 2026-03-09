@@ -12,6 +12,7 @@ export default function HelpPage() {
     const [mounted, setMounted] = useState(false);
 
     useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setMounted(true);
     }, []);
 
@@ -106,7 +107,7 @@ export default function HelpPage() {
                                     {tips.map((tip, i) => (
                                         <li key={i} className="flex items-start gap-3 bg-slate-800/50 p-3 rounded-lg border border-slate-700/30">
                                             <span className="text-primary font-bold mt-0.5">•</span>
-                                            <span className="text-sm text-slate-300 font-medium">"{tip}"</span>
+                                            <span className="text-sm text-slate-300 font-medium">&quot;{tip}&quot;</span>
                                         </li>
                                     ))}
                                 </ul>

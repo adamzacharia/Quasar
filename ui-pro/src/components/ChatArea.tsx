@@ -30,7 +30,9 @@ export function ChatArea() {
 
     // Use a ref so handleSend always reads the CURRENT token (avoids stale closure)
     const tokenRef = useRef<string | null>(null);
-    tokenRef.current = token ?? null;
+    useEffect(() => {
+        tokenRef.current = token ?? null;
+    }, [token]);
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const [inputValue, setInputValue] = useState("");
