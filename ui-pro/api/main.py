@@ -46,6 +46,11 @@ if PROJECT_ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
+# ── Observability: Loguru + Sentry ────────────────────────────────────────────
+from core.logger import logger, init_sentry
+init_sentry()  # no-op if SENTRY_DSN env var is not set
+logger.info("[QUASAR API] Starting up")
+
 app = FastAPI(
     title="QUASAR API",
     description="Backend API for the QUASAR Professional Chat Interface",
@@ -60,6 +65,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Request / response logging middleware ─────────────────────────────────────
+import time as _time
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        t0 = _time.perf_counter()
+        response = await call_next(request)
+        elapsed = _time.perf_counter() - t0
+        logger.info(
+            f"{request.method} {request.url.path} → {response.status_code} "
+            f"({elapsed*1000:.0f}ms)"
+        )
+        return response
+
+app.add_middleware(LoggingMiddleware)
 
 # Thread pool for running synchronous agent calls
 _executor = ThreadPoolExecutor(max_workers=4)

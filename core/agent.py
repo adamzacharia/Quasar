@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 import openai
 from openai import OpenAI
 
+from core.logger import logger, log_tool
+
 
 from core.memory import ConversationMemory
 from core.tools import ToolRegistry, Tool
@@ -955,6 +957,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
 
 
+    @log_tool
     def _tavily_web_search(self, query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
         """
         Real-time web search powered by Tavily.
@@ -999,6 +1002,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e2:
             return {"success": False, "error": str(e2)}
 
+    @log_tool
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
                            facility: Optional[str] = None,
                            max_results: int = 100) -> Dict[str, Any]:
@@ -1019,6 +1023,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    @log_tool
     def _search_by_target(self, target_name: str, facility: Optional[str] = None,
                           date_range: Optional[str] = None,
                           max_results: int = 100) -> Dict[str, Any]:
@@ -1038,6 +1043,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    @log_tool
     def _search_by_frequency(self, min_freq_ghz: float, max_freq_ghz: float,
                             facility: Optional[str] = None,
                             max_results: int = 100) -> Dict[str, Any]:
@@ -1153,6 +1159,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    @log_tool
     def _search_papers(self, query: str, max_results: int = 10, sort: str = "date desc") -> Dict[str, Any]:
         """Search NASA ADS for papers.
         
