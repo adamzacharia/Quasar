@@ -148,21 +148,41 @@ async def root():
 async def list_models():
     return {
         "models": [
-            # ── OpenAI ─────────────────
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "gpt-3.5-turbo",
-            # ── Gemini (free tier) ─────
-            "gemini-2.5-flash-preview-05-20",
-            "gemini-2.5-flash-lite-preview-06-17",
-            "gemini-3-flash",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            # ── Gemini Pro (paid/limited)
-            "gemini-3-pro",
-            "gemini-3.1-pro",
-            "gemini-2.5-pro-preview-06-05",
+            # ── Anthropic Claude (Latest) ──────────────────────────
+            "claude-sonnet-4-6",       # Latest Sonnet — best coding, default free/pro
+            "claude-opus-4-6",         # Latest Opus — smartest, 1M context (beta)
+            "claude-sonnet-4-5",       # Sonnet 4.5 — coding/computer use
+            "claude-opus-4-5",         # Opus 4.5 — best coding & agents
+            "claude-haiku-4-5",        # Haiku 4.5 — fastest & cheapest
+            "claude-opus-4-1",         # Opus 4.1 — agentic tasks
+            "claude-sonnet-4",         # Sonnet 4
+            "claude-opus-4",           # Opus 4
+            "claude-3-7-sonnet-20250219",  # Claude 3.7 Sonnet — hybrid reasoning
+            "claude-3-5-sonnet-20241022",  # Claude 3.5 Sonnet (Oct 2024)
+            "claude-3-5-haiku-20241022",   # Claude 3.5 Haiku
+            # ── OpenAI GPT (Latest) ───────────────────────────────
+            "gpt-5.4",                 # GPT-5.4 — latest flagship (Mar 2026)
+            "gpt-5.4-2026-03-05",      # GPT-5.4 snapshot
+            "gpt-5",                   # GPT-5
+            "gpt-5-mini",              # GPT-5 Mini — lower latency
+            "gpt-5-nano",              # GPT-5 Nano — cheapest
+            "gpt-4o",                  # GPT-4o — omni flagship
+            "gpt-4o-mini",             # GPT-4o Mini — fast & cheap
+            "gpt-4.1",                 # GPT-4.1 — coding & long-context (1M)
+            "gpt-4.1-mini",            # GPT-4.1 Mini — balanced
+            "gpt-4.1-nano",            # GPT-4.1 Nano — fastest/cheapest
+            "o3",                      # o3 — advanced reasoning
+            "o4-mini",                 # o4-mini — reasoning, lower cost
+            # ── Google Gemini (Latest) ────────────────────────────
+            "gemini-3.1-pro",          # Gemini 3.1 Pro — best reasoning
+            "gemini-3.1-flash",        # Gemini 3.1 Flash
+            "gemini-3.1-flash-lite",   # Gemini 3.1 Flash Lite
+            "gemini-3-flash",          # Gemini 3 Flash (default app)
+            "gemini-3-pro",            # Gemini 3 Pro
+            "gemini-2.5-pro",          # Gemini 2.5 Pro
+            "gemini-2.5-flash",        # Gemini 2.5 Flash
+            "gemini-2.5-flash-lite",   # Gemini 2.5 Flash Lite
+            "gemini-2.0-flash",        # Gemini 2.0 Flash
         ]
     }
 
@@ -356,154 +376,200 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                 yield "data: [DONE]\n\n"
             return
 
+        # ── Claude (Anthropic) model routing ──────────────────────────────────
+        if model_name.startswith("claude-"):
+            try:
+                import anthropic
+                claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+                yield _status(f"Routing to {model_name}", "running")
+
+                def _claude_call():
+                    return claude_client.messages.stream(
+                        model=model_name,
+                        max_tokens=int(os.getenv("MAX_TOKENS", "8096")),
+                        messages=[{"role": "user", "content": effective_request.message}],
+                    )
+
+                loop = asyncio.get_event_loop()
+                yield _status(f"Routing to {model_name}", "completed")
+
+                def _run_claude_stream(q):
+                    with claude_client.messages.stream(
+                        model=model_name,
+                        max_tokens=int(os.getenv("MAX_TOKENS", "8096")),
+                        messages=[{"role": "user", "content": effective_request.message}],
+                    ) as stream:
+                        for text in stream.text_stream:
+                            asyncio.run_coroutine_threadsafe(q.put(("token", text)), loop)
+                    asyncio.run_coroutine_threadsafe(q.put(("done", "")), loop)
+
+                claude_queue = asyncio.Queue()
+                loop.run_in_executor(_executor, _run_claude_stream, claude_queue)
+
+                while True:
+                    msg = await claude_queue.get()
+                    if msg[0] == "done":
+                        break
+                    elif msg[0] == "token" and msg[1]:
+                        data = json.dumps({"type": "token", "content": msg[1]})
+                        yield f"data: {data}\n\n"
+
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                err = json.dumps({"type": "error", "content": f"Claude error: {e}"})
+                yield f"data: {err}\n\n"
+                yield "data: [DONE]\n\n"
+            return
+
         # ── Real OpenAI agent execution ────────────────────────────────────
 
         try:
             loop = asyncio.get_event_loop()
 
-            # ── Step 1: Complexity Analysis ──
+            # ── Complexity check (informational only — does NOT change routing) ──
+            # All queries go through stream_response_api which has the full 27-tool
+            # calling loop. The RLM path was removed because rlm.execute() uses a
+            # pure LLM with no tools, causing hallucinated step descriptions instead
+            # of actual archive searches, plots, and script generation.
             yield _status("Analyzing prompt complexity")
             await asyncio.sleep(0.05)
-
-            try:
-                should_rlm, complexity = await loop.run_in_executor(
-                    _executor,
-                    lambda: agent.rlm.should_use_rlm(effective_request.message)
-                )
-                score_str = f" (score: {complexity.score:.2f})" if hasattr(complexity, 'score') else ""
-            except Exception as e:
-                print(f"[RLM Check Error] {e}")
-                should_rlm = False
-                score_str = ""
-
             yield _status("Analyzing prompt complexity", "completed")
 
-            if should_rlm:
-                # ── RLM Path ──
-                print(f"[INFO] Routing query to RLM Engine{score_str}")
-                yield _status("Routing to RLM Engine")
+            # ── Route based on DATA SIZE, not query complexity ──────────────────────
+            # Paper standard: RLM REPL fires ONLY for massive data contexts
+            # (>80k chars ≈ 20k tokens — e.g. large FITS headers, multi-MB CSVs).
+            # All normal queries, including multi-step research, always use the
+            # 27-tool calling loop via stream_response_api.
+            REPL_CONTEXT_THRESHOLD = 80_000
+
+            if len(enriched_message) > REPL_CONTEXT_THRESHOLD:
+                # ── RLM REPL Path (beyond-context massive data) ──
+                print(f"[INFO] Message size {len(enriched_message):,} chars > {REPL_CONTEXT_THRESHOLD:,} threshold → RLM REPL")
+                yield _status("Launching RLM REPL (beyond-context mode)")
                 await asyncio.sleep(0.05)
-                yield _status("Routing to RLM Engine", "completed")
+                yield _status("Launching RLM REPL (beyond-context mode)", "completed")
 
-                queue = asyncio.Queue()
+                repl_queue = asyncio.Queue()
 
-                def rlm_status(step: str, state: str):
-                    asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
+                def repl_status(step: str, state: str):
+                    asyncio.run_coroutine_threadsafe(repl_queue.put(("status", step, state)), loop)
 
-                def rlm_token(token: str):
-                    if token:
-                        asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+                def repl_token(tok: str):
+                    if tok:
+                        asyncio.run_coroutine_threadsafe(repl_queue.put(("token", tok)), loop)
 
-                def _run_rlm():
+                def _run_repl():
                     try:
                         res = agent.rlm.execute(
-                            effective_request.message,
-                            status_callback=rlm_status,
-                            on_token=rlm_token
+                            request.message,       # just the query — not the giant blob
+                            context=enriched_message,  # giant data goes into REPL as variable
+                            use_repl=True,
+                            status_callback=repl_status,
+                            on_token=repl_token,
                         )
-                        asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                        asyncio.run_coroutine_threadsafe(repl_queue.put(("done", res)), loop)
                     except Exception as e:
-                        print(f"RLM Agent error: {e}")
-                        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+                        print(f"[RLM REPL error] {e}")
+                        asyncio.run_coroutine_threadsafe(repl_queue.put(("error", str(e))), loop)
 
-                rlm_task = loop.run_in_executor(_executor, _run_rlm)
+                loop.run_in_executor(_executor, _run_repl)
 
                 response_text = ""
-                has_streamed_tokens = False
-                
+                has_repl_tokens = False
                 while True:
-                    msg = await queue.get()
-                    msg_type = msg[0]
-
-                    if msg_type == "done":
+                    msg = await repl_queue.get()
+                    mtype = msg[0]
+                    if mtype == "done":
                         response_text = msg[1]
-                        if not has_streamed_tokens and response_text:
+                        if not has_repl_tokens and response_text:
                             data = json.dumps({"type": "token", "content": response_text})
                             yield f"data: {data}\n\n"
                         break
-                    elif msg_type == "error":
-                        response_text = f"An error occurred in RLM: {msg[1]}"
+                    elif mtype == "error":
+                        response_text = f"RLM REPL error: {msg[1]}"
                         data = json.dumps({"type": "token", "content": response_text})
                         yield f"data: {data}\n\n"
                         break
-                    elif msg_type == "status":
+                    elif mtype == "status":
                         yield _status(msg[1], msg[2])
-                    elif msg_type == "token":
-                        has_streamed_tokens = True
+                    elif mtype == "token":
+                        has_repl_tokens = True
                         data = json.dumps({"type": "token", "content": msg[1]})
                         yield f"data: {data}\n\n"
 
-                # Manually add to agent memory
-                agent.memory.add_message("user", effective_request.message)
+                agent.memory.add_message("user", request.message)
                 agent.memory.add_message("assistant", response_text)
+                agent.last_run_result = None
+                yield "data: [DONE]\n\n"
+                return
 
-            else:
-                # ── Standard Agent Path ──
-                print("[INFO] Routing query to standard Response API")
-                yield _status("Routing to standard agent")
-                await asyncio.sleep(0.05)
-                yield _status("Routing to standard agent", "completed")
+            # ── Standard Agent Path (all normal queries) ──
+            print("[INFO] Routing query to standard Response API (tool-calling loop)")
+            yield _status("Routing to standard agent")
+            await asyncio.sleep(0.05)
+            yield _status("Routing to standard agent", "completed")
 
-                # Prefer the model name requested by the user, fallback to config
-                model_name = request.model or getattr(agent.config, 'model', 'GPT-4o') or 'GPT-4o'
-                yield _status(f"Calling {model_name}")
+            # Prefer the model name requested by the user, fallback to config
+            model_name = request.model or getattr(agent.config, 'model', 'GPT-4o') or 'GPT-4o'
+            yield _status(f"Calling {model_name}")
 
-                queue = asyncio.Queue()
-                
-                def on_token(token: str):
-                    if token:
-                        asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
-                        
-                def _run_agent():
-                    try:
-                        # Use authenticated user_id for mem0 isolation.
-                        # Anonymous users get a sentinel — no stored long-term memory.
-                        _uid = (_current_user.get("sub") if _current_user else None) or "anonymous"
+            queue = asyncio.Queue()
+            
+            def on_token(token: str):
+                if token:
+                    asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+                    
+            def _run_agent():
+                try:
+                    # Use authenticated user_id for mem0 isolation.
+                    # Anonymous users get a sentinel — no stored long-term memory.
+                    _uid = (_current_user.get("sub") if _current_user else None) or "anonymous"
 
-                        def _on_status(step: str, state: str):
-                            asyncio.run_coroutine_threadsafe(
-                                queue.put(("status", step, state)), loop
-                            )
-
-                        res = agent.stream_response_api(
-                            effective_request.message,
-                            message_placeholder=None,
-                            user_id=_uid,
-                            on_token=on_token,
-                            on_status=_on_status,
+                    def _on_status(step: str, state: str):
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put(("status", step, state)), loop
                         )
-                        asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
-                    except Exception as e:
-                        print(f"Agent error: {e}")
-                        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
 
-                agent_task = loop.run_in_executor(_executor, _run_agent)
+                    res = agent.stream_response_api(
+                        effective_request.message,
+                        message_placeholder=None,
+                        user_id=_uid,
+                        on_token=on_token,
+                        on_status=_on_status,
+                    )
+                    asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                except Exception as e:
+                    print(f"Agent error: {e}")
+                    asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
 
-                yield _status(f"Calling {model_name}", "completed")
+            agent_task = loop.run_in_executor(_executor, _run_agent)
 
-                first_token = True
-                response_text = ""
-                
-                while True:
-                    msg = await queue.get()
-                    if isinstance(msg, tuple) and len(msg) == 3:
-                        msg_type, step, state = msg
-                        if msg_type == "status":
-                            yield _status(step, state)
-                            continue
-                    msg_type, payload = msg[0], msg[1]
-                    if msg_type == "done":
-                        response_text = payload
-                        break
-                    elif msg_type == "error":
-                        response_text = f"An error occurred: {payload}"
-                        break
-                    elif msg_type == "token":
-                        if first_token:
-                            yield _status("Generating response", "completed")
-                            first_token = False
-                        data = json.dumps({"type": "token", "content": payload})
-                        yield f"data: {data}\n\n"
+            yield _status(f"Calling {model_name}", "completed")
+
+            first_token = True
+            response_text = ""
+            
+            while True:
+                msg = await queue.get()
+                if isinstance(msg, tuple) and len(msg) == 3:
+                    msg_type, step, state = msg
+                    if msg_type == "status":
+                        yield _status(step, state)
+                        continue
+                msg_type, payload = msg[0], msg[1]
+                if msg_type == "done":
+                    response_text = payload
+                    break
+                elif msg_type == "error":
+                    response_text = f"An error occurred: {payload}"
+                    break
+                elif msg_type == "token":
+                    if first_token:
+                        yield _status("Generating response", "completed")
+                        first_token = False
+                    data = json.dumps({"type": "token", "content": payload})
+                    yield f"data: {data}\n\n"
 
             # ── Tool call results ──
             last_run_result = getattr(agent, 'last_run_result', None)

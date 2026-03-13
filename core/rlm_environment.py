@@ -1,13 +1,19 @@
 # core/rlm_environment.py
 """
-RLM REPL Environment
+RLM REPL Environment — Paper-Standard Implementation
 
-Implements the key RLM insight: treat the prompt/context as a variable in an
-external Python REPL environment, NOT as tokens in the LLM context window.
+Implements the key RLM insight from "Recursive Language Models" (MIT CSAIL, 2025):
+treat the prompt/context as a variable in an external Python REPL environment,
+NOT as tokens in the LLM context window.
 
-The LLM writes code to interact with the context (slice, search, filter)
-rather than reading the entire context directly.  This enables processing
-documents far beyond the model's context window.
+Key capabilities added to match the paper:
+  1. True recursive llm_query() — spawns a child RLMREPLExecutor on sub-chunks.
+  2. call_tool(name, **kwargs) — lets the LLM call any registered Quasar tool
+     (search_by_target, check_line_coverage, generate_casa_imaging_script, etc.)
+     from inside the REPL. This is the bridge between beyond-context data reasoning
+     and live archive access.
+  3. Persistent namespace across iterations — variables, buffers, intermediate
+     results survive across all REPL steps.
 
 Reference: "Recursive Language Models" (MIT CSAIL, 2025)
 """
@@ -110,11 +116,17 @@ class RLMEnvironment:
     persists its namespace across multiple execution steps, so the LLM can
     build up intermediate variables, filter the context, and accumulate
     results over the course of an RLM trajectory.
+
+    Per the paper:
+    - context is stored as a Python string, never fed directly to the LLM
+    - The LLM only ever sees stdout snippets / search results
+    - llm_query() and call_tool() enable recursive and tool-integrated reasoning
     """
 
-    MAX_OUTPUT_CHARS = 4_000  # Truncate stdout to avoid flooding the LLM
+    MAX_OUTPUT_CHARS = 8_000  # Truncate stdout to avoid flooding the LLM
 
-    def __init__(self, context: str):
+    def __init__(self, context: str, call_tool_fn: Callable | None = None,
+                 llm_query_fn: Callable | None = None):
         self.context = context
         self.lines = context.splitlines()
         self.trajectory: List[Dict[str, Any]] = []  # Full execution trace
@@ -122,21 +134,40 @@ class RLMEnvironment:
         # Persistent namespace shared across steps
         self.namespace: Dict[str, Any] = {
             "__builtins__": _make_safe_builtins(),
-            # --- Context helpers ---
-            "context": context,
+            # --- Context helpers (paper standard) ---
+            "context":       context,
             "context_lines": self.lines,
-            "num_lines": len(self.lines),
-            "num_chars": len(context),
+            "num_lines":     len(self.lines),
+            "num_chars":     len(context),
             # --- Utility functions ---
-            "search": self._search,
-            "slice_lines": self._slice_lines,
-            "slice_chars": self._slice_chars,
+            "search":        self._search,
+            "slice_lines":   self._slice_lines,
+            "slice_chars":   self._slice_chars,
             "count_matches": self._count_matches,
-            "head": lambda n=20: "\n".join(self.lines[:n]),
-            "tail": lambda n=20: "\n".join(self.lines[-n:]),
+            "head":          lambda n=20: "\n".join(self.lines[:n]),
+            "tail":          lambda n=20: "\n".join(self.lines[-n:]),
             # --- Results accumulator ---
             "results": [],
         }
+
+        # --- Paper-standard recursive and tool-bridge functions ---
+        # llm_query(prompt, context_chunk="") — recursive sub-LLM call
+        if llm_query_fn is not None:
+            self.namespace["llm_query"] = llm_query_fn
+            self.namespace["sub_query"] = llm_query_fn  # backward compat alias
+        else:
+            self.namespace["llm_query"] = lambda prompt, ctx="": (
+                "[llm_query not configured]"
+            )
+            self.namespace["sub_query"] = self.namespace["llm_query"]
+
+        # call_tool(name, **kwargs) — calls a registered Quasar tool from REPL
+        if call_tool_fn is not None:
+            self.namespace["call_tool"] = call_tool_fn
+        else:
+            self.namespace["call_tool"] = lambda name, **kw: (
+                {"error": "call_tool not configured — no tool executor set"}
+            )
 
     # --- Public API ---------------------------------------------------------
 
@@ -191,14 +222,15 @@ class RLMEnvironment:
 
     def get_state_summary(self) -> str:
         """Return a compact summary of the current environment state."""
+        _builtins = (
+            "context", "context_lines", "num_lines", "num_chars",
+            "search", "slice_lines", "slice_chars", "count_matches",
+            "head", "tail", "results", "llm_query", "sub_query", "call_tool",
+        )
         user_vars = {
             k: _summarize_value(v)
             for k, v in self.namespace.items()
-            if not k.startswith("_") and k not in (
-                "context", "context_lines", "num_lines", "num_chars",
-                "search", "slice_lines", "slice_chars", "count_matches",
-                "head", "tail", "results",
-            )
+            if not k.startswith("_") and k not in _builtins
         }
         return (
             f"Context: {self.namespace['num_chars']:,} chars, "
@@ -243,48 +275,71 @@ class RLMEnvironment:
 
 
 # ---------------------------------------------------------------------------
-# RLM Executor  (REPL-based)
+# System Prompt  (matches Appendix D of the paper)
 # ---------------------------------------------------------------------------
 
 RLM_REPL_SYSTEM_PROMPT = """\
 You are an RLM (Recursive Language Model) agent operating inside a Python REPL \
-environment.
+environment. Your job is to answer a question by WRITING CODE to examine a large \
+context — do NOT try to read the whole context at once.
 
-The user's input context has been loaded as:
-- `context`       — the full text as a string ({num_chars:,} chars)
+The user's context has been loaded as Python variables:
+- `context`       — full text ({num_chars:,} chars). DO NOT print this directly.
 - `context_lines` — list of lines ({num_lines:,} lines)
 - `num_lines`, `num_chars` — dimensions
 
-You also have these helper functions:
-- search(pattern)           → [(line_num, line), ...]  regex search
-- slice_lines(start, end)   → str  (1-indexed, inclusive)
-- slice_chars(start, end)   → str
-- count_matches(pattern)    → int
-- head(n=20) / tail(n=20)   → first/last n lines
-- sub_query(prompt)          → str  (make a recursive LLM call)
+BUILT-IN FUNCTIONS:
+- search(pattern)            → [(line_num, line), ...]  — regex search over all lines
+- slice_lines(start, end)    → str  (1-indexed, inclusive)
+- slice_chars(start, end)    → str
+- count_matches(pattern)     → int
+- head(n=20) / tail(n=20)    → first/last N lines
+- llm_query(prompt, ctx="")  → str  — recursive LLM sub-call. If ctx is given,
+                                      spawns a full REPL child on that sub-chunk.
+                                      Use for: summarising a chunk, answering a
+                                      question about a slice, extracting fields.
+- call_tool(name, **kwargs)  → dict — call any Quasar tool by name from REPL.
+                                      Examples:
+                                        call_tool("search_by_target", target_name="Elias 2-27")
+                                        call_tool("check_line_coverage", line_freq_ghz=230.538, z=0.0)
+                                        call_tool("search_papers", query="ALMA protostellar disk")
+                                        call_tool("generate_casa_imaging_script", target="Elias 2-27", vis="data.ms")
 
-Store your intermediate findings in the `results` list.
-When ready, call `answer(your_final_answer_string)`.
+- results  — a list. Append your findings here as you go.
+- answer(text) — call this to submit your final answer.
 
-⚠️  Do NOT try to print the entire context. It is too large.
-Instead, use code to filter and extract relevant sections.
+STRATEGY (from the paper):
+1. Use search() or head() to orient yourself in the context first.
+2. Break large contexts into chunks with slice_lines(). Use llm_query() on each chunk.
+3. Use call_tool() to fetch live data from the ALMA archive when the context mentions targets.
+4. Store intermediate findings in results[] or in named variables.
+5. Do NOT hallucinate — only report what you found via code execution.
+6. Call answer("...your answer...") when done.
 
-Always explain your plan BEFORE writing code blocks.
-Separate code from explanation with ```python ... ``` markers.\
+Always explain your plan BEFORE writing code. Separate code with ```python ... ``` markers.\
 """
 
 # Sentinel used to detect when the LLM calls answer()
 _ANSWER_SENTINEL = object()
 
 
+# ---------------------------------------------------------------------------
+# RLM REPL Executor  (paper-standard with tools + true recursion)
+# ---------------------------------------------------------------------------
+
 class RLMREPLExecutor:
     """
-    Runs the full RLM REPL loop:
-      1. Show the LLM the environment state
-      2. LLM generates a plan + code
-      3. Execute code, capture output
-      4. Feed output back to LLM
+    Runs the full RLM REPL loop as described in the paper:
+
+      1. Show LLM the environment state + query
+      2. LLM generates a plan + Python code
+      3. Execute code in sandboxed REPL (with context as variable)
+      4. Feed stdout back to LLM as next input
       5. Repeat until answer() is called or max iterations hit
+
+    Paper-standard additions:
+    - llm_query(prompt, ctx) spawns a child RLMREPLExecutor (true recursion)
+    - call_tool(name, **kwargs) bridges to registered Quasar tools
     """
 
     DEFAULT_MAX_ITERATIONS = 12
@@ -295,11 +350,13 @@ class RLMREPLExecutor:
         model: str = "gpt-4o",
         sub_model: str = "gpt-4o-mini",
         verbose: bool = False,
+        tool_executor: Callable | None = None,  # (tool_name, kwargs) -> result
     ):
         self.client = client
         self.model = model
         self.sub_model = sub_model
         self.verbose = verbose
+        self.tool_executor = tool_executor  # Bridge to Quasar tool registry
 
     def run(
         self,
@@ -315,34 +372,49 @@ class RLMREPLExecutor:
         """
         max_iter = max_iterations or self.DEFAULT_MAX_ITERATIONS
 
-        # Set up environment
-        env = RLMEnvironment(context)
+        # Build the two Python-callable functions to inject into the REPL
+        def _llm_query_fn(prompt: str, context_chunk: str = "") -> str:
+            return self._sub_query_llm(prompt, context_chunk)
+
+        def _call_tool_fn(tool_name: str, **kwargs) -> Any:
+            if self.tool_executor is None:
+                return {"error": "No tool executor configured on RLMREPLExecutor"}
+            try:
+                return self.tool_executor(tool_name, kwargs)
+            except Exception as e:
+                return {"error": f"Tool '{tool_name}' raised: {e}"}
+
+        # Set up environment with both bridges
+        env = RLMEnvironment(
+            context=context,
+            call_tool_fn=_call_tool_fn,
+            llm_query_fn=_llm_query_fn,
+        )
         final_answer: List[str] = []  # mutable container for the answer() call
 
-        # Inject answer() and sub_query() into namespace
+        # Inject answer() into namespace
         def _answer(result: str):
             final_answer.append(str(result))
 
-        def _sub_query(prompt: str) -> str:
-            return self._sub_query_llm(prompt)
-
         env.namespace["answer"] = _answer
-        env.namespace["sub_query"] = _sub_query
 
-        # Build initial system prompt (used as instructions for Responses API)
+        # Build system prompt
         system = RLM_REPL_SYSTEM_PROMPT.format(
             num_chars=env.namespace["num_chars"],
             num_lines=env.namespace["num_lines"],
         )
 
         # Initial user input for the first turn
-        current_input = f"Question: {query}\n\nEnvironment state:\n{env.get_state_summary()}"
+        current_input = (
+            f"Question: {query}\n\n"
+            f"Environment state:\n{env.get_state_summary()}"
+        )
         last_response_id = None  # Track conversation continuity
 
         for iteration in range(max_iter):
             if self.verbose:
                 print(f"  [REPL iter {iteration+1}/{max_iter}]")
-                
+
             if status_callback:
                 status_callback(f"REPL Step {iteration+1}: Analyzing context", "running")
 
@@ -357,7 +429,7 @@ class RLMREPLExecutor:
             )
             last_response_id = resp.id
             assistant_msg = resp.output_text or ""
-            
+
             if status_callback:
                 status_callback(f"REPL Step {iteration+1}: Analyzing context", "completed")
 
@@ -370,18 +442,22 @@ class RLMREPLExecutor:
                     if on_token:
                         on_token(final_answer[0])
                     return final_answer[0]
-                # Treat the whole message as the answer if no code
+                # Treat the whole message as the answer if no code after first turn
                 if iteration > 0:
                     if on_token:
                         on_token(assistant_msg)
                     return assistant_msg
-                # First iteration with no code — ask for code
-                current_input = "Please write Python code to work with the context. Use ```python ... ``` code blocks."
+                # First iteration with no code — prompt for code
+                current_input = (
+                    "Please write Python code to work with the context and tools. "
+                    "Use ```python ... ``` code blocks."
+                )
                 continue
 
             # Execute each code block
             if status_callback:
                 status_callback(f"REPL Step {iteration+1}: Executing Python code", "running")
+
             all_outputs = []
             for code in code_blocks:
                 result = env.execute(code.strip())
@@ -413,7 +489,10 @@ class RLMREPLExecutor:
             )
 
         # Max iterations reached — ask for final answer
-        current_input = "Max iterations reached. Please call answer() with your best answer now."
+        current_input = (
+            "Max iterations reached. Please call answer() with your best "
+            "answer based on everything you have found so far."
+        )
         resp = self.client.responses.create(
             model=self.model,
             input=current_input,
@@ -424,25 +503,47 @@ class RLMREPLExecutor:
         )
         final_msg = resp.output_text or ""
 
-        # Try to extract answer
         ans = final_answer[0] if final_answer else final_msg
         if on_token:
             on_token(ans)
         return ans
 
-    def _sub_query_llm(self, prompt: str) -> str:
-        """Make a recursive LLM sub-call using the cheaper sub-model."""
-        try:
-            resp = self.client.responses.create(
-                model=self.sub_model,
-                input=prompt,
-                instructions="You are a helpful research assistant. Be concise.",
-                temperature=0.2,
-                max_output_tokens=500,
+    def _sub_query_llm(self, prompt: str, context_chunk: str = "") -> str:
+        """
+        True recursive sub-call per the paper.
+
+        If context_chunk is provided: spawns a child RLMREPLExecutor on that
+        chunk (true recursion — child has its own REPL, same tools).
+        If no chunk: makes a direct Responses API call with the sub-model.
+        """
+        if context_chunk:
+            # Spawn a child REPL on the sub-chunk (paper's core recursive primitive)
+            if self.verbose:
+                print(f"  [llm_query] Spawning child REPL on {len(context_chunk):,} char chunk")
+            child = RLMREPLExecutor(
+                client=self.client,
+                model=self.sub_model,       # cheaper model for sub-calls
+                sub_model=self.sub_model,
+                verbose=self.verbose,
+                tool_executor=self.tool_executor,  # tools pass down to children
             )
-            return resp.output_text.strip()
-        except Exception as e:
-            return f"[Sub-query error: {e}]"
+            return child.run(prompt, context_chunk, max_iterations=6)
+        else:
+            # No sub-chunk context — direct LLM answer with sub-model
+            try:
+                resp = self.client.responses.create(
+                    model=self.sub_model,
+                    input=prompt,
+                    instructions=(
+                        "You are an expert radio astronomer. "
+                        "Answer concisely using only what you know."
+                    ),
+                    temperature=0.2,
+                    max_output_tokens=600,
+                )
+                return resp.output_text.strip()
+            except Exception as e:
+                return f"[llm_query error: {e}]"
 
 
 # ---------------------------------------------------------------------------

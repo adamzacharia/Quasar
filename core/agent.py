@@ -163,6 +163,9 @@ class QuasarAgent:
             tool_executor=self._rlm_tool_executor,
             verbose=self.config.verbose,
         )
+        # Wire all 27 registered tools into the REPL executor so the LLM can
+        # call any Quasar tool from within REPL Python code via call_tool()
+        self.rlm.repl_executor.tool_executor = self._rlm_tool_bridge
         
         print("DEBUG: Agent init done")
 
@@ -214,6 +217,7 @@ Your goal is to help users find, visualize, and analyze ALMA data.
 GUIDELINES:
 - **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
+- **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
 - **PAPER SEARCH**: When you use the `search_papers` tool, do NOT write any text listing the papers. Output NOTHING after the tool call. The UI renders the papers as interactive cards automatically.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
@@ -1452,6 +1456,25 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     # --- RLM helpers -------------------------------------------------------
 
+    def _rlm_tool_bridge(self, tool_name: str, kwargs: dict) -> Any:
+        """
+        Bridge from REPL call_tool(name, **kwargs) to registered Quasar tools.
+
+        This is the key paper-standard addition: any of the 27+ registered
+        Quasar tools can be called from inside the REPL Python environment:
+          call_tool("search_by_target", target_name="Elias 2-27")
+          call_tool("check_line_coverage", line_freq_ghz=230.538, z=0.0)
+          call_tool("generate_casa_imaging_script", target="Elias 2-27", vis="x.ms")
+        """
+        tool = self.tool_registry.get_tool(tool_name)
+        if tool:
+            try:
+                result = tool.execute(**kwargs)
+                return result
+            except Exception as e:
+                return {"error": f"Tool '{tool_name}' execution failed: {e}"}
+        return {"error": f"Unknown tool: '{tool_name}'. Available: {[t.name for t in self.tool_registry.list_tools()]}"}
+
     def _rlm_tool_executor(self, subtask: str, context: str) -> Optional[str]:
         """
         Callback used by the RLM engine to execute domain-specific sub-tasks.
@@ -1625,7 +1648,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             if message_placeholder:
                 message_placeholder.markdown("🔄 Processing...")
             
-            MAX_TOOL_ROUNDS = 5
+            MAX_TOOL_ROUNDS = 12  # supports up to 8-step multi-tool query chains
             last_id = self.last_response_id
             output_text = ""
             
@@ -1703,7 +1726,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     if tool:
                         try:
                             result = tool.execute(**args)
-                            result_str = json.dumps(result, default=str)[:4000]
+                            result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
                         except Exception as te:
                             result_str = json.dumps({"error": str(te)})
                     else:

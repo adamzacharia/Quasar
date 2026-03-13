@@ -185,11 +185,14 @@ class RecursiveLanguageModel:
         self.verbose = verbose
         self.detector = ComplexityDetector(client, model="gpt-4o-mini")
         self.use_repl = use_repl
+        # tool_executor will be set after agent initialises (see QuasarAgent._register_rlm_tools)
+        self.tool_executor = None
         self.repl_executor = RLMREPLExecutor(
             client=client,
             model=model,
             sub_model="gpt-4o-mini",
             verbose=verbose,
+            tool_executor=None,  # wired up later via set_tool_executor()
         )
 
     # --- public API ---------------------------------------------------------
@@ -219,15 +222,19 @@ class RecursiveLanguageModel:
         """
         repl_mode = use_repl if use_repl is not None else self.use_repl
 
-        # Use REPL mode for large contexts or when explicitly requested
-        if repl_mode and context and len(context) > 2000:
+        # Use REPL mode when context is genuinely massive (>80k chars ≈ 20k tokens).
+        # This is the paper's intended use case — processing datasets far beyond the
+        # LLM's context window, not for normal multi-step queries.
+        REPL_CONTEXT_THRESHOLD = 80_000
+        if repl_mode and context and len(context) > REPL_CONTEXT_THRESHOLD:
             if self.verbose:
-                print(f"[RLM] Using REPL mode for {len(context):,} char context")
+                print(f"[RLM] Using REPL mode for {len(context):,} char context (threshold: {REPL_CONTEXT_THRESHOLD:,})")
             if status_callback:
+                status_callback("Initializing Python REPL environment", "running")
                 status_callback("Initializing Python REPL environment", "completed")
             return self.repl_executor.run(query, context, status_callback=status_callback, on_token=on_token)
 
-        # Fallback: LLM-only decomposition
+        # Fallback: LLM-only decomposition (rarely used — main path is stream_response_api)
         return self._execute_decompose(query, context, depth, status_callback=status_callback, on_token=on_token)
 
     def _execute_decompose(self, query: str, context: str, depth: int = 0, status_callback=None, on_token=None) -> str:

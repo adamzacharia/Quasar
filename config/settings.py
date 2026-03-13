@@ -33,9 +33,11 @@ class LogLevel(Enum):
 class APIConfig:
     """API configuration"""
     openai_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    openai_model: str = field(default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "gpt-4-turbo-preview"))
+    openai_model: str = field(default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "claude-sonnet-4-6"))
     openai_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7")))
     openai_max_tokens: int = field(default_factory=lambda: int(os.getenv("MAX_TOKENS", "2000")))
+
+    anthropic_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
 
     nasa_ads_key: str = field(default_factory=lambda: os.getenv("NASA_ADS_API_KEY", ""))
 

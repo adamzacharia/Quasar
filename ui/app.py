@@ -322,10 +322,41 @@ def render_sidebar_logo():
 def render_model_selector_top():
     """Render model selector at top left of main area (like Playground)"""
     available_models = [
-        "gpt-4o",
-        "gpt-4o-mini", 
-        "gpt-4.1",
-        "gpt-3.5-turbo"
+        # ── Anthropic Claude (Latest) ──────────────────────────────
+        "claude-sonnet-4-6",       # Latest Sonnet — best coding, default free/pro
+        "claude-opus-4-6",         # Latest Opus — smartest, 1M context (beta)
+        "claude-sonnet-4-5",       # Sonnet 4.5 — coding/computer use
+        "claude-opus-4-5",         # Opus 4.5 — best coding & agents
+        "claude-haiku-4-5",        # Haiku 4.5 — fastest & cheapest
+        "claude-opus-4-1",         # Opus 4.1 — agentic tasks
+        "claude-sonnet-4",         # Sonnet 4
+        "claude-opus-4",           # Opus 4
+        "claude-3-7-sonnet-20250219",  # Claude 3.7 Sonnet — hybrid reasoning
+        "claude-3-5-sonnet-20241022",  # Claude 3.5 Sonnet (Oct 2024)
+        "claude-3-5-haiku-20241022",   # Claude 3.5 Haiku
+        # ── OpenAI GPT (Latest) ───────────────────────────────────
+        "gpt-5.4",                 # GPT-5.4 — latest flagship (Mar 2026)
+        "gpt-5.4-2026-03-05",      # GPT-5.4 snapshot
+        "gpt-5",                   # GPT-5
+        "gpt-5-mini",              # GPT-5 Mini — lower latency
+        "gpt-5-nano",              # GPT-5 Nano — cheapest
+        "gpt-4o",                  # GPT-4o — omni flagship
+        "gpt-4o-mini",             # GPT-4o Mini — fast & cheap
+        "gpt-4.1",                 # GPT-4.1 — coding & long-context (1M)
+        "gpt-4.1-mini",            # GPT-4.1 Mini — balanced
+        "gpt-4.1-nano",            # GPT-4.1 Nano — fastest/cheapest
+        "o3",                      # o3 — advanced reasoning
+        "o4-mini",                 # o4-mini — reasoning, lower cost
+        # ── Google Gemini (Latest) ────────────────────────────────
+        "gemini-3.1-pro",          # Gemini 3.1 Pro — best reasoning
+        "gemini-3.1-flash",        # Gemini 3.1 Flash
+        "gemini-3.1-flash-lite",   # Gemini 3.1 Flash Lite
+        "gemini-3-flash",          # Gemini 3 Flash (default app)
+        "gemini-3-pro",            # Gemini 3 Pro
+        "gemini-2.5-pro",          # Gemini 2.5 Pro
+        "gemini-2.5-flash",        # Gemini 2.5 Flash
+        "gemini-2.5-flash-lite",   # Gemini 2.5 Flash Lite
+        "gemini-2.0-flash",        # Gemini 2.0 Flash
     ]
     
     selected_model = st.selectbox(
