@@ -55,6 +55,7 @@ export interface DataTableResult {
     columns: string[];
     rows: Record<string, string | number>[];
     sourceName: string;
+    archiveLink?: string;  // URL to full dataset on ALMA/ESO portal
 }
 
 export interface Paper {

@@ -599,7 +599,12 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
 
             if last_run_result:
                 result_type = last_run_result.get("type", "")
-                tool_name_raw = last_run_result.get("tool_name", "search_nasa_ads")
+                # Use actual tool name stored by each tool, with sensible fallback
+                tool_name_raw = last_run_result.get("tool_name") or (
+                    "search_papers" if result_type == "papers" else
+                    "search_alma_archive" if result_type == "data" else
+                    "quasar_tool"
+                )
                 tool_display = tool_name_raw.replace("_", " ").title()
 
                 # Emit tool call event
@@ -619,20 +624,56 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                     df = last_run_result.get("data")
                     if df is not None and hasattr(df, 'to_dict'):
                         try:
-                            rows = df.head(50).to_dict("records")
-                            columns = list(df.columns)
+                            # ── Select key display columns only (ALMA has 80+ raw cols) ──
+                            ALMA_DISPLAY_COLS = {
+                                "project_code"       : "Project",
+                                "target_name"        : "Target",
+                                "band_list"          : "Band",
+                                "frequency"          : "Freq (GHz)",
+                                "min_frequency"      : "Min Freq",
+                                "max_frequency"      : "Max Freq",
+                                "spatial_resolution" : "Res (arcsec)",
+                                "s_resolution"       : "Res (arcsec)",
+                                "t_exptime"          : "Exp (s)",
+                                "integration"        : "Exp (s)",
+                                "pi_name"            : "PI",
+                                "obs_release_date"   : "Release",
+                                "science_keyword"    : "Keywords",
+                            }
+                            available = {raw: nice for raw, nice in ALMA_DISPLAY_COLS.items() if raw in df.columns}
+                            if not available:
+                                sel_cols = list(df.columns[:8])
+                                display_cols = sel_cols
+                            else:
+                                sel_cols = list(available.keys())
+                                display_cols = [available[c] for c in sel_cols]
+
+                            sub = df[sel_cols].head(50).copy()
+                            sub.columns = display_cols
+                            for col in sub.select_dtypes(include="object").columns:
+                                sub[col] = sub[col].astype(str).str[:60]
+                            rows = sub.to_dict("records")
+                            rows = [{k: ("" if (v is None or (isinstance(v, float) and v != v)) else str(v)) for k, v in r.items()} for r in rows]
+
+                            # Build ALMA archive link for this target
                             source = last_run_result.get("source", "ALMA")
+                            alma_link = None
+                            if df is not None and "target_name" in df.columns and not df.empty:
+                                _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
+                                alma_link = f"https://almascience.eso.org/aq/?target={_tgt}"
                             metrics = [
-                                {"label": "Total Obs", "value": len(df), "color": "text-primary"},
-                                {"label": "Columns", "value": len(columns), "color": "text-indigo-400"},
+                                {"label": "Observations", "value": str(len(df)), "color": "text-primary"},
+                                {"label": "Showing",      "value": str(len(rows)), "color": "text-indigo-400"},
+                                {"label": "Source",       "value": source, "color": "text-emerald-400"},
                             ]
                             data_event = json.dumps({
                                 "type": "data",
                                 "content": {
                                     "sourceName": source,
                                     "metrics": metrics,
-                                    "columns": columns,
+                                    "columns": display_cols,
                                     "rows": rows,
+                                    "archiveLink": alma_link,
                                 }
                             })
                             yield f"data: {data_event}\n\n"

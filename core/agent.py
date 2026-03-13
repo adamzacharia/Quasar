@@ -1011,14 +1011,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             results = self.search_service.cone_search(
                 ra, dec, radius, facility, max_results
             )
-            # Cache for plotting/download
             self.last_search_results = results
-            self.last_run_result = {"type": "data", "data": results, "source": f"Position Search: {ra}, {dec}"}
-            
+            self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_position"}
+            _KEY_COLS = ["project_code", "target_name", "band_list", "frequency",
+                         "min_frequency", "max_frequency", "spatial_resolution", "pi_name"]
+            _avail = [c for c in _KEY_COLS if c in results.columns]
+            _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
-                "count": len(results),
-                "results": results.to_dict("records") if not results.empty else []
+                "total_results": len(results),
+                "ra": ra, "dec": dec, "radius_deg": radius,
+                "sample_rows": _sample,
+                "note": f"Found {len(results)} observations. Full dataset shown in UI table."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1033,12 +1037,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 target_name, facility, date_range, max_results
             )
             self.last_search_results = results
-            self.last_run_result = {"type": "data", "data": results, "source": f"Target Search: {target_name}"}
-            
+            self.last_run_result = {"type": "data", "data": results, "source": f"ALMA", "tool_name": "search_by_target"}
+            # Return a compact summary to LLM — NOT the full giant DataFrame
+            _KEY_COLS = ["project_code", "target_name", "band_list", "frequency",
+                         "min_frequency", "max_frequency", "spatial_resolution",
+                         "s_resolution", "pi_name", "obs_release_date"]
+            _avail = [c for c in _KEY_COLS if c in results.columns]
+            _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
-                "count": len(results),
-                "results": results.to_dict("records") if not results.empty else []
+                "total_results": len(results),
+                "facility": facility or "ALMA",
+                "target": target_name,
+                "sample_rows": _sample,
+                "note": f"Found {len(results)} observations. Full dataset shown to user in the UI table."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
