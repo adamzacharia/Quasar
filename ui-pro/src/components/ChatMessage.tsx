@@ -167,16 +167,29 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     {/* Data table */}
                     {message.dataTable && <DataTableCard data={message.dataTable} />}
 
-                    {/* Papers */}
-                    {message.papers && message.papers.length > 0 && (
-                        <div className="grid grid-flow-col auto-cols-[100%] md:auto-cols-[calc(50%-0.5rem)] gap-4 overflow-x-auto snap-x snap-mandatory pb-4 hide-scrollbar">
-                            {message.papers.map((paper) => (
-                                <div key={paper.id} className="snap-start w-full">
-                                    <PaperCard paper={paper} />
+                    {/* Papers — 2-column grid, up to 10, scrollable if more */}
+                    {message.papers && message.papers.length > 0 && (() => {
+                        const VISIBLE_MAX = 10;
+                        const shown = message.papers.slice(0, VISIBLE_MAX);
+                        const hasMore = message.papers.length > VISIBLE_MAX;
+                        return (
+                            <div>
+                                <div
+                                    className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${hasMore ? "max-h-[680px] overflow-y-auto pr-1 custom-scrollbar" : ""}`}
+                                >
+                                    {shown.map((paper) => (
+                                        <PaperCard key={paper.id} paper={paper} />
+                                    ))}
                                 </div>
-                            ))}
-                        </div>
-                    )}
+                                {hasMore && (
+                                    <p className="text-xs text-slate-500 mt-2 text-right">
+                                        Showing {VISIBLE_MAX} of {message.papers.length} papers
+                                    </p>
+                                )}
+                            </div>
+                        );
+                    })()}
+
 
                     {/* Notebook payload */}
                     {message.type === "notebook" && message.notebookData && (

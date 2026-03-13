@@ -84,3 +84,18 @@
   -ms-overflow-style: none;
   scrollbar-width: none;
 }
+
+/* Styled scrollbar for paper grids */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #f471b5;
+}
