@@ -599,15 +599,13 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
 
             if last_run_result:
                 result_type = last_run_result.get("type", "")
-                # Use actual tool name stored by each tool, with sensible fallback
+                # Use actual tool name stored by each tool
                 tool_name_raw = last_run_result.get("tool_name") or (
                     "search_papers" if result_type == "papers" else
                     "search_alma_archive" if result_type == "data" else
                     "quasar_tool"
                 )
                 tool_display = tool_name_raw.replace("_", " ").title()
-
-                # Emit tool call event
                 tool_event = json.dumps({
                     "type": "tool_call",
                     "name": tool_name_raw,
@@ -619,52 +617,86 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                 yield f"data: {tool_event}\n\n"
                 await asyncio.sleep(0.05)
 
-                # Emit data table if we have structured data
                 if result_type == "data":
                     df = last_run_result.get("data")
                     if df is not None and hasattr(df, 'to_dict'):
                         try:
-                            # ── Select key display columns only (ALMA has 80+ raw cols) ──
-                            ALMA_DISPLAY_COLS = {
-                                "project_code"       : "Project",
-                                "target_name"        : "Target",
-                                "band_list"          : "Band",
-                                "frequency"          : "Freq (GHz)",
-                                "min_frequency"      : "Min Freq",
-                                "max_frequency"      : "Max Freq",
-                                "spatial_resolution" : "Res (arcsec)",
-                                "s_resolution"       : "Res (arcsec)",
-                                "t_exptime"          : "Exp (s)",
-                                "integration"        : "Exp (s)",
-                                "pi_name"            : "PI",
-                                "obs_release_date"   : "Release",
-                                "science_keyword"    : "Keywords",
-                            }
-                            available = {raw: nice for raw, nice in ALMA_DISPLAY_COLS.items() if raw in df.columns}
-                            if not available:
+                            import math
+
+                            # ── Key display columns — ordered for readability ──
+                            ALMA_DISPLAY_COLS = [
+                                ("project_code",    "Project"),
+                                ("target_name",     "Target"),
+                                ("band_list",       "Band"),
+                                ("frequency",       "Freq (GHz)"),
+                                ("min_frequency",   "Min Freq (GHz)"),
+                                ("max_frequency",   "Max Freq (GHz)"),
+                                ("spatial_resolution", "Res (arcsec)"),
+                                ("s_resolution",    "Res (arcsec)"),
+                                ("t_exptime",       "Exp (s)"),
+                                ("pi_name",         "PI"),
+                                ("obs_release_date","Release"),
+                                ("member_ous_uid",  "MOUS ID"),
+                            ]
+                            # Only keep first match per display name (avoid duplicate Res column)
+                            seen_display = set()
+                            sel_cols, display_cols = [], []
+                            for raw, nice in ALMA_DISPLAY_COLS:
+                                if raw in df.columns and nice not in seen_display:
+                                    sel_cols.append(raw)
+                                    display_cols.append(nice)
+                                    seen_display.add(nice)
+
+                            if not sel_cols:
                                 sel_cols = list(df.columns[:8])
                                 display_cols = sel_cols
-                            else:
-                                sel_cols = list(available.keys())
-                                display_cols = [available[c] for c in sel_cols]
 
                             sub = df[sel_cols].head(50).copy()
                             sub.columns = display_cols
-                            for col in sub.select_dtypes(include="object").columns:
-                                sub[col] = sub[col].astype(str).str[:60]
-                            rows = sub.to_dict("records")
-                            rows = [{k: ("" if (v is None or (isinstance(v, float) and v != v)) else str(v)) for k, v in r.items()} for r in rows]
 
-                            # Build ALMA archive link for this target
+                            # ── Per-row archive links from access_url ──
+                            # access_url is built by _standardize_columns from member_ous_uid
+                            per_row_links = []
+                            if "access_url" in df.columns:
+                                per_row_links = df["access_url"].head(50).fillna("").tolist()
+                            elif "member_ous_uid" in df.columns:
+                                per_row_links = [
+                                    f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
+                                    if pd.notna(v) and str(v).strip() else ""
+                                    for v in df["member_ous_uid"].head(50)
+                                ]
+
+                            def _fmt(v):
+                                """Format a cell value cleanly."""
+                                if v is None or (isinstance(v, float) and math.isnan(v)):
+                                    return ""
+                                if isinstance(v, float):
+                                    # Round long decimals to 3 significant figures
+                                    return f"{v:.3f}".rstrip("0").rstrip(".")
+                                return str(v)[:60]
+
+                            for col in sub.columns:
+                                sub[col] = sub[col].apply(_fmt)
+
+                            rows = sub.to_dict("records")
+                            # Attach per-row link
+                            for i, link in enumerate(per_row_links):
+                                if i < len(rows):
+                                    rows[i]["_link"] = link
+
                             source = last_run_result.get("source", "ALMA")
+                            filter_label = last_run_result.get("filter_label", source)
+
+                            # Build footer ALMA archive link
                             alma_link = None
-                            if df is not None and "target_name" in df.columns and not df.empty:
+                            if "target_name" in df.columns and not df.empty:
                                 _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
                                 alma_link = f"https://almascience.eso.org/aq/?target={_tgt}"
+
                             metrics = [
-                                {"label": "Observations", "value": str(len(df)), "color": "text-primary"},
-                                {"label": "Showing",      "value": str(len(rows)), "color": "text-indigo-400"},
-                                {"label": "Source",       "value": source, "color": "text-emerald-400"},
+                                {"label": "Observations",  "value": str(len(df)), "color": "text-primary"},
+                                {"label": "Showing",       "value": str(len(rows)), "color": "text-indigo-400"},
+                                {"label": "Source",        "value": filter_label, "color": "text-emerald-400"},
                             ]
                             data_event = json.dumps({
                                 "type": "data",
@@ -674,12 +706,15 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                                     "columns": display_cols,
                                     "rows": rows,
                                     "archiveLink": alma_link,
+                                    "hasRowLinks": bool(per_row_links),
                                 }
                             })
                             yield f"data: {data_event}\n\n"
                             await asyncio.sleep(0.05)
                         except Exception as e:
+                            import traceback
                             print(f"[WARN] Failed to serialize data table: {e}")
+                            traceback.print_exc()
 
                 elif result_type == "papers":
                     papers = last_run_result.get("papers")

@@ -254,14 +254,26 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="search_by_target",
-            description="Search NRAO/ALMA archives by target name",
+            description=(
+                "Search ALMA archive by target name. Accepts optional filters "
+                "(band, resolution, frequency) to narrow results BEFORE returning — "
+                "so only matching observations are shown. "
+                "ALWAYS pass user-specified constraints as parameters rather than "
+                "filtering separately afterwards."
+            ),
             function=self._search_by_target,
             parameters={
                 "type": "object",
                 "properties": {
-                    "target_name": {"type": "string", "description": "Name of the astronomical target (e.g., 'HL Tau', 'M87')"},
-                    "facility": {"type": "string", "enum": ["VLA", "VLBA", "ALMA", "GBT"], "description": "Observatory facility. Default to ALMA."},
-                    "max_results": {"type": "integer", "description": "Maximum results to return"}
+                    "target_name":    {"type": "string",  "description": "Astronomical target name (e.g. 'TW Hya', 'HL Tau')"},
+                    "facility":       {"type": "string",  "enum": ["ALMA", "VLA", "VLBA", "GBT"], "description": "Observatory. Default ALMA."},
+                    "band":           {"type": "integer", "description": "ALMA band number to filter (3-10). E.g. 6 for Band 6 (~220 GHz)."},
+                    "max_resolution": {"type": "number",  "description": "Maximum angular resolution in arcsec (e.g. 0.2 means keep only rows with res <= 0.2)."},
+                    "min_resolution": {"type": "number",  "description": "Minimum angular resolution in arcsec."},
+                    "min_freq_ghz":   {"type": "number",  "description": "Minimum frequency in GHz."},
+                    "max_freq_ghz":   {"type": "number",  "description": "Maximum frequency in GHz."},
+                    "min_exp_s":      {"type": "number",  "description": "Minimum integration time in seconds."},
+                    "public_only":    {"type": "boolean", "description": "Only return publicly available data."},
                 },
                 "required": ["target_name"]
             }
@@ -1029,28 +1041,90 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     @log_tool
     def _search_by_target(self, target_name: str, facility: Optional[str] = None,
-                          date_range: Optional[str] = None,
-                          max_results: int = 100) -> Dict[str, Any]:
-        """Search archives by target name"""
+                          date_range: Optional[str] = None, max_results: int = 100,
+                          band: Optional[int] = None,
+                          max_resolution: Optional[float] = None,
+                          min_resolution: Optional[float] = None,
+                          min_freq_ghz: Optional[float] = None,
+                          max_freq_ghz: Optional[float] = None,
+                          min_exp_s: Optional[float] = None,
+                          public_only: bool = False) -> Dict[str, Any]:
+        """Search ALMA by target name, with optional native post-filters."""
         try:
             results = self.search_service.search_by_target(
                 target_name, facility, date_range, max_results
             )
+            if results.empty:
+                self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_target"}
+                return {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
+
+            # ── Tier 2: Pandas post-filters ──────────────────────────────
+            filter_parts = []
+
+            # Band filter — check band_list or Band column
+            if band is not None:
+                band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
+                if band_col:
+                    before = len(results)
+                    results = results[results[band_col].astype(str).str.split(",").apply(
+                        lambda bands: any(str(band).strip() == b.strip() for b in bands)
+                    )]
+                    filter_parts.append(f"Band {band}")
+                    print(f"[FILTER] Band {band}: {before} → {len(results)} rows")
+
+            # Resolution filter
+            res_col = next((c for c in ["spatial_resolution", "s_resolution", "resolution"] if c in results.columns), None)
+            if res_col:
+                if max_resolution is not None:
+                    before = len(results)
+                    results = results[pd.to_numeric(results[res_col], errors="coerce") <= max_resolution]
+                    filter_parts.append(f"res ≤ {max_resolution}\"")
+                    print(f"[FILTER] max_resolution {max_resolution}: {before} → {len(results)} rows")
+                if min_resolution is not None:
+                    before = len(results)
+                    results = results[pd.to_numeric(results[res_col], errors="coerce") >= min_resolution]
+                    filter_parts.append(f"res ≥ {min_resolution}\"")
+
+            # Frequency filter
+            freq_col = next((c for c in ["frequency", "min_frequency", "freq_min"] if c in results.columns), None)
+            if freq_col:
+                if min_freq_ghz is not None:
+                    results = results[pd.to_numeric(results[freq_col], errors="coerce") >= min_freq_ghz]
+                    filter_parts.append(f"freq ≥ {min_freq_ghz} GHz")
+                if max_freq_ghz is not None:
+                    results = results[pd.to_numeric(results[freq_col], errors="coerce") <= max_freq_ghz]
+                    filter_parts.append(f"freq ≤ {max_freq_ghz} GHz")
+
+            # Integration time filter
+            exp_col = next((c for c in ["t_exptime", "integration"] if c in results.columns), None)
+            if exp_col and min_exp_s is not None:
+                results = results[pd.to_numeric(results[exp_col], errors="coerce") >= min_exp_s]
+                filter_parts.append(f"exp ≥ {min_exp_s}s")
+
+            # Build source label showing active filters
+            filter_label = f"ALMA › {target_name}"
+            if filter_parts:
+                filter_label += " [" + ", ".join(filter_parts) + "]"
+
             self.last_search_results = results
-            self.last_run_result = {"type": "data", "data": results, "source": f"ALMA", "tool_name": "search_by_target"}
-            # Return a compact summary to LLM — NOT the full giant DataFrame
-            _KEY_COLS = ["project_code", "target_name", "band_list", "frequency",
-                         "min_frequency", "max_frequency", "spatial_resolution",
-                         "s_resolution", "pi_name", "obs_release_date"]
-            _avail = [c for c in _KEY_COLS if c in results.columns]
+            self.last_run_result = {
+                "type": "data", "data": results,
+                "source": "ALMA", "filter_label": filter_label,
+                "tool_name": "search_by_target"
+            }
+
+            # Compact 5-row summary to LLM
+            _KEY = ["project_code", "target_name", "band_list", "frequency",
+                    "spatial_resolution", "s_resolution", "pi_name"]
+            _avail = [c for c in _KEY if c in results.columns]
             _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
                 "total_results": len(results),
-                "facility": facility or "ALMA",
+                "filters_applied": filter_parts,
                 "target": target_name,
                 "sample_rows": _sample,
-                "note": f"Found {len(results)} observations. Full dataset shown to user in the UI table."
+                "note": f"Found {len(results)} observations matching your constraints. Full data shown in UI table."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1065,15 +1139,96 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 min_freq_ghz, max_freq_ghz, facility, max_results
             )
             self.last_search_results = results
-            self.last_run_result = {"type": "data", "data": results, "source": f"Freq Search: {min_freq_ghz}-{max_freq_ghz} GHz"}
-            
+            self.last_run_result = {"type": "data", "data": results,
+                                    "source": "ALMA",
+                                    "filter_label": f"ALMA › {min_freq_ghz}–{max_freq_ghz} GHz",
+                                    "tool_name": "search_by_frequency"}
+            _KEY = ["project_code", "target_name", "band_list", "frequency", "spatial_resolution"]
+            _avail = [c for c in _KEY if c in results.columns]
+            _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
-                "count": len(results),
-                "results": results.to_dict("records") if not results.empty else []
+                "total_results": len(results),
+                "sample_rows": _sample,
+                "note": f"Found {len(results)} observations at {min_freq_ghz}–{max_freq_ghz} GHz. Full table shown in UI."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _filter_results(self, column: str, operator: str, value: float) -> Dict[str, Any]:
+        """
+        Apply a numeric or string filter to the LAST search results.
+        Friendly column aliases are supported (e.g. 'Band', 'resolution', 'frequency').
+        Updates last_run_result so the filtered table is shown in the UI.
+        """
+        try:
+            if self.last_search_results is None or self.last_search_results.empty:
+                return {"success": False, "error": "No search results to filter. Run a search first."}
+
+            df = self.last_search_results.copy()
+
+            # ── Friendly column alias mapping ──────────────────────────────────
+            ALIAS = {
+                "band":       ["band_list", "Band", "band"],
+                "resolution": ["spatial_resolution", "s_resolution", "resolution"],
+                "frequency":  ["frequency", "min_frequency", "freq_min", "freq"],
+                "freq":       ["frequency", "min_frequency", "freq_min"],
+                "exp":        ["t_exptime", "integration"],
+                "exptime":    ["t_exptime", "integration"],
+                "pi":         ["pi_name"],
+                "project":    ["project_code"],
+            }
+            # Resolve column name
+            col_lower = column.lower()
+            candidates = ALIAS.get(col_lower, [column])
+            real_col = next((c for c in candidates if c in df.columns), None)
+            if real_col is None:
+                # Try direct match (case-insensitive)
+                real_col = next((c for c in df.columns if c.lower() == col_lower), None)
+            if real_col is None:
+                available = [c for c in df.columns][:15]
+                return {"success": False, "error": f"Column '{column}' not found. Available: {available}"}
+
+            # ── Apply filter ──────────────────────────────────────────────────
+            before = len(df)
+            numeric_series = pd.to_numeric(df[real_col], errors="coerce")
+
+            OPS = {"<": lambda s, v: s < v, "<=": lambda s, v: s <= v,
+                   ">": lambda s, v: s > v, ">=": lambda s, v: s >= v,
+                   "==": lambda s, v: s == v, "!=": lambda s, v: s != v}
+            if operator not in OPS:
+                return {"success": False, "error": f"Invalid operator '{operator}'. Use: < <= > >= == !="}
+
+            mask = OPS[operator](numeric_series, value)
+            df = df[mask]
+
+            print(f"[FILTER] {real_col} {operator} {value}: {before} → {len(df)} rows")
+
+            # Update agent state so UI shows filtered table
+            self.last_search_results = df
+            prev_label = (self.last_run_result or {}).get("filter_label", "ALMA")
+            filter_label = f"{prev_label} | {real_col} {operator} {value}"
+            self.last_run_result = {
+                **(self.last_run_result or {}),
+                "data": df,
+                "filter_label": filter_label,
+                "tool_name": "filter_results",
+            }
+
+            _KEY = ["project_code", "target_name", "band_list", "frequency", "spatial_resolution"]
+            _avail = [c for c in _KEY if c in df.columns]
+            _sample = df[_avail].head(5).fillna("").to_dict("records") if _avail else []
+            return {
+                "success": True,
+                "rows_before": before,
+                "rows_after": len(df),
+                "filter": f"{real_col} {operator} {value}",
+                "sample_rows": _sample,
+                "note": f"Filtered from {before} to {len(df)} rows. Updated table shown in UI."
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 
     def _get_observation_details(self, obs_id: str) -> Dict[str, Any]:
         """Get detailed observation information"""
