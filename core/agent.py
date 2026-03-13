@@ -169,12 +169,6 @@ class QuasarAgent:
         
         print("DEBUG: Agent init done")
 
-    def set_model(self, model_name: str):
-        """Dynamically change the model"""
-        self.config.model = model_name
-        if self.config.verbose:
-            print(f"[yellow]Model changed to: {model_name}[/yellow]")
-
     def _estimate_tokens(self, text: str) -> int:
         """Rough token estimate: ~4 chars per token for English text."""
         return len(text) // 4
@@ -219,6 +213,7 @@ GUIDELINES:
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
 - **PAPER SEARCH**: When you use the `search_papers` tool, do NOT write any text listing the papers. Output NOTHING after the tool call. The UI renders the papers as interactive cards automatically.
+- **WEB SEARCH**: Use the `web_search` tool for real-time queries: current telescope schedules, recent arXiv preprints, observatory news, instrument specs, call-for-proposals, or anything not in the ALMA archive or NASA ADS.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
@@ -1494,12 +1489,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     
     def _extract_response_text(self, response) -> str:
         """Helper to extract text from Responses API response object"""
-        if hasattr(response, 'output_text'):
+        if hasattr(response, 'output_text') and response.output_text:
             return response.output_text
         elif hasattr(response, 'output'):
             for item in response.output:
-                if hasattr(item, 'content') and getattr(item, 'type', None) == "text":
-                    return item.content
+                if hasattr(item, 'content'):
+                    content = item.content
+                    # content can be a list of content-part objects or a plain string
+                    if isinstance(content, list):
+                        return " ".join(
+                            c.text for c in content if hasattr(c, 'text') and c.text
+                        )
+                    return str(content)
         return str(response)
 
     def analyze_query_intent(self, query: str) -> Dict[str, Any]:
@@ -1593,7 +1594,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         source_name = entities.get("source_name", "")
         
         # Handle specific intents
-        if intent == "SEARCH" or "search" in query.lower() and "paper" not in query.lower():
+        if intent == "SEARCH" or ("search" in query.lower() and "paper" not in query.lower()):
             # Data Search
             if not source_name:
                 # Try to extract from query if entity extraction failed

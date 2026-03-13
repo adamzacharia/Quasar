@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -185,14 +185,13 @@ class RecursiveLanguageModel:
         self.verbose = verbose
         self.detector = ComplexityDetector(client, model="gpt-4o-mini")
         self.use_repl = use_repl
-        # tool_executor will be set after agent initialises (see QuasarAgent._register_rlm_tools)
-        self.tool_executor = None
+        # tool_executor will be set after agent initialises (see QuasarAgent.__init__)
         self.repl_executor = RLMREPLExecutor(
             client=client,
             model=model,
             sub_model="gpt-4o-mini",
             verbose=verbose,
-            tool_executor=None,  # wired up later via set_tool_executor()
+            tool_executor=tool_executor,  # pass through, wired up via _rlm_tool_bridge
         )
 
     # --- public API ---------------------------------------------------------
