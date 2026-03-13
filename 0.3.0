@@ -1,0 +1,17 @@
+Collecting tavily-python
+  Downloading tavily_python-0.7.23-py3-none-any.whl.metadata (10 kB)
+Requirement already satisfied: requests in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from tavily-python) (2.32.5)
+Requirement already satisfied: tiktoken>=0.5.1 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from tavily-python) (0.12.0)
+Requirement already satisfied: httpx in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from tavily-python) (0.28.1)
+Requirement already satisfied: regex>=2022.1.18 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from tiktoken>=0.5.1->tavily-python) (2026.2.28)
+Requirement already satisfied: charset_normalizer<4,>=2 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from requests->tavily-python) (3.4.5)
+Requirement already satisfied: idna<4,>=2.5 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from requests->tavily-python) (3.11)
+Requirement already satisfied: urllib3<3,>=1.21.1 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from requests->tavily-python) (2.6.3)
+Requirement already satisfied: certifi>=2017.4.17 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from requests->tavily-python) (2026.2.25)
+Requirement already satisfied: anyio in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from httpx->tavily-python) (4.12.1)
+Requirement already satisfied: httpcore==1.* in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from httpx->tavily-python) (1.0.9)
+Requirement already satisfied: h11>=0.16 in C:\Users\adama\anaconda3\envs\quasar\Lib\site-packages (from httpcore==1.*->httpx->tavily-python) (0.16.0)
+Downloading tavily_python-0.7.23-py3-none-any.whl (19 kB)
+Installing collected packages: tavily-python
+Successfully installed tavily-python-0.7.23
+
