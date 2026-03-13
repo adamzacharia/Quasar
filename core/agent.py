@@ -473,12 +473,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # ── Browser Control Tools ──────────────────────────────────
         self.tool_registry.register(Tool(
             name="web_search",
-            description="Search the web for astronomy papers, portal data, or any external information. Use this for NASA ADS, arXiv, VizieR, CADC, ESO, or any web resource.",
-            function=lambda **kw: self.browser_service.web_search(**kw),
+            description=(
+                "Search the web for real-time information: astronomy news, telescope schedules, "
+                "arXiv preprints, observatory announcements, instrument specs, or any live web content. "
+                "Uses Tavily for grounded, source-cited results. "
+                "Examples: 'latest JWST observations 2024', 'ALMA call for proposals 2025', "
+                "'what is the VLA sensitivity at 1.4 GHz'."
+            ),
+            function=self._tavily_web_search,
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query string (e.g., 'ALMA observations M87 CO line 2022')"}
+                    "query": {"type": "string", "description": "Web search query string"},
+                    "max_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"},
+                    "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "'basic' for quick answers, 'advanced' for comprehensive research (default: basic)"},
                 },
                 "required": ["query"]
             }
@@ -951,6 +959,50 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
 
 
+
+    def _tavily_web_search(self, query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
+        """
+        Real-time web search powered by Tavily.
+        Falls back to BrowserService if Tavily key is unavailable.
+        """
+        tavily_key = os.getenv("TAVILY_API_KEY", "")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                client = TavilyClient(api_key=tavily_key)
+                max_results = min(int(max_results), 10)
+                response = client.search(
+                    query=query,
+                    max_results=max_results,
+                    search_depth=search_depth,
+                    include_answer=True,          # brief AI-synthesised answer
+                    include_raw_content=False,
+                )
+                # Build a clean, LLM-friendly result
+                results = []
+                for r in response.get("results", []):
+                    results.append({
+                        "title":   r.get("title", ""),
+                        "url":     r.get("url", ""),
+                        "snippet": r.get("content", "")[:500],
+                    })
+                return {
+                    "success":      True,
+                    "provider":     "Tavily",
+                    "query":        query,
+                    "answer":       response.get("answer", ""),   # synthesised answer
+                    "results":      results,
+                    "result_count": len(results),
+                }
+            except Exception as e:
+                print(f"[WARN] Tavily search failed: {e}. Falling back to BrowserService.")
+
+        # ── Fallback: BrowserService ──────────────────────────────
+        try:
+            fallback = self.browser_service.web_search(query=query)
+            return {"success": True, "provider": "BrowserService (fallback)", "results": fallback}
+        except Exception as e2:
+            return {"success": False, "error": str(e2)}
 
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
                            facility: Optional[str] = None,

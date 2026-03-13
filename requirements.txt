@@ -138,6 +138,7 @@ numexpr
 numpy
 openai>=1.50.0
 anthropic>=0.25.0
+tavily-python>=0.3.0
 mem0ai
 pandas
 pillow
