@@ -1134,6 +1134,79 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _reproduce_paper_methods(self, identifier: str) -> Dict[str, Any]:
+        """Extract methodology from a paper and generate a reproduction script.
+        
+        Args:
+            identifier: arXiv ID (e.g. '1812.04040') or ADS bibcode 
+                        (e.g. '2018ApJ...869L..41A')
+        """
+        try:
+            # Step 1: Resolve identifier to a PDF URL
+            # Try arXiv first (most common for astro papers)
+            arxiv_id = identifier.strip()
+            # If it looks like a bibcode, try to get the arXiv ID from ADS
+            if '.' not in arxiv_id or len(arxiv_id) > 20:
+                # Likely an ADS bibcode — try to resolve via ADS
+                if self.ads_client:
+                    try:
+                        details = self.ads_client.get_paper_details(arxiv_id)
+                        if isinstance(details, dict) and details.get("arxiv_id"):
+                            arxiv_id = details["arxiv_id"]
+                        elif isinstance(details, dict) and details.get("doi"):
+                            return {
+                                "success": False,
+                                "error": f"Paper has DOI ({details['doi']}) but no arXiv ID. "
+                                         "PDF download is only supported for arXiv papers currently."
+                            }
+                    except Exception:
+                        pass  # Fall through and try the identifier as-is
+
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+            # Step 2: Download and extract methodology
+            result = self.pdf_service.get_paper_methodology_from_url(pdf_url)
+
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "error": f"Could not extract methodology: {result.get('error', 'Unknown error')}",
+                    "identifier": identifier
+                }
+
+            methodology_text = result["methodology"]
+
+            # Step 3: Generate reproduction script using LIT_TO_CODE_PROMPT
+            prompt = LIT_TO_CODE_PROMPT.format(methodology_text=methodology_text)
+
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert radio astronomy data reduction specialist."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=4000
+            )
+
+            script = response.choices[0].message.content.strip()
+
+            self.last_run_result = {
+                "type": "code",
+                "code": script,
+                "source": f"Reproduce: {identifier}"
+            }
+
+            return {
+                "success": True,
+                "identifier": identifier,
+                "methodology_summary": methodology_text[:500] + "..." if len(methodology_text) > 500 else methodology_text,
+                "generated_script": script
+            }
+
+        except Exception as e:
+            return {"success": False, "error": str(e), "identifier": identifier}
+
     def _download_alma_data(self, dry_run: bool = True) -> Dict[str, Any]:
         """Download ALMA data for observations in current context"""
         try:
