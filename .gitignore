@@ -48,5 +48,8 @@ ISSUES.md
 config/key_export.txt
 config/key_temp.pub
 
+# User custom tools & secrets (per-user, never commit)
+user_tools/
+
 # Deployment docs
 fixes.md

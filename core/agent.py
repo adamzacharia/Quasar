@@ -76,6 +76,8 @@ class AgentConfig:
     use_responses_api: bool = False  # Toggle for Responses API vs Chat Completions
     mcp_server_url: str = "http://localhost:8000/sse"  # MCP server SSE endpoint
     enable_mcp: bool = False  # Enable MCP tool connection
+    # User context — needed to load custom tools on startup
+    user_id: str = ""
 
 class QuasarAgent:
     """Main AI agent for radio astronomy operations"""
@@ -168,8 +170,172 @@ class QuasarAgent:
         # Wire all 27 registered tools into the REPL executor so the LLM can
         # call any Quasar tool from within REPL Python code via call_tool()
         self.rlm.repl_executor.tool_executor = self._rlm_tool_bridge
+
+        # Load per-user custom tools (if user_id is set)
+        if self.config.user_id:
+            print(f"DEBUG: Loading user tools for {self.config.user_id}")
+            self._load_user_tools(self.config.user_id)
+            print(f"DEBUG: Loading MCP servers for {self.config.user_id}")
+            self._load_mcp_servers(self.config.user_id)
         
         print("DEBUG: Agent init done")
+
+    # ── Custom User Tools ──────────────────────────────────────────────────
+
+    def _load_user_tools(self, user_id: str):
+        """
+        Load per-user custom tool definitions from user_tools/<user_id>/tools.json,
+        inject their API key secrets into os.environ, then register each callable
+        into the live ToolRegistry so the LLM can call them immediately.
+        """
+        try:
+            from services.user_tools_service import UserToolsService
+            svc = UserToolsService()
+
+            # Inject API key secrets before building callables
+            svc.inject_secrets_to_env(user_id)
+
+            tools_loaded = 0
+            for tool_def in svc.load_tools(user_id):
+                try:
+                    fn = svc.build_callable(tool_def)
+                    self.tool_registry.register(Tool(
+                        name=tool_def["name"],
+                        description=tool_def["description"],
+                        function=fn,
+                        parameters=tool_def["parameters"],
+                        category="custom",
+                    ))
+                    tools_loaded += 1
+                    print(f"[UserTools] Registered custom tool: {tool_def['name']}")
+                except Exception as e:
+                    print(f"[UserTools] Skipping '{tool_def.get('name', '?')}': {e}")
+
+            if tools_loaded:
+                print(f"[UserTools] {tools_loaded} custom tool(s) loaded for user '{user_id}'")
+        except Exception as e:
+            print(f"[UserTools] Failed to load user tools: {e}")
+
+    def _load_mcp_servers(self, user_id: str):
+        """
+        Load per-user MCP server definitions from user_tools/<user_id>/mcp_servers.json,
+        spawn them via stdio, and register their exported tools into ToolRegistry.
+        """
+        try:
+            from services.mcp_server_service import MCPServerService
+            import asyncio
+            import threading
+            from mcp.client.stdio import stdio_client, StdioServerParameters
+            from mcp.client.sse import sse_client
+            from mcp.client.session import ClientSession
+            
+            svc = MCPServerService()
+            configs = svc.load_servers(user_id)
+            if not configs:
+                return
+                
+            # We must maintain sessions for the lifetime of the agent.
+            if not hasattr(self, "_mcp_exit_stacks"):
+                self._mcp_exit_stacks = []
+                
+            def _start_mcp_bridge(config):
+                # We need to run the async MCP client bridging in a background thread/event loop
+                # because the stdio client is fully async, but Quasar's tool_registry expects sync callables.
+                async def _run_client():
+                    from contextlib import AsyncExitStack
+                    stack = AsyncExitStack()
+                    
+                    try:
+                        transport = config.get("transport", "stdio")
+                        
+                        if transport == "http":
+                            url = config.get("url")
+                            if not url:
+                                raise ValueError("HTTP transport requires a URL")
+                            # sse_client requires the URL
+                            read, write = await stack.enter_async_context(sse_client(url))
+                        else:
+                            # Default to stdio
+                            env = os.environ.copy()
+                            env.update(config.get("env", {}))
+                            
+                            server_params = StdioServerParameters(
+                                command=config["command"],
+                                args=config.get("args", []),
+                                env=env
+                            )
+                            read, write = await stack.enter_async_context(stdio_client(server_params))
+                    
+                        session = await stack.enter_async_context(ClientSession(read, write))
+                        await session.initialize()
+                        
+                        # List exported tools
+                        tools_resp = await session.list_tools()
+                        
+                        for mcp_tool in tools_resp.tools:
+                            t_name = f"{config['name']}__{mcp_tool.name}"
+                            t_desc = mcp_tool.description or f"Tool {mcp_tool.name} from {config['name']}"
+                            t_params = mcp_tool.inputSchema
+                            
+                            # Build a sync wrapper that calls the async session.call_tool
+                            def make_wrapper(session_ref, orig_name):
+                                def wrapper(**kwargs):
+                                    # Since we're in a sync context (LLM Tool call), we need to run the 
+                                    # async call_tool in the background loop. 
+                                    # Using asyncio.run directly here might clash with Streamlit's loop,
+                                    # but since tools run in their own thread in _rlm_tool_executor or 
+                                    # the main loop, we'll spawn a quick loop just for the tool call.
+                                    import asyncio
+                                    async def _do_call():
+                                        res = await session_ref.call_tool(orig_name, arguments=kwargs)
+                                        # mcp result format usually has .content array
+                                        if getattr(res, "content", None):
+                                            return [c.text for c in res.content if getattr(c, 'type', '') == 'text']
+                                        elif getattr(res, "isError", False):
+                                            return {"error": "Tool execution failed"}
+                                        return {"status": "success"}
+                                    try:
+                                        # If there's a running loop, this might fail, but streamlit usually
+                                        # runs event handlers in dummy threads without loops.
+                                        loop = asyncio.new_event_loop()
+                                        return loop.run_until_complete(_do_call())
+                                    except Exception as e:
+                                        return {"error": str(e)}
+                                return wrapper
+                            
+                            sync_fn = make_wrapper(session, mcp_tool.name)
+                            
+                            self.tool_registry.register(Tool(
+                                name=t_name,
+                                description=t_desc,
+                                function=sync_fn,
+                                parameters=t_params,
+                                category="mcp"
+                            ))
+                            print(f"[MCPServers] Registered bridged tool: {t_name}")
+                            
+                        self._mcp_exit_stacks.append(stack)
+                        
+                        # We must keep the event loop alive so the stdio pipes don't close.
+                        # This is a bit of a hack: just sleep forever in this thread.
+                        while True:
+                            await asyncio.sleep(3600)
+                            
+                    except Exception as e:
+                        print(f"[MCPServers] Failed to bridge {config['name']}: {e}")
+                
+                # Run the bridge setup in a dedicated background thread per server
+                # This ensures the async context manager stays alive and connected.
+                t = threading.Thread(target=lambda: asyncio.run(_run_client()), daemon=True)
+                t.start()
+                
+            for cfg in configs:
+                _start_mcp_bridge(cfg)
+                
+        except Exception as e:
+            print(f"[MCPServers] Failed to set up MCP clients: {e}")
+
+    # ── Token helpers ──────────────────────────────────────────────────────
 
     def _estimate_tokens(self, text: str) -> int:
         """Rough token estimate: ~4 chars per token for English text."""

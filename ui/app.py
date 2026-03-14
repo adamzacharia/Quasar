@@ -1123,31 +1123,179 @@ def main():
         st.divider()
         
         # =====================================================================
-        # ADD CUSTOM TOOLS
+        # ADD CUSTOM TOOLS  (3-tab panel)
         # =====================================================================
-        with st.expander("Add Tools", expanded=False):
-            st.markdown("Add your own function tools:")
-            
-            tool_name = st.text_input("Tool name", placeholder="my_custom_tool", key="tool_name_input")
-            tool_desc = st.text_area("Description", placeholder="What does this tool do?", 
-                                     height=60, key="tool_desc_input")
-            tool_code = st.text_area("Python code", height=120, key="tool_code_input",
-                                     placeholder='''def my_custom_tool(param1: str) -> dict:
-    """Your tool logic here"""
-    return {"result": "success"}''')
-            
-            if st.button("+ Add Tool", use_container_width=True):
-                if tool_name and tool_code:
-                    # Save tool definition to file
-                    tools_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "user_tools", user_id)
-                    os.makedirs(tools_dir, exist_ok=True)
-                    tool_file = os.path.join(tools_dir, f"{tool_name}.py")
-                    with open(tool_file, "w") as f:
-                        f.write(f'"""{tool_desc}"""\n\n{tool_code}')
-                    st.success(f"✓ Tool '{tool_name}' saved!")
-                    st.info("Restart app to load new tools")
+        with st.expander("🔧 Add Tools", expanded=False):
+            _tab_tmpl, _tab_add, _tab_installed = st.tabs(["📋 Templates", "➕ Add Tool", "🔧 Installed"])
+
+            # ── Tab 1: Templates ──────────────────────────────────────────
+            with _tab_tmpl:
+                st.markdown(
+                    """
+> **How tools work:** Write a regular Python function. The AI sees your function's *name*, *description* (from its docstring), and the *parameter types* — so be descriptive!  
+> Functions must return a `dict` or a `str`.
+                    """
+                )
+
+                _SIMPLE_TEMPLATE = '''\
+def greet_astronomer(name: str) -> dict:
+    """Greets a radio astronomer by name. Pass the astronomer\'s last name."""
+    return {"message": f"Hello, Dr. {name}! Welcome to Quasar."}
+'''
+
+                _API_TEMPLATE = '''\
+import os, requests
+
+def search_my_service(query: str, max_results: int = 5) -> dict:
+    """Search MyService for astronomy data. Requires MY_SERVICE_KEY."""
+    api_key = os.environ.get("MY_SERVICE_KEY", "")
+    if not api_key:
+        return {"error": "MY_SERVICE_KEY not configured. Add it in the API Key fields when saving this tool."}
+    resp = requests.get(
+        "https://api.myservice.com/search",
+        params={"q": query, "limit": max_results, "key": api_key},
+        timeout=15,
+    )
+    data = resp.json()
+    return {"results": data.get("items", []), "total": data.get("total", 0)}
+'''
+
+                st.markdown("**Simple tool** (no API key needed)")
+                st.code(_SIMPLE_TEMPLATE, language="python")
+                if st.button("📋 Use this template", key="tmpl_simple"):
+                    st.session_state["_tool_code_prefill"] = _SIMPLE_TEMPLATE
+                    st.session_state["_tool_name_prefill"] = "greet_astronomer"
+                    st.session_state["_tool_desc_prefill"] = "Greets a radio astronomer by name."
+                    st.toast("Template copied! Switch to the ➕ Add Tool tab.", icon="📋")
+
+                st.divider()
+
+                st.markdown("**API-key tool** (calls an external service)")
+                st.code(_API_TEMPLATE, language="python")
+                if st.button("📋 Use this template", key="tmpl_api"):
+                    st.session_state["_tool_code_prefill"] = _API_TEMPLATE
+                    st.session_state["_tool_name_prefill"] = "search_my_service"
+                    st.session_state["_tool_desc_prefill"] = "Search MyService for astronomy data."
+                    st.toast("Template copied! Switch to the ➕ Add Tool tab.", icon="📋")
+
+            # ── Tab 2: Add Tool ───────────────────────────────────────────
+            with _tab_add:
+                _pf_name = st.session_state.pop("_tool_name_prefill", "")
+                _pf_desc = st.session_state.pop("_tool_desc_prefill", "")
+                _pf_code = st.session_state.pop("_tool_code_prefill", "")
+
+                _t_name = st.text_input(
+                    "Tool name",
+                    value=_pf_name,
+                    placeholder="my_custom_tool",
+                    help="Lowercase letters, digits, underscores only. Must match the Python function name exactly.",
+                    key="ut_name"
+                )
+                _t_desc = st.text_area(
+                    "Description",
+                    value=_pf_desc,
+                    placeholder="What does this tool do? Be descriptive — the AI reads this.",
+                    height=70,
+                    key="ut_desc"
+                )
+                _t_code = st.text_area(
+                    "Python code",
+                    value=_pf_code,
+                    height=180,
+                    placeholder="def my_tool(param: str) -> dict:\n    return {}",
+                    help="Paste your complete function here. It must define a function with the exact name above.",
+                    key="ut_code"
+                )
+
+                st.markdown("**API Key** *(optional — only needed if your tool calls an external service)*")
+                _col_kn, _col_kv = st.columns(2)
+                with _col_kn:
+                    _t_key_name = st.text_input(
+                        "Key name",
+                        placeholder="MY_SERVICE_KEY",
+                        help="The env-var name your code reads with os.environ.get()",
+                        key="ut_key_name"
+                    )
+                with _col_kv:
+                    _t_key_val = st.text_input(
+                        "Key value",
+                        placeholder="sk-...",
+                        type="password",
+                        help="Stored securely, never shown again.",
+                        key="ut_key_val"
+                    )
+
+                if st.button("➕ Add Tool", use_container_width=True, type="primary", key="ut_submit"):
+                    if not _t_name or not _t_code:
+                        st.warning("Tool name and code are required.")
+                    else:
+                        try:
+                            from services.user_tools_service import UserToolsService as _UTS
+                            _svc = _UTS()
+
+                            # Save the API key secret first (if provided)
+                            if _t_key_name and _t_key_val:
+                                _svc.save_secret(user_id, _t_key_name.strip(), _t_key_val.strip())
+
+                            # Save the tool definition
+                            _saved = _svc.save_tool(
+                                user_id,
+                                name=_t_name.strip(),
+                                description=_t_desc.strip() or _t_name,
+                                code=_t_code,
+                                api_key_name=_t_key_name.strip() if _t_key_name else None,
+                            )
+
+                            # Force agent re-init so the new tool is live immediately
+                            if 'agent_version' in st.session_state:
+                                st.session_state['agent_version'] = f"{st.session_state.get('agent_version', '0')}_utool"
+                            if 'agent' in st.session_state:
+                                del st.session_state['agent']
+
+                            st.success(f"✅ Tool **{_t_name}** added! Quasar can now call it immediately.")
+                            if _t_key_name and _t_key_val:
+                                st.info(f"🔑 API key `{_t_key_name}` saved securely.")
+                        except ValueError as _ve:
+                            st.error(f"❌ Validation error: {_ve}")
+                        except Exception as _ex:
+                            st.error(f"❌ Error: {_ex}")
+
+            # ── Tab 3: Installed Tools ────────────────────────────────────
+            with _tab_installed:
+                try:
+                    from services.user_tools_service import UserToolsService as _UTS2
+                    _installed = _UTS2().load_tools(user_id)
+                except Exception:
+                    _installed = []
+
+                if not _installed:
+                    st.info("No custom tools installed yet. Use the ➕ Add Tool tab to get started.")
                 else:
-                    st.warning("Please fill in name and code")
+                    st.caption(f"{len(_installed)} custom tool(s) installed")
+                    for _td in _installed:
+                        _ic1, _ic2 = st.columns([5, 1])
+                        with _ic1:
+                            st.markdown(
+                                f"**`{_td['name']}`** `[custom]`  \n"
+                                f"<span style='color:#94a3b8;font-size:0.85em'>{_td.get('description','')[:120]}</span>"
+                                + (f"  \n🔑 Key: `{_td['api_key_name']}`" if _td.get('api_key_name') else ""),
+                                unsafe_allow_html=True
+                            )
+                        with _ic2:
+                            if st.button("🗑️", key=f"del_tool_{_td['name']}",
+                                         help=f"Remove {_td['name']}"):
+                                try:
+                                    from services.user_tools_service import UserToolsService as _UTS3
+                                    _UTS3().delete_tool(user_id, _td['name'])
+                                    # Force agent re-init
+                                    if 'agent' in st.session_state:
+                                        del st.session_state['agent']
+                                    st.success(f"Removed `{_td['name']}`")
+                                    st.rerun()
+                                except Exception as _de:
+                                    st.error(f"Delete failed: {_de}")
+                        st.divider()
+
         
         st.divider()
 
@@ -1255,6 +1403,9 @@ def main():
         # Manually set ADS key if provided, to avoid init issues if class definition is stale
         if ads_key and hasattr(config, 'ads_api_key'):
             config.ads_api_key = ads_key
+        # Pass user_id so agent loads custom tools on startup
+        if hasattr(config, 'user_id'):
+            config.user_id = user_id
         
         try:
             # Try new signature with rag_service
