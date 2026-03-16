@@ -72,7 +72,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
         return () => document.removeEventListener("mousedown", handleClick);
     }, []);
 
-    const openaiModels = availableModels.filter(m => m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3"));
+    const openaiModels = availableModels.filter(m => m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4"));
     const geminiModels = availableModels.filter(m => m.startsWith("gemini-") || m.startsWith("gemma-"));
     const claudeModels = availableModels.filter(m => m.startsWith("claude-"));
 

@@ -455,6 +455,28 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
             model=request.model
         )
 
+        # ── QUASAR system prompt for non-OpenAI models ──────────────────────
+        # OpenAI models go through agent.stream_response_api() which uses the
+        # full 27-tool system prompt.  Gemini & Claude skip that path but still
+        # need to know they are QUASAR so responses are domain-specific.
+        from datetime import datetime as _dt
+        QUASAR_SYSTEM_PROMPT = (
+            "You are Quasar, an expert AI assistant for radio astronomy.\n\n"
+            "You have deep knowledge of the ALMA Science Archive, radio interferometry, "
+            "spectral line identification, UV coverage analysis, CASA calibration, "
+            "and astronomical data reduction.\n\n"
+            "GUIDELINES:\n"
+            "- You specialize in ALMA, VLA, VLBA, and GBT data.\n"
+            "- Help users find, analyze, and visualize radio astronomy data.\n"
+            "- When users ask what you can do, describe your radio astronomy capabilities: "
+            "searching the ALMA archive, spectral line ID via Splatalogue, publication "
+            "search via NASA ADS, CASA script generation, UV coverage analysis, "
+            "multi-archive cross-matching, and web search for real-time info.\n"
+            "- If asked about observations, cite ALMA bands, frequencies, resolutions.\n"
+            "- Be concise, scientific, and action-oriented.\n"
+            f"- Current date: {_dt.now().strftime('%Y-%m-%d')}\n"
+        )
+
         # ── Gemini model routing ──────────────────────────────────────────
         model_name = request.model or "gpt-4o"
         if model_name.startswith("gemini-"):
@@ -465,9 +487,11 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                 yield _status(f"Routing to {model_name}", "running")
 
                 def _gemini_call():
+                    # Prepend QUASAR system prompt so Gemini knows its role
+                    full_prompt = QUASAR_SYSTEM_PROMPT + "\n\nUser query: " + effective_request.message
                     return gemini_client.models.generate_content_stream(
                         model=model_name,
-                        contents=effective_request.message,
+                        contents=full_prompt,
                     )
 
                 loop = asyncio.get_event_loop()
@@ -500,6 +524,7 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                     return claude_client.messages.stream(
                         model=model_name,
                         max_tokens=int(os.getenv("MAX_TOKENS", "8096")),
+                        system=QUASAR_SYSTEM_PROMPT,
                         messages=[{"role": "user", "content": effective_request.message}],
                     )
 
@@ -510,6 +535,7 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                     with claude_client.messages.stream(
                         model=model_name,
                         max_tokens=int(os.getenv("MAX_TOKENS", "8096")),
+                        system=QUASAR_SYSTEM_PROMPT,
                         messages=[{"role": "user", "content": effective_request.message}],
                     ) as stream:
                         for text in stream.text_stream:
