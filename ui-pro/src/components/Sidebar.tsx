@@ -74,6 +74,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
 
     const openaiModels = availableModels.filter(m => m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3"));
     const geminiModels = availableModels.filter(m => m.startsWith("gemini-") || m.startsWith("gemma-"));
+    const claudeModels = availableModels.filter(m => m.startsWith("claude-"));
 
     const renderGroup = (label: string, models: string[]) => models.length === 0 ? null : (
         <>
@@ -101,7 +102,9 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             {open && (
                 <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-800 border border-slate-600/50 rounded-xl shadow-2xl shadow-black/40 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto">
                     {renderGroup("OpenAI", openaiModels)}
-                    {geminiModels.length > 0 && openaiModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
+                    {claudeModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
+                    {renderGroup("Anthropic Claude", claudeModels)}
+                    {geminiModels.length > 0 && (openaiModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Google Gemini", geminiModels)}
                 </div>
             )}

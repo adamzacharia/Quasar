@@ -45,7 +45,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     selectedModel: "gpt-4o-mini",
     availableModels: [
         // OpenAI
-        "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo",
+        "gpt-4o", "gpt-4o-mini", "gpt-4.1", "claude-3-7-sonnet-20250219", "gemini-3.1-pro",
         // Gemini free tier
         "gemini-2.5-flash-preview-05-20",
         "gemini-2.5-flash-lite-preview-06-17",
