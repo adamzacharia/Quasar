@@ -66,6 +66,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Startup: ensure all DB tables/collections exist ────────────────────────────
+@app.on_event("startup")
+def _init_all_tables():
+    """Create SQL tables that may not exist yet (runs once on boot)."""
+    try:
+        from services.db import get_connection
+        conn = get_connection()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                uploaded_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("[STARTUP] Personalization documents table ready")
+    except Exception as e:
+        logger.warning(f"[STARTUP] Personalization table init failed: {e}")
+
 # ── Request / response logging middleware ─────────────────────────────────────
 import time as _time
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -1018,24 +1041,13 @@ async def chat_with_files(
 import sqlite3, tempfile, datetime as _dt
 from pathlib import Path as _Path
 
-_PERS_DB = _Path(__file__).resolve().parent.parent / "data" / "personalization.db"
+# Personalization DB fallback path (used only in local dev mode)
+_PERS_DB_LOCAL = _Path(__file__).resolve().parent.parent / "data" / "personalization.db"
 
 def _get_pers_db():
-    """Return a connection to the personalization metadata SQLite DB."""
-    _PERS_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_PERS_DB))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS documents (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            chunk_count INTEGER NOT NULL DEFAULT 0,
-            uploaded_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
+    """Return a connection to the personalization metadata DB (Turso cloud or local SQLite)."""
+    from services.db import get_connection
+    return get_connection(str(_PERS_DB_LOCAL))
 
 
 @app.post("/api/personalization/upload")

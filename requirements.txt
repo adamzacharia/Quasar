@@ -157,7 +157,7 @@ rich
 langchain
 langchain-community
 langchain-openai
-chromadb
+qdrant-client>=1.7.0
 pypdf
 tiktoken
 fastapi
@@ -165,3 +165,4 @@ uvicorn
 python-multipart
 google-auth
 PyJWT
+libsql-client

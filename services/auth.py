@@ -1,16 +1,17 @@
 # services/auth.py
 """
 Authentication Service
-Handles user registration and login using SQLite and PBKDF2 hashing.
+Handles user registration and login using PBKDF2 hashing.
+Uses Turso (cloud) when TURSO_DATABASE_URL is set, else local SQLite.
 """
 
-import sqlite3
 import hashlib
 import os
 import uuid
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
+from services.db import get_connection
 import jwt
 
 # Secure default or loaded from env
@@ -20,7 +21,7 @@ JWT_EXPIRATION_HOURS = 24 * 7  # 1 week
 
 
 def _default_db_path() -> str:
-    """Return a stable DB path relative to the project root."""
+    """Return a stable DB path relative to the project root (local fallback only)."""
     root = Path(__file__).resolve().parent.parent
     data_dir = root / "data"
     data_dir.mkdir(exist_ok=True)
@@ -34,12 +35,16 @@ class AuthService:
     """
 
     def __init__(self, db_path: str = None):
-        self.db_path = db_path or _default_db_path()
+        self._local_db_path = db_path or _default_db_path()
         self._init_db()
+
+    def _get_conn(self):
+        """Get a database connection (Turso cloud or local SQLite)."""
+        return get_connection(self._local_db_path)
 
     def _init_db(self):
         """Initialize the users database and handle migrations"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             
             # Create base table if it doesn't exist
@@ -56,17 +61,17 @@ class AuthService:
             # Simple migration: add columns if they don't exist
             try:
                 cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
-            except sqlite3.OperationalError:
+            except Exception:
                 pass # Column exists
                 
             try:
                 cursor.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
-            except sqlite3.OperationalError:
+            except Exception:
                 pass
                 
             try:
                 cursor.execute("ALTER TABLE users ADD COLUMN auth_provider TEXT DEFAULT 'local'")
-            except sqlite3.OperationalError:
+            except Exception:
                 pass
                 
             conn.commit()
@@ -115,7 +120,7 @@ class AuthService:
             display_name = username.split('@')[0]
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_conn() as conn:
                 cursor = conn.cursor()
 
                 # Check if user exists
@@ -142,7 +147,7 @@ class AuthService:
     def login_user(self, username: str, password: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str], str]:
         """Login a user. Returns (success, user_id, email, display_name, message)"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_conn() as conn:
                 cursor = conn.cursor()
 
                 cursor.execute("SELECT id, password_hash, salt, auth_provider, email, display_name FROM users WHERE username = ?", (username,))
@@ -172,7 +177,7 @@ class AuthService:
         username = email # Use email as username for Google auth
         
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_conn() as conn:
                 cursor = conn.cursor()
                 
                 # Check if user exists

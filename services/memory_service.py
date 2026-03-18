@@ -1,9 +1,9 @@
 # services/memory_service.py
 """
-Memory Service — Long-term user memory using ChromaDB vector store.
+Memory Service — Long-term user memory using Qdrant vector store.
 
 CALLED BY: core/agent.py (_update_memory, context retrieval)
-CALLS:     ChromaDB (langchain_community.vectorstores.Chroma)
+CALLS:     Qdrant Cloud (via services/vector_db.py), OpenAI Embeddings
 
 Stores implicit user facts extracted from conversations (e.g.,
 "User is interested in protoplanetary disks") and retrieves them
@@ -15,51 +15,53 @@ import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_core.documents import Document
+
+from services.vector_db import (
+    upsert_vectors,
+    search_vectors,
+    scroll_all,
+    ensure_collection,
+)
+
+# Qdrant collection for long-term user memory
+MEMORY_COLLECTION = "user_memory"
+
 
 class MemoryService:
     """
     Long-Term Memory Service (Mem0-inspired)
     Stores and retrieves user facts/preferences across sessions.
+    Uses Qdrant Cloud for persistent vector storage.
     """
-    
+
     def __init__(self, persist_directory: str = None):
-        if persist_directory is None:
-            # Default to project_root/chroma_db
-            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            persist_directory = os.path.join(root_dir, "chroma_db")
-            
-        self.persist_directory = persist_directory
+        # persist_directory kept for backward-compat but now ignored
         self.embeddings = OpenAIEmbeddings()
-        self.vector_store = None
-        
-        # Initialize vector store (separate collection for memory)
+
+        # Ensure the memory collection exists
         try:
-            self.vector_store = Chroma(
-                collection_name="user_memory",
-                persist_directory=persist_directory,
-                embedding_function=self.embeddings
-            )
-            print(f"MemoryService initialized at {persist_directory}")
+            ensure_collection(MEMORY_COLLECTION)
+            print(f"MemoryService initialized (Qdrant collection: {MEMORY_COLLECTION})")
         except Exception as e:
             print(f"MemoryService init failed: {e}")
 
     def add_memory(self, content: str, user_id: str = "user", metadata: Dict = None) -> bool:
         """Add a new memory fact"""
-        if self.vector_store is None:
-            return False
-            
         try:
-            meta = metadata or {}
-            meta.update({
+            # Embed the content
+            vector = self.embeddings.embed_query(content)
+
+            # Build payload
+            pay = metadata.copy() if metadata else {}
+            pay.update({
+                "text": content,
                 "user_id": user_id,
                 "timestamp": datetime.now().isoformat(),
-                "type": "fact"
+                "type": "fact",
             })
-            
-            doc = Document(page_content=content, metadata=meta)
-            self.vector_store.add_documents([doc])
+
+            mem_id = str(uuid.uuid4())
+            upsert_vectors(MEMORY_COLLECTION, [mem_id], [vector], [pay])
             return True
         except Exception as e:
             print(f"Failed to add memory: {e}")
@@ -67,31 +69,28 @@ class MemoryService:
 
     def search_memories(self, query: str, user_id: str = "user", k: int = 3) -> List[str]:
         """Search for relevant memories"""
-        if self.vector_store is None:
-            return []
-            
         try:
-            # Filter by user_id if possible (Chroma supports where filter)
-            results = self.vector_store.similarity_search(
-                query, 
-                k=k,
-                filter={"user_id": user_id}
+            query_vector = self.embeddings.embed_query(query)
+            hits = search_vectors(
+                MEMORY_COLLECTION,
+                query_vector,
+                limit=k,
+                filter_conditions={"user_id": user_id},
             )
-            return [doc.page_content for doc in results]
+            return [hit["payload"].get("text", "") for hit in hits]
         except Exception as e:
             print(f"Memory search failed: {e}")
             return []
 
     def get_all_memories(self, user_id: str = "user", limit: int = 100) -> List[str]:
         """Get all memories for a user (most recent first)"""
-        if self.vector_store is None:
-            return []
-            
         try:
-            # Chroma doesn't have a simple "get all", so we search with empty query or generic term
-            # Actually, we can use get()
-            results = self.vector_store.get(where={"user_id": user_id}, limit=limit)
-            return results['documents'] if results else []
+            points = scroll_all(
+                MEMORY_COLLECTION,
+                filter_conditions={"user_id": user_id},
+                limit=limit,
+            )
+            return [p["payload"].get("text", "") for p in points]
         except Exception as e:
             print(f"Get all memories failed: {e}")
             return []

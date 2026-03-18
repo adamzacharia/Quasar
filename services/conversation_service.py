@@ -1,20 +1,21 @@
 # services/conversation_service.py
 """
 Conversation Storage Service
-Manages multiple chat conversations per user using SQLite
+Manages multiple chat conversations per user.
+Uses Turso (cloud) when TURSO_DATABASE_URL is set, else local SQLite.
 """
 
-import sqlite3
 import json
 import os
 from datetime import datetime
 from typing import List, Dict, Optional
 import uuid
+from services.db import get_connection
 
 class ConversationService:
     """
     Manages conversation storage and retrieval per user.
-    Uses SQLite for persistent storage.
+    Uses Turso cloud DB or local SQLite fallback.
     """
     
     def __init__(self, db_path: str = None):
@@ -24,12 +25,16 @@ class ConversationService:
             os.makedirs(data_dir, exist_ok=True)
             db_path = os.path.join(data_dir, "conversations.db")
         
-        self.db_path = db_path
+        self._local_db_path = db_path
         self._init_db()
+
+    def _get_conn(self):
+        """Get a database connection (Turso cloud or local SQLite)."""
+        return get_connection(self._local_db_path)
     
     def _init_db(self):
         """Initialize database tables"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         # Conversations table
@@ -75,7 +80,7 @@ class ConversationService:
         conv_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -93,7 +98,7 @@ class ConversationService:
         """Save a message to a conversation"""
         now = datetime.now().isoformat()
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -117,7 +122,7 @@ class ConversationService:
         """
         import pandas as pd
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         # Delete existing messages
@@ -183,7 +188,7 @@ class ConversationService:
         """
         import pandas as pd
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -244,7 +249,7 @@ class ConversationService:
     
     def get_user_conversations(self, user_id: str, limit: int = 20) -> List[Dict]:
         """Get list of conversations for a user, most recent first"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -269,7 +274,7 @@ class ConversationService:
     
     def update_conversation_title(self, conversation_id: str, title: str):
         """Update conversation title"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -297,7 +302,7 @@ class ConversationService:
     
     def delete_conversation(self, conversation_id: str):
         """Delete a conversation and all its messages"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         cursor = conn.cursor()
         
         cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
