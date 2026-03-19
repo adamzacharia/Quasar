@@ -50,7 +50,15 @@ from services.casa_generator import CASAScriptGenerator
 from services.gcn_monitor import GCNAlertMonitor
 from services.notebook_gen import generate_analysis_notebook
 from services.pdf_processing import PDFProcessingService
+from services.fits_processing import FITSProcessingService
 from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
+
+# Phase 1-4: Multi-Agent Workforce modules
+from core.conductor import Conductor
+from core.model_router import ModelRouter
+from core.recovery import RecoveryEngine
+from core.observability import QueryTracer
+from core.agent_pool import AgentPool
 
 # Import mem0 for long-term memory (optional - graceful fallback)
 try:
@@ -158,6 +166,32 @@ class QuasarAgent:
         self.gcn_monitor = GCNAlertMonitor()
         print("DEBUG: Init PDFProcessingService")
         self.pdf_service = PDFProcessingService(self.config.api_key)
+
+        # Phase 0: DataLink + FITS remote header
+        print("DEBUG: Init DataLinkClient")
+        self.datalink_client = DataLinkClient()
+        print("DEBUG: Init FITSProcessingService")
+        self.fits_service = FITSProcessingService()
+
+        # Phase 1-4: Multi-Agent Workforce infrastructure
+        print("DEBUG: Init ModelRouter")
+        self.model_router = ModelRouter(default_model=self.config.model)
+        print("DEBUG: Init RecoveryEngine")
+        self.recovery_engine = RecoveryEngine(
+            client=self.client, model=self.config.model, verbose=True
+        )
+        print("DEBUG: Init QueryTracer")
+        self.query_tracer = QueryTracer()
+        print("DEBUG: Init AgentPool")
+        self.agent_pool = AgentPool()
+        print("DEBUG: Init Conductor")
+        self.conductor = Conductor(
+            client=self.client,
+            model=self.config.model,
+            recovery_engine=self.recovery_engine,
+            model_router=self.model_router,
+            verbose=True,
+        )
 
         # Initialize RLM (Recursive Language Model) for complex queries
         print("DEBUG: Init RLM")
@@ -1133,7 +1167,95 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
+        # ── DataLink + FITS Remote Header Tools (Phase 0) ──────────
+        self.tool_registry.register(Tool(
+            name="list_alma_files",
+            description=(
+                "List all deliverable files (images, cubes, continuum maps) for a "
+                "given ALMA MOUS UID via the DataLink protocol. Returns filenames, "
+                "sizes, and direct access URLs.  Use after a search to discover "
+                "which data products (e.g. *pbcor.fits) are available for download "
+                "or remote FITS header inspection."
+            ),
+            function=self._list_alma_files,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mous_uid": {
+                        "type": "string",
+                        "description": "MOUS UID, e.g. 'uid://A001/X1590/X30ae'"
+                    },
+                    "filename_pattern": {
+                        "type": "string",
+                        "description": "Optional glob filter, e.g. '*.pbcor.fits' to only show primary-beam-corrected images"
+                    },
+                },
+                "required": ["mous_uid"]
+            },
+            category="archive"
+        ))
 
+        self.tool_registry.register(Tool(
+            name="inspect_fits_header",
+            description=(
+                "Read key metadata from a remote FITS file header WITHOUT downloading "
+                "the full file. Returns beam size (BMAJ/BMIN in arcsec), RMS noise/sensitivity, "
+                "rest frequency, target name, pixel scale, and image dimensions. "
+                "Use after list_alma_files to inspect the data quality of each product."
+            ),
+            function=self._inspect_fits_header,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "access_url": {
+                        "type": "string",
+                        "description": "Direct HTTPS URL to the FITS file (from list_alma_files access_url)"
+                    },
+                },
+                "required": ["access_url"]
+            },
+            category="archive"
+        ))
+
+    # ── Phase 0: DataLink + FITS backing methods ──────────────────────────
+
+    @log_tool
+    def _list_alma_files(self, mous_uid: str, filename_pattern: str = None) -> Dict[str, Any]:
+        """List deliverable files for a MOUS via the ALMA DataLink protocol."""
+        try:
+            files = self.datalink_client.list_files(
+                mous_uid=mous_uid,
+                pattern=filename_pattern,
+            )
+            if not files:
+                return {
+                    "success": True,
+                    "mous_uid": mous_uid,
+                    "file_count": 0,
+                    "message": "No files found. The MOUS UID might be invalid or the data is not yet public.",
+                }
+            return {
+                "success": True,
+                "mous_uid": mous_uid,
+                "file_count": len(files),
+                "files": files[:50],  # Cap at 50 for LLM context
+                "note": f"Found {len(files)} file(s)." + (
+                    f" Showing first 50." if len(files) > 50 else ""
+                ),
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "mous_uid": mous_uid}
+
+    @log_tool
+    def _inspect_fits_header(self, access_url: str) -> Dict[str, Any]:
+        """Read FITS header from a remote URL without downloading the full file."""
+        try:
+            metadata = self.fits_service.extract_metadata_from_url(access_url)
+            if "error" in metadata:
+                return {"success": False, **metadata}
+            return {"success": True, **metadata}
+        except Exception as e:
+            return {"success": False, "error": str(e), "url": access_url}
 
     @log_tool
     def _tavily_web_search(self, query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
@@ -2036,6 +2158,37 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "This helps users verify the information."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}\n\nUser: {query}"
+
+        # 4a. Conductor check — delegate complex queries to DAG orchestration
+        try:
+            complexity = self.rlm.complexity_detector.detect(query) if hasattr(self, 'rlm') else 0.0
+            if complexity > Conductor.COMPLEXITY_THRESHOLD:
+                import asyncio
+                trace_id = self.query_tracer.new_trace(query, user_id=user_id)
+                if on_status:
+                    on_status(f"Complex query detected (score={complexity:.2f}) — activating multi-agent workforce", "running")
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            conductor_answer = pool.submit(
+                                asyncio.run,
+                                self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token)
+                            ).result()
+                    else:
+                        conductor_answer = asyncio.run(
+                            self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token)
+                        )
+                    if conductor_answer:
+                        self.query_tracer.end_trace(trace_id, "completed")
+                        return conductor_answer
+                    # Conductor returned None → query not complex enough, fall through
+                except Exception as ce:
+                    print(f"[WARNING] Conductor orchestration failed: {ce}. Falling back to standard path.")
+                    self.query_tracer.end_trace(trace_id, "failed")
+        except Exception as e:
+            print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
         
         try:
             if message_placeholder:
