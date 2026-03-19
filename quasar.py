@@ -7,11 +7,24 @@ Usage:
     python quasar.py cli          Launch interactive CLI
     python quasar.py test         Run system tests
     python quasar.py query "..."  Run a single query
-    python quasar.py web          Launch web UI (Streamlit)
 """
 
 import sys
 import os
+
+# --- Python 3.13 'cgi' module shim for pyvo ---
+import sys as _sys
+if "cgi" not in _sys.modules:
+    import types
+    import email.message
+    cgi = types.ModuleType("cgi")
+    def parse_header(line):
+        m = email.message.Message()
+        m['content-type'] = line
+        return m.get_content_type(), m.get_params() or {}
+    cgi.parse_header = parse_header
+    _sys.modules["cgi"] = cgi
+# ---------------------------------------------
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -64,11 +77,6 @@ def main():
             response_text = str(result)
 
         print(response_text)
-
-    elif command == "web":
-        import subprocess
-        ui_path = os.path.join(os.path.dirname(__file__), "ui", "app.py")
-        subprocess.run([sys.executable, "-m", "streamlit", "run", ui_path])
 
     else:
         print(f"Unknown command: {command}")

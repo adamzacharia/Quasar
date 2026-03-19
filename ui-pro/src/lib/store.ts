@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import type { Conversation, Message } from "./types";
+import type { Conversation, Message, TaskGroup, TaskItem, TaskChecklist } from "./types";
 import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 
 interface ChatStore {
@@ -15,6 +15,11 @@ interface ChatStore {
     sidebarOpen: boolean;
     thinkingSteps: ThoughtStep[];
     thinkingStatus: "idle" | "running" | "completed";
+    // Task Execution state (Perplexity-style)
+    taskGroups: TaskGroup[];
+    taskItems: Map<string, TaskItem>;
+    taskChecklist: TaskChecklist | null;
+    taskExecutionActive: boolean;
     setActiveConversation: (id: string | null) => void;
     addMessage: (message: Message) => void;
     updateLastAssistantMessage: (content: string) => void;
@@ -30,6 +35,11 @@ interface ChatStore {
     clearThinking: () => void;
     fetchModels: () => Promise<void>;
     attachThinkingToLastMessage: () => void;
+    // Task Execution actions
+    handleTaskGroup: (group: Record<string, unknown>) => void;
+    handleTaskUpdate: (update: Record<string, unknown>) => void;
+    handleTaskList: (list: Record<string, unknown>) => void;
+    clearTaskExecution: () => void;
 }
 
 function generateId(): string {
@@ -56,9 +66,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     sidebarOpen: true,
     thinkingSteps: [],
     thinkingStatus: "idle",
+    // Task Execution initial state
+    taskGroups: [],
+    taskItems: new Map(),
+    taskChecklist: null,
+    taskExecutionActive: false,
 
     setActiveConversation: (id) => set((state) => {
-        // Save current messages to current conversation
         if (state.activeConversationId && state.messages.length > 0) {
             const updatedConversations = state.conversations.map(c =>
                 c.id === state.activeConversationId
@@ -79,19 +93,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     addMessage: (message) => set((state) => {
         const newMessages = [...state.messages, message];
 
-        // If this is the first user message, create or update conversation
         let updatedConversations = [...state.conversations];
         if (state.activeConversationId) {
             const existingConv = updatedConversations.find(c => c.id === state.activeConversationId);
             if (existingConv) {
-                // Update existing conversation
                 updatedConversations = updatedConversations.map(c =>
                     c.id === state.activeConversationId
                         ? {
                             ...c,
                             messages: newMessages,
                             updatedAt: new Date(),
-                            // Update title from first user message
                             title: message.role === "user" && c.messages.length === 0
                                 ? message.content.slice(0, 60) + (message.content.length > 60 ? "…" : "")
                                 : c.title,
@@ -99,7 +110,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                         : c
                 );
             } else {
-                // Create new conversation
                 const title = message.role === "user"
                     ? message.content.slice(0, 60) + (message.content.length > 60 ? "…" : "")
                     : "New Chat";
@@ -122,7 +132,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     updateLastAssistantMessage: (content) => set((state) => {
         const msgs = [...state.messages];
-        // Find the last assistant message (could be anywhere if tool calls were inserted)
         for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i].role === "assistant" && msgs[i].type === "text") {
                 msgs[i] = { ...msgs[i], content };
@@ -138,7 +147,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     setSelectedModel: (model) => set({ selectedModel: model }),
 
     createNewConversation: () => set((state) => {
-        // Save current conversation messages first
         let updatedConversations = [...state.conversations];
         if (state.activeConversationId && state.messages.length > 0) {
             updatedConversations = updatedConversations.map(c =>
@@ -166,7 +174,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     addThinkingStep: (step, state) => set((s) => {
         const steps = [...s.thinkingSteps];
-        // If this step already exists (running -> completed), update it
         const existingIdx = steps.findIndex(t => t.text === step);
         if (existingIdx >= 0) {
             steps[existingIdx] = { ...steps[existingIdx], status: state };
@@ -199,5 +206,70 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             }
         }
         return { messages: msgs };
+    }),
+
+    // ── Task Execution Actions ──────────────────────────────────────────────
+
+    handleTaskGroup: (group) => set((s) => {
+        const newGroup: TaskGroup = {
+            groupId: group.groupId as string,
+            title: group.title as string,
+            taskIds: (group.taskIds as string[]) || [],
+            tasks: ((group.tasks as Array<Record<string, unknown>>) || []).map(t => ({
+                id: t.id as string,
+                description: t.description as string,
+                status: "pending" as const,
+                agentType: t.agentType as string,
+                icon: t.icon as string,
+                groupId: group.groupId as string,
+            })),
+        };
+        const items = new Map(s.taskItems);
+        for (const task of newGroup.tasks) {
+            if (!items.has(task.id)) {
+                items.set(task.id, task);
+            }
+        }
+        return {
+            taskGroups: [...s.taskGroups, newGroup],
+            taskItems: items,
+            taskExecutionActive: true,
+        };
+    }),
+
+    handleTaskUpdate: (update) => set((s) => {
+        const items = new Map(s.taskItems);
+        const taskId = update.taskId as string;
+        const existing = items.get(taskId);
+        items.set(taskId, {
+            id: taskId,
+            description: (update.title as string) || existing?.description || taskId,
+            status: (update.status as TaskItem["status"]) || "running",
+            agentType: (update.agentType as string) || existing?.agentType || "general",
+            icon: (update.icon as string) || existing?.icon,
+            detail: (update.detail as string) || existing?.detail,
+            groupId: (update.groupId as string) || existing?.groupId,
+        });
+        return { taskItems: items };
+    }),
+
+    handleTaskList: (list) => set(() => {
+        const checklist: TaskChecklist = {
+            title: (list.title as string) || "Execution Plan",
+            tasks: ((list.tasks as Array<Record<string, unknown>>) || []).map(t => ({
+                id: t.id as string,
+                description: t.description as string,
+                status: (t.status as TaskItem["status"]) || "pending",
+                agentType: (t.agentType as string) || "general",
+            })),
+        };
+        return { taskChecklist: checklist, taskExecutionActive: true };
+    }),
+
+    clearTaskExecution: () => set({
+        taskGroups: [],
+        taskItems: new Map(),
+        taskChecklist: null,
+        taskExecutionActive: false,
     }),
 }));

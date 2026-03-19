@@ -149,7 +149,6 @@ python-dotenv
 pyvo
 requests
 scipy
-streamlit>=1.28.0
 
 rich
 

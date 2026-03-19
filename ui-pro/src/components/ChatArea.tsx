@@ -8,6 +8,7 @@ import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "../lib/types";
+import { TaskExecutionWidget } from "./TaskExecutionWidget";
 import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
@@ -23,7 +24,9 @@ export function ChatArea() {
         selectedModel, conversations,
         toggleStar,
         thinkingSteps, thinkingStatus, addThinkingStep, clearThinking,
-        attachThinkingToLastMessage
+        attachThinkingToLastMessage,
+        taskGroups, taskItems, taskChecklist, taskExecutionActive,
+        handleTaskGroup, handleTaskUpdate, handleTaskList, clearTaskExecution,
     } = useChatStore();
 
     const { token } = useAuthStore();
@@ -65,6 +68,7 @@ export function ChatArea() {
         setInputValue("");
         setStreaming(true);
         clearThinking();
+        clearTaskExecution();
         // ↓ Instantly show the Processing Pipeline widget — before the first network event
         addThinkingStep("Connecting to QUASAR engine", "running");
 
@@ -185,6 +189,9 @@ export function ChatArea() {
                                 notebookData: notebook as unknown as NotebookData,
                             });
                         },
+                        onTaskGroup: (group) => handleTaskGroup(group),
+                        onTaskUpdate: (update) => handleTaskUpdate(update),
+                        onTaskList: (list) => handleTaskList(list),
                         onComplete: () => {
                             attachThinkingToLastMessage();
                             setStreaming(false);
@@ -238,6 +245,16 @@ export function ChatArea() {
                         {messages.map((msg, i) => {
                             const isLastAssistant = isStreaming && msg.role === "assistant" && msg.type === "text" && i === messages.length - 1;
                             return (
+                                <>
+                                {/* Show TaskExecutionWidget before the last streaming assistant message */}
+                                {isLastAssistant && taskExecutionActive && (
+                                    <TaskExecutionWidget state={{
+                                        groups: taskGroups,
+                                        tasks: taskItems,
+                                        checklist: taskChecklist,
+                                        isActive: taskExecutionActive && isStreaming,
+                                    }} />
+                                )}
                                 <ChatMessage
                                     key={msg.id}
                                     message={msg}
@@ -245,6 +262,7 @@ export function ChatArea() {
                                     thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
                                     thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
                                 />
+                                </>
                             );
                         })}
                     </div>

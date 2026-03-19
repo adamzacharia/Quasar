@@ -716,7 +716,15 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
                     if msg_type == "status":
-                        yield _status(step, state)
+                        # Check for structured Conductor events (prefixed with __event__)
+                        if isinstance(step, str) and step.startswith("__event__"):
+                            try:
+                                event_json = step[len("__event__"):]
+                                yield f"data: {event_json}\n\n"
+                            except Exception:
+                                yield _status(step, state)
+                        else:
+                            yield _status(step, state)
                         continue
                 msg_type, payload = msg[0], msg[1]
                 if msg_type == "done":

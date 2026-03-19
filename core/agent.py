@@ -188,8 +188,10 @@ class QuasarAgent:
         self.conductor = Conductor(
             client=self.client,
             model=self.config.model,
+            tool_executor=self._conductor_tool_executor,
             recovery_engine=self.recovery_engine,
             model_router=self.model_router,
+            agent_pool=self.agent_pool,
             verbose=True,
         )
 
@@ -2101,6 +2103,143 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         return self.stream_response_api(query, message_placeholder, user_id)
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # CONDUCTOR TOOL EXECUTOR — Bridges sub-agents to the full tool set
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def _conductor_tool_executor(self, task_description: str, dep_context: str = "") -> str:
+        """
+        Execute a sub-task using a mini Responses API call with full tool access.
+
+        This is the callback passed to Conductor so each DAG node can use
+        all 28+ registered tools (ALMA search, ADS, Splatalogue, etc.).
+
+        Parameters
+        ----------
+        task_description : str
+            Human-readable task description (e.g., "Search ALMA for Band 6 observations of Sz65")
+        dep_context : str
+            Results from prior tasks in the DAG that this task depends on.
+
+        Returns
+        -------
+        str
+            The agent's response text after executing the task with tools.
+        """
+        # Build a focused prompt for this subtask
+        system_instructions = (
+            "You are a radio astronomy specialist executing one step of a larger analysis. "
+            "Use the available tools to complete this specific task. "
+            "Be concise — return only the relevant data/findings, no preamble."
+        )
+
+        user_input = task_description
+        if dep_context:
+            user_input = f"Context from prior steps:\n{dep_context}\n\nYour task: {task_description}"
+
+        try:
+            # Build the tool list from registered tools
+            tools = self._build_tool_definitions()
+
+            # Single Responses API call with tool access
+            response = self.client.responses.create(
+                model=self.config.model,
+                instructions=system_instructions,
+                input=user_input,
+                tools=tools,
+                temperature=0.1,
+                max_output_tokens=2000,
+            )
+
+            # Process tool calls (up to 3 rounds)
+            output_text = ""
+            for _round in range(3):
+                tool_calls = [item for item in response.output if getattr(item, 'type', '') == 'function_call']
+
+                if not tool_calls:
+                    # No more tool calls — extract text
+                    for item in response.output:
+                        if getattr(item, 'type', '') == 'output_text':
+                            output_text += item.text
+                    break
+
+                # Execute each tool call
+                tool_results = []
+                for tc in tool_calls:
+                    fn_name = tc.name
+                    fn_args = tc.arguments
+                    result = self._dispatch_tool_call(fn_name, fn_args)
+                    tool_results.append({
+                        "type": "function_call_output",
+                        "call_id": tc.call_id,
+                        "output": str(result)[:4000],
+                    })
+
+                # Continue conversation with tool results
+                response = self.client.responses.create(
+                    model=self.config.model,
+                    previous_response_id=response.id,
+                    input=tool_results,
+                    tools=tools,
+                    temperature=0.1,
+                    max_output_tokens=2000,
+                )
+
+            # Extract final text if not already
+            if not output_text:
+                output_text = response.output_text if hasattr(response, 'output_text') else str(response.output)
+
+            return output_text.strip() if output_text else "[No output]"
+
+        except Exception as e:
+            logger.error(f"Conductor tool executor failed: {e}")
+            return f"[Tool execution error: {e}]"
+
+    def _build_tool_definitions(self) -> list:
+        """Build OpenAI tool definitions from the registered tool list."""
+        return [
+            {
+                "type": "function",
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "parameters": t["function"].get("parameters", {}),
+            }
+            for t in self.tools
+            if t.get("type") == "function"
+        ]
+
+    def _dispatch_tool_call(self, tool_name: str, arguments_json: str) -> str:
+        """
+        Dispatch a tool call by name using the tool registry.
+
+        Parameters
+        ----------
+        tool_name : str
+            Name of the registered tool function.
+        arguments_json : str
+            JSON string of the tool arguments.
+
+        Returns
+        -------
+        str
+            JSON-encoded result from the tool.
+        """
+        import json as _json
+        try:
+            args = _json.loads(arguments_json) if arguments_json else {}
+        except _json.JSONDecodeError:
+            args = {}
+
+        tool = self.tool_registry.get_tool(tool_name)
+        if tool:
+            try:
+                result = tool.execute(**args)
+                return _json.dumps(result, default=str)[:8000]
+            except Exception as e:
+                return _json.dumps({"error": str(e)})
+        else:
+            return _json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # RESPONSES API METHOD (New Architecture)
     # ═══════════════════════════════════════════════════════════════════════════════
     
@@ -2167,6 +2306,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 trace_id = self.query_tracer.new_trace(query, user_id=user_id)
                 if on_status:
                     on_status(f"Complex query detected (score={complexity:.2f}) — activating multi-agent workforce", "running")
+
+                # Build on_event emitter that forwards structured events through the SSE queue
+                on_event = None
+                if on_status:
+                    import json as _json
+                    def on_event(evt: dict):
+                        # The status callback in api/main.py will forward this as an SSE event
+                        evt_type = evt.get('type', 'status')
+                        on_status(f"__event__{_json.dumps(evt)}", evt_type)
+
                 try:
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
@@ -2174,11 +2323,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         with concurrent.futures.ThreadPoolExecutor() as pool:
                             conductor_answer = pool.submit(
                                 asyncio.run,
-                                self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token)
+                                self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token, on_event=on_event)
                             ).result()
                     else:
                         conductor_answer = asyncio.run(
-                            self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token)
+                            self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token, on_event=on_event)
                         )
                     if conductor_answer:
                         self.query_tracer.end_trace(trace_id, "completed")
@@ -2191,8 +2340,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
         
         try:
-            if message_placeholder:
-                message_placeholder.markdown("🔄 Processing...")
             
             MAX_TOOL_ROUNDS = 12  # supports up to 8-step multi-tool query chains
             last_id = self.last_response_id
@@ -2294,9 +2441,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             
             print(f"[DEBUG] Response text length: {len(output_text)}")
             
-            if message_placeholder:
-                message_placeholder.markdown(output_text)
-            
+
             # 8. Update long-term memory — only for authenticated users
             if self.long_term_memory and not _is_anonymous:
                 try:
@@ -2314,15 +2459,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # Responses API not available in this OpenAI version
             error_msg = f"Responses API not available: {ae}. Please upgrade the openai package."
             print(f"[ERROR] {error_msg}")
-            if message_placeholder:
-                message_placeholder.error(error_msg)
             return error_msg
             
         except Exception as e:
             error_msg = f"Error with Responses API: {str(e)}"
             print(f"[ERROR] {error_msg}")
-            if message_placeholder:
-                message_placeholder.error(error_msg)
             return error_msg
     
     def _build_tools_for_responses_api(self) -> list:

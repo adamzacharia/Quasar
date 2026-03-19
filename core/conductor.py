@@ -7,6 +7,12 @@ the full query context, decomposes it into a dependency DAG, routes each
 subtask to the right sub-agent, runs them in parallel where possible,
 handles failures with the Recovery Engine, and synthesizes the final answer.
 
+SSE Protocol:
+  The Conductor emits structured events for the Perplexity-style task UI:
+    - task_group:  parallel batch header
+    - task_update: individual task progress
+    - task_list:   full checklist view
+
 Integration point:
   agent.py → stream_response_api() checks complexity →
   if complex, delegates to Conductor.orchestrate()
@@ -26,6 +32,17 @@ from core.task_dag import TaskDAG, TaskNode, TaskStatus
 from core.workflow_memory import WorkflowMemory
 
 logger = logging.getLogger(__name__)
+
+# ── Agent type → Icon + Display name mapping ────────────────────────────
+AGENT_ICONS = {
+    "archive":    ("🗄️", "Archive Search"),
+    "literature": ("📚", "Literature Review"),
+    "analysis":   ("🔬", "Data Analysis"),
+    "viz":        ("📊", "Visualization"),
+    "web":        ("🌐", "Web Search"),
+    "synthesis":  ("📋", "Result Synthesis"),
+    "general":    ("⚡", "General Task"),
+}
 
 # ── DAG decomposition prompt ─────────────────────────────────────────────
 
@@ -88,8 +105,7 @@ class Conductor:
     routes subtasks to sub-agents, runs them in parallel, and
     synthesizes the final answer.
 
-    For queries that aren't complex enough, returns None so the caller
-    falls back to the standard tool-calling loop.
+    Emits Perplexity Computer-style SSE events for real-time task UI.
     """
 
     MAX_SUBTASKS = 10
@@ -102,7 +118,9 @@ class Conductor:
         tool_executor: Optional[Callable] = None,
         model_router: Optional[Any] = None,
         recovery_engine: Optional[Any] = None,
+        agent_pool: Optional[Any] = None,
         on_status: Optional[Callable[[str, str], None]] = None,
+        on_event: Optional[Callable[[dict], None]] = None,
         verbose: bool = False,
     ):
         self.client = client
@@ -110,10 +128,84 @@ class Conductor:
         self.tool_executor = tool_executor
         self.model_router = model_router
         self.recovery = recovery_engine
+        self.agent_pool = agent_pool
         self.on_status = on_status
+        self.on_event = on_event   # Structured SSE event emitter
         self.verbose = verbose
         self.workflow_memory = WorkflowMemory()
         self.dag = TaskDAG()
+
+    # ── SSE Event Helpers ──────────────────────────────────────────────────
+
+    def _emit(self, event: dict, on_event: Optional[Callable] = None):
+        """Emit a structured SSE event for the frontend."""
+        fn = on_event or self.on_event
+        if fn:
+            fn(event)
+
+    def _emit_status(self, step: str, state: str,
+                     on_status: Optional[Callable] = None):
+        fn = on_status or self.on_status
+        if fn:
+            fn(step, state)
+
+    def _emit_task_list(self, title: str,
+                        on_event: Optional[Callable] = None):
+        """Emit a task_list event showing DAG progress as a checklist."""
+        tasks = []
+        for n in self.dag.nodes.values():
+            icon, _ = AGENT_ICONS.get(n.agent_type, ("⚡", "Task"))
+            tasks.append({
+                "id": n.id,
+                "description": f"{icon} {n.description}",
+                "status": n.status.value,
+                "agentType": n.agent_type,
+            })
+        self._emit({
+            "type": "task_list",
+            "title": title,
+            "tasks": tasks,
+        }, on_event)
+
+    def _emit_task_group(self, group_id: str, title: str,
+                         ready_nodes: List[TaskNode],
+                         on_event: Optional[Callable] = None):
+        """Emit a task_group event for parallel execution."""
+        self._emit({
+            "type": "task_group",
+            "groupId": group_id,
+            "title": title,
+            "taskIds": [n.id for n in ready_nodes],
+            "tasks": [
+                {
+                    "id": n.id,
+                    "description": n.description,
+                    "agentType": n.agent_type,
+                    "icon": AGENT_ICONS.get(n.agent_type, ("⚡",))[0],
+                }
+                for n in ready_nodes
+            ],
+        }, on_event)
+
+    def _emit_task_update(self, node: TaskNode, status: str,
+                          detail: str = "",
+                          group_id: str = "",
+                          on_event: Optional[Callable] = None):
+        """Emit a task_update event for a single task."""
+        icon, agent_label = AGENT_ICONS.get(node.agent_type, ("⚡", "Task"))
+        self._emit({
+            "type": "task_update",
+            "taskId": node.id,
+            "groupId": group_id,
+            "title": node.description,
+            "status": status,
+            "agentType": node.agent_type,
+            "agentLabel": agent_label,
+            "icon": icon,
+            "detail": detail,
+        }, on_event)
+
+    # ── Main Orchestration ─────────────────────────────────────────────────
 
     async def orchestrate(
         self,
@@ -121,50 +213,42 @@ class Conductor:
         context: str = "",
         on_status: Optional[Callable[[str, str], None]] = None,
         on_token: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[dict], None]] = None,
     ) -> Optional[str]:
         """
         Main entry point for complex query orchestration.
 
-        Returns
-        -------
-        str or None
-            The final synthesized answer, or None if the query isn't
-            complex enough for DAG orchestration.
+        Returns the final synthesized answer, or None if the query
+        isn't complex enough for DAG orchestration.
         """
         status_fn = on_status or self.on_status
+        event_fn = on_event or self.on_event
         self.workflow_memory.clear()
 
         # Step 1: Decompose query into DAG
-        if status_fn:
-            status_fn("Analyzing query complexity and building execution plan", "running")
+        self._emit_status("Analyzing query complexity and building execution plan", "running", status_fn)
 
         subtasks = self._decompose(query, context)
 
         if not subtasks:
-            if status_fn:
-                status_fn("Query is simple — using direct response", "completed")
+            self._emit_status("Query is simple — using direct response", "completed", status_fn)
             return None  # Caller falls back to standard path
 
         # Build the DAG
         self.dag.build_from_subtasks(subtasks)
 
-        if self.verbose or status_fn:
-            task_summary = ", ".join(
-                f"{s['id']}:{s['agent_type']}" for s in subtasks
-            )
-            msg = f"Execution plan: {len(subtasks)} tasks ({task_summary})"
-            logger.info(msg)
-            if status_fn:
-                status_fn(msg, "completed")
+        task_summary = ", ".join(f"{s['id']}:{s['agent_type']}" for s in subtasks)
+        msg = f"Execution plan: {len(subtasks)} tasks ({task_summary})"
+        logger.info(msg)
+        self._emit_status(msg, "completed", status_fn)
 
-        # Step 2: Execute DAG
-        if status_fn:
-            status_fn(f"Executing {len(subtasks)} sub-tasks (parallel where possible)", "running")
+        # Emit task_list showing the full checklist
+        self._emit_task_list(f"Multi-step analysis: {query[:60]}...", event_fn)
 
-        results = await self.dag.execute(
-            executor_fn=self._execute_node,
-            on_status=status_fn,
-        )
+        # Step 2: Execute DAG with structured SSE events
+        self._emit_status(f"Executing {len(subtasks)} sub-tasks (parallel where possible)", "running", status_fn)
+
+        results = await self._execute_dag_with_events(event_fn, status_fn)
 
         # Step 3: Write all results to workflow memory
         for task_id, result in results.items():
@@ -172,56 +256,116 @@ class Conductor:
             agent_type = node.agent_type if node else "unknown"
             self.workflow_memory.write(agent_type, task_id, result)
 
-        # Step 4: Synthesize final answer
-        if status_fn:
-            status_fn("Synthesizing final answer from all results", "running")
+        # Step 4: Emit final task_list showing all completed
+        self._emit_task_list(f"Multi-step analysis: {query[:60]}...", event_fn)
+
+        # Step 5: Synthesize final answer
+        self._emit_status("Synthesizing final answer from all results", "running", status_fn)
+        self._emit_task_update(
+            TaskNode(id="synthesis", description="Synthesizing results", agent_type="synthesis"),
+            "running", "Combining results from all agents...", "", event_fn,
+        )
 
         final_answer = self._synthesize(query, results)
 
-        if status_fn:
-            status_fn("Answer ready", "completed")
+        self._emit_status("Answer ready", "completed", status_fn)
 
         if on_token:
             on_token(final_answer)
 
         return final_answer
 
-    # ── Internals ──────────────────────────────────────────────────────────
+    async def _execute_dag_with_events(
+        self,
+        on_event: Optional[Callable] = None,
+        on_status: Optional[Callable] = None,
+    ) -> Dict[str, Any]:
+        """Execute the full DAG, emitting Perplexity-style parallel group events."""
+        total = len(self.dag.nodes)
+        round_num = 0
 
-    def _decompose(self, query: str, context: str) -> List[dict]:
-        """Decompose a query into structured subtasks with dependencies."""
-        prompt = DAG_DECOMPOSITION_PROMPT.format(
-            query=query,
-            context=context or "(no prior context)",
-        )
+        for _round in range(20):
+            ready = self.dag.get_ready_tasks()
+            if not ready:
+                pending = [n for n in self.dag.nodes.values() if n.status == TaskStatus.PENDING]
+                if not pending:
+                    break
+                for p in pending:
+                    self.dag.mark_failed(p.id, "Unmet dependencies — predecessor failed")
+                    self._emit_task_update(p, "error", "Predecessor task failed", f"g{round_num}", on_event)
+                break
 
-        try:
-            resp = self.client.responses.create(
-                model=self.model,
-                input=prompt,
-                temperature=0.1,
-                max_output_tokens=800,
-                text={"format": {"type": "json_object"}},
-            )
-            data = json.loads(resp.output_text)
-            subtasks = data.get("subtasks", [])
+            round_num += 1
+            group_id = f"g{round_num}"
 
-            if self.verbose:
-                reasoning = data.get("reasoning", "")
-                logger.info("Decomposition: %s", reasoning)
+            # Emit parallel group header
+            if len(ready) > 1:
+                self._emit_task_group(group_id, "Running tasks in parallel", ready, on_event)
+            else:
+                self._emit_task_group(group_id, f"Running: {ready[0].description[:50]}", ready, on_event)
 
-            return subtasks[:self.MAX_SUBTASKS]
+            # Emit individual task_update: running
+            for node in ready:
+                icon, label = AGENT_ICONS.get(node.agent_type, ("⚡", "Task"))
+                self._emit_task_update(node, "running", f"Starting {label}...", group_id, on_event)
 
-        except Exception as e:
-            logger.error("Conductor decomposition failed: %s", e)
-            return []
+            # Execute all ready tasks in parallel
+            async def _run_one(node: TaskNode):
+                self.dag.mark_running(node.id)
+                try:
+                    result = await asyncio.wait_for(
+                        self._execute_node(node),
+                        timeout=node.sla_seconds,
+                    )
+                    self.dag.mark_completed(node.id, result)
+
+                    # Emit success update
+                    detail = self._summarize_result(result)
+                    self._emit_task_update(node, "completed", detail, group_id, on_event)
+
+                except asyncio.TimeoutError:
+                    self.dag.mark_failed(node.id, f"Timeout after {node.sla_seconds}s")
+                    self._emit_task_update(node, "error", f"Timed out after {node.sla_seconds}s", group_id, on_event)
+                except Exception as e:
+                    self.dag.mark_failed(node.id, str(e))
+                    self._emit_task_update(node, "error", str(e)[:100], group_id, on_event)
+
+            await asyncio.gather(*[_run_one(node) for node in ready])
+
+            completed = sum(1 for n in self.dag.nodes.values() if n.status == TaskStatus.COMPLETED)
+            self._emit_status(f"Completed {completed}/{total} tasks", "completed", on_status)
+
+        # Collect results
+        return {
+            tid: node.result
+            for tid, node in self.dag.nodes.items()
+            if node.status == TaskStatus.COMPLETED
+        }
+
+    def _summarize_result(self, result: Any) -> str:
+        """Create a short human-readable summary of a task result."""
+        if result is None:
+            return "No results"
+        if isinstance(result, str):
+            return result[:80] + ("..." if len(result) > 80 else "")
+        if isinstance(result, dict):
+            if "total_results" in result:
+                return f"Found {result['total_results']} results"
+            if "error" in result:
+                return f"Error: {result['error']}"
+            return f"{len(result)} fields returned"
+        if isinstance(result, list):
+            return f"Found {len(result)} items"
+        return str(result)[:80]
+
+    # ── Node Execution ─────────────────────────────────────────────────────
 
     async def _execute_node(self, node: TaskNode) -> Any:
         """
         Execute a single task node.
 
         Uses the tool_executor callback which ultimately calls the same
-        tool functions as the main agent — so all 27+ tools are available.
+        tool functions as the main agent — so all 28+ tools are available.
         """
         if self.verbose:
             logger.info("Executing %s (%s): %s", node.id, node.agent_type, node.description)
@@ -277,9 +421,38 @@ class Conductor:
         except Exception as e:
             return f"[Error: {e}]"
 
+    # ── Internals ──────────────────────────────────────────────────────────
+
+    def _decompose(self, query: str, context: str) -> List[dict]:
+        """Decompose a query into structured subtasks with dependencies."""
+        prompt = DAG_DECOMPOSITION_PROMPT.format(
+            query=query,
+            context=context or "(no prior context)",
+        )
+
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                input=prompt,
+                temperature=0.1,
+                max_output_tokens=800,
+                text={"format": {"type": "json_object"}},
+            )
+            data = json.loads(resp.output_text)
+            subtasks = data.get("subtasks", [])
+
+            if self.verbose:
+                reasoning = data.get("reasoning", "")
+                logger.info("Decomposition: %s", reasoning)
+
+            return subtasks[:self.MAX_SUBTASKS]
+
+        except Exception as e:
+            logger.error("Conductor decomposition failed: %s", e)
+            return []
+
     def _synthesize(self, query: str, results: Dict[str, Any]) -> str:
         """Synthesize all sub-task results into a final coherent answer."""
-        # Build results text
         results_parts = []
         for task_id, result in results.items():
             node = self.dag.nodes.get(task_id)
@@ -287,7 +460,6 @@ class Conductor:
             result_str = json.dumps(result, default=str)[:2000]
             results_parts.append(f"### {task_id}: {desc}\n{result_str}")
 
-        # Include failed tasks
         for node in self.dag.nodes.values():
             if node.status == TaskStatus.FAILED:
                 results_parts.append(
@@ -310,7 +482,6 @@ class Conductor:
             )
             return resp.output_text.strip()
         except Exception as e:
-            # Fallback: return raw results
             return (
                 f"**Results for:** {query}\n\n"
                 + results_text

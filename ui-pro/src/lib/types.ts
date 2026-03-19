@@ -88,3 +88,34 @@ export interface AppSettings {
     model: string;
     availableModels: string[];
 }
+
+// ── Task Execution UI Types (Perplexity Computer-style) ──────────────────
+
+export interface TaskItem {
+    id: string;
+    description: string;
+    status: "pending" | "running" | "completed" | "error";
+    agentType: string;
+    icon?: string;
+    detail?: string;
+    groupId?: string;
+}
+
+export interface TaskGroup {
+    groupId: string;
+    title: string;
+    taskIds: string[];
+    tasks: TaskItem[];
+}
+
+export interface TaskChecklistItem {
+    id: string;
+    description: string;
+    status: "pending" | "running" | "completed" | "error";
+    agentType: string;
+}
+
+export interface TaskChecklist {
+    title: string;
+    tasks: TaskChecklistItem[];
+}
