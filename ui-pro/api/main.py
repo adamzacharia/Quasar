@@ -57,14 +57,9 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS — allow the Next.js dev server and deployed domains
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|http://localhost:3000|http://127\.0\.0\.1:3000",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: CORSMiddleware is added AFTER LoggingMiddleware below (line ~115)
+# so it becomes the OUTERMOST middleware (Starlette uses LIFO order).
+# This ensures CORS headers are always present, even on error responses.
 
 # ── Startup: ensure all DB tables/collections exist ────────────────────────────
 @app.on_event("startup")
@@ -106,6 +101,27 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(LoggingMiddleware)
+
+# CORS — added LAST so it is the OUTERMOST middleware (Starlette LIFO).
+# This guarantees every response (including errors) carries CORS headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|http://localhost:3000|http://127\.0\.0\.1:3000",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Catch-all exception handler — ensures a proper JSON 500 with CORS headers ──
+from starlette.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+    )
 
 # Thread pool for running synchronous agent calls
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -926,6 +942,7 @@ async def chat_with_files(
 ):
     """Stream a chat response with attached files (images/documents) via SSE."""
     import base64, io
+    logger.info(f"[UPLOAD] Received {len(files)} file(s), message={message[:80]!r}")
 
     # Split files into images vs documents
     image_contents = []   # OpenAI vision content dicts
