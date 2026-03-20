@@ -208,8 +208,7 @@ async def root():
 
 @app.get("/api/models")
 async def list_models():
-    return {
-        "models": [
+    cloud_models = [
             # ── Anthropic Claude (Latest) ──────────────────────────
             "claude-sonnet-4-6",       # Latest Sonnet — best coding, default free/pro
             "claude-opus-4-6",         # Latest Opus — smartest, 1M context (beta)
@@ -245,8 +244,25 @@ async def list_models():
             "gemini-2.5-flash",        # Gemini 2.5 Flash
             "gemini-2.5-flash-lite",   # Gemini 2.5 Flash Lite
             "gemini-2.0-flash",        # Gemini 2.0 Flash
-        ]
-    }
+    ]
+
+    # ── Auto-discover local models (Ollama / LM Studio) ──────────────
+    local_models = []
+    local_base = os.getenv("LOCAL_LLM_BASE_URL", "")
+    if local_base:
+        try:
+            import httpx
+            resp = httpx.get(f"{local_base}/models", timeout=3.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for m in data.get("data", []):
+                    model_id = m.get("id", "")
+                    if model_id:
+                        local_models.append(f"local/{model_id}")
+        except Exception as e:
+            logger.warning(f"[MODELS] Failed to discover local models: {e}")
+
+    return {"models": cloud_models + local_models}
 
 # ── Custom Tool Models ────────────────────────────────────────
 
@@ -516,88 +532,12 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
             f"- Current date: {_dt.now().strftime('%Y-%m-%d')}\n"
         )
 
-        # ── Gemini model routing ──────────────────────────────────────────
+        # ── Unified model routing ─────────────────────────────────────────
+        # All models (OpenAI, Claude, Gemini, Local) now go through the
+        # same full tool-calling pipeline via LLMClient.
         model_name = request.model or "gpt-4o"
-        if model_name.startswith("gemini-"):
-            try:
-                from google import genai as ggenai
-                gemini_client = ggenai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-                yield _status(f"Routing to {model_name}", "running")
-
-                def _gemini_call():
-                    # Prepend QUASAR system prompt so Gemini knows its role
-                    full_prompt = QUASAR_SYSTEM_PROMPT + "\n\nUser query: " + effective_request.message
-                    return gemini_client.models.generate_content_stream(
-                        model=model_name,
-                        contents=full_prompt,
-                    )
-
-                loop = asyncio.get_event_loop()
-                stream = await loop.run_in_executor(_executor, _gemini_call)
-
-                yield _status(f"Routing to {model_name}", "completed")
-
-                for chunk in stream:
-                    text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
-                    if text:
-                        data = json.dumps({"type": "token", "content": text})
-                        yield f"data: {data}\n\n"
-
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                err = json.dumps({"type": "error", "content": f"Gemini error: {e}"})
-                yield f"data: {err}\n\n"
-                yield "data: [DONE]\n\n"
-            return
-
-        # ── Claude (Anthropic) model routing ──────────────────────────────────
-        if model_name.startswith("claude-"):
-            try:
-                import anthropic
-                claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-                yield _status(f"Routing to {model_name}", "running")
-
-                def _claude_call():
-                    return claude_client.messages.stream(
-                        model=model_name,
-                        max_tokens=int(os.getenv("MAX_TOKENS", "8096")),
-                        system=QUASAR_SYSTEM_PROMPT,
-                        messages=[{"role": "user", "content": effective_request.message}],
-                    )
-
-                loop = asyncio.get_event_loop()
-                yield _status(f"Routing to {model_name}", "completed")
-
-                def _run_claude_stream(q):
-                    with claude_client.messages.stream(
-                        model=model_name,
-                        max_tokens=int(os.getenv("MAX_TOKENS", "8096")),
-                        system=QUASAR_SYSTEM_PROMPT,
-                        messages=[{"role": "user", "content": effective_request.message}],
-                    ) as stream:
-                        for text in stream.text_stream:
-                            asyncio.run_coroutine_threadsafe(q.put(("token", text)), loop)
-                    asyncio.run_coroutine_threadsafe(q.put(("done", "")), loop)
-
-                claude_queue = asyncio.Queue()
-                loop.run_in_executor(_executor, _run_claude_stream, claude_queue)
-
-                while True:
-                    msg = await claude_queue.get()
-                    if msg[0] == "done":
-                        break
-                    elif msg[0] == "token" and msg[1]:
-                        data = json.dumps({"type": "token", "content": msg[1]})
-                        yield f"data: {data}\n\n"
-
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                err = json.dumps({"type": "error", "content": f"Claude error: {e}"})
-                yield f"data: {err}\n\n"
-                yield "data: [DONE]\n\n"
-            return
+        if model_name != agent.config.model:
+            agent.set_model(model_name)
 
         # ── Real OpenAI agent execution ────────────────────────────────────
 

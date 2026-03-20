@@ -75,6 +75,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
     const openaiModels = availableModels.filter(m => m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4"));
     const geminiModels = availableModels.filter(m => m.startsWith("gemini-") || m.startsWith("gemma-"));
     const claudeModels = availableModels.filter(m => m.startsWith("claude-"));
+    const localModels = availableModels.filter(m => m.startsWith("local/"));
 
     const renderGroup = (label: string, models: string[]) => models.length === 0 ? null : (
         <>
@@ -84,7 +85,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             {models.map((model) => (
                 <button key={model} onClick={() => { onSelect(model); setOpen(false); }}
                     className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/10 text-primary" : "text-slate-300 hover:bg-slate-700/50 hover:text-white"}`}>
-                    <span className="font-medium truncate">{model}</span>
+                    <span className="font-medium truncate">{model.startsWith("local/") ? model.replace("local/", "") : model}</span>
                     {model === selectedModel && <Check className="w-4 h-4 text-primary shrink-0 ml-1" />}
                 </button>
             ))}
@@ -95,7 +96,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
         <div ref={ref} className="relative">
             <button onClick={() => setOpen(!open)}
                 className="flex items-center justify-between w-full px-3 py-2.5 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors">
-                <div className="flex items-center gap-2"><Bot className="w-4 h-4" /><span className="truncate">Model: {selectedModel}</span></div>
+                <div className="flex items-center gap-2"><Bot className="w-4 h-4" /><span className="truncate">Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "🖥️ ") : selectedModel}</span></div>
                 <ChevronDown className={`w-4 h-4 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
             </button>
 
@@ -106,6 +107,8 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
                     {renderGroup("Anthropic Claude", claudeModels)}
                     {geminiModels.length > 0 && (openaiModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Google Gemini", geminiModels)}
+                    {localModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
+                    {renderGroup("🖥️ Local LLM", localModels)}
                 </div>
             )}
         </div>

@@ -22,6 +22,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 import openai
 from openai import OpenAI
+from core.llm_client import LLMClient, detect_provider
 
 from core.logger import logger, log_tool
 
@@ -95,12 +96,17 @@ class QuasarAgent:
         print("DEBUG: Agent init start - VERSION 2")
         self.config = config or AgentConfig()
 
-        if not self.config.api_key:
-            raise ValueError("OpenAI API key is required")
+        # API key validation — only required for cloud providers
+        provider = detect_provider(self.config.model)
+        if provider == "openai" and not self.config.api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required for OpenAI models. "
+                "Set it in .env or use a local model (prefix with 'local/')."
+            )
 
-        # Initialize OpenAI client
-        print("DEBUG: Init OpenAI")
-        self.client = OpenAI(api_key=self.config.api_key)
+        # Initialize unified LLM client (routes to OpenAI/Claude/Gemini/Local)
+        print(f"DEBUG: Init LLMClient (provider={provider}, model={self.config.model})")
+        self.client = LLMClient(model=self.config.model)
 
         # Initialize components
         print("DEBUG: Init Memory")
@@ -2624,10 +2630,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         return self.memory.get_history()
 
     def set_model(self, model: str):
-        """Change the LLM model"""
+        """Change the LLM model and update the LLMClient default."""
+        old_provider = detect_provider(self.config.model)
         self.config.model = model
+        # Update the LLMClient's default model so provider routing stays in sync
+        self.client.default_model = model
+        new_provider = detect_provider(model)
         if self.config.verbose:
-            print(f"[cyan]Model changed to: {model}[/cyan]")
+            print(f"[cyan]Model changed to: {model} (provider: {new_provider})[/cyan]")
+        if old_provider != new_provider:
+            logger.info(f"Provider switch: {old_provider} → {new_provider}")
 
     def _update_memory(self, query: str, user_id: str = "user"):
         """Extract and save new memories from user interaction using Responses API"""
