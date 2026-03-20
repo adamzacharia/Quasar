@@ -1,155 +1,174 @@
 # Quasar
 
-![Python Version](https://img.shields.io/badge/python-3.9%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=streamlit&logoColor=white)
-![OpenAI](https://img.shields.io/badge/OpenAI-412991?logo=openai&logoColor=white)
+![Quasar UI](UI.png)
 
-<img width="1897" height="783" alt="image" src="https://github.com/user-attachments/assets/f38936a3-c8f2-4aad-a00a-145327aaf0bb" />
+Quasar is a full stack ALMA-focused research assistant. The current implementation combines a Next.js client, a FastAPI streaming API, and a tool-enabled agent runtime to support natural-language archive search, technical retrieval, literature lookup, remote FITS metadata inspection, and workflow-oriented analysis.
 
-## AI-Powered Radio Astronomy Data Discovery and Processing
+## Access
 
-Quasar is an intelligent assistant that bridges natural language queries with the National Radio Astronomy Observatory (NRAO) archives, enabling seamless discovery, calibration, and visualization of radio astronomy data.
+- Live application: [quasar-alpha.vercel.app](https://quasar-alpha.vercel.app/)
+- Repository: [adamzacharia/Quasar](https://github.com/adamzacharia/Quasar)
 
-## Features
+## Current Capabilities
 
-- **Natural Language Archive Search** - Query ALMA observations using standard English (powered by `alminer`)
-- **Literature Integration** - NASA ADS API for identifying related publications
-- **Technical RAG** - Intelligent Q&A based on the ALMA Proposer's Guide
-- **AI-Powered Workflow** - Interpret user intent and execute complex queries
+- Natural-language ALMA archive search by target, position, frequency, and metadata filters
+- NASA ADS literature search and paper retrieval
+- Retrieval over ALMA technical and policy documents
+- Personal document retrieval for authenticated users
+- ALMA DataLink file listing and remote FITS header inspection
+- CASA imaging and calibration script generation
+- Streamed task execution updates for complex multi-step queries
 
-## Prerequisites
+## Architecture
+
+```mermaid
+flowchart LR
+    U["User"]
+    FE["Next.js UI<br/>ui-pro/src"]
+    API["FastAPI SSE API<br/>ui-pro/api/main.py<br/>/api/chat and /api/chat/upload"]
+    AG["QuasarAgent<br/>core/agent.py"]
+    CTX["Context retrieval<br/>RAGService, MemoryService, mem0"]
+    CD["Complexity detection<br/>RLM detector"]
+    DIRECT["Direct tool loop<br/>Responses API"]
+    COND["Conductor path<br/>TaskDAG orchestration"]
+    SVC["Domain services<br/>search, ADS, DataLink, FITS, CASA, plotting"]
+    EXT["External systems<br/>ALMA archive, NASA ADS, Qdrant, Turso"]
+    SSE["SSE events<br/>token, status, tool, task"]
+
+    U --> FE --> API --> AG
+    AG --> CTX
+    AG --> CD
+    CD --> DIRECT
+    CD --> COND
+    DIRECT --> SVC
+    COND --> SVC
+    SVC --> EXT
+    AG --> SSE --> FE
+```
+
+## Repository Layout
+
+| Path | Purpose |
+|---|---|
+| `core/` | Agent runtime, orchestration, tool registry, RLM, and Conductor |
+| `services/` | Domain logic for search, retrieval, FITS processing, plotting, CASA, auth, and storage |
+| `integrations/` | External system adapters for ALMA, ADS, DataLink, TAP, CASA, and CARTA |
+| `ui-pro/src/` | Next.js frontend |
+| `ui-pro/api/` | FastAPI backend and SSE endpoints |
+| `tests/` | Integration, evaluation, and verification scripts |
+
+## Requirements
 
 - Python 3.9+
-- OpenAI API key
-- NASA ADS API key (optional)
+- Node.js and npm
+- `OPENAI_API_KEY`
 
+Optional configuration:
 
-## Installation
+- `NASA_ADS_API_KEY`
+- `QDRANT_URL`
+- `QDRANT_API_KEY`
+- `TURSO_DATABASE_URL`
+- `TURSO_AUTH_TOKEN`
+- `JWT_SECRET`
+- `NEXT_PUBLIC_API_URL`
 
-### 1. Clone and Setup
+## Configuration
+
+Create a repository root `.env` file before starting the backend.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | Primary model access for the agent runtime |
+| `NASA_ADS_API_KEY` | No | Literature search via NASA ADS |
+| `QDRANT_URL` | No | Persistent vector storage for RAG and memory |
+| `QDRANT_API_KEY` | No | Authentication for Qdrant Cloud |
+| `TURSO_DATABASE_URL` | No | Cloud SQL storage |
+| `TURSO_AUTH_TOKEN` | No | Authentication for Turso |
+| `JWT_SECRET` | No | JWT signing secret for authentication |
+| `NEXT_PUBLIC_API_URL` | No | Frontend API base URL override |
+
+## Local Development
+
+### 1. Clone the repository and install Python dependencies
+
 ```bash
-git clone https://github.com/yourusername/quasar.git
-cd quasar
-python -m venv venv
-source venv/bin/activate
-```
+git clone https://github.com/adamzacharia/Quasar.git
+cd Quasar
+python -m venv .venv
 
-### 2. Install Dependencies
-```bash
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# macOS or Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
-```
 
-### 3. Configure Environment
-```bash
+# macOS or Linux
 cp .env.example .env
-# Edit .env with your API keys
+
+# Windows PowerShell
+Copy-Item .env.example .env
 ```
 
-## Getting Started
+### 2. Start the backend
 
-### 1. Start the Backend API (Required for UI-Pro)
-The backend service powers the core Quasar agent operations and connects to the ALMA Science Archive.
+Run the FastAPI backend from the `ui-pro` directory:
+
 ```bash
-# From the root quasar directory
-conda activate quasar
-uvicorn ui-pro.api.main:app --reload --port 8000
+cd ui-pro
+uvicorn api.main:app --reload --port 8000
 ```
-*The backend will be available at `http://localhost:8000`*
 
-### 2. Start the Frontend (UI-Pro)
-The modern web interface provides a chat-like experience for interacting with the Quasar agent.
+The backend loads `.env` from the repository root and exposes SSE endpoints on `http://localhost:8000`.
+
+### 3. Start the frontend
+
+Open a second terminal and run:
+
 ```bash
-# In a new terminal, navigate to the ui-pro directory
 cd ui-pro
 npm install
 npm run dev
 ```
-*Navigate to `http://localhost:3000` in your web browser.*
 
-### Alternative: Streamlit Interface (Legacy)
+The frontend runs on `http://localhost:3000`. If `NEXT_PUBLIC_API_URL` is not set, it defaults to `http://localhost:8000`.
+
+### 4. Run the CLI
+
+From the repository root:
+
 ```bash
-streamlit run ui/app.py
-```
-*Navigate to `http://localhost:8501`*
-
-### Alternative: Python API
-```python
-from quasar import QuasarAgent
-
-agent = QuasarAgent()
-results = agent.search("Find ALMA observations of Sz65 in Band 6")
+python quasar.py cli
 ```
 
-## Usage Examples
+You can also run a single query from the command line:
 
-### Search for Observations
-```
-"Show me recent ALMA observations of Sz65"
-"Find ALMA data for Lupus I between 2020-2023"
-"Search for protoplanetary disks in Band 7"
+```bash
+python quasar.py query "Find ALMA observations of HL Tau in Band 6"
 ```
 
-## Architecture
+## Example Queries
 
-```
-quasar/
-├── core/           # Core agent logic and LLM integration
-├── integrations/   # External service connectors (ALminer, ADS)
-├── services/       # Business logic and data processing
-├── ui/            # Streamlit web interface
-├── utils/         # Helper functions and utilities
-└── config/        # Configuration management
-```
+- Find ALMA observations of HL Tau in Band 6.
+- List available data products for the best matching MOUS and inspect the FITS headers.
+- Search NASA ADS for recent ALMA papers on protoplanetary disks.
+- Generate a CASA imaging script for a calibrated measurement set.
 
-## Configuration
+## Verification
 
-### Environment Variables (.env)
-Create a `.env` file in the root directory:
+1. Check the backend health endpoint at `http://localhost:8000/health`.
+2. Open `http://localhost:3000`.
+3. Submit a sample ALMA query.
+4. Confirm that the UI receives streamed text, status updates, and task execution events.
 
-```ini
-# Core API Keys
-OPENAI_API_KEY=sk-...
+## Notes
 
-# Optional: For Literature Search
-NASA_ADS_API_KEY=...
-```
-
-### Settings
-Edit `config/settings.py` to customize query limits and default search parameters.
-
-## API Documentation
-
-### QuasarAgent
-The main agent class for orchestrating searches.
-
-```python
-agent = QuasarAgent(api_key="your-openai-key")
-results = agent.search("Find ALMA observations of Sz65", max_results=100)
-```
-
-## Troubleshooting Guide
-
-### Common Issues
-
-**ALminer Import Error**
-- Ensure `alminer` is installed: `pip install alminer`
-
-**OpenAI API Error**
-- Verify your API key in `.env`
-- Check your quota/billing status
+- The primary runtime surface is the Next.js frontend plus FastAPI backend under `ui-pro/`.
+- The repository contains broader astronomy modules, but the strongest supported workflow is ALMA archive search and analysis support.
+- The implementation reference is maintained in `QUASAR_SYSTEM_DOCUMENTATION.md`.
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Acknowledgements
-
-- National Radio Astronomy Observatory for archive access
-- OpenAI for GPT API
-- NASA ADS for literature database
-- The `alminer` team for their excellent ALMA archive wrapper
-
-## Contact
-
-For questions or support, please open an issue on GitHub.
+MIT License. See `LICENSE` for details.
