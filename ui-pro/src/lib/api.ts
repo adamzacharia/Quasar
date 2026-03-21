@@ -22,6 +22,22 @@ export interface StreamCallbacks {
     onError: (error: string) => void;
 }
 
+async function getErrorMessage(response: Response): Promise<string> {
+    const fallback = `API error: ${response.status}`;
+    const contentType = response.headers.get("content-type") || "";
+
+    try {
+        if (contentType.includes("application/json")) {
+            const payload = await response.json();
+            return payload.detail || payload.message || payload.error || fallback;
+        }
+        const text = (await response.text()).trim();
+        return text || fallback;
+    } catch {
+        return fallback;
+    }
+}
+
 export async function sendChatMessage(request: ChatRequest, callbacks: StreamCallbacks): Promise<void> {
     try {
         let response: Response;
@@ -46,7 +62,10 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             });
         }
 
-        if (!response.ok) { callbacks.onError(`API error: ${response.status}`); return; }
+        if (!response.ok) {
+            callbacks.onError(await getErrorMessage(response));
+            return;
+        }
         const reader = response.body?.getReader();
         if (!reader) { callbacks.onError("No response body"); return; }
         const decoder = new TextDecoder();
@@ -100,7 +119,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
         }
         callbacks.onComplete(fullText);
     } catch (error) {
-        callbacks.onError(error instanceof Error ? error.message : "Failed to connect to backend. Is the server running?");
+        callbacks.onError(error instanceof Error ? error.message : "Request failed.");
     }
 }
 
@@ -119,7 +138,7 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks): Pr
             body: form,
         });
 
-        if (!response.ok) { callbacks.onError(`API error: ${response.status}`); return; }
+        if (!response.ok) { callbacks.onError(await getErrorMessage(response)); return; }
         const reader = response.body?.getReader();
         if (!reader) { callbacks.onError("No response body"); return; }
         const decoder = new TextDecoder();
@@ -157,6 +176,6 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks): Pr
         }
         callbacks.onComplete(fullText);
     } catch (error) {
-        callbacks.onError(error instanceof Error ? error.message : "Failed to connect to backend for proposal review.");
+        callbacks.onError(error instanceof Error ? error.message : "Proposal review request failed.");
     }
 }

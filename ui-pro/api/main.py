@@ -26,7 +26,7 @@ if "cgi" not in sys.modules:
     _cgi_stub.parse_header = _parse_header
     sys.modules["cgi"] = _cgi_stub
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
@@ -157,10 +157,17 @@ class GoogleLoginRequest(BaseModel):
 
 # ── Auth Service Instance ──
 from services.auth import AuthService
+from services.provider_file_service import (
+    ProviderFileError,
+    ProviderFileService,
+    UploadedChatFile,
+)
+from core.llm_client import detect_provider
 auth_service = AuthService()
+provider_file_service = ProviderFileService()
 
-def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
     token = authorization.split(" ")[1]
     payload = auth_service.verify_token(token)
@@ -197,6 +204,438 @@ def get_agent():
 
 def get_agent_error():
     return _agent_error
+
+
+def _safe_authorization_header(authorization: Any) -> Optional[str]:
+    return authorization if isinstance(authorization, str) else None
+
+
+def _resolve_optional_user(authorization: Any) -> Optional[dict]:
+    auth_header = _safe_authorization_header(authorization)
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    try:
+        return auth_service.verify_token(auth_header.split(" ", 1)[1])
+    except Exception:
+        return None
+
+
+def _stream_headers() -> Dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+
+def _sse_status(step: str, state: str = "running") -> str:
+    return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
+
+
+def _sse_error_response(message: str) -> StreamingResponse:
+    async def generate():
+        yield f"data: {json.dumps({'type': 'error', 'content': message})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers=_stream_headers(),
+    )
+
+
+def _extract_document_preview_text(filename: str, content_type: str, raw: bytes) -> str:
+    """Best-effort text extraction used only when documents accompany images/FITS."""
+    import io
+
+    if content_type == "application/pdf":
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(raw))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            return f"\n\n### Attached PDF: {filename}\n{text[:8000]}"
+        except ImportError:
+            return f"\n\n[PDF: {filename} - install pypdf to extract text]"
+        except Exception as e:
+            return f"\n\n[PDF: {filename} - extraction failed: {e}]"
+
+    if content_type in ("text/plain", "text/csv", "text/markdown", "application/json") or \
+       any((filename or "").lower().endswith(ext) for ext in [".csv", ".txt", ".md", ".json", ".tsv"]):
+        try:
+            text = raw.decode("utf-8", errors="replace")[:8000]
+            return f"\n\n### Attached file: {filename}\n```\n{text}\n```"
+        except Exception:
+            return f"\n\n[Binary file: {filename} ({len(raw)/1024:.1f} KB)]"
+
+    return f"\n\n[Attached file: {filename} ({len(raw)/1024:.1f} KB)]"
+
+
+def _stream_chat_response(
+    request: ChatRequest,
+    authorization: Optional[str] = None,
+    attachment_context: Optional[Dict[str, Any]] = None,
+) -> StreamingResponse:
+    """Shared SSE chat pipeline used by both /api/chat and /api/chat/upload."""
+    agent = get_agent()
+    auth_header = _safe_authorization_header(authorization)
+    current_user = _resolve_optional_user(auth_header)
+
+    requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or "gpt-4o"
+    provider = detect_provider(requested_model)
+    current_user_id = current_user.get("sub") if current_user else None
+
+    if attachment_context is None and provider in {"openai", "anthropic", "google"}:
+        attachment_context = provider_file_service.get_active_files(
+            provider=provider,
+            conversation_id=request.conversation_id,
+            user_id=current_user_id,
+        )
+    attachment_context = attachment_context or {}
+    active_attachments = attachment_context.get("attachments") or []
+
+    async def generate():
+        if agent is None:
+            err = get_agent_error() or "Unknown initialization error"
+            mock_response = (
+                "Backend initialization failed.\n\n"
+                "QuasarAgent could not be loaded. Python traceback:\n\n"
+                f"```python\n{err}\n```\n"
+            )
+            for chunk in mock_response.split("\n"):
+                data = json.dumps({"type": "token", "content": chunk + "\n"})
+                yield f"data: {data}\n\n"
+                await asyncio.sleep(0.02)
+            yield "data: [DONE]\n\n"
+            return
+
+        for note in attachment_context.get("messages", []):
+            yield _sse_status(note, "completed")
+
+        # Personal RAG retrieval for authenticated users only.
+        enriched_message = request.message
+        if current_user:
+            user_id = current_user.get("sub")
+            if user_id:
+                try:
+                    yield _sse_status("Searching personal knowledge base", "running")
+                    loop2 = asyncio.get_event_loop()
+
+                    def _rag_search():
+                        from services.rag_service import RAGService
+
+                        svc = RAGService(user_id=user_id)
+                        return svc.search(request.message, k=4, include_personal=True)
+
+                    rag_docs = await loop2.run_in_executor(_executor, _rag_search)
+                    if rag_docs:
+                        ctx_lines = []
+                        for d in rag_docs:
+                            src = d.metadata.get("source_file", "personal doc")
+                            ctx_lines.append(f"[From: {src}]\n{d.page_content.strip()}")
+                        context_block = "\n\n---\n".join(ctx_lines)
+                        enriched_message = (
+                            "The user has the following relevant documents in their personal "
+                            f"knowledge base:\n\n{context_block}\n\n---\nUser's question: {request.message}"
+                        )
+                    yield _sse_status("Searching personal knowledge base", "completed")
+                except Exception as e:
+                    print(f"[WARN] Personal RAG search failed: {e}")
+                    yield _sse_status("Searching personal knowledge base", "completed")
+
+        effective_request = ChatRequest(
+            message=enriched_message,
+            conversation_id=request.conversation_id,
+            model=requested_model,
+        )
+
+        if requested_model != agent.config.model:
+            agent.set_model(requested_model)
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            yield _sse_status("Analyzing prompt complexity", "running")
+            await asyncio.sleep(0.05)
+            yield _sse_status("Analyzing prompt complexity", "completed")
+
+            repl_context_threshold = 80_000
+            if len(enriched_message) > repl_context_threshold:
+                print(
+                    f"[INFO] Message size {len(enriched_message):,} chars > "
+                    f"{repl_context_threshold:,} threshold -> RLM REPL"
+                )
+                yield _sse_status("Launching RLM REPL (beyond-context mode)", "running")
+                await asyncio.sleep(0.05)
+                yield _sse_status("Launching RLM REPL (beyond-context mode)", "completed")
+
+                repl_queue = asyncio.Queue()
+
+                def repl_status(step: str, state: str):
+                    asyncio.run_coroutine_threadsafe(repl_queue.put(("status", step, state)), loop)
+
+                def repl_token(tok: str):
+                    if tok:
+                        asyncio.run_coroutine_threadsafe(repl_queue.put(("token", tok)), loop)
+
+                def _run_repl():
+                    try:
+                        res = agent.rlm.execute(
+                            request.message,
+                            context=enriched_message,
+                            use_repl=True,
+                            status_callback=repl_status,
+                            on_token=repl_token,
+                        )
+                        asyncio.run_coroutine_threadsafe(repl_queue.put(("done", res)), loop)
+                    except Exception as e:
+                        print(f"[RLM REPL error] {e}")
+                        asyncio.run_coroutine_threadsafe(repl_queue.put(("error", str(e))), loop)
+
+                loop.run_in_executor(_executor, _run_repl)
+
+                response_text = ""
+                has_repl_tokens = False
+                while True:
+                    msg = await repl_queue.get()
+                    msg_type = msg[0]
+                    if msg_type == "done":
+                        response_text = msg[1]
+                        if not has_repl_tokens and response_text:
+                            data = json.dumps({"type": "token", "content": response_text})
+                            yield f"data: {data}\n\n"
+                        break
+                    if msg_type == "error":
+                        response_text = f"RLM REPL error: {msg[1]}"
+                        data = json.dumps({"type": "token", "content": response_text})
+                        yield f"data: {data}\n\n"
+                        break
+                    if msg_type == "status":
+                        yield _sse_status(msg[1], msg[2])
+                    elif msg_type == "token":
+                        has_repl_tokens = True
+                        data = json.dumps({"type": "token", "content": msg[1]})
+                        yield f"data: {data}\n\n"
+
+                agent.memory.add_message("user", request.message)
+                agent.memory.add_message("assistant", response_text)
+                agent.last_run_result = None
+                yield "data: [DONE]\n\n"
+                return
+
+            print("[INFO] Routing query to standard Response API (tool-calling loop)")
+            yield _sse_status("Routing to standard agent", "running")
+            await asyncio.sleep(0.05)
+            yield _sse_status("Routing to standard agent", "completed")
+
+            model_name = requested_model or getattr(agent.config, "model", "gpt-4o")
+            yield _sse_status(f"Calling {model_name}", "running")
+
+            queue = asyncio.Queue()
+
+            def on_token(token: str):
+                if token:
+                    asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+
+            def _run_agent():
+                try:
+                    effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
+
+                    def _on_status(step: str, state: str):
+                        asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
+
+                    res = agent.stream_response_api(
+                        effective_request.message,
+                        message_placeholder=None,
+                        user_id=effective_user_id,
+                        on_token=on_token,
+                        on_status=_on_status,
+                        attachments=active_attachments,
+                    )
+                    asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                except Exception as e:
+                    print(f"Agent error: {e}")
+                    asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+
+            loop.run_in_executor(_executor, _run_agent)
+
+            yield _sse_status(f"Calling {model_name}", "completed")
+
+            first_token = True
+            response_text = ""
+
+            while True:
+                msg = await queue.get()
+                if isinstance(msg, tuple) and len(msg) == 3:
+                    msg_type, step, state = msg
+                    if msg_type == "status":
+                        if isinstance(step, str) and step.startswith("__event__"):
+                            try:
+                                event_json = step[len("__event__"):]
+                                yield f"data: {event_json}\n\n"
+                            except Exception:
+                                yield _sse_status(step, state)
+                        else:
+                            yield _sse_status(step, state)
+                        continue
+
+                msg_type, payload = msg[0], msg[1]
+                if msg_type == "done":
+                    response_text = payload
+                    break
+                if msg_type == "error":
+                    response_text = f"An error occurred: {payload}"
+                    break
+                if msg_type == "token":
+                    if first_token:
+                        yield _sse_status("Generating response", "completed")
+                        first_token = False
+                    data = json.dumps({"type": "token", "content": payload})
+                    yield f"data: {data}\n\n"
+
+            last_run_result = getattr(agent, "last_run_result", None)
+            if last_run_result:
+                result_type = last_run_result.get("type", "")
+                tool_name_raw = last_run_result.get("tool_name") or (
+                    "search_papers" if result_type == "papers" else
+                    "search_alma_archive" if result_type == "data" else
+                    "quasar_tool"
+                )
+                tool_display = tool_name_raw.replace("_", " ").title()
+                tool_event = json.dumps({
+                    "type": "tool_call",
+                    "name": tool_name_raw,
+                    "displayName": tool_display,
+                    "status": "completed",
+                    "input": last_run_result.get("params", {}),
+                    "output": "Found results",
+                })
+                yield f"data: {tool_event}\n\n"
+                await asyncio.sleep(0.05)
+
+                if result_type == "data":
+                    df = last_run_result.get("data")
+                    if df is not None and hasattr(df, "to_dict"):
+                        try:
+                            import math
+                            import pandas as pd
+
+                            alma_display_cols = [
+                                ("project_code", "Project"),
+                                ("target_name", "Target"),
+                                ("band_list", "Band"),
+                                ("frequency", "Freq (GHz)"),
+                                ("min_frequency", "Min Freq (GHz)"),
+                                ("max_frequency", "Max Freq (GHz)"),
+                                ("spatial_resolution", "Res (arcsec)"),
+                                ("s_resolution", "Res (arcsec)"),
+                                ("t_exptime", "Exp (s)"),
+                                ("pi_name", "PI"),
+                                ("obs_release_date", "Release"),
+                                ("member_ous_uid", "MOUS ID"),
+                            ]
+                            seen_display = set()
+                            sel_cols, display_cols = [], []
+                            for raw, nice in alma_display_cols:
+                                if raw in df.columns and nice not in seen_display:
+                                    sel_cols.append(raw)
+                                    display_cols.append(nice)
+                                    seen_display.add(nice)
+
+                            if not sel_cols:
+                                sel_cols = list(df.columns[:8])
+                                display_cols = sel_cols
+
+                            sub = df[sel_cols].head(50).copy()
+                            sub.columns = display_cols
+
+                            per_row_links = []
+                            if "access_url" in df.columns:
+                                per_row_links = df["access_url"].head(50).fillna("").tolist()
+                            elif "member_ous_uid" in df.columns:
+                                per_row_links = [
+                                    f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
+                                    if pd.notna(v) and str(v).strip() else ""
+                                    for v in df["member_ous_uid"].head(50)
+                                ]
+
+                            def _fmt(v):
+                                if v is None or (isinstance(v, float) and math.isnan(v)):
+                                    return ""
+                                if isinstance(v, float):
+                                    return f"{v:.3f}".rstrip("0").rstrip(".")
+                                return str(v)[:60]
+
+                            for col in sub.columns:
+                                sub[col] = sub[col].map(_fmt)
+
+                            rows = sub.to_dict("records")
+                            for i, link in enumerate(per_row_links):
+                                if link and i < len(rows):
+                                    rows[i]["_link"] = link
+
+                            metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
+                            if "band_list" in df.columns:
+                                metrics.append({
+                                    "label": "Bands",
+                                    "value": int(df["band_list"].astype(str).nunique()),
+                                    "color": "purple",
+                                })
+
+                            archive_link = ""
+                            if "access_url" in df.columns and not df["access_url"].isna().all():
+                                archive_link = str(df["access_url"].dropna().iloc[0])
+                            elif "member_ous_uid" in df.columns:
+                                mous = next((str(v) for v in df["member_ous_uid"] if pd.notna(v) and str(v).strip()), "")
+                                if mous:
+                                    archive_link = f"https://almascience.nrao.edu/aq/?member_ous_id={mous}"
+
+                            table_event = json.dumps({
+                                "type": "data",
+                                "metrics": metrics,
+                                "columns": list(sub.columns),
+                                "rows": rows,
+                                "sourceName": last_run_result.get("filter_label")
+                                or last_run_result.get("source", "ALMA Archive"),
+                                "archiveLink": archive_link,
+                                "hasRowLinks": any(bool(r.get("_link")) for r in rows),
+                            })
+                            yield f"data: {table_event}\n\n"
+                            await asyncio.sleep(0.05)
+                        except Exception as e:
+                            print(f"[WARN] Could not serialize data table for UI: {e}")
+
+                elif result_type == "papers":
+                    papers = last_run_result.get("papers", [])
+                    if papers:
+                        papers_event = json.dumps({"type": "papers", "papers": papers})
+                        yield f"data: {papers_event}\n\n"
+                        await asyncio.sleep(0.05)
+
+                elif result_type == "notebook":
+                    nb = last_run_result.get("notebook", {})
+                    if nb:
+                        notebook_event = json.dumps({"type": "notebook", **nb})
+                        yield f"data: {notebook_event}\n\n"
+                        await asyncio.sleep(0.05)
+
+            if response_text and first_token:
+                data = json.dumps({"type": "token", "content": response_text})
+                yield f"data: {data}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            print(f"Chat route error: {e}")
+            error_data = json.dumps({"type": "error", "content": str(e)})
+            yield f"data: {error_data}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers=_stream_headers(),
+    )
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -439,13 +878,14 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest, authorization: str = Header(None)):
-    """Stream a chat response via SSE using the real QuasarAgent."""
+async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
+    """Stream a chat response via SSE using the shared chat pipeline."""
+    return _stream_chat_response(request, authorization=authorization)
     agent = get_agent()
 
     # ── Resolve user from optional token (for personal RAG) ──
     _current_user = None
-    if authorization and authorization.startswith("Bearer "):
+    if isinstance(authorization, str) and authorization.startswith("Bearer "):
         try:
             _current_user = auth_service.verify_token(authorization.split(" ")[1])
         except Exception:
@@ -879,8 +1319,144 @@ async def chat_with_files(
     conversation_id: Optional[str] = Form(None),
     model: Optional[str] = Form("gpt-4o"),
     files: PyList[UploadFile] = File(default=[]),
+    authorization: Optional[str] = Header(None),
 ):
     """Stream a chat response with attached files (images/documents) via SSE."""
+    auth_header = _safe_authorization_header(authorization)
+    current_user = _resolve_optional_user(auth_header)
+    user_id = current_user.get("sub") if current_user else None
+    selected_model = model or "gpt-4o"
+    provider = detect_provider(selected_model)
+
+    import base64
+
+    logger.info(f"[UPLOAD] Received {len(files)} file(s), message={message[:80]!r}")
+
+    image_contents = []
+    enriched_text = message.strip()
+    document_uploads: PyList[UploadedChatFile] = []
+    mixed_document_previews: PyList[str] = []
+
+    for f in files:
+        filename = f.filename or "upload"
+        content_type = (f.content_type or "").lower()
+        raw = await f.read()
+
+        if content_type.startswith("image/"):
+            b64 = base64.b64encode(raw).decode("utf-8")
+            image_contents.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{content_type};base64,{b64}", "detail": "auto"},
+            })
+            continue
+
+        if filename.lower().endswith(".fits") or filename.lower().endswith(".fit"):
+            try:
+                from services.fits_processing import FITSProcessingService
+
+                metadata = FITSProcessingService.extract_metadata(raw)
+                header_str = "\n".join([f"{k}: {v}" for k, v in metadata.items() if k != "error"])
+                err = metadata.get("error", "")
+
+                if hdrs := header_str.strip():
+                    enriched_text += (
+                        f"\n\n### Attached FITS: {filename}\n**Header Metadata:**\n"
+                        f"```yaml\n{hdrs}\n```\n"
+                    )
+                if err:
+                    enriched_text += f"\n[FITS Metadata Error: {err}]"
+
+                b64_img = FITSProcessingService.generate_preview(raw)
+                if b64_img:
+                    image_contents.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_img}", "detail": "high"},
+                    })
+                    enriched_text += (
+                        "*(A 2D visual representation of this FITS file has been attached "
+                        "as an image for analysis.)*\n"
+                    )
+                else:
+                    enriched_text += "*(Could not generate a 2D preview image for this FITS data.)*\n"
+            except Exception as e:
+                enriched_text += f"\n\n[FITS: {filename} - extraction failed: {e}]"
+            continue
+
+        document_uploads.append(
+            UploadedChatFile(
+                filename=filename,
+                mime_type=content_type or "application/octet-stream",
+                data=raw,
+            )
+        )
+        mixed_document_previews.append(_extract_document_preview_text(filename, content_type, raw))
+
+    if image_contents:
+        import openai as _openai
+
+        if mixed_document_previews:
+            enriched_text += "".join(preview for preview in mixed_document_previews if preview)
+
+        client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        content_parts = []
+        if enriched_text:
+            content_parts.append({"type": "text", "text": enriched_text})
+        content_parts.extend(image_contents)
+
+        async def vision_stream():
+            try:
+                yield _sse_status("Analyzing image with vision model", "running")
+                loop = asyncio.get_event_loop()
+
+                def _call():
+                    return client.chat.completions.create(
+                        model=selected_model,
+                        messages=[{"role": "user", "content": content_parts}],
+                        stream=True,
+                        max_tokens=1024,
+                    )
+
+                stream = await loop.run_in_executor(_executor, _call)
+                yield _sse_status("Analyzing image with vision model", "completed")
+
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if delta:
+                        data = json.dumps({"type": "token", "content": delta})
+                        yield f"data: {data}\n\n"
+
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                err = json.dumps({"type": "error", "content": str(e)})
+                yield f"data: {err}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            vision_stream(),
+            media_type="text/event-stream",
+            headers=_stream_headers(),
+        )
+
+    attachment_context = None
+    if document_uploads:
+        try:
+            attachment_context = provider_file_service.prepare_files(
+                provider=provider,
+                model=selected_model,
+                files=document_uploads,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+        except ProviderFileError as exc:
+            return _sse_error_response(str(exc))
+
+    req = ChatRequest(
+        message=message.strip() or message,
+        conversation_id=conversation_id,
+        model=selected_model,
+    )
+    return _stream_chat_response(req, authorization=auth_header, attachment_context=attachment_context)
+
     import base64, io
     logger.info(f"[UPLOAD] Received {len(files)} file(s), message={message[:80]!r}")
 
@@ -998,7 +1574,7 @@ async def chat_with_files(
 
     # ── No images — delegate to regular chat endpoint ────────────────────────
     req = ChatRequest(message=enriched_text or message, conversation_id=conversation_id, model=model)
-    return await chat(req)
+    return _stream_chat_response(req, authorization=authorization)
 
 
 # ── Personalization Endpoints ────────────────────────────────────────────────

@@ -56,7 +56,9 @@ export function ChatArea() {
         }
 
         // Build display content for the user message
-        const displayContent = text.trim() || (attachments && attachments.length > 0 ? `📎 ${attachments.map(a => a.file.name).join(", ")}` : "");
+        const displayContent = text.trim() || (attachments && attachments.length > 0
+            ? `Attached files: ${attachments.map(a => a.file.name).join(", ")}`
+            : "");
         const imageAttachments = attachments?.filter(a => a.type === "image") || [];
 
         const userMsg: Message = {
@@ -198,17 +200,34 @@ export function ChatArea() {
                         },
                         onError: (error: string) => {
                             attachThinkingToLastMessage();
-                            updateLastAssistantMessage(`Error: ${error}\n\nPlease ensure the backend is running.`);
+                            updateLastAssistantMessage(`Error: ${error}`);
                             setStreaming(false);
                         },
                     }
                 );
             } // end if-else
         } catch (err) {
-            updateLastAssistantMessage(`Connection failed. Is the backend running?\n\nStart it with:\n\`\`\`bash\ncd Quasar-main\nuvicorn api.main:app --reload --port 8000\n\`\`\``);
+            const message = err instanceof Error ? err.message : "Request failed.";
+            updateLastAssistantMessage(`Error: ${message}`);
             setStreaming(false);
         }
-    }, [addMessage, updateLastAssistantMessage, setStreaming, isStreaming, activeConversationId, setActiveConversation, selectedModel, addThinkingStep, clearThinking, attachThinkingToLastMessage, tokenRef]);
+    }, [
+        addMessage,
+        updateLastAssistantMessage,
+        setStreaming,
+        isStreaming,
+        activeConversationId,
+        setActiveConversation,
+        selectedModel,
+        addThinkingStep,
+        clearThinking,
+        attachThinkingToLastMessage,
+        clearTaskExecution,
+        handleTaskGroup,
+        handleTaskUpdate,
+        handleTaskList,
+        tokenRef,
+    ]);
 
     const handleSuggestionClick = (prompt: string) => { setInputValue(prompt); handleSend(prompt); };
     const hasMessages = messages.length > 0;

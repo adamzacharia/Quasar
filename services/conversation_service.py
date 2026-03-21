@@ -71,6 +71,33 @@ class ConversationService:
             CREATE INDEX IF NOT EXISTS idx_msg_conv 
             ON messages(conversation_id, created_at)
         ''')
+
+        # Conversation-scoped provider file references for document reuse.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversation_file_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model_family TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                provider_file_id TEXT,
+                provider_file_name TEXT,
+                provider_file_uri TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_file_unique
+            ON conversation_file_refs(user_id, conversation_id, provider, content_hash)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_conv_file_lookup
+            ON conversation_file_refs(user_id, conversation_id, provider, updated_at DESC)
+        ''')
         
         conn.commit()
         conn.close()
@@ -307,6 +334,7 @@ class ConversationService:
         
         cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
         cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
+        cursor.execute('DELETE FROM conversation_file_refs WHERE conversation_id = ?', (conversation_id,))
         
         conn.commit()
         conn.close()
@@ -319,3 +347,179 @@ class ConversationService:
             return conversations[0]["id"]
         else:
             return self.create_conversation(user_id)
+
+    def save_conversation_file_ref(
+        self,
+        user_id: str,
+        conversation_id: str,
+        provider: str,
+        model_family: str,
+        filename: str,
+        mime_type: str,
+        content_hash: str,
+        provider_file_id: Optional[str] = None,
+        provider_file_name: Optional[str] = None,
+        provider_file_uri: Optional[str] = None,
+    ) -> Dict:
+        """Insert or update a provider file reference for a conversation."""
+        now = datetime.now().isoformat()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            SELECT id FROM conversation_file_refs
+            WHERE user_id = ? AND conversation_id = ? AND provider = ? AND content_hash = ?
+            ''',
+            (user_id, conversation_id, provider, content_hash),
+        )
+        row = cursor.fetchone()
+
+        if row:
+            ref_id = row[0]
+            cursor.execute(
+                '''
+                UPDATE conversation_file_refs
+                SET model_family = ?, filename = ?, mime_type = ?, provider_file_id = ?,
+                    provider_file_name = ?, provider_file_uri = ?, updated_at = ?
+                WHERE id = ?
+                ''',
+                (
+                    model_family,
+                    filename,
+                    mime_type,
+                    provider_file_id,
+                    provider_file_name,
+                    provider_file_uri,
+                    now,
+                    ref_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                '''
+                INSERT INTO conversation_file_refs (
+                    user_id, conversation_id, provider, model_family, filename, mime_type,
+                    content_hash, provider_file_id, provider_file_name, provider_file_uri,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    user_id,
+                    conversation_id,
+                    provider,
+                    model_family,
+                    filename,
+                    mime_type,
+                    content_hash,
+                    provider_file_id,
+                    provider_file_name,
+                    provider_file_uri,
+                    now,
+                    now,
+                ),
+            )
+            ref_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "id": ref_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "provider": provider,
+            "model_family": model_family,
+            "filename": filename,
+            "mime_type": mime_type,
+            "content_hash": content_hash,
+            "provider_file_id": provider_file_id,
+            "provider_file_name": provider_file_name,
+            "provider_file_uri": provider_file_uri,
+            "updated_at": now,
+        }
+
+    def list_conversation_file_refs(
+        self,
+        user_id: str,
+        conversation_id: str,
+        provider: Optional[str] = None,
+    ) -> List[Dict]:
+        """List stored provider file references for a user conversation."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if provider:
+            cursor.execute(
+                '''
+                SELECT provider, model_family, filename, mime_type, content_hash,
+                       provider_file_id, provider_file_name, provider_file_uri,
+                       created_at, updated_at
+                FROM conversation_file_refs
+                WHERE user_id = ? AND conversation_id = ? AND provider = ?
+                ORDER BY updated_at ASC, id ASC
+                ''',
+                (user_id, conversation_id, provider),
+            )
+        else:
+            cursor.execute(
+                '''
+                SELECT provider, model_family, filename, mime_type, content_hash,
+                       provider_file_id, provider_file_name, provider_file_uri,
+                       created_at, updated_at
+                FROM conversation_file_refs
+                WHERE user_id = ? AND conversation_id = ?
+                ORDER BY updated_at ASC, id ASC
+                ''',
+                (user_id, conversation_id),
+            )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        refs = []
+        for row in rows:
+            refs.append({
+                "provider": row[0],
+                "model_family": row[1],
+                "filename": row[2],
+                "mime_type": row[3],
+                "content_hash": row[4],
+                "provider_file_id": row[5],
+                "provider_file_name": row[6],
+                "provider_file_uri": row[7],
+                "created_at": row[8],
+                "updated_at": row[9],
+            })
+        return refs
+
+    def clear_conversation_file_refs(
+        self,
+        user_id: str,
+        conversation_id: str,
+        provider: Optional[str] = None,
+    ):
+        """Delete stored provider file references for a user conversation."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if provider:
+            cursor.execute(
+                '''
+                DELETE FROM conversation_file_refs
+                WHERE user_id = ? AND conversation_id = ? AND provider = ?
+                ''',
+                (user_id, conversation_id, provider),
+            )
+        else:
+            cursor.execute(
+                '''
+                DELETE FROM conversation_file_refs
+                WHERE user_id = ? AND conversation_id = ?
+                ''',
+                (user_id, conversation_id),
+            )
+
+        conn.commit()
+        conn.close()

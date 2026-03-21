@@ -157,18 +157,23 @@ class ResponsesShim:
         model = kwargs.get("model", self._llm.default_model)
         provider = detect_provider(model)
         stream = kwargs.get("stream", False)
+        attachments = kwargs.pop("attachments", None)
 
         if provider == "openai":
-            return self._call_openai(kwargs)
+            return self._call_openai(kwargs, attachments=attachments)
         elif provider == "anthropic":
             if stream:
-                return self._stream_anthropic(kwargs)
-            return self._call_anthropic(kwargs)
+                return self._stream_anthropic(kwargs, attachments=attachments)
+            return self._call_anthropic(kwargs, attachments=attachments)
         elif provider == "google":
             if stream:
-                return self._stream_google(kwargs)
-            return self._call_google(kwargs)
+                return self._stream_google(kwargs, attachments=attachments)
+            return self._call_google(kwargs, attachments=attachments)
         elif provider == "local":
+            if attachments:
+                raise ValueError(
+                    "Document attachments are not supported for local models in this path."
+                )
             if stream:
                 return self._stream_local(kwargs)
             return self._call_local(kwargs)
@@ -177,14 +182,48 @@ class ResponsesShim:
 
     # ── OpenAI (passthrough — native Responses API) ──────────────────────
 
-    def _call_openai(self, kwargs: dict) -> Any:
+    def _call_openai(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
         """Direct passthrough to OpenAI Responses API."""
         client = self._llm._get_openai_client()
+        if attachments:
+            kwargs = dict(kwargs)
+            kwargs["input"] = self._build_openai_input(kwargs.get("input", ""), attachments)
         return client.responses.create(**kwargs)
+
+    def _build_openai_input(
+        self,
+        input_data,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """Build a Responses API input payload with native input_file items."""
+        if isinstance(input_data, list):
+            return input_data
+
+        content = []
+        prompt_text = input_data if isinstance(input_data, str) else json.dumps(input_data, default=str)
+        if prompt_text:
+            content.append({"type": "input_text", "text": prompt_text})
+
+        for attachment in attachments or []:
+            if attachment.get("kind") != "openai_input_file":
+                continue
+            file_id = attachment.get("file_id")
+            if not file_id:
+                raise ValueError("OpenAI attachment is missing file_id.")
+            content.append({"type": "input_file", "file_id": file_id})
+
+        if not content:
+            content.append({"type": "input_text", "text": ""})
+
+        return [{"role": "user", "content": content}]
 
     # ── Anthropic (Claude) ───────────────────────────────────────────────
 
-    def _call_anthropic(self, kwargs: dict) -> LLMResponse:
+    def _call_anthropic(
+        self,
+        kwargs: dict,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> LLMResponse:
         """Translate responses.create() to Anthropic Messages API."""
         client = self._llm._get_anthropic_client()
         model = kwargs.get("model", self._llm.default_model)
@@ -201,7 +240,7 @@ class ResponsesShim:
                 json_mode = True
 
         # Build messages
-        messages = self._build_anthropic_messages(input_data)
+        messages = self._build_anthropic_messages(input_data, attachments=attachments)
 
         # Translate tool schemas
         anthropic_tools = None
@@ -229,7 +268,11 @@ class ResponsesShim:
         # Convert to LLMResponse
         return self._anthropic_to_llm_response(resp)
 
-    def _stream_anthropic(self, kwargs: dict):
+    def _stream_anthropic(
+        self,
+        kwargs: dict,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ):
         """Streaming Anthropic call — returns an iterator of StreamEvents."""
         client = self._llm._get_anthropic_client()
         model = kwargs.get("model", self._llm.default_model)
@@ -239,7 +282,7 @@ class ResponsesShim:
         max_tokens = kwargs.get("max_output_tokens", 2000)
         tools_raw = kwargs.get("tools", None)
 
-        messages = self._build_anthropic_messages(input_data)
+        messages = self._build_anthropic_messages(input_data, attachments=attachments)
         anthropic_tools = self._translate_tools_for_anthropic(tools_raw) if tools_raw else None
 
         call_kwargs = {
@@ -308,9 +351,30 @@ class ResponsesShim:
                                     item=fc,
                                 )
 
-    def _build_anthropic_messages(self, input_data) -> list:
+    def _build_anthropic_messages(self, input_data, attachments: Optional[List[Dict[str, Any]]] = None) -> list:
         """Convert responses.create() input to Anthropic messages format."""
         if isinstance(input_data, str):
+            if attachments:
+                content_blocks = []
+                for attachment in attachments:
+                    if attachment.get("kind") != "anthropic_document_file":
+                        continue
+                    file_id = attachment.get("file_id")
+                    if not file_id:
+                        raise ValueError("Anthropic attachment is missing file_id.")
+                    content_blocks.append({
+                        "type": "document",
+                        "title": attachment.get("filename") or "Attached document",
+                        "source": {
+                            "type": "file",
+                            "file_id": file_id,
+                        },
+                    })
+                if input_data:
+                    content_blocks.append({"type": "text", "text": input_data})
+                if not content_blocks:
+                    content_blocks.append({"type": "text", "text": input_data or ""})
+                return [{"role": "user", "content": content_blocks}]
             return [{"role": "user", "content": input_data}]
         elif isinstance(input_data, list):
             # Tool results format: [{"type": "function_call_output", "call_id": ..., "output": ...}]
@@ -367,7 +431,11 @@ class ResponsesShim:
 
     # ── Google Gemini ────────────────────────────────────────────────────
 
-    def _call_google(self, kwargs: dict) -> LLMResponse:
+    def _call_google(
+        self,
+        kwargs: dict,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> LLMResponse:
         """Translate responses.create() to Google GenAI API."""
         client = self._llm._get_google_client()
         model = kwargs.get("model", self._llm.default_model)
@@ -403,7 +471,7 @@ class ResponsesShim:
 
         call_kwargs = {
             "model": model,
-            "contents": full_prompt,
+            "contents": self._build_google_contents(full_prompt, attachments=attachments),
             "config": gen_config,
         }
         if gemini_tools:
@@ -413,7 +481,11 @@ class ResponsesShim:
 
         return self._google_to_llm_response(resp)
 
-    def _stream_google(self, kwargs: dict):
+    def _stream_google(
+        self,
+        kwargs: dict,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ):
         """Streaming Google GenAI call — returns an iterator of StreamEvents."""
         client = self._llm._get_google_client()
         model = kwargs.get("model", self._llm.default_model)
@@ -434,7 +506,7 @@ class ResponsesShim:
         }
         call_kwargs = {
             "model": model,
-            "contents": full_prompt,
+            "contents": self._build_google_contents(full_prompt, attachments=attachments),
             "config": gen_config,
         }
         if gemini_tools:
@@ -508,6 +580,38 @@ class ResponsesShim:
             output_text=output_text,
             output=output_items or [MessageOutputItem(content=[TextContentItem(text=output_text)])],
         )
+
+    def _build_google_contents(
+        self,
+        prompt_text: str,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """Build Gemini contents with file_data parts for uploaded documents."""
+        if not attachments:
+            return prompt_text
+
+        parts = []
+        for attachment in attachments:
+            if attachment.get("kind") != "gemini_file":
+                continue
+            file_uri = attachment.get("file_uri")
+            mime_type = attachment.get("mime_type")
+            if not file_uri or not mime_type:
+                raise ValueError("Gemini attachment is missing file_uri or mime_type.")
+            parts.append({
+                "file_data": {
+                    "mime_type": mime_type,
+                    "file_uri": file_uri,
+                }
+            })
+
+        if prompt_text:
+            parts.append({"text": prompt_text})
+
+        if not parts:
+            return prompt_text
+
+        return [{"role": "user", "parts": parts}]
 
     # ── Local LLM (Ollama / LM Studio via OpenAI-compat API) ────────────
 

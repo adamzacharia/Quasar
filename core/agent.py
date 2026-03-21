@@ -2249,7 +2249,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     # RESPONSES API METHOD (New Architecture)
     # ═══════════════════════════════════════════════════════════════════════════════
     
-    def stream_response_api(self, query: str, message_placeholder=None, user_id: str = "user", on_token=None, on_status=None) -> str:
+    def stream_response_api(
+        self,
+        query: str,
+        message_placeholder=None,
+        user_id: str = "user",
+        on_token=None,
+        on_status=None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -2353,16 +2361,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             
             # 5. Call Responses API with manual streaming loop
             for _round in range(MAX_TOOL_ROUNDS):
-                response_stream = self.client.responses.create(
-                    model=self.config.model,
-                    input=full_input if _round == 0 else tool_results,
-                    instructions=self.system_prompt,
-                    previous_response_id=last_id,
-                    tools=tools,
-                    temperature=self.config.temperature,
-                    max_output_tokens=self.config.max_tokens,
-                    stream=True
-                )
+                request_kwargs = {
+                    "model": self.config.model,
+                    "input": full_input if _round == 0 else tool_results,
+                    "instructions": self.system_prompt,
+                    "previous_response_id": last_id,
+                    "tools": tools,
+                    "temperature": self.config.temperature,
+                    "max_output_tokens": self.config.max_tokens,
+                    "stream": True,
+                }
+                if _round == 0 and attachments:
+                    request_kwargs["attachments"] = attachments
+
+                response_stream = self.client.responses.create(**request_kwargs)
                 
                 function_calls = {} # call_id -> dict
                 item_id_to_call_id = {}  # item.id -> call_id mapping

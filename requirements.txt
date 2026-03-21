@@ -163,5 +163,6 @@ fastapi
 uvicorn
 python-multipart
 google-auth
+google-genai>=1.0.0
 PyJWT
 libsql-client
