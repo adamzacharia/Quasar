@@ -2272,6 +2272,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # 1. Retrieve RAG context (from ALMA Manual - ChromaDB)
         rag_context = ""
         try:
+            if on_status:
+                on_status("Searching ALMA Manuals & Documentation", "running")
             docs = self.rag_service.search(query)
             if docs:
                 context_pieces = []
@@ -2282,7 +2284,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     page = d.metadata.get("page", "?")
                     context_pieces.append(f"[Source: {src}, p.{page}]\n{d.page_content}")
                 rag_context = "\n\nRelevant Technical Context:\n" + "\n---\n".join(context_pieces)
+            if on_status:
+                on_status("Searching ALMA Manuals & Documentation", "completed")
         except Exception as e:
+            if on_status:
+                on_status("Searching ALMA Manuals & Documentation", "failed")
             print(f"[WARNING] RAG search failed: {e}")
         
         # 2. Retrieve long-term memories (from mem0) — only for authenticated users
