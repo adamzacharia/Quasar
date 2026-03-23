@@ -122,16 +122,6 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     {rows.length} row{rows.length !== 1 ? "s" : ""} · {columns.length} col{columns.length !== 1 ? "s" : ""}
                 </span>
                 <div className="flex gap-2 flex-wrap justify-end">
-                    {data.archiveLink && (
-                        <a
-                            href={data.archiveLink}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/10 rounded-lg transition-colors"
-                        >
-                            <ExternalLink className="w-3.5 h-3.5" />All on ALMA Archive
-                        </a>
-                    )}
                     <button
                         onClick={handleDownloadCSV}
                         className="flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-700 rounded-lg transition-colors"

@@ -89,7 +89,15 @@ export function PaperCard({ paper }: PaperCardProps) {
 
             {/* Footer with citations & external link */}
             <div className="mt-auto px-4 pb-4 pt-3 border-t border-slate-700/50 flex items-center justify-between text-xs">
-                <div className="flex items-center gap-1 text-slate-500"><Quote className="w-3.5 h-3.5" /><span>{paper.citationCount} Citations</span></div>
+                {paper.bibcode ? (
+                    <a href={`https://ui.adsabs.harvard.edu/abs/${encodeURIComponent(paper.bibcode)}/citations`}
+                       target="_blank" rel="noopener noreferrer"
+                       className="flex items-center gap-1 text-slate-500 hover:text-primary transition-colors">
+                        <Quote className="w-3.5 h-3.5" /><span>{paper.citationCount} Citations</span>
+                    </a>
+                ) : (
+                    <div className="flex items-center gap-1 text-slate-500"><Quote className="w-3.5 h-3.5" /><span>{paper.citationCount} Citations</span></div>
+                )}
                 {adsUrl ? (
                     <a href={adsUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-slate-400 hover:text-primary transition-colors">
                         <span className="text-[10px]">ADS</span>

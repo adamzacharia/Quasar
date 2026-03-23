@@ -439,6 +439,9 @@ def _stream_chat_response(
 
             def _run_agent():
                 try:
+                    # Clear stale results from previous conversations
+                    agent.last_run_result = None
+
                     effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
 
                     def _on_status(step: str, state: str):
@@ -1079,6 +1082,9 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                     
             def _run_agent():
                 try:
+                    # Clear stale results from previous conversations
+                    agent.last_run_result = None
+
                     # Use authenticated user_id for mem0 isolation.
                     # Anonymous users get a sentinel — no stored long-term memory.
                     _uid = (_current_user.get("sub") if _current_user else None) or "anonymous"
