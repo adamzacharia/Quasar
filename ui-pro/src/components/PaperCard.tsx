@@ -1,8 +1,9 @@
 "use client";
 
-import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Cpu } from "lucide-react";
+import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Bookmark } from "lucide-react";
 import { useState } from "react";
 import type { Paper } from "../lib/types";
+import { useChatStore } from "../lib/store";
 
 const TYPE_STYLES: Record<string, string> = {
     journal: "bg-emerald-500/10 text-emerald-400",
@@ -14,6 +15,8 @@ interface PaperCardProps { paper: Paper; }
 
 export function PaperCard({ paper }: PaperCardProps) {
     const [expanded, setExpanded] = useState(false);
+    const { savedPapers, savePaper, removePaper } = useChatStore();
+    const isSaved = savedPapers.some(p => p.id === paper.id);
     const typeLabel = paper.type === "journal" ? "Journal" : paper.type === "arxiv" ? "ArXiv" : "Radio";
 
     // Build ADS link from bibcode, fallback to DOI
@@ -24,6 +27,16 @@ export function PaperCard({ paper }: PaperCardProps) {
             : paper.arxivId
                 ? `https://arxiv.org/abs/${paper.arxivId}`
                 : null;
+
+    const handleToggleSave = (e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (isSaved) {
+            removePaper(paper.id);
+        } else {
+            savePaper(paper);
+        }
+    };
 
     return (
         <div className="bg-sidebar-dark rounded-2xl border border-slate-700/50 hover:border-emerald-500/50 transition-colors group flex flex-col justify-between h-full">
@@ -37,7 +50,20 @@ export function PaperCard({ paper }: PaperCardProps) {
             >
                 <div className="flex items-start justify-between">
                     <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${TYPE_STYLES[paper.type] || TYPE_STYLES.journal}`}>{typeLabel}</span>
-                    <span className="text-xs text-slate-400">{paper.year}</span>
+                    <div className="flex items-center gap-2">
+                        <span className="text-xs text-slate-400">{paper.year}</span>
+                        <button
+                            onClick={handleToggleSave}
+                            title={isSaved ? "Remove from Saved Papers" : "Save Paper"}
+                            className={`p-1 rounded-md transition-all ${
+                                isSaved
+                                    ? "text-yellow-500 hover:text-yellow-400 bg-yellow-500/10"
+                                    : "text-slate-500 hover:text-yellow-500 hover:bg-yellow-500/10 opacity-0 group-hover:opacity-100"
+                            }`}
+                        >
+                            <Bookmark className="w-3.5 h-3.5" fill={isSaved ? "currentColor" : "none"} />
+                        </button>
+                    </div>
                 </div>
                 <h4 className="text-sm font-bold text-white group-hover:text-primary transition-colors leading-snug">{paper.title}</h4>
                 <p className="text-xs text-slate-400 line-clamp-1">{paper.authors}</p>
@@ -76,3 +102,4 @@ export function PaperCard({ paper }: PaperCardProps) {
         </div>
     );
 }
+

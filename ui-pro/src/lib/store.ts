@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import type { Conversation, Message, TaskGroup, TaskItem, TaskChecklist } from "./types";
+import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist } from "./types";
 import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 
 interface ChatStore {
@@ -20,6 +20,7 @@ interface ChatStore {
     taskItems: Map<string, TaskItem>;
     taskChecklist: TaskChecklist | null;
     taskExecutionActive: boolean;
+    savedPapers: Paper[];
     setActiveConversation: (id: string | null) => void;
     addMessage: (message: Message) => void;
     updateLastAssistantMessage: (content: string) => void;
@@ -40,6 +41,8 @@ interface ChatStore {
     handleTaskUpdate: (update: Record<string, unknown>) => void;
     handleTaskList: (list: Record<string, unknown>) => void;
     clearTaskExecution: () => void;
+    savePaper: (paper: Paper) => void;
+    removePaper: (paperId: string) => void;
 }
 
 function generateId(): string {
@@ -71,6 +74,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     taskItems: new Map(),
     taskChecklist: null,
     taskExecutionActive: false,
+    savedPapers: [],
 
     setActiveConversation: (id) => set((state) => {
         if (state.activeConversationId && state.messages.length > 0) {
@@ -272,4 +276,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         taskChecklist: null,
         taskExecutionActive: false,
     }),
+
+    savePaper: (paper) => set((s) => {
+        if (s.savedPapers.some(p => p.id === paper.id)) return {};
+        return { savedPapers: [...s.savedPapers, paper] };
+    }),
+
+    removePaper: (paperId) => set((s) => ({
+        savedPapers: s.savedPapers.filter(p => p.id !== paperId),
+    })),
 }));

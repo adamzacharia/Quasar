@@ -176,19 +176,62 @@ function SettingsContent({ selectedModel, availableModels, onSelectModel }: {
    SAVED PAPERS PANEL CONTENT
    ──────────────────────────────────────────── */
 function SavedPapersContent() {
-    return (
-        <div className="p-5 space-y-4">
-            <p className="text-xs text-slate-500">Papers you bookmark during research sessions will appear here.</p>
+    const { savedPapers, removePaper } = useChatStore();
 
-            <div className="flex flex-col items-center justify-center py-12 text-center">
-                <div className="w-14 h-14 rounded-2xl bg-slate-800/80 flex items-center justify-center mb-4">
-                    <Bookmark className="w-7 h-7 text-slate-600" />
+    if (savedPapers.length === 0) {
+        return (
+            <div className="p-5 space-y-4">
+                <p className="text-xs text-slate-500">Papers you bookmark during research sessions will appear here.</p>
+
+                <div className="flex flex-col items-center justify-center py-12 text-center">
+                    <div className="w-14 h-14 rounded-2xl bg-slate-800/80 flex items-center justify-center mb-4">
+                        <Bookmark className="w-7 h-7 text-slate-600" />
+                    </div>
+                    <p className="text-sm text-slate-400 font-medium">No saved papers yet</p>
+                    <p className="text-xs text-slate-600 mt-1.5 max-w-[200px]">
+                        Search for papers using <span className="text-primary font-mono">@paper</span> in the chat, then bookmark the ones you want to save.
+                    </p>
                 </div>
-                <p className="text-sm text-slate-400 font-medium">No saved papers yet</p>
-                <p className="text-xs text-slate-600 mt-1.5 max-w-[200px]">
-                    Search for papers using <span className="text-primary font-mono">@paper</span> in the chat, then bookmark the ones you want to save.
-                </p>
             </div>
+        );
+    }
+
+    return (
+        <div className="p-4 space-y-2">
+            <p className="text-xs text-slate-500 px-1 mb-3">{savedPapers.length} saved paper{savedPapers.length !== 1 ? "s" : ""}</p>
+            {savedPapers.map((paper) => {
+                const adsUrl = paper.bibcode
+                    ? `https://ui.adsabs.harvard.edu/abs/${encodeURIComponent(paper.bibcode)}`
+                    : paper.doi ? `https://doi.org/${paper.doi}`
+                    : paper.arxivId ? `https://arxiv.org/abs/${paper.arxivId}`
+                    : null;
+                return (
+                    <div key={paper.id} className="bg-slate-800/50 rounded-xl p-3 space-y-1.5 group hover:bg-slate-800/80 transition-colors">
+                        <div className="flex items-start justify-between gap-2">
+                            {adsUrl ? (
+                                <a href={adsUrl} target="_blank" rel="noopener noreferrer"
+                                   className="text-xs font-semibold text-white hover:text-primary transition-colors leading-snug flex-1">
+                                    {paper.title}
+                                </a>
+                            ) : (
+                                <span className="text-xs font-semibold text-white leading-snug flex-1">{paper.title}</span>
+                            )}
+                            <button onClick={() => removePaper(paper.id)}
+                                    title="Remove from saved"
+                                    className="p-1 text-yellow-500 hover:text-red-400 transition-colors shrink-0 opacity-0 group-hover:opacity-100">
+                                <X className="w-3.5 h-3.5" />
+                            </button>
+                        </div>
+                        <p className="text-[10px] text-slate-400 line-clamp-1">{paper.authors} · {paper.year}</p>
+                        {adsUrl && (
+                            <a href={adsUrl} target="_blank" rel="noopener noreferrer"
+                               className="inline-flex items-center gap-1 text-[10px] text-slate-500 hover:text-primary transition-colors">
+                                <ExternalLink className="w-3 h-3" />Open in ADS
+                            </a>
+                        )}
+                    </div>
+                );
+            })}
         </div>
     );
 }
