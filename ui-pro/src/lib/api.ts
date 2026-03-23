@@ -91,14 +91,17 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onToken(parsed.content);
                         } else if (parsed.type === "status" && callbacks.onStatus) {
                             callbacks.onStatus(parsed.step, parsed.state);
-                        } else if (parsed.type === "tool_call" && callbacks.onToolCall) {
-                            callbacks.onToolCall(parsed.name || parsed.displayName, JSON.stringify(parsed.input || {}));
+                        } else if (parsed.type === "tool_call") {
+                            // Show as a thinking step, not a separate message bubble
+                            if (callbacks.onStatus) {
+                                callbacks.onStatus(parsed.displayName || parsed.name, parsed.status || "completed");
+                            }
                         } else if (parsed.type === "data" && callbacks.onData) {
-                            callbacks.onData(parsed.content);
+                            callbacks.onData(parsed);
                         } else if (parsed.type === "papers" && callbacks.onPapers) {
-                            callbacks.onPapers(parsed.content);
+                            callbacks.onPapers(parsed.papers);
                         } else if (parsed.type === "notebook" && callbacks.onNotebook) {
-                            callbacks.onNotebook(parsed.content);
+                            callbacks.onNotebook(parsed);
                         } else if (parsed.type === "task_group" && callbacks.onTaskGroup) {
                             callbacks.onTaskGroup(parsed);
                         } else if (parsed.type === "task_update" && callbacks.onTaskUpdate) {
