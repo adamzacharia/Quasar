@@ -237,7 +237,7 @@ export function ChatArea() {
 
     return (
         <main className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
-            <header className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-slate-800/80 glass-panel">
+            <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-2 md:py-4 border-b border-slate-800/80 glass-panel">
                 <div className="flex items-center gap-3">
                     <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800/50 transition-all"><PanelLeft className="w-5 h-5" /></button>
                     <h2 className="text-base font-semibold text-white tracking-tight">

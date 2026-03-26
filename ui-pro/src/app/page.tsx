@@ -8,20 +8,53 @@ import { useEffect, useState } from "react";
 
 export default function Home() {
   const sidebarOpen = useChatStore((s) => s.sidebarOpen);
+  const toggleSidebar = useChatStore((s) => s.toggleSidebar);
   const [mounted, setMounted] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setMounted(true);
+
+    const mq = window.matchMedia("(max-width: 767px)");
+    const handleChange = (e: MediaQueryListEvent | MediaQueryList) => {
+      setIsMobile(e.matches);
+      // Auto-close sidebar when switching to mobile
+      if (e.matches && useChatStore.getState().sidebarOpen) {
+        useChatStore.getState().toggleSidebar();
+      }
+    };
+    handleChange(mq); // initial check
+    mq.addEventListener("change", handleChange);
+    return () => mq.removeEventListener("change", handleChange);
   }, []);
 
   if (!mounted) return null; // Prevent hydration mismatch Flash
 
   return (
     <>
-      <div className={`${sidebarOpen ? "w-[280px]" : "w-0"} transition-all duration-300 shrink-0 overflow-hidden`}>
-        <Sidebar />
-      </div>
+      {/* ── MOBILE: sidebar as a full-screen overlay ── */}
+      {isMobile && sidebarOpen && (
+        <div className="fixed inset-0 z-40 flex">
+          {/* Dark backdrop — click to close */}
+          <div
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40"
+            onClick={toggleSidebar}
+          />
+          {/* Sidebar panel */}
+          <div className="relative z-50 w-[280px] h-full animate-in slide-in-from-left duration-200">
+            <Sidebar />
+          </div>
+        </div>
+      )}
+
+      {/* ── DESKTOP: sidebar as a push panel (original behaviour) ── */}
+      {!isMobile && (
+        <div className={`${sidebarOpen ? "w-[280px]" : "w-0"} transition-all duration-300 shrink-0 overflow-hidden`}>
+          <Sidebar />
+        </div>
+      )}
+
       <ChatArea />
 
       {/* Auth Modal Overlay */}
