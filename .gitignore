@@ -55,3 +55,26 @@ user_tools/
 fixes.md
 
 # Keep alive script
+
+# LaTeX build artifacts (paper/)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.synctex(busy)
+*.toc
+*.lot
+*.lof
+*.nav
+*.snm
+*.vrb
+*.run.xml
+*-blx.bib
+*.bcf
+*.log
+
+# Paper folder
+paper/
