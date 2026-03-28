@@ -38,7 +38,7 @@ async function getErrorMessage(response: Response): Promise<string> {
     }
 }
 
-export async function sendChatMessage(request: ChatRequest, callbacks: StreamCallbacks): Promise<void> {
+export async function sendChatMessage(request: ChatRequest, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
     try {
         let response: Response;
 
@@ -51,7 +51,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             request.attachments.forEach(f => form.append("files", f));
             const headers: Record<string, string> = {};
             if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
-            response = await fetch(`${API_BASE}/api/chat/upload`, { method: "POST", headers, body: form });
+            response = await fetch(`${API_BASE}/api/chat/upload`, { method: "POST", headers, body: form, signal });
         } else {
             const headers: Record<string, string> = { "Content-Type": "application/json" };
             if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
@@ -59,6 +59,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                 method: "POST",
                 headers,
                 body: JSON.stringify({ message: request.message, conversation_id: request.conversation_id, model: request.model }),
+                signal,
             });
         }
 
@@ -122,6 +123,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
         }
         callbacks.onComplete(fullText);
     } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return; // user cancelled
         callbacks.onError(error instanceof Error ? error.message : "Request failed.");
     }
 }
@@ -131,7 +133,7 @@ export async function getModels(): Promise<string[]> {
     catch { return ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "claude-3-7-sonnet-20250219", "gemini-3.1-pro"]; }
 }
 
-export async function reviewProposal(file: File, callbacks: StreamCallbacks): Promise<void> {
+export async function reviewProposal(file: File, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
     try {
         const form = new FormData();
         form.append("file", file);
@@ -139,6 +141,7 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks): Pr
         const response = await fetch(`${API_BASE}/api/proposals/review`, {
             method: "POST",
             body: form,
+            signal,
         });
 
         if (!response.ok) { callbacks.onError(await getErrorMessage(response)); return; }
@@ -179,6 +182,7 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks): Pr
         }
         callbacks.onComplete(fullText);
     } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return; // user cancelled
         callbacks.onError(error instanceof Error ? error.message : "Proposal review request failed.");
     }
 }
