@@ -39,6 +39,7 @@ export function ChatArea() {
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const [inputValue, setInputValue] = useState("");
+    const abortControllerRef = useRef<AbortController | null>(null);
 
     const activeConversation = conversations.find(c => c.id === activeConversationId);
     const isStarred = activeConversation?.isStarred || false;
@@ -46,9 +47,22 @@ export function ChatArea() {
 
     useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, thinkingSteps]);
 
+    const handleStop = useCallback(() => {
+        if (abortControllerRef.current) {
+            abortControllerRef.current.abort();
+            abortControllerRef.current = null;
+        }
+        attachThinkingToLastMessage();
+        setStreaming(false);
+    }, [attachThinkingToLastMessage, setStreaming]);
+
     const handleSend = useCallback(async (text: string, attachments?: AttachedFile[]) => {
         const hasContent = text.trim() || (attachments && attachments.length > 0);
         if (!hasContent || isStreaming) return;
+
+        // Create a new AbortController for this request
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
 
         if (!activeConversationId) {
             const newId = "conv-" + generateId();
@@ -114,7 +128,7 @@ export function ChatArea() {
                         updateLastAssistantMessage(`Error: ${error}`);
                         setStreaming(false);
                     }
-                });
+                }, controller.signal);
             } else {
                 // Standard workflow
                 await sendChatMessage(
@@ -203,7 +217,8 @@ export function ChatArea() {
                             updateLastAssistantMessage(`Error: ${error}`);
                             setStreaming(false);
                         },
-                    }
+                    },
+                    controller.signal,
                 );
             } // end if-else
         } catch (err) {
@@ -290,7 +305,7 @@ export function ChatArea() {
                 <EmptyState onSuggestionClick={handleSuggestionClick} />
             )}
 
-            <ChatInput onSend={handleSend} isStreaming={isStreaming} initialValue={inputValue} />
+            <ChatInput onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue} />
         </main>
     );
 }

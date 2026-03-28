@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Send, PlusCircle, X, FileText, Image as ImageIcon } from "lucide-react";
+import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square } from "lucide-react";
 
 interface AttachedFile {
     file: File;
@@ -11,11 +11,12 @@ interface AttachedFile {
 
 interface ChatInputProps {
     onSend: (message: string, attachments?: AttachedFile[]) => void;
+    onStop?: () => void;
     isStreaming: boolean;
     initialValue?: string;
 }
 
-export function ChatInput({ onSend, isStreaming, initialValue = "" }: ChatInputProps) {
+export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: ChatInputProps) {
     const [value, setValue] = useState(initialValue);
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -119,17 +120,28 @@ export function ChatInput({ onSend, isStreaming, initialValue = "" }: ChatInputP
                                 value={value}
                                 onChange={(e) => setValue(e.target.value)}
                                 onKeyDown={handleKeyDown}
-                                placeholder="Ask QUASAR about observations, data, or literature..."
+                                placeholder={isStreaming ? "QUASAR is thinking..." : "Ask QUASAR about observations, data, or literature..."}
                                 className="flex-1 bg-transparent border-none outline-none text-white placeholder-slate-500 focus:ring-0 text-sm"
                                 disabled={isStreaming}
                             />
-                            <button
-                                type="submit"
-                                disabled={(!value.trim() && attachments.length === 0) || isStreaming}
-                                className="p-2.5 bg-primary hover:bg-primary/90 text-white rounded-full transition-all shadow-lg shadow-primary/20 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
-                            >
-                                <Send className="w-5 h-5" />
-                            </button>
+                            {isStreaming ? (
+                                <button
+                                    type="button"
+                                    onClick={onStop}
+                                    className="p-2.5 bg-red-500/80 hover:bg-red-500 text-white rounded-full transition-all shadow-lg shadow-red-500/20 flex items-center justify-center animate-pulse"
+                                    title="Stop generating"
+                                >
+                                    <Square className="w-4 h-4 fill-current" />
+                                </button>
+                            ) : (
+                                <button
+                                    type="submit"
+                                    disabled={!value.trim() && attachments.length === 0}
+                                    className="p-2.5 bg-primary hover:bg-primary/90 text-white rounded-full transition-all shadow-lg shadow-primary/20 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    <Send className="w-5 h-5" />
+                                </button>
+                            )}
                         </div>
                     </div>
                 </form>
