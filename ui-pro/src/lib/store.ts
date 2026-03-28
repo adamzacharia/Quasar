@@ -55,7 +55,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     messages: [],
     isStreaming: false,
     streamingContent: "",
-    selectedModel: "gpt-4o-mini",
+    selectedModel: "gpt-4.1",
     availableModels: [
         // OpenAI
         "gpt-4o", "gpt-4o-mini", "gpt-4.1", "claude-3-7-sonnet-20250219", "gemini-3.1-pro",

@@ -355,80 +355,14 @@ def _stream_chat_response(
         try:
             loop = asyncio.get_event_loop()
 
+
             yield _sse_status("Analyzing prompt complexity", "running")
             await asyncio.sleep(0.05)
             yield _sse_status("Analyzing prompt complexity", "completed")
 
-            repl_context_threshold = 80_000
-            if len(enriched_message) > repl_context_threshold:
-                print(
-                    f"[INFO] Message size {len(enriched_message):,} chars > "
-                    f"{repl_context_threshold:,} threshold -> RLM REPL"
-                )
-                yield _sse_status("Launching RLM REPL (beyond-context mode)", "running")
-                await asyncio.sleep(0.05)
-                yield _sse_status("Launching RLM REPL (beyond-context mode)", "completed")
-
-                repl_queue = asyncio.Queue()
-
-                def repl_status(step: str, state: str):
-                    asyncio.run_coroutine_threadsafe(repl_queue.put(("status", step, state)), loop)
-
-                def repl_token(tok: str):
-                    if tok:
-                        asyncio.run_coroutine_threadsafe(repl_queue.put(("token", tok)), loop)
-
-                def _run_repl():
-                    try:
-                        res = agent.rlm.execute(
-                            request.message,
-                            context=enriched_message,
-                            use_repl=True,
-                            status_callback=repl_status,
-                            on_token=repl_token,
-                        )
-                        asyncio.run_coroutine_threadsafe(repl_queue.put(("done", res)), loop)
-                    except Exception as e:
-                        print(f"[RLM REPL error] {e}")
-                        asyncio.run_coroutine_threadsafe(repl_queue.put(("error", str(e))), loop)
-
-                loop.run_in_executor(_executor, _run_repl)
-
-                response_text = ""
-                has_repl_tokens = False
-                while True:
-                    msg = await repl_queue.get()
-                    msg_type = msg[0]
-                    if msg_type == "done":
-                        response_text = msg[1]
-                        if not has_repl_tokens and response_text:
-                            data = json.dumps({"type": "token", "content": response_text})
-                            yield f"data: {data}\n\n"
-                        break
-                    if msg_type == "error":
-                        response_text = f"RLM REPL error: {msg[1]}"
-                        data = json.dumps({"type": "token", "content": response_text})
-                        yield f"data: {data}\n\n"
-                        break
-                    if msg_type == "status":
-                        yield _sse_status(msg[1], msg[2])
-                    elif msg_type == "token":
-                        has_repl_tokens = True
-                        data = json.dumps({"type": "token", "content": msg[1]})
-                        yield f"data: {data}\n\n"
-
-                agent.memory.add_message("user", request.message)
-                agent.memory.add_message("assistant", response_text)
-                agent.last_run_result = None
-                yield "data: [DONE]\n\n"
-                return
-
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
-            yield _sse_status("Routing to standard agent", "running")
-            await asyncio.sleep(0.05)
-            yield _sse_status("Routing to standard agent", "completed")
 
-            model_name = requested_model or getattr(agent.config, "model", "gpt-4o")
+            model_name = requested_model or getattr(agent.config, "model", "gpt-4.1")
             yield _sse_status(f"Calling {model_name}", "running")
 
             queue = asyncio.Queue()

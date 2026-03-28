@@ -2320,7 +2320,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         # 4a. Conductor check — delegate complex queries to DAG orchestration
         try:
-            complexity = self.rlm.complexity_detector.detect(query) if hasattr(self, 'rlm') else 0.0
+            complexity = self.rlm.detector.assess(query).score if hasattr(self, 'rlm') else 0.0
             if complexity > Conductor.COMPLEXITY_THRESHOLD:
                 import asyncio
                 trace_id = self.query_tracer.new_trace(query, user_id=user_id)
