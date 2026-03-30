@@ -85,8 +85,7 @@ export function ChatArea() {
         setStreaming(true);
         clearThinking();
         clearTaskExecution();
-        // ↓ Instantly show the Processing Pipeline widget — before the first network event
-        addThinkingStep("Connecting to QUASAR engine", "running");
+        // Thinking steps will arrive dynamically from backend SSE events
 
 
         const assistantMsgId = generateId();
@@ -164,16 +163,9 @@ export function ChatArea() {
                                 toolCall,
                             });
                         },
-                        onStatus: (() => {
-                            let connected = false;
-                            return (step: string, state: string) => {
-                                if (!connected) {
-                                    connected = true;
-                                    addThinkingStep("Connecting to QUASAR engine", "completed");
-                                }
-                                addThinkingStep(step, state as "running" | "completed");
-                            };
-                        })(),
+                        onStatus: (step: string, state: string) => {
+                            addThinkingStep(step, state as "running" | "completed");
+                        },
                         onData: (data: Record<string, unknown>) => {
                             const tableData = data as unknown as DataTableResult;
                             addMessage({

@@ -106,7 +106,7 @@ app.add_middleware(LoggingMiddleware)
 # This guarantees every response (including errors) carries CORS headers.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|https://quasarassistant\.com|http://localhost:3000|http://127\.0\.0\.1:3000",
+    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|https://(www\.)?quasarassistant\.com|http://localhost:3000|http://127\.0\.0\.1:3000",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -355,15 +355,7 @@ def _stream_chat_response(
         try:
             loop = asyncio.get_event_loop()
 
-
-            yield _sse_status("Analyzing prompt complexity", "running")
-            await asyncio.sleep(0.05)
-            yield _sse_status("Analyzing prompt complexity", "completed")
-
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
-
-            model_name = requested_model or getattr(agent.config, "model", "gpt-4.1")
-            yield _sse_status(f"Calling {model_name}", "running")
 
             queue = asyncio.Queue()
 
@@ -396,8 +388,6 @@ def _stream_chat_response(
 
             loop.run_in_executor(_executor, _run_agent)
 
-            yield _sse_status(f"Calling {model_name}", "completed")
-
             first_token = True
             response_text = ""
 
@@ -424,9 +414,7 @@ def _stream_chat_response(
                     response_text = f"An error occurred: {payload}"
                     break
                 if msg_type == "token":
-                    if first_token:
-                        yield _sse_status("Generating response", "completed")
-                        first_token = False
+                    first_token = False
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
 
@@ -818,7 +806,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
     """Stream a chat response via SSE using the shared chat pipeline."""
     return _stream_chat_response(request, authorization=authorization)
-    agent = get_agent()
+
 
     # ── Resolve user from optional token (for personal RAG) ──
     _current_user = None
@@ -929,8 +917,6 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
             yield _status("Analyzing prompt complexity")
             await asyncio.sleep(0.05)
             yield _status("Analyzing prompt complexity", "completed")
-
-            # ── Route based on DATA SIZE, not query complexity ──────────────────────
             # Paper standard: RLM REPL fires ONLY for massive data contexts
             # (>80k chars ≈ 20k tokens — e.g. large FITS headers, multi-MB CSVs).
             # All normal queries, including multi-step research, always use the
@@ -1000,13 +986,6 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
             # ── Standard Agent Path (all normal queries) ──
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
-            yield _status("Routing to standard agent")
-            await asyncio.sleep(0.05)
-            yield _status("Routing to standard agent", "completed")
-
-            # Prefer the model name requested by the user, fallback to config
-            model_name = request.model or getattr(agent.config, 'model', 'GPT-4o') or 'GPT-4o'
-            yield _status(f"Calling {model_name}")
 
             queue = asyncio.Queue()
             
@@ -1042,8 +1021,6 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
             agent_task = loop.run_in_executor(_executor, _run_agent)
 
-            yield _status(f"Calling {model_name}", "completed")
-
             first_token = True
             response_text = ""
             
@@ -1070,9 +1047,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                     response_text = f"An error occurred: {payload}"
                     break
                 elif msg_type == "token":
-                    if first_token:
-                        yield _status("Generating response", "completed")
-                        first_token = False
+                    first_token = False
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
 

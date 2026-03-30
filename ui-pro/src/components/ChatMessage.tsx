@@ -134,7 +134,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     {/* Thinking Process Widget — rendered ABOVE content */}
                     {hasThinking && (
                         <ThoughtProcessWidget
-                            title="Processing Pipeline"
+                            title="Thinking"
                             status={thinkingStatus === "running" && !hasContent ? "running" : "completed"}
                             steps={thinkingSteps}
                             forceCollapsed={hasContent}

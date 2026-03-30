@@ -16,7 +16,7 @@ interface ThoughtProcessWidgetProps {
     forceCollapsed?: boolean;
 }
 
-export function ThoughtProcessWidget({ title = "Thought Process", status, steps, forceCollapsed }: ThoughtProcessWidgetProps) {
+export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceCollapsed }: ThoughtProcessWidgetProps) {
     const [seconds, setSeconds] = useState(0);
 
     useEffect(() => {

@@ -2269,27 +2269,52 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # 0. Session Pruning — reset context if token count is too high
         self._prune_session_if_needed(query, user_id)
 
-        # 1. Retrieve RAG context (from ALMA Manual - ChromaDB)
+        # Emit connecting step
+        if on_status:
+            on_status("Connecting to QUASAR engine", "running")
+            on_status("Connecting to QUASAR engine", "completed")
+
+        # 1. Smart RAG — only search documentation for queries that likely
+        #    relate to ALMA/radio astronomy/technical documentation.
         rag_context = ""
-        try:
-            if on_status:
-                on_status("Searching ALMA Manuals & Documentation", "running")
-            docs = self.rag_service.search(query)
-            if docs:
-                context_pieces = []
-                for d in docs[:3]:
-                    src = d.metadata.get("source", d.metadata.get("source_file", "Unknown"))
-                    if "/" in src or "\\" in src:
-                        src = src.replace("\\", "/").split("/")[-1]
-                    page = d.metadata.get("page", "?")
-                    context_pieces.append(f"[Source: {src}, p.{page}]\n{d.page_content}")
-                rag_context = "\n\nRelevant Technical Context:\n" + "\n---\n".join(context_pieces)
-            if on_status:
-                on_status("Searching ALMA Manuals & Documentation", "completed")
-        except Exception as e:
-            if on_status:
-                on_status("Searching ALMA Manuals & Documentation", "failed")
-            print(f"[WARNING] RAG search failed: {e}")
+        _rag_keywords = {
+            "alma", "band", "frequency", "resolution", "calibration",
+            "observation", "correlator", "antenna", "baseline", "uv",
+            "spectral", "continuum", "imaging", "pipeline", "casa",
+            "interferometry", "interferometer", "receiver", "sensitivity",
+            "proposal", "proprietary", "archive", "data reduction",
+            "cycle", "configuration", "mosaic", "polarization",
+            "flux", "beam", "synthesized", "primary beam", "fov",
+            "spectral window", "spw", "channel", "bandwidth",
+            "integration", "scheduling", "phase", "amplitude",
+            "manual", "documentation", "technical handbook",
+            "vla", "vlba", "gbt", "radio", "submillimeter",
+            "millimeter", "ghz", "mhz", "jy", "arcsec",
+            "fits", "measurement set", "uvfits", "clean", "tclean",
+        }
+        _query_lower = query.lower()
+        _should_rag = any(kw in _query_lower for kw in _rag_keywords)
+
+        if _should_rag:
+            try:
+                if on_status:
+                    on_status("Searching ALMA Manuals & Documentation", "running")
+                docs = self.rag_service.search(query)
+                if docs:
+                    context_pieces = []
+                    for d in docs[:3]:
+                        src = d.metadata.get("source", d.metadata.get("source_file", "Unknown"))
+                        if "/" in src or "\\" in src:
+                            src = src.replace("\\", "/").split("/")[-1]
+                        page = d.metadata.get("page", "?")
+                        context_pieces.append(f"[Source: {src}, Page {page}]\n{d.page_content}")
+                    rag_context = "\n\nRelevant Technical Context (from ALMA documentation):\n" + "\n---\n".join(context_pieces)
+                if on_status:
+                    on_status("Searching ALMA Manuals & Documentation", "completed")
+            except Exception as e:
+                if on_status:
+                    on_status("Searching ALMA Manuals & Documentation", "completed")
+                print(f"[WARNING] RAG search failed: {e}")
         
         # 2. Retrieve long-term memories (from mem0) — only for authenticated users
         memory_context = ""
@@ -2305,16 +2330,22 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         
         # 3. Build tools list
         tools = self._build_tools_for_responses_api()
+
+        # Emit model step
+        if on_status:
+            on_status(f"Calling {self.config.model}", "running")
+            on_status(f"Calling {self.config.model}", "completed")
         
         # 4. Build the full input
         citation_note = ""
         if rag_context:
             citation_note = (
-                "\n\nIMPORTANT: When your answer uses information from the "
-                "Relevant Technical Context above, cite the source at the end "
-                "of the relevant sentence in brackets, e.g. "
-                "[Source: ALMA_Technical_Handbook.pdf, p.42]. "
-                "This helps users verify the information."
+                "\n\nIMPORTANT CITATION RULES: When your answer uses information from the "
+                "Relevant Technical Context above, you MUST cite the source at the end "
+                "of the relevant sentence using this exact format: "
+                "[Source: filename, Page X]. For example: "
+                "[Source: ALMA_Technical_Handbook.pdf, Page 42]. "
+                "Always include the page number. This is critical for traceability."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}\n\nUser: {query}"
 
@@ -2458,6 +2489,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         "output": result_str,
                     })
             
+            # Emit final step
+            if on_status:
+                on_status("Generating response", "running")
+                on_status("Generating response", "completed")
+
             if not output_text:
                 output_text = "I processed your query but didn't generate a text response. Please try rephrasing."
                 if on_token:
