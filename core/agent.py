@@ -2118,20 +2118,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         This is the callback passed to Conductor so each DAG node can use
         all 28+ registered tools (ALMA search, ADS, Splatalogue, etc.).
-
-        Parameters
-        ----------
-        task_description : str
-            Human-readable task description (e.g., "Search ALMA for Band 6 observations of Sz65")
-        dep_context : str
-            Results from prior tasks in the DAG that this task depends on.
-
-        Returns
-        -------
-        str
-            The agent's response text after executing the task with tools.
         """
-        # Build a focused prompt for this subtask
         system_instructions = (
             "You are a radio astronomy specialist executing one step of a larger analysis. "
             "Use the available tools to complete this specific task. "
@@ -2143,8 +2130,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             user_input = f"Context from prior steps:\n{dep_context}\n\nYour task: {task_description}"
 
         try:
-            # Build the tool list from registered tools
-            tools = self._build_tool_definitions()
+            # ── Use _build_tools_for_responses_api() — reads from self.tool_registry
+            # (self.tools does not exist; _build_tool_definitions() would crash)
+            tools = self._build_tools_for_responses_api()
 
             # Single Responses API call with tool access
             response = self.client.responses.create(
@@ -2156,27 +2144,45 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 max_output_tokens=2000,
             )
 
-            # Process tool calls (up to 3 rounds)
+            # Process tool calls (up to 4 rounds)
             output_text = ""
-            for _round in range(3):
-                tool_calls = [item for item in response.output if getattr(item, 'type', '') == 'function_call']
+            for _round in range(4):
+                # Look for function_call items in response.output
+                tool_calls = [
+                    item for item in (response.output or [])
+                    if getattr(item, "type", "") == "function_call"
+                ]
 
                 if not tool_calls:
-                    # No more tool calls — extract text
-                    for item in response.output:
-                        if getattr(item, 'type', '') == 'output_text':
-                            output_text += item.text
+                    # No more tool calls — extract text from every possible location
+                    # 1. Convenience property (works for OpenAI and LLMResponse shim)
+                    if hasattr(response, "output_text") and response.output_text:
+                        output_text = response.output_text
+                    else:
+                        # 2. Walk output items
+                        for item in (response.output or []):
+                            item_type = getattr(item, "type", "")
+                            if item_type == "output_text":
+                                output_text += getattr(item, "text", "")
+                            elif item_type == "message":
+                                for chunk in getattr(item, "content", []):
+                                    output_text += getattr(chunk, "text", "")
                     break
 
                 # Execute each tool call
                 tool_results = []
                 for tc in tool_calls:
-                    fn_name = tc.name
-                    fn_args = tc.arguments
+                    fn_name = getattr(tc, "name", "")
+                    fn_args = getattr(tc, "arguments", "{}")
+                    call_id = getattr(tc, "call_id", "")
+                    if on_status := getattr(self, "_last_on_status", None):
+                        on_status(f"Calling tool: {fn_name}", "running")
                     result = self._dispatch_tool_call(fn_name, fn_args)
+                    if on_status:
+                        on_status(f"Calling tool: {fn_name}", "completed")
                     tool_results.append({
                         "type": "function_call_output",
-                        "call_id": tc.call_id,
+                        "call_id": call_id,
                         "output": str(result)[:4000],
                     })
 
@@ -2190,28 +2196,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     max_output_tokens=2000,
                 )
 
-            # Extract final text if not already
-            if not output_text:
-                output_text = response.output_text if hasattr(response, 'output_text') else str(response.output)
-
-            return output_text.strip() if output_text else "[No output]"
+            return output_text.strip() if output_text else "[No output from subtask]"
 
         except Exception as e:
-            logger.error(f"Conductor tool executor failed: {e}")
+            import traceback
+            logger.error(
+                "Conductor tool executor failed for task '%s': %s\n%s",
+                task_description[:80], e, traceback.format_exc()
+            )
             return f"[Tool execution error: {e}]"
-
-    def _build_tool_definitions(self) -> list:
-        """Build OpenAI tool definitions from the registered tool list."""
-        return [
-            {
-                "type": "function",
-                "name": t["function"]["name"],
-                "description": t["function"].get("description", ""),
-                "parameters": t["function"].get("parameters", {}),
-            }
-            for t in self.tools
-            if t.get("type") == "function"
-        ]
 
     def _dispatch_tool_call(self, tool_name: str, arguments_json: str) -> str:
         """
@@ -2365,6 +2358,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 def on_event(evt: dict):
                     if on_status:
                         on_status(f"__event__{_json.dumps(evt)}", evt.get('type', 'status'))
+
+                # Store on_status so _conductor_tool_executor can emit tool-call steps
+                self._last_on_status = on_status
 
                 # ③ Run the async Conductor in a dedicated thread with its own event loop.
                 #    We CANNOT use pool.submit(asyncio.run, coro) here because this
