@@ -563,14 +563,51 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="advanced_search",
-            description="Execute a custom SQL/TAP query on ALMA archive",
+            description=(
+                "Execute a custom ADQL/TAP query directly on the ALMA Science Archive (ivoa.obscore table).\n"
+                "IMPORTANT: The obscore table has NO 'redshift' column. Use frequency/bandwidth containment instead.\n"
+                "To find observations covering a specific frequency nu_ghz:\n"
+                "  WHERE (frequency - 0.5*bandwidth/1e9) < {nu_ghz} AND (frequency + 0.5*bandwidth/1e9) > {nu_ghz}\n"
+                "Key columns: target_name, s_ra, s_dec, frequency (GHz), bandwidth (Hz), scientific_category,\n"
+                "  science_keyword, proposal_id, member_ous_uid, t_exptime, s_resolution, band_list.\n"
+                "Add OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY to limit results."
+            ),
             function=self._advanced_search,
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "ADQL/TAP query string"}
+                    "query": {"type": "string", "description": "ADQL TAP query string for ivoa.obscore"}
                 },
                 "required": ["query"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="search_alma_co_in_redshift_range",
+            description=(
+                "Search the ALMA archive for observations that cover CO emission lines "
+                "for galaxies at a given redshift range. Handles the CO rest-frequency → "
+                "observed-frequency conversion and TAP frequency-containment query automatically. "
+                "Use this for any query like 'galaxies at z=1-2 with CO coverage' or "
+                "'ALMA CO detections at high redshift'.\n"
+                "CO transitions checked: J=1-0 (115.3 GHz), J=2-1 (230.5), J=3-2 (345.8), "
+                "J=4-3 (461.0), J=5-4 (576.3), J=6-5 (691.5), J=7-6 (806.7).\n"
+                "Returns: target_name, proposal_id, CO_transition, obs_frequency_ghz, bandwidth_ghz."
+            ),
+            function=self._search_alma_co_in_redshift_range,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "z_min": {"type": "number", "description": "Minimum redshift (e.g. 1.0)"},
+                    "z_max": {"type": "number", "description": "Maximum redshift (e.g. 2.0)"},
+                    "science_category": {
+                        "type": "string",
+                        "description": "Optional ALMA science category filter (e.g. 'Galaxy evolution', 'Cosmology', 'Active galaxies'). Leave empty for all.",
+                        "default": ""
+                    },
+                    "max_results": {"type": "integer", "description": "Maximum rows to return (default 500)", "default": 500}
+                },
+                "required": ["z_min", "z_max"]
             }
         ))
 
@@ -1589,6 +1626,161 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "results": results.to_dict("records") if not results.empty else []
             }
         except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _search_alma_co_in_redshift_range(
+        self,
+        z_min: float,
+        z_max: float,
+        science_category: str = "",
+        max_results: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Search ALMA archive for observations covering CO emission lines at a given
+        redshift range.  Fully stateless — no prior search needed.
+
+        Method (from ALMA archive notebook nb6):
+          1. For each CO transition, compute the observed frequency at z_min and z_max.
+          2. Issue a TAP ADQL query with the frequency-containment WHERE clause.
+          3. Union results across all transitions; deduplicate; return summary table.
+
+        The ALMA obscore table has NO 'redshift' column — this tool implements the
+        correct indirect approach (ν_obs = ν_rest / (1+z)).
+        """
+        import pandas as pd
+
+        # CO rotational transitions: (J_upper, rest_freq_GHz)
+        CO_TRANSITIONS = [
+            ("CO(1-0)",  115.2712018),
+            ("CO(2-1)",  230.5380000),
+            ("CO(3-2)",  345.7959899),
+            ("CO(4-3)",  461.0407682),
+            ("CO(5-4)",  576.2679305),
+            ("CO(6-5)",  691.4730763),
+            ("CO(7-6)",  806.6518060),
+        ]
+
+        # Build ADQL frequency-range OR conditions for all transitions
+        # Each transition covers a *range* of frequencies depending on the z range.
+        # ν_obs_min (at z_max) to ν_obs_max (at z_min)
+        freq_conditions = []
+        transition_map = {}  # (freq_min, freq_max) -> transition label
+
+        for label, nu_rest in CO_TRANSITIONS:
+            nu_at_z_max = nu_rest / (1.0 + z_max)   # lower observed freq (higher z)
+            nu_at_z_min = nu_rest / (1.0 + z_min)   # higher observed freq (lower z)
+
+            # We want any observation whose spectral window overlaps [nu_at_z_max, nu_at_z_min]
+            # (frequency - 0.5*bw/1e9) < nu_at_z_min  AND  (frequency + 0.5*bw/1e9) > nu_at_z_max
+            cond = (
+                f"((frequency - 0.5*bandwidth/1e9) < {nu_at_z_min:.4f} "
+                f"AND (frequency + 0.5*bandwidth/1e9) > {nu_at_z_max:.4f})"
+            )
+            freq_conditions.append(cond)
+            transition_map[(round(nu_at_z_max, 4), round(nu_at_z_min, 4))] = label
+
+        freq_where = " OR ".join(freq_conditions)
+
+        # Optional science category filter
+        cat_clause = ""
+        if science_category:
+            cat_clause = f" AND scientific_category LIKE '%{science_category}%'"
+        else:
+            # Default: restrict to extragalactic categories
+            cat_clause = (
+                " AND (scientific_category LIKE '%Galaxy%' "
+                "OR scientific_category LIKE '%Cosmology%' "
+                "OR scientific_category LIKE '%Active%')"
+            )
+
+        adql_query = f"""
+SELECT TOP {max_results}
+       target_name, proposal_id, member_ous_uid,
+       frequency, bandwidth, scientific_category, science_keyword,
+       s_ra, s_dec, t_exptime, s_resolution
+FROM ivoa.obscore
+WHERE ({freq_where})
+{cat_clause}
+ORDER BY target_name
+"""
+
+        logger.info("CO redshift search ADQL:\n%s", adql_query.strip())
+
+        try:
+            import pyvo
+            tap_url = "https://almascience.eso.org/tap"
+            service = pyvo.dal.TAPService(tap_url)
+            res = service.search(adql_query)
+            df = res.to_table().to_pandas()
+
+            if df.empty:
+                return {
+                    "success": True,
+                    "count": 0,
+                    "message": (
+                        f"No ALMA observations found covering CO lines at z={z_min}–{z_max}. "
+                        "The archive may not have public data for this parameter space, or "
+                        "the frequency range falls outside ALMA's standard bands."
+                    ),
+                    "z_range": [z_min, z_max],
+                    "co_obs_freq_ranges_ghz": {
+                        label: {
+                            "nu_min_ghz": round(nu_rest / (1 + z_max), 2),
+                            "nu_max_ghz": round(nu_rest / (1 + z_min), 2),
+                        }
+                        for label, nu_rest in CO_TRANSITIONS
+                    },
+                }
+
+            # Annotate which CO transition each observation covers
+            def _which_co(row):
+                obs_nu = float(row.get("frequency", 0))
+                bw_ghz = float(row.get("bandwidth", 0)) / 1e9
+                covered = []
+                for label, nu_rest in CO_TRANSITIONS:
+                    nu_lo = nu_rest / (1 + z_max)
+                    nu_hi = nu_rest / (1 + z_min)
+                    obs_lo = obs_nu - 0.5 * bw_ghz
+                    obs_hi = obs_nu + 0.5 * bw_ghz
+                    if obs_lo < nu_hi and obs_hi > nu_lo:
+                        covered.append(label)
+                return ", ".join(covered) if covered else "unknown"
+
+            df["CO_transitions_covered"] = df.apply(_which_co, axis=1)
+            df["obs_freq_ghz"] = df["frequency"].round(3)
+            df["bandwidth_ghz"] = (df["bandwidth"] / 1e9).round(3)
+
+            # Store in agent cache for follow-up plotting
+            self.last_search_results = df
+            self.last_run_result = {"type": "data", "data": df, "source": f"CO z={z_min}-{z_max}"}
+
+            # Build summary
+            summary_cols = ["target_name", "proposal_id", "CO_transitions_covered",
+                            "obs_freq_ghz", "bandwidth_ghz", "scientific_category"]
+            available_cols = [c for c in summary_cols if c in df.columns]
+            summary = df[available_cols].drop_duplicates().to_dict("records")
+
+            return {
+                "success": True,
+                "count": len(df),
+                "unique_targets": int(df["target_name"].nunique()) if "target_name" in df.columns else None,
+                "z_range": [z_min, z_max],
+                "co_transitions_searched": [t[0] for t in CO_TRANSITIONS],
+                "results": summary[:100],  # cap at 100 for LLM context
+                "note": (
+                    "Observations found where CO line at given z falls inside the ALMA spectral window. "
+                    "Use plot_alma_results() to visualize sky distribution."
+                )
+            }
+
+        except ImportError:
+            return {
+                "success": False,
+                "error": "pyvo is not installed. Run: pip install pyvo",
+            }
+        except Exception as e:
+            import traceback
+            logger.error("CO redshift search failed: %s\n%s", e, traceback.format_exc())
             return {"success": False, "error": str(e)}
 
     def _plot_alma_results(self, plot_type: str = "sky") -> Dict[str, Any]:
