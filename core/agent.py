@@ -2353,40 +2353,60 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         try:
             complexity = self.rlm.detector.assess(query).score if hasattr(self, 'rlm') else 0.0
             if complexity > Conductor.COMPLEXITY_THRESHOLD:
-                import asyncio
+                import asyncio, threading, json as _json
                 trace_id = self.query_tracer.new_trace(query, user_id=user_id)
-                if on_status:
-                    on_status(f"Complex query detected (score={complexity:.2f}) — activating multi-agent workforce", "running")
 
-                # Build on_event emitter that forwards structured events through the SSE queue
-                on_event = None
+                # ① Mark detection as COMPLETED immediately so the UI shows a ✓
                 if on_status:
-                    import json as _json
-                    def on_event(evt: dict):
-                        # The status callback in api/main.py will forward this as an SSE event
-                        evt_type = evt.get('type', 'status')
-                        on_status(f"__event__{_json.dumps(evt)}", evt_type)
+                    on_status(f"Complex query detected (score={complexity:.2f}) — activating multi-agent workforce", "completed")
 
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        import concurrent.futures
-                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                            conductor_answer = pool.submit(
-                                asyncio.run,
-                                self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token, on_event=on_event)
-                            ).result()
-                    else:
-                        conductor_answer = asyncio.run(
-                            self.conductor.orchestrate(query, context=rag_context, on_status=on_status, on_token=on_token, on_event=on_event)
-                        )
-                    if conductor_answer:
-                        self.query_tracer.end_trace(trace_id, "completed")
-                        return conductor_answer
-                    # Conductor returned None → query not complex enough, fall through
-                except Exception as ce:
-                    print(f"[WARNING] Conductor orchestration failed: {ce}. Falling back to standard path.")
+                # ② Build on_event emitter — forwards task_group / task_update / task_list
+                #    events through the SSE queue in api/main.py
+                def on_event(evt: dict):
+                    if on_status:
+                        on_status(f"__event__{_json.dumps(evt)}", evt.get('type', 'status'))
+
+                # ③ Run the async Conductor in a dedicated thread with its own event loop.
+                #    We CANNOT use pool.submit(asyncio.run, coro) here because this
+                #    function already runs inside a ThreadPoolExecutor thread, and some
+                #    Python/asyncio combinations deadlock when nesting executors that way.
+                conductor_answer = None
+                conductor_exc = None
+                _done = threading.Event()
+
+                def _run_conductor():
+                    nonlocal conductor_answer, conductor_exc
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            conductor_answer = loop.run_until_complete(
+                                self.conductor.orchestrate(
+                                    query,
+                                    context=rag_context,
+                                    on_status=on_status,
+                                    on_token=on_token,
+                                    on_event=on_event,
+                                )
+                            )
+                        finally:
+                            loop.close()
+                    except Exception as _ce:
+                        conductor_exc = _ce
+                    finally:
+                        _done.set()
+
+                t = threading.Thread(target=_run_conductor, daemon=True)
+                t.start()
+                _done.wait(timeout=300)   # wait up to 5 min for complex queries
+
+                if conductor_exc:
+                    print(f"[WARNING] Conductor orchestration failed: {conductor_exc}. Falling back to standard path.")
                     self.query_tracer.end_trace(trace_id, "failed")
+                elif conductor_answer:
+                    self.query_tracer.end_trace(trace_id, "completed")
+                    return conductor_answer
+                # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:
             print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
         

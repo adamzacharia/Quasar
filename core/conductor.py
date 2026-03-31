@@ -33,15 +33,16 @@ from core.workflow_memory import WorkflowMemory
 
 logger = logging.getLogger(__name__)
 
-# ── Agent type → Icon + Display name mapping ────────────────────────────
+# ── Agent type → Display name mapping ───────────────────────────────────
+# Icons are rendered as custom SVG components on the frontend.
 AGENT_ICONS = {
-    "archive":    ("🗄️", "Archive Search"),
-    "literature": ("📚", "Literature Review"),
-    "analysis":   ("🔬", "Data Analysis"),
-    "viz":        ("📊", "Visualization"),
-    "web":        ("🌐", "Web Search"),
-    "synthesis":  ("📋", "Result Synthesis"),
-    "general":    ("⚡", "General Task"),
+    "archive":    ("archive",    "Archive Search"),
+    "literature": ("literature", "Literature Review"),
+    "analysis":   ("analysis",   "Data Analysis"),
+    "viz":        ("viz",        "Visualization"),
+    "web":        ("web",        "Web Search"),
+    "synthesis":  ("synthesis",  "Result Synthesis"),
+    "general":    ("general",    "General Task"),
 }
 
 # ── DAG decomposition prompt ─────────────────────────────────────────────
