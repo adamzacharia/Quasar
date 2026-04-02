@@ -281,26 +281,36 @@ export function ChatArea() {
             {hasMessages ? (
                 <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6">
                     <div className="max-w-4xl mx-auto space-y-6">
-                        {messages.map((msg, i) => {
-                            const isLastAssistant = isStreaming && msg.role === "assistant" && msg.type === "text" && i === messages.length - 1;
-                            // Build task execution state to pass into the Thinking widget
-                            const execState = isLastAssistant && taskExecutionActive ? {
-                                groups: taskGroups,
-                                tasks: taskItems,
-                                checklist: taskChecklist,
-                                isActive: taskExecutionActive && isStreaming,
-                            } : null;
-                            return (
-                                <ChatMessage
-                                    key={msg.id}
-                                    message={msg}
-                                    isStreaming={isLastAssistant}
-                                    thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
-                                    thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
-                                    taskExecutionState={execState}
-                                />
-                            );
-                        })}
+                        {(() => {
+                            // Find the last text-type assistant message for attaching thinking/task state
+                            const lastTextAssistantIdx = (() => {
+                                for (let j = messages.length - 1; j >= 0; j--) {
+                                    if (messages[j].role === "assistant" && messages[j].type === "text") return j;
+                                }
+                                return -1;
+                            })();
+
+                            return messages.map((msg, i) => {
+                                const isLastAssistant = isStreaming && i === lastTextAssistantIdx;
+                                // Build task execution state to pass into the message
+                                const execState = isLastAssistant && taskExecutionActive ? {
+                                    groups: taskGroups,
+                                    tasks: taskItems,
+                                    checklist: taskChecklist,
+                                    isActive: taskExecutionActive && isStreaming,
+                                } : null;
+                                return (
+                                    <ChatMessage
+                                        key={msg.id}
+                                        message={msg}
+                                        isStreaming={isLastAssistant}
+                                        thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
+                                        thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
+                                        taskExecutionState={execState}
+                                    />
+                                );
+                            });
+                        })()}
                     </div>
                 </div>
             ) : (

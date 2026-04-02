@@ -141,13 +141,18 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             steps={thinkingSteps}
                             forceCollapsed={hasContent}
                         >
-                            {/* Multi-Agent Workforce nested inside Thinking */}
-                            {taskExecutionState && taskExecutionState.isActive && (
+                            {/* Multi-Agent Workforce collapses INTO Thinking once completed */}
+                            {taskExecutionState && !taskExecutionState.isActive && (
                                 <div className="mt-3 pt-3 border-t border-slate-700/30">
                                     <TaskExecutionWidget state={taskExecutionState} />
                                 </div>
                             )}
                         </ThoughtProcessWidget>
+                    )}
+
+                    {/* Multi-Agent Workforce — shown BELOW thinking while actively running */}
+                    {taskExecutionState && taskExecutionState.isActive && (
+                        <TaskExecutionWidget state={taskExecutionState} />
                     )}
 
                     {/* Content — rendered BELOW thinking */}
@@ -165,6 +170,28 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     const code = String(children).replace(/\n$/, "");
                                     if (match) return <CodeBlock language={match[1]}>{code}</CodeBlock>;
                                     return <code className="bg-slate-800 px-1.5 py-0.5 rounded text-primary text-sm font-mono" {...props}>{children}</code>;
+                                },
+                                table({ children }) {
+                                    return (
+                                        <div className="overflow-x-auto my-4 rounded-xl border border-slate-700/30">
+                                            <table className="w-full border-collapse text-sm">{children}</table>
+                                        </div>
+                                    );
+                                },
+                                thead({ children }) {
+                                    return <thead className="bg-gradient-to-r from-primary/10 to-accent-purple/8 border-b border-primary/20">{children}</thead>;
+                                },
+                                tbody({ children }) {
+                                    return <tbody>{children}</tbody>;
+                                },
+                                tr({ children }) {
+                                    return <tr className="border-b border-slate-700/20 transition-colors hover:bg-white/[0.03]">{children}</tr>;
+                                },
+                                th({ children }) {
+                                    return <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-slate-200 whitespace-nowrap">{children}</th>;
+                                },
+                                td({ children }) {
+                                    return <td className="px-4 py-2 text-slate-300 text-xs leading-relaxed">{children}</td>;
                                 },
                             }}>{message.content}</ReactMarkdown>
                         </div>
