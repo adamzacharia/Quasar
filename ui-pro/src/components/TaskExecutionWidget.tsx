@@ -289,7 +289,7 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
     const hasErrors      = Array.from(state.tasks.values()).some(t => t.status === "error");
 
     return (
-        <div className="bg-[#1a2a44]/60 border border-slate-700/40 rounded-2xl overflow-hidden max-w-2xl my-3 backdrop-blur-sm">
+        <div className="bg-slate-900/40 border border-slate-700/30 rounded-xl overflow-hidden w-full my-1 backdrop-blur-sm">
             {/* Header — matches the "Thinking" widget style */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-700/30">
                 <div className="flex items-center gap-2.5">

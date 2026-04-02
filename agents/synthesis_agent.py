@@ -33,6 +33,8 @@ Guidelines:
 - Cite specific values (beam sizes, RMS, frequencies, observation counts) from the data.
 - Highlight the best dataset(s) based on user criteria (e.g. highest resolution, best sensitivity).
 - Use markdown formatting: tables, bullet points, bold for key values.
+- TABLES: ALWAYS use proper Markdown table syntax with | pipes and | --- | separators.
+  Never output space-aligned text — it does not render correctly in the UI.
 - If any sub-agent failed, note what data is missing and suggest alternatives.
 - Be concise but thorough — this is the final answer the user sees.
 """

@@ -3,6 +3,13 @@
 import { create } from "zustand";
 import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist } from "./types";
 import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
+import {
+    fetchConversations as apiFetchConversations,
+    fetchConversationMessages as apiFetchMessages,
+    deleteConversationApi,
+    type ServerConversation,
+    type ServerMessage,
+} from "./api";
 
 interface ChatStore {
     conversations: Conversation[];
@@ -21,6 +28,10 @@ interface ChatStore {
     taskChecklist: TaskChecklist | null;
     taskExecutionActive: boolean;
     savedPapers: Paper[];
+    // Conversation history loading state
+    _loadedConversationIds: Set<string>;
+    _conversationsLoaded: boolean;
+
     setActiveConversation: (id: string | null) => void;
     addMessage: (message: Message) => void;
     updateLastAssistantMessage: (content: string) => void;
@@ -43,10 +54,37 @@ interface ChatStore {
     clearTaskExecution: () => void;
     savePaper: (paper: Paper) => void;
     removePaper: (paperId: string) => void;
+    // Server-sync actions
+    loadConversations: (token: string) => Promise<void>;
+    loadConversationMessages: (conversationId: string, token: string) => Promise<void>;
+    deleteConversation: (conversationId: string, token: string) => Promise<void>;
+    setActiveConversationId: (id: string | null) => void;
+    clearAllConversations: () => void;
 }
 
 function generateId(): string {
     return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+function serverMessageToLocal(msg: ServerMessage, index: number): Message {
+    return {
+        id: `srv-${index}-${Date.now().toString(36)}`,
+        role: msg.role as Message["role"],
+        content: msg.content || "",
+        type: (msg.type || "text") as Message["type"],
+        timestamp: new Date(),
+    };
+}
+
+function serverConvToLocal(conv: ServerConversation): Conversation {
+    return {
+        id: conv.id,
+        title: conv.title || "New Chat",
+        createdAt: new Date(conv.created_at),
+        updatedAt: new Date(conv.updated_at),
+        messages: [],
+        model: "",
+    };
 }
 
 export const useChatStore = create<ChatStore>((set, get) => ({
@@ -75,6 +113,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     taskChecklist: null,
     taskExecutionActive: false,
     savedPapers: [],
+    _loadedConversationIds: new Set(),
+    _conversationsLoaded: false,
 
     setActiveConversation: (id) => set((state) => {
         if (state.activeConversationId && state.messages.length > 0) {
@@ -285,4 +325,69 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     removePaper: (paperId) => set((s) => ({
         savedPapers: s.savedPapers.filter(p => p.id !== paperId),
     })),
+
+    // ── Server-sync Actions ─────────────────────────────────────────────────
+
+    loadConversations: async (token: string) => {
+        const serverConvos = await apiFetchConversations(token);
+        const localConvos = serverConvos.map(serverConvToLocal);
+        set({
+            conversations: localConvos,
+            _conversationsLoaded: true,
+        });
+    },
+
+    loadConversationMessages: async (conversationId: string, token: string) => {
+        const loaded = get()._loadedConversationIds;
+        if (loaded.has(conversationId)) return; // already fetched
+
+        const serverMsgs = await apiFetchMessages(conversationId, token);
+        const localMsgs = serverMsgs.map(serverMessageToLocal);
+
+        const newLoaded = new Set(loaded);
+        newLoaded.add(conversationId);
+
+        set((state) => {
+            // Update the conversation's messages cache
+            const updatedConvos = state.conversations.map(c =>
+                c.id === conversationId ? { ...c, messages: localMsgs } : c
+            );
+
+            // If this is the active conversation, set messages
+            const updates: Partial<ChatStore> = {
+                conversations: updatedConvos,
+                _loadedConversationIds: newLoaded,
+            };
+            if (state.activeConversationId === conversationId) {
+                (updates as { messages: Message[] }).messages = localMsgs;
+            }
+            return updates as ChatStore;
+        });
+    },
+
+    deleteConversation: async (conversationId: string, token: string) => {
+        const ok = await deleteConversationApi(conversationId, token);
+        if (!ok) return;
+
+        set((state) => {
+            const newLoaded = new Set(state._loadedConversationIds);
+            newLoaded.delete(conversationId);
+            return {
+                conversations: state.conversations.filter(c => c.id !== conversationId),
+                activeConversationId: state.activeConversationId === conversationId ? null : state.activeConversationId,
+                messages: state.activeConversationId === conversationId ? [] : state.messages,
+                _loadedConversationIds: newLoaded,
+            };
+        });
+    },
+
+    setActiveConversationId: (id) => set({ activeConversationId: id }),
+
+    clearAllConversations: () => set({
+        conversations: [],
+        activeConversationId: null,
+        messages: [],
+        _loadedConversationIds: new Set(),
+        _conversationsLoaded: false,
+    }),
 }));

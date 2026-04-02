@@ -157,6 +157,7 @@ class GoogleLoginRequest(BaseModel):
 
 # ── Auth Service Instance ──
 from services.auth import AuthService
+from services.conversation_service import ConversationService
 from services.provider_file_service import (
     ProviderFileError,
     ProviderFileService,
@@ -164,6 +165,7 @@ from services.provider_file_service import (
 )
 from core.llm_client import detect_provider
 auth_service = AuthService()
+conversation_service = ConversationService()
 provider_file_service = ProviderFileService()
 
 def get_current_user(authorization: Optional[str] = Header(None)):
@@ -284,6 +286,18 @@ def _stream_chat_response(
     requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or "gpt-4o"
     provider = detect_provider(requested_model)
     current_user_id = current_user.get("sub") if current_user else None
+
+    # ── Conversation persistence: auto-create + save user message ──────
+    conv_id = request.conversation_id
+    if current_user_id:
+        try:
+            if not conv_id:
+                title = conversation_service.generate_title_from_message(request.message)
+                conv_id = conversation_service.create_conversation(current_user_id, title)
+                logger.info(f"[CHAT] Auto-created conversation {conv_id} for user {current_user_id}")
+            conversation_service.save_message(conv_id, "user", request.message)
+        except Exception as e:
+            logger.warning(f"[CHAT] Failed to persist user message: {e}")
 
     if attachment_context is None and provider in {"openai", "anthropic", "google"}:
         attachment_context = provider_file_service.get_active_files(
@@ -548,6 +562,18 @@ def _stream_chat_response(
                 data = json.dumps({"type": "token", "content": response_text})
                 yield f"data: {data}\n\n"
 
+            # ── Persist assistant response to DB ──────────────────────
+            if current_user_id and conv_id and response_text:
+                try:
+                    conversation_service.save_message(conv_id, "assistant", response_text)
+                except Exception as e:
+                    logger.warning(f"[CHAT] Failed to persist assistant message: {e}")
+
+            # Send back the conversation_id so the frontend can track it
+            if conv_id:
+                meta_event = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
+                yield f"data: {meta_event}\n\n"
+
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -802,6 +828,52 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     }
 
 
+# ── Conversation History Endpoints ──────────────────────────────
+
+@app.get("/api/conversations")
+async def list_conversations(current_user: dict = Depends(get_current_user)):
+    """List a user's conversations, most recent first."""
+    user_id = current_user["sub"]
+    convos = conversation_service.get_user_conversations(user_id, limit=50)
+    return {"conversations": convos}
+
+
+@app.post("/api/conversations")
+async def create_conversation_endpoint(req: ConversationCreate, current_user: dict = Depends(get_current_user)):
+    """Create a new empty conversation."""
+    user_id = current_user["sub"]
+    conv_id = conversation_service.create_conversation(user_id, req.title)
+    return {"id": conv_id, "title": req.title}
+
+
+@app.get("/api/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Fetch all messages for a conversation."""
+    messages = conversation_service.get_conversation_messages(conversation_id)
+    return {"messages": messages}
+
+
+class ConversationTitleUpdate(BaseModel):
+    title: str
+
+@app.put("/api/conversations/{conversation_id}/title")
+async def update_conversation_title_endpoint(
+    conversation_id: str,
+    req: ConversationTitleUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update a conversation's title."""
+    conversation_service.update_conversation_title(conversation_id, req.title)
+    return {"status": "ok"}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation_endpoint(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete a conversation and all its messages."""
+    conversation_service.delete_conversation(conversation_id)
+    return {"status": "ok"}
+
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
     """Stream a chat response via SSE using the shared chat pipeline."""
@@ -894,6 +966,10 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
             "multi-archive cross-matching, and web search for real-time info.\n"
             "- If asked about observations, cite ALMA bands, frequencies, resolutions.\n"
             "- Be concise, scientific, and action-oriented.\n"
+            "- FORMATTING: Always use proper Markdown. For tabular data, ALWAYS use "
+            "Markdown table syntax with | pipes and | --- | header separators. "
+            "Never use space-aligned text for tables. Use ## headings, **bold** for "
+            "key values, and bullet lists for structure.\n"
             f"- Current date: {_dt.now().strftime('%Y-%m-%d')}\n"
         )
 

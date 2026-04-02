@@ -432,6 +432,18 @@ GUIDELINES:
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
+FORMATTING RULES:
+- **ALWAYS use proper Markdown** for your final output. The UI renders full GitHub-Flavored Markdown.
+- **TABLES**: Whenever you present tabular data (types, descriptions, comparisons, summaries), you MUST use proper Markdown table syntax with pipe characters and header separators. Example:
+  | Type | Description | Format |
+  | --- | --- | --- |
+  | Science data | Final calibrated data | FITS |
+  Never use space-aligned plain text for tabular data — it will not render correctly.
+- **HEADINGS**: Use ## and ### for sections, not numbered lists for top-level categories.
+- **BOLD** key values, observatory names, and important findings.
+- **BULLET LISTS**: Use - for lists of items or key points.
+- Keep your response well-structured, scannable, and visually organized.
+
 Current Context:
 Date: {datetime.now().strftime("%Y-%m-%d")}
 

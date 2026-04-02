@@ -8,7 +8,7 @@ import { useAuthStore } from "../lib/auth-store";
 import {
     Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon
+    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
 
@@ -243,20 +243,46 @@ export function Sidebar() {
     const {
         conversations, activeConversationId, setActiveConversation,
         createNewConversation, selectedModel, availableModels, setSelectedModel,
-        fetchModels,
+        fetchModels, loadConversations, loadConversationMessages,
+        deleteConversation, clearAllConversations,
     } = useChatStore();
 
-    const { user, logout, isAuthenticated, openAuthModal } = useAuthStore();
+    const { user, logout, isAuthenticated, openAuthModal, token } = useAuthStore();
     const pathname = usePathname();
 
     // Fetch model list from backend on mount
     useEffect(() => { fetchModels(); }, [fetchModels]);
+
+    // Load conversations from server when authenticated
+    useEffect(() => {
+        if (isAuthenticated && token) {
+            loadConversations(token);
+        } else {
+            clearAllConversations();
+        }
+    }, [isAuthenticated, token, loadConversations, clearAllConversations]);
 
     const [activePanel, setActivePanel] = useState<"papers" | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
 
     const togglePanel = (panel: "papers") => {
         setActivePanel((prev) => (prev === panel ? null : panel));
+    };
+
+    const handleSelectConversation = (convId: string) => {
+        setActiveConversation(convId);
+        setActivePanel(null);
+        // Load messages from server if not already loaded
+        if (token) {
+            loadConversationMessages(convId, token);
+        }
+    };
+
+    const handleDeleteConversation = (e: React.MouseEvent, convId: string) => {
+        e.stopPropagation();
+        if (token) {
+            deleteConversation(convId, token);
+        }
     };
 
     // Get user initials
@@ -294,14 +320,24 @@ export function Sidebar() {
                         {conversations.map((conv) => {
                             const isActive = conv.id === activeConversationId;
                             return (
-                                <button key={conv.id} onClick={() => { setActiveConversation(conv.id); setActivePanel(null); }}
-                                    className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-all text-left ${isActive ? "bg-slate-700/50 text-white border-l-2 border-primary" : "text-slate-300 hover:bg-slate-800/50 group"}`}>
-                                    {isActive ? <MessageSquare className="w-5 h-5 text-primary shrink-0" /> : <History className="w-5 h-5 text-slate-400 group-hover:text-primary transition-colors shrink-0" />}
-                                    <div className="flex flex-col overflow-hidden">
-                                        <span className="text-sm font-medium truncate">{conv.title}</span>
-                                        <span className="text-[10px] text-slate-500">{timeAgo(conv.updatedAt)}</span>
-                                    </div>
-                                </button>
+                                <div key={conv.id} className="relative group/item">
+                                    <button onClick={() => handleSelectConversation(conv.id)}
+                                        className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-all text-left ${isActive ? "bg-slate-700/50 text-white border-l-2 border-primary" : "text-slate-300 hover:bg-slate-800/50 group"}`}>
+                                        {isActive ? <MessageSquare className="w-5 h-5 text-primary shrink-0" /> : <History className="w-5 h-5 text-slate-400 group-hover:text-primary transition-colors shrink-0" />}
+                                        <div className="flex flex-col overflow-hidden flex-1">
+                                            <span className="text-sm font-medium truncate">{conv.title}</span>
+                                            <span className="text-[10px] text-slate-500">{timeAgo(conv.updatedAt)}</span>
+                                        </div>
+                                    </button>
+                                    {/* Delete button — visible on hover */}
+                                    <button
+                                        onClick={(e) => handleDeleteConversation(e, conv.id)}
+                                        title="Delete conversation"
+                                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-all opacity-0 group-hover/item:opacity-100"
+                                    >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
                             );
                         })}
                     </>

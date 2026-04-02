@@ -8,7 +8,6 @@ import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "../lib/types";
-import { TaskExecutionWidget } from "./TaskExecutionWidget";
 import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
@@ -27,9 +26,10 @@ export function ChatArea() {
         attachThinkingToLastMessage,
         taskGroups, taskItems, taskChecklist, taskExecutionActive,
         handleTaskGroup, handleTaskUpdate, handleTaskList, clearTaskExecution,
+        setActiveConversationId, loadConversations,
     } = useChatStore();
 
-    const { token } = useAuthStore();
+    const { token, isAuthenticated } = useAuthStore();
 
     // Use a ref so handleSend always reads the CURRENT token (avoids stale closure)
     const tokenRef = useRef<string | null>(null);
@@ -200,9 +200,19 @@ export function ChatArea() {
                         onTaskGroup: (group) => handleTaskGroup(group),
                         onTaskUpdate: (update) => handleTaskUpdate(update),
                         onTaskList: (list) => handleTaskList(list),
+                        onConversationMeta: (meta) => {
+                            // Server assigned a conversation ID — adopt it
+                            if (meta.conversation_id) {
+                                setActiveConversationId(meta.conversation_id);
+                            }
+                        },
                         onComplete: () => {
                             attachThinkingToLastMessage();
                             setStreaming(false);
+                            // Reload conversation list from server so new/updated chats appear in sidebar
+                            if (isAuthenticated && tokenRef.current) {
+                                loadConversations(tokenRef.current);
+                            }
                         },
                         onError: (error: string) => {
                             attachThinkingToLastMessage();
@@ -234,6 +244,9 @@ export function ChatArea() {
         handleTaskUpdate,
         handleTaskList,
         tokenRef,
+        setActiveConversationId,
+        loadConversations,
+        isAuthenticated,
     ]);
 
     const handleSuggestionClick = (prompt: string) => { setInputValue(prompt); handleSend(prompt); };
@@ -270,25 +283,22 @@ export function ChatArea() {
                     <div className="max-w-4xl mx-auto space-y-6">
                         {messages.map((msg, i) => {
                             const isLastAssistant = isStreaming && msg.role === "assistant" && msg.type === "text" && i === messages.length - 1;
+                            // Build task execution state to pass into the Thinking widget
+                            const execState = isLastAssistant && taskExecutionActive ? {
+                                groups: taskGroups,
+                                tasks: taskItems,
+                                checklist: taskChecklist,
+                                isActive: taskExecutionActive && isStreaming,
+                            } : null;
                             return (
-                                <>
-                                {/* Show TaskExecutionWidget before the last streaming assistant message */}
-                                {isLastAssistant && taskExecutionActive && (
-                                    <TaskExecutionWidget state={{
-                                        groups: taskGroups,
-                                        tasks: taskItems,
-                                        checklist: taskChecklist,
-                                        isActive: taskExecutionActive && isStreaming,
-                                    }} />
-                                )}
                                 <ChatMessage
                                     key={msg.id}
                                     message={msg}
                                     isStreaming={isLastAssistant}
                                     thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
                                     thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
+                                    taskExecutionState={execState}
                                 />
-                                </>
                             );
                         })}
                     </div>

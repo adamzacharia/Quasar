@@ -40,7 +40,7 @@ export const useAuthStore = create<AuthStore>()(
         }),
         {
             name: "quasar-auth",
-            partialize: (state) => ({ token: state.token }), // Only persist token
+            partialize: (state) => ({ token: state.token, user: state.user }), // Persist token + user
         }
     )
 );

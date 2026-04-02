@@ -1,7 +1,7 @@
 "use client";
 
 import { ChevronDown, Brain, CheckCircle2 } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useState, useEffect, type ReactNode } from "react";
 
 export interface ThoughtStep {
     text: string;
@@ -14,9 +14,10 @@ interface ThoughtProcessWidgetProps {
     status: "running" | "completed" | "error";
     steps: ThoughtStep[];
     forceCollapsed?: boolean;
+    children?: ReactNode;
 }
 
-export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceCollapsed }: ThoughtProcessWidgetProps) {
+export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceCollapsed, children }: ThoughtProcessWidgetProps) {
     const [seconds, setSeconds] = useState(0);
 
     useEffect(() => {
@@ -69,6 +70,7 @@ export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceC
                             </div>
                         </div>
                     ))}
+                    {children}
                 </div>
             </details>
         </div>

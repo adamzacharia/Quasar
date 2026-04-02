@@ -99,3 +99,57 @@
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #f471b5;
 }
+
+/* ── Beautiful Markdown Tables ─────────────────────────────── */
+.prose table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  margin: 1rem 0;
+  font-size: 0.8rem;
+}
+
+.prose thead {
+  background: linear-gradient(135deg, rgba(244, 113, 181, 0.12), rgba(168, 85, 247, 0.10));
+  border-bottom: 1px solid rgba(244, 113, 181, 0.25);
+}
+
+.prose thead th {
+  padding: 0.65rem 0.9rem;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #f1f5f9;
+  white-space: nowrap;
+  border-bottom: 1px solid rgba(244, 113, 181, 0.2);
+}
+
+.prose tbody tr {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+  transition: background-color 0.15s ease;
+}
+
+.prose tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.prose tbody tr:hover {
+  background: rgba(244, 113, 181, 0.06);
+}
+
+.prose tbody td {
+  padding: 0.55rem 0.9rem;
+  color: #cbd5e1;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+  vertical-align: top;
+  line-height: 1.5;
+}
+
+.prose tbody tr:last-child td {
+  border-bottom: none;
+}

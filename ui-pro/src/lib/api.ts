@@ -18,6 +18,7 @@ export interface StreamCallbacks {
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
     onTaskList?: (list: Record<string, unknown>) => void;
+    onConversationMeta?: (meta: { conversation_id: string }) => void;
     onComplete: (fullResponse: string) => void;
     onError: (error: string) => void;
 }
@@ -109,6 +110,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onTaskUpdate(parsed);
                         } else if (parsed.type === "task_list" && callbacks.onTaskList) {
                             callbacks.onTaskList(parsed);
+                        } else if (parsed.type === "conversation_meta" && callbacks.onConversationMeta) {
+                            callbacks.onConversationMeta(parsed);
                         } else if (parsed.type === "error") {
                             callbacks.onError(parsed.content);
                             return;
@@ -184,5 +187,59 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks, sig
     } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return; // user cancelled
         callbacks.onError(error instanceof Error ? error.message : "Proposal review request failed.");
+    }
+}
+
+// ── Conversation History API ────────────────────────────────────
+
+function authHeaders(token: string): Record<string, string> {
+    return { "Content-Type": "application/json", "Authorization": `Bearer ${token}` };
+}
+
+export interface ServerConversation {
+    id: string;
+    title: string;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface ServerMessage {
+    role: string;
+    content: string;
+    type: string;
+    metadata?: Record<string, unknown>;
+}
+
+export async function fetchConversations(token: string): Promise<ServerConversation[]> {
+    try {
+        const res = await fetch(`${API_BASE}/api/conversations`, { headers: authHeaders(token) });
+        if (!res.ok) return [];
+        const data = await res.json();
+        return data.conversations || [];
+    } catch {
+        return [];
+    }
+}
+
+export async function fetchConversationMessages(conversationId: string, token: string): Promise<ServerMessage[]> {
+    try {
+        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages`, { headers: authHeaders(token) });
+        if (!res.ok) return [];
+        const data = await res.json();
+        return data.messages || [];
+    } catch {
+        return [];
+    }
+}
+
+export async function deleteConversationApi(conversationId: string, token: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+            method: "DELETE",
+            headers: authHeaders(token),
+        });
+        return res.ok;
+    } catch {
+        return false;
     }
 }

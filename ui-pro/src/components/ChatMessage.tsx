@@ -10,6 +10,7 @@ import type { Message } from "../lib/types";
 import { DataTableCard } from "./DataTableCard";
 import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
+import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 
 function renderWithTags(content: string): React.ReactNode {
     const parts = content.split(/(@archive|@paper|@search)/gi);
@@ -44,9 +45,10 @@ interface ChatMessageProps {
     isStreaming?: boolean;
     thinkingSteps?: ThoughtStep[];
     thinkingStatus?: "idle" | "running" | "completed";
+    taskExecutionState?: TaskExecutionState | null;
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState }: ChatMessageProps) {
     const isUser = message.role === "user";
     const hasContent = !!message.content;
     const hasThinking = thinkingSteps && thinkingSteps.length > 0;
@@ -138,7 +140,14 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             status={thinkingStatus === "running" && !hasContent ? "running" : "completed"}
                             steps={thinkingSteps}
                             forceCollapsed={hasContent}
-                        />
+                        >
+                            {/* Multi-Agent Workforce nested inside Thinking */}
+                            {taskExecutionState && taskExecutionState.isActive && (
+                                <div className="mt-3 pt-3 border-t border-slate-700/30">
+                                    <TaskExecutionWidget state={taskExecutionState} />
+                                </div>
+                            )}
+                        </ThoughtProcessWidget>
                     )}
 
                     {/* Content — rendered BELOW thinking */}
