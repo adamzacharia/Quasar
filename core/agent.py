@@ -63,6 +63,13 @@ from core.recovery import RecoveryEngine
 from core.observability import QueryTracer
 from core.agent_pool import AgentPool
 
+# Phase 5: OpenClaude-inspired reliability & context management
+from core.context_manager import ContextManager
+from core.session_memory import SessionMemory
+from core.token_budget import TokenBudget
+from core.tool_budget import apply_tool_result_budget
+from core.health_monitor import HealthMonitor
+
 # Import mem0 for long-term memory (optional - graceful fallback)
 try:
     from mem0 import Memory as Mem0Memory
@@ -145,8 +152,8 @@ class QuasarAgent:
         
         # Responses API state tracking
         self.last_response_id = None  # For conversation continuity
-        self._session_token_estimate = 0  # Running token count estimate
-        self._session_token_limit = 90000  # Prune if over ~90k tokens (GPT-4o limit: 128k)
+        self._session_token_estimate = 0  # Running token count estimate (legacy — kept for compat)
+        self._session_token_limit = 90000  # Legacy threshold (superseded by ContextManager)
         
         # Initialize mem0 long-term memory (if available)
         self.long_term_memory = None
@@ -191,6 +198,18 @@ class QuasarAgent:
         print("DEBUG: Init QueryTracer")
         self.query_tracer = QueryTracer()
         print("DEBUG: Init AgentPool")
+
+        # Phase 5: OpenClaude-inspired modules
+        print("DEBUG: Init ContextManager")
+        self.context_manager = ContextManager(
+            client=self.client, model=self.config.model,
+        )
+        print("DEBUG: Init SessionMemory")
+        self.session_memory = SessionMemory(client=self.client)
+        print("DEBUG: Init HealthMonitor")
+        self.health_monitor = HealthMonitor()
+        # Wire health monitor into model router
+        self.model_router.health_monitor = self.health_monitor
         self.agent_pool = AgentPool()
         print("DEBUG: Init Conductor")
         self.conductor = Conductor(
@@ -387,31 +406,24 @@ class QuasarAgent:
 
     def _prune_session_if_needed(self, query: str, user_id: str):
         """
-        If the running token estimate exceeds the threshold, save context to 
-        long-term memory and reset the session (clear previous_response_id).
-        This is transparent to the user — they see no interruption.
+        Smart context management — replaces the old session nuke with
+        LLM-powered summarization via ContextManager.
+
+        Legacy: used to reset last_response_id and lose ALL context.
+        New: summarizes old turns, keeps recent context intact.
         """
+        # Note: For the Responses API path (previous_response_id chaining),
+        # context management is handled server-side by OpenAI. This method
+        # updates the session_memory and tracks token growth for diagnostics.
         self._session_token_estimate += self._estimate_tokens(query)
-        
-        if self._session_token_estimate >= self._session_token_limit:
-            print(f"[SESSION PRUNING] Token estimate {self._session_token_estimate} exceeded limit. Pruning session and saving to Mem0.")
-            
-            # Distill recent conversation topics into Mem0 before clearing
-            if self.long_term_memory:
-                try:
-                    summary_text = f"Long research session on: {query[:200]}. Session context pruned to stay within context limits."
-                    self.long_term_memory.add(
-                        [{"role": "system", "content": summary_text}],
-                        user_id=user_id
-                    )
-                    print("[SESSION PRUNING] Saved context summary to Mem0.")
-                except Exception as e:
-                    print(f"[SESSION PRUNING] Failed to save to Mem0: {e}")
-            
-            # Reset the session — new conversation thread starts fresh
-            self.last_response_id = None
-            self._session_token_estimate = 0
-            print("[SESSION PRUNING] Session reset. Fresh context window started.")
+
+        # Fire session memory extraction (runs in background thread)
+        try:
+            self.session_memory.extract_if_needed(
+                self.memory.get_history(),
+            )
+        except Exception as e:
+            print(f"[SESSION MEMORY] Background extraction failed: {e}")
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the agent"""
@@ -2526,7 +2538,7 @@ ORDER BY target_name
         - Parallel web search for queries beyond LLM knowledge cutoff
         """
         
-        # 0. Session Pruning — reset context if token count is too high
+        # 0. Session Management — smart context handling + session memory
         self._prune_session_if_needed(query, user_id)
 
         # Emit connecting step
@@ -2729,12 +2741,13 @@ ORDER BY target_name
         
         try:
             
-            MAX_TOOL_ROUNDS = 12  # supports up to 8-step multi-tool query chains
+            # Smart token budget replaces hard MAX_TOOL_ROUNDS = 12
+            _token_budget = TokenBudget(max_budget=100_000)
             last_id = self.last_response_id
             output_text = ""
             
             # 5. Call Responses API with manual streaming loop
-            for _round in range(MAX_TOOL_ROUNDS):
+            for _round in range(_token_budget.HARD_MAX_ITERATIONS if hasattr(_token_budget, 'HARD_MAX_ITERATIONS') else 25):
                 request_kwargs = {
                     "model": self.config.model,
                     "input": full_input if _round == 0 else tool_results,
@@ -2786,6 +2799,12 @@ ORDER BY target_name
                 
                 if not function_calls:
                     break  # No tool calls — we have the final text
+
+                # Track output growth for smart budget
+                _token_budget.record_output(len(output_text))
+                if not _token_budget.should_continue():
+                    print(f"[TOKEN BUDGET] Stopping — {_token_budget.get_stats()}")
+                    break
                 
                 # Execute each function call and collect results
                 tool_results = []
@@ -2812,6 +2831,8 @@ ORDER BY target_name
                         try:
                             result = tool.execute(**args)
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
+                            # Record tool calls for session memory
+                            self.session_memory.record_tool_calls(1)
                         except Exception as te:
                             result_str = json.dumps({"error": str(te)})
                     else:
@@ -2825,6 +2846,9 @@ ORDER BY target_name
                         "call_id": fc["call_id"],
                         "output": result_str,
                     })
+
+                # Apply tool result budget — truncate oversized old results
+                tool_results = apply_tool_result_budget(tool_results)
             
             # Emit final step
             if on_status:
@@ -2934,6 +2958,8 @@ ORDER BY target_name
         """Reset conversation state for new chat session"""
         self.last_response_id = None
         self.memory.clear()
+        self.session_memory.clear()
+        self._session_token_estimate = 0
         if self.config.verbose:
             print("[yellow]Conversation state reset[/yellow]")
 

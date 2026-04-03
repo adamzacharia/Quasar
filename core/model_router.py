@@ -13,6 +13,8 @@ import logging
 import re
 from typing import Any, Dict, Optional
 
+from core.llm_client import detect_provider
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,6 +76,7 @@ class ModelRouter:
 
     def __init__(self, default_model: str = "gpt-4o"):
         self.default_model = default_model
+        self.health_monitor = None  # Injected by agent.py
 
     def route(self, task_description: str, agent_type: str = "general") -> str:
         """
@@ -99,13 +102,13 @@ class ModelRouter:
                     "Routed '%s' → %s (%s)",
                     agent_type, entry["model"], entry["reason"],
                 )
-                return entry["model"]
+                return self._apply_health_check(entry["model"])
 
         # Fallback: classify from description
         category = self.classify_task_type(task_description)
         entry = self.ROUTING_TABLE.get(category)
         if entry:
-            return entry["model"]
+            return self._apply_health_check(entry["model"])
 
         return self.default_model
 
@@ -133,3 +136,25 @@ class ModelRouter:
             "category": category,
             "reason": entry.get("reason", "Default routing"),
         }
+
+    def _apply_health_check(self, model: str) -> str:
+        """
+        Check if the model's provider is healthy. If not, return a fallback.
+        The static ROUTING_TABLE is unchanged — health is a filter on top.
+        """
+        if self.health_monitor is None:
+            return model
+
+        provider = detect_provider(model)
+        if self.health_monitor.is_healthy(provider):
+            return model
+
+        fallback = self.health_monitor.get_fallback_model(model, provider)
+        if fallback:
+            logger.warning(
+                "Health check: '%s' (%s) unhealthy — routing to fallback '%s'",
+                model, provider, fallback,
+            )
+            return fallback
+
+        return model  # No fallback available, try anyway

@@ -38,6 +38,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
+from core.retry import with_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -182,6 +184,7 @@ class ResponsesShim:
 
     # ── OpenAI (passthrough — native Responses API) ──────────────────────
 
+    @with_retry(max_retries=3, backoff_base=1.0)
     def _call_openai(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
         """Direct passthrough to OpenAI Responses API."""
         client = self._llm._get_openai_client()
@@ -219,6 +222,7 @@ class ResponsesShim:
 
     # ── Anthropic (Claude) ───────────────────────────────────────────────
 
+    @with_retry(max_retries=3, backoff_base=1.0)
     def _call_anthropic(
         self,
         kwargs: dict,
@@ -431,6 +435,7 @@ class ResponsesShim:
 
     # ── Google Gemini ────────────────────────────────────────────────────
 
+    @with_retry(max_retries=3, backoff_base=1.0)
     def _call_google(
         self,
         kwargs: dict,
@@ -615,6 +620,7 @@ class ResponsesShim:
 
     # ── Local LLM (Ollama / LM Studio via OpenAI-compat API) ────────────
 
+    @with_retry(max_retries=3, backoff_base=1.0)
     def _call_local(self, kwargs: dict) -> LLMResponse:
         """Translate responses.create() to OpenAI Chat Completions (local)."""
         client = self._llm._get_local_client()
