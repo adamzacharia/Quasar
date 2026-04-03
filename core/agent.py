@@ -2843,7 +2843,23 @@ ORDER BY target_name
                 if conductor_exc:
                     print(f"[WARNING] Conductor orchestration failed: {conductor_exc}. Falling back to standard path.")
                     self.query_tracer.end_trace(trace_id, "failed")
-                elif conductor_answer:
+                elif conductor_answer is not None:
+                    # Conductor ran — use its answer (even if some subtasks failed).
+                    # Guard against empty synthesis: if the model returned blank,
+                    # build a minimal fallback from the DAG status.
+                    if not conductor_answer.strip():
+                        dag_summary = self.conductor.dag.get_execution_summary()
+                        completed = dag_summary.get("completed", 0)
+                        total = dag_summary.get("total_tasks", 0)
+                        conductor_answer = (
+                            f"The multi-agent analysis completed {completed}/{total} tasks "
+                            f"but failed to synthesize a final response. Please try rephrasing "
+                            f"your question or breaking it into simpler parts."
+                        )
+                        print(f"[WARNING] Conductor synthesis returned empty. DAG summary: {dag_summary}")
+                        if on_token:
+                            on_token(conductor_answer)
+
                     self.query_tracer.end_trace(trace_id, "completed")
                     # Append parallel web search results to conductor answer
                     if _web_thread is not None:

@@ -505,7 +505,15 @@ class Conductor:
                 temperature=0.3,
                 max_output_tokens=2000,
             )
-            return resp.output_text.strip()
+            answer = resp.output_text.strip()
+            if not answer:
+                logger.warning("Synthesis model returned empty — falling back to raw results")
+                return (
+                    f"**Results for:** {query}\n\n"
+                    + results_text
+                    + "\n\n*(Synthesis returned empty — showing raw sub-agent results)*"
+                )
+            return answer
         except Exception as e:
             return (
                 f"**Results for:** {query}\n\n"
