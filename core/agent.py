@@ -16,6 +16,8 @@ This is the heart of Quasar. The QuasarAgent class:
 
 import os
 import json
+import re
+import threading
 import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -2446,6 +2448,66 @@ ORDER BY target_name
     # RESPONSES API METHOD (New Architecture)
     # ═══════════════════════════════════════════════════════════════════════════════
     
+    # ── Knowledge cutoff detection ──────────────────────────────────────────
+
+    # LLM training knowledge cutoff — GPT-4o data ends ~Oct 2024
+    _LLM_CUTOFF_YEAR = 2024
+    _LLM_CUTOFF_MONTH = 10   # October 2024
+
+    def _detect_beyond_cutoff(self, query: str) -> Optional[str]:
+        """
+        Check if a query references dates or time periods beyond the LLM's
+        training data cutoff.  Returns a web-search query string if detected,
+        else None.
+
+        Triggers on:
+        - Explicit future years:  "as of March 2025", "in 2026"
+        - Freshness keywords:    "latest", "current", "recent", "now",
+                                  "today", "this year", "this month"
+        """
+        _q = query.lower()
+
+        # 1. Explicit year mentions beyond cutoff
+        year_matches = re.findall(r'\b(20[2-9]\d)\b', query)
+        for ym in year_matches:
+            y = int(ym)
+            if y > self._LLM_CUTOFF_YEAR:
+                return query  # whole query is the search string
+
+        # 2. Month+Year combos in cutoff year but after cutoff month
+        month_year = re.findall(
+            r'(?:january|february|march|april|may|june|july|august|'
+            r'september|october|november|december)\s+(20[2-9]\d)',
+            _q,
+        )
+        month_names = {
+            'january': 1, 'february': 2, 'march': 3, 'april': 4,
+            'may': 5, 'june': 6, 'july': 7, 'august': 8,
+            'september': 9, 'october': 10, 'november': 11, 'december': 12,
+        }
+        for match in re.finditer(
+            r'(january|february|march|april|may|june|july|august|'
+            r'september|october|november|december)\s+(20[2-9]\d)',
+            _q,
+        ):
+            m_name, m_year = match.group(1), int(match.group(2))
+            if m_year > self._LLM_CUTOFF_YEAR:
+                return query
+            if m_year == self._LLM_CUTOFF_YEAR and month_names[m_name] > self._LLM_CUTOFF_MONTH:
+                return query
+
+        # 3. Freshness keywords ("latest", "current", "as of today", etc.)
+        freshness_patterns = [
+            r'\b(?:latest|current|up[- ]?to[- ]?date|as of today|right now)\b',
+            r'\brecent(?:ly)?\b.*\b(?:data|status|update|release)\b',
+            r'\bthis (?:year|month|week)\b',
+        ]
+        for pat in freshness_patterns:
+            if re.search(pat, _q):
+                return query
+
+        return None
+
     def stream_response_api(
         self,
         query: str,
@@ -2461,6 +2523,7 @@ ORDER BY target_name
         - Optional MCP tool connection
         - mem0 long-term memory for cross-session facts
         - Token streaming via `on_token` callback
+        - Parallel web search for queries beyond LLM knowledge cutoff
         """
         
         # 0. Session Pruning — reset context if token count is too high
@@ -2470,6 +2533,33 @@ ORDER BY target_name
         if on_status:
             on_status("Connecting to QUASAR engine", "running")
             on_status("Connecting to QUASAR engine", "completed")
+
+        # 0a. Knowledge-cutoff detection — launch parallel web search
+        _web_search_query = self._detect_beyond_cutoff(query)
+        _web_result_holder = {}   # will be filled by background thread
+
+        if _web_search_query:
+            if on_status:
+                on_status(
+                    "⚡ Time period beyond training knowledge cutoff detected — "
+                    "searching the web in parallel",
+                    "running",
+                )
+
+            def _bg_web_search():
+                try:
+                    _web_result_holder["data"] = self._tavily_web_search(
+                        query=_web_search_query,
+                        max_results=5,
+                        search_depth="advanced",
+                    )
+                except Exception as _e:
+                    _web_result_holder["error"] = str(_e)
+
+            _web_thread = threading.Thread(target=_bg_web_search, daemon=True)
+            _web_thread.start()
+        else:
+            _web_thread = None
 
         # 1. Smart RAG — only search documentation for queries that likely
         #    relate to ALMA/radio astronomy/technical documentation.
@@ -2605,6 +2695,33 @@ ORDER BY target_name
                     self.query_tracer.end_trace(trace_id, "failed")
                 elif conductor_answer:
                     self.query_tracer.end_trace(trace_id, "completed")
+                    # Append parallel web search results to conductor answer
+                    if _web_thread is not None:
+                        _web_thread.join(timeout=15)
+                        if on_status:
+                            on_status(
+                                "⚡ Time period beyond training knowledge cutoff detected — "
+                                "searching the web in parallel",
+                                "completed",
+                            )
+                        web_data = _web_result_holder.get("data")
+                        if web_data and web_data.get("success"):
+                            web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
+                            web_section += "*The following information was retrieved from the web "
+                            web_section += "because your query references a time period beyond "
+                            web_section += "the model's training data cutoff.*\n\n"
+                            if web_data.get("answer"):
+                                web_section += f"**Summary:** {web_data['answer']}\n\n"
+                            for i, r in enumerate(web_data.get("results", []), 1):
+                                title = r.get("title", "Untitled")
+                                url = r.get("url", "")
+                                snippet = r.get("snippet", "")
+                                web_section += f"{i}. **[{title}]({url})**\n"
+                                web_section += f"   {snippet[:300]}\n\n"
+                            conductor_answer += web_section
+                            if on_token:
+                                on_token(web_section)
+                            print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results to conductor response")
                     return conductor_answer
                 # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:
@@ -2720,6 +2837,41 @@ ORDER BY target_name
                     on_token(output_text)
             
             print(f"[DEBUG] Response text length: {len(output_text)}")
+
+            # 7a. Append parallel web search results if available
+            if _web_thread is not None:
+                _web_thread.join(timeout=15)  # wait up to 15s for web results
+                if on_status:
+                    on_status(
+                        "⚡ Time period beyond training knowledge cutoff detected — "
+                        "searching the web in parallel",
+                        "completed",
+                    )
+                web_data = _web_result_holder.get("data")
+                if web_data and web_data.get("success"):
+                    web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
+                    web_section += "*The following information was retrieved from the web "
+                    web_section += "because your query references a time period beyond "
+                    web_section += "the model's training data cutoff.*\n\n"
+
+                    # Synthesised answer from Tavily
+                    if web_data.get("answer"):
+                        web_section += f"**Summary:** {web_data['answer']}\n\n"
+
+                    # Individual sources
+                    for i, r in enumerate(web_data.get("results", []), 1):
+                        title = r.get("title", "Untitled")
+                        url = r.get("url", "")
+                        snippet = r.get("snippet", "")
+                        web_section += f"{i}. **[{title}]({url})**\n"
+                        web_section += f"   {snippet[:300]}\n\n"
+
+                    output_text += web_section
+                    if on_token:
+                        on_token(web_section)
+                    print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results to response")
+                elif _web_result_holder.get("error"):
+                    print(f"[WEB SEARCH] Parallel web search failed: {_web_result_holder['error']}")
             
 
             # 8. Update long-term memory — only for authenticated users
