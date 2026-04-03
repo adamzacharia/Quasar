@@ -57,6 +57,7 @@ export interface DataTableResult {
     sourceName: string;
     archiveLink?: string;  // Footer link to full dataset on ALMA/ESO portal
     hasRowLinks?: boolean; // Whether rows include per-row _link field
+    hasPreview?: boolean;  // Whether rows include per-row _preview sky thumbnail URL
 }
 
 export interface Paper {

@@ -513,6 +513,29 @@ def _stream_chat_response(
                                 if link and i < len(rows):
                                     rows[i]["_link"] = link
 
+                            # ── Inject sky preview thumbnail URLs ──────────
+                            #    Uses CDS HiPS2FITS to generate DSS2 color cutouts
+                            ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
+                            dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
+                            has_preview = False
+                            if ra_col and dec_col:
+                                for i, (_, orig_row) in enumerate(df.head(50).iterrows()):
+                                    if i >= len(rows):
+                                        break
+                                    try:
+                                        ra_v = float(orig_row[ra_col])
+                                        dec_v = float(orig_row[dec_col])
+                                        if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                                            rows[i]["_preview"] = (
+                                                f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+                                                f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
+                                                f"&fov=0.033&projection=TAN&coordsys=icrs"
+                                                f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
+                                            )
+                                            has_preview = True
+                                    except (ValueError, TypeError):
+                                        pass
+
                             metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
                             if "band_list" in df.columns:
                                 metrics.append({
@@ -538,6 +561,7 @@ def _stream_chat_response(
                                 or last_run_result.get("source", "ALMA Archive"),
                                 "archiveLink": archive_link,
                                 "hasRowLinks": any(bool(r.get("_link")) for r in rows),
+                                "hasPreview": has_preview,
                             })
                             yield f"data: {table_event}\n\n"
                             await asyncio.sleep(0.05)
@@ -1217,6 +1241,28 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                 if i < len(rows):
                                     rows[i]["_link"] = link
 
+                            # ── Inject sky preview thumbnail URLs ──────────
+                            ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
+                            dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
+                            has_preview = False
+                            if ra_col and dec_col:
+                                for i, (_, orig_row) in enumerate(df.head(50).iterrows()):
+                                    if i >= len(rows):
+                                        break
+                                    try:
+                                        ra_v = float(orig_row[ra_col])
+                                        dec_v = float(orig_row[dec_col])
+                                        if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                                            rows[i]["_preview"] = (
+                                                f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+                                                f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
+                                                f"&fov=0.033&projection=TAN&coordsys=icrs"
+                                                f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
+                                            )
+                                            has_preview = True
+                                    except (ValueError, TypeError):
+                                        pass
+
                             source = last_run_result.get("source", "ALMA")
                             filter_label = last_run_result.get("filter_label", source)
 
@@ -1240,6 +1286,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                     "rows": rows,
                                     "archiveLink": alma_link,
                                     "hasRowLinks": bool(per_row_links),
+                                    "hasPreview": has_preview,
                                 }
                             })
                             yield f"data: {data_event}\n\n"
