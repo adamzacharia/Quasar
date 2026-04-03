@@ -1,16 +1,65 @@
 "use client";
 
 import { useState } from "react";
-import { Download, ExternalLink, Link2, X, Telescope } from "lucide-react";
+import { Download, Link2, X, Telescope, BarChart3 } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
 
 interface DataTableCardProps { data: DataTableResult; }
+
+/* ── Donut chart via CSS conic-gradient ── */
+const CHART_COLORS = [
+    "#6366f1", "#8b5cf6", "#10b981", "#f59e0b",
+    "#ef4444", "#06b6d4", "#ec4899", "#84cc16",
+];
+
+function MiniDonut({
+    data, title,
+}: { data: Record<string, number>; title: string }) {
+    const entries = Object.entries(data);
+    const total = entries.reduce((s, [, v]) => s + v, 0);
+    if (total === 0) return null;
+
+    // Build conic-gradient segments
+    let cumDeg = 0;
+    const segments = entries.map(([, v], i) => {
+        const start = cumDeg;
+        cumDeg += (v / total) * 360;
+        return `${CHART_COLORS[i % CHART_COLORS.length]} ${start}deg ${cumDeg}deg`;
+    });
+
+    return (
+        <div className="flex flex-col items-center gap-1.5 min-w-[100px]">
+            <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                {title}
+            </span>
+            <div
+                className="w-14 h-14 rounded-full"
+                style={{
+                    background: `conic-gradient(${segments.join(", ")})`,
+                    mask: "radial-gradient(closest-side, transparent 55%, black 56%)",
+                    WebkitMask: "radial-gradient(closest-side, transparent 55%, black 56%)",
+                }}
+            />
+            <div className="flex flex-wrap justify-center gap-x-2 gap-y-0.5 max-w-[160px]">
+                {entries.map(([k, v], i) => (
+                    <span key={k} className="text-[9px] text-slate-400 flex items-center gap-1 whitespace-nowrap">
+                        <span
+                            className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                            style={{ background: CHART_COLORS[i % CHART_COLORS.length] }}
+                        />
+                        {k.length > 12 ? k.slice(0, 11) + "…" : k}
+                        <span className="text-slate-500">({v})</span>
+                    </span>
+                ))}
+            </div>
+        </div>
+    );
+}
 
 /* ── Lightbox overlay for zoomed sky preview ── */
 function PreviewLightbox({
     src, target, ra, dec, onClose,
 }: { src: string; target?: string; ra?: string; dec?: string; onClose: () => void }) {
-    // Build a larger version of the HiPS URL (400px, wider FOV)
     const largeSrc = src
         .replace("width=120", "width=400")
         .replace("height=120", "height=400")
@@ -58,8 +107,8 @@ function PreviewLightbox({
 
 /* ── Inline thumbnail component ── */
 function SkyThumbnail({
-    src, target, ra, dec, onClick,
-}: { src: string; target?: string; ra?: string; dec?: string; onClick: () => void }) {
+    src, target, onClick,
+}: { src: string; target?: string; onClick: () => void }) {
     const [loaded, setLoaded] = useState(false);
     const [errored, setErrored] = useState(false);
 
@@ -101,6 +150,11 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const [lightbox, setLightbox] = useState<{
         src: string; target?: string; ra?: string; dec?: string;
     } | null>(null);
+
+    const hasDemographics = data.demographics && (
+        data.demographics.bands || data.demographics.projects ||
+        data.demographics.telescopes || data.demographics.instruments
+    );
 
     // Download CSV helper
     const handleDownloadCSV = () => {
@@ -148,6 +202,32 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     </div>
                 )}
 
+                {/* ── Demographics Charts ── */}
+                {hasDemographics && (
+                    <div className="border-b border-slate-700/50 bg-slate-900/40 px-4 py-3">
+                        <div className="flex items-center gap-1.5 mb-2">
+                            <BarChart3 className="w-3.5 h-3.5 text-slate-500" />
+                            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
+                                Demographics
+                            </span>
+                        </div>
+                        <div className="flex flex-wrap items-start justify-center gap-6">
+                            {data.demographics?.bands && Object.keys(data.demographics.bands).length > 1 && (
+                                <MiniDonut data={data.demographics.bands} title="Bands" />
+                            )}
+                            {data.demographics?.telescopes && Object.keys(data.demographics.telescopes).length > 1 && (
+                                <MiniDonut data={data.demographics.telescopes} title="Telescopes" />
+                            )}
+                            {data.demographics?.instruments && Object.keys(data.demographics.instruments).length > 1 && (
+                                <MiniDonut data={data.demographics.instruments} title="Instruments" />
+                            )}
+                            {data.demographics?.projects && Object.keys(data.demographics.projects).length > 1 && (
+                                <MiniDonut data={data.demographics.projects} title="Projects" />
+                            )}
+                        </div>
+                    </div>
+                )}
+
                 {/* ── Table ── */}
                 {columns.length > 0 && rows.length > 0 ? (
                     <div className="overflow-x-auto overflow-y-auto max-h-[420px] custom-scrollbar">
@@ -189,32 +269,17 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                                     <SkyThumbnail
                                                         src={String(row["_preview"])}
                                                         target={String(row[columns[1]] ?? row[columns[0]] ?? "")}
-                                                        ra={(() => {
+                                                        onClick={() => {
                                                             const url = String(row["_preview"]);
-                                                            const m = url.match(/ra=([\d.]+)/);
-                                                            return m ? m[1] : undefined;
-                                                        })()}
-                                                        dec={(() => {
-                                                            const url = String(row["_preview"]);
-                                                            const m = url.match(/dec=(-?[\d.]+)/);
-                                                            return m ? m[1] : undefined;
-                                                        })()}
-                                                        onClick={() =>
+                                                            const raMatch = url.match(/ra=([\d.]+)/);
+                                                            const decMatch = url.match(/dec=(-?[\d.]+)/);
                                                             setLightbox({
-                                                                src: String(row["_preview"]),
+                                                                src: url,
                                                                 target: String(row[columns[1]] ?? row[columns[0]] ?? ""),
-                                                                ra: (() => {
-                                                                    const url = String(row["_preview"]);
-                                                                    const m = url.match(/ra=([\d.]+)/);
-                                                                    return m ? m[1] : undefined;
-                                                                })(),
-                                                                dec: (() => {
-                                                                    const url = String(row["_preview"]);
-                                                                    const m = url.match(/dec=(-?[\d.]+)/);
-                                                                    return m ? m[1] : undefined;
-                                                                })(),
-                                                            })
-                                                        }
+                                                                ra: raMatch ? raMatch[1] : undefined,
+                                                                dec: decMatch ? decMatch[1] : undefined,
+                                                            });
+                                                        }}
                                                     />
                                                 ) : (
                                                     <div className="w-10 h-10 rounded bg-slate-800/50 flex items-center justify-center">
@@ -273,6 +338,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     <span className="text-xs text-slate-500">
                         {rows.length} row{rows.length !== 1 ? "s" : ""} · {columns.length} col{columns.length !== 1 ? "s" : ""}
                         {data.hasPreview && " · DSS2 previews"}
+                        {data.fitsEstimate && data.fitsEstimate > 0 && ` · ~${data.fitsEstimate} FITS files`}
                     </span>
                     <div className="flex gap-2 flex-wrap justify-end">
                         <button

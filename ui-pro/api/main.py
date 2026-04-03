@@ -123,6 +123,45 @@ async def _global_exception_handler(request, exc):
         content={"detail": str(exc)},
     )
 
+
+# ── Demographics & FITS estimation helper ────────────────────
+def _compute_demographics(df) -> tuple:
+    """Compute distribution data and FITS estimate from a search DataFrame.
+    Returns (demographics_dict, fits_estimate_int).
+    """
+    import math
+    demographics: Dict[str, Dict[str, int]] = {}
+
+    if "band_list" in df.columns:
+        band_counts = df["band_list"].astype(str).value_counts().head(8)
+        demographics["bands"] = {str(k): int(v) for k, v in band_counts.items()}
+
+    if "project_code" in df.columns:
+        proj_counts = df["project_code"].value_counts().head(6)
+        demographics["projects"] = {str(k): int(v) for k, v in proj_counts.items()}
+
+    # Multi-telescope support (CADC results have obs_collection)
+    if "obs_collection" in df.columns:
+        tel_counts = df["obs_collection"].value_counts().head(8)
+        demographics["telescopes"] = {str(k): int(v) for k, v in tel_counts.items()}
+
+    if "instrument_name" in df.columns:
+        inst_counts = df["instrument_name"].value_counts().head(6)
+        demographics["instruments"] = {str(k): int(v) for k, v in inst_counts.items()}
+
+    # FITS file estimation
+    fits_estimate = 0
+    if "member_ous_uid" in df.columns:
+        unique_mous = df["member_ous_uid"].dropna().nunique()
+        fits_estimate = unique_mous * 5  # ~5 FITS products per MOUS (conservative)
+    elif "obs_publisher_did" in df.columns:
+        fits_estimate = int(df["obs_publisher_did"].dropna().nunique())
+    elif len(df) > 0:
+        fits_estimate = len(df) * 3  # Generic estimate for non-ALMA archives
+
+    return demographics, fits_estimate
+
+
 # Thread pool for running synchronous agent calls
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -462,16 +501,21 @@ def _stream_chat_response(
                             alma_display_cols = [
                                 ("project_code", "Project"),
                                 ("target_name", "Target"),
+                                ("obs_collection", "Telescope"),
+                                ("instrument_name", "Instrument"),
                                 ("band_list", "Band"),
                                 ("frequency", "Freq (GHz)"),
                                 ("min_frequency", "Min Freq (GHz)"),
                                 ("max_frequency", "Max Freq (GHz)"),
+                                ("dataproduct_type", "Type"),
+                                ("calib_level", "Cal Level"),
                                 ("spatial_resolution", "Res (arcsec)"),
                                 ("s_resolution", "Res (arcsec)"),
                                 ("t_exptime", "Exp (s)"),
                                 ("pi_name", "PI"),
                                 ("obs_release_date", "Release"),
                                 ("member_ous_uid", "MOUS ID"),
+                                ("obs_publisher_did", "Obs ID"),
                             ]
                             seen_display = set()
                             sel_cols, display_cols = [], []
@@ -536,12 +580,27 @@ def _stream_chat_response(
                                     except (ValueError, TypeError):
                                         pass
 
+                            # ── Demographics & FITS estimation ─────────────
+                            demographics, fits_estimate = _compute_demographics(df)
+
                             metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
                             if "band_list" in df.columns:
                                 metrics.append({
                                     "label": "Bands",
                                     "value": int(df["band_list"].astype(str).nunique()),
                                     "color": "purple",
+                                })
+                            if fits_estimate > 0:
+                                metrics.append({
+                                    "label": "Est. FITS",
+                                    "value": f"~{fits_estimate}",
+                                    "color": "amber",
+                                })
+                            if "obs_collection" in df.columns:
+                                metrics.append({
+                                    "label": "Telescopes",
+                                    "value": int(df["obs_collection"].nunique()),
+                                    "color": "emerald",
                                 })
 
                             archive_link = ""
@@ -562,6 +621,8 @@ def _stream_chat_response(
                                 "archiveLink": archive_link,
                                 "hasRowLinks": any(bool(r.get("_link")) for r in rows),
                                 "hasPreview": has_preview,
+                                "demographics": demographics if demographics else None,
+                                "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
                             })
                             yield f"data: {table_event}\n\n"
                             await asyncio.sleep(0.05)
@@ -1184,16 +1245,21 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             ALMA_DISPLAY_COLS = [
                                 ("project_code",    "Project"),
                                 ("target_name",     "Target"),
+                                ("obs_collection",  "Telescope"),
+                                ("instrument_name", "Instrument"),
                                 ("band_list",       "Band"),
                                 ("frequency",       "Freq (GHz)"),
                                 ("min_frequency",   "Min Freq (GHz)"),
                                 ("max_frequency",   "Max Freq (GHz)"),
+                                ("dataproduct_type", "Type"),
+                                ("calib_level",     "Cal Level"),
                                 ("spatial_resolution", "Res (arcsec)"),
                                 ("s_resolution",    "Res (arcsec)"),
                                 ("t_exptime",       "Exp (s)"),
                                 ("pi_name",         "PI"),
                                 ("obs_release_date","Release"),
                                 ("member_ous_uid",  "MOUS ID"),
+                                ("obs_publisher_did", "Obs ID"),
                             ]
                             # Only keep first match per display name (avoid duplicate Res column)
                             seen_display = set()
@@ -1266,17 +1332,26 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             source = last_run_result.get("source", "ALMA")
                             filter_label = last_run_result.get("filter_label", source)
 
-                            # Build footer ALMA archive link
+                            # Build footer archive link
                             alma_link = None
                             if "target_name" in df.columns and not df.empty:
                                 _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
                                 alma_link = f"https://almascience.eso.org/aq/?target={_tgt}"
+
+                            # ── Demographics & FITS estimation ─────────────
+                            demographics, fits_estimate = _compute_demographics(df)
 
                             metrics = [
                                 {"label": "Observations",  "value": str(len(df)), "color": "text-primary"},
                                 {"label": "Showing",       "value": str(len(rows)), "color": "text-indigo-400"},
                                 {"label": "Source",        "value": filter_label, "color": "text-emerald-400"},
                             ]
+                            if fits_estimate > 0:
+                                metrics.append({
+                                    "label": "Est. FITS",
+                                    "value": f"~{fits_estimate}",
+                                    "color": "text-amber-400",
+                                })
                             data_event = json.dumps({
                                 "type": "data",
                                 "content": {
@@ -1287,6 +1362,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                     "archiveLink": alma_link,
                                     "hasRowLinks": bool(per_row_links),
                                     "hasPreview": has_preview,
+                                    "demographics": demographics if demographics else None,
+                                    "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
                                 }
                             })
                             yield f"data: {data_event}\n\n"

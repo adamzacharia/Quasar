@@ -58,6 +58,13 @@ export interface DataTableResult {
     archiveLink?: string;  // Footer link to full dataset on ALMA/ESO portal
     hasRowLinks?: boolean; // Whether rows include per-row _link field
     hasPreview?: boolean;  // Whether rows include per-row _preview sky thumbnail URL
+    demographics?: {       // Distribution data for auto-generated charts
+        bands?: Record<string, number>;
+        projects?: Record<string, number>;
+        telescopes?: Record<string, number>;
+        instruments?: Record<string, number>;
+    };
+    fitsEstimate?: number; // Estimated number of FITS files available
 }
 
 export interface Paper {

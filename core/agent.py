@@ -429,8 +429,10 @@ class QuasarAgent:
         """Build the system prompt for the agent"""
         return f"""You are Quasar, an expert AI assistant for radio astronomy.
 
-You have access to the ALMA Science Archive via the 'alminer' library.
-Your goal is to help users find, visualize, and analyze ALMA data.
+You have access to the ALMA Science Archive via the 'alminer' library,
+and the Canadian Astronomy Data Centre (CADC) for multi-wavelength data
+from JWST, HST, JCMT, CFHT, and Gemini telescopes.
+Your goal is to help users find, visualize, and analyze astronomical data.
 
 GUIDELINES:
 - **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool.
@@ -443,6 +445,7 @@ GUIDELINES:
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
 - **DO NOT** output raw tool usage strings like `[TOOL: ...]` or JSON. Just use the Native Tool Calling feature.
 - **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
+- **MULTI-WAVELENGTH**: When users ask about JWST, HST, Hubble, or optical/infrared data, use `search_cadc_archive` instead of or in addition to ALMA search. For comprehensive coverage, search both ALMA and CADC.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
@@ -526,6 +529,29 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "max_results": {"type": "integer", "description": "Max results"}
                 },
                 "required": ["min_freq_ghz", "max_freq_ghz"]
+            }
+        ))
+
+        # ── CADC Multi-wavelength Archive Search ──────────────────
+        self.tool_registry.register(Tool(
+            name="search_cadc_archive",
+            description=(
+                "Search the Canadian Astronomy Data Centre (CADC) for multi-wavelength observations "
+                "from JWST, HST, JCMT, CFHT, Gemini, and other telescopes. Uses the IVOA ObsCore TAP "
+                "service. Complements ALMA searches with optical/infrared/submm data."
+            ),
+            function=self._search_cadc,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Target name to resolve via SIMBAD (e.g. 'M31', 'TW Hya')"},
+                    "ra":          {"type": "number", "description": "RA in decimal degrees (ICRS). Used if target_name is not given."},
+                    "dec":         {"type": "number", "description": "Dec in decimal degrees (ICRS). Used if target_name is not given."},
+                    "radius":      {"type": "number", "description": "Search radius in degrees. Default 0.05 (~3 arcmin).", "default": 0.05},
+                    "collection":  {"type": "string", "description": "Filter by telescope collection (e.g. 'JWST', 'HST', 'JCMT', 'CFHT', 'Gemini'). Leave empty for all."},
+                    "max_results": {"type": "integer", "description": "Maximum results to return. Default 100.", "default": 100},
+                },
+                "required": []
             }
         ))
 
@@ -1513,6 +1539,118 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    @log_tool
+    def _search_cadc(self, target_name: Optional[str] = None,
+                     ra: Optional[float] = None, dec: Optional[float] = None,
+                     radius: float = 0.05, collection: Optional[str] = None,
+                     max_results: int = 100) -> Dict[str, Any]:
+        """Search CADC archive for multi-wavelength observations (JWST, HST, JCMT, etc.)."""
+        try:
+            import pyvo
+
+            # Resolve target name to coordinates if needed
+            if target_name and (ra is None or dec is None):
+                try:
+                    from astroquery.simbad import Simbad
+                    result = Simbad.query_object(target_name)
+                    if result is not None and len(result) > 0:
+                        ra = float(result["RA"][0].replace(" ", ":").split(":")[0]) * 15 + \
+                             float(result["RA"][0].replace(" ", ":").split(":")[1]) * 15/60 + \
+                             float(result["RA"][0].replace(" ", ":").split(":")[2]) * 15/3600
+                        dec_parts = result["DEC"][0].replace(" ", ":").split(":")
+                        dec_sign = -1 if dec_parts[0].startswith("-") else 1
+                        dec = dec_sign * (abs(float(dec_parts[0])) + float(dec_parts[1])/60 + float(dec_parts[2])/3600)
+                    else:
+                        return {"success": False, "error": f"Could not resolve target '{target_name}' via SIMBAD."}
+                except Exception as e:
+                    # Fallback: try using our existing resolve_target
+                    try:
+                        resolved = self._resolve_target(target_name)
+                        if resolved.get("success") and resolved.get("ra") is not None:
+                            ra = resolved["ra"]
+                            dec = resolved["dec"]
+                        else:
+                            return {"success": False, "error": f"Could not resolve '{target_name}': {e}"}
+                    except Exception:
+                        return {"success": False, "error": f"Could not resolve '{target_name}': {e}"}
+
+            if ra is None or dec is None:
+                return {"success": False, "error": "Provide target_name or (ra, dec) coordinates."}
+
+            # Build ADQL query against CADC's IVOA ObsCore
+            collection_filter = ""
+            if collection:
+                collection_filter = f"AND obs_collection = '{collection.upper()}'"
+
+            adql = f"""
+            SELECT TOP {max_results}
+                obs_collection, target_name, s_ra, s_dec,
+                instrument_name, dataproduct_type, calib_level,
+                t_exptime, em_min, em_max,
+                obs_id, obs_publisher_did, access_url, access_format
+            FROM ivoa.ObsCore
+            WHERE CONTAINS(POINT('ICRS', s_ra, s_dec),
+                           CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius})) = 1
+            {collection_filter}
+            ORDER BY obs_collection, t_exptime DESC
+            """
+
+            # Query CADC TAP
+            tap_url = "https://ws.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/argus"
+            tap = pyvo.dal.TAPService(tap_url)
+            result = tap.search(adql)
+            df = result.to_table().to_pandas()
+
+            if df.empty:
+                self.last_run_result = {"type": "data", "data": df, "source": "CADC", "tool_name": "search_cadc_archive"}
+                note = f"No CADC observations found near "
+                note += f"'{target_name}'" if target_name else f"RA={ra:.4f}, Dec={dec:.4f}"
+                note += f" (radius={radius}°)"
+                if collection:
+                    note += f" for {collection}"
+                return {"success": True, "total_results": 0, "note": note}
+
+            # Build source label
+            telescopes = df["obs_collection"].unique().tolist() if "obs_collection" in df.columns else []
+            filter_label = "CADC"
+            if target_name:
+                filter_label += f" › {target_name}"
+            if collection:
+                filter_label += f" [{collection}]"
+            elif telescopes:
+                filter_label += f" [{', '.join(telescopes[:3])}]"
+
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", "data": df,
+                "source": "CADC", "filter_label": filter_label,
+                "tool_name": "search_cadc_archive"
+            }
+
+            # Build compact summary for LLM
+            _KEY = ["obs_collection", "target_name", "instrument_name", "dataproduct_type", "calib_level"]
+            _avail = [c for c in _KEY if c in df.columns]
+            _sample = df[_avail].head(5).fillna("").to_dict("records") if _avail else []
+
+            # Count by telescope
+            tel_summary = df["obs_collection"].value_counts().to_dict() if "obs_collection" in df.columns else {}
+
+            return {
+                "success": True,
+                "total_results": len(df),
+                "telescopes": tel_summary,
+                "sample_rows": _sample,
+                "note": (
+                    f"Found {len(df)} observations from {len(telescopes)} telescope(s): "
+                    f"{', '.join(f'{t} ({c})' for t, c in tel_summary.items())}. "
+                    f"Full data shown in UI table."
+                )
+            }
+        except ImportError:
+            return {"success": False, "error": "pyvo library not installed. Run: pip install pyvo"}
+        except Exception as e:
+            return {"success": False, "error": f"CADC TAP query failed: {str(e)}"}
 
     def _filter_results(self, column: str, operator: str, value: float) -> Dict[str, Any]:
         """
