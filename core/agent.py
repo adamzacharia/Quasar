@@ -2652,7 +2652,7 @@ ORDER BY target_name
         try:
             complexity = self.rlm.detector.assess(query).score if hasattr(self, 'rlm') else 0.0
             if complexity > Conductor.COMPLEXITY_THRESHOLD:
-                import asyncio, threading, json as _json
+                import asyncio, json as _json
                 trace_id = self.query_tracer.new_trace(query, user_id=user_id)
 
                 # ① Mark detection as COMPLETED immediately so the UI shows a ✓
