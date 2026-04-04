@@ -70,13 +70,21 @@ from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
 from core.health_monitor import HealthMonitor
 
-# Import mem0 for long-term memory (optional - graceful fallback)
-try:
-    from mem0 import Memory as Mem0Memory
-    MEM0_AVAILABLE = True
-except ImportError:
+# mem0 DISABLED — it pulls in sentence-transformers + PyTorch (~1–1.5GB RAM),
+# which causes OOM on 2GB Render instances. The app already uses Qdrant + RAG
+# for knowledge persistence. Set ENABLE_MEM0=1 to re-enable if you have ≥4GB.
+import os as _os_mem0
+if _os_mem0.getenv("ENABLE_MEM0", "").strip() in ("1", "true", "yes"):
+    try:
+        from mem0 import Memory as Mem0Memory
+        MEM0_AVAILABLE = True
+        print("[INFO] mem0 long-term memory enabled (ENABLE_MEM0=1)")
+    except ImportError:
+        MEM0_AVAILABLE = False
+        print("[WARNING] mem0 not installed. Long-term memory disabled.")
+else:
     MEM0_AVAILABLE = False
-    print("[WARNING] mem0 not installed. Long-term memory disabled.")
+    print("[INFO] mem0 disabled to save memory. Set ENABLE_MEM0=1 to enable.")
 
 
 

@@ -163,7 +163,7 @@ def _compute_demographics(df) -> tuple:
 
 
 # Thread pool for running synchronous agent calls
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=2)  # Keep low to avoid OOM on 2GB instances
 
 # ── Channel Routers ──────────────────────────────────────────
 try:
@@ -675,6 +675,10 @@ def _stream_chat_response(
             error_data = json.dumps({"type": "error", "content": str(e)})
             yield f"data: {error_data}\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            # Free memory between requests — critical on 2GB instances
+            import gc
+            gc.collect()
 
     return StreamingResponse(
         generate(),
