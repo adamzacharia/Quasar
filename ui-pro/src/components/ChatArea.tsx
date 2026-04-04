@@ -198,6 +198,20 @@ export function ChatArea() {
                                 notebookData: notebook as unknown as NotebookData,
                             });
                         },
+                        onImage: (img) => {
+                            // Resolve relative URL to absolute backend URL
+                            const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+                            const imageUrl = img.url.startsWith("http") ? img.url : `${apiBase}${img.url}`;
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: img.caption || "",
+                                type: "image",
+                                timestamp: new Date(),
+                                imageUrl: imageUrl,
+                                imageCaption: img.caption || "",
+                            });
+                        },
                         onTaskGroup: (group) => handleTaskGroup(group),
                         onTaskUpdate: (update) => handleTaskUpdate(update),
                         onTaskList: (list) => handleTaskList(list),

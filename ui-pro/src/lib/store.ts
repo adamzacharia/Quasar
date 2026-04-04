@@ -121,6 +121,21 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             notebookData: nb as unknown as Message["notebookData"],
         });
     }
+    // Restore rendered image as a separate "image" message
+    if (meta.image) {
+        const img = meta.image as { url: string; caption: string };
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        const imageUrl = img.url.startsWith("http") ? img.url : `${apiBase}${img.url}`;
+        messages.push({
+            id: `srv-${index}-img-${Date.now().toString(36)}`,
+            role: "assistant",
+            content: img.caption || "",
+            type: "image",
+            timestamp: new Date(),
+            imageUrl: imageUrl,
+            imageCaption: img.caption || "",
+        });
+    }
 
     return messages;
 }

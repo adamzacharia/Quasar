@@ -14,6 +14,7 @@ export interface StreamCallbacks {
     onData?: (data: Record<string, unknown>) => void;
     onPapers?: (papers: Record<string, unknown>[]) => void;
     onNotebook?: (notebook: Record<string, unknown>) => void;
+    onImage?: (image: { url: string; caption: string }) => void;
     onStatus?: (step: string, state: string) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
@@ -104,6 +105,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onPapers(parsed.papers);
                         } else if (parsed.type === "notebook" && callbacks.onNotebook) {
                             callbacks.onNotebook(parsed);
+                        } else if (parsed.type === "image" && callbacks.onImage) {
+                            callbacks.onImage(parsed);
                         } else if (parsed.type === "task_group" && callbacks.onTaskGroup) {
                             callbacks.onTaskGroup(parsed);
                         } else if (parsed.type === "task_update" && callbacks.onTaskUpdate) {

@@ -1272,6 +1272,53 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
+        # ── FITS Image Rendering Tools ─────────────────────────────
+        self.tool_registry.register(Tool(
+            name="render_fits_image",
+            description=(
+                "Download a FITS file from an archive URL and render it as a "
+                "publication-quality image displayed inline in the chat. Use this "
+                "when the user asks to SEE or VISUALIZE data. The URL should come "
+                "from a prior archive search (access_url or datalink URL)."
+            ),
+            function=self._render_fits_image,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url":      {"type": "string", "description": "Direct URL to the FITS file (from access_url, DataLink, or CADC cutout service)."},
+                    "title":    {"type": "string", "description": "Title for the rendered image (e.g., 'JWST NIRCam F200W — Hubble Ultra Deep Field')."},
+                    "colormap": {"type": "string", "description": "Matplotlib colormap. Default 'inferno'. Options: 'viridis', 'plasma', 'magma', 'gray', 'hot'."},
+                    "stretch":  {"type": "string", "enum": ["sqrt", "log", "linear", "asinh"], "description": "Pixel stretch. Default 'sqrt'."},
+                },
+                "required": ["url"]
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="overlay_fits_images",
+            description=(
+                "Download two FITS files and create an overlay composite: one rendered "
+                "as a colorscale background, the other as contours on top. Uses WCS "
+                "reprojection to align them. Perfect for showing ALMA contours on "
+                "JWST/HST colorscale images."
+            ),
+            function=self._overlay_fits_images,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "base_url":       {"type": "string", "description": "URL to the base/background FITS file (rendered as colorscale)."},
+                    "contour_url":    {"type": "string", "description": "URL to the FITS file rendered as contours on top."},
+                    "base_label":     {"type": "string", "description": "Label for the base image (e.g., 'JWST NIRCam'). Default 'JWST'."},
+                    "contour_label":  {"type": "string", "description": "Label for the contour image (e.g., 'ALMA Band 6'). Default 'ALMA'."},
+                    "base_cmap":      {"type": "string", "description": "Colormap for base image. Default 'inferno'."},
+                    "contour_levels": {"type": "integer", "description": "Number of contour levels. Default 8."},
+                },
+                "required": ["base_url", "contour_url"]
+            },
+            category="analysis"
+        ))
+
         # ── DataLink + FITS Remote Header Tools (Phase 0) ──────────
         self.tool_registry.register(Tool(
             name="list_alma_files",
@@ -1947,6 +1994,44 @@ ORDER BY target_name
                 }
                 return {"success": True, "message": f"Generated {plot_type} plot successfully"}
             return {"success": False, "error": "Plot generation returned empty"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _render_fits_image(self, url: str, title: str = "", colormap: str = "inferno",
+                           stretch: str = "sqrt") -> Dict[str, Any]:
+        """Download a FITS file and render it as a PNG image displayed in chat."""
+        try:
+            from services.fits_service import render_fits_image
+            result = render_fits_image(url, title=title, colormap=colormap, stretch=stretch)
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _overlay_fits_images(self, base_url: str, contour_url: str,
+                             base_label: str = "JWST", contour_label: str = "ALMA",
+                             base_cmap: str = "inferno",
+                             contour_levels: int = 8) -> Dict[str, Any]:
+        """Create an overlay composite of two FITS images and display it in chat."""
+        try:
+            from services.fits_service import overlay_fits_images
+            result = overlay_fits_images(
+                base_url, contour_url,
+                base_label=base_label, contour_label=contour_label,
+                base_cmap=base_cmap, contour_levels=contour_levels,
+            )
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
         except Exception as e:
             return {"success": False, "error": str(e)}
 

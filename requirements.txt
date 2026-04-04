@@ -149,6 +149,7 @@ python-dotenv
 pyvo
 requests
 scipy
+reproject
 
 rich
 

@@ -112,6 +112,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Static file serving for rendered FITS images ─────────────────
+import os as _os
+from fastapi.staticfiles import StaticFiles
+_RENDERED_IMAGES_DIR = _os.path.join(_os.path.dirname(__file__), "..", "data", "rendered_images")
+_os.makedirs(_RENDERED_IMAGES_DIR, exist_ok=True)
+app.mount("/api/images", StaticFiles(directory=_RENDERED_IMAGES_DIR), name="rendered_images")
+
 # ── Catch-all exception handler — ensures a proper JSON 500 with CORS headers ──
 from starlette.responses import JSONResponse
 
@@ -456,6 +463,7 @@ def _stream_chat_response(
             _rich_data_table = None
             _rich_papers = None
             _rich_notebook = None
+            _rich_image = None
             _rich_thinking = []
 
             while True:
@@ -658,11 +666,27 @@ def _stream_chat_response(
                         await asyncio.sleep(0.05)
 
                 elif result_type == "notebook":
-                    nb = last_run_result.get("notebook", {})
-                    if nb:
-                        notebook_event = json.dumps({"type": "notebook", **nb})
+                    nb_data = last_run_result.get("notebook_data", {})
+                    nb_title = last_run_result.get("title", "Analysis Notebook")
+                    if nb_data:
+                        notebook_event = json.dumps({
+                            "type": "notebook",
+                            "title": nb_title,
+                            "data": nb_data,
+                        })
                         yield f"data: {notebook_event}\n\n"
-                        _rich_notebook = nb  # Capture for history
+                        _rich_notebook = {"title": nb_title, "data": nb_data}
+                        await asyncio.sleep(0.05)
+
+                elif result_type == "image":
+                    img_url = last_run_result.get("image_url", "")
+                    caption = last_run_result.get("caption", "")
+                    if img_url:
+                        image_event = json.dumps({
+                            "type": "image", "url": img_url, "caption": caption,
+                        })
+                        yield f"data: {image_event}\n\n"
+                        _rich_image = {"url": img_url, "caption": caption}
                         await asyncio.sleep(0.05)
 
             if response_text and first_token:
@@ -679,6 +703,8 @@ def _stream_chat_response(
                         rich_meta["papers"] = _rich_papers
                     if _rich_notebook:
                         rich_meta["notebook"] = _rich_notebook
+                    if _rich_image:
+                        rich_meta["image"] = _rich_image
                     if _rich_thinking:
                         rich_meta["thinkingSteps"] = _rich_thinking
                     conversation_service.save_message(
@@ -1437,12 +1463,20 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                     if notebook_data:
                         nb_event = json.dumps({
                             "type": "notebook",
-                            "content": {
-                                "title": title,
-                                "data": notebook_data
-                            }
+                            "title": title,
+                            "data": notebook_data,
                         })
                         yield f"data: {nb_event}\n\n"
+                        await asyncio.sleep(0.05)
+
+                elif result_type == "image":
+                    img_url = last_run_result.get("image_url", "")
+                    caption = last_run_result.get("caption", "")
+                    if img_url:
+                        image_event = json.dumps({
+                            "type": "image", "url": img_url, "caption": caption,
+                        })
+                        yield f"data: {image_event}\n\n"
                         await asyncio.sleep(0.05)
 
             # Clear last_run_result
