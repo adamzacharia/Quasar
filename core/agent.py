@@ -2569,6 +2569,14 @@ ORDER BY target_name
                 task_description[:80], e, traceback.format_exc()
             )
             return f"[Tool execution error: {e}]"
+        finally:
+            # Free cached DataFrames between subtasks — they can be large
+            # (hundreds of rows × 20 columns) and the Conductor only uses
+            # the text output.  Without this, N sequential subtasks
+            # accumulate N DataFrames on the shared agent singleton.
+            self.last_search_results = None
+            self.last_run_result = None
+            import gc; gc.collect()
 
     def _dispatch_tool_call(self, tool_name: str, arguments_json: str) -> str:
         """
