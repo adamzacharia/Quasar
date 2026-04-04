@@ -150,6 +150,7 @@ pyvo
 requests
 scipy
 reproject
+spectral-cube
 
 rich
 

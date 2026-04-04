@@ -1319,6 +1319,56 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
+        self.tool_registry.register(Tool(
+            name="compute_moment_map",
+            description=(
+                "Download a FITS spectral cube and compute a moment map. "
+                "Moment 0 = integrated intensity (total emission). "
+                "Moment 1 = velocity field (mean velocity). "
+                "Moment 2 = velocity dispersion (turbulence). "
+                "Use this for ALMA cubes when the user asks about emission maps, "
+                "velocity fields, or line intensity maps."
+            ),
+            function=self._compute_moment_map,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url":          {"type": "string",  "description": "Direct URL to the FITS spectral cube."},
+                    "order":        {"type": "integer", "description": "Moment order: 0 (intensity), 1 (velocity), 2 (dispersion). Default 0."},
+                    "title":        {"type": "string",  "description": "Title for the rendered image."},
+                    "colormap":     {"type": "string",  "description": "Colormap for moment 0. Moment 1 uses RdBu_r, moment 2 uses magma. Default 'inferno'."},
+                    "freq_min_ghz": {"type": "number",  "description": "Optional: only use channels above this frequency (GHz) for the moment."},
+                    "freq_max_ghz": {"type": "number",  "description": "Optional: only use channels below this frequency (GHz) for the moment."},
+                },
+                "required": ["url"]
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="extract_spectrum",
+            description=(
+                "Download a FITS spectral cube and extract a 1D spectrum at a given "
+                "sky position (RA/Dec) or pixel coordinate. If no position is given, "
+                "extracts at the peak emission pixel. The spectrum is plotted as "
+                "flux vs frequency/velocity and displayed inline."
+            ),
+            function=self._extract_spectrum,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url":     {"type": "string", "description": "Direct URL to the FITS spectral cube."},
+                    "ra_deg":  {"type": "number", "description": "RA in decimal degrees (ICRS). Optional."},
+                    "dec_deg": {"type": "number", "description": "Dec in decimal degrees (ICRS). Optional."},
+                    "x_pixel": {"type": "integer", "description": "X pixel coordinate. Optional. Use if RA/Dec not available."},
+                    "y_pixel": {"type": "integer", "description": "Y pixel coordinate. Optional."},
+                    "title":   {"type": "string",  "description": "Title for the spectrum plot."},
+                },
+                "required": ["url"]
+            },
+            category="analysis"
+        ))
+
         # ── DataLink + FITS Remote Header Tools (Phase 0) ──────────
         self.tool_registry.register(Tool(
             name="list_alma_files",
@@ -2024,6 +2074,46 @@ ORDER BY target_name
                 base_url, contour_url,
                 base_label=base_label, contour_label=contour_label,
                 base_cmap=base_cmap, contour_levels=contour_levels,
+            )
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _compute_moment_map(self, url: str, order: int = 0, title: str = "",
+                            colormap: str = "inferno", freq_min_ghz: float = None,
+                            freq_max_ghz: float = None) -> Dict[str, Any]:
+        """Compute a moment map from a FITS spectral cube and display it in chat."""
+        try:
+            from services.fits_service import compute_moment_map
+            result = compute_moment_map(
+                url, order=order, title=title, colormap=colormap,
+                freq_min_ghz=freq_min_ghz, freq_max_ghz=freq_max_ghz,
+            )
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _extract_spectrum(self, url: str, ra_deg: float = None, dec_deg: float = None,
+                          x_pixel: int = None, y_pixel: int = None,
+                          title: str = "") -> Dict[str, Any]:
+        """Extract a 1D spectrum from a FITS spectral cube and display it in chat."""
+        try:
+            from services.fits_service import extract_spectrum
+            result = extract_spectrum(
+                url, ra_deg=ra_deg, dec_deg=dec_deg,
+                x_pixel=x_pixel, y_pixel=y_pixel, title=title,
             )
             if result.get("success"):
                 self.last_run_result = {
