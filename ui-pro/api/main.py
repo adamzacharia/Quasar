@@ -331,9 +331,18 @@ def _stream_chat_response(
     if current_user_id:
         try:
             if not conv_id:
+                # No conversation_id from frontend — create a new one
                 title = conversation_service.generate_title_from_message(request.message)
                 conv_id = conversation_service.create_conversation(current_user_id, title)
                 logger.info(f"[CHAT] Auto-created conversation {conv_id} for user {current_user_id}")
+            else:
+                # Frontend sent a conversation_id — verify it exists in the DB
+                existing = conversation_service.get_user_conversations(current_user_id, limit=100)
+                if not any(c["id"] == conv_id for c in existing):
+                    # ID doesn't exist in DB (orphan/client-generated) — create a proper one
+                    title = conversation_service.generate_title_from_message(request.message)
+                    conv_id = conversation_service.create_conversation(current_user_id, title)
+                    logger.info(f"[CHAT] Client conv_id not found in DB, created new {conv_id}")
             conversation_service.save_message(conv_id, "user", request.message)
         except Exception as e:
             logger.warning(f"[CHAT] Failed to persist user message: {e}")

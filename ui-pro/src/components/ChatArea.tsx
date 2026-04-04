@@ -133,7 +133,8 @@ export function ChatArea() {
                 await sendChatMessage(
                     {
                         message: messageWithContext,
-                        conversation_id: activeConversationId || undefined,
+                        // Only send conversation_id if it's a server-created UUID (not a client-generated "conv-" ID)
+                        conversation_id: activeConversationId && !activeConversationId.startsWith("conv-") ? activeConversationId : undefined,
                         model: selectedModel,
                         attachments: attachments?.map(a => a.file),
                         token: tokenRef.current || undefined,  // always reads current auth state
@@ -201,8 +202,17 @@ export function ChatArea() {
                         onTaskUpdate: (update) => handleTaskUpdate(update),
                         onTaskList: (list) => handleTaskList(list),
                         onConversationMeta: (meta) => {
-                            // Server assigned a conversation ID — adopt it
+                            // Server assigned a conversation ID — adopt it and migrate the local entry
                             if (meta.conversation_id) {
+                                const oldId = useChatStore.getState().activeConversationId;
+                                // Migrate the local conversation entry from client ID to server UUID
+                                if (oldId && oldId !== meta.conversation_id) {
+                                    useChatStore.setState((state) => ({
+                                        conversations: state.conversations.map(c =>
+                                            c.id === oldId ? { ...c, id: meta.conversation_id } : c
+                                        ),
+                                    }));
+                                }
                                 setActiveConversationId(meta.conversation_id);
                             }
                         },
