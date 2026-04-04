@@ -275,12 +275,20 @@ interface TaskExecutionWidgetProps {
 
 export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
     const [seconds, setSeconds] = useState(0);
+    const [isCollapsed, setIsCollapsed] = useState(false);
 
     useEffect(() => {
         if (!state.isActive) return;
         const interval = setInterval(() => setSeconds(s => s + 1), 1000);
         return () => clearInterval(interval);
     }, [state.isActive]);
+
+    // Auto-collapse when execution completes
+    useEffect(() => {
+        if (!state.isActive && state.tasks.size > 0) {
+            setIsCollapsed(true);
+        }
+    }, [state.isActive, state.tasks.size]);
 
     if (!state.isActive && state.groups.length === 0 && !state.checklist) return null;
 
@@ -290,8 +298,13 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
 
     return (
         <div className="bg-slate-900/40 border border-slate-700/30 rounded-xl overflow-hidden w-full my-1 backdrop-blur-sm">
-            {/* Header — matches the "Thinking" widget style */}
-            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-700/30">
+            {/* Header — clickable to expand/collapse when done */}
+            <button
+                onClick={() => !state.isActive && setIsCollapsed(!isCollapsed)}
+                className={`flex items-center justify-between px-4 py-3 w-full text-left ${
+                    !state.isActive ? "cursor-pointer hover:bg-white/[0.02] transition-colors" : ""
+                } ${!isCollapsed ? "border-b border-slate-700/30" : ""}`}
+            >
                 <div className="flex items-center gap-2.5">
                     {/* Pink brain-style icon container */}
                     <div className="w-8 h-8 flex items-center justify-center bg-primary/20 rounded-lg">
@@ -310,37 +323,45 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
                         </span>
                     </div>
                 </div>
-                {/* Progress pill */}
-                {totalTasks > 0 && (
-                    <div className="flex items-center gap-2">
-                        <div className="h-1.5 w-20 bg-slate-700 rounded-full overflow-hidden">
-                            <div
-                                className="h-full bg-primary rounded-full transition-all duration-500"
-                                style={{ width: `${(completedTasks / totalTasks) * 100}%` }}
-                            />
+                <div className="flex items-center gap-2">
+                    {/* Progress pill */}
+                    {totalTasks > 0 && (
+                        <div className="flex items-center gap-2">
+                            <div className="h-1.5 w-20 bg-slate-700 rounded-full overflow-hidden">
+                                <div
+                                    className="h-full bg-primary rounded-full transition-all duration-500"
+                                    style={{ width: `${(completedTasks / totalTasks) * 100}%` }}
+                                />
+                            </div>
+                            <span className="text-[10px] font-mono text-slate-400">
+                                {completedTasks}/{totalTasks}
+                            </span>
                         </div>
-                        <span className="text-[10px] font-mono text-slate-400">
-                            {completedTasks}/{totalTasks}
-                        </span>
-                    </div>
-                )}
-            </div>
+                    )}
+                    {/* Expand/collapse chevron — only when done */}
+                    {!state.isActive && (
+                        <ChevronDown className={`w-4 h-4 text-slate-500 transition-transform duration-200 ${isCollapsed ? "" : "rotate-180"}`} />
+                    )}
+                </div>
+            </button>
 
-            {/* Content */}
-            <div className="px-2 py-2 space-y-1 max-h-[400px] overflow-y-auto custom-scrollbar">
-                {/* Full checklist plan first */}
-                {state.checklist && (
-                    <TaskChecklistWidget checklist={state.checklist} />
-                )}
-                {/* Divider between plan and live groups */}
-                {state.checklist && state.groups.length > 0 && (
-                    <div className="border-t border-slate-700/30 mx-3 my-1" />
-                )}
-                {/* Live parallel execution groups */}
-                {state.groups.map(group => (
-                    <TaskGroupWidget key={group.groupId} group={group} tasks={state.tasks} />
-                ))}
-            </div>
+            {/* Content — collapsible when done */}
+            {!isCollapsed && (
+                <div className="px-2 py-2 space-y-1 max-h-[400px] overflow-y-auto custom-scrollbar">
+                    {/* Full checklist plan first */}
+                    {state.checklist && (
+                        <TaskChecklistWidget checklist={state.checklist} />
+                    )}
+                    {/* Divider between plan and live groups */}
+                    {state.checklist && state.groups.length > 0 && (
+                        <div className="border-t border-slate-700/30 mx-3 my-1" />
+                    )}
+                    {/* Live parallel execution groups */}
+                    {state.groups.map(group => (
+                        <TaskGroupWidget key={group.groupId} group={group} tasks={state.tasks} />
+                    ))}
+                </div>
+            )}
         </div>
     );
 }

@@ -284,18 +284,11 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             status={thinkingStatus === "running" && !hasContent ? "running" : "completed"}
                             steps={thinkingSteps}
                             forceCollapsed={hasContent}
-                        >
-                            {/* Multi-Agent Workforce collapses INTO Thinking once completed */}
-                            {taskExecutionState && !taskExecutionState.isActive && (
-                                <div className="mt-3 pt-3 border-t border-slate-700/30">
-                                    <TaskExecutionWidget state={taskExecutionState} />
-                                </div>
-                            )}
-                        </ThoughtProcessWidget>
+                        />
                     )}
 
-                    {/* Multi-Agent Workforce — shown BELOW thinking while actively running */}
-                    {taskExecutionState && taskExecutionState.isActive && (
+                    {/* Multi-Agent Workforce — always visible (full when active, collapsed when done) */}
+                    {taskExecutionState && (
                         <TaskExecutionWidget state={taskExecutionState} />
                     )}
 

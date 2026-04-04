@@ -67,7 +67,7 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
    - "archive": ALMA/VLA search, target resolution, file listing, downloads
    - "literature": NASA ADS paper search, author metrics, BibTeX export
    - "analysis": Spectral line ID, FITS header inspection, CASA scripting, cross-match
-   - "viz": Plotting, sky maps, Jupyter notebook generation
+   - "viz": FITS image rendering (render_fits_image), contour overlays (overlay_fits_images), moment maps (compute_moment_map), spectrum extraction (extract_spectrum), Jupyter notebook generation
    - "web": Web search, page navigation, real-time info
    - "synthesis": Final answer assembly, comparison tables (runs LAST)
 
