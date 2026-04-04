@@ -1418,16 +1418,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             self.last_search_results = results
             self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_position"}
-            _KEY_COLS = ["project_code", "target_name", "band_list", "frequency",
-                         "min_frequency", "max_frequency", "spatial_resolution", "pi_name"]
-            _avail = [c for c in _KEY_COLS if c in results.columns]
-            _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
                 "total_results": len(results),
                 "ra": ra, "dec": dec, "radius_deg": radius,
-                "sample_rows": _sample,
-                "note": f"Found {len(results)} observations. Full dataset shown in UI table."
+                "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1507,17 +1502,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
 
             # Compact 5-row summary to LLM
-            _KEY = ["project_code", "target_name", "band_list", "frequency",
-                    "spatial_resolution", "s_resolution", "pi_name"]
-            _avail = [c for c in _KEY if c in results.columns]
-            _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
                 "total_results": len(results),
                 "filters_applied": filter_parts,
                 "target": target_name,
-                "sample_rows": _sample,
-                "note": f"Found {len(results)} observations matching your constraints. Full data shown in UI table."
+                "note": f"Found {len(results)} observations matching your constraints. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1536,14 +1526,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                                     "source": "ALMA",
                                     "filter_label": f"ALMA › {min_freq_ghz}–{max_freq_ghz} GHz",
                                     "tool_name": "search_by_frequency"}
-            _KEY = ["project_code", "target_name", "band_list", "frequency", "spatial_resolution"]
-            _avail = [c for c in _KEY if c in results.columns]
-            _sample = results[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
                 "total_results": len(results),
-                "sample_rows": _sample,
-                "note": f"Found {len(results)} observations at {min_freq_ghz}–{max_freq_ghz} GHz. Full table shown in UI."
+                "note": f"Found {len(results)} observations at {min_freq_ghz}–{max_freq_ghz} GHz. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1637,10 +1623,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
 
             # Build compact summary for LLM
-            _KEY = ["obs_collection", "target_name", "instrument_name", "dataproduct_type", "calib_level"]
-            _avail = [c for c in _KEY if c in df.columns]
-            _sample = df[_avail].head(5).fillna("").to_dict("records") if _avail else []
-
             # Count by telescope
             tel_summary = df["obs_collection"].value_counts().to_dict() if "obs_collection" in df.columns else {}
 
@@ -1648,11 +1630,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "success": True,
                 "total_results": len(df),
                 "telescopes": tel_summary,
-                "sample_rows": _sample,
                 "note": (
                     f"Found {len(df)} observations from {len(telescopes)} telescope(s): "
                     f"{', '.join(f'{t} ({c})' for t, c in tel_summary.items())}. "
-                    f"Full data shown in UI table."
+                    f"Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
                 )
             }
         except ImportError:
@@ -1720,16 +1701,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "tool_name": "filter_results",
             }
 
-            _KEY = ["project_code", "target_name", "band_list", "frequency", "spatial_resolution"]
-            _avail = [c for c in _KEY if c in df.columns]
-            _sample = df[_avail].head(5).fillna("").to_dict("records") if _avail else []
             return {
                 "success": True,
                 "rows_before": before,
                 "rows_after": len(df),
                 "filter": f"{real_col} {operator} {value}",
-                "sample_rows": _sample,
-                "note": f"Filtered from {before} to {len(df)} rows. Updated table shown in UI."
+                "note": f"Filtered from {before} to {len(df)} rows. Updated table shown in UI. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
