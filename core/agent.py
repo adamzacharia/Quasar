@@ -2697,6 +2697,7 @@ ORDER BY target_name
 
                 # Execute each tool call
                 tool_results = []
+                tool_summaries = []   # Track what tools did for fallback text
                 for tc in tool_calls:
                     fn_name = getattr(tc, "name", "")
                     fn_args = getattr(tc, "arguments", "{}")
@@ -2706,6 +2707,22 @@ ORDER BY target_name
                     result = self._dispatch_tool_call(fn_name, fn_args)
                     if on_status:
                         on_status(f"Calling tool: {fn_name}", "completed")
+
+                    # ── Capture image results IMMEDIATELY after each tool call ──
+                    if self.last_run_result and self.last_run_result.get("type") == "image":
+                        if hasattr(self, '_conductor_images'):
+                            self._conductor_images.append(self.last_run_result.copy())
+                        img_url = self.last_run_result.get("image_url", "")
+                        caption = self.last_run_result.get("caption", "")
+                        tool_summaries.append(
+                            f"✅ Image rendered via {fn_name}: {caption} "
+                            f"[image_url: {img_url}]"
+                        )
+                    else:
+                        # Track non-image tool results too
+                        result_str = str(result)[:500]
+                        tool_summaries.append(f"Tool {fn_name}: {result_str}")
+
                     tool_results.append({
                         "type": "function_call_output",
                         "call_id": call_id,
@@ -2722,7 +2739,13 @@ ORDER BY target_name
                     max_output_tokens=2000,
                 )
 
-            return output_text.strip() if output_text else "[No output from subtask]"
+            # If the LLM produced text, use it. Otherwise fall back to tool summaries.
+            if output_text.strip():
+                return output_text.strip()
+            elif tool_summaries:
+                return "\n".join(tool_summaries)
+            else:
+                return "[No output from subtask]"
 
         except Exception as e:
             import traceback
@@ -2732,15 +2755,7 @@ ORDER BY target_name
             )
             return f"[Tool execution error: {e}]"
         finally:
-            # Save any image result BEFORE wiping — the conductor accumulator
-            # will forward these to the SSE pipeline after orchestration ends.
-            if self.last_run_result and self.last_run_result.get("type") == "image":
-                if hasattr(self, '_conductor_images'):
-                    self._conductor_images.append(self.last_run_result.copy())
-            # Free cached DataFrames between subtasks — they can be large
-            # (hundreds of rows × 20 columns) and the Conductor only uses
-            # the text output.  Without this, N sequential subtasks
-            # accumulate N DataFrames on the shared agent singleton.
+            # Images already captured in the loop above — just clean up.
             self.last_search_results = None
             self.last_run_result = None
             import gc; gc.collect()

@@ -1493,6 +1493,18 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                         yield f"data: {image_event}\n\n"
                         await asyncio.sleep(0.05)
 
+                elif result_type == "conductor_images":
+                    images = last_run_result.get("images", [])
+                    for img in images:
+                        img_url = img.get("image_url", "")
+                        caption = img.get("caption", "")
+                        if img_url:
+                            image_event = json.dumps({
+                                "type": "image", "url": img_url, "caption": caption,
+                            })
+                            yield f"data: {image_event}\n\n"
+                            await asyncio.sleep(0.05)
+
             # Clear last_run_result
             agent.last_run_result = None
 

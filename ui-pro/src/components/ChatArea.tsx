@@ -316,8 +316,11 @@ export function ChatArea() {
 
                             return messages.map((msg, i) => {
                                 const isLastAssistant = isStreaming && i === lastTextAssistantIdx;
-                                // Build task execution state to pass into the message
-                                const execState = isLastAssistant && taskExecutionActive ? {
+                                // Task execution state persists AFTER streaming ends
+                                // so the widget auto-collapses instead of vanishing.
+                                const isLastAssistantMsg = i === lastTextAssistantIdx;
+                                const hasTaskData = taskGroups.length > 0 || taskItems.size > 0 || taskChecklist !== null;
+                                const execState = isLastAssistantMsg && hasTaskData ? {
                                     groups: taskGroups,
                                     tasks: taskItems,
                                     checklist: taskChecklist,
