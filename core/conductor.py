@@ -121,6 +121,15 @@ Below are all the sub-agent results (each tackled a piece of the question):
    - Bullet points for lists of recommendations
 6. **Be concise but thorough** — this is the final answer the user sees.
    Don't repeat raw tool output; synthesize it into insight.
+7. **If images were rendered**: Sub-agents may have called render_fits_image,
+   overlay_fits_images, compute_moment_map, or extract_spectrum. If the result
+   mentions "image_path" or "success: True", that image is ALREADY displayed
+   inline in the chat above your text. Reference it naturally (e.g., "As shown
+   in the image above...") — do NOT tell the user to specify files, download
+   data, or follow steps. The visualization is DONE.
+8. **NEVER give generic "Next Steps" or "Recommendations" like "specify which
+   file you want"** when the sub-agents already produced results. The user
+   asked a question — ANSWER it with the data you have.
 """
 
 

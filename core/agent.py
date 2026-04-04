@@ -2732,6 +2732,11 @@ ORDER BY target_name
             )
             return f"[Tool execution error: {e}]"
         finally:
+            # Save any image result BEFORE wiping — the conductor accumulator
+            # will forward these to the SSE pipeline after orchestration ends.
+            if self.last_run_result and self.last_run_result.get("type") == "image":
+                if hasattr(self, '_conductor_images'):
+                    self._conductor_images.append(self.last_run_result.copy())
             # Free cached DataFrames between subtasks — they can be large
             # (hundreds of rows × 20 columns) and the Conductor only uses
             # the text output.  Without this, N sequential subtasks
@@ -2990,6 +2995,7 @@ ORDER BY target_name
                 #    Python/asyncio combinations deadlock when nesting executors that way.
                 conductor_answer = None
                 conductor_exc = None
+                self._conductor_images = []  # Accumulate images from sub-agents
                 _done = threading.Event()
 
                 def _run_conductor():
@@ -3066,6 +3072,13 @@ ORDER BY target_name
                             if on_token:
                                 on_token(web_section)
                             print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results to conductor response")
+                    # Re-emit accumulated images via last_run_result so the SSE
+                    # loop in main.py can emit them as inline image events.
+                    if hasattr(self, '_conductor_images') and self._conductor_images:
+                        self.last_run_result = {
+                            "type": "conductor_images",
+                            "images": self._conductor_images,
+                        }
                     return conductor_answer
                 # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:

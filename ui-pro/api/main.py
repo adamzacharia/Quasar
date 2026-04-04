@@ -689,6 +689,20 @@ def _stream_chat_response(
                         _rich_image = {"url": img_url, "caption": caption}
                         await asyncio.sleep(0.05)
 
+                elif result_type == "conductor_images":
+                    # Multiple images accumulated during Conductor orchestration
+                    images = last_run_result.get("images", [])
+                    for img in images:
+                        img_url = img.get("image_url", "")
+                        caption = img.get("caption", "")
+                        if img_url:
+                            image_event = json.dumps({
+                                "type": "image", "url": img_url, "caption": caption,
+                            })
+                            yield f"data: {image_event}\n\n"
+                            _rich_image = {"url": img_url, "caption": caption}
+                            await asyncio.sleep(0.05)
+
             if response_text and first_token:
                 data = json.dumps({"type": "token", "content": response_text})
                 yield f"data: {data}\n\n"
