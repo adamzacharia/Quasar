@@ -452,6 +452,11 @@ def _stream_chat_response(
 
             first_token = True
             response_text = ""
+            # Accumulators for rich UI events — persisted to Turso for history replay
+            _rich_data_table = None
+            _rich_papers = None
+            _rich_notebook = None
+            _rich_thinking = []
 
             while True:
                 msg = await queue.get()
@@ -466,6 +471,8 @@ def _stream_chat_response(
                                 yield _sse_status(step, state)
                         else:
                             yield _sse_status(step, state)
+                            # Capture thinking steps for history
+                            _rich_thinking.append({"step": step, "state": state})
                         continue
 
                 msg_type, payload = msg[0], msg[1]
@@ -634,6 +641,9 @@ def _stream_chat_response(
                                 "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
                             })
                             yield f"data: {table_event}\n\n"
+                            # Capture for history persistence
+                            _rich_data_table = json.loads(table_event)
+                            _rich_data_table.pop("type", None)  # strip SSE type marker
                             await asyncio.sleep(0.05)
                         except Exception as e:
                             print(f"[WARN] Could not serialize data table for UI: {e}")
@@ -643,6 +653,7 @@ def _stream_chat_response(
                     if papers:
                         papers_event = json.dumps({"type": "papers", "papers": papers})
                         yield f"data: {papers_event}\n\n"
+                        _rich_papers = papers  # Capture for history
                         await asyncio.sleep(0.05)
 
                 elif result_type == "notebook":
@@ -650,16 +661,29 @@ def _stream_chat_response(
                     if nb:
                         notebook_event = json.dumps({"type": "notebook", **nb})
                         yield f"data: {notebook_event}\n\n"
+                        _rich_notebook = nb  # Capture for history
                         await asyncio.sleep(0.05)
 
             if response_text and first_token:
                 data = json.dumps({"type": "token", "content": response_text})
                 yield f"data: {data}\n\n"
 
-            # ── Persist assistant response to DB ──────────────────────
+            # ── Persist assistant response + rich UI data to DB ─────
             if current_user_id and conv_id and response_text:
                 try:
-                    conversation_service.save_message(conv_id, "assistant", response_text)
+                    rich_meta = {}
+                    if _rich_data_table:
+                        rich_meta["dataTable"] = _rich_data_table
+                    if _rich_papers:
+                        rich_meta["papers"] = _rich_papers
+                    if _rich_notebook:
+                        rich_meta["notebook"] = _rich_notebook
+                    if _rich_thinking:
+                        rich_meta["thinkingSteps"] = _rich_thinking
+                    conversation_service.save_message(
+                        conv_id, "assistant", response_text,
+                        metadata=rich_meta if rich_meta else None,
+                    )
                 except Exception as e:
                     logger.warning(f"[CHAT] Failed to persist assistant message: {e}")
 

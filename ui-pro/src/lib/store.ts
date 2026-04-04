@@ -66,14 +66,63 @@ function generateId(): string {
     return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
-function serverMessageToLocal(msg: ServerMessage, index: number): Message {
-    return {
+function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
+    const base: Message = {
         id: `srv-${index}-${Date.now().toString(36)}`,
         role: msg.role as Message["role"],
         content: msg.content || "",
         type: (msg.type || "text") as Message["type"],
         timestamp: new Date(),
     };
+
+    // Restore thinking steps from metadata (shown in "Thinking" widget)
+    const meta = msg.metadata || {};
+    if (meta.thinkingSteps && Array.isArray(meta.thinkingSteps)) {
+        base.thinkingSteps = (meta.thinkingSteps as { step: string; state: string }[]).map(
+            (s) => ({ text: s.step, status: s.state as "running" | "completed" })
+        );
+    }
+
+    const messages: Message[] = [base];
+
+    // Restore DataTableCard as a separate "data" message (same as live SSE)
+    if (meta.dataTable) {
+        messages.push({
+            id: `srv-${index}-dt-${Date.now().toString(36)}`,
+            role: "assistant",
+            content: "",
+            type: "data",
+            timestamp: new Date(),
+            dataTable: meta.dataTable as Message["dataTable"],
+        });
+    }
+
+    // Restore Paper cards as a separate "papers" message
+    if (meta.papers && Array.isArray(meta.papers) && meta.papers.length > 0) {
+        messages.push({
+            id: `srv-${index}-pp-${Date.now().toString(36)}`,
+            role: "assistant",
+            content: "Here are the relevant papers I found:",
+            type: "papers",
+            timestamp: new Date(),
+            papers: meta.papers as Message["papers"],
+        });
+    }
+
+    // Restore Notebook as a separate "notebook" message
+    if (meta.notebook) {
+        const nb = meta.notebook as Record<string, unknown>;
+        messages.push({
+            id: `srv-${index}-nb-${Date.now().toString(36)}`,
+            role: "assistant",
+            content: `I've generated a Jupyter Notebook for your analysis: **${nb.title || "Dynamic Notebook"}**`,
+            type: "notebook",
+            timestamp: new Date(),
+            notebookData: nb as unknown as Message["notebookData"],
+        });
+    }
+
+    return messages;
 }
 
 function serverConvToLocal(conv: ServerConversation): Conversation {
@@ -358,7 +407,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         // Always fetch from server — the local cache may have been
         // invalidated by loadConversations refreshing the list.
         const serverMsgs = await apiFetchMessages(conversationId, token);
-        const localMsgs = serverMsgs.map(serverMessageToLocal);
+        const localMsgs = serverMsgs.flatMap(serverMessageToLocal);
 
         set((state) => {
             // Update the conversation's messages cache
