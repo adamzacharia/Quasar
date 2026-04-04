@@ -242,10 +242,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     attachThinkingToLastMessage: () => set((s) => {
         if (s.thinkingSteps.length === 0) return {};
+        // Mark any still-running steps as completed (streaming is done)
+        const finalSteps = s.thinkingSteps.map(step =>
+            step.status === "running" ? { ...step, status: "completed" as const } : step
+        );
         const msgs = [...s.messages];
         for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i].role === "assistant" && msgs[i].type === "text") {
-                msgs[i] = { ...msgs[i], thinkingSteps: [...s.thinkingSteps] };
+                msgs[i] = { ...msgs[i], thinkingSteps: finalSteps };
                 break;
             }
         }
@@ -331,21 +335,30 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     loadConversations: async (token: string) => {
         const serverConvos = await apiFetchConversations(token);
         const localConvos = serverConvos.map(serverConvToLocal);
+
+        // Preserve locally-cached messages when refreshing the list
+        const existing = get().conversations;
+        const msgCache = new Map<string, Message[]>();
+        for (const c of existing) {
+            if (c.messages.length > 0) msgCache.set(c.id, c.messages);
+        }
+
+        const merged = localConvos.map(c => {
+            const cached = msgCache.get(c.id);
+            return cached ? { ...c, messages: cached } : c;
+        });
+
         set({
-            conversations: localConvos,
+            conversations: merged,
             _conversationsLoaded: true,
         });
     },
 
     loadConversationMessages: async (conversationId: string, token: string) => {
-        const loaded = get()._loadedConversationIds;
-        if (loaded.has(conversationId)) return; // already fetched
-
+        // Always fetch from server — the local cache may have been
+        // invalidated by loadConversations refreshing the list.
         const serverMsgs = await apiFetchMessages(conversationId, token);
         const localMsgs = serverMsgs.map(serverMessageToLocal);
-
-        const newLoaded = new Set(loaded);
-        newLoaded.add(conversationId);
 
         set((state) => {
             // Update the conversation's messages cache
@@ -353,10 +366,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 c.id === conversationId ? { ...c, messages: localMsgs } : c
             );
 
-            // If this is the active conversation, set messages
+            // If this is still the active conversation, set messages
             const updates: Partial<ChatStore> = {
                 conversations: updatedConvos,
-                _loadedConversationIds: newLoaded,
             };
             if (state.activeConversationId === conversationId) {
                 (updates as { messages: Message[] }).messages = localMsgs;

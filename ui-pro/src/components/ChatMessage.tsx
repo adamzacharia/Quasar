@@ -120,6 +120,77 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         );
     }
 
+    // ── Data-only / Papers-only / Notebook-only messages ──
+    // These are continuation payloads injected into the stream and should
+    // NOT render their own avatar + "QUASAR AI" header.
+    if (message.type === "data" && message.dataTable) {
+        // Suppress empty data tables (0 rows)
+        const rows = message.dataTable.rows;
+        if (!rows || rows.length === 0) return null;
+        return (
+            <div className="pl-11">
+                <DataTableCard data={message.dataTable} />
+            </div>
+        );
+    }
+
+    if (message.type === "papers" && message.papers && message.papers.length > 0) {
+        const VISIBLE_MAX = 10;
+        const shown = message.papers.slice(0, VISIBLE_MAX);
+        const hasMore = message.papers.length > VISIBLE_MAX;
+        return (
+            <div className="pl-11">
+                <div className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${hasMore ? "max-h-[680px] overflow-y-auto pr-1 custom-scrollbar" : ""}`}>
+                    {shown.map((paper) => (
+                        <PaperCard key={paper.id} paper={paper} />
+                    ))}
+                </div>
+                {hasMore && (
+                    <p className="text-xs text-slate-500 mt-2 text-right">
+                        Showing {VISIBLE_MAX} of {message.papers.length} papers
+                    </p>
+                )}
+            </div>
+        );
+    }
+
+    if (message.type === "notebook" && message.notebookData) {
+        return (
+            <div className="pl-11">
+                <div className="mt-4 p-4 rounded-xl border border-indigo-500/30 bg-indigo-950/20 flex flex-col sm:flex-row items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                        <div className="p-2 bg-indigo-500/20 rounded-lg shrink-0">
+                            <svg className="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                        </div>
+                        <div className="min-w-0">
+                            <h4 className="text-sm font-semibold text-slate-200 truncate">{message.notebookData.title || "Data Analysis Notebook"}</h4>
+                            <p className="text-xs text-slate-400">Ready to run in Jupyter (.ipynb)</p>
+                        </div>
+                    </div>
+                    <button
+                        onClick={() => {
+                            const blob = new Blob([JSON.stringify(message.notebookData?.data, null, 2)], { type: "application/json" });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `${(message.notebookData?.title || 'analysis').replace(/\s+/g, '_').toLowerCase()}.ipynb`;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                        }}
+                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg transition-colors shadow-lg shadow-indigo-500/20 whitespace-nowrap"
+                    >
+                        Download Notebook
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    // Skip empty assistant text messages (placeholder bubbles with no content and no thinking)
+    if (!hasContent && !hasThinking && !isStreaming) return null;
+
     // Assistant message — with integrated thinking process
     return (
         <div className="flex justify-start">
@@ -199,64 +270,6 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
                     {/* Streaming cursor */}
                     {isStreaming && <div className="w-2 h-5 bg-primary/80 animate-pulse rounded-sm" />}
-
-                    {/* Data table */}
-                    {message.dataTable && <DataTableCard data={message.dataTable} />}
-
-                    {/* Papers — 2-column grid, up to 10, scrollable if more */}
-                    {message.papers && message.papers.length > 0 && (() => {
-                        const VISIBLE_MAX = 10;
-                        const shown = message.papers.slice(0, VISIBLE_MAX);
-                        const hasMore = message.papers.length > VISIBLE_MAX;
-                        return (
-                            <div>
-                                <div
-                                    className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${hasMore ? "max-h-[680px] overflow-y-auto pr-1 custom-scrollbar" : ""}`}
-                                >
-                                    {shown.map((paper) => (
-                                        <PaperCard key={paper.id} paper={paper} />
-                                    ))}
-                                </div>
-                                {hasMore && (
-                                    <p className="text-xs text-slate-500 mt-2 text-right">
-                                        Showing {VISIBLE_MAX} of {message.papers.length} papers
-                                    </p>
-                                )}
-                            </div>
-                        );
-                    })()}
-
-
-                    {/* Notebook payload */}
-                    {message.type === "notebook" && message.notebookData && (
-                        <div className="mt-4 p-4 rounded-xl border border-indigo-500/30 bg-indigo-950/20 flex flex-col sm:flex-row items-center justify-between gap-4">
-                            <div className="flex items-center gap-3">
-                                <div className="p-2 bg-indigo-500/20 rounded-lg shrink-0">
-                                    <svg className="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                </div>
-                                <div className="min-w-0">
-                                    <h4 className="text-sm font-semibold text-slate-200 truncate">{message.notebookData.title || "Data Analysis Notebook"}</h4>
-                                    <p className="text-xs text-slate-400">Ready to run in Jupyter (.ipynb)</p>
-                                </div>
-                            </div>
-                            <button
-                                onClick={() => {
-                                    const blob = new Blob([JSON.stringify(message.notebookData?.data, null, 2)], { type: "application/json" });
-                                    const url = URL.createObjectURL(blob);
-                                    const a = document.createElement('a');
-                                    a.href = url;
-                                    a.download = `${(message.notebookData?.title || 'analysis').replace(/\s+/g, '_').toLowerCase()}.ipynb`;
-                                    document.body.appendChild(a);
-                                    a.click();
-                                    document.body.removeChild(a);
-                                    URL.revokeObjectURL(url);
-                                }}
-                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg transition-colors shadow-lg shadow-indigo-500/20 whitespace-nowrap"
-                            >
-                                Download Notebook
-                            </button>
-                        </div>
-                    )}
                 </div>
             </div>
         </div>
