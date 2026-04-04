@@ -545,17 +545,18 @@ def _stream_chat_response(
                                 sel_cols = list(df.columns[:8])
                                 display_cols = sel_cols
 
-                            sub = df[sel_cols].head(50).copy()
+                            _MAX_TABLE_ROWS = 500  # show all rows (card has scroll)
+                            sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
                             sub.columns = display_cols
 
                             per_row_links = []
                             if "access_url" in df.columns:
-                                per_row_links = df["access_url"].head(50).fillna("").tolist()
+                                per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
                             elif "member_ous_uid" in df.columns:
                                 per_row_links = [
                                     f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
                                     if pd.notna(v) and str(v).strip() else ""
-                                    for v in df["member_ous_uid"].head(50)
+                                    for v in df["member_ous_uid"].head(_MAX_TABLE_ROWS)
                                 ]
 
                             def _fmt(v):
@@ -579,7 +580,7 @@ def _stream_chat_response(
                             dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
                             has_preview = False
                             if ra_col and dec_col:
-                                for i, (_, orig_row) in enumerate(df.head(50).iterrows()):
+                                for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
                                     if i >= len(rows):
                                         break
                                     try:
@@ -1311,19 +1312,20 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                 sel_cols = list(df.columns[:8])
                                 display_cols = sel_cols
 
-                            sub = df[sel_cols].head(50).copy()
+                            _MAX_TABLE_ROWS = 500
+                            sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
                             sub.columns = display_cols
 
                             # ── Per-row archive links from access_url ──
                             # access_url is built by _standardize_columns from member_ous_uid
                             per_row_links = []
                             if "access_url" in df.columns:
-                                per_row_links = df["access_url"].head(50).fillna("").tolist()
+                                per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
                             elif "member_ous_uid" in df.columns:
                                 per_row_links = [
                                     f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
                                     if pd.notna(v) and str(v).strip() else ""
-                                    for v in df["member_ous_uid"].head(50)
+                                    for v in df["member_ous_uid"].head(_MAX_TABLE_ROWS)
                                 ]
 
                             def _fmt(v):
@@ -1349,7 +1351,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
                             has_preview = False
                             if ra_col and dec_col:
-                                for i, (_, orig_row) in enumerate(df.head(50).iterrows()):
+                                for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
                                     if i >= len(rows):
                                         break
                                     try:
