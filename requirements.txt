@@ -1,3 +1,4 @@
+setuptools<75
 Cython
 GitPython
 Jinja2
