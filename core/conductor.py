@@ -112,25 +112,32 @@ Below are all the sub-agent results (each tackled a piece of the question):
    paper titles, and author names. Never invent or hallucinate data.
 3. **Use data-driven comparisons**: If multiple targets/papers were queried, present a
    comparison table with actual values from the results.
-4. **Handle failures gracefully**: If a sub-task failed, note what data is missing and suggest
-   what the user could try next. Don't pretend the data exists.
+4. **Handle failures HONESTLY**: If a sub-task failed, say EXACTLY what failed and why
+   (e.g. "FITS download timed out" or "CADC returned 0 imaging products").
+   Do NOT dress up failures as "recommendations" or "next steps for the user."
 5. **Format for the web UI**:
    - Use ## headings for major sections
    - Use Markdown tables for comparisons (ALWAYS use pipe syntax)
    - Bold key findings and observatory names
-   - Bullet points for lists of recommendations
+   - Bullet points for lists
 6. **Be concise but thorough** — this is the final answer the user sees.
    Don't repeat raw tool output; synthesize it into insight.
-7. **If images were rendered**: Sub-agents may have called render_fits_image,
-   overlay_fits_images, compute_moment_map, or extract_spectrum. If the result
-   mentions "image_path" or "success: True", that image is ALREADY displayed
-   inline in the chat above your text. Reference it naturally (e.g., "As shown
-   in the image above...") — do NOT tell the user to specify files, download
-   data, or follow steps. The visualization is DONE.
-8. **NEVER give generic "Next Steps" or "Recommendations" like "specify which
-   file you want"** when the sub-agents already produced results. The user
-   asked a question — ANSWER it with the data you have.
+7. **If images were rendered**: If a result mentions "image_path" or "success: True",
+   that image is ALREADY displayed inline in the chat above your text. Reference it
+   naturally (e.g. "As shown in the ALMA+JWST overlay above..."). Do NOT tell the
+   user to download data or follow steps. The visualization is DONE.
+
+## CRITICAL ANTI-PATTERNS — NEVER DO THESE:
+
+8. NEVER write "Recommendations for Data Access" or "Steps to Overlay".
+9. NEVER tell the user to "re-run the search", "provide the URL", or "identify the product".
+   The sub-agents had all the tools. If they failed, explain the error.
+10. NEVER write generic advice like "filter by band" or "consider filtering" unless the
+    user explicitly asked for advice. They asked for RESULTS.
+11. NEVER write "Current Blockers" — if something blocked, say what error occurred.
+12. If a sub-agent returned an error string, quote that exact error.
 """
+
 
 
 class Conductor:
@@ -409,7 +416,7 @@ class Conductor:
         for dep_id in node.depends_on:
             dep_node = self.dag.nodes.get(dep_id)
             if dep_node and dep_node.result:
-                result_str = json.dumps(dep_node.result, default=str)[:3000]
+                result_str = json.dumps(dep_node.result, default=str)[:6000]
                 dep_context += f"\n[Result from {dep_id}]: {result_str}"
 
         # Build the task description with dependency context
@@ -418,9 +425,16 @@ class Conductor:
             full_task += f"\n\nContext from prior steps:{dep_context}"
 
         # Use the tool executor (wired to agent's tool-calling loop)
+        # IMPORTANT: tool_executor is SYNCHRONOUS (OpenAI API + HTTP archive
+        # calls).  Running it directly would block this event loop and make
+        # asyncio.gather() tasks execute sequentially instead of in parallel.
+        # Wrapping in run_in_executor() puts each subtask in a real thread.
         if self.tool_executor:
             try:
-                result = self.tool_executor(full_task, dep_context)
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, self.tool_executor, full_task, dep_context
+                )
                 if result:
                     return result
             except Exception as e:

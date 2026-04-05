@@ -1515,10 +1515,22 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             self.last_search_results = results
             self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_position"}
+
+            # Include top MOUS UIDs + access URLs so Conductor subtasks
+            # can use them for list_alma_files / render_fits_image.
+            top_mous = []
+            if hasattr(results, 'columns') and 'member_ous_uid' in results.columns:
+                top_mous = results['member_ous_uid'].dropna().unique()[:5].tolist()
+            top_urls = []
+            if hasattr(results, 'columns') and 'access_url' in results.columns:
+                top_urls = results['access_url'].dropna().head(5).tolist()
+
             return {
                 "success": True,
                 "total_results": len(results),
                 "ra": ra, "dec": dec, "radius_deg": radius,
+                "top_mous_uids": top_mous,
+                "top_access_urls": top_urls,
                 "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
@@ -1598,12 +1610,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "tool_name": "search_by_target"
             }
 
-            # Compact 5-row summary to LLM
+            # Compact summary + top MOUS UIDs & URLs for Conductor subtask chaining
+            top_mous = []
+            if 'member_ous_uid' in results.columns:
+                top_mous = results['member_ous_uid'].dropna().unique()[:5].tolist()
+            top_urls = []
+            if 'access_url' in results.columns:
+                top_urls = results['access_url'].dropna().head(5).tolist()
+
             return {
                 "success": True,
                 "total_results": len(results),
                 "filters_applied": filter_parts,
                 "target": target_name,
+                "top_mous_uids": top_mous,
+                "top_access_urls": top_urls,
                 "note": f"Found {len(results)} observations matching your constraints. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
@@ -1723,10 +1744,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # Count by telescope
             tel_summary = df["obs_collection"].value_counts().to_dict() if "obs_collection" in df.columns else {}
 
+            # Include top access_urls so Conductor subtasks can download/render
+            top_urls = []
+            if "access_url" in df.columns:
+                top_urls = df["access_url"].dropna().head(5).tolist()
+
             return {
                 "success": True,
                 "total_results": len(df),
                 "telescopes": tel_summary,
+                "top_access_urls": top_urls,
                 "note": (
                     f"Found {len(df)} observations from {len(telescopes)} telescope(s): "
                     f"{', '.join(f'{t} ({c})' for t, c in tel_summary.items())}. "
@@ -2711,7 +2738,12 @@ ORDER BY target_name
                     # ── Capture image results IMMEDIATELY after each tool call ──
                     if self.last_run_result and self.last_run_result.get("type") == "image":
                         if hasattr(self, '_conductor_images'):
-                            self._conductor_images.append(self.last_run_result.copy())
+                            lock = getattr(self, '_conductor_images_lock', None)
+                            if lock:
+                                with lock:
+                                    self._conductor_images.append(self.last_run_result.copy())
+                            else:
+                                self._conductor_images.append(self.last_run_result.copy())
                         img_url = self.last_run_result.get("image_url", "")
                         caption = self.last_run_result.get("caption", "")
                         tool_summaries.append(
@@ -3011,6 +3043,7 @@ ORDER BY target_name
                 conductor_answer = None
                 conductor_exc = None
                 self._conductor_images = []  # Accumulate images from sub-agents
+                self._conductor_images_lock = threading.Lock()  # Thread-safe — subtasks run in parallel
                 _done = threading.Event()
 
                 def _run_conductor():

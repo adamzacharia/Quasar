@@ -467,7 +467,14 @@ def _stream_chat_response(
             _rich_thinking = []
 
             while True:
-                msg = await queue.get()
+                # Use a timeout so we can send SSE keepalive comments.
+                # Render's reverse proxy kills idle connections after ~30s.
+                # Sending `:keepalive\n\n` (an SSE comment) every 15s prevents this.
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
                     if msg_type == "status":
@@ -1264,7 +1271,11 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
             response_text = ""
             
             while True:
-                msg = await queue.get()
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
                     if msg_type == "status":
