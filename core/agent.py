@@ -3127,6 +3127,16 @@ ORDER BY target_name
                             "type": "conductor_images",
                             "images": self._conductor_images,
                         }
+
+                    # Attach companion notebook if the Conductor generated one
+                    notebook = getattr(self.conductor, '_notebook', None)
+                    if notebook:
+                        if self.last_run_result is None:
+                            self.last_run_result = {}
+                        # Store notebook data so main.py can emit it for history
+                        self.last_run_result["notebook"] = notebook
+                        self.last_run_result["notebook_title"] = f"Research: {query[:60]}"
+
                     return conductor_answer
                 # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:

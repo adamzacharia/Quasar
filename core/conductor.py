@@ -30,6 +30,7 @@ from openai import OpenAI
 
 from core.task_dag import TaskDAG, TaskNode, TaskStatus
 from core.workflow_memory import WorkflowMemory
+from services.notebook_gen import generate_conductor_notebook
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +312,24 @@ class Conductor:
 
         self._emit_status("Answer ready", "completed", status_fn)
 
+        # Step 6: Generate companion Jupyter notebook
+        try:
+            notebook_dict = generate_conductor_notebook(
+                query=query,
+                subtasks=subtasks,
+                results=results,
+                dag_summary=self.dag.get_execution_summary(),
+            )
+            self._emit({
+                "type": "notebook",
+                "notebook": notebook_dict,
+                "title": f"Research: {query[:60]}",
+            }, event_fn)
+            self._notebook = notebook_dict  # store for caller
+        except Exception as nb_err:
+            logger.warning("Notebook generation failed: %s", nb_err)
+            self._notebook = None
+
         if on_token:
             on_token(final_answer)
 
@@ -358,11 +377,49 @@ class Conductor:
                         self._execute_node(node),
                         timeout=node.sla_seconds,
                     )
-                    self.dag.mark_completed(node.id, result)
 
-                    # Emit success update
-                    detail = self._summarize_result(result)
-                    self._emit_task_update(node, "completed", detail, group_id, on_event)
+                    # ── Soft-failure detection ──────────────────────────
+                    # A result can signal failure even without raising an
+                    # exception (e.g. {"success": false, "error": "..."}).
+                    is_soft_failure = False
+                    if isinstance(result, dict):
+                        if result.get("success") is False or "error" in result:
+                            is_soft_failure = True
+                    elif isinstance(result, str) and "[Tool execution error:" in result:
+                        is_soft_failure = True
+
+                    # ── One automatic retry for soft failures ──────────
+                    if is_soft_failure and node.retries < 1:
+                        node.retries += 1
+                        self._emit_task_update(
+                            node, "running",
+                            "Retrying after error...", group_id, on_event,
+                        )
+                        retry_result = await asyncio.wait_for(
+                            self._execute_node(node),
+                            timeout=node.sla_seconds,
+                        )
+                        # Re-check after retry
+                        retry_failed = False
+                        if isinstance(retry_result, dict):
+                            if retry_result.get("success") is False or "error" in retry_result:
+                                retry_failed = True
+                        elif isinstance(retry_result, str) and "[Tool execution error:" in retry_result:
+                            retry_failed = True
+
+                        if not retry_failed:
+                            # Retry succeeded
+                            result = retry_result
+                            is_soft_failure = False
+
+                    if is_soft_failure:
+                        detail = self._summarize_result(result)
+                        self.dag.mark_completed(node.id, result)  # still store for dep_context
+                        self._emit_task_update(node, "error", detail, group_id, on_event)
+                    else:
+                        self.dag.mark_completed(node.id, result)
+                        detail = self._summarize_result(result)
+                        self._emit_task_update(node, "completed", detail, group_id, on_event)
 
                 except asyncio.TimeoutError:
                     self.dag.mark_failed(node.id, f"Timeout after {node.sla_seconds}s")
@@ -374,7 +431,18 @@ class Conductor:
             await asyncio.gather(*[_run_one(node) for node in ready])
 
             completed = sum(1 for n in self.dag.nodes.values() if n.status == TaskStatus.COMPLETED)
-            self._emit_status(f"Completed {completed}/{total} tasks", "completed", on_status)
+            errored = sum(
+                1 for n in self.dag.nodes.values()
+                if n.status == TaskStatus.COMPLETED and isinstance(n.result, dict)
+                and (n.result.get("success") is False or "error" in n.result)
+            )
+            true_ok = completed - errored
+            failed_hard = sum(1 for n in self.dag.nodes.values() if n.status == TaskStatus.FAILED)
+            self._emit_status(
+                f"Completed {true_ok}/{total} tasks"
+                + (f" ({errored + failed_hard} errors)" if errored + failed_hard else ""),
+                "completed", on_status,
+            )
 
         # Collect results
         return {

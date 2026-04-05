@@ -258,12 +258,28 @@ class DataLinkClient:
             return []
 
         files = []
+        col_names = info_table.colnames if hasattr(info_table, 'colnames') else []
         for row in info_table:
-            access_url = str(row.get("access_url", ""))
-            content_length = row.get("content_length", 0)
-            content_type = str(row.get("content_type", ""))
-            description = str(row.get("description", ""))
-            semantics = str(row.get("semantics", ""))
+            try:
+                access_url = str(row["access_url"]) if "access_url" in col_names else ""
+            except Exception:
+                access_url = ""
+            try:
+                content_length = row["content_length"] if "content_length" in col_names else 0
+            except Exception:
+                content_length = 0
+            try:
+                content_type = str(row["content_type"]) if "content_type" in col_names else ""
+            except Exception:
+                content_type = ""
+            try:
+                description = str(row["description"]) if "description" in col_names else ""
+            except Exception:
+                description = ""
+            try:
+                semantics = str(row["semantics"]) if "semantics" in col_names else ""
+            except Exception:
+                semantics = ""
 
             # Extract filename from access_url
             filename = access_url.split("/")[-1].split("?")[0] if access_url else ""
@@ -323,11 +339,21 @@ class DataLinkClient:
                 votable = parse_votable(io.BytesIO(xml_text.encode("utf-8")))
                 table = votable.get_first_table().to_table()
 
+                vot_cols = table.colnames if hasattr(table, 'colnames') else []
                 for row in table:
-                    access_url = str(row.get("access_url", ""))
+                    try:
+                        access_url = str(row["access_url"]) if "access_url" in vot_cols else ""
+                    except Exception:
+                        access_url = ""
                     filename = access_url.split("/")[-1].split("?")[0] if access_url else ""
-                    content_length = row.get("content_length", 0)
-                    content_type = str(row.get("content_type", ""))
+                    try:
+                        content_length = row["content_length"] if "content_length" in vot_cols else 0
+                    except Exception:
+                        content_length = 0
+                    try:
+                        content_type = str(row["content_type"]) if "content_type" in vot_cols else ""
+                    except Exception:
+                        content_type = ""
 
                     if not filename or filename.startswith("."):
                         continue
