@@ -151,7 +151,7 @@ class Conductor:
     """
 
     MAX_SUBTASKS = 10
-    COMPLEXITY_THRESHOLD = 0.55
+    COMPLEXITY_THRESHOLD = 0.7
 
     def __init__(
         self,

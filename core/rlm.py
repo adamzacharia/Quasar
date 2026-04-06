@@ -67,7 +67,7 @@ class ComplexityDetector:
       2. LLM-based assessment (only triggered when heuristic is ambiguous).
     """
 
-    THRESHOLD = 0.55  # queries scoring above this are treated as complex
+    THRESHOLD = 0.7  # queries scoring above this are treated as complex
 
     def __init__(self, client: OpenAI, model: str = "gpt-4o-mini"):
         self.client = client
@@ -100,6 +100,20 @@ class ComplexityDetector:
     @staticmethod
     def _heuristic_score(query: str) -> float:
         q = query.lower()
+
+        # Fast-track obvious single-step queries → always non-complex.
+        # Patterns: "lookup X", "search X", "find X", "show X",
+        #           "what is X", "tell me about X", etc.
+        import re as _re
+        _simple_patterns = [
+            r'^(?:look\s*up|search|find|show|get|list|display)\b',
+            r'^(?:what|where|who|when|how)\s+(?:is|are|was|were|do|does)\b',
+            r'^(?:tell\s+me\s+about|explain|describe|define)\b',
+        ]
+        for pat in _simple_patterns:
+            if _re.search(pat, q):
+                return 0.0
+
         hits = sum(1 for kw in _MULTI_HOP_INDICATORS if kw in q)
         # Normalize: 3+ hits → 1.0
         return min(hits / 3.0, 1.0)

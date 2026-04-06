@@ -686,19 +686,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        self.tool_registry.register(Tool(
-            name="search_papers",
-            description="Search NASA ADS for research papers",
-            function=self._search_papers,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query keywords or object name"},
-                    "sort": {"type": "string", "enum": ["date", "relevance", "citation_count"], "description": "Sort order"}
-                },
-                "required": ["query"]
-            }
-        ))
 
         # NEW: Advanced ALminer Tools
         self.tool_registry.register(Tool(
@@ -2875,15 +2862,10 @@ ORDER BY target_name
             if m_year == self._LLM_CUTOFF_YEAR and month_names[m_name] > self._LLM_CUTOFF_MONTH:
                 return query
 
-        # 3. Freshness keywords ("latest", "current", "as of today", etc.)
-        freshness_patterns = [
-            r'\b(?:latest|current|up[- ]?to[- ]?date|as of today|right now)\b',
-            r'\brecent(?:ly)?\b.*\b(?:data|status|update|release)\b',
-            r'\bthis (?:year|month|week)\b',
-        ]
-        for pat in freshness_patterns:
-            if re.search(pat, _q):
-                return query
+        # 3. Freshness keywords — REMOVED.
+        #    Web search now only triggers on explicit dates beyond the cutoff.
+        #    Words like "latest", "current", "recent" are too common and caused
+        #    false positives on nearly every query.
 
         return None
 
@@ -3191,12 +3173,30 @@ ORDER BY target_name
                             name = getattr(item, 'name', 'unknown')
                             cid = call_id or item_id
                             if cid:
-                                function_calls[cid] = {"name": name, "arguments": "", "call_id": cid}
+                                function_calls[cid] = {"name": name, "arguments": "", "call_id": cid, "_item_id": item_id}
                                 # Map item_id to call_id so argument deltas can find the right entry
                                 if item_id and item_id != cid:
                                     item_id_to_call_id[item_id] = cid
                                 if call_id and call_id != item_id:
                                     item_id_to_call_id[call_id] = cid
+                    elif event.type == "response.output_item.done":
+                        # CRITICAL FIX: The real call_id may only be available
+                        # when the function_call item is DONE, not when it is
+                        # first added.  Update our records with the canonical
+                        # call_id so the follow-up request matches what the
+                        # API expects.
+                        item = event.item
+                        if getattr(item, 'type', None) == 'function_call':
+                            final_call_id = getattr(item, 'call_id', None)
+                            item_id = getattr(item, 'id', None)
+                            if final_call_id:
+                                # Find the entry we stored (keyed by item_id or preliminary call_id)
+                                old_cid = item_id_to_call_id.get(item_id, item_id)
+                                if old_cid in function_calls:
+                                    function_calls[old_cid]["call_id"] = final_call_id
+                                # Also try direct item_id lookup
+                                elif item_id in function_calls:
+                                    function_calls[item_id]["call_id"] = final_call_id
                     elif event.type == "response.function_call_arguments.delta":
                         # Try all possible ID fields the API might use
                         raw_id = getattr(event, 'call_id', None) or getattr(event, 'item_id', None)
