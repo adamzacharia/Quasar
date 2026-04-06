@@ -696,7 +696,7 @@ def _stream_chat_response(
                         _rich_image = {"url": img_url, "caption": caption}
                         await asyncio.sleep(0.05)
 
-                elif result_type == "conductor_images":
+                elif result_type == "conductor_result":
                     # Multiple images accumulated during Conductor orchestration
                     images = last_run_result.get("images", [])
                     for img in images:
@@ -709,6 +709,19 @@ def _stream_chat_response(
                             yield f"data: {image_event}\n\n"
                             _rich_image = {"url": img_url, "caption": caption}
                             await asyncio.sleep(0.05)
+                            
+                    # Companion notebook
+                    nb_data = last_run_result.get("notebook_data", {})
+                    nb_title = last_run_result.get("title", "Research Notebook")
+                    if nb_data:
+                        nb_event = json.dumps({
+                            "type": "notebook",
+                            "title": nb_title,
+                            "data": nb_data,
+                        })
+                        yield f"data: {nb_event}\n\n"
+                        _rich_notebook = {"title": nb_title, "data": nb_data}
+                        await asyncio.sleep(0.05)
 
             if response_text and first_token:
                 data = json.dumps({"type": "token", "content": response_text})
@@ -1504,7 +1517,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                         yield f"data: {image_event}\n\n"
                         await asyncio.sleep(0.05)
 
-                elif result_type == "conductor_images":
+                elif result_type == "conductor_result":
                     images = last_run_result.get("images", [])
                     for img in images:
                         img_url = img.get("image_url", "")
@@ -1515,6 +1528,17 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             })
                             yield f"data: {image_event}\n\n"
                             await asyncio.sleep(0.05)
+                            
+                    nb_data = last_run_result.get("notebook_data")
+                    nb_title = last_run_result.get("title", "Research Notebook")
+                    if nb_data:
+                        nb_event = json.dumps({
+                            "type": "notebook",
+                            "title": nb_title,
+                            "data": nb_data,
+                        })
+                        yield f"data: {nb_event}\n\n"
+                        await asyncio.sleep(0.05)
 
             # Clear last_run_result
             agent.last_run_result = None

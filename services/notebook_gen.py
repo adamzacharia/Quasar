@@ -171,17 +171,26 @@ def generate_conductor_notebook(
         agent = st.get("agent_type", "general")
         result = results.get(tid)
 
-        # Markdown heading for this subtask
         status_emoji = "✅" if result is not None else "❌"
+        
+        # Build agent findings text
+        findings = ""
+        if result:
+            res_str = str(result)
+            findings = f"**Agent Findings:**\n\n```text\n{res_str}\n```"
+        else:
+            findings = "⚠️ *Task failed to produce a result.*"
+
         nb.add_markdown_cell(
             f"## {status_emoji} Step {tid}: {desc}\n\n"
-            f"*Agent type: `{agent}`*"
+            f"*Agent type: `{agent}`*\n\n"
+            f"{findings}"
         )
 
-        # Build a code cell based on the agent type and result content.
-        # We try to emit real, runnable code rather than just pasting results.
+        # Build a code cell template for reproducibility
         code = _build_code_cell(agent, desc, result)
-        nb.add_code_cell(code)
+        if code:
+            nb.add_code_cell(code)
 
     # ── Summary section ──
     if dag_summary:
@@ -208,58 +217,68 @@ def generate_conductor_notebook(
 
 def _build_code_cell(agent_type: str, description: str, result) -> str:
     """
-    Build a runnable Python code cell for a subtask based on its agent type
-    and the actual result data.  Falls back to a commented result dump.
+    Build a runnable Python code cell template for a subtask based on its agent type
+    and the actual result data.
     """
-    # Extract useful data from result
-    if isinstance(result, dict):
-        # Archive searches often return MOUS UIDs, access URLs, etc.
-        mous_uids = result.get("top_mous_uids", [])
-        access_urls = result.get("top_access_urls", [])
-        total = result.get("total_results", "")
+    desc_lower = description.lower()
+    
+    if agent_type == "archive" or "alma" in desc_lower or "cadc" in desc_lower or "search" in desc_lower:
+        return (
+            f"# Reproducing: {description}\n"
+            "from astroquery.alma import Alma\n"
+            "import pandas as pd\n\n"
+            "# 1. Define the query parameters based on the task\n"
+            "# rs = Alma.query_object('TARGET_NAME') \n"
+            "# df = rs.to_pandas()\n"
+            "# df.head()"
+        )
 
-        if agent_type == "archive" and (mous_uids or access_urls):
-            lines = [f"# {description}", ""]
-            if "alma" in description.lower() or "search" in description.lower():
-                # Emit a real astroquery search
-                # Try to extract target name from description
-                lines.append("from astroquery.alma import Alma")
-                lines.append("alma = Alma()")
-                lines.append(f"# Query returned {total} results")
-                if mous_uids:
-                    lines.append(f"mous_uids = {mous_uids!r}")
-                    lines.append("")
-                    lines.append("# List files for first MOUS UID")
-                    lines.append("info = alma.get_data_info(mous_uids[0])")
-                    lines.append("print(f'Found {len(info)} files')")
-                    lines.append("info")
-                elif access_urls:
-                    lines.append(f"access_urls = {access_urls[:3]!r}")
-            return "\n".join(lines)
+    if agent_type == "literature" or "paper" in desc_lower or "ads" in desc_lower:
+         return (
+            f"# Reproducing: {description}\n"
+            "import requests\n"
+            "import urllib.parse\n\n"
+            "# Query the NASA ADS API (requires ADS_DEV_KEY token)\n"
+            "# q = urllib.parse.quote('QUERY')\n"
+            "# url = f'https://api.adsabs.harvard.edu/v1/search/query?q={{q}}&fl=title,author,bibcode'\n"
+            "# print(f'Searching ADS: {{url}}')"
+         )
+         
+    if agent_type == "viz" or "overlay" in desc_lower or "plot" in desc_lower or "render" in desc_lower:
+         return (
+             f"# Reproducing: {description}\n"
+             "import matplotlib.pyplot as plt\n"
+             "from astropy.io import fits\n"
+             "from astropy.visualization import astropy_mpl_style\n"
+             "plt.style.use(astropy_mpl_style)\n\n"
+             "# 1. Load the FITS file from the archive\n"
+             "# hdul = fits.open('FITS_URL_OR_PATH')\n"
+             "# data = hdul[0].data\n\n"
+             "# 2. Plot the image\n"
+             "# plt.figure(figsize=(8,8))\n"
+             "# plt.imshow(data, cmap='inferno', origin='lower')\n"
+             "# plt.colorbar()\n"
+             "# plt.show()"
+         )
+         
+    if agent_type == "analysis" or "splatalogue" in desc_lower or "line" in desc_lower:
+         return (
+             f"# Reproducing: {description}\n"
+             "from astroquery.splatalogue import Splatalogue\n"
+             "import astropy.units as u\n\n"
+             "# Query Splatalogue for molecular lines\n"
+             "# lines = Splatalogue.query_lines(\n"
+             "#     100 * u.GHz, \n"
+             "#     115 * u.GHz, \n"
+             "#     chemical_name=' CO ',\n"
+             "#     energy_max=500,\n"
+             "#     energy_type='eu_k'\n"
+             "# )\n"
+             "# lines.to_pandas().head()"
+         )
 
-        if agent_type == "viz" and result.get("type") == "image":
-            url = result.get("image_url", "")
-            return (
-                f"# {description}\n"
-                f"from IPython.display import Image, display\n"
-                f"display(Image(url='{url}', width=600))"
-            )
-
-        if agent_type == "literature":
-            result_str = json.dumps(result, default=str, indent=2)[:3000]
-            return (
-                f"# {description}\n"
-                f"# Literature search results:\n"
-                f"results = {result_str}\n"
-                f"print(json.dumps(results, indent=2))"
-            )
-
-    # Fallback: dump the result as a comment
-    result_str = str(result)[:2000] if result else "No result"
     return (
-        f"# {description}\n"
+        f"# Reproducing: {description}\n"
         f"# Agent type: {agent_type}\n"
-        f"#\n"
-        f"# Result:\n"
-        + "\n".join(f"# {line}" for line in result_str.split("\n")[:30])
+        "# Custom code block for analytical script / synthesis."
     )

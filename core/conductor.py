@@ -320,11 +320,6 @@ class Conductor:
                 results=results,
                 dag_summary=self.dag.get_execution_summary(),
             )
-            self._emit({
-                "type": "notebook",
-                "notebook": notebook_dict,
-                "title": f"Research: {query[:60]}",
-            }, event_fn)
             self._notebook = notebook_dict  # store for caller
         except Exception as nb_err:
             logger.warning("Notebook generation failed: %s", nb_err)

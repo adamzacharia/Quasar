@@ -3124,7 +3124,7 @@ ORDER BY target_name
                     # loop in main.py can emit them as inline image events.
                     if hasattr(self, '_conductor_images') and self._conductor_images:
                         self.last_run_result = {
-                            "type": "conductor_images",
+                            "type": "conductor_result",
                             "images": self._conductor_images,
                         }
 
@@ -3132,10 +3132,12 @@ ORDER BY target_name
                     notebook = getattr(self.conductor, '_notebook', None)
                     if notebook:
                         if self.last_run_result is None:
-                            self.last_run_result = {}
+                            self.last_run_result = {"type": "conductor_result"}
+                        else:
+                            self.last_run_result["type"] = "conductor_result"
                         # Store notebook data so main.py can emit it for history
-                        self.last_run_result["notebook"] = notebook
-                        self.last_run_result["notebook_title"] = f"Research: {query[:60]}"
+                        self.last_run_result["notebook_data"] = notebook
+                        self.last_run_result["title"] = f"Research: {query[:60]}"
 
                     return conductor_answer
                 # Conductor returned None → not complex enough, fall through to standard path
