@@ -9,7 +9,6 @@ env/
 build/
 develop-eggs/
 dist/
-downloads/
 eggs/
 .eggs/
 /lib/
@@ -40,9 +39,52 @@ ISSUES.md
 
 # Databases (local state)
 *.db
+chroma_db/
 
-# Large binary files
+# Large binary / data files
+*.fits
+*.tar
+*.tar.gz
+*.tar.bz2
+*.zip
+*.gz
 *.pdf
+
+# Docs / reference text (not needed in repo)
+docs/
+
+# Downloaded data / observations
+PDF/
+mastDownload/
+downloads/
+user_uploads/
+2015.1.01096.S/
+
+# Generated images
+*.png
+
+# Lint / build output
+lint_output.txt
+
+# Temp / scratch scripts
+tmp_*.py
+measure_memory*.py
+check_qdrant.py
+
+# Test artifacts (output files, not test code)
+test_results/
+test_output.ipynb
+test_proposal.md
+test_proposal.pdf
+thought_process.html
+
+# Test scripts at root (not in tests/ folder)
+test_critic.py
+test_cutoff_detection.py
+test_datalink.py
+test_integration.py
+test_lit_to_code_end_to_end.py
+test_notebook.py
 
 # Sensitive keys
 config/key_export.txt
@@ -51,10 +93,16 @@ config/key_temp.pub
 # User custom tools & secrets (per-user, never commit)
 user_tools/
 
-# Deployment docs
+# Deployment / internal docs
 fixes.md
+implementation_plan.md
+implementation_plan_2
+ml4ps_papers_and_latex_guide.md
+quasar_execution_flow.json
+benchmark_and_visuals_guide.md
 
-# Keep alive script
+# Logs
+logs/
 
 # LaTeX build artifacts (paper/)
 *.aux
@@ -74,7 +122,14 @@ fixes.md
 *.run.xml
 *-blx.bib
 *.bcf
-*.log
 
 # Paper folder
 paper/
+
+# Versioned changelogs (loose files at root)
+0.3.0
+1.5
+2.0.0
+
+# Understand-Anything
+.understand-anything/

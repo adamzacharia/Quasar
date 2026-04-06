@@ -1,7 +1,0 @@
-....
-----------------------------------------------------------------------
-Ran 4 tests in 0.440s
-
-OK
-DEBUG: ALMINER_AVAILABLE=True
-DEBUG: MATPLOTLIB_AVAILABLE=True
