@@ -1655,7 +1655,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     @log_tool
     def _search_cadc(self, target_name: Optional[str] = None,
                      ra: Optional[float] = None, dec: Optional[float] = None,
-                     radius: float = 0.05, collection: Optional[str] = None,
+                     radius: float = 0.02, collection: Optional[str] = None,
                      max_results: int = 100) -> Dict[str, Any]:
         """Search CADC archive for multi-wavelength observations (JWST, HST, JCMT, etc.)."""
         try:
@@ -1705,7 +1705,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             WHERE CONTAINS(POINT('ICRS', s_ra, s_dec),
                            CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius})) = 1
             {collection_filter}
-            ORDER BY obs_collection, t_exptime DESC
             """
 
             # Query CADC TAP
