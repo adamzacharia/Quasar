@@ -3137,7 +3137,11 @@ ORDER BY target_name
                             self.last_run_result["type"] = "conductor_result"
                         # Store notebook data so main.py can emit it for history
                         self.last_run_result["notebook_data"] = notebook
-                        self.last_run_result["title"] = f"Research: {query[:60]}"
+                        
+                        import re
+                        words = [w for w in re.split(r'\W+', query) if w]
+                        short_title = "_".join(words[:2]) if words else "Analysis"
+                        self.last_run_result["title"] = short_title
 
                     return conductor_answer
                 # Conductor returned None → not complex enough, fall through to standard path

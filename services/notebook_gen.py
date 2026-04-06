@@ -158,53 +158,26 @@ def generate_conductor_notebook(
     # ── Instructions ──
     nb.add_markdown_cell(
         "## 📋 Instructions\n\n"
-        "1. Run each cell in order — they mirror the sub-tasks the agents executed.\n"
-        "2. Some cells may require network access to the ALMA archive or NASA ADS.\n"
-        "3. `access_url` values come from actual archive queries and should work directly.\n"
-        "4. If a cell errors, check that the required packages are installed."
+        "1. Start by importing the required Astropy and Astroquery libraries.\n"
+        "2. Follow the steps sequentially to reproduce the research logic.\n"
+        "3. Replace generic tokens like `TARGET_NAME` or `QUERY` with your specific dataset parameters."
     )
 
     # ── One section per subtask ──
-    for st in subtasks:
-        tid = st.get("id", "?")
+    for index, st in enumerate(subtasks):
         desc = st.get("description", "Unnamed step")
         agent = st.get("agent_type", "general")
-        result = results.get(tid)
-
-        status_emoji = "✅" if result is not None else "❌"
-        
-        # Build agent findings text
-        findings = ""
-        if result:
-            res_str = str(result)
-            findings = f"**Agent Findings:**\n\n```text\n{res_str}\n```"
-        else:
-            findings = "⚠️ *Task failed to produce a result.*"
+        result = results.get(st.get("id"))
 
         nb.add_markdown_cell(
-            f"## {status_emoji} Step {tid}: {desc}\n\n"
-            f"*Agent type: `{agent}`*\n\n"
-            f"{findings}"
+            f"### Step {index + 1}: {desc}\n\n"
+            f"The following code demonstrates how to perform this analytical step programmatically."
         )
 
         # Build a code cell template for reproducibility
         code = _build_code_cell(agent, desc, result)
         if code:
             nb.add_code_cell(code)
-
-    # ── Summary section ──
-    if dag_summary:
-        total = dag_summary.get("total_tasks", 0)
-        ok = dag_summary.get("completed", 0)
-        fail = dag_summary.get("failed", 0)
-        nb.add_markdown_cell(
-            f"## 📊 Execution Summary\n\n"
-            f"| Metric | Value |\n"
-            f"|--------|-------|\n"
-            f"| Total tasks | {total} |\n"
-            f"| Completed | {ok} |\n"
-            f"| Failed | {fail} |"
-        )
 
     nb.add_markdown_cell(
         "---\n\n"
@@ -278,7 +251,7 @@ def _build_code_cell(agent_type: str, description: str, result) -> str:
          )
 
     return (
-        f"# Reproducing: {description}\n"
-        f"# Agent type: {agent_type}\n"
-        "# Custom code block for analytical script / synthesis."
+        f"# Perform step: {description}\n"
+        "# Ensure you configure the proper functions and custom analytical scripts below.\n"
+        "pass"
     )
