@@ -156,6 +156,7 @@ class QuasarAgent:
             print("[green]QuasarAgent initialized successfully[/green]")
         
         self.last_run_result = None
+        self._accumulated_run_results = []  # All tool results in a session (multi-target support)
         self.last_search_results = None
         
         # Responses API state tracking
@@ -455,6 +456,7 @@ GUIDELINES:
 - **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
 - **MINIMAL PARAMETERS**: When calling search_by_target, ONLY include optional parameters (band, max_resolution, min_freq_ghz, etc.) if the user EXPLICITLY requested them. For example, if the user says "Find ALMA data of M87", call search_by_target(target_name="M87") with NO other parameters. Do NOT pass band=0, min_freq_ghz=0, max_resolution=100 etc. Leaving them out returns ALL data.
 - **MULTI-TARGET**: If the user mentions multiple targets (e.g. "M87 and Sz65"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
+- **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
 - **MULTI-WAVELENGTH**: When users ask about JWST, HST, Hubble, or optical/infrared data, use `search_cadc_archive` instead of or in addition to ALMA search. For comprehensive coverage, search both ALMA and CADC.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
@@ -517,7 +519,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "properties": {
                     "target_name":    {"type": "string",  "description": "Astronomical target name (e.g. 'TW Hya', 'HL Tau'). For multiple targets use comma or 'and': 'M87, NGC 1068'."},
                     "facility":       {"type": "string",  "enum": ["ALMA", "VLA", "VLBA", "GBT"], "description": "Observatory. Default ALMA."},
-                    "band":           {"type": "integer", "description": "ALMA band number to filter (3-10). ONLY pass if user explicitly asks for a specific band."},
+                    "band":           {"type": "string", "description": "ALMA band number(s) to filter (3-10). For a single band pass '6'. For multiple bands pass comma-separated like '6,7'. ONLY pass if user explicitly asks for a specific band."},
                     "max_resolution": {"type": "number",  "description": "Maximum angular resolution in arcsec. ONLY pass if user specifies."},
                     "min_resolution": {"type": "number",  "description": "Minimum angular resolution in arcsec. ONLY pass if user specifies."},
                     "min_freq_ghz":   {"type": "number",  "description": "Minimum frequency in GHz. ONLY pass if user specifies."},
@@ -1531,7 +1533,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     @log_tool
     def _search_by_target(self, target_name: str, facility: Optional[str] = None,
                           date_range: Optional[str] = None, max_results: int = 100,
-                          band: Optional[int] = None,
+                          band = None,
                           max_resolution: Optional[float] = None,
                           min_resolution: Optional[float] = None,
                           min_freq_ghz: Optional[float] = None,
@@ -1539,10 +1541,31 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                           min_exp_s: Optional[float] = None,
                           public_only: bool = False) -> Dict[str, Any]:
         """Search ALMA by target name, with optional native post-filters."""
-        # ── Safety: ignore nonsensical band values ──
-        if band is not None and (band < 1 or band > 10):
-            print(f"[FILTER] Ignoring invalid band={band} (must be 3-10)")
-            band = None
+        # ── Normalize band to a list (multi-band support) ──
+        band_list_input: List[int] = []
+        if band is not None:
+            if isinstance(band, list):
+                # LLM passed a list (e.g. [6, 7])
+                band_list_input = [int(b) for b in band if str(b).strip().isdigit() and 1 <= int(b) <= 10]
+            elif isinstance(band, (int, float)):
+                # Single integer
+                b = int(band)
+                if 1 <= b <= 10:
+                    band_list_input = [b]
+                else:
+                    print(f"[FILTER] Ignoring invalid band={band} (must be 3-10)")
+            elif isinstance(band, str):
+                # String like "6" or "6,7" or "6 and 7"
+                import re as _re_band
+                parts = _re_band.split(r'[,\s]+and[\s]+|[,\s]+', band.strip())
+                for p in parts:
+                    p = p.strip()
+                    if p.isdigit():
+                        b = int(p)
+                        if 1 <= b <= 10:
+                            band_list_input.append(b)
+            else:
+                print(f"[FILTER] Ignoring unrecognized band={band}")
 
         # ── Safety: ignore near-zero min values (LLM default filling) ──
         if min_resolution is not None and min_resolution <= 0:
@@ -1595,19 +1618,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_target"}
                 return {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
 
-            # ── Tier 2: Pandas post-filters ──────────────────────────────
+            # ── Tier 2: Pandas post-filters (non-band) ─────────────────
             filter_parts = []
-
-            # Band filter — check band_list or Band column
-            if band is not None:
-                band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
-                if band_col:
-                    before = len(results)
-                    results = results[results[band_col].astype(str).str.split(",").apply(
-                        lambda bands: any(str(band).strip() == b.strip() for b in bands)
-                    )]
-                    filter_parts.append(f"Band {band}")
-                    print(f"[FILTER] Band {band}: {before} → {len(results)} rows")
 
             # Resolution filter
             res_col = next((c for c in ["spatial_resolution", "s_resolution", "resolution"] if c in results.columns), None)
@@ -1638,17 +1650,72 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 results = results[pd.to_numeric(results[exp_col], errors="coerce") >= min_exp_s]
                 filter_parts.append(f"exp ≥ {min_exp_s}s")
 
-            # Build source label showing active filters
-            filter_label = f"ALMA › {target_name}"
-            if filter_parts:
-                filter_label += " [" + ", ".join(filter_parts) + "]"
+            # ── Multi-band handling ────────────────────────────────────
+            # When multiple bands are requested (e.g. [6, 7]), produce a
+            # separate data card for each band via _accumulated_run_results.
+            band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
 
-            self.last_search_results = results
-            self.last_run_result = {
-                "type": "data", "data": results,
-                "source": "ALMA", "filter_label": filter_label,
-                "tool_name": "search_by_target"
-            }
+            if len(band_list_input) > 1 and band_col:
+                # Multi-band: emit a separate result per band
+                any_found = False
+                for b in band_list_input:
+                    band_filtered = results[results[band_col].astype(str).str.split(",").apply(
+                        lambda bands, _b=b: any(str(_b).strip() == x.strip() for x in bands)
+                    )]
+                    print(f"[MULTI-BAND] Band {b}: {len(results)} → {len(band_filtered)} rows")
+                    if not band_filtered.empty:
+                        any_found = True
+                        b_filter_label = f"ALMA › {target_name} [Band {b}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
+                        self.last_search_results = band_filtered
+                        self.last_run_result = {
+                            "type": "data", "data": band_filtered,
+                            "source": "ALMA", "filter_label": b_filter_label,
+                            "tool_name": "search_by_target"
+                        }
+                        # Accumulate each band result for multi-card display
+                        self._accumulated_run_results.append(self.last_run_result.copy())
+
+                if not any_found:
+                    # None of the bands had data — still show the unfiltered results
+                    filter_label = f"ALMA › {target_name}"
+                    if filter_parts:
+                        filter_label += " [" + ", ".join(filter_parts) + "]"
+                    self.last_search_results = results
+                    self.last_run_result = {
+                        "type": "data", "data": results,
+                        "source": "ALMA", "filter_label": filter_label,
+                        "tool_name": "search_by_target"
+                    }
+            elif len(band_list_input) == 1 and band_col:
+                # Single band filter
+                b = band_list_input[0]
+                before = len(results)
+                results = results[results[band_col].astype(str).str.split(",").apply(
+                    lambda bands, _b=b: any(str(_b).strip() == x.strip() for x in bands)
+                )]
+                filter_parts.append(f"Band {b}")
+                print(f"[FILTER] Band {b}: {before} → {len(results)} rows")
+
+                filter_label = f"ALMA › {target_name}"
+                if filter_parts:
+                    filter_label += " [" + ", ".join(filter_parts) + "]"
+                self.last_search_results = results
+                self.last_run_result = {
+                    "type": "data", "data": results,
+                    "source": "ALMA", "filter_label": filter_label,
+                    "tool_name": "search_by_target"
+                }
+            else:
+                # No band filter
+                filter_label = f"ALMA › {target_name}"
+                if filter_parts:
+                    filter_label += " [" + ", ".join(filter_parts) + "]"
+                self.last_search_results = results
+                self.last_run_result = {
+                    "type": "data", "data": results,
+                    "source": "ALMA", "filter_label": filter_label,
+                    "tool_name": "search_by_target"
+                }
 
             # Compact summary + top MOUS UIDs & URLs for Conductor subtask chaining
             top_mous = []
@@ -2829,6 +2896,7 @@ ORDER BY target_name
             # Images already captured in the loop above — just clean up.
             self.last_search_results = None
             self.last_run_result = None
+            self._accumulated_run_results = []
             import gc; gc.collect()
 
     def _dispatch_tool_call(self, tool_name: str, arguments_json: str) -> str:
@@ -2932,6 +3000,8 @@ ORDER BY target_name
         attachments: Optional[List[Dict[str, Any]]] = None,
         raw_query: Optional[str] = None,
     ) -> str:
+        # Reset accumulated results for this new request
+        self._accumulated_run_results = []
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -3306,6 +3376,9 @@ ORDER BY target_name
                         try:
                             result = tool.execute(**args)
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
+                            # Capture each tool's run result for multi-target support
+                            if self.last_run_result is not None:
+                                self._accumulated_run_results.append(self.last_run_result.copy())
                             # Record tool calls for session memory
                             self.session_memory.record_tool_calls(1)
                         except Exception as te:

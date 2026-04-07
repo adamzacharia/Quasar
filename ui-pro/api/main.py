@@ -556,7 +556,8 @@ def _stream_chat_response(
             first_token = True
             response_text = ""
             # Accumulators for rich UI events — persisted to Turso for history replay
-            _rich_data_table = None
+            _rich_data_tables = []  # list of data tables (multi-target support)
+            _rich_data_table = None  # last data table (backward compat)
             _rich_papers = None
             _rich_notebook = None
             _rich_image = None
@@ -598,10 +599,37 @@ def _stream_chat_response(
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
 
-            last_run_result = getattr(agent, "last_run_result", None)
-            if last_run_result:
-                result_type = last_run_result.get("type", "")
-                tool_name_raw = last_run_result.get("tool_name") or (
+            # ── Collect all accumulated results (multi-target support) ──
+            # When the LLM makes separate tool calls for each target,
+            # _accumulated_run_results captures every result instead of
+            # only the last one.
+            _all_results = getattr(agent, "_accumulated_run_results", [])
+            _last_result = getattr(agent, "last_run_result", None)
+            # Deduplicate: if last_run_result isn't already in the list, add it
+            if _last_result and not _all_results:
+                _all_results = [_last_result]
+            elif _last_result and _all_results:
+                # Check if last result is already captured (by identity)
+                if not any(r is _last_result for r in _all_results):
+                    _all_results.append(_last_result)
+
+            # ── Process each accumulated result ──────────────────────
+            _seen_result_ids = set()  # avoid duplicate emissions
+            for _run_result in _all_results:
+                if not _run_result:
+                    continue
+                # Deduplicate by (type, tool_name, data-id) to avoid emitting same result twice
+                _dedup_key = (
+                    _run_result.get("type", ""),
+                    _run_result.get("tool_name", ""),
+                    id(_run_result.get("data")) if _run_result.get("data") is not None else id(_run_result),
+                )
+                if _dedup_key in _seen_result_ids:
+                    continue
+                _seen_result_ids.add(_dedup_key)
+
+                result_type = _run_result.get("type", "")
+                tool_name_raw = _run_result.get("tool_name") or (
                     "search_papers" if result_type == "papers" else
                     "search_alma_archive" if result_type == "data" else
                     "quasar_tool"
@@ -612,14 +640,14 @@ def _stream_chat_response(
                     "name": tool_name_raw,
                     "displayName": tool_display,
                     "status": "completed",
-                    "input": last_run_result.get("params", {}),
+                    "input": _run_result.get("params", {}),
                     "output": "Found results",
                 })
                 yield f"data: {tool_event}\n\n"
                 await asyncio.sleep(0.05)
 
                 if result_type == "data":
-                    df = last_run_result.get("data")
+                    df = _run_result.get("data")
                     if df is not None and hasattr(df, "to_dict"):
                         try:
                             import math
@@ -757,7 +785,7 @@ def _stream_chat_response(
                             demographics, fits_estimate = _compute_demographics(df)
 
                             # ── Detect archive source dynamically ─────────
-                            _detected_source = last_run_result.get("filter_label") or last_run_result.get("source", "")
+                            _detected_source = _run_result.get("filter_label") or _run_result.get("source", "")
                             if not _detected_source:
                                 if cadc_collections:
                                     _detected_source = " / ".join(sorted(cadc_collections)[:3])
@@ -812,14 +840,16 @@ def _stream_chat_response(
                             })
                             yield f"data: {table_event}\n\n"
                             # Capture for history persistence
-                            _rich_data_table = json.loads(table_event)
-                            _rich_data_table.pop("type", None)  # strip SSE type marker
+                            _rich_dt = json.loads(table_event)
+                            _rich_dt.pop("type", None)  # strip SSE type marker
+                            _rich_data_tables.append(_rich_dt)
+                            _rich_data_table = _rich_dt  # backward compat
                             await asyncio.sleep(0.05)
                         except Exception as e:
                             print(f"[WARN] Could not serialize data table for UI: {e}")
 
                 elif result_type == "papers":
-                    papers = last_run_result.get("papers", [])
+                    papers = _run_result.get("papers", [])
                     if papers:
                         papers_event = json.dumps({"type": "papers", "papers": papers})
                         yield f"data: {papers_event}\n\n"
@@ -827,8 +857,8 @@ def _stream_chat_response(
                         await asyncio.sleep(0.05)
 
                 elif result_type == "notebook":
-                    nb_data = last_run_result.get("notebook_data", {})
-                    nb_title = last_run_result.get("title", "Analysis Notebook")
+                    nb_data = _run_result.get("notebook_data", {})
+                    nb_title = _run_result.get("title", "Analysis Notebook")
                     if nb_data:
                         notebook_event = json.dumps({
                             "type": "notebook",
@@ -840,8 +870,8 @@ def _stream_chat_response(
                         await asyncio.sleep(0.05)
 
                 elif result_type == "image":
-                    img_url = last_run_result.get("image_url", "")
-                    caption = last_run_result.get("caption", "")
+                    img_url = _run_result.get("image_url", "")
+                    caption = _run_result.get("caption", "")
                     if img_url:
                         image_event = json.dumps({
                             "type": "image", "url": img_url, "caption": caption,
@@ -852,7 +882,7 @@ def _stream_chat_response(
 
                 elif result_type == "conductor_result":
                     # Multiple images accumulated during Conductor orchestration
-                    images = last_run_result.get("images", [])
+                    images = _run_result.get("images", [])
                     for img in images:
                         img_url = img.get("image_url", "")
                         caption = img.get("caption", "")
@@ -865,8 +895,8 @@ def _stream_chat_response(
                             await asyncio.sleep(0.05)
                             
                     # Companion notebook
-                    nb_data = last_run_result.get("notebook_data", {})
-                    nb_title = last_run_result.get("title", "Research Notebook")
+                    nb_data = _run_result.get("notebook_data", {})
+                    nb_title = _run_result.get("title", "Research Notebook")
                     if nb_data:
                         nb_event = json.dumps({
                             "type": "notebook",
@@ -885,7 +915,14 @@ def _stream_chat_response(
             if current_user_id and conv_id and response_text:
                 try:
                     rich_meta = {}
-                    if _rich_data_table:
+                    if _rich_data_tables:
+                        # Store all data tables for multi-target support
+                        if len(_rich_data_tables) == 1:
+                            rich_meta["dataTable"] = _rich_data_tables[0]
+                        else:
+                            rich_meta["dataTable"] = _rich_data_tables[0]  # primary (backward compat)
+                            rich_meta["dataTables"] = _rich_data_tables    # all tables
+                    elif _rich_data_table:
                         rich_meta["dataTable"] = _rich_data_table
                     if _rich_papers:
                         rich_meta["papers"] = _rich_papers

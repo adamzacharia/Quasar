@@ -331,6 +331,7 @@ export default function HelpPage() {
                                 <div className="space-y-3 text-sm text-slate-400 leading-relaxed">
                                     <p>This project makes use of data from the <span className="text-slate-300">Atacama Large Millimeter/submillimeter Array (ALMA)</span>, <span className="text-slate-300">NASA Astrophysics Data System (ADS)</span>, and <span className="text-slate-300">SIMBAD</span> astronomical database operated at CDS, Strasbourg, France.</p>
                                     <p>ALMA is a partnership of ESO, NSF (USA), and NINS (Japan), together with NRC (Canada), NSTC and ASIAA (Taiwan), and KASI (Republic of Korea), in cooperation with the Republic of Chile.</p>
+                                    <p>Special thanks to <span className="text-slate-300 font-medium">Dr Nikhil Mukund</span> for inspiring me to build tools and teaching me so much about LLMs, and to <span className="text-slate-300 font-medium">Dr Lisa Barsotti</span> and the <span className="text-slate-300 font-medium">MIT LIGO Lab</span> for giving invaluable opportunity and support.</p>
                                 </div>
                             </section>
                         </div>
