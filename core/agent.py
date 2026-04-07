@@ -3263,7 +3263,6 @@ ORDER BY target_name
                         # Store notebook data so main.py can emit it for history
                         self.last_run_result["notebook_data"] = notebook
                         
-                        import re
                         words = [w for w in re.split(r'\W+', query) if w]
                         short_title = "_".join(words[:2]) if words else "Analysis"
                         self.last_run_result["title"] = short_title
