@@ -79,13 +79,14 @@ function aitoffProject(
 function drawSkyMap(
     canvas: HTMLCanvasElement,
     coords: { ra: number; dec: number }[],
-    opts: { large?: boolean } = {},
+    opts: { large?: boolean; time?: number } = {},
 ) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const W = canvas.width;
     const H = canvas.height;
     const large = opts.large ?? false;
+    const t = opts.time ?? 0;
 
     const cx = W / 2;
     const cy = H / 2;
@@ -99,6 +100,20 @@ function drawSkyMap(
     bg.addColorStop(1, "#060d17");
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, W, H);
+
+    // ── Background star field (static faint dots) ──
+    if (large) {
+        ctx.fillStyle = "rgba(180, 200, 230, 0.12)";
+        // Deterministic pseudo-random stars based on canvas size
+        for (let i = 0; i < 120; i++) {
+            const sx = ((i * 7919 + 31) % W);
+            const sy = ((i * 6271 + 17) % H);
+            const sr = ((i * 3) % 3 === 0) ? 0.8 : 0.4;
+            ctx.beginPath();
+            ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
 
     // ── Aitoff boundary ellipse ──
     ctx.save();
@@ -114,12 +129,14 @@ function drawSkyMap(
     ctx.stroke();
     ctx.restore();
 
-    // ── Coordinate grid ──
-    ctx.strokeStyle = "rgba(100, 140, 200, 0.08)";
-    ctx.lineWidth = 0.5;
+    // ── Coordinate grid (denser) ──
+    const decStep = large ? 15 : 30;
+    const raStep = large ? 30 : 60;
 
-    // Dec lines
-    for (let dec = -60; dec <= 60; dec += 30) {
+    // Minor grid lines
+    ctx.strokeStyle = "rgba(100, 140, 200, 0.06)";
+    ctx.lineWidth = 0.4;
+    for (let dec = -75; dec <= 75; dec += decStep) {
         ctx.beginPath();
         let first = true;
         for (let ra = 0; ra <= 360; ra += 2) {
@@ -129,8 +146,7 @@ function drawSkyMap(
         }
         ctx.stroke();
     }
-    // RA lines
-    for (let ra = 0; ra < 360; ra += 30) {
+    for (let ra = 0; ra < 360; ra += raStep) {
         ctx.beginPath();
         let first = true;
         for (let dec = -90; dec <= 90; dec += 2) {
@@ -140,8 +156,23 @@ function drawSkyMap(
         }
         ctx.stroke();
     }
-    // Equator (RA axis)
-    ctx.strokeStyle = "rgba(100, 140, 200, 0.18)";
+
+    // Major grid lines (every 30° dec, 90° RA)
+    ctx.strokeStyle = "rgba(100, 140, 200, 0.12)";
+    ctx.lineWidth = 0.6;
+    for (const dec of [-60, -30, 30, 60]) {
+        ctx.beginPath();
+        let first = true;
+        for (let ra = 0; ra <= 360; ra += 2) {
+            const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
+            if (first) { ctx.moveTo(px, py); first = false; }
+            else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+    }
+
+    // Equator (RA axis) — brighter
+    ctx.strokeStyle = "rgba(100, 140, 200, 0.22)";
     ctx.lineWidth = 0.8;
     ctx.beginPath();
     let firstEq = true;
@@ -159,10 +190,8 @@ function drawSkyMap(
     ctx.lineWidth = large ? 14 : 6;
     ctx.beginPath();
     let firstGal = true;
-    // Approximate galactic plane in equatorial coords
     for (let l = 0; l <= 360; l += 3) {
         const lRad = (l * Math.PI) / 180;
-        // Simple galactic → equatorial approx
         const ra = (l + 192.85) % 360;
         const dec = 27.13 * Math.sin(lRad - 0.57) - 5;
         const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
@@ -172,17 +201,25 @@ function drawSkyMap(
     ctx.stroke();
     ctx.restore();
 
-    // ── Data points ──
-    const pointR = large ? 3.5 : 2;
-    const glowR = large ? 12 : 6;
+    // ── Data points (with twinkling) ──
+    const baseR = large ? 3.5 : 2;
+    const baseGlow = large ? 12 : 6;
 
-    for (const { ra, dec } of coords) {
+    coords.forEach(({ ra, dec }, idx) => {
         const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
+
+        // Each point has a unique phase offset for independent twinkling
+        const phase = idx * 2.39996 + ra * 0.01 + dec * 0.01; // golden-ratio-ish spread
+        const twinkle = 0.6 + 0.4 * Math.sin(t * 0.003 + phase);
+        const glowTwinkle = 0.5 + 0.5 * Math.sin(t * 0.002 + phase * 1.3);
+
+        const pointR = baseR * (0.85 + 0.15 * twinkle);
+        const glowR = baseGlow * (0.8 + 0.3 * glowTwinkle);
 
         // Outer glow
         const glow = ctx.createRadialGradient(px, py, 0, px, py, glowR);
-        glow.addColorStop(0, "rgba(56, 200, 220, 0.45)");
-        glow.addColorStop(0.4, "rgba(56, 200, 220, 0.12)");
+        glow.addColorStop(0, `rgba(56, 200, 220, ${0.35 * twinkle})`);
+        glow.addColorStop(0.4, `rgba(56, 200, 220, ${0.1 * twinkle})`);
         glow.addColorStop(1, "rgba(56, 200, 220, 0)");
         ctx.fillStyle = glow;
         ctx.fillRect(px - glowR, py - glowR, glowR * 2, glowR * 2);
@@ -190,31 +227,30 @@ function drawSkyMap(
         // Core dot
         ctx.beginPath();
         ctx.arc(px, py, pointR, 0, Math.PI * 2);
-        ctx.fillStyle = "#38d8dc";
+        ctx.fillStyle = `rgba(56, 216, 220, ${0.7 + 0.3 * twinkle})`;
         ctx.fill();
 
         // Hot center
         ctx.beginPath();
         ctx.arc(px, py, pointR * 0.4, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(220, 255, 255, 0.9)";
+        ctx.fillStyle = `rgba(220, 255, 255, ${0.6 + 0.4 * twinkle})`;
         ctx.fill();
-    }
+    });
 
-    // ── RA labels (large mode only) ──
+    // ── RA / Dec labels ──
     if (large) {
         ctx.font = "11px 'Inter', sans-serif";
         ctx.fillStyle = "rgba(148, 163, 184, 0.6)";
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        for (let ra = 0; ra < 360; ra += 60) {
+        for (let ra = 0; ra < 360; ra += 30) {
             const [px, py] = aitoffProject(ra, 0, cx, cy, scaleX, scaleY);
             const h = Math.round(ra / 15);
             ctx.fillText(`${h}h`, px, py + 4);
         }
-        // Dec labels
         ctx.textAlign = "right";
         ctx.textBaseline = "middle";
-        for (let dec = -60; dec <= 60; dec += 30) {
+        for (let dec = -75; dec <= 75; dec += 15) {
             if (dec === 0) continue;
             const [px, py] = aitoffProject(180, dec, cx, cy, scaleX, scaleY);
             ctx.fillText(`${dec > 0 ? "+" : ""}${dec}°`, px - 4, py);
@@ -222,14 +258,22 @@ function drawSkyMap(
     }
 }
 
-/* ── Mini sky map thumbnail ── */
+/* ── Mini sky map thumbnail (animated) ── */
 function MiniSkyMap({
     coords, onClick,
 }: { coords: { ra: number; dec: number }[]; onClick: () => void }) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const animRef = useRef<number>(0);
 
     useEffect(() => {
-        if (canvasRef.current) drawSkyMap(canvasRef.current, coords);
+        let running = true;
+        const animate = (time: number) => {
+            if (!running || !canvasRef.current) return;
+            drawSkyMap(canvasRef.current, coords, { time });
+            animRef.current = requestAnimationFrame(animate);
+        };
+        animRef.current = requestAnimationFrame(animate);
+        return () => { running = false; cancelAnimationFrame(animRef.current); };
     }, [coords]);
 
     return (
@@ -267,9 +311,17 @@ function SkyMapLightbox({
     coords, sourceName, onClose,
 }: { coords: { ra: number; dec: number }[]; sourceName?: string; onClose: () => void }) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const animRef = useRef<number>(0);
 
     useEffect(() => {
-        if (canvasRef.current) drawSkyMap(canvasRef.current, coords, { large: true });
+        let running = true;
+        const animate = (time: number) => {
+            if (!running || !canvasRef.current) return;
+            drawSkyMap(canvasRef.current, coords, { large: true, time });
+            animRef.current = requestAnimationFrame(animate);
+        };
+        animRef.current = requestAnimationFrame(animate);
+        return () => { running = false; cancelAnimationFrame(animRef.current); };
     }, [coords]);
 
     // Compute RA/Dec range for footer
@@ -593,10 +645,10 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                                         href={String(row["_link"])}
                                                         target="_blank"
                                                         rel="noopener noreferrer"
-                                                        title="Open this observation in ALMA Archive"
+                                                        title={`Open in ${data.sourceName || "Archive"}`}
                                                         className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/10 rounded-md transition-colors whitespace-nowrap"
                                                     >
-                                                        <Link2 className="w-3 h-3" />ALMA ↗
+                                                        <Link2 className="w-3 h-3" />{(data.sourceName || "Archive").split(" / ")[0].split(" ")[0]} ↗
                                                     </a>
                                                 ) : (
                                                     <span className="text-slate-600 text-xs">—</span>
@@ -616,7 +668,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 <div className="flex items-center justify-between gap-3 px-4 py-3 bg-surface-dark border-t border-slate-700/50 flex-wrap">
                     <span className="text-xs text-slate-500">
                         {rows.length} row{rows.length !== 1 ? "s" : ""} · {columns.length} col{columns.length !== 1 ? "s" : ""}
-                        {data.hasPreview && " · DSS2 previews"}
+                        {data.hasPreview && " · Sky previews"}
                         {data.fitsEstimate && data.fitsEstimate > 0 && ` · ~${data.fitsEstimate} FITS files`}
                     </span>
                     <div className="flex gap-2 flex-wrap justify-end">

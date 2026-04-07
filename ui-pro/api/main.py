@@ -186,6 +186,84 @@ def _compute_demographics(df) -> tuple:
     return demographics, fits_estimate
 
 
+# ── CADC DataLink preview URL fetcher ─────────────────────────
+_CADC_DATALINK_URL = "https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/caom2ops/datalink"
+
+def _fetch_cadc_preview_urls(obs_publisher_dids: List[str], max_ids: int = 30) -> Dict[str, str]:
+    """Batch-query CADC DataLink for preview image URLs.
+
+    Sends a single HTTP request with multiple IDs and parses the VOTable
+    response to extract rows with semantics=#preview or #thumbnail.
+
+    Returns {obs_publisher_did: preview_access_url} mapping.
+    Falls back to empty dict on any error (non-blocking).
+    """
+    import urllib.request
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    ids = obs_publisher_dids[:max_ids]
+    if not ids:
+        return {}
+
+    try:
+        params = "&".join(f"ID={urllib.parse.quote(oid, safe='')}" for oid in ids)
+        url = f"{_CADC_DATALINK_URL}?{params}"
+        req = urllib.request.Request(url, headers={"Accept": "application/x-votable+xml"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = resp.read()
+
+        # Parse VOTable XML — extract ID, semantics, access_url columns
+        root = ET.fromstring(data)
+        ns = {"vo": "http://www.ivoa.net/xml/VOTable/v1.3"}
+
+        # Find FIELD column indices
+        table = root.find(".//vo:TABLE", ns) or root.find(".//TABLE")
+        if table is None:
+            # Try without namespace
+            ns = {}
+            table = root.find(".//TABLE")
+        if table is None:
+            return {}
+
+        fields = table.findall("vo:FIELD", ns) if ns else table.findall("FIELD")
+        col_names = [f.get("name", "").lower() for f in fields]
+
+        id_idx = next((i for i, n in enumerate(col_names) if n == "id"), None)
+        sem_idx = next((i for i, n in enumerate(col_names) if n == "semantics"), None)
+        url_idx = next((i for i, n in enumerate(col_names) if n == "access_url"), None)
+
+        if id_idx is None or sem_idx is None or url_idx is None:
+            return {}
+
+        preview_map: Dict[str, str] = {}
+        data_el = table.find("vo:DATA", ns) if ns else table.find("DATA")
+        if data_el is None:
+            return {}
+        tabledata = data_el.find("vo:TABLEDATA", ns) if ns else data_el.find("TABLEDATA")
+        if tabledata is None:
+            return {}
+
+        for tr in (tabledata.findall("vo:TR", ns) if ns else tabledata.findall("TR")):
+            tds = tr.findall("vo:TD", ns) if ns else tr.findall("TD")
+            if len(tds) <= max(id_idx, sem_idx, url_idx):
+                continue
+            obs_id = (tds[id_idx].text or "").strip()
+            semantics = (tds[sem_idx].text or "").strip().lower()
+            access = (tds[url_idx].text or "").strip()
+
+            if semantics in ("#preview", "#thumbnail") and access:
+                # Prefer #thumbnail (smaller), but #preview is fine too
+                if obs_id not in preview_map or semantics == "#thumbnail":
+                    preview_map[obs_id] = access
+
+        return preview_map
+
+    except Exception as e:
+        print(f"[INFO] CADC DataLink preview fetch skipped: {e}")
+        return {}
+
+
 # Thread pool for running synchronous agent calls
 _executor = ThreadPoolExecutor(max_workers=2)  # Keep low to avoid OOM on 2GB instances
 
@@ -608,11 +686,56 @@ def _stream_chat_response(
                                     rows[i]["_link"] = link
 
                             # ── Inject sky preview thumbnail URLs ──────────
-                            #    Uses CDS HiPS2FITS to generate DSS2 color cutouts
+                            #    Hybrid: CADC DataLink for JWST/HST, DSS2 for everything else
                             ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
                             dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
                             has_preview = False
-                            if ra_col and dec_col:
+
+                            # Detect if this is CADC/MAST data (JWST, HST, Gemini, etc.)
+                            is_cadc = False
+                            cadc_collections = set()
+                            if "obs_collection" in df.columns:
+                                cadc_collections = set(df["obs_collection"].dropna().astype(str).unique())
+                                is_cadc = bool(cadc_collections)
+                            elif "obs_publisher_did" in df.columns:
+                                sample = str(df["obs_publisher_did"].dropna().iloc[0]) if not df["obs_publisher_did"].dropna().empty else ""
+                                is_cadc = "cadc" in sample.lower() or "mast" in sample.lower()
+
+                            cadc_preview_map = {}
+                            if is_cadc and "obs_publisher_did" in df.columns:
+                                # Batch-fetch actual observation previews from CADC DataLink
+                                pub_ids = df["obs_publisher_did"].head(_MAX_TABLE_ROWS).dropna().astype(str).tolist()
+                                try:
+                                    cadc_preview_map = _fetch_cadc_preview_urls(pub_ids)
+                                except Exception:
+                                    pass  # Fall through to DSS2
+
+                            if cadc_preview_map:
+                                # Use real observation previews from CADC
+                                for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
+                                    if i >= len(rows):
+                                        break
+                                    pub_id = str(orig_row.get("obs_publisher_did", "")).strip()
+                                    if pub_id in cadc_preview_map:
+                                        rows[i]["_preview"] = cadc_preview_map[pub_id]
+                                        has_preview = True
+                                    elif ra_col and dec_col:
+                                        # DSS2 fallback for rows without CADC preview
+                                        try:
+                                            ra_v = float(orig_row[ra_col])
+                                            dec_v = float(orig_row[dec_col])
+                                            if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                                                rows[i]["_preview"] = (
+                                                    f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+                                                    f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
+                                                    f"&fov=0.033&projection=TAN&coordsys=icrs"
+                                                    f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
+                                                )
+                                                has_preview = True
+                                        except (ValueError, TypeError):
+                                            pass
+                            elif ra_col and dec_col:
+                                # Pure DSS2 fallback (ALMA and non-CADC data)
                                 for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
                                     if i >= len(rows):
                                         break
@@ -632,6 +755,16 @@ def _stream_chat_response(
 
                             # ── Demographics & FITS estimation ─────────────
                             demographics, fits_estimate = _compute_demographics(df)
+
+                            # ── Detect archive source dynamically ─────────
+                            _detected_source = last_run_result.get("filter_label") or last_run_result.get("source", "")
+                            if not _detected_source:
+                                if cadc_collections:
+                                    _detected_source = " / ".join(sorted(cadc_collections)[:3])
+                                elif "member_ous_uid" in df.columns:
+                                    _detected_source = "ALMA Archive"
+                                else:
+                                    _detected_source = "Archive"
 
                             metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
                             if "band_list" in df.columns:
@@ -653,8 +786,12 @@ def _stream_chat_response(
                                     "color": "emerald",
                                 })
 
+                            # ── Build archive link (per-archive) ──────────
                             archive_link = ""
-                            if "access_url" in df.columns and not df["access_url"].isna().all():
+                            if is_cadc and "target_name" in df.columns and not df.empty:
+                                _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
+                                archive_link = f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.target.name={_tgt}"
+                            elif "access_url" in df.columns and not df["access_url"].isna().all():
                                 archive_link = str(df["access_url"].dropna().iloc[0])
                             elif "member_ous_uid" in df.columns:
                                 mous = next((str(v) for v in df["member_ous_uid"] if pd.notna(v) and str(v).strip()), "")
@@ -666,8 +803,7 @@ def _stream_chat_response(
                                 "metrics": metrics,
                                 "columns": list(sub.columns),
                                 "rows": rows,
-                                "sourceName": last_run_result.get("filter_label")
-                                or last_run_result.get("source", "ALMA Archive"),
+                                "sourceName": _detected_source,
                                 "archiveLink": archive_link,
                                 "hasRowLinks": any(bool(r.get("_link")) for r in rows),
                                 "hasPreview": has_preview,
@@ -1430,10 +1566,52 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                     rows[i]["_link"] = link
 
                             # ── Inject sky preview thumbnail URLs ──────────
+                            #    Hybrid: CADC DataLink for JWST/HST, DSS2 for everything else
                             ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
                             dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
                             has_preview = False
-                            if ra_col and dec_col:
+
+                            # Detect if this is CADC/MAST data
+                            is_cadc = False
+                            cadc_collections = set()
+                            if "obs_collection" in df.columns:
+                                cadc_collections = set(df["obs_collection"].dropna().astype(str).unique())
+                                is_cadc = bool(cadc_collections)
+                            elif "obs_publisher_did" in df.columns:
+                                sample = str(df["obs_publisher_did"].dropna().iloc[0]) if not df["obs_publisher_did"].dropna().empty else ""
+                                is_cadc = "cadc" in sample.lower() or "mast" in sample.lower()
+
+                            cadc_preview_map = {}
+                            if is_cadc and "obs_publisher_did" in df.columns:
+                                pub_ids = df["obs_publisher_did"].head(_MAX_TABLE_ROWS).dropna().astype(str).tolist()
+                                try:
+                                    cadc_preview_map = _fetch_cadc_preview_urls(pub_ids)
+                                except Exception:
+                                    pass
+
+                            if cadc_preview_map:
+                                for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
+                                    if i >= len(rows):
+                                        break
+                                    pub_id = str(orig_row.get("obs_publisher_did", "")).strip()
+                                    if pub_id in cadc_preview_map:
+                                        rows[i]["_preview"] = cadc_preview_map[pub_id]
+                                        has_preview = True
+                                    elif ra_col and dec_col:
+                                        try:
+                                            ra_v = float(orig_row[ra_col])
+                                            dec_v = float(orig_row[dec_col])
+                                            if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                                                rows[i]["_preview"] = (
+                                                    f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+                                                    f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
+                                                    f"&fov=0.033&projection=TAN&coordsys=icrs"
+                                                    f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
+                                                )
+                                                has_preview = True
+                                        except (ValueError, TypeError):
+                                            pass
+                            elif ra_col and dec_col:
                                 for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
                                     if i >= len(rows):
                                         break
@@ -1451,14 +1629,27 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                     except (ValueError, TypeError):
                                         pass
 
-                            source = last_run_result.get("source", "ALMA")
+                            # ── Detect archive source dynamically ─────────
+                            source = last_run_result.get("source", "")
                             filter_label = last_run_result.get("filter_label", source)
+                            if not filter_label:
+                                if cadc_collections:
+                                    filter_label = " / ".join(sorted(cadc_collections)[:3])
+                                elif "member_ous_uid" in df.columns:
+                                    filter_label = "ALMA"
+                                else:
+                                    filter_label = "Archive"
+                            if not source:
+                                source = filter_label
 
-                            # Build footer archive link
-                            alma_link = None
-                            if "target_name" in df.columns and not df.empty:
+                            # ── Build archive link (per-archive) ──────────
+                            archive_link = None
+                            if is_cadc and "target_name" in df.columns and not df.empty:
                                 _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
-                                alma_link = f"https://almascience.eso.org/aq/?target={_tgt}"
+                                archive_link = f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.target.name={_tgt}"
+                            elif "target_name" in df.columns and not df.empty:
+                                _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
+                                archive_link = f"https://almascience.eso.org/aq/?target={_tgt}"
 
                             # ── Demographics & FITS estimation ─────────────
                             demographics, fits_estimate = _compute_demographics(df)
@@ -1481,7 +1672,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                     "metrics": metrics,
                                     "columns": display_cols,
                                     "rows": rows,
-                                    "archiveLink": alma_link,
+                                    "archiveLink": archive_link,
                                     "hasRowLinks": bool(per_row_links),
                                     "hasPreview": has_preview,
                                     "demographics": demographics if demographics else None,

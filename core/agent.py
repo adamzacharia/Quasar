@@ -453,6 +453,8 @@ GUIDELINES:
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
 - **DO NOT** output raw tool usage strings like `[TOOL: ...]` or JSON. Just use the Native Tool Calling feature.
 - **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
+- **MINIMAL PARAMETERS**: When calling search_by_target, ONLY include optional parameters (band, max_resolution, min_freq_ghz, etc.) if the user EXPLICITLY requested them. For example, if the user says "Find ALMA data of M87", call search_by_target(target_name="M87") with NO other parameters. Do NOT pass band=0, min_freq_ghz=0, max_resolution=100 etc. Leaving them out returns ALL data.
+- **MULTI-TARGET**: If the user mentions multiple targets (e.g. "M87 and Sz65"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
 - **MULTI-WAVELENGTH**: When users ask about JWST, HST, Hubble, or optical/infrared data, use `search_cadc_archive` instead of or in addition to ALMA search. For comprehensive coverage, search both ALMA and CADC.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
@@ -500,24 +502,27 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="search_by_target",
             description=(
-                "Search ALMA archive by target name. Accepts optional filters "
-                "(band, resolution, frequency) to narrow results BEFORE returning — "
-                "so only matching observations are shown. "
-                "ALWAYS pass user-specified constraints as parameters rather than "
-                "filtering separately afterwards."
+                "Search ALMA archive by target name. Supports multiple targets separated by "
+                "'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
+                "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency) "
+                "if the user EXPLICITLY mentions them. Do NOT invent default values. "
+                "If the user just says 'Find ALMA data of M87', pass ONLY target_name='M87' "
+                "with NO other parameters — this returns ALL observations across all bands.\n"
+                "Only pass band=6 if the user says 'Band 6'. Only pass max_resolution if "
+                "the user specifies a resolution constraint. Omitting a filter means 'no filter'."
             ),
             function=self._search_by_target,
             parameters={
                 "type": "object",
                 "properties": {
-                    "target_name":    {"type": "string",  "description": "Astronomical target name (e.g. 'TW Hya', 'HL Tau')"},
+                    "target_name":    {"type": "string",  "description": "Astronomical target name (e.g. 'TW Hya', 'HL Tau'). For multiple targets use comma or 'and': 'M87, NGC 1068'."},
                     "facility":       {"type": "string",  "enum": ["ALMA", "VLA", "VLBA", "GBT"], "description": "Observatory. Default ALMA."},
-                    "band":           {"type": "integer", "description": "ALMA band number to filter (3-10). E.g. 6 for Band 6 (~220 GHz)."},
-                    "max_resolution": {"type": "number",  "description": "Maximum angular resolution in arcsec (e.g. 0.2 means keep only rows with res <= 0.2)."},
-                    "min_resolution": {"type": "number",  "description": "Minimum angular resolution in arcsec."},
-                    "min_freq_ghz":   {"type": "number",  "description": "Minimum frequency in GHz."},
-                    "max_freq_ghz":   {"type": "number",  "description": "Maximum frequency in GHz."},
-                    "min_exp_s":      {"type": "number",  "description": "Minimum integration time in seconds."},
+                    "band":           {"type": "integer", "description": "ALMA band number to filter (3-10). ONLY pass if user explicitly asks for a specific band."},
+                    "max_resolution": {"type": "number",  "description": "Maximum angular resolution in arcsec. ONLY pass if user specifies."},
+                    "min_resolution": {"type": "number",  "description": "Minimum angular resolution in arcsec. ONLY pass if user specifies."},
+                    "min_freq_ghz":   {"type": "number",  "description": "Minimum frequency in GHz. ONLY pass if user specifies."},
+                    "max_freq_ghz":   {"type": "number",  "description": "Maximum frequency in GHz. ONLY pass if user specifies."},
+                    "min_exp_s":      {"type": "number",  "description": "Minimum integration time in seconds. ONLY pass if user specifies."},
                     "public_only":    {"type": "boolean", "description": "Only return publicly available data."},
                 },
                 "required": ["target_name"]
@@ -1534,10 +1539,58 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                           min_exp_s: Optional[float] = None,
                           public_only: bool = False) -> Dict[str, Any]:
         """Search ALMA by target name, with optional native post-filters."""
+        # ── Safety: ignore nonsensical band values ──
+        if band is not None and (band < 1 or band > 10):
+            print(f"[FILTER] Ignoring invalid band={band} (must be 3-10)")
+            band = None
+
+        # ── Safety: ignore near-zero min values (LLM default filling) ──
+        if min_resolution is not None and min_resolution <= 0:
+            min_resolution = None
+        if min_freq_ghz is not None and min_freq_ghz <= 0:
+            min_freq_ghz = None
+        if min_exp_s is not None and min_exp_s <= 0:
+            min_exp_s = None
+        # Ignore absurdly wide max values (LLM defaults)
+        if max_resolution is not None and max_resolution >= 100:
+            max_resolution = None
+        if max_freq_ghz is not None and max_freq_ghz >= 5000:
+            max_freq_ghz = None
+
         try:
-            results = self.search_service.search_by_target(
-                target_name, facility, date_range, max_results
-            )
+            # ── Multi-target support ──────────────────────────────────
+            # Detect "M87 and Sz65" or "M87, NGC 1068" patterns
+            import re as _re
+            raw_names = [n.strip() for n in _re.split(r'\s+and\s+|\s*,\s*', target_name) if n.strip()]
+
+            if len(raw_names) > 1:
+                # Search each target independently, concatenate results
+                all_frames = []
+                searched_names = []
+                for name in raw_names[:5]:  # Cap at 5 targets
+                    try:
+                        df = self.search_service.search_by_target(
+                            name, facility, date_range, max_results
+                        )
+                        if not df.empty:
+                            all_frames.append(df)
+                            searched_names.append(name)
+                            print(f"[MULTI] '{name}' → {len(df)} results")
+                        else:
+                            print(f"[MULTI] '{name}' → 0 results")
+                    except Exception as e:
+                        print(f"[MULTI] '{name}' failed: {e}")
+
+                if all_frames:
+                    results = pd.concat(all_frames, ignore_index=True)
+                    target_name = " + ".join(searched_names)  # update label
+                else:
+                    results = pd.DataFrame()
+            else:
+                results = self.search_service.search_by_target(
+                    target_name, facility, date_range, max_results
+                )
+
             if results.empty:
                 self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_target"}
                 return {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
