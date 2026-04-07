@@ -443,29 +443,7 @@ flowchart TD
 
 ---
 
-## Command Tag Routing
 
-```mermaid
-flowchart LR
-    Q["User Query"] --> DETECT{"Detect @tag"}
-
-    DETECT -->|"@archive"| ARCH["tool_choice = required<br/>Forces search tool"]
-    DETECT -->|"@search"| SRCH["tool_choice = none<br/>Pure RAG response"]
-    DETECT -->|"@paper"| PAPER["tool_choice = required<br/>Forces search_papers"]
-    DETECT -->|"No tag"| AUTO["tool_choice = auto<br/>LLM decides"]
-
-    ARCH --> LLM["OpenAI API Call"]
-    SRCH --> LLM
-    PAPER --> LLM
-    AUTO --> LLM
-
-    style ARCH fill:#4A90D9,stroke:#2C5F8A,color:#fff
-    style SRCH fill:#7ED321,stroke:#5CA018,color:#fff
-    style PAPER fill:#F5A623,stroke:#C17D12,color:#fff
-    style AUTO fill:#9B59B6,stroke:#7D3C98,color:#fff
-```
-
----
 
 ## Configuration & Environment
 

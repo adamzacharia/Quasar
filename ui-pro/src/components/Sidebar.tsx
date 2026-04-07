@@ -189,7 +189,7 @@ function SavedPapersContent() {
                     </div>
                     <p className="text-sm text-slate-400 font-medium">No saved papers yet</p>
                     <p className="text-xs text-slate-600 mt-1.5 max-w-[200px]">
-                        Search for papers using <span className="text-primary font-mono">@paper</span> in the chat, then bookmark the ones you want to save.
+                        Ask the assistant to find papers for you in the chat, then bookmark the ones you want to save.
                     </p>
                 </div>
             </div>

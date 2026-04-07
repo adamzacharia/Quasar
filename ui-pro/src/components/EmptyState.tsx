@@ -12,10 +12,10 @@ interface Suggestion {
 }
 
 const SUGGESTIONS: Suggestion[] = [
-    { icon: <Satellite className="w-5 h-5" />, iconBg: "bg-primary/10 text-primary", iconHoverBg: "group-hover:bg-primary group-hover:text-primary-dark", title: "Find ALMA observations", description: "Look for Sz65 in Band 6 data archives.", prompt: "@archive Find ALMA observations of Sz65 in Band 6" },
-    { icon: <FileText className="w-5 h-5" />, iconBg: "bg-indigo-500/10 text-indigo-400", iconHoverBg: "group-hover:bg-indigo-500 group-hover:text-white", title: "Search for papers", description: "Find latest research on protoplanetary disks.", prompt: "@paper Find recent papers on protoplanetary disks" },
+    { icon: <Satellite className="w-5 h-5" />, iconBg: "bg-primary/10 text-primary", iconHoverBg: "group-hover:bg-primary group-hover:text-primary-dark", title: "Find ALMA observations", description: "Look for Sz65 in Band 6 data archives.", prompt: "Find ALMA observations of Sz65 in Band 6" },
+    { icon: <FileText className="w-5 h-5" />, iconBg: "bg-indigo-500/10 text-indigo-400", iconHoverBg: "group-hover:bg-indigo-500 group-hover:text-white", title: "Search for papers", description: "Find latest research on protoplanetary disks.", prompt: "Find recent papers on protoplanetary disks" },
     { icon: <HelpCircle className="w-5 h-5" />, iconBg: "bg-emerald-500/10 text-emerald-400", iconHoverBg: "group-hover:bg-emerald-500 group-hover:text-white", title: "Proprietary Period", description: "What is the current ALMA data policy?", prompt: "What is the ALMA proprietary period?" },
-    { icon: <AudioWaveform className="w-5 h-5" />, iconBg: "bg-orange-500/10 text-orange-400", iconHoverBg: "group-hover:bg-orange-500 group-hover:text-white", title: "Line Coverage Check", description: "Check CO(2-1) line coverage for M87.", prompt: "@archive Check CO(2-1) line coverage for M87" },
+    { icon: <AudioWaveform className="w-5 h-5" />, iconBg: "bg-orange-500/10 text-orange-400", iconHoverBg: "group-hover:bg-orange-500 group-hover:text-white", title: "Line Coverage Check", description: "Check CO(2-1) line coverage for M87.", prompt: "Check CO(2-1) line coverage for M87" },
 ];
 
 interface EmptyStateProps { onSuggestionClick: (prompt: string) => void; }

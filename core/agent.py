@@ -495,6 +495,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "dec": {"type": "number", "description": "Declination in degrees"},
                     "radius": {"type": "number", "description": "Search radius in degrees (default 0.5)"},
                     "facility": {"type": "string", "enum": ["VLA", "VLBA", "ALMA", "GBT"], "description": "Observatory facility. Default to ALMA."},
+                    "band": {"type": "string", "description": "ALMA band number(s) to filter (3-10). Pass a single band like '6' or multiple like '6,7'."},
                     "max_results": {"type": "integer", "description": "Maximum results to return"}
                 },
                 "required": ["ra", "dec"]
@@ -3021,9 +3022,15 @@ ORDER BY target_name
             detection, cutoff checks, and conductor routing).  If omitted,
             *query* is used for everything.
         """
-        # Derive the bare user question for routing / classification.
+        # Derive the bare user question for routing / classification, and strip UI tags
         _user_query = raw_query or query
-        
+        for tag in ["@archive", "@paper", "@search"]:
+            if _user_query.lower().strip().startswith(tag):
+                _user_query = _user_query.strip()[len(tag):].strip()
+            # Also strip from the enriched query so the LLM doesn't get confused
+            pattern = re.compile(re.escape(tag), re.IGNORECASE)
+            query = pattern.sub("", query).strip()
+
         # 0. Session Management — smart context handling + session memory
         self._prune_session_if_needed(query, user_id)
 

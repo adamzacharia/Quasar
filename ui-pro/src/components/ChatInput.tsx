@@ -147,7 +147,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                 </form>
                 <div className="text-center mt-3">
                     <p className="text-[10px] text-slate-600">
-                        QUASAR may produce inaccurate information. Use <span className="text-primary">@archive</span>, <span className="text-emerald-400">@paper</span>, or <span className="text-indigo-400">@search</span> for targeted queries.
+                        QUASAR may produce inaccurate information.
                         <span className="text-slate-700 ml-2">· Accepts images, PDFs, FITS, CSV</span>
                     </p>
                 </div>

@@ -19,11 +19,7 @@ export default function HelpPage() {
 
     if (!mounted) return null; // Prevent hydration mismatch Flash
 
-    const commands = [
-        { tag: "@archive", desc: "Search ALMA observation archives for RAW data cubes and visibilities.", icon: Telescope, color: "text-primary", bg: "bg-primary/10" },
-        { tag: "@paper", desc: "Search NASA ADS for research papers, authors, and abstracts.", icon: FileText, color: "text-accent-purple", bg: "bg-accent-purple/10" },
-        { tag: "@search", desc: "General search across all astrophysical databases and sources.", icon: Search, color: "text-emerald-accent", bg: "bg-emerald-accent/10" },
-    ];
+
 
     const tips = [
         `Ask natural questions like "Find ALMA observations of HL Tau"`,
@@ -110,26 +106,7 @@ export default function HelpPage() {
                         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-in fade-in duration-300">
                             {/* Left Column */}
                             <div className="space-y-8">
-                                {/* Command Tags Section */}
-                                <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">
-                                    <h2 className="text-xl font-semibold text-white mb-6 flex items-center gap-2">
-                                        <div className="p-1.5 bg-slate-700/50 rounded-md"><Zap className="w-5 h-5 text-yellow-400" /></div>
-                                        Command Tags
-                                    </h2>
-                                    <div className="space-y-4">
-                                        {commands.map((cmd) => (
-                                            <div key={cmd.tag} className="flex gap-4 p-4 rounded-xl bg-slate-800/50 hover:bg-slate-800 transition-colors border border-slate-700/50 hover:border-slate-600/50">
-                                                <div className={`p-3 rounded-lg ${cmd.bg} shrink-0 h-fit`}>
-                                                    <cmd.icon className={`w-6 h-6 ${cmd.color}`} />
-                                                </div>
-                                                <div>
-                                                    <span className="text-sm font-mono font-bold text-white">{cmd.tag}</span>
-                                                    <p className="text-sm text-slate-400 mt-1 leading-relaxed">{cmd.desc}</p>
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </section>
+
 
                                 {/* Pro Tips Section */}
                                 <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">

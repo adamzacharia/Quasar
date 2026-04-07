@@ -12,16 +12,6 @@ import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 
-function renderWithTags(content: string): React.ReactNode {
-    const parts = content.split(/(@archive|@paper|@search)/gi);
-    return parts.map((part, i) => {
-        const lower = part.toLowerCase();
-        if (lower === "@archive") return <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-primary text-white text-xs font-bold mr-1 align-middle select-none"><Database className="w-3.5 h-3.5" />@archive</span>;
-        if (lower === "@paper") return <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-600 text-white text-xs font-bold mr-1 align-middle select-none">@paper</span>;
-        if (lower === "@search") return <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-500 text-white text-xs font-bold mr-1 align-middle select-none">@search</span>;
-        return <span key={i}>{part}</span>;
-    });
-}
 
 function CodeBlock({ language, children }: { language: string; children: string }) {
     const [copied, setCopied] = useState(false);
@@ -60,7 +50,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     <div className="space-y-1">
                         <div className="flex justify-end"><span className="text-[10px] text-slate-400 uppercase font-medium tracking-wider mr-1">You</span></div>
                         <div className="bg-card-dark border border-primary/20 rounded-2xl rounded-tr-sm px-5 py-3 text-slate-100 shadow-sm space-y-3">
-                            {message.content && <p className="leading-relaxed">{renderWithTags(message.content)}</p>}
+                            {message.content && <p className="leading-relaxed">{message.content}</p>}
 
                             {/* Image attachment previews */}
                             {message.attachmentPreviews && message.attachmentPreviews.length > 0 && (
