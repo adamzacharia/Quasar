@@ -2877,6 +2877,7 @@ ORDER BY target_name
         on_token=None,
         on_status=None,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        raw_query: Optional[str] = None,
     ) -> str:
         """
         Stream a response using OpenAI Responses API with:
@@ -2885,7 +2886,20 @@ ORDER BY target_name
         - mem0 long-term memory for cross-session facts
         - Token streaming via `on_token` callback
         - Parallel web search for queries beyond LLM knowledge cutoff
+
+        Parameters
+        ----------
+        raw_query : str, optional
+            The original, un-enriched user message.  When the caller wraps
+            the user's question inside personal-RAG context (e.g.
+            ``"The user has …\n---\nUser's question: …"``), the enriched
+            text should go in *query* (so the LLM sees everything) while
+            the bare question goes in *raw_query* (used for complexity
+            detection, cutoff checks, and conductor routing).  If omitted,
+            *query* is used for everything.
         """
+        # Derive the bare user question for routing / classification.
+        _user_query = raw_query or query
         
         # 0. Session Management — smart context handling + session memory
         self._prune_session_if_needed(query, user_id)
@@ -2896,7 +2910,7 @@ ORDER BY target_name
             on_status("Connecting to QUASAR engine", "completed")
 
         # 0a. Knowledge-cutoff detection — launch parallel web search
-        _web_search_query = self._detect_beyond_cutoff(query)
+        _web_search_query = self._detect_beyond_cutoff(_user_query)
         _web_result_holder = {}   # will be filled by background thread
 
         if _web_search_query:
@@ -2999,7 +3013,7 @@ ORDER BY target_name
 
         # 4a. Conductor check — delegate complex queries to DAG orchestration
         try:
-            complexity = self.rlm.detector.assess(query).score if hasattr(self, 'rlm') else 0.0
+            complexity = self.rlm.detector.assess(_user_query).score if hasattr(self, 'rlm') else 0.0
             if complexity > Conductor.COMPLEXITY_THRESHOLD:
                 import asyncio, json as _json
                 trace_id = self.query_tracer.new_trace(query, user_id=user_id)

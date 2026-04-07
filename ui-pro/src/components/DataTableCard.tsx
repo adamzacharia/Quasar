@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Download, Link2, X, Telescope, BarChart3 } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
+import { Download, Link2, X, Telescope, BarChart3, Map } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
 
 interface DataTableCardProps { data: DataTableResult; }
@@ -51,6 +51,269 @@ function MiniDonut({
                         <span className="text-slate-500">({v})</span>
                     </span>
                 ))}
+            </div>
+        </div>
+    );
+}
+
+/* ── Aitoff‑Hammer projection helpers ── */
+function aitoffProject(
+    raDeg: number, decDeg: number,
+    cx: number, cy: number, scaleX: number, scaleY: number,
+): [number, number] {
+    // Convert RA from [0,360) → longitude [-π, π]  (180° at center)
+    let lam = ((raDeg - 180) * Math.PI) / 180;
+    if (lam > Math.PI) lam -= 2 * Math.PI;
+    if (lam < -Math.PI) lam += 2 * Math.PI;
+    const phi = (decDeg * Math.PI) / 180;
+
+    const alpha = Math.acos(Math.cos(phi) * Math.cos(lam / 2));
+    const sinc = alpha === 0 ? 1 : Math.sin(alpha) / alpha;
+
+    const x = (2 * Math.cos(phi) * Math.sin(lam / 2)) / sinc;
+    const y = Math.sin(phi) / sinc;
+
+    return [cx + x * scaleX, cy - y * scaleY];
+}
+
+function drawSkyMap(
+    canvas: HTMLCanvasElement,
+    coords: { ra: number; dec: number }[],
+    opts: { large?: boolean } = {},
+) {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const W = canvas.width;
+    const H = canvas.height;
+    const large = opts.large ?? false;
+
+    const cx = W / 2;
+    const cy = H / 2;
+    const scaleX = W * 0.44;
+    const scaleY = H * 0.44;
+
+    // ── Background gradient ──
+    const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H));
+    bg.addColorStop(0, "#0c1929");
+    bg.addColorStop(0.5, "#0a1220");
+    bg.addColorStop(1, "#060d17");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // ── Aitoff boundary ellipse ──
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, scaleX * 2.02, scaleY * 1.02, 0, 0, Math.PI * 2);
+    const boundGrad = ctx.createRadialGradient(cx, cy, scaleY * 0.2, cx, cy, scaleX * 2);
+    boundGrad.addColorStop(0, "rgba(30, 58, 95, 0.15)");
+    boundGrad.addColorStop(1, "rgba(15, 30, 50, 0.05)");
+    ctx.fillStyle = boundGrad;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(100, 140, 200, 0.15)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+
+    // ── Coordinate grid ──
+    ctx.strokeStyle = "rgba(100, 140, 200, 0.08)";
+    ctx.lineWidth = 0.5;
+
+    // Dec lines
+    for (let dec = -60; dec <= 60; dec += 30) {
+        ctx.beginPath();
+        let first = true;
+        for (let ra = 0; ra <= 360; ra += 2) {
+            const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
+            if (first) { ctx.moveTo(px, py); first = false; }
+            else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+    }
+    // RA lines
+    for (let ra = 0; ra < 360; ra += 30) {
+        ctx.beginPath();
+        let first = true;
+        for (let dec = -90; dec <= 90; dec += 2) {
+            const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
+            if (first) { ctx.moveTo(px, py); first = false; }
+            else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+    }
+    // Equator (RA axis)
+    ctx.strokeStyle = "rgba(100, 140, 200, 0.18)";
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    let firstEq = true;
+    for (let ra = 0; ra <= 360; ra += 2) {
+        const [px, py] = aitoffProject(ra, 0, cx, cy, scaleX, scaleY);
+        if (firstEq) { ctx.moveTo(px, py); firstEq = false; }
+        else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    // ── Galactic plane hint (soft band) ──
+    ctx.save();
+    ctx.globalAlpha = 0.04;
+    ctx.strokeStyle = "#c4a55a";
+    ctx.lineWidth = large ? 14 : 6;
+    ctx.beginPath();
+    let firstGal = true;
+    // Approximate galactic plane in equatorial coords
+    for (let l = 0; l <= 360; l += 3) {
+        const lRad = (l * Math.PI) / 180;
+        // Simple galactic → equatorial approx
+        const ra = (l + 192.85) % 360;
+        const dec = 27.13 * Math.sin(lRad - 0.57) - 5;
+        const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
+        if (firstGal) { ctx.moveTo(px, py); firstGal = false; }
+        else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // ── Data points ──
+    const pointR = large ? 3.5 : 2;
+    const glowR = large ? 12 : 6;
+
+    for (const { ra, dec } of coords) {
+        const [px, py] = aitoffProject(ra, dec, cx, cy, scaleX, scaleY);
+
+        // Outer glow
+        const glow = ctx.createRadialGradient(px, py, 0, px, py, glowR);
+        glow.addColorStop(0, "rgba(56, 200, 220, 0.45)");
+        glow.addColorStop(0.4, "rgba(56, 200, 220, 0.12)");
+        glow.addColorStop(1, "rgba(56, 200, 220, 0)");
+        ctx.fillStyle = glow;
+        ctx.fillRect(px - glowR, py - glowR, glowR * 2, glowR * 2);
+
+        // Core dot
+        ctx.beginPath();
+        ctx.arc(px, py, pointR, 0, Math.PI * 2);
+        ctx.fillStyle = "#38d8dc";
+        ctx.fill();
+
+        // Hot center
+        ctx.beginPath();
+        ctx.arc(px, py, pointR * 0.4, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(220, 255, 255, 0.9)";
+        ctx.fill();
+    }
+
+    // ── RA labels (large mode only) ──
+    if (large) {
+        ctx.font = "11px 'Inter', sans-serif";
+        ctx.fillStyle = "rgba(148, 163, 184, 0.6)";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        for (let ra = 0; ra < 360; ra += 60) {
+            const [px, py] = aitoffProject(ra, 0, cx, cy, scaleX, scaleY);
+            const h = Math.round(ra / 15);
+            ctx.fillText(`${h}h`, px, py + 4);
+        }
+        // Dec labels
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        for (let dec = -60; dec <= 60; dec += 30) {
+            if (dec === 0) continue;
+            const [px, py] = aitoffProject(180, dec, cx, cy, scaleX, scaleY);
+            ctx.fillText(`${dec > 0 ? "+" : ""}${dec}°`, px - 4, py);
+        }
+    }
+}
+
+/* ── Mini sky map thumbnail ── */
+function MiniSkyMap({
+    coords, onClick,
+}: { coords: { ra: number; dec: number }[]; onClick: () => void }) {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    useEffect(() => {
+        if (canvasRef.current) drawSkyMap(canvasRef.current, coords);
+    }, [coords]);
+
+    return (
+        <div className="flex flex-col items-center gap-1.5 min-w-[100px]">
+            <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                Sky Map
+            </span>
+            <button
+                onClick={onClick}
+                className="relative rounded-lg overflow-hidden border border-slate-600/40
+                           hover:border-cyan-500/50 transition-all hover:scale-105
+                           hover:shadow-lg hover:shadow-cyan-500/10 cursor-pointer group"
+                title="Click to expand sky map"
+            >
+                <canvas
+                    ref={canvasRef}
+                    width={160}
+                    height={90}
+                    className="block"
+                    style={{ width: 160, height: 90 }}
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent
+                                opacity-0 group-hover:opacity-100 transition-opacity" />
+                <div className="absolute bottom-1 right-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Map className="w-3 h-3 text-cyan-400/60" />
+                </div>
+            </button>
+            <span className="text-[9px] text-slate-500">{coords.length} positions</span>
+        </div>
+    );
+}
+
+/* ── Sky map lightbox (expanded) ── */
+function SkyMapLightbox({
+    coords, sourceName, onClose,
+}: { coords: { ra: number; dec: number }[]; sourceName?: string; onClose: () => void }) {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    useEffect(() => {
+        if (canvasRef.current) drawSkyMap(canvasRef.current, coords, { large: true });
+    }, [coords]);
+
+    // Compute RA/Dec range for footer
+    const raMin = Math.min(...coords.map(c => c.ra));
+    const raMax = Math.max(...coords.map(c => c.ra));
+    const decMin = Math.min(...coords.map(c => c.dec));
+    const decMax = Math.max(...coords.map(c => c.dec));
+
+    return (
+        <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+            onClick={onClose}
+        >
+            <div
+                className="relative bg-[#0a1220] border border-slate-600/60 rounded-2xl p-4 shadow-2xl max-w-[680px] w-full mx-4"
+                onClick={e => e.stopPropagation()}
+            >
+                <button
+                    onClick={onClose}
+                    className="absolute -top-2 -right-2 p-1 bg-slate-800 border border-slate-600 rounded-full hover:bg-red-500/20 transition-colors z-10"
+                >
+                    <X className="w-4 h-4 text-slate-300" />
+                </button>
+
+                <canvas
+                    ref={canvasRef}
+                    width={1200}
+                    height={600}
+                    className="w-full rounded-xl"
+                    style={{ maxHeight: 400 }}
+                />
+
+                <div className="mt-3 text-center space-y-1">
+                    <p className="text-sm font-semibold text-slate-200 flex items-center justify-center gap-2">
+                        <Map className="w-4 h-4 text-cyan-400" />
+                        {sourceName ? `${sourceName} — Sky Distribution` : "Sky Distribution"}
+                    </p>
+                    <p className="text-[10px] text-slate-500 font-mono">
+                        {coords.length} observations · RA {raMin.toFixed(2)}°–{raMax.toFixed(2)}° · Dec {decMin.toFixed(2)}°–{decMax.toFixed(2)}°
+                    </p>
+                    <p className="text-[9px] text-slate-600">
+                        Aitoff equal-area projection · Equatorial J2000
+                    </p>
+                </div>
             </div>
         </div>
     );
@@ -150,10 +413,13 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const [lightbox, setLightbox] = useState<{
         src: string; target?: string; ra?: string; dec?: string;
     } | null>(null);
+    const [skyMapOpen, setSkyMapOpen] = useState(false);
 
+    const skyCoords = data.demographics?.skyCoords;
     const hasDemographics = data.demographics && (
         data.demographics.bands || data.demographics.projects ||
-        data.demographics.telescopes || data.demographics.instruments
+        data.demographics.telescopes || data.demographics.instruments ||
+        (skyCoords && skyCoords.length > 0)
     );
 
     // Download CSV helper
@@ -173,7 +439,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
 
     return (
         <>
-            {/* Lightbox modal */}
+            {/* Lightbox modals */}
             {lightbox && (
                 <PreviewLightbox
                     src={lightbox.src}
@@ -181,6 +447,13 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     ra={lightbox.ra}
                     dec={lightbox.dec}
                     onClose={() => setLightbox(null)}
+                />
+            )}
+            {skyMapOpen && skyCoords && skyCoords.length > 0 && (
+                <SkyMapLightbox
+                    coords={skyCoords}
+                    sourceName={data.sourceName}
+                    onClose={() => setSkyMapOpen(false)}
                 />
             )}
 
@@ -212,6 +485,12 @@ export function DataTableCard({ data }: DataTableCardProps) {
                             </span>
                         </div>
                         <div className="flex flex-wrap items-start justify-center gap-6">
+                            {skyCoords && skyCoords.length > 0 && (
+                                <MiniSkyMap
+                                    coords={skyCoords}
+                                    onClick={() => setSkyMapOpen(true)}
+                                />
+                            )}
                             {data.demographics?.bands && Object.keys(data.demographics.bands).length > 1 && (
                                 <MiniDonut data={data.demographics.bands} title="Bands" />
                             )}

@@ -133,11 +133,12 @@ async def _global_exception_handler(request, exc):
 
 # ── Demographics & FITS estimation helper ────────────────────
 def _compute_demographics(df) -> tuple:
-    """Compute distribution data and FITS estimate from a search DataFrame.
+    """Compute distribution data, FITS estimate, and sky coordinates from a search DataFrame.
     Returns (demographics_dict, fits_estimate_int).
+    demographics_dict may include a 'skyCoords' key with [{ra, dec}, ...] entries.
     """
     import math
-    demographics: Dict[str, Dict[str, int]] = {}
+    demographics: Dict[str, Any] = {}
 
     if "band_list" in df.columns:
         band_counts = df["band_list"].astype(str).value_counts().head(8)
@@ -155,6 +156,22 @@ def _compute_demographics(df) -> tuple:
     if "instrument_name" in df.columns:
         inst_counts = df["instrument_name"].value_counts().head(6)
         demographics["instruments"] = {str(k): int(v) for k, v in inst_counts.items()}
+
+    # ── Sky coordinates for sky-map widget ──────────────────────
+    ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
+    dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
+    if ra_col and dec_col:
+        coords = []
+        for _, row in df.head(500).iterrows():  # cap at 500 for performance
+            try:
+                ra_v = float(row[ra_col])
+                dec_v = float(row[dec_col])
+                if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                    coords.append({"ra": round(ra_v, 4), "dec": round(dec_v, 4)})
+            except (ValueError, TypeError):
+                pass
+        if coords:
+            demographics["skyCoords"] = coords
 
     # FITS file estimation
     fits_estimate = 0
@@ -449,6 +466,7 @@ def _stream_chat_response(
                         on_token=on_token,
                         on_status=_on_status,
                         attachments=active_attachments,
+                        raw_query=request.message,
                     )
                     asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
                 except Exception as e:
@@ -1272,6 +1290,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                         user_id=_uid,
                         on_token=on_token,
                         on_status=_on_status,
+                        raw_query=request.message,
                     )
                     asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
                 except Exception as e:

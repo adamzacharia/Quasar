@@ -106,17 +106,37 @@ class ComplexityDetector:
         #           "what is X", "tell me about X", etc.
         import re as _re
         _simple_patterns = [
-            r'^(?:look\s*up|search|find|show|get|list|display)\b',
+            r'^(?:look\s*up|search|find|show|get|list|display|give\s+me|query)\b',
             r'^(?:what|where|who|when|how)\s+(?:is|are|was|were|do|does)\b',
             r'^(?:tell\s+me\s+about|explain|describe|define)\b',
+            # Archive-query patterns: "any observations of X", "ALMA data for X"
+            r'(?:any|are\s+there)\s+(?:observations|data)\b',
         ]
+        # Fast-track obvious single-step queries, BUT only if the query
+        # doesn't also contain multi-hop reasoning indicators.  A query
+        # like "Find observations that overlap between ALMA and JWST and
+        # combine them" starts with "Find" but is genuinely complex.
+        _multi_hop_hits = sum(1 for kw in _MULTI_HOP_INDICATORS if kw in q)
         for pat in _simple_patterns:
             if _re.search(pat, q):
+                if _multi_hop_hits == 0:
+                    return 0.0
+                break  # has multi-hop indicators — fall through to scoring
+
+        # Explicit single-archive queries: a query that mentions a target
+        # and a band/instrument but NO multi-hop indicators is a simple lookup.
+        _has_target_kw = bool(_re.search(
+            r'\b(?:observation|observations|data|archive)\b', q
+        ))
+        _has_band_or_target = bool(_re.search(
+            r'\b(?:band\s*\d|m\d{1,3}|ngc|ic\s*\d|alma|vla|jwst)\b', q
+        ))
+        if _has_target_kw and _has_band_or_target:
+            if _multi_hop_hits == 0:
                 return 0.0
 
-        hits = sum(1 for kw in _MULTI_HOP_INDICATORS if kw in q)
         # Normalize: 3+ hits → 1.0
-        return min(hits / 3.0, 1.0)
+        return min(_multi_hop_hits / 3.0, 1.0)
 
     def _llm_assess(self, query: str, heuristic_score: float) -> ComplexityResult:
         prompt = (

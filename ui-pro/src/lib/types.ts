@@ -63,6 +63,7 @@ export interface DataTableResult {
         projects?: Record<string, number>;
         telescopes?: Record<string, number>;
         instruments?: Record<string, number>;
+        skyCoords?: { ra: number; dec: number }[];  // RA/Dec positions for sky map
     };
     fitsEstimate?: number; // Estimated number of FITS files available
 }
