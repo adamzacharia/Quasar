@@ -147,6 +147,9 @@ def _compute_demographics(df) -> tuple:
     if "project_code" in df.columns:
         proj_counts = df["project_code"].value_counts().head(6)
         demographics["projects"] = {str(k): int(v) for k, v in proj_counts.items()}
+    elif "proposal_id" in df.columns:
+        proj_counts = df["proposal_id"].value_counts().head(6)
+        demographics["projects"] = {str(k): int(v) for k, v in proj_counts.items()}
 
     # Multi-telescope support (CADC results have obs_collection)
     if "obs_collection" in df.columns:
@@ -162,12 +165,16 @@ def _compute_demographics(df) -> tuple:
     dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
     if ra_col and dec_col:
         coords = []
-        for _, row in df.head(500).iterrows():  # cap at 500 for performance
+        for _, row in df.head(10000).iterrows():
             try:
                 ra_v = float(row[ra_col])
                 dec_v = float(row[dec_col])
-                if not (math.isnan(ra_v) or math.isnan(dec_v)):
-                    coords.append({"ra": round(ra_v, 4), "dec": round(dec_v, 4)})
+                # Filter out NaN and zero-coordinate rows (invalid positions)
+                if math.isnan(ra_v) or math.isnan(dec_v):
+                    continue
+                if abs(ra_v) < 0.001 and abs(dec_v) < 0.001:
+                    continue
+                coords.append({"ra": round(ra_v, 4), "dec": round(dec_v, 4)})
             except (ValueError, TypeError):
                 pass
         if coords:
@@ -395,23 +402,37 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
 
     try:
         alma_display_cols = [
-            ("project_code", "Project"),
+            ("obs_publisher_did", "Project"),
             ("target_name", "Target"),
             ("obs_collection", "Telescope"),
             ("instrument_name", "Instrument"),
             ("band_list", "Band"),
             ("frequency", "Freq (GHz)"),
-            ("min_frequency", "Min Freq (GHz)"),
-            ("max_frequency", "Max Freq (GHz)"),
+            ("frequency_support", "Freq Support"),
+            ("cont_sensitivity_bandwidth", "Cont. Sens. (mJy/beam)"),
             ("dataproduct_type", "Type"),
             ("calib_level", "Cal Level"),
-            ("spatial_resolution", "Res (arcsec)"),
-            ("s_resolution", "Res (arcsec)"),
-            ("t_exptime", "Exp (s)"),
+            ("spatial_resolution", "Ang. Res. (arcsec)"),
+            ("s_resolution", "Ang. Res. (arcsec)"),
+            ("velocity_resolution", "Vel. Res. (km/s)"),
+            ("spatial_scale_max", "Max Recov. Scale (arcsec)"),
+            ("t_exptime", "Int. Time (s)"),
+            ("antenna_arrays", "Array"),
+            ("is_mosaic", "Mosaic"),
+            ("s_fov", "FOV (arcsec)"),
+            ("scientific_category", "Science Category"),
+            ("science_keyword", "Science Keyword"),
+            ("pol_states", "Polarization"),
+            ("pwv", "PWV (mm)"),
             ("pi_name", "PI"),
-            ("obs_release_date", "Release"),
+            ("proposal_authors", "Authors"),
+            ("obs_release_date", "Release Date"),
+            ("obs_title", "Project Title"),
+            ("schedblock_name", "SB Name"),
+            ("proposal_id", "Proposal ID"),
             ("member_ous_uid", "MOUS ID"),
-            ("obs_publisher_did", "Obs ID"),
+            ("group_ous_uid", "Group OUS ID"),
+            ("asdm_uid", "ASDM UID"),
         ]
         seen_display = set()
         sel_cols, display_cols = [], []
@@ -425,19 +446,32 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             sel_cols = list(df.columns[:8])
             display_cols = sel_cols
 
-        _MAX_TABLE_ROWS = 500
+        _MAX_TABLE_ROWS = 10000
         sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
         sub.columns = display_cols
 
         per_row_links = []
-        if "access_url" in df.columns:
-            per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
+        _source = _run_result.get("source", "")
+        if _source == "CADC" and "obs_id" in df.columns:
+            # Build browsable CADC archive links (not raw DataLink URLs)
+            _collections = df["obs_collection"].head(_MAX_TABLE_ROWS).fillna("").tolist() if "obs_collection" in df.columns else [""] * min(len(df), _MAX_TABLE_ROWS)
+            _obs_ids = df["obs_id"].head(_MAX_TABLE_ROWS).fillna("").tolist()
+            import urllib.parse as _urlparse
+            per_row_links = [
+                f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.observationID={_urlparse.quote(str(oid), safe='')}"
+                if oid else ""
+                for oid, col in zip(_obs_ids, _collections)
+            ]
         elif "member_ous_uid" in df.columns:
+            # ALMA archive links via member OUS UID
             per_row_links = [
                 f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
                 if pd.notna(v) and str(v).strip() else ""
                 for v in df["member_ous_uid"].head(_MAX_TABLE_ROWS)
             ]
+        elif "access_url" in df.columns:
+            # Fallback: use access_url directly (non-DataLink sources)
+            per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
 
         def _fmt(v):
             if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -1610,7 +1644,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                                 sel_cols = list(df.columns[:8])
                                 display_cols = sel_cols
 
-                            _MAX_TABLE_ROWS = 500
+                            _MAX_TABLE_ROWS = 10000
                             sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
                             sub.columns = display_cols
 

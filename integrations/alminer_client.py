@@ -101,9 +101,7 @@ class ALminerClient:
                 print("[ALMA] TAP search starting...")
                 service = self._get_tap_service()
                 query = f'''
-                SELECT target_name, s_ra, s_dec, band_list, proposal_id, 
-                       t_exptime, s_resolution, bandwidth, frequency,
-                       member_ous_uid, obs_publisher_did, access_url
+                SELECT *
                 FROM ivoa.obscore 
                 WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1
                 '''
@@ -245,9 +243,7 @@ class ALminerClient:
             service = self._get_tap_service()
             
             query = f'''
-            SELECT target_name, s_ra, s_dec, band_list, proposal_id,
-                   t_exptime, s_resolution, bandwidth, frequency,
-                   member_ous_uid, obs_publisher_did, access_url
+            SELECT *
             FROM ivoa.obscore
             WHERE frequency >= {min_freq_ghz}
               AND frequency <= {max_freq_ghz}

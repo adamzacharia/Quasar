@@ -1666,16 +1666,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         if not df.empty:
                             all_frames.append(df)
                             band_label = ",".join(str(b) for b in _tgt_bands) if _tgt_bands else "all"
-                            label = f"ALMA › {_tgt} [Band {band_label}]" if _tgt_bands else f"ALMA › {_tgt}"
                             searched_names.append(_tgt)
-                            # Emit each target as its own data card
-                            self.last_search_results = df
-                            self.last_run_result = {
-                                "type": "data", "data": df,
-                                "source": "ALMA", "filter_label": label,
-                                "tool_name": "search_by_target"
-                            }
-                            self._accumulated_run_results.append(self.last_run_result.copy())
                             print(f"[PER-TARGET] '{_tgt}' band={band_label} → {len(df)} results")
                         else:
                             print(f"[PER-TARGET] '{_tgt}' → 0 results")
@@ -1781,36 +1772,33 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
 
             if len(band_list_input) > 1 and band_col:
-                # Multi-band: emit a separate result per band
-                any_found = False
+                # Multi-band: combine into a single result with all matching bands
+                band_str_list = [str(b) for b in band_list_input]
+                combined = results[results[band_col].astype(str).str.split(",").apply(
+                    lambda bands: any(x.strip() in band_str_list for x in bands)
+                )]
                 for b in band_list_input:
-                    band_filtered = results[results[band_col].astype(str).str.split(",").apply(
+                    ct = len(results[results[band_col].astype(str).str.split(",").apply(
                         lambda bands, _b=b: any(str(_b).strip() == x.strip() for x in bands)
-                    )]
-                    print(f"[MULTI-BAND] Band {b}: {len(results)} → {len(band_filtered)} rows")
-                    if not band_filtered.empty:
-                        any_found = True
-                        b_filter_label = f"ALMA › {target_name} [Band {b}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
-                        self.last_search_results = band_filtered
-                        self.last_run_result = {
-                            "type": "data", "data": band_filtered,
-                            "source": "ALMA", "filter_label": b_filter_label,
-                            "tool_name": "search_by_target"
-                        }
-                        # Accumulate each band result for multi-card display
-                        self._accumulated_run_results.append(self.last_run_result.copy())
+                    )])
+                    print(f"[MULTI-BAND] Band {b}: {ct} rows")
 
-                if not any_found:
-                    # None of the bands had data — still show the unfiltered results
+                if not combined.empty:
+                    results = combined
+                    band_label = ", ".join(f"Band {b}" for b in band_list_input)
+                    filter_label = f"ALMA › {target_name} [{band_label}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
+                else:
+                    # None of the bands matched — show unfiltered
                     filter_label = f"ALMA › {target_name}"
                     if filter_parts:
                         filter_label += " [" + ", ".join(filter_parts) + "]"
-                    self.last_search_results = results
-                    self.last_run_result = {
-                        "type": "data", "data": results,
-                        "source": "ALMA", "filter_label": filter_label,
-                        "tool_name": "search_by_target"
-                    }
+
+                self.last_search_results = results
+                self.last_run_result = {
+                    "type": "data", "data": results,
+                    "source": "ALMA", "filter_label": filter_label,
+                    "tool_name": "search_by_target"
+                }
             elif len(band_list_input) == 1 and band_col:
                 # Single band filter
                 b = band_list_input[0]
@@ -1928,11 +1916,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 collection_filter = f"AND obs_collection = '{collection.upper()}'"
 
             adql = f"""
-            SELECT TOP {max_results}
-                obs_collection, target_name, s_ra, s_dec,
-                instrument_name, dataproduct_type, calib_level,
-                t_exptime, em_min, em_max,
-                obs_id, obs_publisher_did, access_url, access_format
+            SELECT TOP {max_results} *
             FROM ivoa.ObsCore
             WHERE CONTAINS(POINT('ICRS', s_ra, s_dec),
                            CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius})) = 1
