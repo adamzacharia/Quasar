@@ -1503,12 +1503,37 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     @log_tool
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
                            facility: Optional[str] = None,
-                           max_results: int = 100) -> Dict[str, Any]:
-        """Search archives by sky position"""
+                           band: Optional[str] = None,
+                           max_results: int = 100, **kwargs) -> Dict[str, Any]:
+        """Search archives by sky position.
+        
+        Accepts `band` and extra kwargs so the LLM can pass them without
+        crashing, even though the underlying cone_search doesn't use them.
+        Band filtering is applied as a post-filter on the results.
+        """
         try:
             results = self.search_service.cone_search(
                 ra, dec, radius, facility, max_results
             )
+
+            # Post-filter by band if specified
+            if band is not None and not results.empty:
+                import re as _re_band
+                band_vals = []
+                if isinstance(band, str):
+                    parts = _re_band.split(r'[,\s]+and[\s]+|[,\s]+', band.strip())
+                    band_vals = [int(p) for p in parts if p.strip().isdigit()]
+                elif isinstance(band, (int, float)):
+                    band_vals = [int(band)]
+                if band_vals:
+                    b_col = next((c for c in ['band_list', 'Band', 'band'] if c in results.columns), None)
+                    if b_col:
+                        before = len(results)
+                        results = results[results[b_col].astype(str).apply(
+                            lambda x: any(str(b) in [v.strip() for v in x.split(',')] for b in band_vals)
+                        )]
+                        print(f"[FILTER] Band {band}: {before} → {len(results)} rows")
+
             self.last_search_results = results
             self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_position"}
 
@@ -1569,11 +1594,17 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             else:
                 print(f"[FILTER] Ignoring unrecognized band={band}")
 
-        # ── Safety: ignore near-zero min values (LLM default filling) ──
+        # ── Safety: ignore near-zero/zero min values (LLM default filling) ──
+        # The LLM often fills 0 for optional params despite being told not to.
+        # A value of 0 for resolution/frequency/exptime means "no filter".
         if min_resolution is not None and min_resolution <= 0:
             min_resolution = None
+        if max_resolution is not None and max_resolution <= 0:
+            max_resolution = None  # 0 arcsec = impossible, treat as no filter
         if min_freq_ghz is not None and min_freq_ghz <= 0:
             min_freq_ghz = None
+        if max_freq_ghz is not None and max_freq_ghz <= 0:
+            max_freq_ghz = None
         if min_exp_s is not None and min_exp_s <= 0:
             min_exp_s = None
         # Ignore absurdly wide max values (LLM defaults)
@@ -3044,8 +3075,32 @@ ORDER BY target_name
         - Explicit future years:  "as of March 2025", "in 2026"
         - Freshness keywords:    "latest", "current", "recent", "now",
                                   "today", "this year", "this month"
+
+        Does NOT trigger on archive search queries — those hit live databases
+        (ALMA, CADC, etc.) directly and don't need web search augmentation.
         """
         _q = query.lower()
+
+        # ── Skip web search for archive queries ────────────────────────
+        # Archive searches already query live databases — web search adds
+        # nothing and just wastes time / clutters the response.
+        _archive_keywords = re.search(
+            r'\b(?:observation|observations|data|archive|band\s*\d|'
+            r'search_by|search_cadc|member_ous|mous|project_code|fits)\b',
+            _q,
+        )
+        _archive_verbs = re.search(
+            r'\b(?:find|search|show|get|list|query|look\s*up)\b.*'
+            r'\b(?:observation|observations|data|archive)\b',
+            _q,
+        )
+        _telescope_query = re.search(
+            r'\b(?:alma|vla|vlba|gbt|jwst|hst|gemini|jcmt|cfht|chandra|xmm)\b.*'
+            r'\b(?:observation|observations|data|of)\b',
+            _q,
+        )
+        if _archive_verbs or _telescope_query:
+            return None  # skip web search for archive queries
 
         # 1. Explicit year mentions beyond cutoff
         year_matches = re.findall(r'\b(20[2-9]\d)\b', query)
@@ -3439,6 +3494,32 @@ ORDER BY target_name
                         cid = item_id_to_call_id.get(raw_id, raw_id)
                         if cid and cid in function_calls:
                             function_calls[cid]["arguments"] += event.delta
+                    elif event.type == "response.completed":
+                        # Final sweep: reconcile call_ids from the completed response
+                        # The streaming events may miss the final call_id assignment.
+                        completed_resp = getattr(event, 'response', None)
+                        if completed_resp and hasattr(completed_resp, 'output'):
+                            for out_item in completed_resp.output:
+                                if getattr(out_item, 'type', None) == 'function_call':
+                                    final_cid = getattr(out_item, 'call_id', None)
+                                    item_id = getattr(out_item, 'id', None)
+                                    fn_name = getattr(out_item, 'name', '')
+                                    fn_args = getattr(out_item, 'arguments', '')
+                                    if final_cid:
+                                        # Find the matching entry by item_id or name
+                                        old_key = item_id_to_call_id.get(item_id, item_id)
+                                        if old_key in function_calls:
+                                            function_calls[old_key]["call_id"] = final_cid
+                                        elif item_id in function_calls:
+                                            function_calls[item_id]["call_id"] = final_cid
+                                        elif final_cid not in function_calls:
+                                            # Entirely new — create the entry
+                                            function_calls[final_cid] = {
+                                                "name": fn_name,
+                                                "arguments": fn_args,
+                                                "call_id": final_cid,
+                                                "_item_id": item_id,
+                                            }
                 
                 if not function_calls:
                     break  # No tool calls — we have the final text

@@ -22,6 +22,24 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
     
+# ── Cached SIMBAD resolution ──────────────────────────────────────────────
+# Avoids redundant HTTP round-trips when the same target is queried multiple
+# times in a session.  256 entries ≈ 18 KB — negligible RAM.
+from functools import lru_cache
+
+@lru_cache(maxsize=256)
+def _resolve_simbad_cached(target_name: str):
+    """Resolve target name → (ra_deg, dec_deg) via SIMBAD, with LRU cache."""
+    from astroquery.simbad import Simbad
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    result = Simbad.query_object(target_name)
+    if result is None or len(result) == 0:
+        return (None, None)
+    coord = SkyCoord(result['RA'][0], result['DEC'][0], unit=(u.hourangle, u.deg))
+    return (coord.ra.deg, coord.dec.deg)
+
+
 class ALminerClient:
     """Client for interacting with ALMA archive via ALminer"""
 
@@ -34,36 +52,33 @@ class ALminerClient:
         self.download_dir = "./downloads"
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir, exist_ok=True)
+        
+        # Cached TAP service — reuse TCP connection across queries
+        self._tap_service = None
+
+    def _get_tap_service(self):
+        """Get or create a cached pyvo TAPService instance."""
+        if self._tap_service is None:
+            import pyvo
+            self._tap_service = pyvo.dal.TAPService('https://almascience.nrao.edu/tap')
+        return self._tap_service
             
     def search_by_target(self, target_name: str, public: bool = True) -> pd.DataFrame:
         """
         Search ALMA archive by target name.
         Strategy: 
-        1. Resolve name to RA/Dec via SIMBAD
+        1. Resolve name to RA/Dec via SIMBAD (cached)
         2. Race TAP and ALminer in parallel - return whichever succeeds first
         """
         print(f"[ALMA] Starting search for '{target_name}'")
         
-        # Step 1: Resolve target name to coordinates using SIMBAD
+        # Step 1: Resolve target name using cached SIMBAD lookup
         try:
-            from astroquery.simbad import Simbad
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-            
-            print(f"[ALMA] Resolving '{target_name}' with SIMBAD...")
-            result = Simbad.query_object(target_name)
-            
-            if result is None or len(result) == 0:
+            ra_deg, dec_deg = _resolve_simbad_cached(target_name)
+            if ra_deg is None:
                 print(f"[ALMA] SIMBAD could not resolve '{target_name}'")
                 return pd.DataFrame()
-            
-            ra_str = result['RA'][0]
-            dec_str = result['DEC'][0]
-            coord = SkyCoord(ra_str, dec_str, unit=(u.hourangle, u.deg))
-            ra_deg = coord.ra.deg
-            dec_deg = coord.dec.deg
             print(f"[ALMA] Resolved to RA={ra_deg:.4f}, Dec={dec_deg:.4f}")
-            
         except Exception as e:
             print(f"[ALMA] SIMBAD resolution failed: {e}")
             return pd.DataFrame()
@@ -83,10 +98,8 @@ class ALminerClient:
         
         def tap_search():
             try:
-                import pyvo
                 print("[ALMA] TAP search starting...")
-                tap_url = 'https://almascience.nrao.edu/tap'
-                service = pyvo.dal.TAPService(tap_url)
+                service = self._get_tap_service()
                 query = f'''
                 SELECT target_name, s_ra, s_dec, band_list, proposal_id, 
                        t_exptime, s_resolution, bandwidth, frequency,
@@ -229,9 +242,7 @@ class ALminerClient:
             return pd.DataFrame()
             
         try:
-            import pyvo
-            tap_url = 'https://almascience.nrao.edu/tap'
-            service = pyvo.dal.TAPService(tap_url)
+            service = self._get_tap_service()
             
             query = f'''
             SELECT target_name, s_ra, s_dec, band_list, proposal_id,
