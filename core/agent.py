@@ -567,7 +567,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "dec":         {"type": "number", "description": "Dec in decimal degrees (ICRS). Used if target_name is not given."},
                     "radius":      {"type": "number", "description": "Search radius in degrees. Default 0.05 (~3 arcmin).", "default": 0.05},
                     "collection":  {"type": "string", "description": "Filter by telescope collection (e.g. 'JWST', 'HST', 'JCMT', 'CFHT', 'Gemini'). Leave empty for all."},
-                    "max_results": {"type": "integer", "description": "Maximum results to return. Default 100.", "default": 100},
+                    "max_results": {"type": "integer", "description": "Maximum results to return. Default 500.", "default": 500},
                 },
                 "required": []
             }
@@ -1876,7 +1876,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     def _search_cadc(self, target_name: Optional[str] = None,
                      ra: Optional[float] = None, dec: Optional[float] = None,
                      radius: float = 0.02, collection: Optional[str] = None,
-                     max_results: int = 100) -> Dict[str, Any]:
+                     max_results: int = 500) -> Dict[str, Any]:
         """Search CADC archive for multi-wavelength observations (JWST, HST, JCMT, etc.)."""
         try:
             import pyvo

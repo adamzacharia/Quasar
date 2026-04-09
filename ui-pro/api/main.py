@@ -194,9 +194,9 @@ def _compute_demographics(df) -> tuple:
 
 
 # ── CADC DataLink preview URL fetcher ─────────────────────────
-_CADC_DATALINK_URL = "https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/caom2ops/datalink"
+_CADC_DATALINK_URL = "https://ws.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/caom2ops/datalink"
 
-def _fetch_cadc_preview_urls(obs_publisher_dids: List[str], max_ids: int = 30) -> Dict[str, str]:
+def _fetch_cadc_preview_urls(obs_publisher_dids: List[str], max_ids: int = 200) -> Dict[str, str]:
     """Batch-query CADC DataLink for preview image URLs.
 
     Sends a single HTTP request with multiple IDs and parses the VOTable
