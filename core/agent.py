@@ -3247,6 +3247,10 @@ ORDER BY target_name
             r'\b(?:alma|vla|vlba|gbt|jwst|hst|gemini|jcmt|cfht|chandra|xmm)\b.*'
             r'\b(?:observation|observations|data)\s+(?:of|for|from)\b',
             _query_lower,
+        )) or bool(re.search(
+            r'\b(?:what|any|available)\b.*'
+            r'\b(?:observation|observations|data)\b.*\b(?:of|for|from|available)\b',
+            _query_lower,
         ))
         if _is_archive_fetch:
             _should_rag = False
@@ -3457,6 +3461,12 @@ ORDER BY target_name
                 }
                 if _round == 0 and attachments:
                     request_kwargs["attachments"] = attachments
+
+                # Force tool call on first round for data-fetch queries.
+                # This prevents the LLM from answering from conversation
+                # memory and ensures a fresh data card is always shown.
+                if _round == 0 and _is_archive_fetch:
+                    request_kwargs["tool_choice"] = "required"
 
                 response_stream = self.client.responses.create(**request_kwargs)
                 
