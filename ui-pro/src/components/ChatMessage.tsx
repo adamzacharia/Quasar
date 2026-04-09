@@ -4,9 +4,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Database } from "lucide-react";
+import { Copy, Check, Database, User as UserIcon } from "lucide-react";
 import { useState } from "react";
 import type { Message } from "../lib/types";
+import { useAuthStore } from "../lib/auth-store";
 import { DataTableCard } from "./DataTableCard";
 import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
@@ -43,6 +44,13 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     const hasContent = !!message.content;
     const hasThinking = thinkingSteps && thinkingSteps.length > 0;
 
+    const { user, isAuthenticated } = useAuthStore();
+    const userInitials = user?.display_name
+        ? user.display_name.split(' ').filter(Boolean).map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
+        : user?.username
+            ? user.username.substring(0, 2).toUpperCase()
+            : null;
+
     if (isUser) {
         return (
             <div className="flex justify-end">
@@ -77,7 +85,9 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             )}
                         </div>
                     </div>
-                    <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 shrink-0 mb-1 flex items-center justify-center text-white text-xs font-bold">AZ</div>
+                    <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 shrink-0 mb-1 flex items-center justify-center text-white text-xs font-bold">
+                        {userInitials || <UserIcon className="w-4 h-4" />}
+                    </div>
                 </div>
             </div>
         );

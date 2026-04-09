@@ -455,9 +455,10 @@ GUIDELINES:
 - **DO NOT** output raw tool usage strings like `[TOOL: ...]` or JSON. Just use the Native Tool Calling feature.
 - **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
 - **MINIMAL PARAMETERS**: When calling search_by_target, ONLY include optional parameters (band, max_resolution, min_freq_ghz, etc.) if the user EXPLICITLY requested them. For example, if the user says "Find ALMA data of M87", call search_by_target(target_name="M87") with NO other parameters. Do NOT pass band=0, min_freq_ghz=0, max_resolution=100 etc. Leaving them out returns ALL data.
-- **MULTI-TARGET**: If the user mentions multiple targets (e.g. "M87 and Sz65"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
+- **MULTI-TARGET (SAME CONSTRAINTS)**: If the user mentions multiple targets with the SAME constraints (e.g. "M87 and Sz65", or "M87, Sz65, NGC23 and M83"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
 - **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
-- **MULTI-WAVELENGTH**: When users ask about JWST, HST, Hubble, or optical/infrared data, use `search_cadc_archive` instead of or in addition to ALMA search. For comprehensive coverage, search both ALMA and CADC.
+- **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
+- **MULTI-WAVELENGTH / MIXED SOURCES**: When users ask about JWST, HST, Hubble, or optical/infrared data, use `search_cadc_archive` instead of or in addition to ALMA search. When the user asks for data from DIFFERENT archives (e.g. "ALMA observations of M87 and Gemini observations of NGC23"), make SEPARATE tool calls: search_by_target(target_name="M87") for ALMA, then search_cadc_archive(target_name="NGC23", collection="Gemini") for Gemini. Each produces its own data card in the UI.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
@@ -1584,14 +1585,84 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         try:
             # ── Multi-target support ──────────────────────────────────
             # Detect "M87 and Sz65" or "M87, NGC 1068" patterns
+            # Also handles per-target band specs like:
+            #   "M87 in band 6, Sz65 in band 7"  →  per-target bands
+            #   "M87, Sz65, NGC23"               →  shared bands (from band= param)
             import re as _re
             raw_names = [n.strip() for n in _re.split(r'\s+and\s+|\s*,\s*', target_name) if n.strip()]
 
-            if len(raw_names) > 1:
+            # ── Parse per-target band specifications ──────────────────
+            # If target_name contains inline band specs (e.g. "M87 in band 6"),
+            # extract them so each target gets its own filter.
+            _per_target_specs = []  # list of (name, [bands]) tuples
+            _has_per_target_bands = False
+            _inline_band_pattern = _re.compile(
+                r'^(.+?)\s+(?:in\s+)?band\s*([\d,\s]+(?:\s*(?:and|,)\s*\d+)*)$',
+                _re.IGNORECASE,
+            )
+            for raw in raw_names:
+                m = _inline_band_pattern.match(raw.strip())
+                if m:
+                    _tgt_name = m.group(1).strip()
+                    _band_str = m.group(2)
+                    _bands = [int(b.strip()) for b in _re.split(r'[,\s]+and[\s]+|[,\s]+', _band_str) if b.strip().isdigit()]
+                    _bands = [b for b in _bands if 1 <= b <= 10]
+                    _per_target_specs.append((_tgt_name, _bands))
+                    if _bands:
+                        _has_per_target_bands = True
+                else:
+                    _per_target_specs.append((raw.strip(), []))
+
+            if _has_per_target_bands:
+                # Per-target band mode: search each target with its own band filter
+                all_frames = []
+                searched_names = []
+                for _tgt, _tgt_bands in _per_target_specs:
+                    if not _tgt:
+                        continue
+                    try:
+                        df = self.search_service.search_by_target(
+                            _tgt, facility, date_range, max_results
+                        )
+                        if not df.empty and _tgt_bands:
+                            # Apply per-target band filter
+                            b_col = next((c for c in ["band_list", "Band", "band"] if c in df.columns), None)
+                            if b_col:
+                                df = df[df[b_col].astype(str).str.split(",").apply(
+                                    lambda bands: any(str(b).strip() == x.strip() for x in bands for b in _tgt_bands)
+                                )]
+                        if not df.empty:
+                            all_frames.append(df)
+                            band_label = ",".join(str(b) for b in _tgt_bands) if _tgt_bands else "all"
+                            label = f"ALMA › {_tgt} [Band {band_label}]" if _tgt_bands else f"ALMA › {_tgt}"
+                            searched_names.append(_tgt)
+                            # Emit each target as its own data card
+                            self.last_search_results = df
+                            self.last_run_result = {
+                                "type": "data", "data": df,
+                                "source": "ALMA", "filter_label": label,
+                                "tool_name": "search_by_target"
+                            }
+                            self._accumulated_run_results.append(self.last_run_result.copy())
+                            print(f"[PER-TARGET] '{_tgt}' band={band_label} → {len(df)} results")
+                        else:
+                            print(f"[PER-TARGET] '{_tgt}' → 0 results")
+                    except Exception as e:
+                        print(f"[PER-TARGET] '{_tgt}' failed: {e}")
+
+                if all_frames:
+                    results = pd.concat(all_frames, ignore_index=True)
+                    target_name = " + ".join(searched_names)
+                else:
+                    results = pd.DataFrame()
+                # Skip shared band filtering below — bands already applied per target
+                band_list_input = []
+
+            elif len(raw_names) > 1:
                 # Search each target independently, concatenate results
                 all_frames = []
                 searched_names = []
-                for name in raw_names[:5]:  # Cap at 5 targets
+                for name in raw_names[:10]:  # Cap at 10 targets
                     try:
                         df = self.search_service.search_by_target(
                             name, facility, date_range, max_results
@@ -1614,6 +1685,27 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 results = self.search_service.search_by_target(
                     target_name, facility, date_range, max_results
                 )
+
+            if results.empty:
+                # ── Automatic positional fallback ─────────────────────
+                # The name-based search uses a tight radius (0.05°).
+                # Many ALMA observations have offset pointing centers, so
+                # retry with a wider cone search to avoid losing results
+                # (and critically, to keep band/filter params applied).
+                print(f"[FALLBACK] Name search empty for '{target_name}', trying positional fallback...")
+                try:
+                    resolved = self._resolve_target(target_name)
+                    if resolved.get("success") and resolved.get("ra") is not None:
+                        _fb_ra, _fb_dec = resolved["ra"], resolved["dec"]
+                        print(f"[FALLBACK] Resolved to RA={_fb_ra:.4f}, Dec={_fb_dec:.4f} — cone search 0.14°")
+                        results = self.search_service.cone_search(
+                            _fb_ra, _fb_dec, radius=0.14,
+                            facility=facility, max_results=max_results
+                        )
+                        if not results.empty:
+                            print(f"[FALLBACK] Cone search found {len(results)} results — continuing with filters")
+                except Exception as _fb_err:
+                    print(f"[FALLBACK] Positional fallback failed: {_fb_err}")
 
             if results.empty:
                 self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_target"}
@@ -3384,7 +3476,9 @@ ORDER BY target_name
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
                             # Capture each tool's run result for multi-target support
                             if self.last_run_result is not None:
-                                self._accumulated_run_results.append(self.last_run_result.copy())
+                                _rc = self.last_run_result.copy()
+                                _rc["_result_id"] = id(self.last_run_result)
+                                self._accumulated_run_results.append(_rc)
                             # Record tool calls for session memory
                             self.session_memory.record_tool_calls(1)
                         except Exception as te:

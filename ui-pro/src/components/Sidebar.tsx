@@ -285,10 +285,12 @@ export function Sidebar() {
         }
     };
 
-    // Get user initials
+    // Get user initials from display name, or fallback to username initials
     const initials = user?.display_name
-        ? user.display_name.split(' ').map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
-        : "AZ";
+        ? user.display_name.split(' ').filter(Boolean).map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
+        : user?.username
+            ? user.username.substring(0, 2).toUpperCase()
+            : "U";
 
     return (
         <aside className="relative w-[280px] bg-sidebar-dark border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
@@ -386,8 +388,8 @@ export function Sidebar() {
                                 {initials}
                             </div>
                             <div className="flex flex-col flex-1 overflow-hidden">
-                                <span className="text-sm font-semibold text-white truncate">{user?.display_name || "Alex Z."}</span>
-                                <span className="text-[10px] text-slate-400 truncate">{user?.username || "Astronomer"}</span>
+                                <span className="text-sm font-semibold text-white truncate">{user?.display_name || user?.username || "User"}</span>
+                                <span className="text-[10px] text-slate-400 truncate">{user?.username || ""}</span>
                             </div>
                         </div>
                     ) : (

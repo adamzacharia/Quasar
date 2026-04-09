@@ -609,8 +609,9 @@ def _stream_chat_response(
             if _last_result and not _all_results:
                 _all_results = [_last_result]
             elif _last_result and _all_results:
-                # Check if last result is already captured (by identity)
-                if not any(r is _last_result for r in _all_results):
+                # Check if last result is already captured (by _result_id or identity)
+                _last_id = id(_last_result)
+                if not any(r.get("_result_id") == _last_id or r is _last_result for r in _all_results):
                     _all_results.append(_last_result)
 
             # ── Process each accumulated result ──────────────────────

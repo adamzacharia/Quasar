@@ -45,7 +45,32 @@ export function ChatArea() {
     const isStarred = activeConversation?.isStarred || false;
     const scrollRef = useRef<HTMLDivElement>(null);
 
-    useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, thinkingSteps]);
+    // ── Smart auto-scroll ──────────────────────────────────────
+    // Only scroll to bottom if the user hasn't manually scrolled up.
+    // This lets users read earlier messages while the agent is streaming.
+    const userScrolledUpRef = useRef(false);
+
+    const handleScroll = useCallback(() => {
+        if (!scrollRef.current) return;
+        const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+        const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+        // If user is more than 150px from bottom, they've scrolled up intentionally
+        userScrolledUpRef.current = distanceFromBottom > 150;
+    }, []);
+
+    useEffect(() => {
+        if (scrollRef.current && !userScrolledUpRef.current) {
+            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        }
+    }, [messages, thinkingSteps]);
+
+    // Reset scroll lock when the user sends a new message
+    useEffect(() => {
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg?.role === "user") {
+            userScrolledUpRef.current = false;
+        }
+    }, [messages]);
 
     const handleStop = useCallback(() => {
         if (abortControllerRef.current) {
@@ -303,7 +328,7 @@ export function ChatArea() {
             </header>
 
             {hasMessages ? (
-                <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6">
+                <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6">
                     <div className="max-w-4xl mx-auto space-y-6">
                         {(() => {
                             // Find the last text-type assistant message for attaching thinking/task state

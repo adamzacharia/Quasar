@@ -135,6 +135,32 @@ class ComplexityDetector:
             if _multi_hop_hits == 0:
                 return 0.0
 
+        # ── Multi-target / multi-band archive queries ──────────────────
+        # Queries like:
+        #   "Find ALMA observations of M87 and Sz65"
+        #   "Find ALMA observations of M87 in band 6, Sz65 in band 7"
+        #   "Find ALMA observations of M87, Sz65, NGC23 and M83 in Band 6, 7 and 8"
+        #   "Find ALMA observations of M87 and Gemini observations of NGC23"
+        # These are all direct archive lookups handled by search_by_target /
+        # search_cadc_archive — NOT multi-hop reasoning.  The "and" / ","
+        # separators should NOT be confused with complex multi-step queries.
+        _is_archive_lookup = bool(_re.search(
+            r'\b(?:find|search|show|get|list|look\s*up|query|give\s+me|any)\b'
+            r'.*\b(?:observation|observations|data|archive|result)\b',
+            q,
+        ))
+        if _is_archive_lookup and _multi_hop_hits == 0:
+            return 0.0
+
+        # Also catch: "ALMA observations of X", "Gemini data for Y"
+        # (query starts with telescope/archive name)
+        _starts_with_telescope = bool(_re.search(
+            r'^(?:alma|vla|vlba|gbt|jwst|hst|hubble|gemini|jcmt|cfht|cadc|chandra|xmm)\b',
+            q,
+        ))
+        if _starts_with_telescope and _multi_hop_hits == 0:
+            return 0.0
+
         # Normalize: 3+ hits → 1.0
         return min(_multi_hop_hits / 3.0, 1.0)
 
