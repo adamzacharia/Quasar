@@ -56,6 +56,93 @@ function MiniDonut({
     );
 }
 
+/* ── Mini vertical bar chart (timeline) ── */
+function MiniTimeline({
+    data, title,
+}: { data: Record<string, number>; title: string }) {
+    const entries = Object.entries(data).sort(([a], [b]) => Number(a) - Number(b));
+    if (entries.length === 0) return null;
+    const maxVal = Math.max(...entries.map(([, v]) => v));
+    if (maxVal === 0) return null;
+
+    return (
+        <div className="flex flex-col items-center gap-1.5 min-w-[120px]">
+            <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                {title}
+            </span>
+            <div className="flex items-end gap-[2px] h-12">
+                {entries.map(([year, count]) => {
+                    const heightPct = (count / maxVal) * 100;
+                    return (
+                        <div
+                            key={year}
+                            className="group relative flex flex-col items-center"
+                        >
+                            <div
+                                className="w-[7px] rounded-t-[2px] bg-gradient-to-t from-indigo-600 to-indigo-400 transition-all hover:from-indigo-500 hover:to-indigo-300 cursor-default"
+                                style={{ height: `${Math.max(heightPct, 4)}%`, minHeight: 2 }}
+                                title={`${year}: ${count} obs`}
+                            />
+                            {/* Tooltip on hover */}
+                            <div className="absolute -top-6 left-1/2 -translate-x-1/2 bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-[8px] text-slate-300 whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-10">
+                                {year}: {count}
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+            <div className="flex justify-between w-full px-0.5">
+                <span className="text-[8px] text-slate-500">{entries[0][0]}</span>
+                {entries.length > 1 && (
+                    <span className="text-[8px] text-slate-500">{entries[entries.length - 1][0]}</span>
+                )}
+            </div>
+        </div>
+    );
+}
+
+/* ── Mini horizontal bar chart (histogram) ── */
+function MiniHistogram({
+    data, title, unit,
+}: { data: Record<string, number>; title: string; unit?: string }) {
+    const entries = Object.entries(data);
+    if (entries.length === 0) return null;
+    const maxVal = Math.max(...entries.map(([, v]) => v));
+    if (maxVal === 0) return null;
+
+    return (
+        <div className="flex flex-col items-center gap-1.5 min-w-[110px] max-w-[160px]">
+            <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                {title}
+            </span>
+            <div className="w-full space-y-[3px]">
+                {entries.map(([label, count]) => {
+                    const widthPct = (count / maxVal) * 100;
+                    return (
+                        <div key={label} className="flex items-center gap-1.5 group">
+                            <span className="text-[8px] text-slate-500 w-[38px] text-right flex-shrink-0 font-mono">
+                                {label}
+                            </span>
+                            <div className="flex-1 h-[7px] bg-slate-800 rounded-full overflow-hidden">
+                                <div
+                                    className="h-full rounded-full bg-gradient-to-r from-cyan-600 to-cyan-400 transition-all"
+                                    style={{ width: `${Math.max(widthPct, 3)}%` }}
+                                />
+                            </div>
+                            <span className="text-[8px] text-slate-500 w-[22px] text-left flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                                {count}
+                            </span>
+                        </div>
+                    );
+                })}
+            </div>
+            {unit && (
+                <span className="text-[8px] text-slate-600">{unit}</span>
+            )}
+        </div>
+    );
+}
+
 /* ── Aitoff‑Hammer projection helpers ── */
 function aitoffProject(
     raDeg: number, decDeg: number,
@@ -471,6 +558,8 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const hasDemographics = data.demographics && (
         data.demographics.bands || data.demographics.projects ||
         data.demographics.telescopes || data.demographics.instruments ||
+        data.demographics.observationYears || data.demographics.scienceCategories ||
+        data.demographics.resolutionBins ||
         (skyCoords && skyCoords.length > 0)
     );
 
@@ -554,6 +643,15 @@ export function DataTableCard({ data }: DataTableCardProps) {
                             )}
                             {data.demographics?.projects && Object.keys(data.demographics.projects).length > 1 && (
                                 <MiniDonut data={data.demographics.projects} title="Projects" />
+                            )}
+                            {data.demographics?.scienceCategories && Object.keys(data.demographics.scienceCategories).length > 1 && (
+                                <MiniDonut data={data.demographics.scienceCategories} title="Science" />
+                            )}
+                            {data.demographics?.observationYears && Object.keys(data.demographics.observationYears).length > 1 && (
+                                <MiniTimeline data={data.demographics.observationYears} title="Timeline" />
+                            )}
+                            {data.demographics?.resolutionBins && Object.keys(data.demographics.resolutionBins).length > 1 && (
+                                <MiniHistogram data={data.demographics.resolutionBins} title="Resolution" unit="arcsec" />
                             )}
                         </div>
                     </div>

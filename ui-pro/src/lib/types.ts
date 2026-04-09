@@ -64,6 +64,9 @@ export interface DataTableResult {
         telescopes?: Record<string, number>;
         instruments?: Record<string, number>;
         skyCoords?: { ra: number; dec: number }[];  // RA/Dec positions for sky map
+        observationYears?: Record<string, number>;  // Year → count timeline
+        scienceCategories?: Record<string, number>; // Category → count
+        resolutionBins?: Record<string, number>;    // Resolution range → count
     };
     fitsEstimate?: number; // Estimated number of FITS files available
 }

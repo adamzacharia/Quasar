@@ -180,6 +180,41 @@ def _compute_demographics(df) -> tuple:
         if coords:
             demographics["skyCoords"] = coords
 
+    # ── Observation year timeline ────────────────────────────────
+    if "obs_release_date" in df.columns:
+        try:
+            years = pd.to_datetime(df["obs_release_date"], errors="coerce").dt.year.dropna()
+            if not years.empty:
+                year_counts = years.astype(int).value_counts().sort_index()
+                demographics["observationYears"] = {str(k): int(v) for k, v in year_counts.items()}
+        except Exception:
+            pass
+
+    # ── Science categories ───────────────────────────────────────
+    if "scientific_category" in df.columns:
+        try:
+            cat_counts = df["scientific_category"].dropna().value_counts().head(6)
+            if not cat_counts.empty and len(cat_counts) > 1:
+                demographics["scienceCategories"] = {str(k): int(v) for k, v in cat_counts.items()}
+        except Exception:
+            pass
+
+    # ── Angular resolution distribution ──────────────────────────
+    res_col = next((c for c in ["spatial_resolution", "s_resolution"] if c in df.columns), None)
+    if res_col:
+        try:
+            resolutions = pd.to_numeric(df[res_col], errors="coerce").dropna()
+            if not resolutions.empty and len(resolutions) > 2:
+                bins = [0, 0.1, 0.5, 1.0, 5.0, float("inf")]
+                labels = ['<0.1"', '0.1-0.5"', '0.5-1"', '1-5"', '>5"']
+                binned = pd.cut(resolutions, bins=bins, labels=labels)
+                res_counts = binned.value_counts()
+                res_dict = {str(k): int(v) for k, v in res_counts.items() if v > 0}
+                if len(res_dict) > 1:
+                    demographics["resolutionBins"] = res_dict
+        except Exception:
+            pass
+
     # FITS file estimation
     fits_estimate = 0
     if "member_ous_uid" in df.columns:
@@ -877,9 +912,15 @@ def _stream_chat_response(
             if _last_result and not _all_results:
                 _all_results = [_last_result]
             elif _last_result and _all_results:
-                # Check if last result is already captured (by _result_id or identity)
-                _last_id = id(_last_result)
-                if not any(r.get("_result_id") == _last_id or r is _last_result for r in _all_results):
+                # Check by DataFrame identity — the same data object means same result
+                _last_data_id = id(_last_result.get("data")) if _last_result.get("data") is not None else None
+                _already_present = False
+                for r in _all_results:
+                    r_data_id = id(r.get("data")) if r.get("data") is not None else None
+                    if r is _last_result or (r_data_id is not None and r_data_id == _last_data_id):
+                        _already_present = True
+                        break
+                if not _already_present:
                     _all_results.append(_last_result)
 
             # ── Process each accumulated result ──────────────────────

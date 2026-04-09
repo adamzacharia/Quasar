@@ -99,13 +99,26 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
 
     // Restore Paper cards as a separate "papers" message
     if (meta.papers && Array.isArray(meta.papers) && meta.papers.length > 0) {
+        // Map backend field names to frontend Paper interface
+        const mappedPapers: Paper[] = (meta.papers as Record<string, unknown>[]).map((p, i) => ({
+            id: (p.bibcode as string) || (p.id as string) || `paper-${i}`,
+            title: (p.title as string) || "Untitled",
+            authors: (p.authors as string) || "Unknown",
+            year: Number(p.year) || 0,
+            journal: (p.journal as string) || (p.pub as string) || "",
+            citationCount: Number(p.citations ?? p.citationCount ?? p.citation_count ?? 0),
+            type: (p.type as Paper["type"]) || "radio",
+            bibcode: (p.bibcode as string) || undefined,
+            doi: (p.doi as string) || undefined,
+            abstract: (p.abstract as string) || undefined,
+        }));
         messages.push({
             id: `srv-${index}-pp-${Date.now().toString(36)}`,
             role: "assistant",
             content: "Here are the relevant papers I found:",
             type: "papers",
             timestamp: new Date(),
-            papers: meta.papers as Message["papers"],
+            papers: mappedPapers,
         });
     }
 

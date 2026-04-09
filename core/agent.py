@@ -459,9 +459,17 @@ GUIDELINES:
 - **MULTI-TARGET (SAME CONSTRAINTS)**: If the user mentions multiple targets with the SAME constraints (e.g. "M87 and Sz65", or "M87, Sz65, NGC23 and M83"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
 - **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
 - **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
-- **MULTI-WAVELENGTH / MIXED SOURCES**: When users ask about JWST, HST, Hubble, or optical/infrared data, use `search_cadc_archive` instead of or in addition to ALMA search. When the user asks for data from DIFFERENT archives (e.g. "ALMA observations of M87 and Gemini observations of NGC23"), make SEPARATE tool calls: search_by_target(target_name="M87") for ALMA, then search_cadc_archive(target_name="NGC23", collection="Gemini") for Gemini. Each produces its own data card in the UI.
+- **MULTI-WAVELENGTH / MIXED SOURCES**: When users ask about JWST, HST, Hubble, Gemini, or optical/infrared data, use `search_cadc_archive`. When the user asks for data from DIFFERENT archives (e.g. "ALMA observations of M87 and Gemini observations of NGC23"), make SEPARATE tool calls: search_by_target(target_name="M87") for ALMA, then search_cadc_archive(target_name="NGC23", collection="Gemini") for Gemini. Each produces its own data card in the UI.
+- **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
+
+DUAL-SOURCE RESPONSE STRUCTURE (RAG + Web):
+When your answer draws on BOTH the documentation context provided below AND web search results:
+1. **Documentation First**: Present the answer from the ALMA Technical Documentation first. Cite each fact using the exact format [Source: filename, Page X]. After presenting the documentation-based answer, add a brief note: "*📚 The above information is sourced from the ALMA Technical Documentation and may not reflect the very latest policies or changes.*"
+2. **Web Results Second**: If web search results are appended below your response by the system, they will appear automatically. When you DO have web search data in your context, present it in a separate section titled "🌐 Updated Information from the Web" with the actual URLs as clickable Markdown links so users can verify.
+3. If ONLY documentation context is available (no web results), still cite sources and add the documentation disclaimer.
+4. If ONLY web results are available (no documentation), present them with links and note they are from the web.
 
 FORMATTING RULES:
 - **ALWAYS use proper Markdown** for your final output. The UI renders full GitHub-Flavored Markdown.
@@ -3174,8 +3182,10 @@ ORDER BY target_name
         # 0a. Knowledge-cutoff detection — launch parallel web search
         _web_search_query = self._detect_beyond_cutoff(_user_query)
         _web_result_holder = {}   # will be filled by background thread
+        _web_search_reason = None  # tracks WHY web search was triggered
 
         if _web_search_query:
+            _web_search_reason = "cutoff"
             if on_status:
                 on_status(
                     "⚡ Time period beyond training knowledge cutoff detected — "
@@ -3252,7 +3262,31 @@ ORDER BY target_name
                             src = src.replace("\\", "/").split("/")[-1]
                         page = d.metadata.get("page", "?")
                         context_pieces.append(f"[Source: {src}, Page {page}]\n{d.page_content}")
-                    rag_context = "\n\nRelevant Technical Context (from ALMA documentation):\n" + "\n---\n".join(context_pieces)
+                    rag_context = (
+                        "\n\n📚 DOCUMENTATION CONTEXT (from ALMA Technical Documentation — may be outdated):\n"
+                        + "\n---\n".join(context_pieces)
+                    )
+
+                    # Launch a parallel web search to supplement RAG with fresh data.
+                    # Only if a web thread isn't already running (from cutoff detection).
+                    if _web_thread is None and os.getenv("TAVILY_API_KEY", ""):
+                        _web_search_reason = "rag_supplement"
+                        if on_status:
+                            on_status("Searching the web for updated information", "running")
+
+                        def _bg_web_search_rag():
+                            try:
+                                _web_result_holder["data"] = self._tavily_web_search(
+                                    query=_user_query,
+                                    max_results=5,
+                                    search_depth="basic",
+                                )
+                            except Exception as _e:
+                                _web_result_holder["error"] = str(_e)
+
+                        _web_thread = threading.Thread(target=_bg_web_search_rag, daemon=True)
+                        _web_thread.start()
+
                 if on_status:
                     on_status("Searching ALMA Manuals & Documentation", "completed")
             except Exception as e:
@@ -3284,12 +3318,16 @@ ORDER BY target_name
         citation_note = ""
         if rag_context:
             citation_note = (
-                "\n\nIMPORTANT CITATION RULES: When your answer uses information from the "
-                "Relevant Technical Context above, you MUST cite the source at the end "
-                "of the relevant sentence using this exact format: "
-                "[Source: filename, Page X]. For example: "
-                "[Source: ALMA_Technical_Handbook.pdf, Page 42]. "
-                "Always include the page number. This is critical for traceability."
+                "\n\nIMPORTANT CITATION & STRUCTURE RULES:\n"
+                "1. When your answer uses information from the DOCUMENTATION CONTEXT above, "
+                "you MUST cite the source at the end of the relevant sentence using this exact format: "
+                "[Source: filename, Page X]. For example: [Source: ALMA_Technical_Handbook.pdf, Page 42]. "
+                "Always include the page number.\n"
+                "2. After presenting the documentation-based answer, add a disclaimer line: "
+                "'*📚 The above is sourced from ALMA Technical Documentation and may not reflect the very latest policies.*'\n"
+                "3. If the system appends web search results after your response, the user will see "
+                "both your documentation answer AND fresh web data — DO NOT duplicate web content "
+                "in your response as it will be shown separately."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}\n\nUser: {query}"
 
@@ -3374,19 +3412,31 @@ ORDER BY target_name
                     if _web_thread is not None:
                         _web_thread.join(timeout=15)
                         if on_status:
-                            on_status(
-                                "⚡ Time period beyond training knowledge cutoff detected — "
-                                "searching the web in parallel",
-                                "completed",
+                            _web_status_label = (
+                                "Searching the web for updated information"
+                                if _web_search_reason == "rag_supplement"
+                                else "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
                             )
+                            on_status(_web_status_label, "completed")
                         web_data = _web_result_holder.get("data")
                         if web_data and web_data.get("success"):
-                            web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
-                            web_section += "*The following information was retrieved from the web "
-                            web_section += "because your query references a time period beyond "
-                            web_section += "the model's training data cutoff.*\n\n"
+                            if _web_search_reason == "rag_supplement":
+                                web_section = "\n\n---\n\n## 🌐 Updated Information from the Web\n\n"
+                                web_section += (
+                                    "*The following is more recent information retrieved from the web "
+                                    "to supplement the documentation-based answer above. "
+                                    "Click the links to verify.*\n\n"
+                                )
+                            else:
+                                web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
+                                web_section += (
+                                    "*The following information was retrieved from the web "
+                                    "because your query references a time period beyond "
+                                    "the model's training data cutoff.*\n\n"
+                                )
                             if web_data.get("answer"):
                                 web_section += f"**Summary:** {web_data['answer']}\n\n"
+                            web_section += "**Sources:**\n\n"
                             for i, r in enumerate(web_data.get("results", []), 1):
                                 title = r.get("title", "Untitled")
                                 url = r.get("url", "")
@@ -3396,7 +3446,7 @@ ORDER BY target_name
                             conductor_answer += web_section
                             if on_token:
                                 on_token(web_section)
-                            print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results to conductor response")
+                            print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results ({_web_search_reason}) to conductor response")
                     # Re-emit accumulated images via last_run_result so the SSE
                     # loop in main.py can emit them as inline image events.
                     if hasattr(self, '_conductor_images') and self._conductor_images:
@@ -3622,24 +3672,38 @@ ORDER BY target_name
             # 7a. Append parallel web search results if available
             if _web_thread is not None:
                 _web_thread.join(timeout=15)  # wait up to 15s for web results
+                # Close off the web status indicator
                 if on_status:
-                    on_status(
-                        "⚡ Time period beyond training knowledge cutoff detected — "
-                        "searching the web in parallel",
-                        "completed",
+                    _web_status_label = (
+                        "Searching the web for updated information"
+                        if _web_search_reason == "rag_supplement"
+                        else "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
                     )
+                    on_status(_web_status_label, "completed")
                 web_data = _web_result_holder.get("data")
                 if web_data and web_data.get("success"):
-                    web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
-                    web_section += "*The following information was retrieved from the web "
-                    web_section += "because your query references a time period beyond "
-                    web_section += "the model's training data cutoff.*\n\n"
+                    # Choose header based on why the web search was triggered
+                    if _web_search_reason == "rag_supplement":
+                        web_section = "\n\n---\n\n## 🌐 Updated Information from the Web\n\n"
+                        web_section += (
+                            "*The following is more recent information retrieved from the web "
+                            "to supplement the documentation-based answer above. "
+                            "Click the links to verify.*\n\n"
+                        )
+                    else:
+                        web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
+                        web_section += (
+                            "*The following information was retrieved from the web "
+                            "because your query references a time period beyond "
+                            "the model's training data cutoff.*\n\n"
+                        )
 
                     # Synthesised answer from Tavily
                     if web_data.get("answer"):
                         web_section += f"**Summary:** {web_data['answer']}\n\n"
 
-                    # Individual sources
+                    # Individual sources with clickable links
+                    web_section += "**Sources:**\n\n"
                     for i, r in enumerate(web_data.get("results", []), 1):
                         title = r.get("title", "Untitled")
                         url = r.get("url", "")
@@ -3650,7 +3714,7 @@ ORDER BY target_name
                     output_text += web_section
                     if on_token:
                         on_token(web_section)
-                    print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results to response")
+                    print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results ({_web_search_reason}) to response")
                 elif _web_result_holder.get("error"):
                     print(f"[WEB SEARCH] Parallel web search failed: {_web_result_holder['error']}")
             

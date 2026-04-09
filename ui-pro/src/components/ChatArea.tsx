@@ -203,14 +203,27 @@ export function ChatArea() {
                                 dataTable: tableData,
                             });
                         },
-                        onPapers: (papers: Record<string, unknown>[]) => {
+                        onPapers: (rawPapers: Record<string, unknown>[]) => {
+                            // Map backend field names to frontend Paper interface
+                            const papers: Paper[] = rawPapers.map((p, i) => ({
+                                id: (p.bibcode as string) || `paper-${i}`,
+                                title: (p.title as string) || "Untitled",
+                                authors: (p.authors as string) || "Unknown",
+                                year: Number(p.year) || 0,
+                                journal: (p.journal as string) || (p.pub as string) || "",
+                                citationCount: Number(p.citations ?? p.citationCount ?? p.citation_count ?? 0),
+                                type: "radio",
+                                bibcode: (p.bibcode as string) || undefined,
+                                doi: (p.doi as string) || undefined,
+                                abstract: (p.abstract as string) || undefined,
+                            }));
                             addMessage({
                                 id: generateId(),
                                 role: "assistant",
                                 content: "Here are the relevant papers I found:",
                                 type: "papers",
                                 timestamp: new Date(),
-                                papers: papers as unknown as Paper[],
+                                papers,
                             });
                         },
                         onNotebook: (notebook: Record<string, unknown>) => {
