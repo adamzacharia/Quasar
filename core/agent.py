@@ -445,6 +445,7 @@ Your goal is to help users find, visualize, and analyze astronomical data.
 
 GUIDELINES:
 - **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool.
+- **FRESH DATA ALWAYS**: NEVER answer archive/data queries from conversation memory or prior tool results. ALWAYS make a fresh tool call, even if you already called the same tool earlier in this conversation. Every data request MUST trigger a new search_by_target, search_by_position, search_cadc_archive, or search_papers call. The user expects live data with a data card in the UI — text-only answers without a tool call are UNACCEPTABLE for data queries.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
 - **PAPER SEARCH**: When you use the `search_papers` tool, do NOT write any text listing the papers. Output NOTHING after the tool call. The UI renders the papers as interactive cards automatically.
@@ -3215,6 +3216,8 @@ ORDER BY target_name
 
         # 1. Smart RAG — only search documentation for queries that likely
         #    relate to ALMA/radio astronomy/technical documentation.
+        #    SKIP for archive data-fetch queries (e.g. "find ALMA observations of M87")
+        #    because those hit the live archive, not documentation.
         rag_context = ""
         _rag_keywords = {
             "alma", "band", "frequency", "resolution", "calibration",
@@ -3233,6 +3236,20 @@ ORDER BY target_name
         }
         _query_lower = query.lower()
         _should_rag = any(kw in _query_lower for kw in _rag_keywords)
+
+        # Skip RAG for pure archive data-fetch queries — the user wants data
+        # from the live archive, not ALMA technical documentation.
+        _is_archive_fetch = bool(re.search(
+            r'\b(?:find|search|show|get|list|query|look\s*up|fetch)\b.*'
+            r'\b(?:observation|observations|data)\b',
+            _query_lower,
+        )) or bool(re.search(
+            r'\b(?:alma|vla|vlba|gbt|jwst|hst|gemini|jcmt|cfht|chandra|xmm)\b.*'
+            r'\b(?:observation|observations|data)\s+(?:of|for|from)\b',
+            _query_lower,
+        ))
+        if _is_archive_fetch:
+            _should_rag = False
 
         if _should_rag:
             try:
@@ -3553,13 +3570,30 @@ ORDER BY target_name
                     tool = self.tool_registry.get_tool(tool_name)
                     if tool:
                         try:
+                            _acc_len_before = len(self._accumulated_run_results)
                             result = tool.execute(**args)
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
-                            # Capture each tool's run result for multi-target support
-                            if self.last_run_result is not None:
+                            _acc_len_after = len(self._accumulated_run_results)
+
+                            # If the tool itself already accumulated results
+                            # (e.g. multi-target search appends per-target results),
+                            # eagerly emit each new result for parallel data card rendering.
+                            if _acc_len_after > _acc_len_before:
+                                # Tool accumulated its own results — emit each new one
+                                if on_status:
+                                    for _new_idx in range(_acc_len_before, _acc_len_after):
+                                        _new_rc = self._accumulated_run_results[_new_idx]
+                                        if _new_rc.get("type") in ("data", "papers"):
+                                            _payload = json.dumps({"_eager_result": True, "_idx": _new_idx})
+                                            on_status(f"__data_ready__{_payload}", "ready")
+                            elif self.last_run_result is not None:
+                                # Tool didn't accumulate — add last_run_result ourselves
                                 _rc = self.last_run_result.copy()
                                 _rc["_result_id"] = id(self.last_run_result)
                                 self._accumulated_run_results.append(_rc)
+                                if on_status and _rc.get("type") in ("data", "papers"):
+                                    _payload = json.dumps({"_eager_result": True, "_idx": len(self._accumulated_run_results) - 1})
+                                    on_status(f"__data_ready__{_payload}", "ready")
                             # Record tool calls for session memory
                             self.session_memory.record_tool_calls(1)
                         except Exception as te:

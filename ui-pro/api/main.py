@@ -375,6 +375,213 @@ def _sse_status(step: str, state: str = "running") -> str:
     return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
 
 
+def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
+    """Build a data card SSE event from a run_result dict.
+    
+    Returns (sse_event_str, rich_dt_dict) or None if the result can't be serialized.
+    This is extracted so it can be called both during streaming (eager)
+    and after streaming (fallback), avoiding the 2-4s delay.
+    """
+    import math
+    import pandas as pd
+
+    result_type = _run_result.get("type", "")
+    if result_type != "data":
+        return None
+
+    df = _run_result.get("data")
+    if df is None or not hasattr(df, "to_dict"):
+        return None
+
+    try:
+        alma_display_cols = [
+            ("project_code", "Project"),
+            ("target_name", "Target"),
+            ("obs_collection", "Telescope"),
+            ("instrument_name", "Instrument"),
+            ("band_list", "Band"),
+            ("frequency", "Freq (GHz)"),
+            ("min_frequency", "Min Freq (GHz)"),
+            ("max_frequency", "Max Freq (GHz)"),
+            ("dataproduct_type", "Type"),
+            ("calib_level", "Cal Level"),
+            ("spatial_resolution", "Res (arcsec)"),
+            ("s_resolution", "Res (arcsec)"),
+            ("t_exptime", "Exp (s)"),
+            ("pi_name", "PI"),
+            ("obs_release_date", "Release"),
+            ("member_ous_uid", "MOUS ID"),
+            ("obs_publisher_did", "Obs ID"),
+        ]
+        seen_display = set()
+        sel_cols, display_cols = [], []
+        for raw, nice in alma_display_cols:
+            if raw in df.columns and nice not in seen_display:
+                sel_cols.append(raw)
+                display_cols.append(nice)
+                seen_display.add(nice)
+
+        if not sel_cols:
+            sel_cols = list(df.columns[:8])
+            display_cols = sel_cols
+
+        _MAX_TABLE_ROWS = 500
+        sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
+        sub.columns = display_cols
+
+        per_row_links = []
+        if "access_url" in df.columns:
+            per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
+        elif "member_ous_uid" in df.columns:
+            per_row_links = [
+                f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
+                if pd.notna(v) and str(v).strip() else ""
+                for v in df["member_ous_uid"].head(_MAX_TABLE_ROWS)
+            ]
+
+        def _fmt(v):
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return ""
+            if isinstance(v, float):
+                return f"{v:.3f}".rstrip("0").rstrip(".")
+            return str(v)[:60]
+
+        for col in sub.columns:
+            sub[col] = sub[col].map(_fmt)
+
+        rows = sub.to_dict("records")
+        for i, link in enumerate(per_row_links):
+            if link and i < len(rows):
+                rows[i]["_link"] = link
+
+        # ── Inject sky preview thumbnail URLs ──────────
+        ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
+        dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
+        has_preview = False
+
+        is_cadc = False
+        cadc_collections = set()
+        if "obs_collection" in df.columns:
+            cadc_collections = set(df["obs_collection"].dropna().astype(str).unique())
+            is_cadc = bool(cadc_collections)
+        elif "obs_publisher_did" in df.columns:
+            sample = str(df["obs_publisher_did"].dropna().iloc[0]) if not df["obs_publisher_did"].dropna().empty else ""
+            is_cadc = "cadc" in sample.lower() or "mast" in sample.lower()
+
+        cadc_preview_map = {}
+        if is_cadc and "obs_publisher_did" in df.columns:
+            pub_ids = df["obs_publisher_did"].head(_MAX_TABLE_ROWS).dropna().astype(str).tolist()
+            try:
+                cadc_preview_map = _fetch_cadc_preview_urls(pub_ids)
+            except Exception:
+                pass
+
+        if cadc_preview_map:
+            for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
+                if i >= len(rows):
+                    break
+                pub_id = str(orig_row.get("obs_publisher_did", "")).strip()
+                if pub_id in cadc_preview_map:
+                    rows[i]["_preview"] = cadc_preview_map[pub_id]
+                    has_preview = True
+                elif ra_col and dec_col:
+                    try:
+                        ra_v = float(orig_row[ra_col])
+                        dec_v = float(orig_row[dec_col])
+                        if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                            rows[i]["_preview"] = (
+                                f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+                                f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
+                                f"&fov=0.033&projection=TAN&coordsys=icrs"
+                                f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
+                            )
+                            has_preview = True
+                    except (ValueError, TypeError):
+                        pass
+        elif ra_col and dec_col:
+            for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
+                if i >= len(rows):
+                    break
+                try:
+                    ra_v = float(orig_row[ra_col])
+                    dec_v = float(orig_row[dec_col])
+                    if not (math.isnan(ra_v) or math.isnan(dec_v)):
+                        rows[i]["_preview"] = (
+                            f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+                            f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
+                            f"&fov=0.033&projection=TAN&coordsys=icrs"
+                            f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
+                        )
+                        has_preview = True
+                except (ValueError, TypeError):
+                    pass
+
+        # ── Demographics & FITS estimation ─────────────
+        demographics, fits_estimate = _compute_demographics(df)
+
+        # ── Detect archive source dynamically ─────────
+        _detected_source = _run_result.get("filter_label") or _run_result.get("source", "")
+        if not _detected_source:
+            if cadc_collections:
+                _detected_source = " / ".join(sorted(cadc_collections)[:3])
+            elif "member_ous_uid" in df.columns:
+                _detected_source = "ALMA Archive"
+            else:
+                _detected_source = "Archive"
+
+        metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
+        if "band_list" in df.columns:
+            metrics.append({
+                "label": "Bands",
+                "value": int(df["band_list"].astype(str).nunique()),
+                "color": "purple",
+            })
+        if fits_estimate > 0:
+            metrics.append({
+                "label": "Est. FITS",
+                "value": f"~{fits_estimate}",
+                "color": "amber",
+            })
+        if "obs_collection" in df.columns:
+            metrics.append({
+                "label": "Telescopes",
+                "value": int(df["obs_collection"].nunique()),
+                "color": "emerald",
+            })
+
+        # ── Build archive link (per-archive) ──────────
+        archive_link = ""
+        if is_cadc and "target_name" in df.columns and not df.empty:
+            _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
+            archive_link = f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.target.name={_tgt}"
+        elif "access_url" in df.columns and not df["access_url"].isna().all():
+            archive_link = str(df["access_url"].dropna().iloc[0])
+        elif "member_ous_uid" in df.columns:
+            mous = next((str(v) for v in df["member_ous_uid"] if pd.notna(v) and str(v).strip()), "")
+            if mous:
+                archive_link = f"https://almascience.nrao.edu/aq/?member_ous_id={mous}"
+
+        table_payload = {
+            "type": "data",
+            "metrics": metrics,
+            "columns": list(sub.columns),
+            "rows": rows,
+            "sourceName": _detected_source,
+            "archiveLink": archive_link,
+            "hasRowLinks": any(bool(r.get("_link")) for r in rows),
+            "hasPreview": has_preview,
+            "demographics": demographics if demographics else None,
+            "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
+        }
+        table_event_str = f"data: {json.dumps(table_payload)}\n\n"
+        rich_dt = table_payload.copy()
+        rich_dt.pop("type", None)
+        return (table_event_str, rich_dt)
+    except Exception as e:
+        print(f"[WARN] Could not build data card: {e}")
+        return None
+
+
 def _sse_error_response(message: str) -> StreamingResponse:
     async def generate():
         yield f"data: {json.dumps({'type': 'error', 'content': message})}\n\n"
@@ -482,7 +689,6 @@ def _stream_chat_response(
             user_id = current_user.get("sub")
             if user_id:
                 try:
-                    yield _sse_status("Searching personal knowledge base", "running")
                     loop2 = asyncio.get_event_loop()
 
                     def _rag_search():
@@ -493,6 +699,8 @@ def _stream_chat_response(
 
                     rag_docs = await loop2.run_in_executor(_executor, _rag_search)
                     if rag_docs:
+                        # Only show the step if there are actual personal docs
+                        yield _sse_status("Searching personal knowledge base", "running")
                         ctx_lines = []
                         for d in rag_docs:
                             src = d.metadata.get("source_file", "personal doc")
@@ -502,10 +710,9 @@ def _stream_chat_response(
                             "The user has the following relevant documents in their personal "
                             f"knowledge base:\n\n{context_block}\n\n---\nUser's question: {request.message}"
                         )
-                    yield _sse_status("Searching personal knowledge base", "completed")
+                        yield _sse_status("Searching personal knowledge base", "completed")
                 except Exception as e:
                     print(f"[WARN] Personal RAG search failed: {e}")
-                    yield _sse_status("Searching personal knowledge base", "completed")
 
         effective_request = ChatRequest(
             message=enriched_message,
@@ -562,6 +769,7 @@ def _stream_chat_response(
             _rich_notebook = None
             _rich_image = None
             _rich_thinking = []
+            _eagerly_emitted = set()  # indices of data cards already emitted during streaming
 
             while True:
                 # Use a timeout so we can send SSE keepalive comments.
@@ -575,7 +783,33 @@ def _stream_chat_response(
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
                     if msg_type == "status":
-                        if isinstance(step, str) and step.startswith("__event__"):
+                        if isinstance(step, str) and step.startswith("__data_ready__"):
+                            # ── Eager data card emission ──
+                            # The agent just finished a tool call that produced
+                            # data. Build and emit the card NOW, in parallel
+                            # with remaining text tokens, instead of waiting
+                            # until the entire response finishes.
+                            try:
+                                _payload_str = step[len("__data_ready__"):]
+                                _payload_meta = json.loads(_payload_str)
+                                _eager_idx = _payload_meta.get("_idx", -1)
+                                _eager_results = getattr(agent, "_accumulated_run_results", [])
+                                if 0 <= _eager_idx < len(_eager_results):
+                                    _eager_result = _eager_results[_eager_idx]
+                                    card = _build_data_card_event(_eager_result)
+                                    if card:
+                                        _event_str, _rich = card
+                                        # Emit tool call event first
+                                        _tn = _eager_result.get("tool_name", "search_alma_archive")
+                                        yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results'})}\n\n"
+                                        yield _event_str
+                                        _rich_data_tables.append(_rich)
+                                        _rich_data_table = _rich
+                                        _eagerly_emitted.add(_eager_idx)
+                                        print(f"[EAGER] Data card emitted for idx={_eager_idx} during streaming")
+                            except Exception as _eager_err:
+                                print(f"[WARN] Eager data card emission failed: {_eager_err}")
+                        elif isinstance(step, str) and step.startswith("__event__"):
                             try:
                                 event_json = step[len("__event__"):]
                                 yield f"data: {event_json}\n\n"
@@ -616,8 +850,11 @@ def _stream_chat_response(
 
             # ── Process each accumulated result ──────────────────────
             _seen_result_ids = set()  # avoid duplicate emissions
-            for _run_result in _all_results:
+            for _result_idx, _run_result in enumerate(_all_results):
                 if not _run_result:
+                    continue
+                # Skip results already emitted eagerly during streaming
+                if _result_idx in _eagerly_emitted:
                     continue
                 # Deduplicate by (type, tool_name, data-id) to avoid emitting same result twice
                 _dedup_key = (
@@ -648,206 +885,13 @@ def _stream_chat_response(
                 await asyncio.sleep(0.05)
 
                 if result_type == "data":
-                    df = _run_result.get("data")
-                    if df is not None and hasattr(df, "to_dict"):
-                        try:
-                            import math
-                            import pandas as pd
-
-                            alma_display_cols = [
-                                ("project_code", "Project"),
-                                ("target_name", "Target"),
-                                ("obs_collection", "Telescope"),
-                                ("instrument_name", "Instrument"),
-                                ("band_list", "Band"),
-                                ("frequency", "Freq (GHz)"),
-                                ("min_frequency", "Min Freq (GHz)"),
-                                ("max_frequency", "Max Freq (GHz)"),
-                                ("dataproduct_type", "Type"),
-                                ("calib_level", "Cal Level"),
-                                ("spatial_resolution", "Res (arcsec)"),
-                                ("s_resolution", "Res (arcsec)"),
-                                ("t_exptime", "Exp (s)"),
-                                ("pi_name", "PI"),
-                                ("obs_release_date", "Release"),
-                                ("member_ous_uid", "MOUS ID"),
-                                ("obs_publisher_did", "Obs ID"),
-                            ]
-                            seen_display = set()
-                            sel_cols, display_cols = [], []
-                            for raw, nice in alma_display_cols:
-                                if raw in df.columns and nice not in seen_display:
-                                    sel_cols.append(raw)
-                                    display_cols.append(nice)
-                                    seen_display.add(nice)
-
-                            if not sel_cols:
-                                sel_cols = list(df.columns[:8])
-                                display_cols = sel_cols
-
-                            _MAX_TABLE_ROWS = 500  # show all rows (card has scroll)
-                            sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
-                            sub.columns = display_cols
-
-                            per_row_links = []
-                            if "access_url" in df.columns:
-                                per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
-                            elif "member_ous_uid" in df.columns:
-                                per_row_links = [
-                                    f"https://almascience.nrao.edu/aq/?member_ous_id={v}"
-                                    if pd.notna(v) and str(v).strip() else ""
-                                    for v in df["member_ous_uid"].head(_MAX_TABLE_ROWS)
-                                ]
-
-                            def _fmt(v):
-                                if v is None or (isinstance(v, float) and math.isnan(v)):
-                                    return ""
-                                if isinstance(v, float):
-                                    return f"{v:.3f}".rstrip("0").rstrip(".")
-                                return str(v)[:60]
-
-                            for col in sub.columns:
-                                sub[col] = sub[col].map(_fmt)
-
-                            rows = sub.to_dict("records")
-                            for i, link in enumerate(per_row_links):
-                                if link and i < len(rows):
-                                    rows[i]["_link"] = link
-
-                            # ── Inject sky preview thumbnail URLs ──────────
-                            #    Hybrid: CADC DataLink for JWST/HST, DSS2 for everything else
-                            ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
-                            dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
-                            has_preview = False
-
-                            # Detect if this is CADC/MAST data (JWST, HST, Gemini, etc.)
-                            is_cadc = False
-                            cadc_collections = set()
-                            if "obs_collection" in df.columns:
-                                cadc_collections = set(df["obs_collection"].dropna().astype(str).unique())
-                                is_cadc = bool(cadc_collections)
-                            elif "obs_publisher_did" in df.columns:
-                                sample = str(df["obs_publisher_did"].dropna().iloc[0]) if not df["obs_publisher_did"].dropna().empty else ""
-                                is_cadc = "cadc" in sample.lower() or "mast" in sample.lower()
-
-                            cadc_preview_map = {}
-                            if is_cadc and "obs_publisher_did" in df.columns:
-                                # Batch-fetch actual observation previews from CADC DataLink
-                                pub_ids = df["obs_publisher_did"].head(_MAX_TABLE_ROWS).dropna().astype(str).tolist()
-                                try:
-                                    cadc_preview_map = _fetch_cadc_preview_urls(pub_ids)
-                                except Exception:
-                                    pass  # Fall through to DSS2
-
-                            if cadc_preview_map:
-                                # Use real observation previews from CADC
-                                for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
-                                    if i >= len(rows):
-                                        break
-                                    pub_id = str(orig_row.get("obs_publisher_did", "")).strip()
-                                    if pub_id in cadc_preview_map:
-                                        rows[i]["_preview"] = cadc_preview_map[pub_id]
-                                        has_preview = True
-                                    elif ra_col and dec_col:
-                                        # DSS2 fallback for rows without CADC preview
-                                        try:
-                                            ra_v = float(orig_row[ra_col])
-                                            dec_v = float(orig_row[dec_col])
-                                            if not (math.isnan(ra_v) or math.isnan(dec_v)):
-                                                rows[i]["_preview"] = (
-                                                    f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
-                                                    f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
-                                                    f"&fov=0.033&projection=TAN&coordsys=icrs"
-                                                    f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
-                                                )
-                                                has_preview = True
-                                        except (ValueError, TypeError):
-                                            pass
-                            elif ra_col and dec_col:
-                                # Pure DSS2 fallback (ALMA and non-CADC data)
-                                for i, (_, orig_row) in enumerate(df.head(_MAX_TABLE_ROWS).iterrows()):
-                                    if i >= len(rows):
-                                        break
-                                    try:
-                                        ra_v = float(orig_row[ra_col])
-                                        dec_v = float(orig_row[dec_col])
-                                        if not (math.isnan(ra_v) or math.isnan(dec_v)):
-                                            rows[i]["_preview"] = (
-                                                f"https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
-                                                f"?hips=CDS%2FP%2FDSS2%2Fcolor&width=120&height=120"
-                                                f"&fov=0.033&projection=TAN&coordsys=icrs"
-                                                f"&ra={ra_v:.6f}&dec={dec_v:.6f}&format=jpg"
-                                            )
-                                            has_preview = True
-                                    except (ValueError, TypeError):
-                                        pass
-
-                            # ── Demographics & FITS estimation ─────────────
-                            demographics, fits_estimate = _compute_demographics(df)
-
-                            # ── Detect archive source dynamically ─────────
-                            _detected_source = _run_result.get("filter_label") or _run_result.get("source", "")
-                            if not _detected_source:
-                                if cadc_collections:
-                                    _detected_source = " / ".join(sorted(cadc_collections)[:3])
-                                elif "member_ous_uid" in df.columns:
-                                    _detected_source = "ALMA Archive"
-                                else:
-                                    _detected_source = "Archive"
-
-                            metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
-                            if "band_list" in df.columns:
-                                metrics.append({
-                                    "label": "Bands",
-                                    "value": int(df["band_list"].astype(str).nunique()),
-                                    "color": "purple",
-                                })
-                            if fits_estimate > 0:
-                                metrics.append({
-                                    "label": "Est. FITS",
-                                    "value": f"~{fits_estimate}",
-                                    "color": "amber",
-                                })
-                            if "obs_collection" in df.columns:
-                                metrics.append({
-                                    "label": "Telescopes",
-                                    "value": int(df["obs_collection"].nunique()),
-                                    "color": "emerald",
-                                })
-
-                            # ── Build archive link (per-archive) ──────────
-                            archive_link = ""
-                            if is_cadc and "target_name" in df.columns and not df.empty:
-                                _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
-                                archive_link = f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.target.name={_tgt}"
-                            elif "access_url" in df.columns and not df["access_url"].isna().all():
-                                archive_link = str(df["access_url"].dropna().iloc[0])
-                            elif "member_ous_uid" in df.columns:
-                                mous = next((str(v) for v in df["member_ous_uid"] if pd.notna(v) and str(v).strip()), "")
-                                if mous:
-                                    archive_link = f"https://almascience.nrao.edu/aq/?member_ous_id={mous}"
-
-                            table_event = json.dumps({
-                                "type": "data",
-                                "metrics": metrics,
-                                "columns": list(sub.columns),
-                                "rows": rows,
-                                "sourceName": _detected_source,
-                                "archiveLink": archive_link,
-                                "hasRowLinks": any(bool(r.get("_link")) for r in rows),
-                                "hasPreview": has_preview,
-                                "demographics": demographics if demographics else None,
-                                "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
-                            })
-                            yield f"data: {table_event}\n\n"
-                            # Capture for history persistence
-                            _rich_dt = json.loads(table_event)
-                            _rich_dt.pop("type", None)  # strip SSE type marker
-                            _rich_data_tables.append(_rich_dt)
-                            _rich_data_table = _rich_dt  # backward compat
-                            await asyncio.sleep(0.05)
-                        except Exception as e:
-                            print(f"[WARN] Could not serialize data table for UI: {e}")
+                    card = _build_data_card_event(_run_result)
+                    if card:
+                        _event_str, _rich_dt = card
+                        yield _event_str
+                        _rich_data_tables.append(_rich_dt)
+                        _rich_data_table = _rich_dt
+                        await asyncio.sleep(0.05)
 
                 elif result_type == "papers":
                     papers = _run_result.get("papers", [])
@@ -1289,7 +1333,6 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
             user_id = _current_user.get("sub")
             if user_id:
                 try:
-                    yield _status("Searching personal knowledge base", "running")
                     loop2 = asyncio.get_event_loop()
                     def _rag_search():
                         from services.rag_service import RAGService
@@ -1298,6 +1341,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                         return docs
                     rag_docs = await loop2.run_in_executor(_executor, _rag_search)
                     if rag_docs:
+                        yield _status("Searching personal knowledge base", "running")
                         ctx_lines = []
                         for d in rag_docs:
                             src = d.metadata.get("source_file", "personal doc")
@@ -1309,11 +1353,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             f"---\nUser's question: {request.message}"
                         )
                         yield _status("Searching personal knowledge base", "completed")
-                    else:
-                        yield _status("Searching personal knowledge base", "completed")
                 except Exception as e:
                     print(f"[WARN] Personal RAG search failed: {e}")
-                    yield _status("Searching personal knowledge base", "completed")
 
         # Use enriched message for the rest of the pipeline
         effective_request = ChatRequest(

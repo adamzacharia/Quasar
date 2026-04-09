@@ -133,3 +133,8 @@ paper/
 
 # Understand-Anything
 .understand-anything/
+
+# Render service cache
+.render_service_cache.json
+
+scripts/render_logs.py
