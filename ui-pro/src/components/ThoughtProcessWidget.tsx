@@ -1,6 +1,7 @@
 "use client";
 
-import { ChevronDown, Brain, CheckCircle2 } from "lucide-react";
+import { ChevronDown, CheckCircle2 } from "lucide-react";
+import { IconNeuralNet } from "./icons/QuasarIcons";
 import { useState, useEffect, type ReactNode } from "react";
 
 export interface ThoughtStep {
@@ -34,7 +35,7 @@ export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceC
                 <summary className="flex items-center justify-between p-4 cursor-pointer list-none hover:bg-white/5 transition-colors">
                     <div className="flex items-center gap-3">
                         <div className="w-8 h-8 flex items-center justify-center bg-primary/20 rounded-lg">
-                            <Brain className={`w-5 h-5 ${status === 'running' ? 'text-primary animate-pulse' : 'text-primary'}`} />
+                            <IconNeuralNet className={`w-5 h-5 ${status === 'running' ? 'text-primary animate-pulse' : 'text-primary'}`} />
                         </div>
                         <div className="flex flex-col">
                             <span className="text-sm font-semibold text-slate-100">{title}</span>

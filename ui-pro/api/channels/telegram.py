@@ -95,7 +95,7 @@ async def telegram_webhook(request: Request):
     # Run the agent in a thread pool (it's synchronous)
     agent = _get_agent()
     if agent is None:
-        await _send_telegram_message(chat_id, "⚠️ Quasar backend is starting up. Please try again in a moment.")
+        await _send_telegram_message(chat_id, "[!] Quasar backend is starting up. Please try again in a moment.")
         return Response(content="ok", status_code=200)
 
     loop = asyncio.get_event_loop()

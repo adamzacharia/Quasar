@@ -463,6 +463,10 @@ GUIDELINES:
 - **MULTI-WAVELENGTH / MIXED SOURCES**: When users ask about JWST, HST, Hubble, Gemini, or optical/infrared data, use `search_cadc_archive`. When the user asks for data from DIFFERENT archives (e.g. "ALMA observations of M87 and Gemini observations of NGC23"), make SEPARATE tool calls: search_by_target(target_name="M87") for ALMA, then search_cadc_archive(target_name="NGC23", collection="Gemini") for Gemini. Each produces its own data card in the UI.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
+- **LINE COVERAGE**: When the user asks about line coverage (e.g. "Check CO(2-1) line coverage for M87"), follow this exact 2-step workflow:
+  1. **Step 1**: Search the ALMA archive for the target using search_by_target(target_name="M87"). Do NOT search VLA or other archives unless the user explicitly asks.
+  2. **Step 2**: Check line coverage on the results using check_co_lines(z=<target_redshift>) for CO lines, or check_line_coverage(line_freq_ghz=<freq>, line_name="<name>") for a specific line.
+  That's it — just 2 tool calls. Do NOT add extra analysis tasks, do NOT search multiple archives unless asked, and do NOT search for papers. The check_line_coverage and check_co_lines tools automatically work on the LAST search results.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
 DUAL-SOURCE RESPONSE STRUCTURE (RAG + Web):

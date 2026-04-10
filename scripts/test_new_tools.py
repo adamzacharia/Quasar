@@ -33,9 +33,9 @@ print("Checking new tools:")
 all_present = True
 for tool in expected_new_tools:
     if tool in tools:
-        print(f"  ✅ {tool}")
+        print(f"  [OK] {tool}")
     else:
-        print(f"  ❌ {tool} - MISSING")
+        print(f"  [FAIL] {tool} - MISSING")
         all_present = False
 
 print("\n" + "=" * 60)

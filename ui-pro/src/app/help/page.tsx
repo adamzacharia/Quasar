@@ -4,7 +4,8 @@ import { Sidebar } from "@/components/Sidebar";
 import { useChatStore } from "../../lib/store";
 import { AuthModal } from "@/components/AuthModal";
 import { useEffect, useState } from "react";
-import { Telescope, FileText, Search, Zap, Github, BookOpen, ExternalLink, Bot, X, Shield, Users, Heart } from "lucide-react";
+import { Telescope, FileText, Search, Zap, Github, ExternalLink, Bot, X, Shield, Users, Heart } from "lucide-react";
+import { IconOpenBook } from "@/components/icons/QuasarIcons";
 import Link from "next/link";
 
 export default function HelpPage() {
@@ -36,7 +37,7 @@ export default function HelpPage() {
     ];
 
     const tabs = [
-        { id: "docs" as const, label: "Documentation", icon: BookOpen },
+        { id: "docs" as const, label: "Documentation", icon: IconOpenBook },
         { id: "terms" as const, label: "Terms & Conditions", icon: Shield },
         { id: "credits" as const, label: "Credits", icon: Users },
     ];
@@ -71,7 +72,7 @@ export default function HelpPage() {
                     {/* Header */}
                     <div className="space-y-4">
                         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary/10 text-primary text-xs font-semibold uppercase tracking-wider">
-                            <BookOpen className="w-4 h-4" /> Documentation
+                            <IconOpenBook className="w-4 h-4" /> Documentation
                         </div>
                         <h1 className="text-4xl md:text-5xl font-bold text-white tracking-tight">
                             Help & Docs
@@ -111,7 +112,7 @@ export default function HelpPage() {
                                 {/* Pro Tips Section */}
                                 <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">
                                     <h2 className="text-xl font-semibold text-white mb-6 flex items-center gap-2">
-                                        <div className="p-1.5 bg-slate-700/50 rounded-md"><span className="text-xl">💡</span></div>
+                                        <div className="p-1.5 bg-slate-700/50 rounded-md"><Zap className="w-5 h-5 text-yellow-400" /></div>
                                         Example Queries
                                     </h2>
                                     <ul className="space-y-3">
@@ -302,7 +303,7 @@ export default function HelpPage() {
                             {/* Acknowledgements */}
                             <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
                                 <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                                    <div className="p-1.5 bg-slate-700/50 rounded-md"><BookOpen className="w-5 h-5 text-blue-400" /></div>
+                                    <div className="p-1.5 bg-slate-700/50 rounded-md"><IconOpenBook className="w-5 h-5 text-blue-400" /></div>
                                     Acknowledgements
                                 </h2>
                                 <div className="space-y-3 text-sm text-slate-400 leading-relaxed">

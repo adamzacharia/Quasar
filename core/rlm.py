@@ -33,7 +33,7 @@ from core.rlm_environment import RLMREPLExecutor
 
 # Keywords / patterns that suggest multi-step reasoning is needed
 _MULTI_HOP_INDICATORS = [
-    "cover",
+    "coverage across",
     "overlap",
     "redshift",
     "observed frequency",

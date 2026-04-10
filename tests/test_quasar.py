@@ -36,11 +36,11 @@ def test_imports():
         try:
             module = __import__(module_name, fromlist=[class_name])
             getattr(module, class_name)
-            results.append((module_name, "✅ Success", ""))
+            results.append((module_name, "[OK] Success", ""))
         except ImportError as e:
-            results.append((module_name, "❌ Failed", str(e)))
+            results.append((module_name, "[FAIL] Failed", str(e)))
         except AttributeError as e:
-            results.append((module_name, "⚠️  Warning", f"Class {class_name} not found"))
+            results.append((module_name, "[!]  Warning", f"Class {class_name} not found"))
 
     # Display results
     table = Table(title="Import Tests")
@@ -52,7 +52,7 @@ def test_imports():
         table.add_row(module, status, details)
 
     console.print(table)
-    return all("✅" in r[1] for r in results)
+    return all("[OK]" in r[1] for r in results)
 
 def test_environment():
     """Test environment variables"""
@@ -67,18 +67,18 @@ def test_environment():
     # Required variables
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if openai_key and openai_key.startswith("sk-"):
-        table.add_row("OPENAI_API_KEY", "✅ Set", "sk-***" + openai_key[-4:])
+        table.add_row("OPENAI_API_KEY", "[OK] Set", "sk-***" + openai_key[-4:])
         has_openai = True
     else:
-        table.add_row("OPENAI_API_KEY", "❌ Not set", "Required for chat")
+        table.add_row("OPENAI_API_KEY", "[FAIL] Not set", "Required for chat")
         has_openai = False
 
     # Optional variables
     ads_key = os.getenv("NASA_ADS_API_KEY", "")
     if ads_key:
-        table.add_row("NASA_ADS_API_KEY", "✅ Set", "***" + ads_key[-4:])
+        table.add_row("NASA_ADS_API_KEY", "[OK] Set", "***" + ads_key[-4:])
     else:
-        table.add_row("NASA_ADS_API_KEY", "⚠️  Not set", "Optional")
+        table.add_row("NASA_ADS_API_KEY", "[!]  Not set", "Optional")
 
     console.print(table)
     return has_openai

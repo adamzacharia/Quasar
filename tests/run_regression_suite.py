@@ -193,9 +193,9 @@ def run_suite():
                 status = "PASS" if tool_executed else "FAIL"
                 if not tool_call_str: status = "SKIP (No Tool Sim)"
                 
-                mem_icon = '✅' if context_present else '⚠️' # Warn instead of fail
+                mem_icon = '[OK]' if context_present else '[!]' # Warn instead of fail
                 
-                f.write(f"| {i} | {q1[:30]}... | {'✅' if tool_executed else '❌'} | {mem_icon} | {status} |\n")
+                f.write(f"| {i} | {q1[:30]}... | {'[OK]' if tool_executed else '[FAIL]'} | {mem_icon} | {status} |\n")
                 print(f"Test {i}: {status}")
                 
                 # Clear memory for next test to isolate

@@ -8,31 +8,31 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 print("Testing imports...")
 try:
     from core.agent import QuasarAgent
-    print("✅ core.agent imported")
+    print("[OK] core.agent imported")
 except ImportError as e:
-    print(f"❌ core.agent failed: {e}")
+    print(f"[FAIL] core.agent failed: {e}")
 
 try:
     from services.search import SearchService
-    print("✅ services.search imported")
+    print("[OK] services.search imported")
 except ImportError as e:
-    print(f"❌ services.search failed: {e}")
+    print(f"[FAIL] services.search failed: {e}")
 
 try:
     from services.rag_service import RAGService
-    print("✅ services.rag_service imported")
+    print("[OK] services.rag_service imported")
     
     # Test RAG path resolution
     rag = RAGService()
-    print(f"✅ RAGService initialized with path: {rag.persist_directory}")
+    print(f"[OK] RAGService initialized with path: {rag.persist_directory}")
     if os.path.exists(rag.persist_directory):
-        print("✅ ChromaDB directory found")
+        print("[OK] ChromaDB directory found")
     else:
-        print(f"⚠️ ChromaDB directory not found at {rag.persist_directory}")
+        print(f"[!] ChromaDB directory not found at {rag.persist_directory}")
         
 except ImportError as e:
-    print(f"❌ services.rag_service failed: {e}")
+    print(f"[FAIL] services.rag_service failed: {e}")
 except Exception as e:
-    print(f"❌ RAGService init failed: {e}")
+    print(f"[FAIL] RAGService init failed: {e}")
 
 print("\nTests complete.")

@@ -23,9 +23,9 @@ def test_memory_persistence():
     print("Searching immediately...")
     results = mem_service.search_memories("radio astronomy")
     if any(unique_fact in r for r in results):
-        print("✅ Immediate retrieval successful")
+        print("[OK] Immediate retrieval successful")
     else:
-        print("❌ Immediate retrieval failed")
+        print("[FAIL] Immediate retrieval failed")
         print(f"Results: {results}")
 
     # 4. Re-initialize (Simulate restart)
@@ -34,9 +34,9 @@ def test_memory_persistence():
     results_2 = mem_service_2.search_memories("radio astronomy")
     
     if any(unique_fact in r for r in results_2):
-        print("✅ Persistence successful")
+        print("[OK] Persistence successful")
     else:
-        print("❌ Persistence failed")
+        print("[FAIL] Persistence failed")
         print(f"Results after restart: {results_2}")
 
 if __name__ == "__main__":

@@ -334,7 +334,7 @@ function CustomToolsPanel() {
                     onClick={() => setActiveTab("installed")}
                     className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 \${activeTab === "installed" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
                 >
-                    🔧 Installed ({tools.length})
+                    Installed ({tools.length})
                 </button>
                 <button 
                     onClick={() => setActiveTab("add")}
@@ -346,7 +346,7 @@ function CustomToolsPanel() {
                     onClick={() => setActiveTab("templates")}
                     className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 \${activeTab === "templates" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
                 >
-                    📋 Templates
+                    Templates
                 </button>
             </div>
 
@@ -377,7 +377,7 @@ function CustomToolsPanel() {
                                             <p className="text-xs text-slate-400 line-clamp-2">{tool.description || <span className="italic">No description</span>}</p>
                                             {tool.api_key_name && (
                                                 <div className="mt-2 text-[10px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded inline-block">
-                                                    🔑 {tool.api_key_name}
+                                                    KEY: {tool.api_key_name}
                                                 </div>
                                             )}
                                         </div>
@@ -624,7 +624,7 @@ function MCPServersPanel() {
                     onClick={() => setActiveTab("installed")}
                     className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 \${activeTab === "installed" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
                 >
-                    🔌 Connected ({servers.length})
+                    Connected ({servers.length})
                 </button>
                 <button 
                     onClick={() => setActiveTab("add")}
@@ -659,7 +659,7 @@ function MCPServersPanel() {
                                             </div>
                                             {srv.transport === "http" ? (
                                                 <p className="text-xs text-slate-400 font-mono mt-2 truncate bg-black/30 p-1.5 rounded border border-slate-700/50">
-                                                    🔗 {srv.url}
+                                                    {srv.url}
                                                 </p>
                                             ) : (
                                                 <p className="text-xs text-slate-400 font-mono mt-2 truncate bg-black/30 p-1.5 rounded border border-slate-700/50">

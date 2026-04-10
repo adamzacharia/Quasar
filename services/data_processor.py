@@ -92,11 +92,11 @@ class DataProcessor:
                 freq_range_str = "multiple frequency bands"
             
             summary = f"""
-### 🌌 {source} Archive Summary
+### {source} — Archive Summary
 
 Found **{stats['total_observations']} observations** in the NRAO archives.
 
-**📊 Key Statistics:**
+**Key Statistics:**
 - **Facilities:** {facilities_str}
 - **Date Range:** {date_range_str}
 - **Frequency Coverage:** {freq_range_str}
@@ -106,17 +106,17 @@ Found **{stats['total_observations']} observations** in the NRAO archives.
 """
             
             if len(data['papers']) > 0:
-                summary += f"📚 **{len(data['papers'])} related scientific papers** found in NASA ADS.\n"
+                summary += f"**{len(data['papers'])} related scientific papers** found in NASA ADS.\n"
             
-            summary += "\n💡 *You can ask me to generate analysis code or find more specific information about these observations.*"
+            summary += "\n*You can ask me to generate analysis code or find more specific information about these observations.*"
             
         else:
             summary = f"""
-### ❌ No Results Found
+### No Results Found
 
 No observations found for **{source}** in the NRAO archives.
 
-**💡 Suggestions:**
+**Suggestions:**
 - Check the spelling of the source name
 - Try alternative designations (e.g., '3C 273' vs '3C273')
 - Common sources to try:
