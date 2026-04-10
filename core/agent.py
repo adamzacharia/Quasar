@@ -224,6 +224,7 @@ class QuasarAgent:
         self.conductor = Conductor(
             client=self.client,
             model=self.config.model,
+            conductor_model="gpt-5.4",  # Stronger model for planning/synthesis
             tool_executor=self._conductor_tool_executor,
             recovery_engine=self.recovery_engine,
             model_router=self.model_router,
@@ -2916,8 +2917,10 @@ ORDER BY target_name
             tools = self._build_tools_for_responses_api()
 
             # Single Responses API call with tool access
+            # Use the Conductor's model for subtask execution (gpt-5.4)
+            subtask_model = getattr(self.conductor, 'conductor_model', self.config.model)
             response = self.client.responses.create(
-                model=self.config.model,
+                model=subtask_model,
                 instructions=system_instructions,
                 input=user_input,
                 tools=tools,
