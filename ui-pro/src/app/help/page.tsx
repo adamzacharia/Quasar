@@ -4,7 +4,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { useChatStore } from "../../lib/store";
 import { AuthModal } from "@/components/AuthModal";
 import { useEffect, useState } from "react";
-import { Telescope, FileText, Search, Zap, Github, ExternalLink, Bot, X, Shield, Users, Heart } from "lucide-react";
+import { Telescope, FileText, Search, Zap, Github, ExternalLink, Bot, X, Shield, Users, Heart, Database } from "lucide-react";
 import { IconOpenBook } from "@/components/icons/QuasarIcons";
 import Link from "next/link";
 
