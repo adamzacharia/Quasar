@@ -28,6 +28,10 @@ export default function HelpPage() {
         `Request plots: "Plot the sky distribution of results"`,
         `Search papers: "Find papers about protoplanetary disks"`,
         `Resolve targets: "Where is RXJ1347-1145?"`,
+        `What are the different ALMA configurations and their corresponding angular resolutions?`,
+        `How do I find out which CASA version was used to process data from a given ALMA project?`,
+        `What types of data can I download for observations made with ALMA?`,
+        `How many observing bands are available with ALMA? How many bands have public data available in the ALMA Science Archive as of March 25, 2026?`,
     ];
 
     const tools = [
@@ -162,6 +166,15 @@ export default function HelpPage() {
                                             </div>
                                             <ExternalLink className="w-4 h-4 text-slate-500 group-hover:text-primary transition-colors" />
                                         </a>
+                                        <a href="https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/" target="_blank" rel="noopener noreferrer"
+                                            className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
+                                            <div className="p-2 bg-teal-900/40 rounded-lg group-hover:bg-teal-800/50 transition-colors"><Database className="w-5 h-5 text-teal-400" /></div>
+                                            <div className="flex-1">
+                                                <span className="text-sm font-semibold text-white">CADC Archive</span>
+                                                <p className="text-xs text-slate-400">Canadian Astronomy Data Centre</p>
+                                            </div>
+                                            <ExternalLink className="w-4 h-4 text-slate-500 group-hover:text-primary transition-colors" />
+                                        </a>
                                     </div>
                                 </section>
 
@@ -265,7 +278,7 @@ export default function HelpPage() {
                                 <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
                                     <p className="text-slate-300 leading-relaxed">
                                         QUASAR is supported by a <span className="text-white font-semibold">Seed Fund</span> from the{" "}
-                                        <span className="text-primary font-semibold">CosmicAI</span>{" "}
+                                        <a href="https://cosmicai.org/" target="_blank" rel="noopener noreferrer" className="text-primary font-semibold hover:underline">CosmicAI</a>{" "}
                                         <span className="text-white font-semibold">NSF–Simons Foundation</span>.
                                     </p>
                                     <div className="flex items-center gap-4 mt-4 pt-4 border-t border-slate-700/50">

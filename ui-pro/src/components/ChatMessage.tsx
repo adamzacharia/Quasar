@@ -5,7 +5,8 @@ import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Copy, Check, Database, User as UserIcon } from "lucide-react";
-import { useState } from "react";
+import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
+import { useState, type ReactNode } from "react";
 import type { Message } from "../lib/types";
 import { useAuthStore } from "../lib/auth-store";
 import { DataTableCard } from "./DataTableCard";
@@ -30,6 +31,88 @@ function CodeBlock({ language, children }: { language: string; children: string 
         </div>
     );
 }
+
+/**
+ * Replace emoji characters in text children with custom SVG icons.
+ * Handles: 📚 → IconOpenBook, 🌐 → IconWebGlobe
+ */
+function replaceEmojisWithIcons(children: ReactNode): ReactNode {
+    if (!children) return children;
+
+    // Process arrays of children
+    if (Array.isArray(children)) {
+        return children.map((child, i) => {
+            if (typeof child === "string") {
+                return replaceEmojisInString(child, i);
+            }
+            return child;
+        });
+    }
+
+    // Process single string child
+    if (typeof children === "string") {
+        return replaceEmojisInString(children, 0);
+    }
+
+    return children;
+}
+
+function replaceEmojisInString(text: string, keyBase: number): ReactNode {
+    // Check if text contains any of our target emojis
+    if (!text.includes("📚") && !text.includes("🌐")) {
+        return text;
+    }
+
+    // Split by emoji and interleave with icon components
+    const parts: ReactNode[] = [];
+    let remaining = text;
+    let partKey = 0;
+
+    while (remaining.length > 0) {
+        const bookIdx = remaining.indexOf("📚");
+        const globeIdx = remaining.indexOf("🌐");
+
+        // Find the earliest emoji
+        let nextIdx = -1;
+        let emojiType: "book" | "globe" | null = null;
+
+        if (bookIdx >= 0 && (globeIdx < 0 || bookIdx < globeIdx)) {
+            nextIdx = bookIdx;
+            emojiType = "book";
+        } else if (globeIdx >= 0) {
+            nextIdx = globeIdx;
+            emojiType = "globe";
+        }
+
+        if (nextIdx < 0) {
+            // No more emojis — push remaining text
+            parts.push(remaining);
+            break;
+        }
+
+        // Push text before emoji
+        if (nextIdx > 0) {
+            parts.push(remaining.substring(0, nextIdx));
+        }
+
+        // Push the icon component
+        if (emojiType === "book") {
+            parts.push(
+                <IconOpenBook key={`icon-${keyBase}-${partKey}`} className="w-4 h-4 text-primary inline-block align-text-bottom mr-0.5" />
+            );
+            remaining = remaining.substring(nextIdx + 2); // 📚 is 2 chars (surrogate pair)
+        } else {
+            parts.push(
+                <IconWebGlobe key={`icon-${keyBase}-${partKey}`} className="w-4 h-4 text-cyan-400 inline-block align-text-bottom mr-0.5" />
+            );
+            remaining = remaining.substring(nextIdx + 2); // 🌐 is 2 chars
+        }
+        partKey++;
+    }
+
+    return parts.length === 1 ? parts[0] : <>{parts}</>;
+}
+
 
 interface ChatMessageProps {
     message: Message;
@@ -307,6 +390,16 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     const code = String(children).replace(/\n$/, "");
                                     if (match) return <CodeBlock language={match[1]}>{code}</CodeBlock>;
                                     return <code className="bg-slate-800 px-1.5 py-0.5 rounded text-primary text-sm font-mono" {...props}>{children}</code>;
+                                },
+                                // Replace 📚 and 🌐 emojis with custom SVG icons
+                                p({ children }) {
+                                    return <p>{replaceEmojisWithIcons(children)}</p>;
+                                },
+                                em({ children }) {
+                                    return <em>{replaceEmojisWithIcons(children)}</em>;
+                                },
+                                strong({ children }) {
+                                    return <strong>{replaceEmojisWithIcons(children)}</strong>;
                                 },
                                 table({ children }) {
                                     return (

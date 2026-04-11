@@ -3276,8 +3276,62 @@ ORDER BY target_name
                     )
 
                     # Launch a parallel web search to supplement RAG with fresh data.
-                    # Only if a web thread isn't already running (from cutoff detection).
+                    # Only if a web thread isn't already running (from cutoff detection)
+                    # AND the query actually benefits from web search.
+                    #
+                    # SKIP web search for:
+                    # - Attachment/document queries (summarize PDF, explain this doc)
+                    # - Conversational/follow-up queries (thanks, yes, explain more)
+                    # - Data analysis queries (plot, analyze, compare these results)
+                    # - General knowledge the LLM can answer from training data
+                    #
+                    # ALLOW web search for:
+                    # - Queries about current observatory status/schedules/deadlines
+                    # - Policy/proposal questions that change over time
+                    # - Queries explicitly asking for latest/recent/current info
+                    _needs_web_supplement = False
                     if _web_thread is None and os.getenv("TAVILY_API_KEY", ""):
+                        _uq = _user_query.lower()
+
+                        # ── Blocklist: never web-search for these patterns ──
+                        _is_attachment_query = bool(re.search(
+                            r'\b(?:summarize|summarise|summary|explain|describe|extract|'
+                            r'read|analyze|analyse|parse|review|translate|what does|'
+                            r'tell me about)\b.*'
+                            r'\b(?:pdf|document|file|paper|thesis|article|attachment|'
+                            r'uploaded|attached|this)\b',
+                            _uq,
+                        )) or bool(re.search(
+                            r'\b(?:pdf|document|file|paper|thesis|attachment)\b.*'
+                            r'\b(?:summarize|summarise|summary|explain|about|says?|'
+                            r'contain|content|mean)\b',
+                            _uq,
+                        ))
+                        _has_attachments = bool(attachments)
+
+                        _is_conversational = bool(re.search(
+                            r'^(?:thank|thanks|yes|no|ok|okay|sure|got it|'
+                            r'explain more|continue|go on|what do you mean|'
+                            r'can you elaborate|tell me more|great)\b',
+                            _uq.strip(),
+                        ))
+
+                        # ── Allowlist: web-search IS useful here ──
+                        _wants_current_info = bool(re.search(
+                            r'\b(?:current|latest|recent|upcoming|deadline|'
+                            r'schedule|status|call for|cfp|cycle \d|'
+                            r'when is|when does|how to apply|'
+                            r'policy|policies|regulation)\b',
+                            _uq,
+                        ))
+
+                        if _is_attachment_query or _has_attachments or _is_conversational:
+                            _needs_web_supplement = False
+                        elif _wants_current_info:
+                            _needs_web_supplement = True
+                        # else: default to NOT web-searching (LLM + RAG is enough)
+
+                    if _needs_web_supplement:
                         _web_search_reason = "rag_supplement"
                         if on_status:
                             on_status("Searching the web for updated information", "running")

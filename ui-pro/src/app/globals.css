@@ -100,6 +100,44 @@
   background: #f471b5;
 }
 
+/* ── Prose Heading Spacing ─────────────────────────────────── */
+/* Headings get double the spacing above them vs normal lines  */
+/* so titles visually separate from body text.                 */
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  margin-top: 1.6em;
+  margin-bottom: 0.6em;
+  line-height: 1.3;
+}
+
+/* First heading in a message shouldn't have top margin */
+.prose > h1:first-child,
+.prose > h2:first-child,
+.prose > h3:first-child,
+.prose > h4:first-child,
+.prose > h5:first-child,
+.prose > h6:first-child {
+  margin-top: 0;
+}
+
+/* Paragraphs get tighter spacing */
+.prose p {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+/* Lists get moderate spacing */
+.prose ul, .prose ol {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+/* Horizontal rules (used as section dividers) */
+.prose hr {
+  margin-top: 1.5em;
+  margin-bottom: 1.5em;
+  border-color: rgba(148, 163, 184, 0.15);
+}
+
 /* ── Beautiful Markdown Tables ─────────────────────────────── */
 .prose table {
   width: 100%;
