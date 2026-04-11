@@ -802,8 +802,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "Search the web for real-time information: astronomy news, telescope schedules, "
                 "arXiv preprints, observatory announcements, instrument specs, or any live web content. "
                 "Uses Tavily for grounded, source-cited results. "
-                "Examples: 'latest JWST observations 2024', 'ALMA call for proposals 2025', "
-                "'what is the VLA sensitivity at 1.4 GHz'."
+                "Use the user's query as-is — do NOT add years or dates unless the user explicitly mentioned them. "
+                "Examples: 'ALMA proprietary period policy', 'JWST cycle 4 call for proposals', "
+                "'VLA sensitivity at 1.4 GHz'."
             ),
             function=self._tavily_web_search,
             parameters={
@@ -1178,6 +1179,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "type": "object",
                 "properties": {},
                 "required": []
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="extract_paper_details",
+            description="Download a scientific paper by its arXiv ID or ADS bibcode and extract specific details (e.g. beam size, flux density, telescope configuration) using an LLM QA pass over the full text. Use when the user asks specific questions about the contents of a published paper.",
+            function=self._extract_paper_details,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "identifier": {"type": "string", "description": "arXiv ID (e.g. '1812.04040') or ADS bibcode (e.g. '2018ApJ...869L..41A')"},
+                    "query": {"type": "string", "description": "The specific question to ask about the paper's contents (e.g. 'What was the exact angular resolution achieved for AS 209?')"}
+                },
+                "required": ["identifier", "query"]
             },
             category="literature"
         ))
@@ -2424,6 +2440,32 @@ ORDER BY target_name
                 "papers": papers_list,
                 "top_title": papers_list[0]["title"] if papers_list else "No results",
             }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _extract_paper_details(self, identifier: str, query: str) -> Dict[str, Any]:
+        """Download a paper and extract specific details via QA."""
+        try:
+            arxiv_id = identifier.strip()
+            if '.' not in arxiv_id or len(arxiv_id) > 20:
+                if self.ads_client:
+                    try:
+                        details = self.ads_client.get_paper_details(arxiv_id)
+                        if isinstance(details, dict) and details.get("arxiv_id"):
+                            arxiv_id = details["arxiv_id"]
+                        elif isinstance(details, dict) and details.get("doi"):
+                            return {"success": False, "error": f"Paper has DOI ({details['doi']}) but no arXiv ID. PDF download requires an open access arXiv ID."}
+                    except Exception:
+                        pass
+
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            result = self.pdf_service.query_paper_pdf(pdf_url, query)
+
+            if not result.get("success"):
+                return {"success": False, "error": f"Could not extract details: {result.get('error')}", "identifier": identifier}
+
+            self.last_run_result = {"type": "text", "text": result["answer"], "source": f"Paper Extractor: {identifier}"}
+            return {"success": True, "identifier": identifier, "extracted_answer": result["answer"]}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

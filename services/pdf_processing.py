@@ -129,3 +129,50 @@ class PDFProcessingService:
                     os.remove(pdf_path)
             except Exception as e:
                 logger.warning("Failed to clean up temp file %s: %s", pdf_path, e)
+
+    def query_paper_pdf(self, url: str, query: str) -> Dict[str, Any]:
+        """Download a PDF, extract its text, and use an LLM to answer a specific query."""
+        if not self.client:
+            return {"success": False, "error": "OpenAI API key not configured."}
+
+        pdf_path = self.download_pdf(url)
+        if not pdf_path:
+            return {"success": False, "error": "Failed to download PDF from URL."}
+
+        try:
+            full_text = self.extract_text_from_pdf(pdf_path)
+            if not full_text:
+                return {"success": False, "error": "Failed to extract text from the downloaded PDF."}
+
+            truncated_text = self._truncate_text(full_text)
+            
+            system_prompt = (
+                "You are an expert astrophysics research assistant. "
+                "Your task is to concisely answer the user's question based strictly on the text "
+                "extracted from the provided scientific paper. If the answer cannot be found in the text, "
+                "state that clearly rather than hallucinating."
+            )
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Paper text:\n\n{truncated_text}\n\nQuestion: {query}"}
+                ],
+                temperature=0.0,
+                max_tokens=2000
+            )
+
+            answer = response.choices[0].message.content.strip()
+            return {"success": True, "answer": answer}
+
+        except Exception as e:
+            logger.error("LLM QA failed: %s", e)
+            return {"success": False, "error": str(e)}
+        finally:
+            try:
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+            except Exception as e:
+                logger.warning("Failed to clean up temp file %s: %s", pdf_path, e)
+
