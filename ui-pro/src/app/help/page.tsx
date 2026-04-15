@@ -11,7 +11,7 @@ import Link from "next/link";
 export default function HelpPage() {
     const sidebarOpen = useChatStore((s) => s.sidebarOpen);
     const [mounted, setMounted] = useState(false);
-    const [activeTab, setActiveTab] = useState<"docs" | "terms" | "credits">("docs");
+    const [activeTab, setActiveTab] = useState<"docs" | "terms">("docs");
 
     useEffect(() => {
         // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -43,7 +43,7 @@ export default function HelpPage() {
     const tabs = [
         { id: "docs" as const, label: "Documentation", icon: IconOpenBook },
         { id: "terms" as const, label: "Terms & Conditions", icon: Shield },
-        { id: "credits" as const, label: "Credits", icon: Users },
+        // { id: "credits" as const, label: "Credits", icon: Users },  // Hidden temporarily
     ];
 
     const teamMembers = [
@@ -266,67 +266,12 @@ export default function HelpPage() {
                         </div>
                     )}
 
-                    {/* ═══════════════ CREDITS TAB ═══════════════ */}
-                    {activeTab === "credits" && (
+                    {/* ═══════════════ CREDITS TAB (Hidden temporarily) ═══════════════ */}
+                    {/* activeTab === "credits" && (
                         <div className="max-w-3xl animate-in fade-in duration-300 space-y-8">
                             {/* Funding Section */}
-                            <section className="bg-gradient-to-br from-primary/5 via-slate-800/30 to-accent-purple/5 border border-primary/20 rounded-2xl p-8 backdrop-blur-sm">
-                                <div className="flex items-center gap-3 mb-6">
-                                    <div className="p-2 bg-primary/10 rounded-lg"><Heart className="w-6 h-6 text-primary" /></div>
-                                    <h2 className="text-2xl font-bold text-white">Funding & Support</h2>
-                                </div>
-                                <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
-                                    <p className="text-slate-300 leading-relaxed">
-                                        QUASAR is supported by a <span className="text-white font-semibold">Seed Fund</span> from the{" "}
-                                        <a href="https://cosmicai.org/" target="_blank" rel="noopener noreferrer" className="text-primary font-semibold hover:underline">CosmicAI</a>{" "}
-                                        <span className="text-white font-semibold">NSF–Simons Foundation</span>.
-                                    </p>
-                                    <div className="flex items-center gap-4 mt-4 pt-4 border-t border-slate-700/50">
-                                        <div className="flex gap-1">
-                                            {[...Array(5)].map((_, i) => (
-                                                <div key={i} className="w-1.5 h-1.5 rounded-full bg-primary/60 animate-pulse" style={{ animationDelay: `${i * 200}ms` }} />
-                                            ))}
-                                        </div>
-                                        <span className="text-xs text-slate-500 uppercase tracking-wider font-medium">National Science Foundation &bull; Simons Foundation</span>
-                                    </div>
-                                </div>
-                            </section>
-
-                            {/* Team Section */}
-                            <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
-                                <div className="flex items-center gap-3 mb-6">
-                                    <div className="p-2 bg-accent-purple/10 rounded-lg"><Users className="w-6 h-6 text-accent-purple" /></div>
-                                    <h2 className="text-2xl font-bold text-white">Team</h2>
-                                </div>
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                    {teamMembers.map((member) => (
-                                        <div key={member.name} className="flex items-center gap-4 bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 hover:border-slate-600/50 transition-colors">
-                                            <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary/30 to-accent-purple/30 border border-slate-600/50 flex items-center justify-center shrink-0">
-                                                <span className="text-lg font-bold text-white">{member.name.split(" ").map(n => n[0]).join("").slice(0, 2)}</span>
-                                            </div>
-                                            <div>
-                                                <p className="text-sm font-semibold text-white">{member.name}</p>
-                                                <p className="text-xs text-slate-400 mt-0.5">{member.role}</p>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </section>
-
-                            {/* Acknowledgements */}
-                            <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
-                                <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
-                                    <div className="p-1.5 bg-slate-700/50 rounded-md"><IconOpenBook className="w-5 h-5 text-blue-400" /></div>
-                                    Acknowledgements
-                                </h2>
-                                <div className="space-y-3 text-sm text-slate-400 leading-relaxed">
-                                    <p>This project makes use of data from the <span className="text-slate-300">Atacama Large Millimeter/submillimeter Array (ALMA)</span>, <span className="text-slate-300">NASA Astrophysics Data System (ADS)</span>, and <span className="text-slate-300">SIMBAD</span> astronomical database operated at CDS, Strasbourg, France.</p>
-                                    <p>ALMA is a partnership of ESO, NSF (USA), and NINS (Japan), together with NRC (Canada), NSTC and ASIAA (Taiwan), and KASI (Republic of Korea), in cooperation with the Republic of Chile.</p>
-                                    <p>Special thanks to <span className="text-slate-300 font-medium">Dr Nikhil Mukund</span> for inspiring me to build tools and teaching me so much about LLMs, and to <span className="text-slate-300 font-medium">Dr Lisa Barsotti</span> and the <span className="text-slate-300 font-medium">MIT LIGO Lab</span> for giving invaluable opportunity and support.</p>
-                                </div>
-                            </section>
-                        </div>
-                    )}
+                            {/* ... Credits content hidden temporarily ... */}
+                    {/* ) */}
 
                     <div className="pt-8 text-center border-t border-slate-800 pb-12">
                         <p className="text-sm text-slate-500 font-medium tracking-wide">QUASAR RESEARCH ASSISTANT v2.0</p>
