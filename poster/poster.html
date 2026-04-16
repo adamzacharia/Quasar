@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quasar — AI-Powered Research Assistant for Astronomy Archive Workflows</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* ============================================================
+     PRINT / POSTER SETUP — 48 × 36 in landscape
+     ============================================================ */
+  @page {
+    size: 48in 36in landscape;
+    margin: 0;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    /* Deep space palette */
+    --bg-deep:        #0a0e1a;
+    --bg-card:        rgba(15, 20, 40, 0.85);
+    --bg-card-glass:  rgba(20, 28, 58, 0.65);
+    --border-glow:    rgba(139, 92, 246, 0.35);
+    --accent-purple:  #a855f7;
+    --accent-pink:    #ec4899;
+    --accent-blue:    #3b82f6;
+    --accent-cyan:    #06b6d4;
+    --accent-emerald: #10b981;
+    --accent-amber:   #f59e0b;
+    --accent-rose:    #f43f5e;
+    --text-primary:   #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted:     #64748b;
+    --gradient-hero:  linear-gradient(135deg, #a855f7 0%, #ec4899 50%, #f59e0b 100%);
+    --gradient-card:  linear-gradient(145deg, rgba(30,35,60,0.9) 0%, rgba(15,20,40,0.95) 100%);
+  }
+
+  html, body {
+    width: 48in;
+    height: 36in;
+    font-family: 'Inter', sans-serif;
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    overflow: hidden;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body {
+    background:
+      radial-gradient(ellipse 120% 80% at 15% 10%, rgba(139,92,246,0.15) 0%, transparent 50%),
+      radial-gradient(ellipse 100% 70% at 85% 90%, rgba(236,72,153,0.12) 0%, transparent 50%),
+      radial-gradient(ellipse 80% 60% at 50% 50%, rgba(6,182,212,0.08) 0%, transparent 50%),
+      var(--bg-deep);
+  }
+
+  /* ============================================================
+     POSTER GRID — 3-column layout
+     ============================================================ */
+  .poster {
+    width: 48in;
+    height: 36in;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    grid-template-columns: 1fr;
+    padding: 0.4in;
+    gap: 0.3in;
+  }
+
+  /* ---------- HEADER ---------- */
+  .header {
+    background: linear-gradient(135deg, rgba(20,25,50,0.9) 0%, rgba(10,14,26,0.95) 100%);
+    border: 2px solid var(--border-glow);
+    border-radius: 24px;
+    padding: 0.5in 0.6in;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    backdrop-filter: blur(20px);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .header::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 4px;
+    background: var(--gradient-hero);
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.45in;
+  }
+
+  .logo-box {
+    width: 1.6in;
+    height: 1.6in;
+    border-radius: 28px;
+    background: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 80pt;
+    font-weight: 900;
+    color: #fff;
+    box-shadow: 0 0 60px rgba(168,85,247,0.4);
+    flex-shrink: 0;
+  }
+
+  .header-text h1 {
+    font-size: 52pt;
+    font-weight: 900;
+    background: var(--gradient-hero);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.1;
+    letter-spacing: -1px;
+  }
+
+  .header-text .subtitle {
+    font-size: 26pt;
+    font-weight: 400;
+    color: var(--text-secondary);
+    margin-top: 8px;
+    letter-spacing: 0.5px;
+  }
+
+  .header-right {
+    text-align: right;
+    flex-shrink: 0;
+    max-width: 8in;
+  }
+
+  .authors {
+    font-size: 18pt;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.5;
+  }
+
+  .affiliations {
+    font-size: 14pt;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin-top: 6px;
+  }
+
+  .conference-badge {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 6px 24px;
+    border-radius: 30px;
+    background: linear-gradient(135deg, rgba(168,85,247,0.25), rgba(236,72,153,0.25));
+    border: 1px solid rgba(168,85,247,0.4);
+    font-size: 13pt;
+    font-weight: 600;
+    color: var(--accent-purple);
+    letter-spacing: 1px;
+  }
+
+  /* ---------- MAIN CONTENT ---------- */
+  .content {
+    display: grid;
+    grid-template-columns: 1fr 1.2fr 1fr;
+    gap: 0.3in;
+    min-height: 0;
+  }
+
+  .column {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25in;
+    min-height: 0;
+  }
+
+  /* ---------- CARDS ---------- */
+  .card {
+    background: var(--gradient-card);
+    border: 1.5px solid var(--border-glow);
+    border-radius: 20px;
+    padding: 0.35in 0.38in;
+    backdrop-filter: blur(16px);
+    position: relative;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .card.flex-grow {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    border-radius: 20px 20px 0 0;
+  }
+
+  .card.purple::before  { background: linear-gradient(90deg, var(--accent-purple), var(--accent-pink)); }
+  .card.blue::before    { background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan)); }
+  .card.emerald::before { background: linear-gradient(90deg, var(--accent-emerald), var(--accent-cyan)); }
+  .card.amber::before   { background: linear-gradient(90deg, var(--accent-amber), var(--accent-rose)); }
+  .card.rose::before    { background: linear-gradient(90deg, var(--accent-rose), var(--accent-purple)); }
+  .card.cyan::before    { background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue)); }
+
+  .card-title {
+    font-size: 22pt;
+    font-weight: 800;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    letter-spacing: -0.3px;
+  }
+
+  .card-title .icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20pt;
+    flex-shrink: 0;
+  }
+
+  .card.purple .card-title  { color: var(--accent-purple); }
+  .card.purple .icon        { background: rgba(168,85,247,0.2); }
+  .card.blue .card-title    { color: var(--accent-blue); }
+  .card.blue .icon          { background: rgba(59,130,246,0.2); }
+  .card.emerald .card-title { color: var(--accent-emerald); }
+  .card.emerald .icon       { background: rgba(16,185,129,0.2); }
+  .card.amber .card-title   { color: var(--accent-amber); }
+  .card.amber .icon         { background: rgba(245,158,11,0.2); }
+  .card.rose .card-title    { color: var(--accent-rose); }
+  .card.rose .icon          { background: rgba(244,63,94,0.2); }
+  .card.cyan .card-title    { color: var(--accent-cyan); }
+  .card.cyan .icon          { background: rgba(6,182,212,0.2); }
+
+  .card p, .card li {
+    font-size: 14.5pt;
+    line-height: 1.55;
+    color: var(--text-secondary);
+  }
+
+  .card ul {
+    list-style: none;
+    padding: 0;
+  }
+
+  .card li {
+    padding: 5px 0;
+    padding-left: 28px;
+    position: relative;
+  }
+
+  .card li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    font-weight: 700;
+  }
+
+  .card.purple li::before  { color: var(--accent-purple); }
+  .card.blue li::before    { color: var(--accent-blue); }
+  .card.emerald li::before { color: var(--accent-emerald); }
+  .card.amber li::before   { color: var(--accent-amber); }
+  .card.rose li::before    { color: var(--accent-rose); }
+  .card.cyan li::before    { color: var(--accent-cyan); }
+
+  .card strong {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .highlight-box {
+    background: rgba(168,85,247,0.1);
+    border: 1px solid rgba(168,85,247,0.25);
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin: 10px 0;
+    font-size: 14pt;
+    line-height: 1.5;
+    color: var(--text-secondary);
+  }
+
+  .highlight-box.blue {
+    background: rgba(59,130,246,0.1);
+    border-color: rgba(59,130,246,0.25);
+  }
+
+  .highlight-box.emerald {
+    background: rgba(16,185,129,0.1);
+    border-color: rgba(16,185,129,0.25);
+  }
+
+  .highlight-box strong {
+    color: var(--text-primary);
+  }
+
+  .highlight-box em {
+    color: var(--accent-cyan);
+    font-style: italic;
+  }
+
+  /* Key insight callout */
+  .key-insight {
+    background: linear-gradient(135deg, rgba(168,85,247,0.15), rgba(236,72,153,0.1));
+    border: 1.5px solid rgba(168,85,247,0.35);
+    border-radius: 14px;
+    padding: 16px 22px;
+    margin-top: 12px;
+    font-size: 14pt;
+    line-height: 1.5;
+  }
+
+  .key-insight .label {
+    font-size: 11pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--accent-purple);
+    margin-bottom: 6px;
+  }
+
+  .key-insight p {
+    color: var(--text-primary) !important;
+    font-weight: 500;
+    font-style: italic;
+  }
+
+  /* ---------- ARCHITECTURE FIGURE ---------- */
+  .arch-figure {
+    width: 100%;
+    border-radius: 14px;
+    border: 1px solid rgba(139,92,246,0.2);
+    box-shadow: 0 4px 30px rgba(0,0,0,0.3);
+  }
+
+  .ui-figure {
+    width: 100%;
+    border-radius: 14px;
+    border: 1px solid rgba(139,92,246,0.2);
+    box-shadow: 0 4px 30px rgba(0,0,0,0.3);
+  }
+
+  .figure-caption {
+    font-size: 12pt;
+    color: var(--text-muted);
+    text-align: center;
+    margin-top: 8px;
+    font-style: italic;
+  }
+
+  /* ---------- TOOL BADGES ---------- */
+  .tool-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .tool-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 14px;
+    border-radius: 20px;
+    font-size: 11pt;
+    font-weight: 600;
+    border: 1px solid;
+  }
+
+  .tool-badge.archive  { background: rgba(59,130,246,0.12); border-color: rgba(59,130,246,0.3); color: var(--accent-blue); }
+  .tool-badge.lit      { background: rgba(168,85,247,0.12); border-color: rgba(168,85,247,0.3); color: var(--accent-purple); }
+  .tool-badge.analysis { background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.3); color: var(--accent-emerald); }
+  .tool-badge.viz      { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.3); color: var(--accent-amber); }
+  .tool-badge.web      { background: rgba(6,182,212,0.12);  border-color: rgba(6,182,212,0.3);  color: var(--accent-cyan); }
+  .tool-badge.script   { background: rgba(244,63,94,0.12);  border-color: rgba(244,63,94,0.3);  color: var(--accent-rose); }
+
+  /* ---------- CASE STUDY FLOW ---------- */
+  .case-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    margin: 10px 0;
+  }
+
+  .step-num {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14pt;
+    font-weight: 800;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .card.emerald .step-num { background: rgba(16,185,129,0.2); color: var(--accent-emerald); }
+  .card.amber .step-num   { background: rgba(245,158,11,0.2); color: var(--accent-amber); }
+  .card.cyan .step-num    { background: rgba(6,182,212,0.2); color: var(--accent-cyan); }
+
+  .step-content {
+    flex: 1;
+  }
+
+  .step-content .step-title {
+    font-size: 14pt;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .step-content .step-desc {
+    font-size: 13pt;
+    color: var(--text-secondary);
+    line-height: 1.45;
+  }
+
+  /* ---------- STAT BOXES ---------- */
+  .stats-row {
+    display: flex;
+    gap: 14px;
+    margin-top: 12px;
+  }
+
+  .stat-box {
+    flex: 1;
+    text-align: center;
+    padding: 14px 10px;
+    border-radius: 14px;
+    background: rgba(168,85,247,0.08);
+    border: 1px solid rgba(168,85,247,0.2);
+  }
+
+  .stat-box .stat-value {
+    font-size: 28pt;
+    font-weight: 900;
+    background: var(--gradient-hero);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .stat-box .stat-label {
+    font-size: 11pt;
+    color: var(--text-muted);
+    margin-top: 2px;
+    font-weight: 500;
+  }
+
+  /* ---------- CONTRIB PILLS ---------- */
+  .contrib-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    margin: 12px 0;
+  }
+
+  .contrib-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20pt;
+    flex-shrink: 0;
+    background: rgba(168,85,247,0.15);
+  }
+
+  .contrib-text .contrib-title {
+    font-size: 14.5pt;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .contrib-text .contrib-desc {
+    font-size: 13pt;
+    color: var(--text-secondary);
+    line-height: 1.45;
+  }
+
+  /* ---------- QR / LINKS ---------- */
+  .links-row {
+    display: flex;
+    gap: 16px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+
+  .link-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 18px;
+    border-radius: 12px;
+    background: rgba(139,92,246,0.1);
+    border: 1px solid rgba(139,92,246,0.3);
+    font-size: 13pt;
+    font-weight: 600;
+    color: var(--accent-purple);
+  }
+
+  .link-chip .emoji {
+    font-size: 16pt;
+  }
+
+  /* ---------- CODE SNIPPET ---------- */
+  .code-block {
+    background: rgba(0,0,0,0.4);
+    border: 1px solid rgba(139,92,246,0.2);
+    border-radius: 12px;
+    padding: 14px 18px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5pt;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin: 10px 0;
+    overflow: hidden;
+  }
+
+  .code-block .code-comment { color: var(--text-muted); }
+  .code-block .code-keyword { color: var(--accent-purple); }
+  .code-block .code-string  { color: var(--accent-emerald); }
+  .code-block .code-func    { color: var(--accent-cyan); }
+
+  /* Star particles for background decoration */
+  .star {
+    position: fixed;
+    border-radius: 50%;
+    background: white;
+    opacity: 0.3;
+  }
+
+  /* Decorative glow */
+  .glow-orb {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(80px);
+    pointer-events: none;
+    z-index: 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- Decorative background orbs -->
+<div class="glow-orb" style="width:600px;height:600px;background:rgba(168,85,247,0.06);top:-200px;left:-100px;"></div>
+<div class="glow-orb" style="width:500px;height:500px;background:rgba(236,72,153,0.05);bottom:-150px;right:-50px;"></div>
+<div class="glow-orb" style="width:400px;height:400px;background:rgba(6,182,212,0.04);top:40%;left:45%;"></div>
+
+<div class="poster">
+  <!-- ===================== HEADER ===================== -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo-box">Q</div>
+      <div class="header-text">
+        <h1>Quasar</h1>
+        <div class="subtitle">An AI-Powered Research Assistant for Astronomy Archive Workflows</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="authors">
+        Adam Zacharia Anil<sup>1</sup> &nbsp;·&nbsp; Adele Plunkett<sup>2</sup> &nbsp;·&nbsp; Brian Mason<sup>2</sup> &nbsp;·&nbsp; Stella Offner<sup>3</sup>
+      </div>
+      <div class="affiliations">
+        <sup>1</sup>Independent Researcher &nbsp;&nbsp; <sup>2</sup>National Radio Astronomy Observatory &nbsp;&nbsp; <sup>3</sup>University of Texas at Austin
+      </div>
+      <div class="conference-badge">PAI 2026 &nbsp;·&nbsp; University of Virginia</div>
+    </div>
+  </header>
+
+  <!-- ===================== MAIN CONTENT ===================== -->
+  <div class="content">
+    <!-- =================== COLUMN 1 =================== -->
+    <div class="column">
+      <!-- Motivation / Abstract -->
+      <div class="card purple">
+        <div class="card-title">
+          <span class="icon">🔭</span> Motivation
+        </div>
+        <p>
+          The ALMA Science Archive contains <strong>petabytes of data</strong> spanning a decade of observations. 
+          Despite rich programmatic interfaces, translating a research question into the right combination of 
+          archive queries, metadata filters, and analysis steps requires substantial <strong>domain knowledge 
+          in radio interferometry</strong> — a significant barrier for students and interdisciplinary researchers.
+        </p>
+        <div class="key-insight">
+          <div class="label">Key Insight</div>
+          <p>A general-purpose LLM becomes a capable scientific assistant not through model fine-tuning alone, 
+          but in combination with careful domain engineering.</p>
+        </div>
+      </div>
+
+      <!-- Contributions -->
+      <div class="card blue">
+        <div class="card-title">
+          <span class="icon">⭐</span> Contributions
+        </div>
+        <div class="contrib-item">
+          <div class="contrib-icon">🏗️</div>
+          <div class="contrib-text">
+            <div class="contrib-title">End-to-End Domain Architecture</div>
+            <div class="contrib-desc">Open-source framework demonstrating how generic LLMs can be adapted for expert-level astronomy through 35+ domain-specific tools.</div>
+          </div>
+        </div>
+        <div class="contrib-item">
+          <div class="contrib-icon">🔀</div>
+          <div class="contrib-text">
+            <div class="contrib-title">Robust Workflow Orchestration</div>
+            <div class="contrib-desc">Externalizing task planning into a Conductor-driven DAG reduces the cognitive burden on the backbone model.</div>
+          </div>
+        </div>
+        <div class="contrib-item">
+          <div class="contrib-icon">📚</div>
+          <div class="contrib-text">
+            <div class="contrib-title">Bridging Data with Literature</div>
+            <div class="contrib-desc">Connects ALMA data retrieval and astrophysical calculations with NASA ADS and full-text arXiv extraction.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tool Registry -->
+      <div class="card rose flex-grow">
+        <div class="card-title">
+          <span class="icon">🧰</span> 35+ Domain Tools
+        </div>
+        <div class="tool-grid">
+          <span class="tool-badge archive">🔍 search_by_target</span>
+          <span class="tool-badge archive">📍 search_by_position</span>
+          <span class="tool-badge archive">📡 search_by_frequency</span>
+          <span class="tool-badge archive">🔎 advanced_search</span>
+          <span class="tool-badge archive">📂 list_alma_files</span>
+          <span class="tool-badge archive">📋 inspect_fits_header</span>
+          <span class="tool-badge analysis">🌊 identify_spectral_line</span>
+          <span class="tool-badge analysis">🧪 search_lines_by_molecule</span>
+          <span class="tool-badge analysis">🔢 resolve_target</span>
+          <span class="tool-badge lit">📑 search_papers</span>
+          <span class="tool-badge lit">👤 get_author_papers</span>
+          <span class="tool-badge lit">📊 get_paper_metrics</span>
+          <span class="tool-badge lit">📝 export_bibtex</span>
+          <span class="tool-badge viz">🗺️ plot_sky_map</span>
+          <span class="tool-badge viz">📈 plot_spectrum</span>
+          <span class="tool-badge viz">🖼️ render_fits_image</span>
+          <span class="tool-badge viz">🗂️ overlay_fits_images</span>
+          <span class="tool-badge script">⚙️ generate_casa_script</span>
+          <span class="tool-badge web">🌐 web_search</span>
+          <span class="tool-badge script">📓 generate_notebook</span>
+          <span class="tool-badge analysis">🧮 sandboxed_repl</span>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-box">
+            <div class="stat-value">35+</div>
+            <div class="stat-label">Domain Tools</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value">6</div>
+            <div class="stat-label">Sub-Agents</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value">4</div>
+            <div class="stat-label">LLM Providers</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value">5</div>
+            <div class="stat-label">Recovery Strategies</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- =================== COLUMN 2 (wider) =================== -->
+    <div class="column">
+      <!-- Architecture Figure -->
+      <div class="card purple" style="text-align:center;">
+        <div class="card-title">
+          <span class="icon">🏛️</span> System Architecture
+        </div>
+        <img src="fig_architecture.png" alt="Quasar Architecture" class="arch-figure">
+        <div class="figure-caption">
+          Figure 1: Quasar architecture. Simple queries (green) are handled by the Agent Tool Loop; 
+          complex queries are decomposed by the Conductor into a DAG dispatched to specialist agents (red). 
+          Both paths share the 35+ tool registry connecting to ALMA, CADC, and NASA ADS.
+        </div>
+      </div>
+
+      <!-- Live UI Screenshot -->
+      <div class="card cyan flex-grow" style="text-align:center;">
+        <div class="card-title">
+          <span class="icon">💻</span> Live Web Application
+        </div>
+        <img src="UI.png" alt="Quasar Web UI" class="ui-figure">
+        <div class="figure-caption">
+          Figure 2: Quasar's Next.js web interface with natural language input, streamed responses, 
+          data tables, sky maps, and Conductor task execution visualization.
+        </div>
+        <div class="links-row" style="justify-content:center; margin-top: 14px;">
+          <div class="link-chip"><span class="emoji">🌍</span> quasarassistant.com</div>
+          <div class="link-chip"><span class="emoji">📦</span> Open-Source on GitHub</div>
+          <div class="link-chip"><span class="emoji">📄</span> MIT License</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- =================== COLUMN 3 =================== -->
+    <div class="column">
+      <!-- Case Study 1: Simple -->
+      <div class="card emerald">
+        <div class="card-title">
+          <span class="icon">🟢</span> Case Study 1: Direct Archive Search
+        </div>
+        <div class="highlight-box emerald">
+          <em>"Find ALMA observations of M87 in Band 6."</em>
+        </div>
+        <div class="case-step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <div class="step-title">Complexity Detection → Simple</div>
+            <div class="step-desc">Heuristic scan classifies as simple; routed to Agent Tool Loop.</div>
+          </div>
+        </div>
+        <div class="case-step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <div class="step-title">Tool Invocation</div>
+            <div class="step-desc">LLM calls <strong>search_by_target</strong>(target: M87, band: 6), translating natural language to ADQL.</div>
+          </div>
+        </div>
+        <div class="case-step">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <div class="step-title">Automatic Fallback</div>
+            <div class="step-desc">If name resolution fails → resolves via SIMBAD → re-issues as cone search.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Case Study 2: Complex -->
+      <div class="card amber">
+        <div class="card-title">
+          <span class="icon">🟠</span> Case Study 2: Orchestration + Sandboxing
+        </div>
+        <div class="highlight-box">
+          <em>"Check CO(2-1) line coverage for M87."</em>
+        </div>
+        <div class="case-step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <div class="step-title">Archive Agent</div>
+            <div class="step-desc">Retrieves all Band 6 observations for M87 and extracts spectral window limits.</div>
+          </div>
+        </div>
+        <div class="case-step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <div class="step-title">Analysis Agent + REPL</div>
+            <div class="step-desc">Calculates redshifted CO(2-1) frequency (ν<sub>rest</sub> ≈ 230.538 GHz) via <strong>Sandboxed Python</strong> and cross-matches against spectral ranges.</div>
+          </div>
+        </div>
+        <div class="case-step">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <div class="step-title">Synthesis + Notebook</div>
+            <div class="step-desc">Aggregates matching projects into Markdown summary + reproducible Jupyter Notebook.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Case Study 3: Literature -->
+      <div class="card cyan">
+        <div class="card-title">
+          <span class="icon">📖</span> Case Study 3: Literature Extraction
+        </div>
+        <div class="highlight-box blue">
+          <em>"Find the 2018 DSHARP survey paper by Andrews et al. and extract the angular resolution for AS 209."</em>
+        </div>
+        <div class="case-step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <div class="step-title">Literature Agent</div>
+            <div class="step-desc">Uses NASA ADS tool suite to identify the correct bibcode and retrieve the paper's full text.</div>
+          </div>
+        </div>
+        <div class="case-step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <div class="step-title">Grounded Extraction</div>
+            <div class="step-desc">Accurately extracts synthesized beam parameters — no hallucination from pre-training weights.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Conclusion + Future Work -->
+      <div class="card purple flex-grow">
+        <div class="card-title">
+          <span class="icon">🚀</span> Conclusion & Future Work
+        </div>
+        <p style="margin-bottom:10px;">
+          Quasar synthesizes domain-specific tool use with robust task planning to make astronomical 
+          data retrieval and analysis accessible through <strong>natural language</strong>.
+        </p>
+        <ul>
+          <li><strong>Multi-LLM consensus</strong> protocols for the Conductor to reduce single-point-of-failure risk</li>
+          <li><strong>Open-weight LLM migration</strong> for local deployment without proprietary dependencies</li>
+          <li><strong>Quantitative benchmarks</strong> with structured evaluation suite</li>
+          <li><strong>Multi-wavelength expansion</strong> to NRAO, MAST, NOIRLab, and Astro Data Lab archives</li>
+        </ul>
+        <div class="links-row" style="margin-top: 14px;">
+          <div class="link-chip"><span class="emoji">✉️</span> adamandspace@gmail.com</div>
+          <div class="link-chip"><span class="emoji">🌐</span> quasarassistant.com</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

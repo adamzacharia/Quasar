@@ -317,6 +317,13 @@ try:
 except ImportError as e:
     print(f"[WARNING] Telegram channel not loaded: {e}")
 
+try:
+    from api.channels.whatsapp import router as whatsapp_router
+    app.include_router(whatsapp_router)
+    print("[INFO] WhatsApp channel router registered at /channels/whatsapp")
+except ImportError as e:
+    print(f"[WARNING] WhatsApp channel not loaded: {e}")
+
 
 # ── Models ───────────────────────────────────────────────────
 

@@ -139,6 +139,7 @@ export default function HelpPage() {
                                         Official Resources
                                     </h2>
                                     <div className="space-y-3">
+                                        {/* TEMPORARILY HIDDEN FOR ANONYMOUS REVIEW
                                         <a href="https://github.com/adamzacharia/Quasar2" target="_blank" rel="noopener noreferrer"
                                             className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-slate-700 rounded-lg group-hover:bg-slate-600 transition-colors"><Github className="w-5 h-5 text-white" /></div>
@@ -148,6 +149,7 @@ export default function HelpPage() {
                                             </div>
                                             <ExternalLink className="w-4 h-4 text-slate-500 group-hover:text-primary transition-colors" />
                                         </a>
+                                        */}
                                         <a href="https://almascience.nrao.edu/aq/" target="_blank" rel="noopener noreferrer"
                                             className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-blue-900/40 rounded-lg group-hover:bg-blue-800/50 transition-colors"><Telescope className="w-5 h-5 text-blue-400" /></div>
@@ -257,10 +259,12 @@ export default function HelpPage() {
                                         <p>We reserve the right to modify these Terms at any time. Continued use of the Service after changes constitutes acceptance of the updated Terms. Users will be notified of material changes through the Service interface.</p>
                                     </div>
 
+                                    {/* TEMPORARILY HIDDEN FOR ANONYMOUS REVIEW
                                     <div>
                                         <h3 className="text-base font-semibold text-white mb-2">9. Contact</h3>
                                         <p>For questions about these Terms, please reach out via the <a href="https://github.com/adamzacharia/Quasar2" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">GitHub repository</a>.</p>
                                     </div>
+                                    */}
                                 </div>
                             </section>
                         </div>
