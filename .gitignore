@@ -127,3 +127,6 @@ cloned_repos/
 # User Custom (per-user, never commit)
 # ============================================
 user_tools/
+
+# Local scripts (not tracked)
+scripts/local/
