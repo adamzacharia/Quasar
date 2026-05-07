@@ -160,7 +160,9 @@ langchain
 langchain-community
 langchain-openai
 qdrant-client>=1.7.0
-pypdf
+pymupdf
+pymupdf4llm
+langchain-pymupdf4llm
 tiktoken
 fastapi
 uvicorn

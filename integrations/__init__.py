@@ -44,3 +44,10 @@ try:
     __all__.append("IRSAClient")
 except Exception:
     IRSAClient = None
+
+try:
+    from .openalex_client import OpenAlexService
+
+    __all__.append("OpenAlexService")
+except Exception:
+    OpenAlexService = None

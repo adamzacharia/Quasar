@@ -22,18 +22,18 @@ interface EmptyStateProps { onSuggestionClick: (prompt: string) => void; }
 
 export function EmptyState({ onSuggestionClick }: EmptyStateProps) {
     return (
-        <div className="flex-1 flex flex-col items-center justify-center p-4 md:p-8 w-full max-w-5xl mx-auto overflow-hidden">
-            <div className="flex flex-col items-center justify-center text-center mb-4 md:mb-12">
-                <div className="relative mb-3 md:mb-6">
+        <div className="flex-1 flex flex-col items-center justify-center p-2 md:p-8 w-full max-w-5xl mx-auto overflow-hidden">
+            <div className="flex flex-col items-center justify-center text-center mb-2 md:mb-10">
+                <div className="relative mb-0 md:mb-2">
                     <div className="absolute inset-0 bg-primary/20 rounded-full blur-3xl opacity-50" />
-                    <div className="relative size-14 md:size-24 rounded-2xl md:rounded-3xl bg-gradient-to-br from-primary to-accent-purple flex items-center justify-center logo-glow shadow-2xl">
-                        <span className="text-white font-bold text-3xl md:text-6xl">Q</span>
+                    <div className="relative size-16 md:size-36 flex items-center justify-center">
+                        <img src="/quasar_logo.png" alt="Quasar" className="size-16 md:size-36 object-contain drop-shadow-[0_0_15px_rgba(45,30,209,0.5)]" />
                     </div>
                 </div>
-                <h1 className="text-2xl md:text-5xl font-bold mb-1 md:mb-3 tracking-tight text-white">
-                    <span className="text-gradient">QUASAR</span> Assistant
+                <h1 className="text-xl md:text-5xl font-bold mb-1 md:mb-3 tracking-tight" style={{ color: 'var(--q-text)' }}>
+                    <span className="text-gradient">QUASAR</span>
                 </h1>
-                <p className="text-slate-400 text-sm md:text-lg font-light max-w-md mx-auto leading-relaxed">
+                <p className="text-sm md:text-lg font-light max-w-md mx-auto leading-relaxed" style={{ color: 'var(--q-text-secondary)' }}>
                     Your AI assistant for radio astronomy research, data analysis, and literature review.
                 </p>
             </div>
@@ -44,8 +44,8 @@ export function EmptyState({ onSuggestionClick }: EmptyStateProps) {
                         className={`glass-card p-3 md:p-5 rounded-2xl md:rounded-3xl text-left group flex items-start gap-3 md:gap-4 ${i >= 2 ? "hidden md:flex" : ""}`}>
                         <div className={`p-2 md:p-2.5 rounded-full transition-colors ${s.iconBg} ${s.iconHoverBg}`}>{s.icon}</div>
                         <div>
-                            <h3 className="text-white font-medium text-sm mb-0.5 md:mb-1 group-hover:text-primary transition-colors">{s.title}</h3>
-                            <p className="text-slate-400 text-xs">{s.description}</p>
+                            <h3 className="font-medium text-sm mb-0.5 md:mb-1 group-hover:text-primary transition-colors" style={{ color: 'var(--q-text)' }}>{s.title}</h3>
+                            <p className="text-xs" style={{ color: 'var(--q-text-secondary)' }}>{s.description}</p>
                         </div>
                     </button>
                 ))}

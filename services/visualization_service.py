@@ -164,7 +164,7 @@ class ALminerVisualizationService:
             # Cleanup
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
             
             return image_bytes

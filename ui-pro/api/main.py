@@ -6,6 +6,7 @@ Run with:  uvicorn api.main:app --reload --port 8000
 """
 
 import sys, os, json, asyncio, uuid
+import queue as stdlib_queue
 
 # ── Windows fix: langchain_community.document_loaders.pebblo imports 'pwd' (Unix-only) ──
 if sys.platform == "win32" and "pwd" not in sys.modules:
@@ -120,6 +121,14 @@ from fastapi.staticfiles import StaticFiles
 _RENDERED_IMAGES_DIR = _os.path.join(_os.path.dirname(__file__), "..", "data", "rendered_images")
 _os.makedirs(_RENDERED_IMAGES_DIR, exist_ok=True)
 app.mount("/api/images", StaticFiles(directory=_RENDERED_IMAGES_DIR), name="rendered_images")
+
+# ── Plan Feedback Registry (Human-in-the-Loop) ────────────────────────────────
+# Maps conversation_id → stdlib_queue.Queue for plan review blocking.
+# When the Conductor emits a plan_review event, it blocks on the queue.
+# The POST /api/plan-feedback endpoint pushes user responses into it.
+import threading as _threading
+_plan_feedback_queues: Dict[str, stdlib_queue.Queue] = {}
+_plan_feedback_lock = _threading.Lock()
 
 # ── Catch-all exception handler — ensures a proper JSON 500 with CORS headers ──
 from starlette.responses import JSONResponse
@@ -390,6 +399,9 @@ from core.llm_client import detect_provider
 auth_service = AuthService()
 conversation_service = ConversationService()
 provider_file_service = ProviderFileService()
+
+from services.analytics_service import AnalyticsService
+analytics_service = AnalyticsService()
 
 def get_current_user(authorization: Optional[str] = Header(None)):
     if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -700,13 +712,14 @@ def _extract_document_preview_text(filename: str, content_type: str, raw: bytes)
 
     if content_type == "application/pdf":
         try:
-            from pypdf import PdfReader
+            import fitz  # PyMuPDF
 
-            reader = PdfReader(io.BytesIO(raw))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            doc = fitz.open(stream=raw, filetype="pdf")
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
             return f"\n\n### Attached PDF: {filename}\n{text[:8000]}"
         except ImportError:
-            return f"\n\n[PDF: {filename} - install pypdf to extract text]"
+            return f"\n\n[PDF: {filename} - install pymupdf to extract text]"
         except Exception as e:
             return f"\n\n[PDF: {filename} - extraction failed: {e}]"
 
@@ -725,6 +738,7 @@ def _stream_chat_response(
     request: ChatRequest,
     authorization: Optional[str] = None,
     attachment_context: Optional[Dict[str, Any]] = None,
+    client_ip: str = "",
 ) -> StreamingResponse:
     """Shared SSE chat pipeline used by both /api/chat and /api/chat/upload."""
     agent = get_agent()
@@ -823,12 +837,27 @@ def _stream_chat_response(
         if requested_model != agent.config.model:
             agent.set_model(requested_model)
 
+        _chat_start_time = _time.perf_counter()
         try:
             loop = asyncio.get_event_loop()
 
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
 
+            # Emit conversation_meta EARLY so the frontend has the server UUID
+            # before plan_review events arrive (needed for HITL feedback routing).
+            if conv_id:
+                early_meta = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
+                yield f"data: {early_meta}\n\n"
+
             queue = asyncio.Queue()
+
+            # ── Plan Feedback Queue (HITL) ────────────────────────────
+            # Created at generator scope so the SSE event loop can re-key
+            # the queue when conversation_meta arrives with the server UUID.
+            _pfq = stdlib_queue.Queue()
+            _pfq_key = [conv_id or f"_anon_{id(_pfq)}"]  # mutable for re-keying
+            with _plan_feedback_lock:
+                _plan_feedback_queues[_pfq_key[0]] = _pfq
 
             def on_token(token: str):
                 if token:
@@ -836,24 +865,37 @@ def _stream_chat_response(
 
             def _run_agent():
                 try:
-                    # Clear stale results from previous conversations
-                    agent.last_run_result = None
-
                     effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
 
                     def _on_status(step: str, state: str):
                         asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
 
-                    res = agent.stream_response_api(
-                        effective_request.message,
-                        message_placeholder=None,
-                        user_id=effective_user_id,
-                        on_token=on_token,
-                        on_status=_on_status,
-                        attachments=active_attachments,
-                        raw_query=request.message,
-                    )
-                    asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                    try:
+                        res = agent.stream_response_api(
+                            effective_request.message,
+                            message_placeholder=None,
+                            user_id=effective_user_id,
+                            on_token=on_token,
+                            on_status=_on_status,
+                            attachments=active_attachments,
+                            raw_query=request.message,
+                            conversation_id=conv_id,
+                            plan_feedback_queue=_pfq,
+                        )
+                    finally:
+                        # Clean up the plan feedback queue
+                        with _plan_feedback_lock:
+                            _plan_feedback_queues.pop(_pfq_key[0], None)
+
+                    # Snapshot thread-local results BEFORE leaving this thread.
+                    # The async generator runs on the event-loop thread where
+                    # these thread-local values would be invisible.
+                    done_payload = {
+                        "text": res,
+                        "all_results": list(getattr(agent, '_accumulated_run_results', []) or []),
+                        "last_result": agent.last_run_result,
+                    }
+                    asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
                 except Exception as e:
                     print(f"Agent error: {e}")
                     asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
@@ -870,6 +912,7 @@ def _stream_chat_response(
             _rich_image = None
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
+            _pending_eager_data = []
 
             while True:
                 # Use a timeout so we can send SSE keepalive comments.
@@ -883,23 +926,36 @@ def _stream_chat_response(
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
                     if msg_type == "status":
-                        if isinstance(step, str) and step.startswith("__data_ready__"):
+                        if isinstance(step, str) and step.startswith("__eager_data__"):
+                            # Agent sent inline result data — stash it for
+                            # the next __data_ready__ to consume.
+                            try:
+                                import pandas as pd
+                                _inline_json = step[len("__eager_data__"):]
+                                _inline_result = json.loads(_inline_json)
+                                # Reconstruct DataFrame if serialized
+                                if "data" in _inline_result and isinstance(_inline_result["data"], (dict, list)):
+                                    try:
+                                        _inline_result["data"] = pd.DataFrame(_inline_result["data"])
+                                    except Exception:
+                                        pass
+                                _pending_eager_data.append(_inline_result)
+                            except Exception as _e:
+                                print(f"[WARN] Failed to parse eager data: {_e}")
+                        elif isinstance(step, str) and step.startswith("__data_ready__"):
                             # ── Eager data card emission ──
-                            # The agent just finished a tool call that produced
-                            # data. Build and emit the card NOW, in parallel
-                            # with remaining text tokens, instead of waiting
-                            # until the entire response finishes.
+                            # The agent finished a tool call — build the card
+                            # from the inline data stashed above.
                             try:
                                 _payload_str = step[len("__data_ready__"):]
                                 _payload_meta = json.loads(_payload_str)
                                 _eager_idx = _payload_meta.get("_idx", -1)
-                                _eager_results = getattr(agent, "_accumulated_run_results", [])
-                                if 0 <= _eager_idx < len(_eager_results):
-                                    _eager_result = _eager_results[_eager_idx]
+                                # Use inline data if available
+                                _eager_result = _pending_eager_data.pop(0) if _pending_eager_data else None
+                                if _eager_result:
                                     card = _build_data_card_event(_eager_result)
                                     if card:
                                         _event_str, _rich = card
-                                        # Emit tool call event first
                                         _tn = _eager_result.get("tool_name", "search_alma_archive")
                                         yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results'})}\n\n"
                                         yield _event_str
@@ -912,6 +968,17 @@ def _stream_chat_response(
                         elif isinstance(step, str) and step.startswith("__event__"):
                             try:
                                 event_json = step[len("__event__"):]
+                                event_parsed = json.loads(event_json)
+                                # Re-key plan feedback queue when server assigns conversation_id
+                                if event_parsed.get("type") == "conversation_meta":
+                                    new_cid = event_parsed.get("conversation_id")
+                                    if new_cid and new_cid != _pfq_key[0]:
+                                        old_key = _pfq_key[0]
+                                        with _plan_feedback_lock:
+                                            _plan_feedback_queues.pop(old_key, None)
+                                            _plan_feedback_queues[new_cid] = _pfq
+                                        _pfq_key[0] = new_cid
+                                        print(f"[HITL] Re-keyed plan feedback queue: {old_key[:20]}... → {new_cid[:20]}...")
                                 yield f"data: {event_json}\n\n"
                             except Exception:
                                 yield _sse_status(step, state)
@@ -923,10 +990,15 @@ def _stream_chat_response(
 
                 msg_type, payload = msg[0], msg[1]
                 if msg_type == "done":
-                    response_text = payload
+                    # payload is a dict with text + snapshotted thread-local results
+                    response_text = payload["text"] if isinstance(payload, dict) else payload
+                    _snapshot_all = payload.get("all_results", []) if isinstance(payload, dict) else []
+                    _snapshot_last = payload.get("last_result") if isinstance(payload, dict) else None
                     break
                 if msg_type == "error":
                     response_text = f"An error occurred: {payload}"
+                    _snapshot_all = []
+                    _snapshot_last = None
                     break
                 if msg_type == "token":
                     first_token = False
@@ -934,21 +1006,34 @@ def _stream_chat_response(
                     yield f"data: {data}\n\n"
 
             # ── Collect all accumulated results (multi-target support) ──
-            # When the LLM makes separate tool calls for each target,
-            # _accumulated_run_results captures every result instead of
-            # only the last one.
-            _all_results = getattr(agent, "_accumulated_run_results", [])
-            _last_result = getattr(agent, "last_run_result", None)
+            # Results were snapshotted inside _run_agent (same thread as
+            # the agent) so they survive thread-local cleanup.
+            _all_results = _snapshot_all if '_snapshot_all' in dir() else []
+            _last_result = _snapshot_last if '_snapshot_last' in dir() else None
             # Deduplicate: if last_run_result isn't already in the list, add it
             if _last_result and not _all_results:
                 _all_results = [_last_result]
             elif _last_result and _all_results:
-                # Check by DataFrame identity — the same data object means same result
+                # Check by data/papers identity — the same object means same result
                 _last_data_id = id(_last_result.get("data")) if _last_result.get("data") is not None else None
+                _last_papers_id = id(_last_result.get("papers")) if _last_result.get("papers") is not None else None
+                _last_result_marker = _last_result.get("_result_id")
                 _already_present = False
                 for r in _all_results:
                     r_data_id = id(r.get("data")) if r.get("data") is not None else None
-                    if r is _last_result or (r_data_id is not None and r_data_id == _last_data_id):
+                    r_papers_id = id(r.get("papers")) if r.get("papers") is not None else None
+                    r_result_marker = r.get("_result_id")
+                    if r is _last_result:
+                        _already_present = True
+                        break
+                    if _last_data_id is not None and r_data_id == _last_data_id:
+                        _already_present = True
+                        break
+                    if _last_papers_id is not None and r_papers_id == _last_papers_id:
+                        _already_present = True
+                        break
+                    # Match by _result_id marker set during accumulation
+                    if _last_result_marker is not None and r_result_marker == _last_result_marker:
                         _already_present = True
                         break
                 if not _already_present:
@@ -1090,6 +1175,28 @@ def _stream_chat_response(
                 except Exception as e:
                     logger.warning(f"[CHAT] Failed to persist assistant message: {e}")
 
+            # ── Log chat analytics ─────────────────────────────────
+            try:
+                _elapsed_ms = int((_time.perf_counter() - _chat_start_time) * 1000)
+                _tool_names = [s.get("step", "").replace("Calling tool: ", "") for s in _rich_thinking if "Calling tool:" in s.get("step", "")]
+                _user_email = current_user.get("email", "") if current_user else ""
+                _user_name = current_user.get("name", "") if current_user else ""
+                analytics_service.log_chat(
+                    user_id=current_user_id or "anonymous",
+                    username=_user_email,
+                    email=_user_email,
+                    display_name=_user_name,
+                    ip_address=client_ip,
+                    conversation_id=conv_id or "",
+                    prompt=request.message,
+                    response_preview=response_text,
+                    model=requested_model,
+                    tools_called=_tool_names,
+                    response_time_ms=_elapsed_ms,
+                )
+            except Exception as e:
+                logger.warning(f"[ANALYTICS] Failed to log chat: {e}")
+
             # Send back the conversation_id so the frontend can track it
             if conv_id:
                 meta_event = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
@@ -1115,6 +1222,40 @@ def _stream_chat_response(
 
 
 # ── Endpoints ────────────────────────────────────────────────
+
+# ── Plan Feedback (Human-in-the-Loop) ────────────────────────
+
+class PlanFeedbackRequest(BaseModel):
+    conversation_id: str
+    approve: bool = False
+    feedback: str = ""
+
+@app.post("/api/plan-feedback")
+async def submit_plan_feedback(req: PlanFeedbackRequest):
+    """Receive user approval or feedback for a Conductor execution plan.
+
+    Pushes the response into the plan_feedback_queue for the given
+    conversation, unblocking the Conductor's orchestrate() method.
+    """
+    with _plan_feedback_lock:
+        pfq = _plan_feedback_queues.get(req.conversation_id)
+
+    if not pfq:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending plan review for conversation {req.conversation_id}",
+        )
+
+    pfq.put({
+        "approve": req.approve,
+        "feedback": req.feedback,
+    })
+
+    action = "approved" if req.approve else f"feedback: {req.feedback[:80]}"
+    logger.info(f"[HITL] Plan {action} for conversation {req.conversation_id}")
+    return {"status": "ok", "action": "approved" if req.approve else "feedback_sent"}
+
+# ── General Endpoints ────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -1321,11 +1462,12 @@ async def google_login(req: GoogleLoginRequest):
         
         email = idinfo.get("email")
         name = idinfo.get("name")
+        picture = idinfo.get("picture")  # Google profile picture URL
         
         if not email:
             raise HTTPException(status_code=400, detail="Google account has no email")
             
-        success, user_id, msg, token = auth_service.register_or_login_google_user(email, name)
+        success, user_id, msg, token = auth_service.register_or_login_google_user(email, name, picture)
         
         if not success:
             raise HTTPException(status_code=400, detail=msg)
@@ -1336,7 +1478,8 @@ async def google_login(req: GoogleLoginRequest):
                 "id": user_id,
                 "username": email,
                 "display_name": name,
-                "auth_provider": "google"
+                "auth_provider": "google",
+                "picture_url": picture,
             }
         }
     except ValueError as e:
@@ -1395,14 +1538,24 @@ async def update_conversation_title_endpoint(
 @app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str, current_user: dict = Depends(get_current_user)):
     """Delete a conversation and all its messages."""
-    conversation_service.delete_conversation(conversation_id)
-    return {"status": "ok"}
+    try:
+        conversation_service.delete_conversation(conversation_id)
+        print(f"[INFO] Deleted conversation {conversation_id} for user {current_user.get('sub', 'unknown')}")
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"[ERROR] Failed to delete conversation {conversation_id}: {e}")
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
+async def chat(request: ChatRequest, req: Request = None, authorization: Optional[str] = Header(None)):
     """Stream a chat response via SSE using the shared chat pipeline."""
-    return _stream_chat_response(request, authorization=authorization)
+    _ip = ""
+    if req:
+        _ip = (req.headers.get("x-forwarded-for", "").split(",")[0].strip()
+               or (req.client.host if req.client else ""))
+    return _stream_chat_response(request, authorization=authorization, client_ip=_ip)
 
 
     # ── Resolve user from optional token (for personal RAG) ──
@@ -1586,6 +1739,10 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
 
             queue = asyncio.Queue()
+
+            # ── Plan Feedback Queue (HITL) ────────────────────────────
+            _pfq = stdlib_queue.Queue()
+            _pfq_key = [None]  # will be set inside _run_agent
             
             def on_token(token: str):
                 if token:
@@ -1593,9 +1750,6 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                     
             def _run_agent():
                 try:
-                    # Clear stale results from previous conversations
-                    agent.last_run_result = None
-
                     # Use authenticated user_id for mem0 isolation.
                     # Anonymous users get a sentinel — no stored long-term memory.
                     _uid = (_current_user.get("sub") if _current_user else None) or "anonymous"
@@ -1605,15 +1759,35 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             queue.put(("status", step, state)), loop
                         )
 
-                    res = agent.stream_response_api(
-                        effective_request.message,
-                        message_placeholder=None,
-                        user_id=_uid,
-                        on_token=on_token,
-                        on_status=_on_status,
-                        raw_query=request.message,
-                    )
-                    asyncio.run_coroutine_threadsafe(queue.put(("done", res)), loop)
+                    # Use conversation_id from the request for state isolation
+                    _conv_id = getattr(request, 'conversation_id', None)
+
+                    _pfq_key[0] = _conv_id or f"_anon_{id(_pfq)}"
+                    with _plan_feedback_lock:
+                        _plan_feedback_queues[_pfq_key[0]] = _pfq
+
+                    try:
+                        res = agent.stream_response_api(
+                            effective_request.message,
+                            message_placeholder=None,
+                            user_id=_uid,
+                            on_token=on_token,
+                            on_status=_on_status,
+                            raw_query=request.message,
+                            conversation_id=_conv_id,
+                            plan_feedback_queue=_pfq,
+                        )
+                    finally:
+                        with _plan_feedback_lock:
+                            _plan_feedback_queues.pop(_pfq_key[0], None)
+
+                    # Snapshot thread-local results before leaving this thread
+                    done_payload = {
+                        "text": res,
+                        "all_results": list(getattr(agent, '_accumulated_run_results', []) or []),
+                        "last_result": agent.last_run_result,
+                    }
+                    asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
                 except Exception as e:
                     print(f"Agent error: {e}")
                     asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
@@ -1636,6 +1810,16 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                         if isinstance(step, str) and step.startswith("__event__"):
                             try:
                                 event_json = step[len("__event__"):]
+                                event_parsed = json.loads(event_json)
+                                # Re-key plan feedback queue when server assigns conversation_id
+                                if event_parsed.get("type") == "conversation_meta":
+                                    new_cid = event_parsed.get("conversation_id")
+                                    if new_cid and _pfq_key[0] and new_cid != _pfq_key[0]:
+                                        old_key = _pfq_key[0]
+                                        with _plan_feedback_lock:
+                                            _plan_feedback_queues.pop(old_key, None)
+                                            _plan_feedback_queues[new_cid] = _pfq
+                                        _pfq_key[0] = new_cid
                                 yield f"data: {event_json}\n\n"
                             except Exception:
                                 yield _status(step, state)
@@ -1644,7 +1828,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                         continue
                 msg_type, payload = msg[0], msg[1]
                 if msg_type == "done":
-                    response_text = payload
+                    response_text = payload["text"] if isinstance(payload, dict) else payload
                     break
                 elif msg_type == "error":
                     response_text = f"An error occurred: {payload}"
@@ -1655,7 +1839,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                     yield f"data: {data}\n\n"
 
             # ── Tool call results ──
-            last_run_result = getattr(agent, 'last_run_result', None)
+            # Use snapshotted results from the executor thread
+            last_run_result = (payload.get("last_result") if isinstance(payload, dict) else None) if 'payload' in dir() else None
 
             if last_run_result:
                 result_type = last_run_result.get("type", "")
@@ -2120,12 +2305,13 @@ async def chat_with_files(
 
         elif content_type == "application/pdf":
             try:
-                from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(raw))
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                import fitz  # PyMuPDF
+                doc = fitz.open(stream=raw, filetype="pdf")
+                text = "\n".join(page.get_text() for page in doc)
+                doc.close()
                 enriched_text += f"\n\n### Attached PDF: {f.filename}\n{text[:8000]}"
             except ImportError:
-                enriched_text += f"\n\n[PDF: {f.filename} — install pypdf to extract text]"
+                enriched_text += f"\n\n[PDF: {f.filename} — install pymupdf to extract text]"
             except Exception as e:
                 enriched_text += f"\n\n[PDF: {f.filename} — extraction failed: {e}]"
 
@@ -2429,3 +2615,146 @@ async def health():
         "status": "healthy",
         "agent_loaded": agent is not None,
     }
+
+# ── Analytics API ────────────────────────────────────────────
+
+@app.get("/api/analytics/hit")
+async def analytics_hit(req: Request):
+    """Log a page view and return the current total hit count (public, no auth)."""
+    ip = (req.headers.get("x-forwarded-for", "").split(",")[0].strip()
+          or (req.client.host if req.client else ""))
+    ua = req.headers.get("user-agent", "")
+    country = req.headers.get("cf-ipcountry", "") or req.headers.get("x-vercel-ip-country", "")
+    loop = asyncio.get_event_loop()
+    total = await loop.run_in_executor(
+        _executor,
+        lambda: analytics_service.log_page_view(ip_address=ip, user_agent=ua, country=country),
+    )
+    return {"hits": total}
+
+
+@app.post("/api/feedback")
+async def submit_feedback(req: Request, authorization: Optional[str] = Header(None)):
+    """Persist a like/dislike on an assistant response (public, optional auth)."""
+    body = await req.json()
+    message_id = body.get("message_id", "")
+    feedback = body.get("feedback", "")  # "like" or "dislike"
+    if feedback not in ("like", "dislike") or not message_id:
+        raise HTTPException(status_code=400, detail="message_id and feedback ('like'/'dislike') required")
+
+    auth_header = _safe_authorization_header(authorization)
+    current_user = _resolve_optional_user(auth_header)
+    user_id = current_user.get("sub") if current_user else "anonymous"
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        _executor,
+        lambda: analytics_service.log_feedback(
+            message_id=message_id,
+            feedback=feedback,
+            conversation_id=body.get("conversation_id", ""),
+            user_id=user_id,
+            model=body.get("model", ""),
+            prompt_preview=body.get("prompt_preview", ""),
+            response_preview=body.get("response_preview", ""),
+        ),
+    )
+    return {"success": True, "feedback": feedback}
+
+
+@app.get("/api/admin/feedback/export")
+async def admin_feedback_export(current_user: dict = Depends(get_current_user)):
+    """Export all response feedback data. Admin-only."""
+    user_email = current_user.get("email", "")
+    if not analytics_service.is_admin(user_email):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return analytics_service.export_feedback_json()
+
+
+@app.get("/api/admin/analytics/export")
+async def admin_analytics_export(
+    format: str = "csv",
+    current_user: dict = Depends(get_current_user),
+):
+    """Download all chat analytics as CSV or JSON. Admin-only."""
+    user_email = current_user.get("email", "")
+    if not analytics_service.is_admin(user_email):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    if format == "json":
+        return analytics_service.export_chat_analytics_json()
+
+    # Default: CSV download
+    csv_data = analytics_service.export_chat_analytics_csv()
+    return StreamingResponse(
+        iter([csv_data]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=quasar_analytics.csv"},
+    )
+
+
+@app.get("/api/admin/analytics/summary")
+async def admin_analytics_summary(current_user: dict = Depends(get_current_user)):
+    """Aggregated analytics stats. Admin-only."""
+    user_email = current_user.get("email", "")
+    if not analytics_service.is_admin(user_email):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return analytics_service.get_summary()
+
+
+# ── Conductor Dashboard API (#9) ─────────────────────────────
+
+@app.get("/api/conductor/traces")
+async def get_conductor_traces():
+    """Get aggregated Conductor execution metrics and recent traces."""
+    agent = get_agent()
+    if not agent:
+        return {"error": "Agent not loaded"}
+    return agent.query_tracer.export_metrics()
+
+
+@app.get("/api/conductor/traces/{trace_id}")
+async def get_conductor_trace(trace_id: str):
+    """Get detailed trace for a specific Conductor execution."""
+    agent = get_agent()
+    if not agent:
+        return {"error": "Agent not loaded"}
+    trace = agent.query_tracer.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
+
+
+@app.get("/api/conductor/health")
+async def get_conductor_health():
+    """Get Conductor system health: router, recovery, cache, pool."""
+    agent = get_agent()
+    if not agent:
+        return {"error": "Agent not loaded"}
+    health_data = {
+        "conductor_model": getattr(agent.conductor, "conductor_model", "unknown"),
+        "result_cache": agent.conductor.result_cache.get_stats() if hasattr(agent.conductor, "result_cache") else None,
+        "dag_cache": agent.conductor.dag_cache.get_stats() if hasattr(agent.conductor, "dag_cache") else None,
+        "workflow_memory": agent.conductor.workflow_memory.get_stats() if hasattr(agent.conductor, "workflow_memory") else None,
+    }
+    if hasattr(agent, "model_router") and agent.model_router:
+        health_data["model_router"] = {
+            "default_model": agent.model_router.default_model,
+            "routing_table": {k: v["model"] for k, v in agent.model_router.ROUTING_TABLE.items()},
+        }
+    if hasattr(agent, "recovery_engine") and agent.recovery_engine:
+        health_data["recovery_engine"] = agent.recovery_engine.get_stats()
+    if hasattr(agent, "health_monitor") and agent.health_monitor:
+        health_data["health_monitor"] = agent.health_monitor.get_status()
+    return health_data
+
+
+@app.get("/api/conductor/dag-cache")
+async def get_dag_cache():
+    """Get cached DAG decomposition patterns."""
+    agent = get_agent()
+    if not agent:
+        return {"error": "Agent not loaded"}
+    if hasattr(agent.conductor, "dag_cache"):
+        return agent.conductor.dag_cache.get_stats()
+    return {"entries": 0}

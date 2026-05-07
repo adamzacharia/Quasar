@@ -36,9 +36,13 @@ class ADSService:
         "bibcode",
         "abstract",
         "citation_count",
+        "read_count",
         "pub",
         "doi",
         "identifier",
+        "keyword",
+        "doctype",
+        "property",
     ]
 
     def __init__(
@@ -279,6 +283,8 @@ class ADSService:
             else:
                 author_str = ", ".join(authors)
             
+            properties = paper.get('property', [])
+            
             formatted.append({
                 'title': paper.get('title', ['Unknown'])[0],
                 'authors': author_str,
@@ -287,7 +293,11 @@ class ADSService:
                 'bibcode': paper.get('bibcode', ''),
                 'abstract': paper.get('abstract', 'No abstract available'),
                 'citations': paper.get('citation_count', 0),
+                'reads': paper.get('read_count', 0),
                 'doi': paper.get('doi', [''])[0] if paper.get('doi') else '',
+                'keywords': paper.get('keyword', [])[:8],
+                'doctype': paper.get('doctype', 'unknown'),
+                'is_refereed': 'REFEREED' in properties if properties else False,
                 'link': f"https://ui.adsabs.harvard.edu/abs/{paper.get('bibcode', '')}"
             })
         
@@ -423,23 +433,159 @@ class ADSService:
         sort: Optional[str],
         filters: Optional[List[str]],
     ) -> Dict[str, Any]:
+        """Fallback query builder when the LLM builder fails."""
         term = question.strip().replace('"', "")
         if not term:
             query = "*:*"
         else:
+            # Use keyword: (ADS controlled vocabulary) + title: + object: for better precision
+            # than plain abstract: which catches tangential mentions
             query = (
-                f'object:"{term}" OR title:"{term}" OR abstract:"{term}"'
+                f'keyword:"{term}" OR title:"{term}" OR object:"{term}"'
             )
         return {
             "query": query,
             "rows": max(1, default_rows),
-            "sort": sort or "date desc",
+            "sort": sort or "score desc",
             "filters": filters or ["property:refereed"],
         }
 
 
 class ADSQueryBuilder:
     """LLM-backed helper that turns natural language into ADS queries."""
+
+    # Comprehensive ADS syntax reference for the LLM query translator
+    _SYSTEM_PROMPT = """\
+You are an expert NASA ADS (Astrophysics Data System) query builder.
+Convert natural-language astronomy questions into optimal ADS search queries.
+
+Return JSON with exactly these keys:
+  query   (string)  — the ADS query string
+  rows    (int)     — number of results
+  sort    (string)  — sort order
+  filters (array of strings, optional) — fq filter strings
+
+═══ FIELD SYNTAX (use the most specific field available) ═══
+
+  keyword:"protoplanetary disks"   — ADS controlled-vocabulary keywords (BEST for topic search)
+  title:"disk gaps"                — words in paper title (high precision)
+  abstract:"dust continuum"        — words in abstract (medium precision, catches tangential mentions)
+  body:"gap opening mechanism"     — full-text search inside the paper (use when abstract is too narrow)
+  object:"HL Tau"                  — SIMBAD/NED-linked object (catches ALL name variants automatically)
+  author:"Andrews, Sean"           — author name (Last, First)
+  ^author:"Andrews, Sean"          — FIRST author only
+  orcid:0000-0001-2345-6789        — search by ORCID
+  year:2020-2024                   — year range
+  bibcode:"2018ApJ...869L..41A"    — specific paper
+  doi:"10.3847/..."                — DOI lookup
+  inst:"Harvard"                   — institution/affiliation
+  aff:"Max Planck"                 — affiliation text search
+  facility:"ALMA"                  — facility metadata field (precise)
+
+═══ TELESCOPE/FACILITY FILTERING ═══
+
+  bibgroup:ALMA     — papers curated by NRAO as actually USING ALMA data
+  bibgroup:HST      — papers using Hubble data
+  bibgroup:CXC      — papers using Chandra data
+  bibgroup:ESO      — papers using ESO/VLT data
+  bibgroup:Gemini   — papers using Gemini data
+  bibgroup:Keck     — papers using Keck data
+  bibgroup:NRAO     — papers using any NRAO facility (VLA, VLBA, GBT)
+  bibgroup:Spitzer  — papers using Spitzer data
+  bibgroup:XMM      — papers using XMM-Newton data
+  bibgroup:JCMT     — papers using JCMT data
+
+  PREFER bibgroup: over abstract:"ALMA" — bibgroup is curated by librarians
+  and only includes papers that actually used the telescope, not papers that
+  casually mention it. Only fall back to abstract:"ALMA" if no bibgroup exists.
+
+═══ PROPERTY FILTERS ═══
+
+  property:refereed      — peer-reviewed only (USE BY DEFAULT)
+  property:openaccess    — open access papers
+  property:data          — papers with linked datasets
+  property:nonarticle    — non-article records
+  doctype:article        — journal articles only
+  doctype:eprint         — arXiv preprints only
+  doctype:inproceedings  — conference proceedings
+
+═══ SECOND-ORDER OPERATORS (for discovery) ═══
+
+  similar(query)    — papers with SIMILAR abstract text to results of query
+  trending(query)   — papers that readers of query results are also reading NOW
+  useful(query)     — most-cited references FROM the papers matching query (foundational works)
+  reviews(query)    — papers that cite the papers citing query results (review articles)
+  citations(bibcode:XXX)   — all papers that cite a specific paper
+  references(bibcode:XXX)  — all papers cited BY a specific paper
+
+═══ SORT OPTIONS ═══
+
+  "date desc"                — newest first (default for "recent" queries)
+  "citation_count desc"      — most cited (use for "best/important/influential" queries)
+  "citation_count_norm desc" — normalized citations (corrects for paper age)
+  "score desc"               — ADS relevance ranking (good general-purpose)
+  "read_count desc"          — most-read papers (popularity)
+
+═══ BOOLEAN OPERATORS ═══
+
+  AND  — both terms required (default between terms)
+  OR   — either term
+  NOT  — exclude term
+  ()   — grouping
+
+═══ DECISION RULES ═══
+
+1. For TOPIC searches ("papers on X"), prefer keyword:"X" over abstract:"X".
+   keyword: uses ADS controlled vocabulary and is far more precise.
+   Only add abstract:"X" as a fallback OR if the topic is very niche.
+
+2. For OBJECT searches ("papers about HL Tau"), use object:"HL Tau".
+   This leverages SIMBAD cross-matching and catches all name variants.
+
+3. For TELESCOPE searches ("ALMA papers on X"), use bibgroup:ALMA AND keyword:"X".
+   Do NOT use abstract:"ALMA" — it catches papers that merely mention ALMA.
+
+4. For "recent" queries, sort by "date desc".
+   For "best/important/seminal" queries, sort by "citation_count desc".
+   For "what's hot/trending" queries, use the trending() operator.
+   For general queries with no time preference, sort by "score desc".
+
+5. ALWAYS include property:refereed in filters unless the user specifically
+   asks for preprints or arXiv papers.
+
+6. When the user asks for "seminal/foundational/key" papers, use useful(query).
+   When the user asks for "review papers/reviews", use reviews(query) or add doctype filter.
+   When the user asks for "similar papers to X", use similar(query).
+
+═══ EXAMPLES ═══
+
+"recent papers on protoplanetary disks"
+→ {"query": "keyword:\\"protoplanetary disks\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+
+"best ALMA papers on disk gaps"
+→ {"query": "bibgroup:ALMA AND (keyword:\\"protoplanetary disks\\" AND (title:\\"gap\\" OR title:\\"ring\\"))", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
+
+"papers about HL Tau"
+→ {"query": "object:\\"HL Tau\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+
+"what are people reading about FRBs right now"
+→ {"query": "trending(keyword:\\"fast radio bursts\\")", "sort": "score desc", "rows": 15}
+
+"foundational papers on planet formation"
+→ {"query": "useful(keyword:\\"planet formation\\" AND year:2015-2026)", "sort": "score desc", "rows": 20, "filters": ["property:refereed"]}
+
+"papers by Sean Andrews on ALMA disk surveys"
+→ {"query": "author:\\"Andrews, Sean\\" AND bibgroup:ALMA AND keyword:\\"protoplanetary disks\\"", "sort": "date desc", "rows": 20, "filters": ["property:refereed"]}
+
+"review articles on AGN feedback"
+→ {"query": "reviews(keyword:\\"active galactic nuclei\\" AND keyword:\\"feedback\\")", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
+
+"papers with JWST data on high-z galaxies since 2023"
+→ {"query": "bibgroup:HST AND keyword:\\"high-redshift galaxies\\" AND year:2023-2026", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+
+"full text search for gap opening mechanism in disks"
+→ {"query": "body:\\"gap opening\\" AND keyword:\\"protoplanetary disks\\"", "sort": "score desc", "rows": 15, "filters": ["property:refereed"]}
+"""
 
     def __init__(self, model: Optional[str] = None) -> None:
         self.model = model or os.getenv("ADS_QUERY_MODEL") or os.getenv(
@@ -488,12 +634,6 @@ class ADSQueryBuilder:
     ) -> str:
         client = self._get_client()
 
-        system_prompt = (
-            "You convert natural-language astronomy questions into NASA ADS search "
-            "queries. Return JSON with keys: query, rows, sort, filters (optional array of filter strings). "
-            "Use fielded ADS syntax such as object:\"\", title:\"\", abstract:\"\"."
-        )
-
         user_payload = {
             "question": question,
             "defaults": {
@@ -506,7 +646,7 @@ class ADSQueryBuilder:
         response = client.responses.create(
             model=self.model,
             input="Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload),
-            instructions=system_prompt,
+            instructions=self._SYSTEM_PROMPT,
             temperature=0.2,
             text={"format": {"type": "json_object"}}
         )

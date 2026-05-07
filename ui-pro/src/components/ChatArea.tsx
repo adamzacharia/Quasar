@@ -1,12 +1,15 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { PanelLeft, Star } from "lucide-react";
+import { PanelLeft, Star, ArrowDown } from "lucide-react";
 import { useChatStore } from "../lib/store";
-import { sendChatMessage, reviewProposal } from "../lib/api";
+import { sendChatMessage, reviewProposal, submitPlanFeedback } from "../lib/api";
 import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
+import { DownloadProgress } from "./DownloadProgress";
+import { PlanReviewWidget } from "./PlanReviewWidget";
+import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "../lib/types";
 import { useAuthStore } from "../lib/auth-store";
 
@@ -40,6 +43,19 @@ export function ChatArea() {
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const [inputValue, setInputValue] = useState("");
     const abortControllerRef = useRef<AbortController | null>(null);
+    const [downloadProgress, setDownloadProgress] = useState<{
+        filename: string; downloaded_bytes: number;
+        total_bytes: number | null; speed_kbps: number; percent: number | null;
+    } | null>(null);
+
+    // ── Plan Review (Human-in-the-Loop) ─────────────────────────
+    const [pendingPlan, setPendingPlan] = useState<PlanReviewData | null>(null);
+    const [planSubmitting, setPlanSubmitting] = useState(false);
+    // Track conversation_id from SSE meta for plan feedback
+    const conversationIdRef = useRef<string | null>(null);
+    useEffect(() => {
+        conversationIdRef.current = activeConversationId ?? null;
+    }, [activeConversationId]);
 
     const activeConversation = conversations.find(c => c.id === activeConversationId);
     const isStarred = activeConversation?.isStarred || false;
@@ -49,13 +65,16 @@ export function ChatArea() {
     // Only scroll to bottom if the user hasn't manually scrolled up.
     // This lets users read earlier messages while the agent is streaming.
     const userScrolledUpRef = useRef(false);
+    const [showScrollBtn, setShowScrollBtn] = useState(false);
 
     const handleScroll = useCallback(() => {
         if (!scrollRef.current) return;
         const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
         const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
         // If user is more than 150px from bottom, they've scrolled up intentionally
-        userScrolledUpRef.current = distanceFromBottom > 150;
+        const scrolledUp = distanceFromBottom > 150;
+        userScrolledUpRef.current = scrolledUp;
+        setShowScrollBtn(scrolledUp);
     }, []);
 
     useEffect(() => {
@@ -69,8 +88,17 @@ export function ChatArea() {
         const lastMsg = messages[messages.length - 1];
         if (lastMsg?.role === "user") {
             userScrolledUpRef.current = false;
+            setShowScrollBtn(false);
         }
     }, [messages]);
+
+    const scrollToBottom = useCallback(() => {
+        if (scrollRef.current) {
+            scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+            userScrolledUpRef.current = false;
+            setShowScrollBtn(false);
+        }
+    }, []);
 
     const handleStop = useCallback(() => {
         if (abortControllerRef.current) {
@@ -110,6 +138,8 @@ export function ChatArea() {
         setStreaming(true);
         clearThinking();
         clearTaskExecution();
+        setPendingPlan(null);
+        setPlanSubmitting(false);
         // Thinking steps will arrive dynamically from backend SSE events
 
 
@@ -216,6 +246,13 @@ export function ChatArea() {
                                 bibcode: (p.bibcode as string) || undefined,
                                 doi: (p.doi as string) || undefined,
                                 abstract: (p.abstract as string) || undefined,
+                                // OpenAlex enrichment
+                                fwci: p.fwci != null ? Number(p.fwci) : null,
+                                citationPercentile: p.citation_percentile != null ? Number(p.citation_percentile) : null,
+                                isTop1Percent: Boolean(p.is_top_1_percent),
+                                isTop10Percent: Boolean(p.is_top_10_percent),
+                                funders: Array.isArray(p.funders) ? (p.funders as { name: string; id: string }[]) : undefined,
+                                oaPdfUrl: (p.oa_pdf_url as string) || undefined,
                             }));
                             addMessage({
                                 id: generateId(),
@@ -253,6 +290,35 @@ export function ChatArea() {
                         onTaskGroup: (group) => handleTaskGroup(group),
                         onTaskUpdate: (update) => handleTaskUpdate(update),
                         onTaskList: (list) => handleTaskList(list),
+                        onPlanReview: (plan) => {
+                            setPendingPlan({
+                                conversationId: conversationIdRef.current || plan.query || "",
+                                title: plan.title,
+                                subtasks: plan.subtasks,
+                                reasoning: plan.reasoning,
+                                iteration: plan.iteration,
+                                maxIterations: plan.maxIterations,
+                                query: plan.query,
+                            });
+                        },
+                        onWebSources: (data) => {
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: "",
+                                type: "web_sources",
+                                timestamp: new Date(),
+                                webSources: data.sources,
+                                webImages: data.images,
+                            });
+                        },
+                        onDownloadProgress: (data) => {
+                            setDownloadProgress(data);
+                            // Clear when complete
+                            if (data.percent && data.percent >= 100) {
+                                setTimeout(() => setDownloadProgress(null), 4000);
+                            }
+                        },
                         onConversationMeta: (meta) => {
                             // Server assigned a conversation ID — adopt it and migrate the local entry
                             if (meta.conversation_id) {
@@ -266,6 +332,8 @@ export function ChatArea() {
                                     }));
                                 }
                                 setActiveConversationId(meta.conversation_id);
+                                // Update the ref immediately so plan feedback uses correct ID
+                                conversationIdRef.current = meta.conversation_id;
                             }
                         },
                         onComplete: () => {
@@ -309,7 +377,37 @@ export function ChatArea() {
         setActiveConversationId,
         loadConversations,
         isAuthenticated,
+        pendingPlan,
     ]);
+
+    // ── Plan review handlers ────────────────────────────────────
+    const handlePlanApprove = useCallback(async () => {
+        const cid = conversationIdRef.current;
+        if (!cid || !pendingPlan) return;
+        setPlanSubmitting(true);
+        try {
+            await submitPlanFeedback(cid, true, "", tokenRef.current || undefined);
+            setPendingPlan(null);
+        } catch (err) {
+            console.error("Plan approval failed:", err);
+        } finally {
+            setPlanSubmitting(false);
+        }
+    }, [pendingPlan]);
+
+    const handlePlanFeedback = useCallback(async (feedback: string) => {
+        const cid = conversationIdRef.current;
+        if (!cid || !pendingPlan) return;
+        setPlanSubmitting(true);
+        try {
+            await submitPlanFeedback(cid, false, feedback, tokenRef.current || undefined);
+            // Don't clear pendingPlan — the Conductor will emit a new plan_review event
+        } catch (err) {
+            console.error("Plan feedback failed:", err);
+        } finally {
+            setPlanSubmitting(false);
+        }
+    }, [pendingPlan]);
 
     const handleSuggestionClick = (prompt: string) => { setInputValue(prompt); handleSend(prompt); };
     const hasMessages = messages.length > 0;
@@ -319,7 +417,7 @@ export function ChatArea() {
 
     return (
         <main className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
-            <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-2 md:py-4 border-b border-slate-800/80 glass-panel">
+            <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-1.5 md:py-2 border-b border-slate-800/80 glass-panel">
                 <div className="flex items-center gap-3">
                     <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800/50 transition-all"><PanelLeft className="w-5 h-5" /></button>
                     <h2 className="text-base font-semibold text-white tracking-tight">
@@ -376,10 +474,44 @@ export function ChatArea() {
                                 );
                             });
                         })()}
+                        {pendingPlan && (
+                            <PlanReviewWidget
+                                plan={pendingPlan}
+                                onApprove={handlePlanApprove}
+                                onFeedback={handlePlanFeedback}
+                                isSubmitting={planSubmitting}
+                            />
+                        )}
                     </div>
                 </div>
             ) : (
                 <EmptyState onSuggestionClick={handleSuggestionClick} />
+            )}
+
+            {/* Scroll-to-bottom button */}
+            {hasMessages && showScrollBtn && (
+                <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20">
+                    <button
+                        onClick={scrollToBottom}
+                        className="w-9 h-9 flex items-center justify-center rounded-full shadow-lg transition-all duration-200 hover:scale-110 animate-in fade-in slide-in-from-bottom-2 duration-200"
+                        style={{
+                            background: 'var(--q-card)',
+                            border: '1px solid var(--q-glass-border)',
+                            color: 'var(--q-text-secondary)',
+                            boxShadow: '0 4px 16px -2px rgba(0,0,0,0.25)',
+                        }}
+                        title="Scroll to bottom"
+                    >
+                        <ArrowDown className="w-4 h-4" />
+                    </button>
+                </div>
+            )}
+
+            {/* Download progress bar — inline before input */}
+            {downloadProgress && (
+                <div className="px-4 md:px-8 max-w-4xl mx-auto w-full">
+                    <DownloadProgress data={downloadProgress} />
+                </div>
             )}
 
             <ChatInput onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue} />

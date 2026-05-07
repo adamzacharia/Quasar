@@ -1,0 +1,81 @@
+# ALMA Proposing Guidance
+# Source: https://almascience.eso.org/proposing/learn-more
+# Scraped: 2026-04-27
+
+## What is ALMA?
+
+ALMA is an interferometer of 50 x 12 m antennas (the 12-m Array), 12 x 7 m antennas (the 7-m Array) and 4 x 12 m Total Power antennas (the TP Array) located at an altitude of 5000 m in northern Chile. It operates in the submillimeter/millimeter range, from 8.5 mm to 315 um (35-950 GHz).
+
+ALMA is operated by the Joint ALMA Observatory in Chile. The interface between the ALMA observatory and the astronomical community is provided by the three ALMA Regional Centers (ARCs).
+
+## Developing a Research Program with ALMA
+
+Key elements to consider before developing a proposal:
+- What sensitivity is required to achieve your science?
+- What angular and spectral resolution do you need?
+- What are the size scales of the sources of interest?
+- Depending on the configuration, ALMA may resolve (or filter) out the larger angular scales of emission in extended sources.
+- What is the total area you wish to map? Will you need a mosaic?
+- Do you need to observe the polarization structure of your source?
+- What elevation will your sources have at the ALMA site?
+- Has your source previously been observed by ALMA? Duplicate observations of the same location on the sky with similar observing parameters are not permitted unless scientifically justified.
+
+## Estimating Sensitivity and Integration Time
+
+The ALMA Sensitivity Calculator (ASC) helps with this step. In radio astronomy, source fluxes are generally expressed in terms of flux density using Jansky (Jy) units, or brightness temperature (Tb) in Kelvin. Line fluxes are expressed in velocity-integrated flux (Jy km/s) or intensity (K km/s).
+
+## Imaging Considerations
+
+### Angular Resolution, LAS and Configurations
+
+The ALMA 12-m Array can be configured into several sizes, from 161 m (most compact) up to 16 km (most extended). The longest baselines govern the highest angular resolution. The shortest baselines govern the Maximum Recoverable Scale (MRS).
+
+The Largest Angular Structure (LAS) of interest in your source must be smaller than the MRS of the 12-m Array configuration. Emission larger than the MRS will be spatially filtered out, leaving holes (bowls) on scales larger than the MRS. This is true even with mosaics.
+
+If LAS is larger than MRS with any 12-m configuration, use the Atacama Compact Array (ACA/Morita Array): the 7-m Array and/or the Total Power Array.
+
+### Target Elevation
+
+Targets as far as declination +40 deg or -70 deg (maximum elevation 25 deg at ALMA site) can be observed. Sensitivity and image quality will be negatively affected at low elevations.
+
+## Spectral Resolution and Bandwidth
+
+Continuum bandwidth: 7.5 GHz. Spectral lines can be observed with resolutions ranging from 0.1-111 km/s at 84 GHz to 0.01-10 km/s at 950 GHz. Spectral line databases like Splatalogue are available from within the OT.
+
+## Scheduling Considerations
+
+### Weather
+
+Opacity (primarily determined by Precipitable Water Vapour, PWV) and phase stability limit when ALMA can observe at certain frequencies. High frequency observations are most challenging and only possible during 10-20% of time.
+
+### Configuration Schedule
+
+The angular resolution and LAS needed determine the antenna configuration and consequently the observation period. For high frequency observations, check carefully that the required observation period does not coincide with the Altiplanic winter.
+
+## Preparing Your ALMA Proposal
+
+### Scientific Justification
+
+The Scientific Justification is a free format PDF uploaded into the OT. Use the provided Proposal Template to ensure you include all required aspects. Guidelines are in Section 5.3 of the Proposer's Guide.
+
+### Technical Justification
+
+Each Science Goal requires a Technical Justification. This confirms technical feasibility: whether the proposal can meet stated Science Goals in terms of resolution, frequency access, etc. The Technical Justification is a form within the OT where you must justify the observational setup (sensitivity, imaging, correlator configuration) and non-standard requests.
+
+### Science Goals
+
+Proposals consist of one or more Science Goals (SG) set up in the OT. Each SG contains: spatial coordinates and imaging characteristics, frequency band, spectral windows and resolutions, sensitivity requirements and integration time.
+
+ALMA uses Science Goals to build Scheduling Blocks (SBs) which control the telescope. You specify the range of angular resolutions and the Largest Angular Structure (LAS) expected; ALMA automatically selects the array configurations.
+
+### Proposal Categories
+
+1. Cosmology and the high redshift universe
+2. Galaxies and galactic nuclei
+3. ISM, star formation and astrochemistry
+4. Circumstellar disks, exoplanets and the solar system
+5. Stellar Evolution and the Sun
+
+### Expert Assistance
+
+You can ask questions via the ALMA Helpdesk. The KnowledgeBase contains many articles addressing common questions. You can attend Workshops, Webinars, or Community Day Events, or visit your local ARC or ARC node for assistance.

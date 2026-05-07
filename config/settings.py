@@ -33,7 +33,7 @@ class LogLevel(Enum):
 class APIConfig:
     """API configuration"""
     openai_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    openai_model: str = field(default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "claude-sonnet-4-6"))
+    openai_model: str = field(default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "gpt-4.1"))
     openai_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7")))
     openai_max_tokens: int = field(default_factory=lambda: int(os.getenv("MAX_TOKENS", "2000")))
 
@@ -91,12 +91,12 @@ class SearchConfig:
 class ProcessingConfig:
     """Data processing configuration"""
     # CASA settings
-    casa_enabled: bool = field(default_factory=lambda: os.getenv("ENABLE_CASA_PIPELINE", "true").lower() == "true")
+    casa_enabled: bool = field(default_factory=lambda: os.getenv("ENABLE_CASA_PIPELINE", "false").lower() == "true")
     casa_path: Optional[Path] = field(default_factory=lambda: Path(os.getenv("CASA_PATH", "/usr/local/casa")) if os.getenv("CASA_PATH") else None)
     casa_data_path: Optional[Path] = field(default_factory=lambda: Path(os.getenv("CASA_DATA_PATH", "/usr/local/casa-data")) if os.getenv("CASA_DATA_PATH") else None)
 
     # CARTA settings
-    carta_enabled: bool = field(default_factory=lambda: os.getenv("ENABLE_CARTA_INTEGRATION", "true").lower() == "true")
+    carta_enabled: bool = field(default_factory=lambda: os.getenv("ENABLE_CARTA_INTEGRATION", "false").lower() == "true")
     carta_backend_port: int = field(default_factory=lambda: int(os.getenv("CARTA_BACKEND_PORT", "3002")))
     carta_frontend_port: int = field(default_factory=lambda: int(os.getenv("CARTA_FRONTEND_PORT", "3000")))
     carta_base_dir: Path = field(default_factory=lambda: Path(os.getenv("CARTA_BASE_DIR", "./carta_sessions")))

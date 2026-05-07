@@ -23,13 +23,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue as stdlib_queue
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from openai import OpenAI
 
 from core.task_dag import TaskDAG, TaskNode, TaskStatus
 from core.workflow_memory import WorkflowMemory
+from core.dag_cache import DAGCache
+from core.result_cache import ResultCache
+from core.observability import estimate_cost
 from services.notebook_gen import generate_conductor_notebook
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,7 @@ AGENT_ICONS = {
     "analysis":   ("analysis",   "Data Analysis"),
     "viz":        ("viz",        "Visualization"),
     "web":        ("web",        "Web Search"),
+    "compute":    ("compute",    "Python Computation"),
     "synthesis":  ("synthesis",  "Result Synthesis"),
     "general":    ("general",    "General Task"),
 }
@@ -71,7 +76,7 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
 - search_papers: Search NASA ADS for papers. ONLY use when user asks for papers/publications.
 
 **Web tools (agent_type: "web")**:
-- web_search: Web search for real-time info, news, schedules.
+- web_search: Web search for real-time info, news, schedules. NEVER for papers — use search_papers instead.
 
 **CRITICAL**: We do NOT have VLA, VLBA, or GBT archive search. Do NOT create tasks to search VLA or any non-ALMA radio archive.
 
@@ -92,6 +97,7 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
    - "archive": ALMA archive searches (search_by_target, search_by_position, search_cadc_archive)
    - "literature": NASA ADS paper search (ONLY when user asks for papers)
    - "analysis": Line coverage checks, spectral line ID, filtering (check_co_lines, check_line_coverage, filter_results)
+   - "compute": Python calculations (frequency conversions, sensitivity estimates, unit conversions, data filtering with numpy/scipy/astropy). Use when math or data processing is needed.
    - "web": Web search, real-time info
    - "synthesis": Final answer assembly (runs LAST)
 
@@ -129,6 +135,41 @@ Respond with ONLY valid JSON:
         ...
     ],
     "reasoning": "Brief explanation of the decomposition and parallelism strategy"
+}}
+"""
+
+DAG_REPLAN_PROMPT = """\
+You are a task-decomposition engine for Quasar, a radio astronomy research assistant.
+
+The user has reviewed your execution plan and is requesting changes.
+Revise the plan based on their feedback while respecting all the same tool constraints
+as the original decomposition.
+
+=== ORIGINAL QUERY ===
+{query}
+
+=== CURRENT PLAN ===
+{current_plan}
+
+=== USER FEEDBACK ===
+{feedback}
+
+Revise the plan above based on the user's feedback. You may add, remove, reorder,
+or modify sub-tasks. Keep the same JSON format. Ensure dependencies remain valid
+(no circular deps, every depends_on ID must exist). Maximum {max_subtasks} sub-tasks.
+
+Available agent types: "archive", "literature", "analysis", "compute", "web", "synthesis".
+Available tools: search_by_target, search_by_position, search_cadc_archive, resolve_target,
+check_co_lines, check_line_coverage, search_lines_by_molecule, filter_results,
+search_papers, web_search.
+
+Respond with ONLY valid JSON:
+{{
+    "subtasks": [
+        {{"id": "t1", "description": "...", "depends_on": [], "agent_type": "archive"}},
+        ...
+    ],
+    "reasoning": "Brief explanation of what changed and why"
 }}
 """
 
@@ -185,35 +226,66 @@ class Conductor:
     Emits Perplexity Computer-style SSE events for real-time task UI.
     """
 
-    MAX_SUBTASKS = 10
-    COMPLEXITY_THRESHOLD = 0.7
+    MAX_SUBTASKS = 10  # absolute maximum (expert tier fallback)
+    COMPLEXITY_THRESHOLD = 0.7  # minimum score to trigger Conductor at all
+
+    # Tiered complexity: maps score ranges to subtask budgets.
+    # This prevents over-decomposition of moderate queries (which hurts speed
+    # without helping accuracy) while preserving full DAG power for hard queries.
+    COMPLEXITY_TIERS = {
+        # (min_score, max_score): (tier_name, max_subtasks, description)
+        (0.70, 0.80): ("moderate", 3, "Focused analysis with minimal decomposition"),
+        (0.80, 0.90): ("complex",  6, "Multi-step analysis with parallel execution"),
+        (0.90, 1.01): ("expert",  10, "Full DAG orchestration for deeply complex queries"),
+    }
+
+    @classmethod
+    def classify_tier(cls, score: float) -> tuple:
+        """Map a complexity score to a (tier_name, max_subtasks) tuple.
+
+        Returns ('moderate', 3), ('complex', 6), or ('expert', 10).
+        Falls back to ('expert', 10) if score doesn't match any tier.
+        """
+        for (lo, hi), (name, max_sub, _desc) in cls.COMPLEXITY_TIERS.items():
+            if lo <= score < hi:
+                return (name, max_sub)
+        return ("expert", cls.MAX_SUBTASKS)
 
     def __init__(
         self,
         client: OpenAI,
         model: str = "gpt-4o",
         conductor_model: Optional[str] = None,
+        synthesis_model: Optional[str] = None,
         tool_executor: Optional[Callable] = None,
         model_router: Optional[Any] = None,
         recovery_engine: Optional[Any] = None,
         agent_pool: Optional[Any] = None,
+        sandbox_executor: Optional[Any] = None,
         on_status: Optional[Callable[[str, str], None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         verbose: bool = False,
     ):
         self.client = client
         self.model = model
-        # Use a stronger model for Conductor planning/synthesis if specified
+        # Planning model: expensive, only used for DAG decomposition
         self.conductor_model = conductor_model or model
+        # Synthesis model: cheaper, used for combining results into final answer
+        self.synthesis_model = synthesis_model or "gpt-4.1"
         self.tool_executor = tool_executor
         self.model_router = model_router
         self.recovery = recovery_engine
         self.agent_pool = agent_pool
+        self.sandbox_executor = sandbox_executor
         self.on_status = on_status
-        self.on_event = on_event   # Structured SSE event emitter
+        self.on_event = on_event
         self.verbose = verbose
         self.workflow_memory = WorkflowMemory()
         self.dag = TaskDAG()
+        # (#14) Cross-session DAG learning
+        self.dag_cache = DAGCache(cache_path="data/dag_cache.json")
+        # (#11) Result deduplication cache
+        self.result_cache = ResultCache(ttl_seconds=300)
 
     # ── SSE Event Helpers ──────────────────────────────────────────────────
 
@@ -291,9 +363,12 @@ class Conductor:
         self,
         query: str,
         context: str = "",
+        max_subtasks: Optional[int] = None,
+        complexity_tier: Optional[str] = None,
         on_status: Optional[Callable[[str, str], None]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        plan_feedback_queue: Optional[stdlib_queue.Queue] = None,
     ) -> Optional[str]:
         """
         Main entry point for complex query orchestration.
@@ -305,10 +380,29 @@ class Conductor:
         event_fn = on_event or self.on_event
         self.workflow_memory.clear()
 
-        # Step 1: Decompose query into DAG
+        # Step 1: Decompose query into DAG (with cache lookup #14)
         self._emit_status("Analyzing query complexity and building execution plan", "running", status_fn)
 
-        subtasks = self._decompose(query, context)
+        # (#14) Check DAG cache for a similar previous decomposition
+        cached_plan = self.dag_cache.find_similar(query)
+        if cached_plan:
+            subtasks = cached_plan["subtasks"]
+            logger.info("DAG cache hit — reusing decomposition with %d tasks", len(subtasks))
+            self._emit_status(
+                f"Reusing proven execution plan ({len(subtasks)} tasks)",
+                "completed", status_fn,
+            )
+        else:
+            subtasks = self._decompose(query, context, max_subtasks=max_subtasks or self.MAX_SUBTASKS)
+
+        # Apply max_subtasks cap from tier (if provided)
+        effective_max = max_subtasks or self.MAX_SUBTASKS
+        if len(subtasks) > effective_max:
+            logger.info(
+                "Tier '%s' caps subtasks at %d — trimming %d → %d",
+                complexity_tier or "default", effective_max, len(subtasks), effective_max,
+            )
+            subtasks = subtasks[:effective_max]
 
         if not subtasks:
             self._emit_status("Query is simple — using direct response", "completed", status_fn)
@@ -317,10 +411,97 @@ class Conductor:
         # Build the DAG
         self.dag.build_from_subtasks(subtasks)
 
+        # Log validation warnings (#3)
+        warnings = self.dag.get_validation_warnings()
+        if warnings:
+            for w in warnings:
+                logger.warning("DAG validation: %s", w)
+
         task_summary = ", ".join(f"{s['id']}:{s['agent_type']}" for s in subtasks)
         msg = f"Execution plan: {len(subtasks)} tasks ({task_summary})"
         logger.info(msg)
         self._emit_status(msg, "completed", status_fn)
+
+        # (#12) Human-in-the-loop: emit plan for review and await approval
+        effective_max = max_subtasks or self.MAX_SUBTASKS
+        MAX_REPLAN_ITERATIONS = 3
+
+        if plan_feedback_queue is not None:
+            for iteration in range(MAX_REPLAN_ITERATIONS + 1):
+                # Emit plan_review event with full subtask details
+                plan_dict = self.dag.to_plan_dict()
+                self._emit({
+                    "type": "plan_review",
+                    "title": f"Execution Plan: {len(subtasks)} tasks, {plan_dict.get('estimated_parallel_rounds', '?')} rounds",
+                    "subtasks": [
+                        {
+                            "id": s["id"],
+                            "description": s["description"],
+                            "agentType": s.get("agent_type", "general"),
+                            "dependsOn": s.get("depends_on", []),
+                        }
+                        for s in subtasks
+                    ],
+                    "reasoning": "",
+                    "query": query[:200],
+                    "iteration": iteration + 1,
+                    "maxIterations": MAX_REPLAN_ITERATIONS,
+                }, event_fn)
+
+                self._emit_status(
+                    "Waiting for plan approval...",
+                    "running", status_fn,
+                )
+
+                # Block until user responds via /api/plan-feedback
+                # Uses stdlib queue.Queue (thread-safe) bridged to async via run_in_executor
+                try:
+                    loop = asyncio.get_event_loop()
+                    feedback = await loop.run_in_executor(None, plan_feedback_queue.get)
+                except Exception as e:
+                    logger.warning("Plan feedback queue error: %s — auto-approving", e)
+                    break
+
+                if feedback.get("approve", False):
+                    logger.info("Plan approved by user (iteration %d)", iteration + 1)
+                    self._emit_status("Plan approved — executing", "completed", status_fn)
+                    break
+
+                # User provided feedback — re-plan
+                user_feedback = feedback.get("feedback", "")
+                if not user_feedback.strip():
+                    logger.info("Empty feedback — treating as approval")
+                    self._emit_status("Plan approved — executing", "completed", status_fn)
+                    break
+
+                if iteration >= MAX_REPLAN_ITERATIONS:
+                    logger.info("Max re-plan iterations reached — executing last plan")
+                    self._emit_status("Max revisions reached — executing current plan", "completed", status_fn)
+                    break
+
+                logger.info("Re-planning with user feedback (iteration %d): %s", iteration + 1, user_feedback[:100])
+                self._emit_status(
+                    f"Revising plan based on your feedback (revision {iteration + 1})...",
+                    "running", status_fn,
+                )
+
+                subtasks = self._replan(
+                    query, subtasks, user_feedback,
+                    max_subtasks=effective_max,
+                )
+                if not subtasks:
+                    self._emit_status("Re-planning failed — executing original plan", "completed", status_fn)
+                    break
+
+                # Rebuild DAG with revised subtasks
+                self.dag = TaskDAG()
+                self.dag.build_from_subtasks(subtasks)
+
+                task_summary = ", ".join(f"{s['id']}:{s.get('agent_type', '?')}" for s in subtasks)
+                msg = f"Revised plan: {len(subtasks)} tasks ({task_summary})"
+                logger.info(msg)
+                self._emit_status(msg, "completed", status_fn)
+                # Loop back to emit updated plan_review
 
         # Emit task_list showing the full checklist
         self._emit_task_list(f"Multi-step analysis: {query[:60]}...", event_fn)
@@ -330,25 +511,30 @@ class Conductor:
 
         results = await self._execute_dag_with_events(event_fn, status_fn)
 
-        # Step 3: Write all results to workflow memory
+        # (#7) Write results to workflow memory (already done per-task in _run_one,
+        # but do a final pass to ensure all are captured)
         for task_id, result in results.items():
             node = self.dag.nodes.get(task_id)
             agent_type = node.agent_type if node else "unknown"
-            self.workflow_memory.write(agent_type, task_id, result)
+            self.workflow_memory.write(agent_type, task_id, result, task_id=task_id)
 
         # Step 4: Emit final task_list showing all completed
         self._emit_task_list(f"Multi-step analysis: {query[:60]}...", event_fn)
 
-        # Step 5: Synthesize final answer
+        # Step 5: Synthesize final answer (#4 — streaming)
         self._emit_status("Synthesizing final answer from all results", "running", status_fn)
         self._emit_task_update(
             TaskNode(id="synthesis", description="Synthesizing results", agent_type="synthesis"),
             "running", "Combining results from all agents...", "", event_fn,
         )
 
-        final_answer = self._synthesize(query, results)
+        final_answer = self._synthesize(query, results, on_token=on_token)
 
         self._emit_status("Answer ready", "completed", status_fn)
+
+        # (#14) Store successful decomposition for future reuse
+        dag_summary = self.dag.get_execution_summary()
+        self.dag_cache.store(query, subtasks, execution_summary=dag_summary)
 
         # Step 6: Generate companion Jupyter notebook
         try:
@@ -356,16 +542,14 @@ class Conductor:
                 query=query,
                 subtasks=subtasks,
                 results=results,
-                dag_summary=self.dag.get_execution_summary(),
+                dag_summary=dag_summary,
             )
-            self._notebook = notebook_dict  # store for caller
+            self._notebook = notebook_dict
         except Exception as nb_err:
             logger.warning("Notebook generation failed: %s", nb_err)
             self._notebook = None
 
-        if on_token:
-            on_token(final_answer)
-
+        # Don't re-emit via on_token — streaming synthesis already did that
         return final_answer
 
     async def _execute_dag_with_events(
@@ -383,9 +567,20 @@ class Conductor:
                 pending = [n for n in self.dag.nodes.values() if n.status == TaskStatus.PENDING]
                 if not pending:
                     break
+                # Propagate actual predecessor errors instead of a generic message
                 for p in pending:
-                    self.dag.mark_failed(p.id, "Unmet dependencies — predecessor failed")
-                    self._emit_task_update(p, "error", "Predecessor task failed", f"g{round_num}", on_event)
+                    failed_deps = [
+                        (dep_id, self.dag.nodes[dep_id].error or "unknown error")
+                        for dep_id in p.depends_on
+                        if dep_id in self.dag.nodes
+                        and self.dag.nodes[dep_id].status == TaskStatus.FAILED
+                    ]
+                    if failed_deps:
+                        cause = "; ".join(f"{did}: {err[:100]}" for did, err in failed_deps)
+                        self.dag.mark_failed(p.id, f"Predecessor failed — {cause}")
+                    else:
+                        self.dag.mark_failed(p.id, "Unmet dependencies — predecessor did not complete")
+                    self._emit_task_update(p, "error", f"Blocked: predecessor failed", f"g{round_num}", on_event)
                 break
 
             round_num += 1
@@ -406,14 +601,43 @@ class Conductor:
             async def _run_one(node: TaskNode):
                 self.dag.mark_running(node.id)
                 try:
-                    result = await asyncio.wait_for(
-                        self._execute_node(node),
-                        timeout=node.sla_seconds,
+                    # Build dependency context summary for the RecoveryEngine.
+                    # This lets _replan() and _reassign() see what predecessors
+                    # returned, enabling root-cause analysis.
+                    dep_context = None
+                    if node.depends_on:
+                        dep_parts = []
+                        for dep_id in node.depends_on:
+                            dep_node = self.dag.nodes.get(dep_id)
+                            if dep_node:
+                                if dep_node.status == TaskStatus.COMPLETED:
+                                    summary = self._summarize_result(dep_node.result)
+                                    dep_parts.append(f"[{dep_id}] ({dep_node.description[:60]}): {summary}")
+                                elif dep_node.status == TaskStatus.FAILED:
+                                    dep_parts.append(f"[{dep_id}] ({dep_node.description[:60]}): FAILED — {dep_node.error}")
+                        if dep_parts:
+                            dep_context = "\n".join(dep_parts)
+
+                    # (#2) Use RecoveryEngine for resilient execution
+                    if self.recovery:
+                        result = await self.recovery.execute_with_recovery(
+                            node,
+                            lambda desc, ctx="", model="": self.tool_executor(desc, ctx, model) if self.tool_executor else self._direct_answer(desc, ctx),
+                            on_status=on_status,
+                            dep_context=dep_context,
+                        )
+                    else:
+                        result = await asyncio.wait_for(
+                            self._execute_node(node),
+                            timeout=node.sla_seconds,
+                        )
+
+                    # (#7) Write result to WorkflowMemory immediately
+                    self.workflow_memory.write(
+                        node.agent_type, node.id, result, task_id=node.id
                     )
 
-                    # ── Soft-failure detection ──────────────────────────
-                    # A result can signal failure even without raising an
-                    # exception (e.g. {"success": false, "error": "..."}).
+                    # Soft-failure detection for UI display
                     is_soft_failure = False
                     if isinstance(result, dict):
                         if result.get("success") is False or "error" in result:
@@ -421,33 +645,9 @@ class Conductor:
                     elif isinstance(result, str) and "[Tool execution error:" in result:
                         is_soft_failure = True
 
-                    # ── One automatic retry for soft failures ──────────
-                    if is_soft_failure and node.retries < 1:
-                        node.retries += 1
-                        self._emit_task_update(
-                            node, "running",
-                            "Retrying after error...", group_id, on_event,
-                        )
-                        retry_result = await asyncio.wait_for(
-                            self._execute_node(node),
-                            timeout=node.sla_seconds,
-                        )
-                        # Re-check after retry
-                        retry_failed = False
-                        if isinstance(retry_result, dict):
-                            if retry_result.get("success") is False or "error" in retry_result:
-                                retry_failed = True
-                        elif isinstance(retry_result, str) and "[Tool execution error:" in retry_result:
-                            retry_failed = True
-
-                        if not retry_failed:
-                            # Retry succeeded
-                            result = retry_result
-                            is_soft_failure = False
-
                     if is_soft_failure:
                         detail = self._summarize_result(result)
-                        self.dag.mark_completed(node.id, result)  # still store for dep_context
+                        self.dag.mark_completed(node.id, result)
                         self._emit_task_update(node, "error", detail, group_id, on_event)
                     else:
                         self.dag.mark_completed(node.id, result)
@@ -508,22 +708,60 @@ class Conductor:
 
         Uses the tool_executor callback which ultimately calls the same
         tool functions as the main agent — so all 28+ tools are available.
-        """
-        if self.verbose:
-            logger.info("Executing %s (%s): %s", node.id, node.agent_type, node.description)
 
-        # Gather context from completed dependencies
-        dep_context = ""
-        for dep_id in node.depends_on:
-            dep_node = self.dag.nodes.get(dep_id)
-            if dep_node and dep_node.result:
-                result_str = json.dumps(dep_node.result, default=str)[:6000]
-                dep_context += f"\n[Result from {dep_id}]: {result_str}"
+        Model routing: each subtask is routed to the optimal OpenAI model
+        via ModelRouter (GPT-5.4 for synthesis/reasoning, GPT-4.1 for
+        archive/analysis, GPT-4.1-mini for simple tasks).
+        """
+        # ── Route to the optimal model for this subtask ──────────────────
+        if self.model_router:
+            subtask_model = self.model_router.route(node.description, node.agent_type)
+            routing_info = self.model_router.get_routing_info(node.description, node.agent_type)
+            logger.info(
+                "Routed %s (%s) → %s (%s)",
+                node.id, node.agent_type,
+                subtask_model, routing_info.get("reason", ""),
+            )
+        else:
+            subtask_model = self.conductor_model  # fallback: use conductor_model for everything
+
+        if self.verbose:
+            logger.info("Executing %s (%s) on %s: %s", node.id, node.agent_type, subtask_model, node.description)
+
+        # (#6) Track which model is used on this node
+        node.model_used = subtask_model
+
+        # (#7) Gather context from WorkflowMemory (structured) instead of raw JSON
+        dep_context = self.workflow_memory.get_dependency_context(
+            node.depends_on, max_chars=8000
+        )
+        # Fallback: if WorkflowMemory is empty, use raw node results
+        if not dep_context:
+            for dep_id in node.depends_on:
+                dep_node = self.dag.nodes.get(dep_id)
+                if dep_node and dep_node.result:
+                    result_str = json.dumps(dep_node.result, default=str)[:6000]
+                    dep_context += f"\n[Result from {dep_id}]: {result_str}"
 
         # Build the task description with dependency context
         full_task = node.description
         if dep_context:
             full_task += f"\n\nContext from prior steps:{dep_context}"
+
+        # ── Route "compute" tasks to the sandbox executor ────────────────
+        if node.agent_type == "compute" and self.sandbox_executor:
+            try:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, self.sandbox_executor.run,
+                    full_task,  # query
+                    dep_context or "",  # context
+                )
+                if result:
+                    return result
+            except Exception as e:
+                logger.error("Sandbox executor failed for %s: %s", node.id, e)
+                # Fall through to tool_executor as backup
 
         # Use the tool executor (wired to agent's tool-calling loop)
         # IMPORTANT: tool_executor is SYNCHRONOUS (OpenAI API + HTTP archive
@@ -533,8 +771,10 @@ class Conductor:
         if self.tool_executor:
             try:
                 loop = asyncio.get_event_loop()
+                # Pass subtask_model as 3rd arg so the executor uses the
+                # routed model instead of the default conductor_model.
                 result = await loop.run_in_executor(
-                    None, self.tool_executor, full_task, dep_context
+                    None, self.tool_executor, full_task, dep_context, subtask_model
                 )
                 if result:
                     return result
@@ -572,12 +812,21 @@ class Conductor:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
-    def _decompose(self, query: str, context: str) -> List[dict]:
+    def _decompose(self, query: str, context: str, max_subtasks: Optional[int] = None) -> List[dict]:
         """Decompose a query into structured subtasks with dependencies."""
+        effective_max = max_subtasks or self.MAX_SUBTASKS
         prompt = DAG_DECOMPOSITION_PROMPT.format(
             query=query,
             context=context or "(no prior context)",
         )
+        # Inject subtask budget guidance into the prompt so the LLM
+        # knows how many subtasks to generate for this complexity tier.
+        if effective_max < self.MAX_SUBTASKS:
+            prompt += (
+                f"\n\nIMPORTANT: This query has moderate complexity. "
+                f"Use at most {effective_max} sub-tasks. Prefer fewer, focused tasks "
+                f"over many granular ones. Combine related operations into single tasks."
+            )
 
         try:
             resp = self.client.responses.create(
@@ -600,8 +849,62 @@ class Conductor:
             logger.error("Conductor decomposition failed: %s", e)
             return []
 
-    def _synthesize(self, query: str, results: Dict[str, Any]) -> str:
-        """Synthesize all sub-task results into a final coherent answer."""
+    def _replan(
+        self,
+        query: str,
+        current_subtasks: List[dict],
+        feedback: str,
+        max_subtasks: Optional[int] = None,
+    ) -> List[dict]:
+        """Re-decompose a query based on user feedback about the current plan.
+
+        Uses a clearly labeled prompt with three sections:
+        - ORIGINAL QUERY: what the user asked
+        - CURRENT PLAN: the existing subtask list
+        - USER FEEDBACK: what the user wants changed
+        """
+        effective_max = max_subtasks or self.MAX_SUBTASKS
+
+        # Format current plan as readable JSON for the LLM
+        plan_json = json.dumps(current_subtasks, indent=2)
+
+        prompt = DAG_REPLAN_PROMPT.format(
+            query=query,
+            current_plan=plan_json,
+            feedback=feedback,
+            max_subtasks=effective_max,
+        )
+
+        try:
+            resp = self.client.responses.create(
+                model=self.conductor_model,
+                input=prompt,
+                temperature=0.1,
+                max_output_tokens=800,
+                text={"format": {"type": "json_object"}},
+            )
+            data = json.loads(resp.output_text)
+            subtasks = data.get("subtasks", [])
+
+            reasoning = data.get("reasoning", "")
+            logger.info("Re-plan reasoning: %s", reasoning)
+
+            return subtasks[:effective_max]
+
+        except Exception as e:
+            logger.error("Conductor re-planning failed: %s", e)
+            return current_subtasks  # Fall back to current plan on failure
+
+    def _synthesize(
+        self, query: str, results: Dict[str, Any],
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """
+        Synthesize all sub-task results into a final coherent answer.
+
+        (#4) Streams tokens via on_token for instant UX — the user sees
+        the synthesis appear word-by-word instead of waiting 3-5s.
+        """
         results_parts = []
         for task_id, result in results.items():
             node = self.dag.nodes.get(task_id)
@@ -623,27 +926,41 @@ class Conductor:
         )
 
         try:
+            # (#4) Streaming synthesis -- uses cheaper model (not the planning model)
             resp = self.client.responses.create(
-                model=self.conductor_model,
+                model=self.synthesis_model,
                 input=prompt,
                 temperature=0.3,
                 max_output_tokens=2000,
+                stream=True,
             )
-            answer = resp.output_text.strip()
-            if not answer:
+            answer = ""
+            for event in resp:
+                if event.type == "response.output_text.delta":
+                    answer += event.delta
+                    if on_token:
+                        on_token(event.delta)
+
+            if not answer.strip():
                 logger.warning("Synthesis model returned empty — falling back to raw results")
-                return (
+                fallback = (
                     f"**Results for:** {query}\n\n"
                     + results_text
                     + "\n\n*(Synthesis returned empty — showing raw sub-agent results)*"
                 )
+                if on_token:
+                    on_token(fallback)
+                return fallback
             return answer
         except Exception as e:
-            return (
+            fallback = (
                 f"**Results for:** {query}\n\n"
                 + results_text
                 + f"\n\n(Synthesis failed: {e})"
             )
+            if on_token:
+                on_token(fallback)
+            return fallback
 
     def get_execution_summary(self) -> Dict[str, Any]:
         """Return DAG execution metrics for observability."""

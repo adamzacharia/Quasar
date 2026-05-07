@@ -218,6 +218,178 @@ class SkyViewClient:
         # Return as-is (SkyView will validate)
         return survey
 
+    def generate_finding_chart(
+        self, target: str = None, ra: float = None, dec: float = None,
+        survey: str = "DSS2 Red", fov_arcmin: float = 5.0,
+        pixels: int = 600, title: str = None,
+    ) -> Dict[str, Any]:
+        """
+        Generate a publication-quality finding chart with WCS axes,
+        target crosshair, N/E compass arrows, and angular scale bar.
+
+        Use DSS2 for optical or 2MASS for near-IR. The chart is rendered
+        as a PNG and returned with its path for inline display.
+
+        Args:
+            target: Target name (resolved via SIMBAD)
+            ra: RA in degrees (alternative to target)
+            dec: Dec in degrees (alternative to target)
+            survey: Sky survey (default 'DSS2 Red')
+            fov_arcmin: Field of view in arcminutes (default 5')
+            pixels: Image size in pixels (default 600)
+            title: Custom title (default: target name + survey)
+
+        Returns:
+            Dict with image_path for inline display, plus metadata
+        """
+        import uuid
+
+        if not SKYVIEW_AVAILABLE:
+            return {"success": False, "error": "astroquery.skyview not available"}
+
+        # Resolve target name
+        if target and ra is None:
+            ra, dec = _resolve_simbad_cached(target)
+            if ra is None:
+                return {"success": False, "error": f"Could not resolve target '{target}' via SIMBAD"}
+
+        if ra is None or dec is None:
+            return {"success": False, "error": "Provide target name or RA/Dec coordinates"}
+
+        try:
+            from astropy.coordinates import SkyCoord
+            from astropy.wcs import WCS
+            import astropy.units as u
+
+            survey_name = self._resolve_survey(survey)
+            coord = SkyCoord(ra=ra, dec=dec, unit="deg")
+            label = target if target else f"RA={ra:.4f}, Dec={dec:.4f}"
+            chart_title = title or f"Finding Chart: {label} ({survey_name})"
+
+            print(f"[SkyView] Generating finding chart for {label} "
+                  f"({survey_name}, {fov_arcmin}' FOV)")
+
+            # Fetch the image
+            hdu_list = SkyView.get_images(
+                position=coord,
+                survey=[survey_name],
+                radius=fov_arcmin * u.arcmin,
+                pixels=pixels,
+            )
+
+            if not hdu_list or len(hdu_list) == 0:
+                return {"success": False, "error": f"No {survey_name} image at this position"}
+
+            hdu = hdu_list[0]
+            data = hdu[0].data
+            header = hdu[0].header
+
+            if data is None:
+                return {"success": False, "error": "Empty image data returned"}
+
+            # Render the finding chart
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as np
+            from matplotlib.patches import FancyArrowPatch
+
+            wcs = WCS(header)
+
+            fig = plt.figure(figsize=(8, 8), facecolor="#0f172a")
+            ax = fig.add_subplot(111, projection=wcs)
+
+            # Image with contrast stretch
+            vmin = np.nanpercentile(data, 1)
+            vmax = np.nanpercentile(data, 99.5)
+            ax.imshow(data, origin="lower", cmap="gray_r",
+                      vmin=vmin, vmax=vmax)
+
+            # Target crosshair at center
+            px, py = wcs.world_to_pixel(coord)
+            cross_size = pixels * 0.04
+            ax.plot(float(px), float(py), "+", color="#ef4444",
+                    markersize=18, markeredgewidth=2.5, zorder=10)
+            # Circle around target
+            circle = plt.Circle((float(px), float(py)), cross_size,
+                                fill=False, color="#ef4444", linewidth=1.5,
+                                linestyle="--", zorder=10)
+            ax.add_patch(circle)
+
+            # N/E compass arrows (top-left corner)
+            arrow_origin_x = pixels * 0.12
+            arrow_origin_y = pixels * 0.88
+            arrow_len = pixels * 0.08
+
+            # North arrow (up in standard orientation)
+            ax.annotate("N", xy=(arrow_origin_x, arrow_origin_y + arrow_len),
+                        xytext=(arrow_origin_x, arrow_origin_y),
+                        arrowprops=dict(arrowstyle="->", color="white", lw=2),
+                        color="white", fontsize=12, fontweight="bold",
+                        ha="center", va="bottom", zorder=15)
+
+            # East arrow (left in standard orientation)
+            ax.annotate("E", xy=(arrow_origin_x - arrow_len, arrow_origin_y),
+                        xytext=(arrow_origin_x, arrow_origin_y),
+                        arrowprops=dict(arrowstyle="->", color="white", lw=2),
+                        color="white", fontsize=12, fontweight="bold",
+                        ha="right", va="center", zorder=15)
+
+            # Scale bar (bottom-right)
+            if fov_arcmin >= 2:
+                bar_arcmin = 1.0
+                bar_label = "1'"
+            else:
+                bar_arcmin = fov_arcmin / 5
+                bar_label = f'{bar_arcmin * 60:.0f}"'
+
+            bar_pixels = (bar_arcmin / fov_arcmin) * pixels * 0.5
+            bar_x = pixels * 0.95 - bar_pixels
+            bar_y = pixels * 0.06
+            ax.plot([bar_x, bar_x + bar_pixels], [bar_y, bar_y],
+                    color="white", linewidth=3, zorder=15)
+            ax.text(bar_x + bar_pixels / 2, bar_y + pixels * 0.02,
+                    bar_label, color="white", fontsize=11,
+                    ha="center", va="bottom", fontweight="bold", zorder=15)
+
+            # Axis labels
+            ax.set_title(chart_title, color="white", fontsize=13, pad=12)
+            ax.coords[0].set_axislabel("RA (J2000)", color="white", fontsize=10)
+            ax.coords[1].set_axislabel("Dec (J2000)", color="white", fontsize=10)
+            ax.coords[0].set_ticklabel(color="white", fontsize=8)
+            ax.coords[1].set_ticklabel(color="white", fontsize=8)
+            ax.coords.grid(color="white", alpha=0.15, linestyle="--")
+            ax.set_facecolor("black")
+            fig.patch.set_facecolor("#0f172a")
+
+            # Save
+            rendered_dir = os.path.join(
+                os.path.dirname(__file__), "..", "data", "rendered_images"
+            )
+            os.makedirs(rendered_dir, exist_ok=True)
+            img_name = f"findchart_{uuid.uuid4().hex[:10]}.png"
+            img_path = os.path.join(rendered_dir, img_name)
+            fig.savefig(img_path, dpi=150, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close(fig)
+
+            return {
+                "success": True,
+                "image_path": f"/api/images/{img_name}",
+                "caption": chart_title,
+                "target": label,
+                "ra_deg": ra,
+                "dec_deg": dec,
+                "survey": survey_name,
+                "fov_arcmin": fov_arcmin,
+            }
+
+        except Exception as e:
+            print(f"[SkyView] Finding chart generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
     def _save_preview(self, data, png_path: str, survey: str, label: str) -> Optional[str]:
         """Save a PNG preview of the FITS image."""
         try:

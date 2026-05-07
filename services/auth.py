@@ -73,15 +73,21 @@ class AuthService:
                 cursor.execute("ALTER TABLE users ADD COLUMN auth_provider TEXT DEFAULT 'local'")
             except Exception:
                 pass
-                
+
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN picture_url TEXT")
+            except Exception:
+                pass
+
             conn.commit()
 
-    def generate_token(self, user_id: str, email: str = None, display_name: str = None) -> str:
+    def generate_token(self, user_id: str, email: str = None, display_name: str = None, picture_url: str = None) -> str:
         """Generate a JWT token for a user"""
         payload = {
             "sub": user_id,
             "email": email,
             "name": display_name,
+            "picture": picture_url,
             "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
             "iat": datetime.utcnow()
         }
@@ -172,7 +178,7 @@ class AuthService:
         except Exception as e:
             return False, None, None, None, f"Login failed: {str(e)}"
             
-    def register_or_login_google_user(self, email: str, display_name: str) -> Tuple[bool, str, str, str]:
+    def register_or_login_google_user(self, email: str, display_name: str, picture_url: str = None) -> Tuple[bool, str, str, str]:
         """Register or login a user via Google. Returns (success, user_id, message, token)"""
         username = email # Use email as username for Google auth
         
@@ -186,11 +192,13 @@ class AuthService:
                 
                 if result:
                     user_id = result[0]
-                    # Update display name just in case it changed
-                    cursor.execute("UPDATE users SET display_name = ?, auth_provider = 'google' WHERE id = ?", 
-                                  (display_name, user_id))
+                    # Update display name and picture just in case they changed
+                    cursor.execute(
+                        "UPDATE users SET display_name = ?, picture_url = ?, auth_provider = 'google' WHERE id = ?",
+                        (display_name, picture_url, user_id),
+                    )
                     conn.commit()
-                    token = self.generate_token(user_id, email, display_name)
+                    token = self.generate_token(user_id, email, display_name, picture_url)
                     return True, user_id, "Login successful", token
                 
                 # Create new user
@@ -199,12 +207,12 @@ class AuthService:
                 
                 cursor.execute(
                     """INSERT INTO users 
-                       (id, username, email, display_name, auth_provider, created_at) 
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (user_id, username, email, display_name, 'google', created_at)
+                       (id, username, email, display_name, auth_provider, picture_url, created_at) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, username, email, display_name, 'google', picture_url, created_at)
                 )
                 conn.commit()
-                token = self.generate_token(user_id, email, display_name)
+                token = self.generate_token(user_id, email, display_name, picture_url)
                 return True, user_id, "Registration successful", token
                 
         except Exception as e:

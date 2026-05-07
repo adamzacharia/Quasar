@@ -332,12 +332,21 @@ class ConversationService:
         conn = self._get_conn()
         cursor = conn.cursor()
         
+        # Verify the conversation exists first
+        cursor.execute('SELECT id FROM conversations WHERE id = ?', (conversation_id,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"[WARN] delete_conversation: conversation {conversation_id} not found in DB")
+            conn.close()
+            return
+        
         cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
         cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
         cursor.execute('DELETE FROM conversation_file_refs WHERE conversation_id = ?', (conversation_id,))
         
         conn.commit()
         conn.close()
+        print(f"[INFO] delete_conversation: successfully deleted {conversation_id}")
     
     def get_or_create_current(self, user_id: str) -> str:
         """Get most recent conversation or create new one"""

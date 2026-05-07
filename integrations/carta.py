@@ -5,6 +5,7 @@ CARTA (Cube Analysis and Rendering Tool for Astronomy) is a visualization tool
 """
 
 import os
+import shutil
 import subprocess
 import json
 import time
@@ -59,14 +60,8 @@ class CARTAIntegration:
         return None
 
     def _command_exists(self, command: str) -> bool:
-        """Check if command exists in PATH"""
-        try:
-            subprocess.run(["which", command],
-                         capture_output=True,
-                         check=True)
-            return True
-        except:
-            return False
+        """Check if command exists in PATH (cross-platform)."""
+        return shutil.which(command) is not None
 
     def _is_port_open(self, port: int) -> bool:
         """Check if port is available"""
@@ -577,7 +572,7 @@ class CARTARemote:
                 return response.json().get('files', [])
             else:
                 return []
-        except:
+        except Exception:
             return []
 
 

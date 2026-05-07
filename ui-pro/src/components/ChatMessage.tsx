@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Database, User as UserIcon } from "lucide-react";
+import { Copy, Check, Database, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, type ReactNode } from "react";
 import type { Message } from "../lib/types";
@@ -13,6 +13,10 @@ import { DataTableCard } from "./DataTableCard";
 import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
+import { WebSourcesCard } from "./WebSourcesCard";
+import { useChatStore } from "../lib/store";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 
 function CodeBlock({ language, children }: { language: string; children: string }) {
@@ -32,6 +36,60 @@ function CodeBlock({ language, children }: { language: string; children: string 
     );
 }
 
+function MessageActions({ message }: { message: Message }) {
+    const [copied, setCopied] = useState(false);
+    const [feedback, setFeedback] = useState<"like" | "dislike" | null>(null);
+    const { activeConversationId, selectedModel } = useChatStore();
+
+    const copyText = () => {
+        navigator.clipboard.writeText(message.content);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
+    const sendFeedback = async (type: "like" | "dislike") => {
+        const newFeedback = feedback === type ? null : type;
+        setFeedback(newFeedback);
+        if (!newFeedback) return; // toggled off — no API call
+        try {
+            const token = useAuthStore.getState().token;
+            await fetch(`${API_BASE}/api/feedback`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                },
+                body: JSON.stringify({
+                    message_id: message.id,
+                    feedback: newFeedback,
+                    conversation_id: activeConversationId || "",
+                    model: selectedModel || "",
+                    response_preview: message.content?.slice(0, 500) || "",
+                }),
+            });
+        } catch {
+            // Silent fail — feedback is non-critical
+        }
+    };
+
+    return (
+        <div className="flex items-center gap-1 mt-2 opacity-0 group-hover/msg:opacity-100 transition-opacity">
+            <button onClick={copyText} title="Copy response"
+                className="p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-700/50 rounded-lg transition-all">
+                {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+            </button>
+            <button onClick={() => sendFeedback("like")} title="Good response"
+                className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
+            </button>
+            <button onClick={() => sendFeedback("dislike")} title="Bad response"
+                className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
+            </button>
+        </div>
+    );
+}
+
 /**
  * Replace emoji characters in text children with custom SVG icons.
  * Handles: 📚 → IconOpenBook, 🌐 → IconWebGlobe
@@ -41,12 +99,12 @@ function replaceEmojisWithIcons(children: ReactNode): ReactNode {
 
     // Process arrays of children
     if (Array.isArray(children)) {
-        return children.map((child, i) => {
+        return <>{children.map((child, i) => {
             if (typeof child === "string") {
-                return replaceEmojisInString(child, i);
+                return <span key={`ec-${i}`}>{replaceEmojisInString(child, i)}</span>;
             }
             return child;
-        });
+        })}</>;
     }
 
     // Process single string child
@@ -59,7 +117,7 @@ function replaceEmojisWithIcons(children: ReactNode): ReactNode {
 
 function replaceEmojisInString(text: string, keyBase: number): ReactNode {
     // Check if text contains any of our target emojis
-    if (!text.includes("📚") && !text.includes("🌐")) {
+    if (!text.includes("\ud83d\udcda") && !text.includes("\ud83c\udf10")) {
         return text;
     }
 
@@ -69,8 +127,8 @@ function replaceEmojisInString(text: string, keyBase: number): ReactNode {
     let partKey = 0;
 
     while (remaining.length > 0) {
-        const bookIdx = remaining.indexOf("📚");
-        const globeIdx = remaining.indexOf("🌐");
+        const bookIdx = remaining.indexOf("\ud83d\udcda");
+        const globeIdx = remaining.indexOf("\ud83c\udf10");
 
         // Find the earliest emoji
         let nextIdx = -1;
@@ -86,28 +144,27 @@ function replaceEmojisInString(text: string, keyBase: number): ReactNode {
 
         if (nextIdx < 0) {
             // No more emojis — push remaining text
-            parts.push(remaining);
+            parts.push(<span key={`t-${keyBase}-${partKey++}`}>{remaining}</span>);
             break;
         }
 
         // Push text before emoji
         if (nextIdx > 0) {
-            parts.push(remaining.substring(0, nextIdx));
+            parts.push(<span key={`t-${keyBase}-${partKey++}`}>{remaining.substring(0, nextIdx)}</span>);
         }
 
         // Push the icon component
         if (emojiType === "book") {
             parts.push(
-                <IconOpenBook key={`icon-${keyBase}-${partKey}`} className="w-4 h-4 text-primary inline-block align-text-bottom mr-0.5" />
+                <IconOpenBook key={`icon-${keyBase}-${partKey++}`} className="w-4 h-4 text-primary inline-block align-text-bottom mr-0.5" />
             );
             remaining = remaining.substring(nextIdx + 2); // 📚 is 2 chars (surrogate pair)
         } else {
             parts.push(
-                <IconWebGlobe key={`icon-${keyBase}-${partKey}`} className="w-4 h-4 text-cyan-400 inline-block align-text-bottom mr-0.5" />
+                <IconWebGlobe key={`icon-${keyBase}-${partKey++}`} className="w-4 h-4 text-cyan-400 inline-block align-text-bottom mr-0.5" />
             );
             remaining = remaining.substring(nextIdx + 2); // 🌐 is 2 chars
         }
-        partKey++;
     }
 
     return parts.length === 1 ? parts[0] : <>{parts}</>;
@@ -141,7 +198,19 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     <div className="space-y-1">
                         <div className="flex justify-end"><span className="text-[10px] text-slate-400 uppercase font-medium tracking-wider mr-1">You</span></div>
                         <div className="bg-card-dark border border-primary/20 rounded-2xl rounded-tr-sm px-5 py-3 text-slate-100 shadow-sm space-y-3">
-                            {message.content && <p className="leading-relaxed">{message.content}</p>}
+                            {message.content && (
+                                <div className="prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-p:my-1">
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                                        // Keep user messages lightweight — no code blocks, just inline code
+                                        code({ children, ...props }) {
+                                            return <code className="bg-slate-800 px-1.5 py-0.5 rounded text-primary text-sm font-mono" {...props}>{children}</code>;
+                                        },
+                                        a({ href, children }) {
+                                            return <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">{children}</a>;
+                                        },
+                                    }}>{message.content}</ReactMarkdown>
+                                </div>
+                            )}
 
                             {/* Image attachment previews */}
                             {message.attachmentPreviews && message.attachmentPreviews.length > 0 && (
@@ -168,9 +237,13 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             )}
                         </div>
                     </div>
-                    <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 shrink-0 mb-1 flex items-center justify-center text-white text-xs font-bold">
-                        {userInitials || <UserIcon className="w-4 h-4" />}
-                    </div>
+                    {user?.picture_url ? (
+                        <img src={user.picture_url} alt={user.display_name || "You"} className="size-8 rounded-full object-cover shrink-0 mb-1 shadow-md" referrerPolicy="no-referrer" />
+                    ) : (
+                        <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 shrink-0 mb-1 flex items-center justify-center text-white text-xs font-bold">
+                            {userInitials || <UserIcon className="w-4 h-4" />}
+                        </div>
+                    )}
                 </div>
             </div>
         );
@@ -194,8 +267,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         return (
             <div className="flex justify-start">
                 <div className="flex items-start gap-3 w-full lg:max-w-[95%]">
-                    <div className="size-8 rounded-xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-lg shadow-primary/20 shrink-0 mt-1">
-                        <span className="text-white font-bold text-sm">Q</span>
+                    <div className="size-8 rounded-xl flex items-center justify-center shrink-0 mt-1 overflow-hidden" style={{ background: 'var(--q-bg)' }}>
+                        <img src="/quasar_logo.png" alt="Quasar" className="size-7 object-contain" />
                     </div>
                     <ThoughtProcessWidget title={message.toolCall.displayName || message.toolCall.name} status={message.toolCall.status} steps={steps} />
                 </div>
@@ -344,15 +417,24 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         );
     }
 
+    // -- Web Sources (source cards + image grid from web search) --
+    if (message.type === "web_sources" && (message.webSources?.length || message.webImages?.length)) {
+        return (
+            <div className="pl-11">
+                <WebSourcesCard sources={message.webSources} images={message.webImages} />
+            </div>
+        );
+    }
+
     // Skip empty assistant text messages (placeholder bubbles with no content and no thinking)
     if (!hasContent && !hasThinking && !isStreaming) return null;
 
     // Assistant message — with integrated thinking process
     return (
-        <div className="flex justify-start">
+        <div className="flex justify-start group/msg">
             <div className="flex items-start gap-3 w-full lg:max-w-[95%]">
-                <div className="size-8 rounded-xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-lg shadow-primary/20 shrink-0 mt-1">
-                    <span className="text-white font-bold text-sm">Q</span>
+                <div className="size-8 rounded-xl flex items-center justify-center shrink-0 mt-1 overflow-hidden" style={{ background: 'var(--q-bg)' }}>
+                    <img src="/quasar_logo.png" alt="Quasar" className="size-7 object-contain" />
                 </div>
                 <div className="space-y-3 w-full min-w-0">
                     <div className="flex items-center gap-2">
@@ -423,12 +505,20 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                 td({ children }) {
                                     return <td className="px-4 py-2 text-slate-300 text-xs leading-relaxed">{children}</td>;
                                 },
-                            }}>{message.content}</ReactMarkdown>
+                                // Block LLM-hallucinated image URLs -- only system-provided images
+                                // (FITS, web search grid) should render via their own components.
+                                img() {
+                                    return null;
+                                },
+                            }}>{message.content.replace(/!\[([^\]]*)\]\([^)]+\)/g, '')}</ReactMarkdown>
                         </div>
                     )}
 
                     {/* Streaming cursor */}
                     {isStreaming && <div className="w-2 h-5 bg-primary/80 animate-pulse rounded-sm" />}
+
+                    {/* Action bar: copy, like, dislike — shown at bottom on hover */}
+                    {hasContent && !isStreaming && <MessageActions message={message} />}
                 </div>
             </div>
         </div>

@@ -1,6 +1,6 @@
 # Quasar
 
-![Quasar UI](UI.png)
+![Quasar UI](assets/UI.png)
 
 **Quasar** is an open-source AI research assistant that makes ALMA Science Archive search and data retrieval as simple as asking a question in natural language. It is a *domain-specialized agent framework* that wraps any general-purpose LLM with the tools, knowledge, and orchestration needed to perform real radio astronomy tasks.
 
@@ -73,7 +73,7 @@ flowchart LR
 |---|---|
 | `core/` | Agent runtime, Conductor orchestration, tool registry, complexity detector, and sandboxed REPL |
 | `services/` | Domain logic for search, retrieval, FITS processing, plotting, CASA, auth, and storage |
-| `integrations/` | External system adapters for ALMA, NASA ADS, DataLink, TAP, CASA, and CARTA |
+| `integrations/` | External system adapters for ALMA, NASA ADS, DataLink, TAP, MAST, ESO, IRSA, SkyView |
 | `ui-pro/src/` | Next.js frontend |
 | `ui-pro/api/` | FastAPI backend and SSE endpoints |
 | `tests/` | Integration, evaluation, and verification scripts |
@@ -93,6 +93,7 @@ Optional configuration:
 - `TURSO_AUTH_TOKEN`
 - `JWT_SECRET`
 - `NEXT_PUBLIC_API_URL`
+- `DEFAULT_LLM_MODEL` (defaults to `gpt-4.1`)
 
 ## Configuration
 
@@ -108,6 +109,7 @@ Create a repository root `.env` file before starting the backend.
 | `TURSO_AUTH_TOKEN` | No | Authentication for Turso |
 | `JWT_SECRET` | No | JWT signing secret for authentication |
 | `NEXT_PUBLIC_API_URL` | No | Frontend API base URL override |
+| `DEFAULT_LLM_MODEL` | No | Backbone LLM model (default: `gpt-4.1`) |
 
 ## Local Development
 
@@ -189,8 +191,11 @@ python quasar.py query "Find ALMA observations of HL Tau in Band 6"
 ## Notes
 
 - The primary runtime surface is the Next.js frontend plus FastAPI backend under `ui-pro/`.
+- The default LLM model is `gpt-4.1`. Override via `DEFAULT_LLM_MODEL` in `.env`.
+- CASA and CARTA integrations are disabled by default due to high RAM requirements. Enable via `ENABLE_CASA_PIPELINE=true` and `ENABLE_CARTA_INTEGRATION=true`.
+- CI runs automatically on pushes to `main`/`beta` and all PRs via GitHub Actions.
 - The repository contains broader astronomy modules, but the strongest supported workflow is ALMA archive search and analysis support.
-- The implementation reference is maintained in `QUASAR_SYSTEM_DOCUMENTATION.md`.
+- The implementation reference is maintained in `docs/QUASAR_SYSTEM_DOCUMENTATION.md`.
 
 ## License
 

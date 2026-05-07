@@ -3,24 +3,42 @@
 RAG Service — Retrieval Augmented Generation for ALMA documentation.
 
 CALLED BY: core/agent.py (context retrieval before every LLM call)
-           scripts/ingest_alma_docs.py, scripts/ingest_manual.py
+           scripts/ingest_alma_docs.py, scripts/ingest_docs_folder.py
 CALLS:     Qdrant Cloud (vector store), OpenAI Embeddings
 
 PURPOSE:
-    Ingests PDFs (ALMA Manual, user docs) into chunked vector embeddings,
-    then performs semantic similarity search to provide relevant context
-    to the LLM before generating responses.
+    Ingests PDFs (ALMA Manual, user docs) into chunked vector embeddings
+    with rich metadata (year, category, cycle, etc.), then performs
+    semantic similarity search with optional metadata filtering to
+    provide relevant, up-to-date context to the LLM.
 
 COLLECTIONS (Qdrant):
-    alma_general      — Shared ALMA documentation
+    alma_general      — Shared ALMA documentation (with metadata)
     user_{id}_personal — Per-user uploaded documents
     proposal_rubrics  — TAC rubric guidelines
+
+METADATA SCHEMA (per chunk in alma_general):
+    doc_year       (int)  — Publication/version year (e.g. 2025)
+    doc_month      (int)  — Publication month (1-12) when available
+    doc_day        (int)  — Publication day (1-31) when available
+    doc_category   (str)  — Document category (e.g. "technical_handbook")
+    doc_title      (str)  — Human-readable title
+    alma_cycle     (str)  — ALMA cycle if detected (e.g. "Cycle 12")
+    source_file    (str)  — Original filename
+    page           (int)  — Page number within document
+    total_pages    (int)  — Total pages in document
+    chunk_index    (int)  — Sequential chunk position
+    ingested_at    (str)  — ISO timestamp of ingestion
+    file_size_kb   (int)  — File size in kilobytes
+    is_personal    (bool) — Whether this is a personal document
 """
 
 import os
+import re
 import uuid
-from typing import List, Dict, Any, Optional, Callable
-from langchain_community.document_loaders.pdf import PyPDFLoader
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Callable, Union
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_community.document_loaders.text import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
@@ -31,28 +49,263 @@ from services.vector_db import (
     search_vectors,
     scroll_all,
     delete_by_filter,
+    delete_collection,
+    create_payload_index,
     collection_count,
     ensure_collection,
 )
+from qdrant_client.models import PayloadSchemaType
 
 
-# Qdrant collection names
+# ──────────────────────────────────────────────────────────────────
+# Collection names
+# ──────────────────────────────────────────────────────────────────
 GENERAL_COLLECTION = "alma_general"
 RUBRICS_COLLECTION = "proposal_rubrics"
 
 def _personal_collection(user_id: str) -> str:
     """Return the Qdrant collection name for a user's personal docs."""
-    # Sanitise user_id (UUIDs contain hyphens which are fine for Qdrant)
     return f"user_{user_id}_personal"
 
+
+# ──────────────────────────────────────────────────────────────────
+# Document category mapping (filename pattern → category)
+# ──────────────────────────────────────────────────────────────────
+CATEGORY_MAP = {
+    "technical-handbook":     "technical_handbook",
+    "technical_handbook":     "technical_handbook",
+    "proposers-guide":        "proposers_guide",
+    "proposers_guide":        "proposers_guide",
+    "pipeline":               "pipeline",
+    "user-policies":          "user_policies",
+    "user_policies":          "user_policies",
+    "ot-usermanual":          "observing_tool",
+    "ot-refmanual":           "observing_tool",
+    "ot-quickstart":          "observing_tool",
+    "large-program":          "large_programs",
+    "large_program":          "large_programs",
+    "archive-primer":         "archive",
+    "archive_primer":         "archive",
+    "downloading":            "archive",
+    "scheduling-blocks":      "scheduling",
+    "scheduling_blocks":      "scheduling",
+    "snoopi":                 "snoopi",
+    "phase2":                 "phase2",
+    "review-process":         "review_process",
+    "review_process":         "review_process",
+    "principles-review":      "review_process",
+    "tap_columns":            "archive",
+    "tap-columns":            "archive",
+    "reference-manual":       "reference",
+    "reference_manual":       "reference",
+    "known-issues":           "pipeline",
+    "known_issues":           "pipeline",
+    "rlm":                    "internal",
+    "mem0":                   "internal",
+}
+
+# ALMA cycle → approximate year mapping
+CYCLE_YEAR_MAP = {
+    "1": 2013, "2": 2014, "3": 2015, "4": 2016, "5": 2017,
+    "6": 2018, "7": 2019, "8": 2020, "9": 2021, "10": 2022,
+    "11": 2023, "12": 2024, "13": 2025, "14": 2026,
+}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Metadata extraction helpers
+# ──────────────────────────────────────────────────────────────────
+
+def _extract_year_from_filename(filename: str) -> Optional[int]:
+    """Try to extract a year from the filename.
+
+    Matches patterns like: _2025.pdf, -2025., 2025_, (2025)
+    """
+    # Match 4-digit year in filename
+    matches = re.findall(r'(?:_|-|\b)(20[1-3]\d)(?:_|-|\.|\b)', filename)
+    if matches:
+        return int(matches[-1])  # Take last match (more likely to be version year)
+    return None
+
+
+def _extract_date_from_pdf_metadata(file_path: str) -> Dict[str, Optional[int]]:
+    """Extract year, month, day from PDF internal metadata (CreationDate, ModDate).
+
+    Returns:
+        Dict with keys 'year', 'month', 'day' (any may be None).
+    """
+    result: Dict[str, Optional[int]] = {"year": None, "month": None, "day": None}
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(file_path)
+        info = doc.metadata
+        doc.close()
+        if not info:
+            return result
+
+        # Try modDate first (more likely to reflect the version), then creationDate
+        for field in ["modDate", "creationDate"]:
+            val = info.get(field, "")
+            if val:
+                # PDF date format: D:YYYYMMDDHHmmSS+TZ or just raw string
+                date_match = re.search(r'D:(\d{4})(\d{2})(\d{2})', str(val))
+                if date_match:
+                    result["year"] = int(date_match.group(1))
+                    result["month"] = int(date_match.group(2))
+                    result["day"] = int(date_match.group(3))
+                    return result
+                # Fallback: just extract year
+                year_match = re.search(r'(20[1-3]\d)', str(val))
+                if year_match:
+                    result["year"] = int(year_match.group(1))
+                    return result
+    except Exception:
+        pass
+    return result
+
+
+def _extract_title_from_pdf(file_path: str, filename: str) -> str:
+    """Extract a human-readable title from PDF metadata or filename."""
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(file_path)
+        info = doc.metadata
+        doc.close()
+        if info:
+            title = info.get("title", "")
+            if title and len(title) > 3 and not title.startswith("Microsoft"):
+                return str(title).strip()
+    except Exception:
+        pass
+
+    # Fallback: clean the filename into a title
+    name = os.path.splitext(filename)[0]
+    name = re.sub(r'[-_]', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name.title()
+
+
+def _extract_year_from_content(pages_text: List[str], max_pages: int = 5) -> Optional[int]:
+    """Scan the first N pages for year references."""
+    for page_text in pages_text[:max_pages]:
+        # Look for "Cycle N" references first
+        cycle_match = re.search(r'Cycle\s+(\d{1,2})', page_text, re.IGNORECASE)
+        if cycle_match:
+            cycle_num = cycle_match.group(1)
+            if cycle_num in CYCLE_YEAR_MAP:
+                return CYCLE_YEAR_MAP[cycle_num]
+
+        # Look for standalone years in context like "2025 edition", "Version 2025"
+        year_match = re.search(
+            r'(?:version|edition|release|dated?|updated?|copyright|©)\s*:?\s*(20[1-3]\d)',
+            page_text,
+            re.IGNORECASE,
+        )
+        if year_match:
+            return int(year_match.group(1))
+
+    return None
+
+
+def _detect_alma_cycle(pages_text: List[str], max_pages: int = 10) -> Optional[str]:
+    """Detect the ALMA Cycle referenced in the document."""
+    for page_text in pages_text[:max_pages]:
+        match = re.search(r'Cycle\s+(\d{1,2})', page_text, re.IGNORECASE)
+        if match:
+            return f"Cycle {match.group(1)}"
+    return None
+
+
+def _classify_category(filename: str) -> str:
+    """Map a filename to a document category."""
+    fn_lower = filename.lower()
+    for pattern, category in CATEGORY_MAP.items():
+        if pattern in fn_lower:
+            return category
+    return "general"
+
+
+def extract_document_metadata(file_path: str, pages_text: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Extract rich metadata from a document file.
+
+    Args:
+        file_path:  Full path to the document.
+        pages_text: Optional list of page texts (to avoid re-reading).
+
+    Returns:
+        Dict with: doc_year, doc_category, doc_title, alma_cycle,
+                   file_size_kb, total_pages, ingested_at.
+    """
+    filename = os.path.basename(file_path)
+
+    # Date detection (priority: filename → PDF metadata → content scan)
+    year = _extract_year_from_filename(filename)
+    month = None
+    day = None
+
+    # Try PDF metadata for full date (year + month + day)
+    pdf_date = _extract_date_from_pdf_metadata(file_path)
+    if year is None:
+        year = pdf_date["year"]
+    month = pdf_date["month"]
+    day = pdf_date["day"]
+
+    if year is None and pages_text:
+        year = _extract_year_from_content(pages_text)
+    if year is None:
+        # Last resort: file modification time
+        try:
+            mtime = os.path.getmtime(file_path)
+            dt = datetime.fromtimestamp(mtime)
+            year = dt.year
+            if month is None:
+                month = dt.month
+            if day is None:
+                day = dt.day
+        except Exception:
+            year = 2024  # Safe default
+
+    # Category
+    category = _classify_category(filename)
+
+    # Title
+    title = _extract_title_from_pdf(file_path, filename)
+
+    # ALMA Cycle
+    alma_cycle = None
+    if pages_text:
+        alma_cycle = _detect_alma_cycle(pages_text)
+
+    # File size
+    try:
+        file_size_kb = int(os.path.getsize(file_path) / 1024)
+    except Exception:
+        file_size_kb = 0
+
+    return {
+        "doc_year": year,
+        "doc_month": month,
+        "doc_day": day,
+        "doc_category": category,
+        "doc_title": title,
+        "alma_cycle": alma_cycle or "",
+        "file_size_kb": file_size_kb,
+        "ingested_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
+# RAG Service
+# ──────────────────────────────────────────────────────────────────
 
 class RAGService:
     """
     Service for Retrieval Augmented Generation with Personal Collections
 
     Supports:
-    - General RAG (shared ALMA documentation)
+    - General RAG (shared ALMA documentation with rich metadata)
     - Personal RAG (user-specific documents)
+    - Metadata-filtered search (year, category, source)
     - Progress callbacks for UI
     - Combined search across both collections
     """
@@ -75,15 +328,19 @@ class RAGService:
         ensure_collection(self.rubrics_collection)
 
     # ------------------------------------------------------------------
-    # Document loading (unchanged)
+    # Document loading
     # ------------------------------------------------------------------
 
     def _load_document(self, file_path: str) -> List[Document]:
-        """Load document based on file type"""
+        """Load document based on file type.
+
+        Uses PyMuPDF4LLM for PDFs — significantly better at extracting text
+        from scientific documents with multi-column layouts, equations, and tables.
+        """
         ext = os.path.splitext(file_path)[1].lower()
 
         if ext == '.pdf':
-            loader = PyPDFLoader(file_path)
+            loader = PyMuPDF4LLMLoader(file_path)
         elif ext in ['.txt', '.md']:
             loader = TextLoader(file_path, encoding='utf-8')
         else:
@@ -92,25 +349,27 @@ class RAGService:
         return loader.load()
 
     # ------------------------------------------------------------------
-    # Ingestion
+    # Ingestion (with rich metadata)
     # ------------------------------------------------------------------
 
     def ingest_document(
         self,
         file_path: str,
         personal: bool = False,
-        progress_callback: Optional[Callable[[str, int], None]] = None
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Ingest a single document into the vector store
+        Ingest a single document into the vector store with rich metadata.
 
         Args:
             file_path: Path to the document
             personal: If True, add to personal collection
             progress_callback: Function(status_msg, percent) for progress updates
+            extra_metadata: Optional additional metadata to merge into each chunk
 
         Returns:
-            Dict with success status, chunk count, etc.
+            Dict with success status, chunk count, extracted metadata, etc.
         """
         try:
             filename = os.path.basename(file_path)
@@ -120,9 +379,18 @@ class RAGService:
                 progress_callback(f"Loading {filename}...", 10)
             documents = self._load_document(file_path)
 
-            # Step 2: Split into chunks
+            # Step 2: Extract rich metadata
             if progress_callback:
-                progress_callback(f"Splitting {len(documents)} pages...", 30)
+                progress_callback(f"Extracting metadata from {filename}...", 20)
+
+            pages_text = [doc.page_content for doc in documents]
+            doc_meta = extract_document_metadata(file_path, pages_text)
+            total_pages = len(documents)
+            doc_meta["total_pages"] = total_pages
+
+            # Step 3: Split into chunks
+            if progress_callback:
+                progress_callback(f"Splitting {total_pages} pages...", 30)
 
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
@@ -131,7 +399,17 @@ class RAGService:
             )
             chunks = text_splitter.split_documents(documents)
 
-            # Step 3: Create embeddings and upsert
+            # Guard: skip documents with no extractable text (e.g. scanned PDFs)
+            if not chunks:
+                if progress_callback:
+                    progress_callback(f"⚠ No text could be extracted from {filename}", 100)
+                return {
+                    "success": False,
+                    "error": "No text could be extracted (possibly a scanned/image-only PDF)",
+                    "filename": filename,
+                }
+
+            # Step 4: Create embeddings and upsert (in batches to avoid API limits)
             if progress_callback:
                 progress_callback(f"Creating embeddings for {len(chunks)} chunks...", 50)
 
@@ -141,28 +419,69 @@ class RAGService:
             else:
                 target = self.general_collection
 
-            # Embed all chunk texts
+            # Embed in batches of EMBED_BATCH_SIZE to avoid OpenAI rate limits
+            import time
+            EMBED_BATCH_SIZE = 100
             texts = [chunk.page_content for chunk in chunks]
-            vectors = self.embeddings.embed_documents(texts)
+            vectors = []
+            for batch_start in range(0, len(texts), EMBED_BATCH_SIZE):
+                batch_end = min(batch_start + EMBED_BATCH_SIZE, len(texts))
+                batch_texts = texts[batch_start:batch_end]
+                if progress_callback:
+                    pct = 50 + int(30 * batch_end / len(texts))
+                    progress_callback(
+                        f"Embedding batch {batch_start//EMBED_BATCH_SIZE + 1} "
+                        f"({batch_end}/{len(texts)} chunks)...", pct
+                    )
+                # Retry up to 3 times for transient API errors
+                for attempt in range(3):
+                    try:
+                        batch_vectors = self.embeddings.embed_documents(batch_texts)
+                        vectors.extend(batch_vectors)
+                        break
+                    except Exception as embed_err:
+                        if attempt < 2:
+                            wait = 2 ** (attempt + 1)
+                            print(f"[RAG] Embedding batch failed (attempt {attempt+1}), "
+                                  f"retrying in {wait}s: {embed_err}")
+                            time.sleep(wait)
+                        else:
+                            raise
 
-            # Build IDs and payloads
+            # Build IDs and payloads with rich metadata
             ids = [str(uuid.uuid4()) for _ in chunks]
             payloads = []
-            for chunk in chunks:
+            for idx, chunk in enumerate(chunks):
                 pay = {
                     "text": chunk.page_content,
                     "source_file": filename,
                     "is_personal": personal,
+                    "chunk_index": idx,
+                    # Rich metadata fields
+                    "doc_year": doc_meta["doc_year"],
+                    "doc_month": doc_meta.get("doc_month"),
+                    "doc_day": doc_meta.get("doc_day"),
+                    "doc_category": doc_meta["doc_category"],
+                    "doc_title": doc_meta["doc_title"],
+                    "alma_cycle": doc_meta["alma_cycle"],
+                    "total_pages": doc_meta["total_pages"],
+                    "file_size_kb": doc_meta["file_size_kb"],
+                    "ingested_at": doc_meta["ingested_at"],
                 }
                 if self.user_id and personal:
                     pay["user_id"] = self.user_id
-                # Carry over any existing metadata
+                # Merge extra metadata if provided
+                if extra_metadata:
+                    for k, v in extra_metadata.items():
+                        if k not in pay:
+                            pay[k] = v
+                # Carry over page number and other loader metadata
                 for k, v in chunk.metadata.items():
                     if k not in pay:
                         pay[k] = str(v) if not isinstance(v, (str, int, float, bool)) else v
                 payloads.append(pay)
 
-            # Upsert to Qdrant
+            # Step 5: Upsert to Qdrant
             if progress_callback:
                 progress_callback(f"Storing {len(chunks)} chunks in Qdrant...", 80)
 
@@ -174,9 +493,10 @@ class RAGService:
             return {
                 "success": True,
                 "filename": filename,
-                "pages": len(documents),
+                "pages": total_pages,
                 "chunks": len(chunks),
-                "personal": personal
+                "personal": personal,
+                "metadata": doc_meta,
             }
 
         except Exception as e:
@@ -204,50 +524,247 @@ class RAGService:
         return results
 
     # ------------------------------------------------------------------
-    # Search
+    # Collection management
     # ------------------------------------------------------------------
 
-    def search(self, query: str, k: int = 5, include_personal: bool = True) -> List[Document]:
+    def wipe_general_collection(self) -> bool:
+        """Delete and recreate the general collection (for clean re-ingestion)."""
+        deleted = delete_collection(self.general_collection)
+        ensure_collection(self.general_collection)
+        return deleted
+
+    def create_metadata_indexes(self):
+        """Create payload indexes on frequently filtered metadata fields."""
+        try:
+            create_payload_index(
+                self.general_collection, "doc_year", PayloadSchemaType.INTEGER
+            )
+        except Exception as e:
+            print(f"[RAG] Index on doc_year may already exist: {e}")
+
+        try:
+            create_payload_index(
+                self.general_collection, "doc_month", PayloadSchemaType.INTEGER
+            )
+        except Exception as e:
+            print(f"[RAG] Index on doc_month may already exist: {e}")
+
+        try:
+            create_payload_index(
+                self.general_collection, "doc_category", PayloadSchemaType.KEYWORD
+            )
+        except Exception as e:
+            print(f"[RAG] Index on doc_category may already exist: {e}")
+
+        try:
+            create_payload_index(
+                self.general_collection, "source_file", PayloadSchemaType.KEYWORD
+            )
+        except Exception as e:
+            print(f"[RAG] Index on source_file may already exist: {e}")
+
+    # ------------------------------------------------------------------
+    # Search (with metadata filtering)
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        include_personal: bool = True,
+        year: Optional[int] = None,
+        min_year: Optional[int] = None,
+        max_year: Optional[int] = None,
+        category: Optional[str] = None,
+        source_file: Optional[str] = None,
+    ) -> List[Document]:
         """
-        Search for relevant documents in both general and personal collections
+        Hybrid search: semantic (Qdrant) + keyword (BM25) reranking.
+
+        1. Over-fetches 4× from Qdrant using dense vector similarity.
+        2. Applies BM25 keyword scoring on the returned chunks.
+        3. Combines both rankings via Reciprocal Rank Fusion (RRF).
+        4. Returns the top-k results.
+
+        This catches exact acronym/keyword matches that pure embedding
+        similarity misses (e.g., "SB execution fraction" vs "scheduling
+        block execution fraction") with zero re-ingestion.
 
         Args:
             query: Search query
-            k: Number of results per collection
+            k: Number of final results to return
             include_personal: Whether to include personal docs
+            year: Exact year filter (e.g. 2025)
+            min_year: Minimum year (inclusive, e.g. 2024)
+            max_year: Maximum year (inclusive, e.g. 2025)
+            category: Document category filter (e.g. "technical_handbook")
+            source_file: Filter by specific source filename
 
         Returns:
-            Combined list of relevant documents
+            Combined list of relevant documents with metadata
         """
+        # Over-fetch factor: retrieve more candidates for BM25 reranking
+        fetch_k = k * 4
+
         results = []
         query_vector = self.embeddings.embed_query(query)
 
-        # Search general collection
+        # Build filter conditions
+        filter_conditions = {}
+        range_conditions = {}
+
+        if category:
+            filter_conditions["doc_category"] = category
+        if source_file:
+            filter_conditions["source_file"] = source_file
+
+        if year:
+            # Exact year match via range (gte=year, lte=year)
+            range_conditions["doc_year"] = {"gte": year, "lte": year}
+        else:
+            if min_year or max_year:
+                year_range = {}
+                if min_year:
+                    year_range["gte"] = min_year
+                if max_year:
+                    year_range["lte"] = max_year
+                range_conditions["doc_year"] = year_range
+
+        # Search general collection (over-fetch for reranking)
         try:
-            general_hits = search_vectors(self.general_collection, query_vector, limit=k)
+            general_hits = search_vectors(
+                self.general_collection,
+                query_vector,
+                limit=fetch_k,
+                filter_conditions=filter_conditions or None,
+                range_conditions=range_conditions or None,
+            )
             for hit in general_hits:
+                meta = {kk: vv for kk, vv in hit["payload"].items() if kk != "text"}
+                meta["_semantic_score"] = round(hit["score"], 4)
                 doc = Document(
                     page_content=hit["payload"].get("text", ""),
-                    metadata={k: v for k, v in hit["payload"].items() if k != "text"},
+                    metadata=meta,
                 )
                 results.append(doc)
         except Exception as e:
             print(f"General search failed: {e}")
 
-        # Search personal collection
+        # Search personal collection (no metadata filters — personal docs are unstructured)
         if include_personal and self.personal_collection:
             try:
-                personal_hits = search_vectors(self.personal_collection, query_vector, limit=k)
+                personal_hits = search_vectors(
+                    self.personal_collection,
+                    query_vector,
+                    limit=fetch_k,
+                )
                 for hit in personal_hits:
+                    meta = {kk: vv for kk, vv in hit["payload"].items() if kk != "text"}
+                    meta["_semantic_score"] = round(hit["score"], 4)
                     doc = Document(
                         page_content=hit["payload"].get("text", ""),
-                        metadata={k: v for k, v in hit["payload"].items() if k != "text"},
+                        metadata=meta,
                     )
                     results.append(doc)
             except Exception as e:
                 print(f"Personal search failed: {e}")
 
+        # Apply hybrid BM25 reranking if we have enough candidates
+        if len(results) > k:
+            results = self._hybrid_rerank(query, results, k)
+        else:
+            # Not enough candidates to rerank — just set _score = _semantic_score
+            for doc in results:
+                doc.metadata["_score"] = doc.metadata.get("_semantic_score", 0.0)
+
         return results
+
+    @staticmethod
+    def _hybrid_rerank(
+        query: str,
+        candidates: List[Document],
+        k: int,
+        semantic_weight: float = 0.7,
+        bm25_weight: float = 0.3,
+        rrf_k: int = 60,
+    ) -> List[Document]:
+        """Rerank candidates using Reciprocal Rank Fusion (semantic + BM25).
+
+        Combines semantic similarity rank (from Qdrant) with BM25 keyword
+        relevance rank. Uses RRF: score = Σ (weight / (rrf_k + rank)).
+
+        Args:
+            query:           The user's search query.
+            candidates:      Over-fetched Document list with _semantic_score.
+            k:               Number of results to return after reranking.
+            semantic_weight: Weight for the semantic (embedding) signal.
+            bm25_weight:     Weight for the BM25 (keyword) signal.
+            rrf_k:           RRF smoothing constant (standard is 60).
+
+        Returns:
+            Top-k documents sorted by combined RRF score.
+        """
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            # Fallback: if rank_bm25 not installed, return top-k by semantic only
+            candidates.sort(
+                key=lambda d: d.metadata.get("_semantic_score", 0), reverse=True
+            )
+            for doc in candidates[:k]:
+                doc.metadata["_score"] = doc.metadata.get("_semantic_score", 0.0)
+            return candidates[:k]
+
+        if not candidates:
+            return []
+
+        # Tokenize for BM25 (simple whitespace + lowercase)
+        tokenized_corpus = [
+            doc.page_content.lower().split() for doc in candidates
+        ]
+        tokenized_query = query.lower().split()
+
+        # Build BM25 index over the candidate set
+        bm25 = BM25Okapi(tokenized_corpus)
+        bm25_scores = bm25.get_scores(tokenized_query)
+
+        # Build semantic rank (already sorted by Qdrant score)
+        semantic_ranked = sorted(
+            range(len(candidates)),
+            key=lambda i: candidates[i].metadata.get("_semantic_score", 0),
+            reverse=True,
+        )
+        semantic_rank = {idx: rank for rank, idx in enumerate(semantic_ranked)}
+
+        # Build BM25 rank
+        bm25_ranked = sorted(
+            range(len(candidates)),
+            key=lambda i: bm25_scores[i],
+            reverse=True,
+        )
+        bm25_rank = {idx: rank for rank, idx in enumerate(bm25_ranked)}
+
+        # Reciprocal Rank Fusion
+        rrf_scores = []
+        for i in range(len(candidates)):
+            sem_rrf = semantic_weight / (rrf_k + semantic_rank[i])
+            bm25_rrf = bm25_weight / (rrf_k + bm25_rank[i])
+            combined = sem_rrf + bm25_rrf
+            rrf_scores.append((i, combined))
+
+        # Sort by combined RRF score
+        rrf_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Return top-k with combined score
+        reranked = []
+        for idx, score in rrf_scores[:k]:
+            doc = candidates[idx]
+            doc.metadata["_score"] = round(score, 6)
+            doc.metadata["_bm25_score"] = round(float(bm25_scores[idx]), 4)
+            doc.metadata["_reranked"] = True
+            reranked.append(doc)
+
+        return reranked
 
     # ------------------------------------------------------------------
     # Rubrics
@@ -291,7 +808,7 @@ class RAGService:
             return [
                 Document(
                     page_content=h["payload"].get("text", ""),
-                    metadata={k: v for k, v in h["payload"].items() if k != "text"},
+                    metadata={kk: vv for kk, vv in h["payload"].items() if kk != "text"},
                 )
                 for h in hits
             ]
@@ -313,14 +830,16 @@ class RAGService:
         try:
             cnt = collection_count(self.general_collection)
             stats["general"] = {"status": "ready" if cnt > 0 else "empty", "count": cnt}
-        except:
+        except Exception as e:
+            print(f"General collection stats failed: {e}")
             stats["general"]["status"] = "error"
 
         if self.personal_collection:
             try:
                 cnt = collection_count(self.personal_collection)
                 stats["personal"] = {"status": "ready" if cnt > 0 else "empty", "count": cnt}
-            except:
+            except Exception as e:
+                print(f"Personal collection stats failed: {e}")
                 stats["personal"]["status"] = "error"
 
         return stats
@@ -338,8 +857,8 @@ class RAGService:
                 if sf:
                     files.add(sf)
             return sorted(list(files))
-        except:
-            pass
+        except Exception as e:
+            print(f"Get personal documents failed: {e}")
         return []
 
     def delete_personal_document(self, filename: str) -> bool:

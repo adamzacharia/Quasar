@@ -1,0 +1,171 @@
+# ALMA Reviewer Guidelines
+# Source: https://almascience.eso.org/proposing/alma-proposal-review/guidelines-for-reviewers
+# Scraped: 2026-04-27
+
+## Role of a Reviewer
+
+As an ALMA proposal reviewer, you play a key role in ensuring a fair, competitive, and transparent evaluation process. Your rankings and written reviews help select the most compelling proposals and provide valuable guidance to proposers and fellow reviewers.
+
+Peer review is vital but challenging. It requires careful analysis, clear communication, and awareness of potential biases. To ensure fairness, evaluate each proposal based on its merits while minimizing any biases that could unintentionally influence your judgment.
+
+## Preparation Steps
+
+1. Allocate sufficient time: Set aside enough time to thoroughly review the proposals. This includes reading each proposal, drafting your reviews, finalizing your rankings, and re-reading your reviews for clarity and accuracy. For distributed peer review, expect to spend 2-3 days reviewing a Proposal Set (i.e., 10 proposals).
+
+2. Mitigate unconscious bias: Unconscious bias can unintentionally influence your evaluations. Recognizing and minimizing this bias is important to ensure fairness.
+
+3. Understand the review criteria: Familiarize yourself with the review criteria for evaluating proposals.
+
+4. Familiarize yourself with key policies: Read the Code of Conduct and Confidentiality, policy on Generative Artificial Intelligence use, Criteria for Conflicts of Interest, and Role of Mentors for non-PhD Reviewers to ensure a fair and ethical review process.
+
+## Code of Conduct and Confidentiality
+
+All participants in the review process are expected to behave in an ethical manner.
+- Reviewers will judge proposals solely on their scientific merit.
+- Reviewers will be mindful of bias in all contexts.
+- Reviewers will declare all major conflicts of interest.
+- Reviewers will write constructive reviews and avoid any inappropriate language.
+- Reviewers will not use generative Artificial Intelligence (GAI) to evaluate or rank proposals.
+
+All proposal materials related to the review process are strictly confidential.
+- The assigned proposals should not be distributed or used in any manner not directly related to the review process.
+- Any data, intellectual property, and non-public information shown in the proposals may be used only for the purpose of carrying out the requested proposal review.
+- The assigned proposals and the reviews may not be discussed with anyone other than the Proposal Handling Team, or the assigned mentor when applicable.
+- Reviewers and mentors will not input any part of the assigned proposals into GAI or machine learning tools.
+- All electronic and paper copies of the proposal materials must be destroyed as soon as a reviewer completes the proposal review process.
+
+## Conflicts of Interest
+
+A major conflict of interest occurs when a reviewer's personal or work interests would benefit if the proposal under review is accepted or rejected.
+
+Who to include in the conflicts-of-interest list:
+- Close collaborators: Defined as a substantial collaboration on three or more papers within the past three years or an active, substantial collaboration on a current project.
+- Students and postdocs under supervision of the reviewer within the past three years.
+- A reviewer's supervisor (for student and postdoc reviewers).
+- Close personal ties (e.g., family member, partner) that are ALMA users.
+- Other reasons: Any other circumstances where the reviewer believes a major conflict exists.
+
+What is NOT a conflict of interest:
+- Suspecting the identity of the proposal team
+- Lack of expertise with a given proposal
+
+## Mitigating Unconscious Bias
+
+Bias in the review process occurs when a reviewer unknowingly favors or disfavors a proposal for reasons unrelated to its scientific merit. These biases are shaped by culture and personal experiences. Common examples include biases based on culture, age, prestige, language, gender, and institutional affiliation.
+
+Cognitive biases such as anchoring (overemphasizing initial impressions), confirmation bias (seeking evidence to confirm preexisting beliefs), and the halo effect (allowing a researcher's reputation to influence evaluations) can unintentionally undermine fairness.
+
+Steps to mitigate bias:
+- Allow Sufficient Time: Avoid rushing through reviews, as bias tends to increase under time pressure.
+- Use a Structured Approach: Apply the review criteria consistently across all proposals. Take notes and base feedback on specific examples from the proposal.
+- Actively Reflect: Be mindful of how initial impressions or assumptions may influence your evaluation.
+- Justify your assessments: Support evaluations with specific examples from the proposal and relevant literature references.
+- Follow dual-anonymous guidelines: Avoid speculating about the identity or affiliation of the proposers.
+
+## Review Criteria
+
+Each proposal contains the following sections which reviewers are required to read:
+- Abstract
+- Scientific Justification
+- Technical Justification
+
+### 1. Scientific Merit
+
+Assess the overall scientific merit of the proposed investigation and its potential contribution to the advancement of scientific knowledge:
+- Does the proposal clearly indicate which important, outstanding questions will be addressed?
+- Will the proposed observations have a high scientific impact on this particular field and address the specific science goals of the proposal?
+- Does the proposal clearly describe how the data will be analyzed in order to achieve the science goals?
+
+Note: ALMA encourages reviewers to consider well-designed high-risk/high-impact proposals even if there is no guarantee of a positive outcome or detection.
+
+### 2. Suitability of Observations
+
+Evaluate the suitability of the observations to achieve the scientific goals:
+- Is the choice of target (or targets) clearly described and well justified?
+- Are the requested signal-to-noise ratio, angular resolution, largest angular scale, and spectral setup sufficient to achieve the science goals well justified?
+- Does the proposal justify why new observations are needed to achieve the science goals?
+- For Joint Proposals, does the proposal clearly describe why observations from multiple observatories are required?
+
+Important: Base your assessment solely on the content of the proposal according to the above criteria.
+
+### 3. Technical Feasibility
+
+- The OT validates most technical aspects of the proposal. Reviewers should assume that the OT technical validation of the proposal is correct.
+- Reviewers should consider if the requested signal-to-noise ratio, angular resolution, largest angular scale, and spectral setup are sufficient to achieve the scientific goals and are well justified.
+- Reviewers should not downgrade a proposal based solely on the requested observation time.
+- Reviewers should not consider the scheduling feasibility in their rankings.
+
+### Additional Criteria for Large Programs
+
+1. Scientific impact: Does the Large Program address a strategic scientific issue and have the potential to lead to a major advance or breakthrough in the field that cannot be achieved by combining regular proposals?
+2. Value of data products: Are the data products appropriate given the scope of the proposal? Will they be valuable to the broader scientific community?
+3. Publication plan: Is the proposed publication plan appropriate for the scope and goals of the project?
+4. Team organization and resources: Is the organization of the team and available computing resources sufficient to complete the project in a timely fashion?
+5. Team expertise: The APRC evaluates team expertise statements after completing scientific rankings.
+6. Technical and scheduling feasibility: JAO assesses separately and reports to the APRC.
+
+## How to Write a Useful Proposal Review
+
+### High-Quality Review Characteristics
+- Strengths and weaknesses are clearly identified and explained.
+- Suggestions are actionable, relevant, and well-connected to the scientific goals.
+- The tone is professional, objective, and respectful.
+
+### Guidelines for Writing Effective Reviews
+
+1. Highlight strengths and weaknesses:
+   - A review should not simply summarize the proposal.
+   - Clearly outline both strengths and weaknesses.
+   - Focus on major strengths and major weaknesses.
+   - Ensure that the balance of strengths and weaknesses aligns with your ranking.
+
+2. Be objective and specific:
+   - Offer specific, constructive feedback on how the proposal could be improved.
+   - Support your statements with references or examples from the proposal.
+   - Avoid vague statements that could apply to any proposal.
+
+3. Be professional and constructive:
+   - Avoid inflammatory or inappropriate language.
+   - Do not use sarcasm or any insulting language.
+
+4. Be concise:
+   - The quality of a review is more important than its length. Typical reviews are about 6-8 sentences.
+
+5. Be aware of unconscious bias.
+
+6. Other best practices:
+   - Use complete sentences.
+   - Do not include comments about scheduling feasibility.
+   - Do not include remarks about possible dual anonymous violations in the review.
+   - Do not include explicit references to other proposals.
+   - Do not ask questions in your review. State weaknesses directly and clearly.
+   - Critique the proposal, not the proposal team (e.g., "The proposal did not..." instead of "The PI did not...").
+
+### Examples of Good vs Bad Reviews
+
+HIGH-QUALITY examples:
+- "The target is well motivated, as it is the closest protostar of its kind, offering excellent spatial resolution for studying the outflow."
+- "The proposal should discuss the probability that the candidate high-redshift galaxy is an interloper at lower redshift, which is critical for interpreting the results."
+- "The proposal could better demonstrate that a signal-to-noise ratio of 5 can reliably measure the spectral index and distinguish between the two models."
+
+ADEQUATE examples (lack detail):
+- "The target is interesting given its proximity."
+- "The redshift of the candidate galaxy is uncertain."
+- "It is not clear that a signal-to-noise of 5 is good enough."
+
+LOW-QUALITY examples (vague or dismissive):
+- "The target seems interesting."
+- "The science goals are unclear."
+- "The proposal has typos."
+- "The proposal is not a good use of telescope time."
+
+## Review Quality Monitoring
+
+The PHT monitors review quality through spot checks and automated flagging systems.
+
+Common reasons for flagging a review for revision:
+- Primarily summarizes the proposal without evaluating strengths and weaknesses
+- Contains generic or vague feedback
+- Shows a misalignment between written comments and assigned ranking
+- Reuses identical review text across multiple proposals
+- Uses unprofessional language

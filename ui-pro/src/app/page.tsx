@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { ChatArea } from "@/components/ChatArea";
 import { useChatStore } from "../lib/store";
 import { AuthModal } from "@/components/AuthModal";
+import { OnboardingOverlay, useShowOnboarding } from "@/components/OnboardingOverlay";
 import { useEffect, useState } from "react";
 
 export default function Home() {
@@ -11,6 +12,7 @@ export default function Home() {
   const toggleSidebar = useChatStore((s) => s.toggleSidebar);
   const [mounted, setMounted] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+  const [showOnboarding, dismissOnboarding] = useShowOnboarding();
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -60,9 +62,21 @@ export default function Home() {
       {/* Auth Modal Overlay */}
       <AuthModal />
 
-      <div className="fixed top-[-10%] right-[-5%] w-[500px] h-[500px] bg-primary/5 rounded-full blur-3xl pointer-events-none" />
-      <div className="fixed bottom-[-10%] left-[-5%] w-[600px] h-[600px] bg-accent-purple/5 rounded-full blur-3xl pointer-events-none" />
-      <div className="fixed inset-0 noise-overlay opacity-[0.03] pointer-events-none" />
+      {/* Onboarding Tutorial — first visit only */}
+      {showOnboarding && <OnboardingOverlay onComplete={dismissOnboarding} />}
+
+      {/* Replaced heavy CSS blurs with GPU-safe radial gradients to prevent monitor-handoff crashes */}
+      <div 
+        className="fixed top-[-10%] right-[-5%] w-[500px] h-[500px] pointer-events-none" 
+        style={{ background: 'radial-gradient(circle, rgba(244,113,181,0.05) 0%, rgba(244,113,181,0) 70%)' }} 
+      />
+      <div 
+        className="fixed bottom-[-10%] left-[-5%] w-[600px] h-[600px] pointer-events-none" 
+        style={{ background: 'radial-gradient(circle, rgba(168,85,247,0.05) 0%, rgba(168,85,247,0) 70%)' }} 
+      />
+      
+      {/* Temporarily disabled SVG noise overlay as feTurbulence can also crash GPU on 4k resizes */}
+      {/* <div className="fixed inset-0 noise-overlay opacity-[0.03] pointer-events-none" /> */}
     </>
   );
 }

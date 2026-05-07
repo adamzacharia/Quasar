@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, Copy } from "lucide-react";
+import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, Copy, BarChart3, Download, Sparkles, Sun, Moon } from "lucide-react";
 import { useAuthStore } from "../lib/auth-store";
+import { resetOnboarding } from "./OnboardingOverlay";
+import { useThemeStore } from "../lib/theme-store";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -775,6 +777,198 @@ function MCPServersPanel() {
     );
 }
 
+// ── Admin Analytics Panel ─────────────────────────────────────────────────
+
+const ADMIN_EMAILS = ["adamandspace@gmail.com"];
+
+interface AnalyticsSummary {
+    total_chats: number;
+    unique_users: number;
+    anonymous_chats: number;
+    top_models: { model: string; count: number }[];
+    top_tools: { tool: string; count: number }[];
+    total_page_views: number;
+    unique_visitors: number;
+    feedback?: { likes: number; dislikes: number; total: number };
+}
+
+function AnalyticsPanel() {
+    const { token } = useAuthStore();
+    const [data, setData] = useState<AnalyticsSummary | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [downloading, setDownloading] = useState<string | null>(null);
+
+    const downloadFile = async (url: string, filename: string, key: string) => {
+        if (!token) return;
+        setDownloading(key);
+        try {
+            const res = await fetch(`${API_BASE}${url}`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const blob = await res.blob();
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(a.href);
+        } catch (e: unknown) {
+            alert(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        setDownloading(null);
+    };
+
+    useEffect(() => {
+        if (!token) return;
+        setLoading(true);
+        fetch(`${API_BASE}/api/admin/analytics/summary`, {
+            headers: { Authorization: `Bearer ${token}` },
+        })
+            .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+            .then(d => { setData(d); setError(null); })
+            .catch(e => setError(e.message))
+            .finally(() => setLoading(false));
+    }, [token]);
+
+    if (loading) return <div className="flex items-center justify-center h-full gap-2 text-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" /> Loading analytics...</div>;
+    if (error) return <div className="flex items-center justify-center h-full text-red-400 text-sm">Error: {error}</div>;
+    if (!data) return null;
+
+    const statCards = [
+        { label: "Total Chats", value: data.total_chats, color: "text-blue-400" },
+        { label: "Unique Users", value: data.unique_users, color: "text-emerald-400" },
+        { label: "Anonymous", value: data.anonymous_chats, color: "text-slate-400" },
+        { label: "Page Views", value: data.total_page_views, color: "text-purple-400" },
+        { label: "Unique Visitors", value: data.unique_visitors, color: "text-cyan-400" },
+    ];
+
+    return (
+        <div className="p-6 space-y-6 overflow-y-auto h-full">
+            <div>
+                <h3 className="text-sm font-semibold text-white mb-1">Platform Analytics</h3>
+                <p className="text-xs text-slate-400">Usage metrics stored in Turso cloud DB (persistent across deploys).</p>
+            </div>
+
+            {/* Stat cards */}
+            <div className="grid grid-cols-3 gap-3">
+                {statCards.map(s => (
+                    <div key={s.label} className="bg-slate-800/60 border border-slate-700/50 rounded-xl px-4 py-3">
+                        <p className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">{s.label}</p>
+                        <p className={`text-2xl font-bold ${s.color} mt-1`}>{s.value.toLocaleString()}</p>
+                    </div>
+                ))}
+            </div>
+
+            {/* Feedback */}
+            {data.feedback && data.feedback.total > 0 && (
+                <div>
+                    <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Response Feedback</h4>
+                    <div className="flex gap-3">
+                        <div className="flex-1 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-4 py-3 text-center">
+                            <p className="text-2xl font-bold text-emerald-400">👍 {data.feedback.likes}</p>
+                            <p className="text-[10px] text-emerald-400/60 mt-1">Likes</p>
+                        </div>
+                        <div className="flex-1 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3 text-center">
+                            <p className="text-2xl font-bold text-red-400">👎 {data.feedback.dislikes}</p>
+                            <p className="text-[10px] text-red-400/60 mt-1">Dislikes</p>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Top models */}
+            {data.top_models.length > 0 && (
+                <div>
+                    <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Top Models</h4>
+                    <div className="space-y-1.5">
+                        {data.top_models.map((m, i) => (
+                            <div key={m.model} className="flex items-center gap-3 bg-slate-800/40 rounded-lg px-3 py-2">
+                                <span className="text-xs font-bold text-slate-500 w-5">{i + 1}</span>
+                                <span className="text-sm text-slate-200 flex-1 font-mono">{m.model}</span>
+                                <span className="text-xs text-slate-400 font-semibold">{m.count} calls</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Top tools */}
+            {data.top_tools.length > 0 && (
+                <div>
+                    <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Top Tools</h4>
+                    <div className="space-y-1.5">
+                        {data.top_tools.map((t, i) => (
+                            <div key={t.tool} className="flex items-center gap-3 bg-slate-800/40 rounded-lg px-3 py-2">
+                                <span className="text-xs font-bold text-slate-500 w-5">{i + 1}</span>
+                                <span className="text-sm text-slate-200 flex-1 font-mono">{t.tool}</span>
+                                <span className="text-xs text-slate-400 font-semibold">{t.count}×</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Export / Download */}
+            <div>
+                <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Export Data</h4>
+                <div className="grid grid-cols-2 gap-2">
+                    <button
+                        onClick={() => downloadFile("/api/admin/analytics/export?format=csv", `quasar_analytics_${new Date().toISOString().slice(0,10)}.csv`, "csv")}
+                        disabled={downloading === "csv"}
+                        className="flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium transition-colors disabled:opacity-50"
+                    >
+                        {downloading === "csv" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                        Chat Analytics (CSV)
+                    </button>
+                    <button
+                        onClick={() => downloadFile("/api/admin/analytics/export?format=json", `quasar_analytics_${new Date().toISOString().slice(0,10)}.json`, "json")}
+                        disabled={downloading === "json"}
+                        className="flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium transition-colors disabled:opacity-50"
+                    >
+                        {downloading === "json" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                        Chat Analytics (JSON)
+                    </button>
+                    <button
+                        onClick={() => downloadFile("/api/admin/feedback/export", `quasar_feedback_${new Date().toISOString().slice(0,10)}.json`, "feedback")}
+                        disabled={downloading === "feedback"}
+                        className="flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium transition-colors disabled:opacity-50"
+                    >
+                        {downloading === "feedback" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                        Feedback Data (JSON)
+                    </button>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-2">Includes: user ID, email, prompt, response, model used, tools called, timestamps, response time.</p>
+            </div>
+        </div>
+    );
+}
+
+// ── Theme Toggle Switch ───────────────────────────────────────────────────
+
+function ThemeSwitch() {
+    const { theme, toggle } = useThemeStore();
+    const isDark = theme === "dark";
+    return (
+        <button
+            onClick={toggle}
+            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+            title={`Switch to ${isDark ? "light" : "dark"} mode`}
+        >
+            <div className="flex items-center gap-2.5">
+                {isDark ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
+                <span>{isDark ? "Dark Mode" : "Light Mode"}</span>
+            </div>
+            {/* Toggle pill */}
+            <div className={`relative w-9 h-5 rounded-full transition-colors ${isDark ? "bg-slate-600" : "bg-primary/40"}`}>
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full shadow-sm transition-all duration-200 ${isDark ? "left-0.5 bg-slate-300" : "left-[18px] bg-primary"}`} />
+            </div>
+        </button>
+    );
+}
+
 // ── Main Settings Modal ───────────────────────────────────────────────────
 
 interface SettingsModalProps {
@@ -782,11 +976,13 @@ interface SettingsModalProps {
     onClose: () => void;
 }
 
-type TabType = 'personalization' | 'tools' | 'mcp';
+type TabType = 'personalization' | 'tools' | 'mcp' | 'analytics';
 
 export function SettingsModal({ open, onClose }: SettingsModalProps) {
     const backdropRef = useRef<HTMLDivElement>(null);
     const [currentTab, setCurrentTab] = useState<TabType>('personalization');
+    const { user } = useAuthStore();
+    const isAdmin = user?.username ? ADMIN_EMAILS.includes(user.username.toLowerCase()) : false;
 
     // Close on Escape
     useEffect(() => {
@@ -803,7 +999,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
             className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm"
             onClick={(e) => { if (e.target === backdropRef.current) onClose(); }}
         >
-            <div className="relative w-[850px] max-w-[95vw] h-[650px] max-h-[90vh] bg-[#0f1117] border border-slate-700/60 rounded-2xl shadow-2xl shadow-black/60 flex overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            <div className="relative w-[850px] max-w-[95vw] h-[650px] max-h-[90vh] border border-slate-700/60 rounded-2xl shadow-2xl shadow-black/60 flex overflow-hidden animate-in fade-in zoom-in-95 duration-200" style={{ background: 'var(--q-surface)' }}>
 
                 {/* Close button */}
                 <button
@@ -814,7 +1010,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 </button>
 
                 {/* Left nav */}
-                <div className="w-48 shrink-0 border-r border-slate-700/50 p-4 bg-[#0c0d12]">
+                <div className="w-48 shrink-0 border-r border-slate-700/50 p-4" style={{ background: 'var(--q-bg)' }}>
                     <p className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold px-2 mb-3">Settings</p>
                     
                     <div className="space-y-1">
@@ -841,20 +1037,47 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                             <span className="text-lg leading-none">🔌</span>
                             MCP Servers
                         </button>
+
+                        {isAdmin && (
+                            <button 
+                                onClick={() => setCurrentTab('analytics')}
+                                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${currentTab === 'analytics' ? "bg-amber-500/10 text-amber-400 border border-amber-500/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
+                            >
+                                <BarChart3 className="w-4 h-4" />
+                                Analytics
+                            </button>
+                        )}
+                    </div>
+
+                    {/* Bottom utilities */}
+                    <div className="mt-auto pt-4 border-t border-slate-700/50 mt-6 space-y-2">
+                        {/* Theme toggle */}
+                        <ThemeSwitch />
+
+                        {/* Restart Tutorial */}
+                        <button
+                            onClick={() => { resetOnboarding(); onClose(); window.location.reload(); }}
+                            className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+                        >
+                            <Sparkles className="w-4 h-4" />
+                            Restart Tutorial
+                        </button>
                     </div>
                 </div>
 
                 {/* Right content */}
-                <div className="flex-1 overflow-hidden flex flex-col bg-[#0f1117]">
+                <div className="flex-1 overflow-hidden flex flex-col" style={{ background: 'var(--q-surface)' }}>
                     <div className="px-6 py-5 border-b border-slate-700/50 shrink-0">
                         <h2 className="text-base font-semibold text-white">
-                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'tools' ? "Custom Tools" : "MCP Servers"}
+                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'tools' ? "Custom Tools" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
                         </h2>
                         <p className="text-xs text-slate-400 mt-0.5">
                             {currentTab === 'personalization' 
                                 ? "Your private knowledge base for smarter conversations" 
                                 : currentTab === 'tools'
                                 ? "Extend Quasar with your own Python agent tools"
+                                : currentTab === 'analytics'
+                                ? "Platform usage metrics and feedback data"
                                 : "Connect standard Model Context Protocol servers"}
                         </p>
                     </div>
@@ -863,6 +1086,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                         {currentTab === 'personalization' && <PersonalizationPanel />}
                         {currentTab === 'tools' && <CustomToolsPanel />}
                         {currentTab === 'mcp' && <MCPServersPanel />}
+                        {currentTab === 'analytics' && <AnalyticsPanel />}
                     </div>
                 </div>
             </div>

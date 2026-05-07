@@ -101,7 +101,7 @@ class SearchService:
         """
         try:
             return self.alminer_client.search_by_target(source_name)
-        except:
+        except Exception:
             return pd.DataFrame()
 
     def check_line_coverage(self, line_freq_ghz: float, z: float = 0.0, line_name: str = "Line") -> pd.DataFrame:

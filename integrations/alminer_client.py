@@ -314,7 +314,7 @@ class ALminerClient:
             # Cleanup temp file
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
             
             return image_bytes
@@ -342,7 +342,7 @@ class ALminerClient:
             
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
             
             return image_bytes
@@ -370,7 +370,7 @@ class ALminerClient:
             
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
             
             return image_bytes

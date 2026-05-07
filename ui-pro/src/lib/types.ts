@@ -3,7 +3,7 @@ import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 
 export type MessageRole = "user" | "assistant" | "system";
 
-export type MessageType = "text" | "data" | "papers" | "tool_call" | "image" | "critique" | "notebook";
+export type MessageType = "text" | "data" | "papers" | "tool_call" | "image" | "critique" | "notebook" | "web_sources";
 
 export interface NotebookData {
     title: string;
@@ -32,6 +32,19 @@ export interface Message {
     thinkingSteps?: ThoughtStep[];
     attachmentPreviews?: string[];  // base64 data URLs for images
     attachmentNames?: string[];     // names of attached documents
+    webSources?: WebSource[];       // clickable source cards from web search
+    webImages?: WebImage[];         // image grid from web search
+}
+
+export interface WebSource {
+    title: string;
+    url: string;
+    snippet: string;
+}
+
+export interface WebImage {
+    url: string;
+    description: string;
 }
 
 export interface Conversation {
@@ -85,6 +98,13 @@ export interface Paper {
     abstract?: string;
     relevanceScore?: number;
     isRadioPaper?: boolean;
+    // OpenAlex enrichment fields
+    fwci?: number | null;
+    citationPercentile?: number | null;
+    isTop1Percent?: boolean;
+    isTop10Percent?: boolean;
+    funders?: { name: string; id: string }[];
+    oaPdfUrl?: string;
 }
 
 export interface ToolCall {

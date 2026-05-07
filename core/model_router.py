@@ -1,10 +1,15 @@
 # core/model_router.py
 """
-Model Router — Route each subtask to the optimal LLM based on task type.
+Model Router — Route each Conductor subtask to the optimal OpenAI model.
 
-Uses a static routing table (tunable) that maps task categories to the
-best-suited model.  The agent already has clients for OpenAI, Anthropic,
-and Google Gemini from the multi-model routing work.
+Uses a 3-tier OpenAI cost ladder:
+  Tier 1 (heavy):  GPT-5.4      -- synthesis, scientific reasoning (expensive, smart)
+  Tier 2 (solid):  GPT-4.1      -- archive search, analysis, viz (solid tool-calling)
+  Tier 3 (cheap):  GPT-4.1-mini -- simple QA, web search, literature (cheap + fast)
+
+The routing table maps agent_type → model.  Falls back to text classification
+when agent_type is unknown.  HealthMonitor integration allows automatic
+fallback if a model starts failing.
 """
 
 from __future__ import annotations
@@ -26,16 +31,26 @@ class ModelRouter:
     Falls back to the default model if classification fails.
     """
 
+    # -- OpenAI-only cost ladder --------------------------------------------------
+    # Tier 1 (heavy): GPT-5.4      -- synthesis, scientific reasoning
+    # Tier 2 (solid): GPT-4.1      -- archive search, analysis, viz, code
+    # Tier 3 (cheap): GPT-4.1-mini -- simple QA, web search, literature
+    #
+    # Rationale: GPT-5.4 is ~10-20× more expensive than 4.1-mini.
+    # Reserve it for tasks that genuinely need intelligence (combining
+    # results, multi-step reasoning).  Archive search is tool-calling —
+    # GPT-4.1 handles that perfectly.  Literature search is just calling
+    # search_papers with a query — 4.1-mini is fine.
     ROUTING_TABLE: Dict[str, Dict[str, str]] = {
-        "archive_search":       {"model": "gpt-4o",          "reason": "Best tool-calling accuracy"},
-        "literature_review":    {"model": "gemini-2.0-pro",  "reason": "2M context for long papers"},
-        "scientific_reasoning": {"model": "claude-sonnet",   "reason": "Strong multi-step reasoning"},
-        "code_generation":      {"model": "gpt-4o",          "reason": "Best code generation"},
-        "data_analysis":        {"model": "gpt-4o",          "reason": "Reliable structured output"},
-        "synthesis":            {"model": "gemini-2.0-pro",  "reason": "Long context for aggregation"},
-        "simple_qa":            {"model": "gpt-4o-mini",     "reason": "Fast + cheap"},
-        "web_search":           {"model": "gpt-4o-mini",     "reason": "Simple tool calls"},
-        "visualization":        {"model": "gpt-4o",          "reason": "Code + tool calling"},
+        "archive_search":       {"model": "gpt-4.1",       "reason": "Solid tool-calling for archive queries"},
+        "literature_review":    {"model": "gpt-4.1-mini",  "reason": "Simple ADS search — cheap + fast"},
+        "scientific_reasoning": {"model": "gpt-5.4",       "reason": "Complex multi-step reasoning needs intelligence"},
+        "code_generation":      {"model": "gpt-4.1",       "reason": "Reliable code generation + tool calling"},
+        "data_analysis":        {"model": "gpt-4.1",       "reason": "Structured output for spectral analysis"},
+        "synthesis":            {"model": "gpt-5.4",       "reason": "Combining results requires deep reasoning"},
+        "simple_qa":            {"model": "gpt-4.1-mini",  "reason": "Fast + cheap for trivial questions"},
+        "web_search":           {"model": "gpt-4.1-mini",  "reason": "Simple tool calls"},
+        "visualization":        {"model": "gpt-4.1",       "reason": "Tool calling for FITS rendering"},
     }
 
     # Keywords for heuristic classification
@@ -74,7 +89,7 @@ class ModelRouter:
         ],
     }
 
-    def __init__(self, default_model: str = "gpt-4o"):
+    def __init__(self, default_model: str = "gpt-4.1"):
         self.default_model = default_model
         self.health_monitor = None  # Injected by agent.py
 

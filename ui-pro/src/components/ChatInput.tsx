@@ -1,7 +1,9 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square } from "lucide-react";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 interface AttachedFile {
     file: File;
@@ -19,11 +21,26 @@ interface ChatInputProps {
 export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: ChatInputProps) {
     const [value, setValue] = useState(initialValue);
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
+    const [hitCount, setHitCount] = useState<number | null>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (initialValue) { setValue(initialValue); inputRef.current?.focus(); } }, [initialValue]);
+
+    // ── Fetch hit count on mount (with timeout to avoid slow renders) ──
+    useEffect(() => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 4000);
+        fetch(`${API_BASE}/api/analytics/hit`, { signal: controller.signal })
+            .then(res => res.json())
+            .then(data => {
+                if (typeof data.hits === "number") setHitCount(data.hits);
+            })
+            .catch(() => {/* silent fail — timeout or network error */})
+            .finally(() => clearTimeout(timeout));
+        return () => { controller.abort(); clearTimeout(timeout); };
+    }, []);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const files = Array.from(e.target.files || []);
@@ -65,7 +82,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
     };
 
     return (
-        <div className="w-full px-4 pb-6 pt-4 z-20">
+        <div className="w-full px-4 pb-3 pt-2 z-20">
             <div className="max-w-3xl mx-auto relative">
                 <form onSubmit={handleSubmit} className="relative group">
                     <div className="absolute inset-0 bg-primary/20 rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
@@ -124,6 +141,10 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                 className="flex-1 bg-transparent border-none outline-none text-white placeholder-slate-500 focus:ring-0 text-sm"
                                 disabled={isStreaming}
                             />
+                            {/* Keyboard shortcut hint */}
+                            {!isStreaming && value.trim() && (
+                                <span className="text-[10px] text-slate-500 font-mono mr-1 select-none hidden sm:inline">⏎</span>
+                            )}
                             {isStreaming ? (
                                 <button
                                     type="button"
@@ -145,10 +166,11 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                         </div>
                     </div>
                 </form>
-                <div className="text-center mt-3">
+                <div className="text-center mt-2">
                     <p className="text-[10px] text-slate-600">
                         QUASAR may produce inaccurate information.
                         <span className="text-slate-700 ml-2">· Accepts images, PDFs, FITS, CSV</span>
+                        <span className={`text-slate-700 ml-2 transition-opacity duration-500 ${hitCount !== null ? 'opacity-100' : 'opacity-0'}`}>· Visits: <span className="text-primary/50 font-mono tabular-nums">{hitCount !== null ? hitCount.toLocaleString() : '—'}</span></span>
                     </p>
                 </div>
             </div>

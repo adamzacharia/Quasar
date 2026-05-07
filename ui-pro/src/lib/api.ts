@@ -19,7 +19,18 @@ export interface StreamCallbacks {
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
     onTaskList?: (list: Record<string, unknown>) => void;
+    onPlanReview?: (plan: {
+        conversationId: string;
+        title: string;
+        subtasks: { id: string; description: string; agentType: string; dependsOn: string[] }[];
+        reasoning: string;
+        iteration: number;
+        maxIterations: number;
+        query: string;
+    }) => void;
+    onWebSources?: (data: { sources: { title: string; url: string; snippet: string }[]; images: { url: string; description: string }[]; query: string }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
+    onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null }) => void;
     onComplete: (fullResponse: string) => void;
     onError: (error: string) => void;
 }
@@ -113,8 +124,14 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onTaskUpdate(parsed);
                         } else if (parsed.type === "task_list" && callbacks.onTaskList) {
                             callbacks.onTaskList(parsed);
+                        } else if (parsed.type === "plan_review" && callbacks.onPlanReview) {
+                            callbacks.onPlanReview(parsed);
                         } else if (parsed.type === "conversation_meta" && callbacks.onConversationMeta) {
                             callbacks.onConversationMeta(parsed);
+                        } else if (parsed.type === "web_sources" && callbacks.onWebSources) {
+                            callbacks.onWebSources(parsed);
+                        } else if (parsed.type === "download_progress" && callbacks.onDownloadProgress) {
+                            callbacks.onDownloadProgress(parsed);
                         } else if (parsed.type === "error") {
                             callbacks.onError(parsed.content);
                             return;
@@ -132,6 +149,32 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
         if (error instanceof DOMException && error.name === "AbortError") return; // user cancelled
         callbacks.onError(error instanceof Error ? error.message : "Request failed.");
     }
+}
+
+export async function submitPlanFeedback(
+    conversationId: string,
+    approve: boolean,
+    feedback: string = "",
+    token?: string,
+): Promise<{ status: string; action: string }> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE}/api/plan-feedback`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+            conversation_id: conversationId,
+            approve,
+            feedback,
+        }),
+    });
+
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Plan feedback failed: ${errText}`);
+    }
+    return res.json();
 }
 
 export async function getModels(): Promise<string[]> {
@@ -236,13 +279,24 @@ export async function fetchConversationMessages(conversationId: string, token: s
 }
 
 export async function deleteConversationApi(conversationId: string, token: string): Promise<boolean> {
-    try {
-        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
-            method: "DELETE",
-            headers: authHeaders(token),
-        });
-        return res.ok;
-    } catch {
-        return false;
+    // Retry up to 3 times — Render cold starts can cause transient failures
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+                method: "DELETE",
+                headers: { "Authorization": `Bearer ${token}` },
+            });
+            if (res.ok) {
+                console.log(`[Quasar] Deleted conversation ${conversationId}`);
+                return true;
+            }
+            console.warn(`[Quasar] Delete attempt ${attempt} failed: HTTP ${res.status}`);
+        } catch (e) {
+            console.warn(`[Quasar] Delete attempt ${attempt} error:`, e);
+        }
+        // Wait before retry (500ms, 1s, 2s)
+        if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 500));
     }
+    console.error(`[Quasar] Failed to delete conversation ${conversationId} after 3 attempts`);
+    return false;
 }

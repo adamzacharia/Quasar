@@ -1,6 +1,6 @@
-﻿"use client";
+"use client";
 
-import { ChevronDown, CheckCircle2 } from "lucide-react";
+import { ChevronDown, CheckCircle2, Brain, Loader2 } from "lucide-react";
 import { useState, useEffect, type ReactNode } from "react";
 
 export interface ThoughtStep {
@@ -27,43 +27,77 @@ export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceC
     }, [status]);
 
     const isOpen = forceCollapsed ? false : (status === "running" || steps.length <= 2);
+    const isRunning = status === "running";
+    const displayTitle = isRunning ? title : (title === "Thinking" ? "Thought" : title);
 
     return (
-        <div className="bg-[#1d2e4a]/50 border border-slate-700/50 rounded-2xl overflow-hidden max-w-2xl my-3">
+        <div className="max-w-2xl my-3 rounded-xl overflow-hidden transition-all duration-300"
+             style={{
+                 background: 'var(--q-glass-bg)',
+                 border: `1px solid ${isRunning ? 'rgba(244, 113, 181, 0.2)' : 'var(--q-glass-border)'}`,
+             }}>
             <details className="group" open={isOpen}>
-                <summary className="flex items-center justify-between p-4 cursor-pointer list-none hover:bg-white/5 transition-colors">
+                <summary className="flex items-center justify-between px-4 py-3 cursor-pointer list-none select-none hover:bg-[var(--q-glass-hover)] transition-colors">
                     <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 flex items-center justify-center bg-primary/20 rounded-lg">
-                            <span className="text-lg">🧠</span>
+                        {/* Icon */}
+                        <div className={`w-7 h-7 flex items-center justify-center rounded-lg transition-colors ${
+                            isRunning
+                                ? "bg-primary/20"
+                                : "bg-emerald-500/15"
+                        }`}>
+                            {isRunning ? (
+                                <Loader2 className="w-4 h-4 text-primary animate-spin" />
+                            ) : (
+                                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                            )}
                         </div>
-                        <div className="flex flex-col">
-                            <span className="text-sm font-semibold text-slate-100">{title}</span>
-                            <span className="text-[10px] text-slate-400 font-mono">
-                                {status === "running" ? `Thinking for ${seconds}s...` : `Completed in ${seconds}s`}
+                        {/* Title + timer */}
+                        <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium" style={{ color: 'var(--q-text)' }}>
+                                {displayTitle}
+                            </span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-md" style={{
+                                color: 'var(--q-text-muted)',
+                                background: 'var(--q-glass-bg)',
+                            }}>
+                                {isRunning ? `${seconds}s` : `${seconds}s`}
                             </span>
                         </div>
                     </div>
-                    <ChevronDown className="w-5 h-5 text-slate-400 group-open:rotate-180 transition-transform" />
+                    <ChevronDown
+                        className="w-4 h-4 group-open:rotate-180 transition-transform duration-200"
+                        style={{ color: 'var(--q-text-muted)' }}
+                    />
                 </summary>
-                <div className="px-4 pb-4 space-y-3 border-t border-slate-700/30 pt-3 mt-1">
+
+                <div className="px-4 pb-3 pt-2 space-y-1.5" style={{ borderTop: '1px solid var(--q-border)' }}>
                     {steps.map((step, i) => (
-                        <div key={i} className="flex items-start gap-3 text-xs w-full">
+                        <div key={i} className="flex items-start gap-2.5 text-xs py-1">
                             <div className="mt-0.5 shrink-0">
                                 {step.status === "completed" ? (
-                                    <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
                                 ) : step.status === "error" ? (
-                                    <div className="w-4 h-4 rounded-full bg-red-500/20 border border-red-500 flex items-center justify-center">
-                                        <span className="text-red-500 font-bold text-[10px]">!</span>
+                                    <div className="w-3.5 h-3.5 rounded-full bg-red-500/20 border border-red-500 flex items-center justify-center">
+                                        <span className="text-red-500 font-bold text-[8px]">!</span>
                                     </div>
                                 ) : (
-                                    <div className="w-4 h-4 flex items-center justify-center">
-                                        <div className="w-1.5 h-1.5 bg-primary rounded-full animate-ping" />
+                                    <div className="w-3.5 h-3.5 flex items-center justify-center">
+                                        <div className="w-1.5 h-1.5 bg-primary rounded-full animate-pulse" />
                                     </div>
                                 )}
                             </div>
-                            <div className={`overflow-x-auto w-full ${step.status === "running" ? "text-primary font-medium italic" : "text-slate-300"}`}>
+                            <div className={`overflow-x-auto w-full leading-relaxed ${
+                                step.status === "running"
+                                    ? "text-primary font-medium"
+                                    : ""
+                            }`} style={{
+                                color: step.status === "running" ? undefined : 'var(--q-text-secondary)',
+                            }}>
                                 {step.isCode ? (
-                                    <pre className="p-2 bg-slate-900/50 rounded-md text-[10px] text-slate-400 font-mono whitespace-pre-wrap">{step.text}</pre>
+                                    <pre className="p-2 rounded-md text-[10px] font-mono whitespace-pre-wrap" style={{
+                                        background: 'var(--q-code-bg)',
+                                        color: 'var(--q-text-muted)',
+                                    }}>{step.text}</pre>
                                 ) : (
                                     step.text
                                 )}
@@ -76,4 +110,3 @@ export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceC
         </div>
     );
 }
-

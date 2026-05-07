@@ -184,10 +184,26 @@ class ResponsesShim:
 
     # ── OpenAI (passthrough — native Responses API) ──────────────────────
 
+    # Models that do NOT support the 'temperature' parameter
+    _NO_TEMPERATURE_MODELS = frozenset({
+        "o1", "o1-mini", "o1-pro",
+        "o3", "o3-mini", "o3-pro",
+        "o4-mini",
+        "gpt-5-nano",
+    })
+
+    def _strip_unsupported_params(self, kwargs: dict) -> dict:
+        """Remove params unsupported by certain OpenAI models (e.g. temperature)."""
+        model = kwargs.get("model", "")
+        if model in self._NO_TEMPERATURE_MODELS:
+            kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+        return kwargs
+
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_openai(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
         """Direct passthrough to OpenAI Responses API."""
         client = self._llm._get_openai_client()
+        kwargs = self._strip_unsupported_params(kwargs)
         if attachments:
             kwargs = dict(kwargs)
             kwargs["input"] = self._build_openai_input(kwargs.get("input", ""), attachments)

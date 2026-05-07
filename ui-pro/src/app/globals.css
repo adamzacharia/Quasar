@@ -2,17 +2,72 @@
 @import url("https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap");
 @import "tailwindcss";
 
+/* ── Fluid responsive scaling ──────────────────────────────── */
+html {
+  font-size: clamp(14px, 0.65vw + 10px, 17px);
+}
+
+/* ── Theme Tokens ──────────────────────────────────────────── */
+/* Tailwind @theme block for design-system constants            */
 @theme {
   --color-primary: #f471b5;
   --color-primary-dark: #22111a;
   --color-accent-purple: #a855f7;
-  --color-bg-dark: #0A1628;
-  --color-sidebar-dark: #112340;
-  --color-card-dark: #1d2e4a;
-  --color-surface-dark: #0f1f38;
   --color-emerald-accent: #10b981;
   --font-display: "Inter", sans-serif;
   --font-mono: "JetBrains Mono", monospace;
+}
+
+/* ── Dark theme (default) ──────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+  --q-bg: #0A1628;
+  --q-sidebar: #112340;
+  --q-card: #1d2e4a;
+  --q-surface: #0f1f38;
+  --q-text: #f1f5f9;
+  --q-text-secondary: #94a3b8;
+  --q-text-muted: #64748b;
+  --q-border: rgba(255, 255, 255, 0.08);
+  --q-glass-bg: rgba(255, 255, 255, 0.03);
+  --q-glass-hover: rgba(255, 255, 255, 0.08);
+  --q-glass-border: rgba(255, 255, 255, 0.08);
+  --q-glass-hover-border: rgba(244, 113, 181, 0.4);
+  --q-scrollbar-track: #112340;
+  --q-scrollbar-thumb: #334155;
+  --q-input-bg: #0f1f38;
+  --q-code-bg: #0a0a0f;
+  --q-shadow-glow: rgba(244, 113, 181, 0.15);
+}
+
+/* ── Light theme ───────────────────────────────────────────── */
+[data-theme="light"] {
+  --q-bg: #f8fafc;
+  --q-sidebar: #f1f5f9;
+  --q-card: #ffffff;
+  --q-surface: #f0f4f8;
+  --q-text: #0f172a;
+  --q-text-secondary: #475569;
+  --q-text-muted: #94a3b8;
+  --q-border: rgba(0, 0, 0, 0.08);
+  --q-glass-bg: rgba(0, 0, 0, 0.02);
+  --q-glass-hover: rgba(0, 0, 0, 0.05);
+  --q-glass-border: rgba(0, 0, 0, 0.08);
+  --q-glass-hover-border: rgba(244, 113, 181, 0.3);
+  --q-scrollbar-track: #e2e8f0;
+  --q-scrollbar-thumb: #94a3b8;
+  --q-input-bg: #ffffff;
+  --q-code-bg: #f1f5f9;
+  --q-shadow-glow: rgba(244, 113, 181, 0.1);
+}
+
+/* ── Backwards-compatible Tailwind aliases ─────────────────── */
+/* So existing bg-bg-dark, bg-sidebar-dark etc. still work      */
+@theme {
+  --color-bg-dark: var(--q-bg);
+  --color-sidebar-dark: var(--q-sidebar);
+  --color-card-dark: var(--q-card);
+  --color-surface-dark: var(--q-surface);
 }
 
 ::-webkit-scrollbar {
@@ -21,11 +76,11 @@
 }
 
 ::-webkit-scrollbar-track {
-  background: #112340;
+  background: var(--q-scrollbar-track);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: var(--q-scrollbar-thumb);
   border-radius: 4px;
 }
 
@@ -41,17 +96,17 @@
 }
 
 .glass-card {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--q-glass-bg);
   backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--q-glass-border);
   transition: all 0.3s ease;
 }
 
 .glass-card:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(244, 113, 181, 0.4);
+  background: var(--q-glass-hover);
+  border-color: var(--q-glass-hover-border);
   transform: translateY(-2px);
-  box-shadow: 0 10px 30px -10px rgba(244, 113, 181, 0.15);
+  box-shadow: 0 10px 30px -10px var(--q-shadow-glow);
 }
 
 .logo-glow {
@@ -59,21 +114,9 @@
 }
 
 .glass-panel {
-  background: rgba(19, 35, 59, 0.4);
+  background: var(--q-glass-bg);
   backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-}
-
-.delay-75 {
-  animation-delay: 75ms;
-}
-
-.delay-150 {
-  animation-delay: 150ms;
-}
-
-.noise-overlay {
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.03'/%3E%3C/svg%3E");
+  border: 1px solid var(--q-border);
 }
 
 /* Hide scrollbar for carousels */
@@ -93,11 +136,148 @@
   background: transparent;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: var(--q-scrollbar-thumb);
   border-radius: 4px;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #f471b5;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   LIGHT THEME — comprehensive surface overrides
+   Remap hardcoded Tailwind slate classes so every component
+   adapts automatically without per-file changes.
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Sidebar ─────────────────────────────────────────────── */
+[data-theme="light"] aside {
+  background: var(--q-sidebar) !important;
+  border-color: var(--q-border) !important;
+}
+
+/* ── All hardcoded bg-slate-800, bg-slate-700, bg-slate-900 surfaces ── */
+[data-theme="light"] .bg-slate-800,
+[data-theme="light"] .bg-slate-800\/50,
+[data-theme="light"] .bg-slate-800\/80 {
+  background-color: #ffffff !important;
+}
+
+[data-theme="light"] .bg-slate-900 {
+  background-color: #f1f5f9 !important;
+}
+
+[data-theme="light"] .bg-slate-700,
+[data-theme="light"] .bg-slate-700\/50 {
+  background-color: #e2e8f0 !important;
+}
+
+/* ── Hover states ─────────────────────────────────────────── */
+[data-theme="light"] .hover\:bg-slate-800\/50:hover,
+[data-theme="light"] .hover\:bg-slate-800:hover {
+  background-color: #e2e8f0 !important;
+}
+[data-theme="light"] .hover\:bg-slate-700:hover,
+[data-theme="light"] .hover\:bg-slate-700\/50:hover {
+  background-color: #cbd5e1 !important;
+}
+
+/* ── Text ─────────────────────────────────────────────────── */
+[data-theme="light"] .text-white {
+  color: #0f172a !important;
+}
+[data-theme="light"] .text-slate-100 {
+  color: #1e293b !important;
+}
+[data-theme="light"] .text-slate-200 {
+  color: #334155 !important;
+}
+[data-theme="light"] .text-slate-300 {
+  color: #475569 !important;
+}
+[data-theme="light"] .text-slate-400 {
+  color: #64748b !important;
+}
+[data-theme="light"] .text-slate-500 {
+  color: #94a3b8 !important;
+}
+[data-theme="light"] .text-slate-600 {
+  color: #94a3b8 !important;
+}
+[data-theme="light"] .hover\:text-white:hover {
+  color: #0f172a !important;
+}
+[data-theme="light"] .hover\:text-slate-200:hover {
+  color: #1e293b !important;
+}
+
+/* ── Borders ──────────────────────────────────────────────── */
+[data-theme="light"] .border-slate-700\/50,
+[data-theme="light"] .border-slate-700,
+[data-theme="light"] .border-slate-600\/50,
+[data-theme="light"] .border-slate-800\/80 {
+  border-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+/* ── Inputs and interactive surfaces ─────────────────────── */
+[data-theme="light"] input,
+[data-theme="light"] textarea {
+  background-color: var(--q-input-bg) !important;
+  color: var(--q-text) !important;
+  border-color: var(--q-border) !important;
+}
+
+/* ── Code blocks ─────────────────────────────────────────── */
+[data-theme="light"] pre,
+[data-theme="light"] code {
+  background-color: var(--q-code-bg) !important;
+  color: #334155 !important;
+}
+[data-theme="light"] pre code {
+  background-color: transparent !important;
+}
+
+/* ── Gradients & backgrounds used inline ─────────────────── */
+[data-theme="light"] .bg-gradient-to-tr.from-blue-500 {
+  opacity: 0.9;
+}
+
+/* ── Shadows — softer in light mode ──────────────────────── */
+[data-theme="light"] .shadow-2xl,
+[data-theme="light"] .shadow-lg {
+  --tw-shadow-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+/* ── Tables: adapt prose tables ──────────────────────────── */
+[data-theme="light"] .prose thead th {
+  color: #1e293b !important;
+}
+[data-theme="light"] .prose tbody td {
+  color: #475569 !important;
+}
+[data-theme="light"] .prose tbody tr:nth-child(even) {
+  background: rgba(0, 0, 0, 0.02) !important;
+}
+[data-theme="light"] .prose hr {
+  border-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+/* ── Markdown prose table borders ────────────────────────── */
+[data-theme="light"] .prose table {
+  border-color: rgba(0, 0, 0, 0.1) !important;
+}
+[data-theme="light"] .prose tbody tr {
+  border-color: rgba(0, 0, 0, 0.05) !important;
+}
+
+/* ── Chat area header glass panel ────────────────────────── */
+[data-theme="light"] .glass-panel {
+  background: rgba(255, 255, 255, 0.7) !important;
+  border-color: var(--q-border) !important;
+}
+
+/* ── Primary button text stays readable ──────────────────── */
+[data-theme="light"] .text-primary-dark {
+  color: #22111a !important;
 }
 
 /* ── Prose Heading Spacing ─────────────────────────────────── */

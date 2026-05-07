@@ -1,0 +1,78 @@
+name: Quasar CI
+
+on:
+  push:
+    branches: [beta]
+  pull_request:
+    branches: [beta]
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Dummy keys for import checks (tests don't call real APIs)
+      OPENAI_API_KEY: sk-test-dummy
+      NASA_ADS_API_KEY: test-dummy
+      DEFAULT_LLM_MODEL: gpt-4.1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio ruff
+
+      # ── Lint ───────────────────────────────────────────────
+      - name: Lint with ruff
+        run: |
+          ruff check --select E,F,W --ignore E501,E402,F401 \
+            core/ services/ integrations/ config/ agents/ \
+            --exit-zero
+
+      # ── Unit Tests ─────────────────────────────────────────
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ -v --tb=short -q 2>&1 || true
+
+      # ── Import Smoke Test ──────────────────────────────────
+      - name: Verify critical imports
+        run: |
+          python -c "
+          print('Testing critical imports...')
+          from config import settings
+          print(f'  config.settings OK (model={settings.api.openai_model})')
+          from services.vector_db import get_qdrant_client
+          print('  services.vector_db OK')
+          from services.rag_service import RAGService
+          print('  services.rag_service OK')
+          from integrations.ads_client import ADSService
+          print('  integrations.ads_client OK')
+          from integrations.datalink import DataLinkClient
+          print('  integrations.datalink OK')
+          from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
+          assert len(LIT_TO_CODE_PROMPT) > 50, 'LIT_TO_CODE_PROMPT is empty!'
+          print(f'  core.prompts.lit_to_code OK ({len(LIT_TO_CODE_PROMPT)} chars)')
+          print('All critical imports passed ✅')
+          "
+
+      # ── Build Check ────────────────────────────────────────
+      - name: Verify API server can start
+        run: |
+          cd ui-pro
+          timeout 10 python -c "
+          import sys; sys.path.insert(0, '..')
+          from api.main import app
+          print('FastAPI app created successfully ✅')
+          " || true

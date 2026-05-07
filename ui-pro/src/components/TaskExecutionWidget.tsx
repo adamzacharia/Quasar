@@ -131,7 +131,7 @@ function StatusIcon({ status }: { status: string }) {
         case "error":
             return <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />;
         default:
-            return <div className="w-4 h-4 rounded-full border border-slate-600 shrink-0" />;
+            return <div className="w-4 h-4 rounded-full shrink-0" style={{ border: '1px solid var(--q-text-muted)' }} />;
     }
 }
 
@@ -160,10 +160,11 @@ function TaskItemRow({ task }: { task: TaskItem }) {
                 />
                 <span className={`text-xs flex-1 ${
                     task.status === "running"   ? "text-primary font-medium" :
-                    task.status === "completed" ? "text-slate-300" :
-                    task.status === "error"     ? "text-red-400" :
-                                                  "text-slate-400"
-                }`}>
+                    task.status === "error"     ? "text-red-400" : ""
+                }`} style={{
+                    color: task.status === "running" || task.status === "error" ? undefined :
+                           task.status === "completed" ? 'var(--q-text-secondary)' : 'var(--q-text-muted)'
+                }}>
                     {task.description}
                 </span>
                 {task.detail && (
@@ -172,7 +173,8 @@ function TaskItemRow({ task }: { task: TaskItem }) {
             </button>
             {expanded && task.detail && (
                 <div className="ml-[3.25rem] px-3 pb-2">
-                    <p className="text-[10px] text-slate-500 font-mono leading-relaxed bg-slate-900/40 rounded-md px-2.5 py-1.5">
+                    <p className="text-[10px] font-mono leading-relaxed rounded-md px-2.5 py-1.5"
+                       style={{ background: 'var(--q-glass-bg)', color: 'var(--q-text-muted)' }}>
                         {task.detail}
                     </p>
                 </div>
@@ -207,7 +209,7 @@ function TaskGroupWidget({ group, tasks }: TaskGroupWidgetProps) {
                 </span>
             </div>
             {/* Task items indented under group */}
-            <div className="ml-2 border-l border-slate-700/50 pl-2 space-y-0.5">
+            <div className="ml-2 pl-2 space-y-0.5" style={{ borderLeft: '1px solid var(--q-border)' }}>
                 {groupTasks.map(task => (
                     <TaskItemRow key={task.id} task={task} />
                 ))}
@@ -226,11 +228,11 @@ function TaskChecklistWidget({ checklist }: { checklist: TaskChecklist }) {
             <div className="flex items-center justify-between px-3 py-1.5">
                 <div className="flex items-center gap-2">
                     <IconConstellation className="w-3.5 h-3.5 text-primary opacity-80" />
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--q-text-muted)' }}>
                         Execution Plan
                     </span>
                 </div>
-                <span className="text-[10px] font-mono text-slate-500">
+                <span className="text-[10px] font-mono" style={{ color: 'var(--q-text-muted)' }}>
                     {completed}/{total} completed
                 </span>
             </div>
@@ -247,11 +249,13 @@ function TaskChecklistWidget({ checklist }: { checklist: TaskChecklist }) {
                             }`}
                         />
                         <span className={`text-xs ${
-                            task.status === "completed" ? "text-slate-400 line-through" :
+                            task.status === "completed" ? "line-through" :
                             task.status === "running"   ? "text-primary font-medium" :
-                            task.status === "error"     ? "text-red-400" :
-                                                          "text-slate-500"
-                        }`}>
+                            task.status === "error"     ? "text-red-400" : ""
+                        }`} style={{
+                            color: task.status === "running" || task.status === "error" ? undefined :
+                                   task.status === "completed" ? 'var(--q-text-muted)' : 'var(--q-text-secondary)'
+                        }}>
                             {task.description}
                         </span>
                     </div>
@@ -297,13 +301,15 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
     const hasErrors      = Array.from(state.tasks.values()).some(t => t.status === "error");
 
     return (
-        <div className="bg-slate-900/40 border border-slate-700/30 rounded-2xl overflow-hidden max-w-2xl my-3 backdrop-blur-sm">
+        <div className="rounded-2xl overflow-hidden max-w-2xl my-3 backdrop-blur-sm"
+             style={{ background: 'var(--q-glass-bg)', border: '1px solid var(--q-glass-border)' }}>
             {/* Header — clickable to expand/collapse when done */}
             <button
                 onClick={() => !state.isActive && setIsCollapsed(!isCollapsed)}
                 className={`flex items-center justify-between px-4 py-3 w-full text-left ${
-                    !state.isActive ? "cursor-pointer hover:bg-white/[0.02] transition-colors" : ""
-                } ${!isCollapsed ? "border-b border-slate-700/30" : ""}`}
+                    !state.isActive ? "cursor-pointer transition-colors" : ""
+                }`}
+                style={!isCollapsed ? { borderBottom: '1px solid var(--q-border)' } : undefined}
             >
                 <div className="flex items-center gap-2.5">
                     {/* Pink brain-style icon container */}
@@ -311,10 +317,10 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
                         <IconConstellation className={`w-5 h-5 text-primary ${state.isActive ? "animate-pulse" : ""}`} />
                     </div>
                     <div className="flex flex-col">
-                        <span className="text-sm font-semibold text-slate-100">
+                        <span className="text-sm font-semibold" style={{ color: 'var(--q-text)' }}>
                             Multi-Agent Workforce
                         </span>
-                        <span className="text-[10px] font-mono text-slate-400">
+                        <span className="text-[10px] font-mono" style={{ color: 'var(--q-text-muted)' }}>
                             {state.isActive
                                 ? `Running for ${seconds}s…`
                                 : hasErrors
@@ -327,20 +333,20 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
                     {/* Progress pill */}
                     {totalTasks > 0 && (
                         <div className="flex items-center gap-2">
-                            <div className="h-1.5 w-20 bg-slate-700 rounded-full overflow-hidden">
+                            <div className="h-1.5 w-20 rounded-full overflow-hidden" style={{ background: 'var(--q-border)' }}>
                                 <div
                                     className="h-full bg-primary rounded-full transition-all duration-500"
                                     style={{ width: `${(completedTasks / totalTasks) * 100}%` }}
                                 />
                             </div>
-                            <span className="text-[10px] font-mono text-slate-400">
+                            <span className="text-[10px] font-mono" style={{ color: 'var(--q-text-muted)' }}>
                                 {completedTasks}/{totalTasks}
                             </span>
                         </div>
                     )}
                     {/* Expand/collapse chevron — only when done */}
                     {!state.isActive && (
-                        <ChevronDown className={`w-4 h-4 text-slate-500 transition-transform duration-200 ${isCollapsed ? "" : "rotate-180"}`} />
+                        <ChevronDown className={`w-4 h-4 transition-transform duration-200 ${isCollapsed ? "" : "rotate-180"}`} style={{ color: 'var(--q-text-muted)' }} />
                     )}
                 </div>
             </button>
@@ -354,7 +360,7 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
                     )}
                     {/* Divider between plan and live groups */}
                     {state.checklist && state.groups.length > 0 && (
-                        <div className="border-t border-slate-700/30 mx-3 my-1" />
+                        <div className="mx-3 my-1" style={{ borderTop: '1px solid var(--q-border)' }} />
                     )}
                     {/* Live parallel execution groups */}
                     {state.groups.map(group => (

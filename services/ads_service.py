@@ -575,23 +575,133 @@ class ADSService:
         sort: Optional[str],
         filters: Optional[List[str]],
     ) -> Dict[str, Any]:
+        """Fallback query builder when the LLM builder fails."""
         term = question.strip().replace('"', "")
         if not term:
             query = "*:*"
         else:
+            # Use keyword: (ADS controlled vocabulary) + title: + object: for better precision
+            # than plain abstract: which catches tangential mentions
             query = (
-                f'object:"{term}" OR title:"{term}" OR abstract:"{term}"'
+                f'keyword:"{term}" OR title:"{term}" OR object:"{term}"'
             )
         return {
             "query": query,
             "rows": max(1, default_rows),
-            "sort": sort or "date desc",
+            "sort": sort or "score desc",
             "filters": filters or ["property:refereed"],
         }
 
 
+
 class ADSQueryBuilder:
     """LLM-backed helper that turns natural language into ADS queries."""
+
+    # Comprehensive ADS syntax reference for the LLM query translator
+    _SYSTEM_PROMPT = """\
+You are an expert NASA ADS (Astrophysics Data System) query builder.
+Convert natural-language astronomy questions into optimal ADS search queries.
+
+Return JSON with exactly these keys:
+  query   (string)  — the ADS query string
+  rows    (int)     — number of results
+  sort    (string)  — sort order
+  filters (array of strings, optional) — fq filter strings
+
+═══ FIELD SYNTAX (use the most specific field available) ═══
+
+  keyword:"protoplanetary disks"   — ADS controlled-vocabulary keywords (BEST for topic search)
+  title:"disk gaps"                — words in paper title (high precision)
+  abstract:"dust continuum"        — words in abstract (medium precision, catches tangential mentions)
+  body:"gap opening mechanism"     — full-text search inside the paper (use when abstract is too narrow)
+  object:"HL Tau"                  — SIMBAD/NED-linked object (catches ALL name variants automatically)
+  author:"Andrews, Sean"           — author name (Last, First)
+  ^author:"Andrews, Sean"          — FIRST author only
+  orcid:0000-0001-2345-6789        — search by ORCID
+  year:2020-2024                   — year range
+  bibcode:"2018ApJ...869L..41A"    — specific paper
+  doi:"10.3847/..."                — DOI lookup
+  inst:"Harvard"                   — institution/affiliation
+  aff:"Max Planck"                 — affiliation text search
+  facility:"ALMA"                  — facility metadata field (precise)
+
+═══ TELESCOPE/FACILITY FILTERING ═══
+
+  bibgroup:ALMA     — papers curated by NRAO as actually USING ALMA data
+  bibgroup:HST      — papers using Hubble data
+  bibgroup:CXC      — papers using Chandra data
+  bibgroup:ESO      — papers using ESO/VLT data
+  bibgroup:Gemini   — papers using Gemini data
+  bibgroup:Keck     — papers using Keck data
+  bibgroup:NRAO     — papers using any NRAO facility (VLA, VLBA, GBT)
+  bibgroup:Spitzer  — papers using Spitzer data
+  bibgroup:XMM      — papers using XMM-Newton data
+  bibgroup:JCMT     — papers using JCMT data
+
+  PREFER bibgroup: over abstract:"ALMA" — bibgroup is curated by librarians
+  and only includes papers that actually used the telescope, not papers that
+  casually mention it. Only fall back to abstract:"ALMA" if no bibgroup exists.
+
+═══ PROPERTY FILTERS ═══
+
+  property:refereed      — peer-reviewed only (USE BY DEFAULT)
+  property:openaccess    — open access papers
+  property:data          — papers with linked datasets
+  doctype:article        — journal articles only
+  doctype:eprint         — arXiv preprints only
+  doctype:inproceedings  — conference proceedings
+
+═══ SECOND-ORDER OPERATORS (for discovery) ═══
+
+  similar(query)    — papers with SIMILAR abstract text to results of query
+  trending(query)   — papers that readers of query results are also reading NOW
+  useful(query)     — most-cited references FROM the papers matching query (foundational works)
+  reviews(query)    — papers that cite the papers citing query results (review articles)
+  citations(bibcode:XXX)   — all papers that cite a specific paper
+  references(bibcode:XXX)  — all papers cited BY a specific paper
+
+═══ SORT OPTIONS ═══
+
+  "date desc"                — newest first (default for "recent" queries)
+  "citation_count desc"      — most cited (use for "best/important/influential" queries)
+  "citation_count_norm desc" — normalized citations (corrects for paper age)
+  "score desc"               — ADS relevance ranking (good general-purpose)
+  "read_count desc"          — most-read papers (popularity)
+
+═══ DECISION RULES ═══
+
+1. For TOPIC searches ("papers on X"), prefer keyword:"X" over abstract:"X".
+   keyword: uses ADS controlled vocabulary and is far more precise.
+
+2. For OBJECT searches ("papers about HL Tau"), use object:"HL Tau".
+   This leverages SIMBAD cross-matching and catches all name variants.
+
+3. For TELESCOPE searches ("ALMA papers on X"), use bibgroup:ALMA AND keyword:"X".
+
+4. For "recent" queries, sort by "date desc".
+   For "best/important/seminal" queries, sort by "citation_count desc".
+   For "what's hot/trending" queries, use the trending() operator.
+
+5. ALWAYS include property:refereed in filters unless the user asks for preprints.
+
+6. When the user asks for "seminal/foundational/key" papers, use useful(query).
+   When the user asks for "review papers/reviews", use reviews(query).
+   When the user asks for "similar papers to X", use similar(query).
+
+═══ EXAMPLES ═══
+
+"recent papers on protoplanetary disks"
+→ {"query": "keyword:\\"protoplanetary disks\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+
+"best ALMA papers on disk gaps"
+→ {"query": "bibgroup:ALMA AND (keyword:\\"protoplanetary disks\\" AND (title:\\"gap\\" OR title:\\"ring\\"))", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
+
+"papers about HL Tau"
+→ {"query": "object:\\"HL Tau\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+
+"foundational papers on planet formation"
+→ {"query": "useful(keyword:\\"planet formation\\" AND year:2015-2026)", "sort": "score desc", "rows": 20, "filters": ["property:refereed"]}
+"""
 
     def __init__(self, model: Optional[str] = None) -> None:
         self.model = model or os.getenv("ADS_QUERY_MODEL") or os.getenv(
@@ -640,28 +750,6 @@ class ADSQueryBuilder:
     ) -> str:
         client = self._get_client()
 
-        system_prompt = (
-            "You are an expert at converting natural-language astronomy questions into "
-            "valid NASA ADS (Astrophysics Data System) search queries.\n"
-            "Return JSON with exactly these keys: query (string), rows (int), sort (string), "
-            "filters (array of strings, optional).\n\n"
-            "IMPORTANT ADS field syntax rules:\n"
-            "- title:\"word\" — search in paper title\n"
-            "- abstract:\"word\" — search in paper abstract\n"
-            "- author:\"Last, First\" — search by author name\n"
-            "- year:2020-2024 — filter by year range\n"
-            "- bibcode:\"...\" — specific bibcode\n"
-            "- object:\"M87\" — known SIMBAD astronomical object (NOT for telescope/instrument names)\n"
-            "- Combine with AND, OR operators\n"
-            "- For telescope/instrument names (ALMA, VLA, Hubble, VLBI, etc.) use title: or abstract:\n\n"
-            "Examples:\n"
-            "- 'ALMA papers on molecular clouds' => abstract:\"ALMA\" AND abstract:\"molecular cloud\"\n"
-            "- 'VLA observations of AGN 2020-2023' => abstract:\"VLA\" AND abstract:\"AGN\" AND year:2020-2023\n"
-            "- 'black hole jets' => title:\"black hole\" AND abstract:\"jet\"\n"
-            "- 'papers by Accomazzi' => author:\"Accomazzi\"\n"
-        )
-
-
         user_payload = {
             "question": question,
             "defaults": {
@@ -674,7 +762,7 @@ class ADSQueryBuilder:
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": self._SYSTEM_PROMPT},
                 {"role": "user", "content": "Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload)},
             ],
             temperature=0.2,

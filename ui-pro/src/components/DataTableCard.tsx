@@ -598,11 +598,11 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 />
             )}
 
-            <div className="bg-sidebar-dark border border-slate-700/50 rounded-2xl overflow-hidden shadow-sm">
+            <div className="rounded-2xl overflow-hidden shadow-sm" style={{ background: 'var(--q-card)', border: '1px solid var(--q-border)' }}>
 
                 {/* ── Metrics bar ── */}
                 {data.metrics && data.metrics.length > 0 && (
-                    <div className="flex flex-wrap divide-x divide-slate-700/50 border-b border-slate-700/50 bg-surface-dark">
+                    <div className="flex flex-wrap border-b" style={{ background: 'var(--q-surface)', borderColor: 'var(--q-border)' }}>
                         {data.metrics.map((metric, i) => (
                             <div key={i} className="px-5 py-3 flex flex-col items-center justify-center min-w-[80px]">
                                 <span className={`text-xl font-bold tabular-nums ${metric.color || "text-white"}`}>
@@ -618,7 +618,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
 
                 {/* ── Demographics Charts ── */}
                 {hasDemographics && (
-                    <div className="border-b border-slate-700/50 bg-slate-900/40 px-4 py-3">
+                    <div className="border-b px-4 py-3" style={{ borderColor: 'var(--q-border)', background: 'var(--q-glass-bg)' }}>
                         <div className="flex items-center gap-1.5 mb-2">
                             <BarChart3 className="w-3.5 h-3.5 text-slate-500" />
                             <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
@@ -662,7 +662,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     <div className="overflow-x-auto overflow-y-auto max-h-[420px] custom-scrollbar">
                         <table className="w-full text-left border-collapse min-w-max">
                             <thead className="sticky top-0 z-10">
-                                <tr className="bg-surface-dark border-b border-slate-700/60">
+                                <tr style={{ background: 'var(--q-surface)', borderBottom: '1px solid var(--q-border)' }}>
                                     {/* Preview column header */}
                                     {data.hasPreview && (
                                         <th className="py-2.5 px-3 text-[11px] font-semibold text-slate-400 uppercase tracking-wider whitespace-nowrap w-14">
@@ -689,7 +689,10 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                 {rows.map((row, ri) => (
                                     <tr
                                         key={ri}
-                                        className="border-b border-slate-700/20 hover:bg-slate-800/40 transition-colors"
+                                        className="transition-colors"
+                                        style={{ borderBottom: '1px solid var(--q-border)' }}
+                                        onMouseEnter={(e) => e.currentTarget.style.background = 'var(--q-glass-hover)'}
+                                        onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
                                     >
                                         {/* Preview thumbnail cell */}
                                         {data.hasPreview && (
@@ -763,7 +766,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 )}
 
                 {/* ── Footer ── */}
-                <div className="flex items-center justify-between gap-3 px-4 py-3 bg-surface-dark border-t border-slate-700/50 flex-wrap">
+                <div className="flex items-center justify-between gap-3 px-4 py-3 border-t flex-wrap" style={{ background: 'var(--q-surface)', borderColor: 'var(--q-border)' }}>
                     <span className="text-xs text-slate-500">
                         {rows.length} row{rows.length !== 1 ? "s" : ""} · {columns.length} col{columns.length !== 1 ? "s" : ""}
                         {data.hasPreview && " · Sky previews"}

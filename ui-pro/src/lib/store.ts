@@ -31,6 +31,7 @@ interface ChatStore {
     // Conversation history loading state
     _loadedConversationIds: Set<string>;
     _conversationsLoaded: boolean;
+    _pendingDeletes: Set<string>;
 
     setActiveConversation: (id: string | null) => void;
     addMessage: (message: Message) => void;
@@ -111,6 +112,13 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             bibcode: (p.bibcode as string) || undefined,
             doi: (p.doi as string) || undefined,
             abstract: (p.abstract as string) || undefined,
+            // OpenAlex enrichment
+            fwci: p.fwci != null ? Number(p.fwci) : null,
+            citationPercentile: p.citation_percentile != null ? Number(p.citation_percentile) : null,
+            isTop1Percent: Boolean(p.is_top_1_percent || p.isTop1Percent),
+            isTop10Percent: Boolean(p.is_top_10_percent || p.isTop10Percent),
+            funders: Array.isArray(p.funders) ? (p.funders as { name: string; id: string }[]) : undefined,
+            oaPdfUrl: (p.oa_pdf_url as string) || (p.oaPdfUrl as string) || undefined,
         }));
         messages.push({
             id: `srv-${index}-pp-${Date.now().toString(36)}`,
@@ -192,6 +200,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     savedPapers: [],
     _loadedConversationIds: new Set(),
     _conversationsLoaded: false,
+    _pendingDeletes: new Set(),
 
     setActiveConversation: (id) => set((state) => {
         if (state.activeConversationId && state.messages.length > 0) {
@@ -415,15 +424,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
         // Preserve locally-cached messages when refreshing the list
         const existing = get().conversations;
+        const pendingDeletes = get()._pendingDeletes;
         const msgCache = new Map<string, Message[]>();
         for (const c of existing) {
             if (c.messages.length > 0) msgCache.set(c.id, c.messages);
         }
 
-        const merged = localConvos.map(c => {
-            const cached = msgCache.get(c.id);
-            return cached ? { ...c, messages: cached } : c;
-        });
+        // Filter out conversations that are currently being deleted
+        const merged = localConvos
+            .filter(c => !pendingDeletes.has(c.id))
+            .map(c => {
+                const cached = msgCache.get(c.id);
+                return cached ? { ...c, messages: cached } : c;
+            });
 
         set({
             conversations: merged,
@@ -455,19 +468,42 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     },
 
     deleteConversation: async (conversationId: string, token: string) => {
-        const ok = await deleteConversationApi(conversationId, token);
-        if (!ok) return;
+        // Optimistic update: remove from UI immediately for instant feedback
+        const prevState = get();
+        const removedConv = prevState.conversations.find(c => c.id === conversationId);
 
         set((state) => {
             const newLoaded = new Set(state._loadedConversationIds);
             newLoaded.delete(conversationId);
+            // Track this ID so loadConversations won't re-add it
+            const newPending = new Set(state._pendingDeletes);
+            newPending.add(conversationId);
             return {
                 conversations: state.conversations.filter(c => c.id !== conversationId),
                 activeConversationId: state.activeConversationId === conversationId ? null : state.activeConversationId,
                 messages: state.activeConversationId === conversationId ? [] : state.messages,
                 _loadedConversationIds: newLoaded,
+                _pendingDeletes: newPending,
             };
         });
+
+        // Call API in background
+        const ok = await deleteConversationApi(conversationId, token);
+        // Clear from pending deletes either way
+        set((state) => {
+            const newPending = new Set(state._pendingDeletes);
+            newPending.delete(conversationId);
+            return { _pendingDeletes: newPending };
+        });
+
+        if (!ok && removedConv) {
+            // Restore the conversation if the API failed
+            set((state) => ({
+                conversations: [...state.conversations, removedConv].sort(
+                    (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()
+                ),
+            }));
+        }
     },
 
     setActiveConversationId: (id) => set({ activeConversationId: id }),

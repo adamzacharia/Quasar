@@ -9,7 +9,7 @@ import requests
 import tempfile
 import logging
 from typing import Optional, Dict, Any
-from langchain_community.document_loaders.pdf import PyPDFLoader
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ class PDFProcessingService:
     def extract_text_from_pdf(self, file_path: str) -> str:
         """Extract all text from a local PDF file."""
         try:
-            loader = PyPDFLoader(file_path)
+            loader = PyMuPDF4LLMLoader(file_path)
             documents = loader.load()
             return "\n".join([doc.page_content for doc in documents])
         except Exception as e:

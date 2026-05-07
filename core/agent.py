@@ -3,12 +3,12 @@ QuasarAgent — Central orchestrator for Quasar AI.
 
 CALLED BY: ui/app.py (Streamlit), ui-pro/api/main.py (FastAPI SSE),
            core/cli.py (terminal REPL), telegram.py (webhook)
-CALLS:     All services/* modules, integrations/*, core/rlm.py,
-           OpenAI API (GPT-4o), mem0 (long-term memory)
+CALLS:     All services/* modules, integrations/*, core/complexity.py,
+           core/sandbox.py, OpenAI API (GPT-4o), mem0 (long-term memory)
 
 This is the heart of Quasar. The QuasarAgent class:
   1. Registers 27+ tools as OpenAI function-calling schemas
-  2. Routes user queries through RLM complexity detection
+  2. Routes user queries through complexity detection → Conductor DAG
   3. Manages RAG context, conversation memory, and long-term memory
   4. Streams responses via Chat Completions API or Responses API
   5. Caches search results (DataFrames) for follow-up operations
@@ -17,6 +17,7 @@ This is the heart of Quasar. The QuasarAgent class:
 import os
 import json
 import re
+import uuid
 import threading
 import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple
@@ -40,11 +41,13 @@ from core.prompts import (
 # from integrations.tap import NRAOTapClient
 from integrations.datalink import DataLinkClient
 from integrations.ads_client import ADSService
+from integrations.openalex_client import OpenAlexService
 from services.search import SearchService
 from services.analysis import RadioAnalysisService
 from services.rag_service import RAGService
 from services.memory_service import MemoryService
-from core.rlm import RecursiveLanguageModel
+from core.complexity import ComplexityDetector
+from core.sandbox import SandboxExecutor
 from services.browser import BrowserService
 from services.plotting import PlottingService
 from services.splatalogue import SplatalogueTool
@@ -59,6 +62,10 @@ from services.notebook_gen import generate_analysis_notebook
 from services.pdf_processing import PDFProcessingService
 from services.fits_processing import FITSProcessingService
 from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
+from services.astro_calculators import (
+    calculate_redshift, convert_coordinates, calculate_beam,
+    calculate_alma_sensitivity,
+)
 
 # Phase 1-4: Multi-Agent Workforce modules
 from core.conductor import Conductor
@@ -140,13 +147,19 @@ class QuasarAgent:
         print("DEBUG: Init Analysis Service")
         self.analysis_service = RadioAnalysisService()
         print("DEBUG: Init RAG Service")
-        self.rag_service = rag_service or RAGService()
+        try:
+            self.rag_service = rag_service or RAGService()
+        except Exception as _rag_err:
+            print(f"[WARN] RAG service unavailable (Qdrant timeout?): {_rag_err}")
+            self.rag_service = None
         print("DEBUG: Init Memory Service (Long-Term)")
         self.memory_service = MemoryService()
         print("DEBUG: Init ADS Client")
         import os as _os
         ads_key = getattr(self.config, 'ads_api_key', None) or _os.getenv("NASA_ADS_API_KEY")
         self.ads_client = ADSService(ads_key) if ads_key else ADSService()  # ADSService handles missing key gracefully
+        print("DEBUG: Init OpenAlex Client")
+        self.openalex_client = OpenAlexService()  # handles missing key gracefully
 
         # Register tools
         print("DEBUG: Register Tools")
@@ -159,12 +172,20 @@ class QuasarAgent:
         if self.config.verbose:
             print("[green]QuasarAgent initialized successfully[/green]")
         
-        self.last_run_result = None
-        self._accumulated_run_results = []  # All tool results in a session (multi-target support)
-        self.last_search_results = None
-        
-        # Responses API state tracking
-        self.last_response_id = None  # For conversation continuity
+        # ── Per-request thread-local storage ─────────────────────────
+        # These attributes are accessed via @property so each concurrent
+        # request (running in its own ThreadPoolExecutor thread) gets
+        # isolated state.  Tools still write `self.last_run_result = {...}`
+        # — the property setter transparently redirects to thread-local.
+        self._tls = threading.local()
+
+        # ── Per-conversation OpenAI response-ID tracking ──────────────
+        # Maps conversation_id → last OpenAI response_id.  Thread-safe.
+        # Replaces the old singleton `self.last_response_id` which caused
+        # cross-user state poisoning on the shared agent instance.
+        self._conv_response_ids: Dict[str, str] = {}
+        self._conv_ids_lock = threading.Lock()
+
         self._session_token_estimate = 0  # Running token count estimate (legacy — kept for compat)
         self._session_token_limit = 90000  # Legacy threshold (superseded by ContextManager)
         
@@ -233,6 +254,21 @@ class QuasarAgent:
         self.model_router.health_monitor = self.health_monitor
         self.agent_pool = AgentPool()
         print("DEBUG: Init Conductor")
+        # Initialize complexity detector (gates Conductor activation)
+        print("DEBUG: Init ComplexityDetector")
+        self.complexity_detector = ComplexityDetector(
+            client=self.client, model="gpt-4o-mini"
+        )
+
+        # Initialize sandbox executor (for Conductor "compute" agent type)
+        print("DEBUG: Init SandboxExecutor")
+        self.sandbox_executor = SandboxExecutor(
+            client=self.client,
+            model=self.config.model,
+            tool_executor=self._sandbox_tool_bridge,
+            verbose=self.config.verbose,
+        )
+
         self.conductor = Conductor(
             client=self.client,
             model=self.config.model,
@@ -241,20 +277,9 @@ class QuasarAgent:
             recovery_engine=self.recovery_engine,
             model_router=self.model_router,
             agent_pool=self.agent_pool,
+            sandbox_executor=self.sandbox_executor,
             verbose=True,
         )
-
-        # Initialize RLM (Recursive Language Model) for complex queries
-        print("DEBUG: Init RLM")
-        self.rlm = RecursiveLanguageModel(
-            client=self.client,
-            model=self.config.model,
-            tool_executor=self._rlm_tool_executor,
-            verbose=self.config.verbose,
-        )
-        # Wire all 27 registered tools into the REPL executor so the LLM can
-        # call any Quasar tool from within REPL Python code via call_tool()
-        self.rlm.repl_executor.tool_executor = self._rlm_tool_bridge
 
         # Load per-user custom tools (if user_id is set)
         if self.config.user_id:
@@ -426,6 +451,69 @@ class QuasarAgent:
         """Rough token estimate: ~4 chars per token for English text."""
         return len(text) // 4
 
+    # ── Thread-local properties ───────────────────────────────────────
+    # These let 40+ tool methods keep writing `self.last_run_result = {}`
+    # while each concurrent request thread sees its own isolated value.
+
+    @property
+    def last_run_result(self):
+        return getattr(self._tls, 'last_run_result', None)
+
+    @last_run_result.setter
+    def last_run_result(self, value):
+        self._tls.last_run_result = value
+
+    @property
+    def _accumulated_run_results(self):
+        if not hasattr(self._tls, 'accumulated_run_results'):
+            self._tls.accumulated_run_results = []
+        return self._tls.accumulated_run_results
+
+    @_accumulated_run_results.setter
+    def _accumulated_run_results(self, value):
+        self._tls.accumulated_run_results = value
+
+    @property
+    def last_search_results(self):
+        return getattr(self._tls, 'last_search_results', None)
+
+    @last_search_results.setter
+    def last_search_results(self, value):
+        self._tls.last_search_results = value
+
+    # ── Per-conversation response ID helpers ────────────────────────
+
+    def _get_response_id(self, conversation_id: str) -> Optional[str]:
+        """Get the OpenAI previous_response_id for a specific conversation."""
+        with self._conv_ids_lock:
+            return self._conv_response_ids.get(conversation_id)
+
+    def _set_response_id(self, conversation_id: str, response_id: Optional[str]):
+        """Set (or clear) the OpenAI response_id for a conversation."""
+        with self._conv_ids_lock:
+            if response_id is None:
+                self._conv_response_ids.pop(conversation_id, None)
+            else:
+                self._conv_response_ids[conversation_id] = response_id
+
+    def _cleanup_conv_states(self, max_entries: int = 500):
+        """Prevent memory leak — evict oldest conversation entries."""
+        with self._conv_ids_lock:
+            if len(self._conv_response_ids) > max_entries:
+                keys = list(self._conv_response_ids.keys())
+                for k in keys[:len(keys) // 2]:
+                    del self._conv_response_ids[k]
+
+    # Backward-compatible property so legacy code (e.g. reset_conversation_state)
+    # still works.  In production, prefer _get/_set_response_id with a conv_id.
+    @property
+    def last_response_id(self):
+        return self._get_response_id("__global__")
+
+    @last_response_id.setter
+    def last_response_id(self, value):
+        self._set_response_id("__global__", value)
+
     def _prune_session_if_needed(self, query: str, user_id: str):
         """
         Smart context management — replaces the old session nuke with
@@ -462,11 +550,42 @@ Your goal is to help users find, visualize, and analyze astronomical data.
 GUIDELINES:
 - **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool.
 - **FRESH DATA ALWAYS**: NEVER answer archive/data queries from conversation memory or prior tool results. ALWAYS make a fresh tool call, even if you already called the same tool earlier in this conversation. Every data request MUST trigger a new search_by_target, search_by_position, search_cadc_archive, or search_papers call. The user expects live data with a data card in the UI — text-only answers without a tool call are UNACCEPTABLE for data queries.
-- **KNOWLEDGE vs DATA**: For factual/conceptual questions (e.g. "What is the ALMA proprietary period?", "How does interferometry work?", "What bands does ALMA support?"), answer directly from the documentation context (RAG) and your knowledge. Do NOT call search_papers or any data tool — these are NOT data queries, they are knowledge queries. Only call search_papers when the user explicitly asks for papers, articles, publications, or literature (e.g. "find papers about...", "show me recent publications on...").
+- **KNOWLEDGE vs DATA**: For factual/conceptual/how-to questions, answer directly from the documentation context (RAG) and your knowledge. Do NOT call search_papers or any data tool — these are NOT data queries, they are knowledge queries. Only call search_papers when the user EXPLICITLY asks for papers, articles, publications, or literature (e.g. "find papers about...", "show me recent publications on...").
+  KNOWLEDGE QUERY EXAMPLES (answer from RAG, NEVER call search_papers):
+  - "What is the ALMA proprietary period?" → RAG answer
+  - "What are the Cycle 13 proposal submission deadlines?" → RAG answer (the word "proposal" does NOT mean "find papers")
+  - "How do I access archival ALMA data?" → RAG answer (the word "archival" means ALMA archive, NOT research articles)
+  - "How does the ALMA proposal review process work?" → RAG answer
+  - "How do I calibrate ALMA Band 6 data?" → RAG answer
+  - "What receiver bands are available on ALMA?" → RAG answer
+  - "What file formats does ALMA deliver?" → RAG answer
+  PAPER QUERY EXAMPLES (call search_papers):
+  - "Find recent papers on protoplanetary disks" → search_papers
+  - "Show me publications about ALMA observations of M87" → search_papers
+  - "What are the latest studies on galaxy mergers?" → search_papers
+  If the query is asking HOW something works, WHAT something is, or about ALMA procedures/policies/deadlines — it is a KNOWLEDGE query. NEVER call search_papers for these.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
-- **PAPER SEARCH**: When you use the `search_papers` tool, do NOT write any text listing the papers. Output NOTHING after the tool call. The UI renders the papers as interactive cards automatically.
-- **WEB SEARCH**: Use the `web_search` tool for real-time queries: current telescope schedules, recent arXiv preprints, observatory news, instrument specs, call-for-proposals, or anything not in the ALMA archive or NASA ADS.
+- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). Do NOT try to construct ADS field syntax — the tool has an internal AI query builder that translates natural language into optimal ADS queries using keyword searches, bibgroup filters, SIMBAD object linking, and second-order discovery operators. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
+- **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer — "Who is X?", "Tell me about X", "Where does X work?" — call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
+  1. **Header**: "## Profile: [Full Name]" with email and personal webpage (from web search if available)
+  2. **Identity**: ORCID, alternative name forms, current institution(s)
+  3. **Academic Metrics** — ALWAYS as a markdown table:
+     | Metric | Value |
+     |--------|-------|
+     | Publications | N |
+     | Citations | N |
+     | h-index | N |
+     | i10-index | N |
+     | 2yr Mean Citedness | N |
+  4. **Research Focus**: Bulleted list of top topics
+  5. **Affiliation History**: Chronological list of past institutions with year ranges
+  6. **Recent Research Activity** — ALWAYS as a markdown table with Year / Works / Citations columns (last 5–10 years)
+  7. **Summary**: A brief narrative paragraph about the researcher
+  If web search results are also available, extract and include their email address, personal webpage, and recent news/awards at the top.
+- **RESEARCH TRENDS**: When the user asks about publication volume, field growth, or funding landscape — "How much research on FRBs?", "Is interest in X growing?", "Who funds research on Y?" — call `get_research_trends`. Returns papers-per-year breakdown and top funders.
+- **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
+- **WEB SEARCH**: Use the `web_search` tool ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. NEVER use web_search when the user asks for papers/publications — use `search_papers` instead.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
@@ -486,11 +605,30 @@ GUIDELINES:
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
 DUAL-SOURCE RESPONSE STRUCTURE (RAG + Web):
-When your answer draws on BOTH the documentation context provided below AND web search results:
-1. **Documentation First**: Present the answer from the ALMA Technical Documentation first. Cite each fact using the exact format [Source: filename, Page X]. After presenting the documentation-based answer, add a brief note: "*📚 The above information is sourced from the ALMA Technical Documentation and may not reflect the very latest policies or changes.*"
-2. **Web Results Second**: If web search results are appended below your response by the system, they will appear automatically. When you DO have web search data in your context, present it in a separate section titled "🌐 Updated Information from the Web" with the actual URLs as clickable Markdown links so users can verify.
-3. If ONLY documentation context is available (no web results), still cite sources and add the documentation disclaimer.
-4. If ONLY web results are available (no documentation), present them with links and note they are from the web.
+When your answer draws on BOTH the documentation context provided below AND web search results, you MUST structure your response in this EXACT order:
+
+**SECTION 1 — Documentation Answer** (from ALMA docs/tutorials):
+Present the main answer using the documentation context. Citations MUST be placed INLINE right after the sentence that uses the information — NEVER collect citations into a "References" or "Sources" section at the bottom. Each documentation chunk has a CITE_AS tag — copy that EXACT string verbatim as your citation. Do NOT modify, rephrase, or invent any fields in the citation.
+- CORRECT inline citation: "The proprietary period is 12 months. [Source: alma-proposers-guide-cycle13.pdf, Page 36, Date: February 2026, Relevance: 0.88]" — copied from the CITE_AS tag.
+- WRONG (bottom-grouped): Putting a "References:" section at the end listing all sources — NEVER do this.
+- WRONG (missing fields): "[Source: alma-proposers-guide.pdf]" — NEVER omit Page, Date, or Relevance.
+- WRONG (unknown): "[Source: file.pdf, Page unknown, Date: unknown]" — the CITE_AS tag always has the correct values. Copy them. NEVER write "unknown" or invent scores.
+
+**SECTION 2 — Documentation Disclaimer** (immediately after Section 1, BEFORE any web content):
+Add this line right after your documentation answer, before the web section:
+"*📚 The above information is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies or changes.*"
+
+**SECTION 3 — Web Search Updates** (after the disclaimer):
+Start with the heading "🌐 Updated Information from the Web:" and then present a DETAILED summary of what the web search results contain. This section MUST:
+- Be at least one full paragraph (3-5 sentences minimum) with specific facts extracted from the web results
+- Include clickable Markdown links to the source URLs
+- Present the web findings as-is, regardless of whether they overlap with the documentation above — the user wants to see what the web says independently
+- NEVER write "No additional web updates were found" or similar dismissals. If web results are provided to you, there IS content to present — extract and summarize it.
+
+IMPORTANT: The disclaimer (Section 2) MUST appear BETWEEN the documentation content and the web content. Never place the disclaimer after the web section.
+
+If ONLY documentation context is available (no web results), still cite sources inline and add the documentation disclaimer.
+If ONLY web results are available (no documentation), present them with links and note they are from the web.
 
 FORMATTING RULES:
 - **ALWAYS use proper Markdown** for your final output. The UI renders full GitHub-Flavored Markdown.
@@ -502,6 +640,7 @@ FORMATTING RULES:
 - **HEADINGS**: Use ## and ### for sections, not numbered lists for top-level categories.
 - **BOLD** key values, observatory names, and important findings.
 - **BULLET LISTS**: Use - for lists of items or key points.
+- **NO IMAGE URLS**: NEVER use markdown image syntax ![alt](url) in your responses. You cannot verify image URLs and they will often be broken or incorrect. Describe visuals in text instead. The system has its own image retrieval tools -- do not embed external URLs.
 - Keep your response well-structured, scannable, and visually organized.
 
 Current Context:
@@ -815,7 +954,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             name="web_search",
             description=(
                 "Search the web for real-time information: astronomy news, telescope schedules, "
-                "arXiv preprints, observatory announcements, instrument specs, or any live web content. "
+                "observatory announcements, instrument specs, call-for-proposals, or operational status updates. "
+                "NEVER use this for finding papers or publications — use search_papers (NASA ADS) instead. "
                 "Uses Tavily for grounded, source-cited results. "
                 "Use the user's query as-is — do NOT add years or dates unless the user explicitly mentioned them. "
                 "Examples: 'ALMA proprietary period policy', 'JWST cycle 4 call for proposals', "
@@ -874,14 +1014,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # ── Publication Plotting Tools ─────────────────────────────
         self.tool_registry.register(Tool(
             name="plot_alma_results",
-            description="Generate a publication-quality scatter plot (ApJ/MNRAS style, 300 DPI, colorblind-safe) from the last ALMA search results. Use after any search to visualize data.",
-            function=lambda **kw: self.plotting_service.plot_alma_results(
-                data_records=(self.last_search_results.to_dict("records") if self.last_search_results is not None and not self.last_search_results.empty else []),
-                **kw
+            description=(
+                "Generate a plot from the last ALMA search results. Two modes:\n"
+                "1. Quick overview: pass plot_type='sky', 'frequency', or 'overview' for pre-built plots.\n"
+                "2. Publication-quality scatter: pass x_column and y_column for a custom ApJ/MNRAS-style "
+                "scatter plot (300 DPI, colorblind-safe).\n"
+                "If plot_type is given, x_column/y_column are ignored. Use after any search."
             ),
+            function=self._merged_plot_alma_results,
             parameters={
                 "type": "object",
                 "properties": {
+                    "plot_type": {"type": "string", "enum": ["sky", "frequency", "overview"], "description": "Quick overview plot type. If provided, x_column/y_column are ignored."},
                     "x_column": {"type": "string", "description": "Column for x-axis (e.g. 'frequency', 'spatial_resolution', 'band')"},
                     "y_column": {"type": "string", "description": "Column for y-axis"},
                     "color_by": {"type": "string", "description": "Column to color-code points by (e.g. 'band', 'facility')"},
@@ -1219,26 +1363,28 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             description=(
                 "Search the NASA ADS database for astronomical papers. "
                 "Returns titles, authors, abstracts, citation counts, DOIs, and a direct link to each paper on NASA ADS. "
-                "IMPORTANT: Use valid ADS field syntax in the query:\n"
-                "- For telescope/instrument names (ALMA, VLA, JWST, Hubble, VLBI, etc): use abstract:\"ALMA\" AND abstract:\"topic\"\n"
-                "- For astronomical objects: object:\"M87\" or title:\"black hole\"\n"
-                "- For authors: author:\"Last, First\"\n"
-                "- For year range: year:2020-2024\n"
-                "- Combine with AND, OR operators\n"
-                "Examples:\n"
-                "- 'recent ALMA molecular cloud papers' → query: abstract:\"ALMA\" AND abstract:\"molecular cloud\"\n"
-                "- 'VLA AGN observations 2022-2024' → query: abstract:\"VLA\" AND abstract:\"AGN\" AND year:2022-2024\n"
-                "- 'black hole accretion disk' → query: title:\"black hole\" AND abstract:\"accretion disk\""
+                "IMPORTANT: Pass the user's request as natural language — an internal AI query builder will "
+                "automatically translate it into optimal ADS syntax using keyword searches, bibgroup filters, "
+                "SIMBAD object linking, second-order discovery operators (trending, similar, useful), and more.\n"
+                "Examples of what to pass as query:\n"
+                "- 'recent papers on protoplanetary disks'\n"
+                "- 'best ALMA papers on disk gaps'\n"
+                "- 'papers about HL Tau'\n"
+                "- 'what are people reading about FRBs right now'\n"
+                "- 'foundational papers on planet formation'\n"
+                "- 'review articles on AGN feedback'\n"
+                "- 'papers by Sean Andrews on disk surveys'\n"
+                "Do NOT try to construct ADS field syntax yourself — just pass the natural language query."
             ),
-            function=lambda query, max_results=10, sort="date desc", **kw: (
+            function=lambda query, max_results=15, sort="date desc", **kw: (
                 self._search_papers(query, max_results=max_results, sort=sort)
                 if self.ads_client else {"error": "ADS client not configured"}
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "ADS search query using field syntax (abstract:, title:, author:, object:, year:)"},
-                    "max_results": {"type": "integer", "description": "Number of results to return (default 10, max 50)"},
+                    "query": {"type": "string", "description": "Natural language search query describing what papers the user wants (e.g. 'recent ALMA papers on protoplanetary disk gaps')"},
+                    "max_results": {"type": "integer", "description": "Number of results to return (default 15, max 50)"},
                     "sort": {"type": "string", "description": "Sort order: 'date desc' (newest first), 'citation_count desc' (most cited), 'score desc' (relevance). Default: 'date desc'"},
                 },
                 "required": ["query"]
@@ -1369,6 +1515,31 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
 
         self.tool_registry.register(Tool(
+            name="evaluate_consensus",
+            description=(
+                "Evaluate the scientific consensus on a research question by searching NASA ADS for the most-cited "
+                "papers on the topic, reading all their abstracts, and producing a structured analysis. "
+                "The output includes: overall consensus level (Strong Agreement / Divided / etc.), "
+                "which specific papers agree vs disagree, WHY they disagree (different methods, data, assumptions), "
+                "key evidence from each side with proper citations, how the consensus has evolved over time, "
+                "and what open questions remain. "
+                "Use this when the user asks questions like: 'Do scientists agree on X?', 'What does the field think about X?', "
+                "'Is there consensus on X?', 'What's the current understanding of X?', or any question where "
+                "a literature-wide summary would be more useful than individual paper results."
+            ),
+            function=self._evaluate_consensus,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The scientific question to evaluate consensus on (e.g. 'Is planet migration necessary for hot Jupiter formation?')"},
+                    "max_papers": {"type": "integer", "description": "Number of top-cited papers to analyze (default 20, max 50)"},
+                },
+                "required": ["question"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
             name="reproduce_paper_methods",
             description="Extract the methodology from a published paper (by arXiv ID or ADS bibcode) and construct a Python/CASA data reduction script that replicates its steps. Use when a user asks 'how did they reduce the data for this paper' or 'reproduce this paper'.",
             function=self._reproduce_paper_methods,
@@ -1439,6 +1610,74 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     },
                 },
                 "required": ["library_id", "bibcodes"]
+            },
+            category="literature"
+        ))
+
+        # ── OpenAlex Researcher & Bibliometric Tools ──────────────────────
+        _oalex = self.openalex_client
+
+        self.tool_registry.register(Tool(
+            name="lookup_researcher",
+            description=(
+                "Look up a researcher/scientist by name or ORCID to get their full academic profile: "
+                "current institution, h-index, i10-index, total publications, total citations, "
+                "ORCID, Scopus ID, research topics, affiliation history, and publication trend "
+                "over the last 10 years.  Powered by OpenAlex (90M+ disambiguated authors).\n"
+                "Use this when the user asks about a person, wants to know who someone is, "
+                "or wants contact/institutional information about a researcher.\n"
+                "Examples: 'Who is Andrea Isella?', 'Tell me about Crystal Brogan', "
+                "'Look up ORCID 0000-0001-2345-6789'"
+            ),
+            function=self._lookup_researcher,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Researcher name (e.g. 'Andrea Isella') or ORCID "
+                            "(e.g. '0000-0001-2345-6789')"
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max author matches to return (default 3)",
+                    },
+                },
+                "required": ["query"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_research_trends",
+            description=(
+                "Get a bibliometric trend showing papers-per-year for a given topic or search "
+                "query.  Returns total paper count and yearly breakdown.\n"
+                "Use when the user asks 'How much research is being done on X?', "
+                "'Is interest in X growing?', 'Publication trends for FRBs'.\n"
+                "Also returns the funding landscape — which funders (NSF, NASA, ESA, etc.) "
+                "have funded research on the topic."
+            ),
+            function=self._get_research_trends,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Topic or search query (e.g. 'fast radio bursts', 'ALMA protoplanetary disks')",
+                    },
+                    "year_from": {
+                        "type": "integer",
+                        "description": "Start year for the trend (default 2015)",
+                    },
+                    "year_to": {
+                        "type": "integer",
+                        "description": "End year for the trend (default 2026)",
+                    },
+                },
+                "required": ["query"]
             },
             category="literature"
         ))
@@ -1566,6 +1805,154 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
+        # ── Spectral Line Profile Fitter (R3) ──────────────────────
+        self.tool_registry.register(Tool(
+            name="fit_spectral_line",
+            description=(
+                "Download a FITS spectral cube, extract a 1D spectrum at a given "
+                "position, and fit a Gaussian profile to the strongest line. "
+                "Returns peak flux, FWHM (in frequency and velocity), center "
+                "frequency, and integrated flux. The fit is overlaid on the "
+                "spectrum plot."
+            ),
+            function=self._fit_spectral_line,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url":     {"type": "string", "description": "Direct URL to the FITS spectral cube."},
+                    "ra_deg":  {"type": "number", "description": "RA in decimal degrees (ICRS). Optional."},
+                    "dec_deg": {"type": "number", "description": "Dec in decimal degrees (ICRS). Optional."},
+                    "x_pixel": {"type": "integer", "description": "X pixel coordinate. Optional."},
+                    "y_pixel": {"type": "integer", "description": "Y pixel coordinate. Optional."},
+                    "title":   {"type": "string",  "description": "Title for the spectrum plot."},
+                },
+                "required": ["url"]
+            },
+            category="analysis"
+        ))
+
+        # ── Astronomy Calculators (U9, U10, R6, R4) ───────────────
+        self.tool_registry.register(Tool(
+            name="calculate_redshift",
+            description=(
+                "Compute cosmological quantities for a given redshift z using "
+                "Planck18 cosmology. Returns luminosity distance, angular diameter "
+                "distance, comoving distance, lookback time, age of the universe "
+                "at that epoch, and the physical scale (kpc per arcsecond). "
+                "Use for any question about distances, ages, or scales at a "
+                "given redshift."
+            ),
+            function=self._calculate_redshift,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "z": {"type": "number", "description": "Cosmological redshift (must be >= 0)."},
+                },
+                "required": ["z"]
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="convert_coordinates",
+            description=(
+                "Convert sky coordinates between ICRS (RA/Dec), Galactic (l/b), "
+                "Ecliptic (lon/lat), FK5 (J2000), and FK4 (B1950) frames. "
+                "Returns the position in ALL frames at once. "
+                "Use for coordinate transformations, epoch precession, or when "
+                "the user gives Galactic coordinates and needs RA/Dec."
+            ),
+            function=self._convert_coordinates,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ra":           {"type": "number", "description": "RA or longitude in degrees (for ICRS/Ecliptic/FK5 input)."},
+                    "dec":          {"type": "number", "description": "Dec or latitude in degrees."},
+                    "l":            {"type": "number", "description": "Galactic longitude in degrees (for Galactic input)."},
+                    "b":            {"type": "number", "description": "Galactic latitude in degrees (for Galactic input)."},
+                    "input_frame":  {"type": "string", "description": "Source frame: 'icrs', 'galactic', 'ecliptic', 'fk5', 'fk4'. Default 'icrs'."},
+                    "output_frame": {"type": "string", "description": "Target frame (all frames are always returned). Default 'galactic'."},
+                },
+                "required": []
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="calculate_beam",
+            description=(
+                "Calculate the synthesized beam size for a radio interferometer "
+                "given the maximum baseline and observing frequency. For ALMA, "
+                "you can specify an array configuration name (C-1 through C-10) "
+                "instead of a raw baseline length. Returns beam size in arcsec "
+                "and milliarcsec."
+            ),
+            function=self._calculate_beam,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "frequency_ghz":  {"type": "number", "description": "Observing frequency in GHz."},
+                    "max_baseline_m": {"type": "number", "description": "Maximum baseline in meters. Optional if array_config is given."},
+                    "array_config":   {"type": "string", "description": "ALMA config name: C-1 through C-10. Overrides max_baseline_m."},
+                },
+                "required": ["frequency_ghz"]
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="calculate_alma_sensitivity",
+            description=(
+                "Estimate ALMA continuum and spectral line sensitivity using "
+                "the radiometer equation. Returns noise level in mJy/beam and "
+                "uJy/beam for given band, bandwidth, and integration time. "
+                "Includes Tsys scaling for weather (PWV). Use when the user "
+                "asks about ALMA sensitivity, noise levels, or integration "
+                "time estimates."
+            ),
+            function=self._calculate_alma_sensitivity,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "band":             {"type": "integer", "description": "ALMA band number (3-10)."},
+                    "bandwidth_ghz":    {"type": "number",  "description": "Total continuum bandwidth in GHz. Default 7.5."},
+                    "t_integration_s":  {"type": "number",  "description": "On-source integration time in seconds. Default 60."},
+                    "n_antennas":       {"type": "integer", "description": "Number of antennas. Default 50."},
+                    "n_polarizations":  {"type": "integer", "description": "Number of polarizations (1 or 2). Default 2."},
+                    "channel_width_khz":{"type": "number",  "description": "Spectral channel width in kHz (for line sensitivity). Optional."},
+                    "pwv_mm":           {"type": "number",  "description": "Precipitable water vapor in mm. Default 1.0."},
+                },
+                "required": ["band"]
+            },
+            category="analysis"
+        ))
+
+        # ── Finding Chart Generator (O6) ──────────────────────────
+        self.tool_registry.register(Tool(
+            name="generate_finding_chart",
+            description=(
+                "Generate a publication-quality finding chart for a target. "
+                "Creates a DSS2 or 2MASS image with WCS axes, a target "
+                "crosshair marker, N/E compass arrows, and an angular scale "
+                "bar. Use when the user needs a finding chart for observations "
+                "or proposals."
+            ),
+            function=self._generate_finding_chart,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target":      {"type": "string", "description": "Target name (e.g., 'M87', 'NGC 1068')."},
+                    "ra":          {"type": "number", "description": "RA in degrees (alternative to target)."},
+                    "dec":         {"type": "number", "description": "Dec in degrees (alternative to target)."},
+                    "survey":      {"type": "string", "description": "Sky survey: 'DSS2 Red', '2MASS-J', 'WISE 3.4', etc. Default 'DSS2 Red'."},
+                    "fov_arcmin":  {"type": "number", "description": "Field of view in arcminutes. Default 5."},
+                    "title":       {"type": "string", "description": "Custom chart title."},
+                },
+                "required": []
+            },
+            category="analysis"
+        ))
+
         # ── DataLink + FITS Remote Header Tools (Phase 0) ──────────
         self.tool_registry.register(Tool(
             name="list_alma_files",
@@ -1622,11 +2009,27 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     def _list_alma_files(self, mous_uid: str, filename_pattern: str = None) -> Dict[str, Any]:
         """List deliverable files for a MOUS via the ALMA DataLink protocol."""
         try:
-            files = self.datalink_client.list_files(
+            result = self.datalink_client.list_files(
                 mous_uid=mous_uid,
                 pattern=filename_pattern,
             )
-            if not files:
+            # list_files() returns a dict: {success, mous_uid, total_files, files, error?}
+            # Unpack the file list from the dict
+            if isinstance(result, dict):
+                if not result.get("success", False):
+                    return {
+                        "success": False,
+                        "mous_uid": mous_uid,
+                        "error": result.get("error", "DataLink query failed"),
+                    }
+                file_list = result.get("files", [])
+            elif isinstance(result, list):
+                # Legacy path: if list_files ever returns a raw list
+                file_list = result
+            else:
+                file_list = []
+
+            if not file_list:
                 return {
                     "success": True,
                     "mous_uid": mous_uid,
@@ -1636,10 +2039,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             return {
                 "success": True,
                 "mous_uid": mous_uid,
-                "file_count": len(files),
-                "files": files[:50],  # Cap at 50 for LLM context
-                "note": f"Found {len(files)} file(s)." + (
-                    f" Showing first 50." if len(files) > 50 else ""
+                "file_count": len(file_list),
+                "files": file_list[:50],  # Cap at 50 for LLM context
+                "note": f"Found {len(file_list)} file(s)." + (
+                    f" Showing first 50." if len(file_list) > 50 else ""
                 ),
             }
         except Exception as e:
@@ -1656,26 +2059,175 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e), "url": access_url}
 
+    # ── Astronomy acronym dictionary for web search disambiguation ─────
+    _ASTRO_ACRONYMS: dict = {
+        # Telescopes & Observatories
+        "ALMA":   "ALMA (Atacama Large Millimeter/submillimeter Array)",
+        "VLA":    "VLA (Very Large Array radio telescope)",
+        "VLBA":   "VLBA (Very Long Baseline Array)",
+        "VLBI":   "VLBI (Very Long Baseline Interferometry)",
+        "GBT":    "GBT (Green Bank Telescope)",
+        "JWST":   "JWST (James Webb Space Telescope)",
+        "HST":    "HST (Hubble Space Telescope)",
+        "JCMT":   "JCMT (James Clerk Maxwell Telescope)",
+        "CFHT":   "CFHT (Canada-France-Hawaii Telescope)",
+        "SKA":    "SKA (Square Kilometre Array)",
+        "ELT":    "ELT (Extremely Large Telescope)",
+        "TMT":    "TMT (Thirty Meter Telescope)",
+        "GMT":    "GMT (Giant Magellan Telescope)",
+        "NOEMA":  "NOEMA (NOrthern Extended Millimeter Array)",
+        "IRAM":   "IRAM (Institut de Radioastronomie Millimétrique)",
+        "LOFAR":  "LOFAR (Low-Frequency Array)",
+        "MeerKAT":"MeerKAT (Karoo Array Telescope)",
+        "ASKAP":  "ASKAP (Australian Square Kilometre Array Pathfinder)",
+        "FAST":   "FAST (Five-hundred-meter Aperture Spherical Telescope)",
+        "CTA":    "CTA (Cherenkov Telescope Array)",
+        "LSST":   "LSST (Legacy Survey of Space and Time, Vera C. Rubin Observatory)",
+        # Space missions
+        "TESS":   "TESS (Transiting Exoplanet Survey Satellite)",
+        "WMAP":   "WMAP (Wilkinson Microwave Anisotropy Probe)",
+        "XMM":    "XMM-Newton (X-ray Multi-Mirror Mission)",
+        "NuSTAR": "NuSTAR (Nuclear Spectroscopic Telescope Array)",
+        "SOFIA":  "SOFIA (Stratospheric Observatory for Infrared Astronomy)",
+        "NICER":  "NICER (Neutron star Interior Composition Explorer)",
+        # Data archives & services
+        "ADS":    "ADS (NASA Astrophysics Data System)",
+        "CADC":   "CADC (Canadian Astronomy Data Centre)",
+        "ESO":    "ESO (European Southern Observatory)",
+        "MAST":   "MAST (Mikulski Archive for Space Telescopes)",
+        "NRAO":   "NRAO (National Radio Astronomy Observatory)",
+        "SIMBAD": "SIMBAD (Set of Identifications, Measurements, and Bibliography for Astronomical Data)",
+        "NED":    "NED (NASA/IPAC Extragalactic Database)",
+        "CDS":    "CDS (Centre de Données astronomiques de Strasbourg)",
+        # Software & pipelines
+        "CASA":   "CASA (Common Astronomy Software Applications)",
+        "CARTA":  "CARTA (Cube Analysis and Rendering Tool for Astronomy)",
+        # Concepts / techniques
+        "AGN":    "AGN (Active Galactic Nucleus)",
+        "ISM":    "ISM (interstellar medium)",
+        "IGM":    "IGM (intergalactic medium)",
+        "CMB":    "CMB (Cosmic Microwave Background)",
+        "GRB":    "GRB (Gamma-Ray Burst)",
+        "SNR":    "SNR (Supernova Remnant)",
+        "HII":    "HII region (ionized hydrogen region)",
+        "FRB":    "FRB (Fast Radio Burst)",
+        "SED":    "SED (Spectral Energy Distribution)",
+        "RFI":    "RFI (Radio Frequency Interference)",
+        "RA":     None,  # skip — too common
+        "DEC":    None,  # skip — too common
+    }
+
+    def _expand_astro_query(self, query: str) -> str:
+        """Expand astronomy acronyms in a web search query so generic
+        search engines return domain-relevant results instead of
+        irrelevant hits (e.g., 'ALMA' → 'ALMA (Atacama Large Millimeter Array)')."""
+        import re as _re
+        words = query.split()
+        expanded = False
+        for i, w in enumerate(words):
+            clean = _re.sub(r'[^A-Za-z]', '', w)
+            upper = clean.upper()
+            if upper in self._ASTRO_ACRONYMS and self._ASTRO_ACRONYMS[upper] is not None:
+                # Only expand if the word appears to be an acronym (all-caps or title-case)
+                if clean.isupper() or (len(clean) >= 2 and clean[0].isupper()):
+                    # Preserve any trailing punctuation
+                    trail = w[len(clean):]
+                    words[i] = self._ASTRO_ACRONYMS[upper] + trail
+                    expanded = True
+        result = " ".join(words)
+        # If we expanded something, add astronomy context hint
+        if expanded and "astronomy" not in result.lower() and "astrophysic" not in result.lower():
+            result += " astronomy"
+        return result
+
+    def _synthesize_web_summary(self, query: str, web_data: Dict[str, Any], reason: str) -> str:
+        """
+        Use a fast LLM to synthesize a concise, query-relevant summary from
+        web search snippets.  This replaces the raw Tavily `answer` field which
+        is often generic and unrelated to the user's actual question.
+        """
+        snippets = []
+        for r in web_data.get("results", [])[:5]:
+            title = r.get("title", "")
+            snippet = r.get("snippet", r.get("content", ""))[:400]
+            url = r.get("url", "")
+            if snippet:
+                snippets.append(f"[{title}]({url}): {snippet}")
+
+        if not snippets:
+            return web_data.get("answer", "").strip()
+
+        context_block = "\n\n".join(snippets)
+
+        system_prompt = (
+            "You are a concise research assistant. Given web search snippets, "
+            "write a SHORT (2-4 sentence) summary that DIRECTLY answers the "
+            "user's question using ONLY information from the snippets. "
+            "Include specific facts, numbers, or dates when available. "
+            "If the snippets don't contain relevant information, say so briefly. "
+            "Do NOT repeat background context the user already knows. "
+            "Do NOT include generic descriptions of organizations or telescopes."
+        )
+
+        user_prompt = (
+            f"User question: {query}\n\n"
+            f"Web search snippets:\n{context_block}\n\n"
+            f"Write a concise, directly relevant summary:"
+        )
+
+        try:
+            from openai import OpenAI
+            client = OpenAI()
+            resp = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=200,
+                temperature=0.2,
+            )
+            summary = resp.choices[0].message.content.strip()
+            if summary:
+                return summary
+        except Exception as e:
+            print(f"[WEB SEARCH] Summary synthesis failed: {e}")
+
+        # Fallback to raw Tavily answer
+        return web_data.get("answer", "").strip()
+
     @log_tool
-    def _tavily_web_search(self, query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
+    def _tavily_web_search(self, query: str, max_results: int = 10, search_depth: str = "basic") -> Dict[str, Any]:
         """
         Real-time web search powered by Tavily.
+        Returns source URLs + related images for ChatGPT-style inline display.
         Falls back to BrowserService if Tavily key is unavailable.
         """
+        # Expand astronomy acronyms — only needed for dumb keyword search
+        # engines (BrowserService fallback). Tavily is AI-powered and handles
+        # acronyms natively; expanding pollutes the query and returns generic
+        # results instead of matching the user's specific intent.
+        search_query = self._expand_astro_query(query)
+        if search_query != query:
+            print(f"[WEB SEARCH] Expanded query (for fallback): {query!r} → {search_query!r}")
+
         tavily_key = os.getenv("TAVILY_API_KEY", "")
         if tavily_key:
             try:
                 from tavily import TavilyClient
                 client = TavilyClient(api_key=tavily_key)
                 max_results = min(int(max_results), 10)
+                # Use the RAW query — Tavily's AI understands acronyms
                 response = client.search(
                     query=query,
                     max_results=max_results,
                     search_depth=search_depth,
-                    include_answer=True,          # brief AI-synthesised answer
+                    include_answer=True,
+                    include_images=True,
+                    include_image_descriptions=True,
                     include_raw_content=False,
                 )
-                # Build a clean, LLM-friendly result
+                # Build source results with full URLs for citation cards
                 results = []
                 for r in response.get("results", []):
                     results.append({
@@ -1683,21 +2235,34 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         "url":     r.get("url", ""),
                         "snippet": r.get("content", "")[:500],
                     })
+
+                # Extract images (top-level query images from Tavily)
+                images = []
+                for img in response.get("images", []):
+                    if isinstance(img, dict):
+                        images.append({
+                            "url": img.get("url", ""),
+                            "description": img.get("description", ""),
+                        })
+                    elif isinstance(img, str):
+                        images.append({"url": img, "description": ""})
+
                 return {
                     "success":      True,
                     "provider":     "Tavily",
                     "query":        query,
-                    "answer":       response.get("answer", ""),   # synthesised answer
+                    "answer":       response.get("answer", ""),
                     "results":      results,
+                    "images":       images[:6],  # cap at 6 images
                     "result_count": len(results),
                 }
             except Exception as e:
                 print(f"[WARN] Tavily search failed: {e}. Falling back to BrowserService.")
 
-        # ── Fallback: BrowserService ──────────────────────────────
+        # -- Fallback: BrowserService --
         try:
-            fallback = self.browser_service.web_search(query=query)
-            return {"success": True, "provider": "BrowserService (fallback)", "results": fallback}
+            fallback = self.browser_service.web_search(query=search_query)
+            return {"success": True, "provider": "BrowserService (fallback)", "results": fallback, "images": []}
         except Exception as e2:
             return {"success": False, "error": str(e2)}
 
@@ -2836,23 +3401,40 @@ ORDER BY target_name
             logger.error("CO redshift search failed: %s\n%s", e, traceback.format_exc())
             return {"success": False, "error": str(e)}
 
-    def _plot_alma_results(self, plot_type: str = "sky") -> Dict[str, Any]:
-        """Generate plots. Uses the LAST search results. Returns image as bytes (Fix 5)."""
+    def _merged_plot_alma_results(self, plot_type: str = None,
+                                    x_column: str = None, y_column: str = None,
+                                    color_by: str = None, title: str = None,
+                                    dark_mode: bool = False) -> Dict[str, Any]:
+        """Unified plot handler — supports quick overview and publication scatter modes."""
         try:
             if not hasattr(self, 'last_search_results') or self.last_search_results is None or self.last_search_results.empty:
-                 return {"success": False, "error": "No results available to plot. Please run a search first."}
-            
-            image_bytes = self.search_service.plot_alma_results(self.last_search_results, plot_type)
-            if image_bytes:
-                self.last_run_result = {
-                    "type": "image", 
-                    "image_bytes": image_bytes, 
-                    "caption": f"ALMA {plot_type.capitalize()} Plot"
-                }
-                return {"success": True, "message": f"Generated {plot_type} plot successfully"}
-            return {"success": False, "error": "Plot generation returned empty"}
+                return {"success": False, "error": "No results available to plot. Please run a search first."}
+
+            # Mode 1: Quick overview plot (sky, frequency, overview)
+            if plot_type:
+                image_bytes = self.search_service.plot_alma_results(self.last_search_results, plot_type)
+                if image_bytes:
+                    self.last_run_result = {
+                        "type": "image",
+                        "image_bytes": image_bytes,
+                        "caption": f"ALMA {plot_type.capitalize()} Plot"
+                    }
+                    return {"success": True, "message": f"Generated {plot_type} plot successfully"}
+                return {"success": False, "error": "Plot generation returned empty"}
+
+            # Mode 2: Publication-quality scatter plot
+            data_records = self.last_search_results.to_dict("records")
+            kw = {}
+            if x_column: kw["x_column"] = x_column
+            if y_column: kw["y_column"] = y_column
+            if color_by: kw["color_by"] = color_by
+            if title: kw["title"] = title
+            if dark_mode: kw["dark_mode"] = dark_mode
+            return self.plotting_service.plot_alma_results(data_records=data_records, **kw)
+
         except Exception as e:
             return {"success": False, "error": str(e)}
+
 
     def _render_fits_image(self, url: str, title: str = "", colormap: str = "inferno",
                            stretch: str = "sqrt") -> Dict[str, Any]:
@@ -2932,6 +3514,98 @@ ORDER BY target_name
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    # ── Phase 1 Tool Handlers: Astronomy Calculators ───────────────────
+
+    def _fit_spectral_line(self, url: str, ra_deg: float = None, dec_deg: float = None,
+                           x_pixel: int = None, y_pixel: int = None,
+                           title: str = "") -> Dict[str, Any]:
+        """Extract spectrum and fit a Gaussian line profile."""
+        try:
+            from services.fits_service import fit_spectral_line
+            result = fit_spectral_line(
+                url, ra_deg=ra_deg, dec_deg=dec_deg,
+                x_pixel=x_pixel, y_pixel=y_pixel, title=title,
+            )
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _calculate_redshift(self, z: float) -> Dict[str, Any]:
+        """Compute cosmological quantities for a given redshift."""
+        try:
+            return calculate_redshift(z)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _convert_coordinates(self, ra: float = None, dec: float = None,
+                             l: float = None, b: float = None,
+                             input_frame: str = "icrs",
+                             output_frame: str = "galactic") -> Dict[str, Any]:
+        """Convert coordinates between frames."""
+        try:
+            return convert_coordinates(
+                ra=ra, dec=dec, l=l, b=b,
+                input_frame=input_frame, output_frame=output_frame,
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _calculate_beam(self, frequency_ghz: float,
+                        max_baseline_m: float = None,
+                        array_config: str = None) -> Dict[str, Any]:
+        """Calculate synthesized beam size."""
+        try:
+            return calculate_beam(
+                frequency_ghz=frequency_ghz,
+                max_baseline_m=max_baseline_m,
+                array_config=array_config,
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _calculate_alma_sensitivity(self, band: int, bandwidth_ghz: float = 7.5,
+                                    t_integration_s: float = 60.0,
+                                    n_antennas: int = None,
+                                    n_polarizations: int = 2,
+                                    channel_width_khz: float = None,
+                                    pwv_mm: float = 1.0) -> Dict[str, Any]:
+        """Estimate ALMA sensitivity using the radiometer equation."""
+        try:
+            return calculate_alma_sensitivity(
+                band=band, bandwidth_ghz=bandwidth_ghz,
+                t_integration_s=t_integration_s, n_antennas=n_antennas,
+                n_polarizations=n_polarizations,
+                channel_width_khz=channel_width_khz, pwv_mm=pwv_mm,
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _generate_finding_chart(self, target: str = None, ra: float = None,
+                                dec: float = None, survey: str = "DSS2 Red",
+                                fov_arcmin: float = 5.0,
+                                title: str = None) -> Dict[str, Any]:
+        """Generate a finding chart with WCS, crosshair, and compass."""
+        try:
+            result = self.skyview_client.generate_finding_chart(
+                target=target, ra=ra, dec=dec,
+                survey=survey, fov_arcmin=fov_arcmin, title=title,
+            )
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def _generate_notebook(self, title: str, steps: list) -> Dict[str, Any]:
         """Generate a Jupyter Notebook and store in last_run_result for UI delivery."""
         try:
@@ -2947,34 +3621,255 @@ ORDER BY target_name
 
     @log_tool
     def _search_papers(self, query: str, max_results: int = 10, sort: str = "date desc") -> Dict[str, Any]:
-        """Search NASA ADS for papers.
+        """Search NASA ADS for papers using intelligent query translation.
         
-        The calling LLM already produces valid ADS fielded-syntax queries
-        (e.g. author:"Torrey" AND abstract:"galaxy formation"), so we call
-        search_papers() directly — no extra LLM query builder needed.
+        The user's natural-language question is passed through an LLM-backed
+        ADSQueryBuilder that translates it into optimal ADS syntax using
+        keyword:, bibgroup:, object:, trending(), useful(), similar(), etc.
+        Falls back to direct query if the builder fails.
+        
+        After ADS returns results, papers are silently enriched with OpenAlex
+        data: FWCI, citation percentile, top-1% flag, funders, and OA PDF URLs.
         """
         try:
             if not self.ads_client:
                 return {"success": False, "error": "NASA ADS Client not initialized (check API Key)"}
 
-            # Call ADS API directly with the query the agent already formatted
-            papers_list = self.ads_client.search_papers(
-                query, max_results=max_results, sort=sort
+            # Use the smart NL→ADS query builder for rich query translation
+            result = self.ads_client.search_natural_language(
+                question=query,
+                max_results=max_results,
+                sort=sort,
             )
+            
+            papers_list = result.get("papers", [])
+            ads_query = result.get("query", query)
+
+            # ── Silent OpenAlex enrichment ────────────────────────────
+            # Batch-enrich papers with funding data, FWCI scores, citation
+            # percentiles, and OA PDF URLs that ADS doesn't provide.
+            # Failures are silently swallowed — enrichment is best-effort.
+            try:
+                oalex = self.openalex_client
+                dois = [p.get("doi", "") for p in papers_list if p.get("doi")]
+                if dois and oalex:
+                    enrichments = oalex.enrich_batch_dois(dois)
+                    if enrichments:
+                        _enriched_count = 0
+                        for paper in papers_list:
+                            doi = paper.get("doi", "")
+                            if doi and doi in enrichments:
+                                e = enrichments[doi]
+                                paper["fwci"] = e.get("fwci")
+                                paper["citation_percentile"] = e.get("citation_percentile")
+                                paper["is_top_1_percent"] = e.get("is_top_1_percent", False)
+                                paper["is_top_10_percent"] = e.get("is_top_10_percent", False)
+                                paper["funders"] = e.get("funders", [])
+                                paper["oa_pdf_url"] = e.get("oa_pdf_url", "")
+                                paper["openalex_topics"] = e.get("topics", [])
+                                _enriched_count += 1
+                        print(f"[OpenAlex] Enriched {_enriched_count}/{len(papers_list)} papers")
+            except Exception as _enrich_err:
+                print(f"[OpenAlex] Enrichment failed (non-fatal): {_enrich_err}")
 
             # Store result for the UI backend to pick up
             self.last_run_result = {
                 "type": "papers",
                 "papers": papers_list,
-                "source": f"ADS: {query}",
+                "source": f"ADS: {ads_query}",
             }
             return {
                 "success": True,
                 "count": len(papers_list),
-                "ads_query": query,
+                "ads_query": ads_query,
                 "papers": papers_list,
                 "top_title": papers_list[0]["title"] if papers_list else "No results",
             }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ------------------------------------------------------------------
+    # OpenAlex tool handlers
+    # ------------------------------------------------------------------
+
+    @log_tool
+    def _lookup_researcher(self, query: str, max_results: int = 3) -> Dict[str, Any]:
+        """Look up a researcher by name or ORCID via OpenAlex."""
+        try:
+            oalex = self.openalex_client
+
+            # Check if the query looks like an ORCID
+            clean = query.strip().replace("https://orcid.org/", "")
+            is_orcid = (
+                clean.replace("-", "").isdigit() and len(clean) >= 16
+            )
+
+            if is_orcid:
+                author = oalex.get_author(clean)
+                if author:
+                    return {
+                        "success": True,
+                        "count": 1,
+                        "researchers": [author],
+                    }
+                return {"success": False, "error": f"No author found for ORCID {clean}"}
+
+            # Name search
+            authors = oalex.search_authors(query, max_results=max_results)
+            if not authors:
+                return {"success": False, "error": f"No researchers found matching '{query}'"}
+
+            return {
+                "success": True,
+                "count": len(authors),
+                "researchers": authors,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @log_tool
+    def _get_research_trends(
+        self, query: str, year_from: int = 2015, year_to: int = 2026
+    ) -> Dict[str, Any]:
+        """Get bibliometric trends and funding landscape for a topic via OpenAlex."""
+        try:
+            oalex = self.openalex_client
+
+            # Publication trends
+            trends = oalex.get_topic_trends(
+                query, year_from=year_from, year_to=year_to,
+            )
+
+            # Funding landscape (top funded works)
+            funded = oalex.get_funding_landscape(query, max_results=15)
+
+            return {
+                "success": True,
+                "trends": trends,
+                "funded_works_count": len(funded),
+                "top_funded_works": funded[:8],
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @log_tool
+    def _evaluate_consensus(self, question: str, max_papers: int = 20) -> Dict[str, Any]:
+        """Search for papers on a scientific question and evaluate the field's consensus.
+        
+        Searches ADS, reads all abstracts, and produces a structured analysis of
+        whether the field agrees or disagrees, citing specific papers and explaining
+        the reasoning behind different positions.
+        """
+        try:
+            if not self.ads_client:
+                return {"success": False, "error": "NASA ADS Client not initialized"}
+
+            # Step 1: Search for highly-cited papers on the topic for authoritative consensus
+            result = self.ads_client.search_natural_language(
+                question=question,
+                max_results=max_papers,
+                sort="citation_count desc",
+            )
+            papers_list = result.get("papers", [])
+            
+            if not papers_list:
+                return {"success": False, "error": "No papers found for this question."}
+            
+            # Step 2: Build a structured context with all abstracts + metadata
+            paper_contexts = []
+            for i, p in enumerate(papers_list, 1):
+                ctx = (
+                    f"[{i}] {p.get('title', 'Unknown')} "
+                    f"({p.get('authors', 'Unknown')}, {p.get('year', '?')})\n"
+                    f"    Journal: {p.get('journal', 'Unknown')} | "
+                    f"Citations: {p.get('citations', 0)} | "
+                    f"Bibcode: {p.get('bibcode', '')}\n"
+                    f"    Abstract: {p.get('abstract', 'No abstract')}\n"
+                )
+                paper_contexts.append(ctx)
+            
+            all_papers_text = "\n".join(paper_contexts)
+            
+            # Step 3: Ask the LLM to evaluate consensus with detailed citations
+            consensus_prompt = f"""\
+You are an expert scientific literature analyst. You have been given {len(papers_list)} \
+peer-reviewed papers retrieved from NASA ADS on the following question:
+
+QUESTION: "{question}"
+
+YOUR TASK: Analyze all the abstracts below and produce a detailed CONSENSUS EVALUATION.
+
+PAPERS:
+{all_papers_text}
+
+PRODUCE YOUR ANALYSIS IN THIS EXACT FORMAT:
+
+## 📊 Field Consensus: [Strong Agreement / Moderate Agreement / Divided / Strong Disagreement]
+**Confidence:** [High / Medium / Low] (based on {len(papers_list)} papers, weighted by citation count)
+**Papers Analyzed:** {len(papers_list)}
+
+### Majority Position
+State the dominant view clearly in 2-3 sentences. Cite the specific papers that support it using their [number] references.
+
+Example: "The majority of the literature ([1], [3], [5], [7], [8], [12]) concludes that..."
+
+### Dissenting/Alternative Views  
+If papers disagree, group them by their position. For EACH dissenting view:
+- State the alternative conclusion
+- List which papers support it (by [number])
+- Explain WHY they reach a different conclusion (different methodology? different data? different assumptions? different telescope?)
+- Cite the specific evidence or reasoning from their abstracts
+
+If there are no dissenting views, state "No significant dissent found in the analyzed literature."
+
+### Key Evidence Summary
+Bullet-point the strongest pieces of evidence from both sides, citing specific papers:
+- "[1] found that..." 
+- "[5] measured X and concluded..."
+- "[9] used ALMA data showing..."
+
+### Evolution Over Time
+If the consensus has shifted over time (older papers say X, newer papers say Y), note this trend.
+
+### Open Questions
+What does the literature identify as unresolved? What would settle the debate?
+
+IMPORTANT RULES:
+- ALWAYS cite papers by their [number] reference
+- Include the author name and year when first citing a paper
+- Be specific about evidence — don't just say "some papers agree"
+- Weight highly-cited papers more heavily in your assessment
+- If a question is too narrow or the papers don't directly address it, say so honestly
+"""
+
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": "You are a meticulous scientific literature analyst who produces rigorous, well-cited consensus evaluations."},
+                    {"role": "user", "content": consensus_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=4000,
+            )
+            
+            analysis = response.choices[0].message.content.strip()
+            
+            # Store for UI rendering
+            self.last_run_result = {
+                "type": "consensus",
+                "text": analysis,
+                "papers": papers_list,
+                "question": question,
+                "source": f"Consensus Analysis: {len(papers_list)} papers",
+            }
+            
+            return {
+                "success": True,
+                "question": question,
+                "papers_analyzed": len(papers_list),
+                "analysis": analysis,
+            }
+            
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -3328,12 +4223,12 @@ ORDER BY target_name
 
     # --- RLM helpers -------------------------------------------------------
 
-    def _rlm_tool_bridge(self, tool_name: str, kwargs: dict) -> Any:
+    def _sandbox_tool_bridge(self, tool_name: str, kwargs: dict) -> Any:
         """
-        Bridge from REPL call_tool(name, **kwargs) to registered Quasar tools.
+        Bridge from sandbox call_tool(name, **kwargs) to registered Quasar tools.
 
-        This is the key paper-standard addition: any of the 27+ registered
-        Quasar tools can be called from inside the REPL Python environment:
+        Any of the 27+ registered Quasar tools can be called from inside the
+        sandbox Python environment:
           call_tool("search_by_target", target_name="Elias 2-27")
           call_tool("check_line_coverage", line_freq_ghz=230.538, z=0.0)
           call_tool("generate_casa_imaging_script", target="Elias 2-27", vis="x.ms")
@@ -3347,62 +4242,9 @@ ORDER BY target_name
                 return {"error": f"Tool '{tool_name}' execution failed: {e}"}
         return {"error": f"Unknown tool: '{tool_name}'. Available: {[t.name for t in self.tool_registry.list_tools()]}"}
 
-    def _rlm_tool_executor(self, subtask: str, context: str) -> Optional[str]:
-        """
-        Callback used by the RLM engine to execute domain-specific sub-tasks.
-        Routes sub-task descriptions to the appropriate agent tools.
-        Returns a string answer or None to let the RLM fall back to LLM.
-        """
-        st = subtask.lower()
-
-        # Search archive for a target
-        if any(kw in st for kw in ["search", "find observations", "query archive"]):
-            # Try to extract target name from the subtask
-            entities = self.extract_entities(subtask)
-            target = entities.get("source_name")
-            if target:
-                try:
-                    results = self.search_service.search_by_target(
-                        target_name=target, facility="ALMA", max_results=20
-                    )
-                    if results is not None and not results.empty:
-                        self.last_search_results = results
-                        return f"Found {len(results)} ALMA observations for {target}."
-                    return f"No ALMA observations found for {target}."
-                except Exception as e:
-                    return f"Search error: {e}"
-
-        # Resolve target coordinates
-        if "resolve" in st or "coordinates" in st:
-            entities = self.extract_entities(subtask)
-            target = entities.get("source_name")
-            if target:
-                result = self._resolve_target(target)
-                return str(result)
-
-        # Frequency / sensitivity calculation
-        if "sensitivity" in st or "noise" in st:
-            return None  # Let LLM answer from the accumulated context
-
-        # Default: let RLM LLM handle it
-        return None
-
     def process_query(self, query: str, user_id: str = "user") -> Tuple[Optional[Any], str, str]:
         """Process a user query and return (result, source_name, result_type)"""
         self.memory.add_message("user", query)
-
-        # --- RLM: check if this is a complex multi-hop query ---
-        try:
-            should_rlm, complexity = self.rlm.should_use_rlm(query)
-            if should_rlm:
-                if self.config.verbose:
-                    print(f"[RLM] Complex query detected (score={complexity.score:.2f}): {complexity.reasoning}")
-                answer = self.rlm.execute(query)
-                self.memory.add_message("assistant", answer)
-                return None, answer, "rlm"  # answer goes in response_text slot
-        except Exception as e:
-            if self.config.verbose:
-                print(f"[RLM] Failed, falling back to normal flow: {e}")
 
         # 1. Determine Intent
         intent_data = self.determine_intent(query)
@@ -3461,12 +4303,18 @@ ORDER BY target_name
     # CONDUCTOR TOOL EXECUTOR — Bridges sub-agents to the full tool set
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    def _conductor_tool_executor(self, task_description: str, dep_context: str = "") -> str:
+    def _conductor_tool_executor(self, task_description: str, dep_context: str = "", subtask_model: str = "") -> str:
         """
         Execute a sub-task using a mini Responses API call with full tool access.
 
         This is the callback passed to Conductor so each DAG node can use
         all 28+ registered tools (ALMA search, ADS, Splatalogue, etc.).
+
+        Parameters
+        ----------
+        subtask_model : str, optional
+            The model to use for this subtask, as determined by ModelRouter.
+            If empty, falls back to conductor_model (GPT-5.4).
         """
         system_instructions = (
             "You are a radio astronomy specialist executing one step of a larger analysis. "
@@ -3493,11 +4341,16 @@ ORDER BY target_name
             # (self.tools does not exist; _build_tool_definitions() would crash)
             tools = self._build_tools_for_responses_api()
 
-            # Single Responses API call with tool access
-            # Use the Conductor's model for subtask execution (gpt-5.4)
-            subtask_model = getattr(self.conductor, 'conductor_model', self.config.model)
+            # ── Model selection: use the routed model if provided,
+            # otherwise fall back to conductor_model (GPT-5.4)
+            if subtask_model:
+                model_to_use = subtask_model
+            else:
+                model_to_use = getattr(self.conductor, 'conductor_model', self.config.model)
+            print(f"[CONDUCTOR] Subtask model: {model_to_use} for: {task_description[:80]}")
+
             response = self.client.responses.create(
-                model=subtask_model,
+                model=model_to_use,
                 instructions=system_instructions,
                 input=user_input,
                 tools=tools,
@@ -3680,6 +4533,17 @@ ORDER BY target_name
         if _archive_verbs or _telescope_query:
             return None  # skip web search for archive queries
 
+        # ── Skip web search for paper/literature queries ───────────────
+        # Papers come from NASA ADS (search_papers tool), not web search.
+        # "recent papers on X" should NOT trigger web search just because
+        # of the word "recent".
+        _paper_query = re.search(
+            r'\b(?:papers?|publications?|articles?|literature|studies)\b',
+            _q,
+        )
+        if _paper_query:
+            return None  # skip web search for paper queries
+
         # 1. Explicit year mentions beyond cutoff
         year_matches = re.findall(r'\b(20[2-9]\d)\b', query)
         for ym in year_matches:
@@ -3709,10 +4573,16 @@ ORDER BY target_name
             if m_year == self._LLM_CUTOFF_YEAR and month_names[m_name] > self._LLM_CUTOFF_MONTH:
                 return query
 
-        # 3. Freshness keywords — REMOVED.
-        #    Web search now only triggers on explicit dates beyond the cutoff.
-        #    Words like "latest", "current", "recent" are too common and caused
+        # 3. Selective freshness keywords — only high-confidence temporal phrases
+        #    that strongly imply the user wants current-year information.
+        #    Avoids broad terms like "latest", "current", "recent" which cause
         #    false positives on nearly every query.
+        _freshness_pattern = re.search(
+            r'\b(?:this\s+year|this\s+month|today|right\s+now|happening\s+now)\b',
+            _q,
+        )
+        if _freshness_pattern:
+            return query
 
         return None
 
@@ -3725,9 +4595,21 @@ ORDER BY target_name
         on_status=None,
         attachments: Optional[List[Dict[str, Any]]] = None,
         raw_query: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        plan_feedback_queue=None,
     ) -> str:
-        # Reset accumulated results for this new request
+        # Assign a unique conversation_id if none provided (isolates anonymous
+        # concurrent requests so they never share OpenAI response state).
+        if not conversation_id:
+            conversation_id = f"anon_{uuid.uuid4().hex[:12]}"
+
+        # Periodic cleanup to prevent unbounded memory growth
+        self._cleanup_conv_states()
+
+        # Reset per-request thread-local state
         self._accumulated_run_results = []
+        self.last_run_result = None
+        self.last_search_results = None
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -3756,8 +4638,16 @@ ORDER BY target_name
             pattern = re.compile(re.escape(tag), re.IGNORECASE)
             query = pattern.sub("", query).strip()
 
-        # 0. Session Management — smart context handling + session memory
+        # 0. Session Management -- smart context handling + session memory
         self._prune_session_if_needed(query, user_id)
+
+        # Helper: emit structured events (web_sources, etc.) through the SSE queue.
+        # Uses the __event__ prefix that main.py already handles.
+        _json = json  # local alias for use in closures
+        def on_event(evt: dict):
+            print(f"[DEBUG on_event] type={evt.get('type')}, images={len(evt.get('images', []))}, sources={len(evt.get('sources', []))}")
+            if on_status:
+                on_status(f"__event__{_json.dumps(evt)}", evt.get('type', 'status'))
 
         # Emit connecting step
         if on_status:
@@ -3767,7 +4657,9 @@ ORDER BY target_name
         # 0a. Knowledge-cutoff detection — launch parallel web search
         _web_search_query = self._detect_beyond_cutoff(_user_query)
         _web_result_holder = {}   # will be filled by background thread
-        _web_search_reason = None  # tracks WHY web search was triggered
+        _web_search_reason = None
+        _email_result_holder = {}  # dedicated email search for researcher queries
+        _email_thread = None
 
         if _web_search_query:
             _web_search_reason = "cutoff"
@@ -3834,21 +4726,220 @@ ORDER BY target_name
         if _is_archive_fetch:
             _should_rag = False
 
+        # Skip RAG for paper/literature queries — these go through NASA ADS
+        # (search_papers tool), NOT ALMA documentation. Words like "disk",
+        # "spectral", "radio" in "recent papers on protoplanetary disks" would
+        # false-positive on _rag_keywords and waste time searching manuals.
+        #
+        # Simple rule: if ANY paper/literature word appears → skip RAG.
+        # Exception: "summarize this paper" / "explain this article" with an
+        # attachment is a DOCUMENT query, not a search — handled separately.
+        _has_paper_word = bool(re.search(
+            r'\b(?:papers?|publications?|articles?|literature|studies|preprints?)\b',
+            _query_lower,
+        ))
+        _is_document_analysis = bool(re.search(
+            r'\b(?:summarize|summarise|explain|describe|extract|read|analyze|analyse|'
+            r'review|translate|what does|tell me about)\b.*'
+            r'\b(?:this|the|attached|uploaded)\b.*'
+            r'\b(?:paper|article|document|pdf)\b',
+            _query_lower,
+        )) or bool(attachments)
+
+        # Determine if this is a paper search query.
+        # When paper keywords are detected but the intent is ambiguous,
+        # use a fast LLM call to verify before committing to search_papers.
+        _is_paper_query = False
+        if _has_paper_word and not _is_document_analysis:
+            # Fast LLM intent verification (~200ms with gpt-4o-mini)
+            try:
+                from openai import OpenAI as _OAI
+                _mini = _OAI()
+                _intent_resp = _mini.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"Classify this astronomy query into exactly one category.\n\n"
+                            f"Query: \"{_user_query}\"\n\n"
+                            f"PAPERS = The user wants to FIND scientific papers, publications, or literature from NASA ADS or arXiv. "
+                            f"Example: 'Find papers about protoplanetary disks', 'Recent publications on galaxy mergers'.\n"
+                            f"KNOWLEDGE = The user wants general information, how-to guides, ALMA policies, procedures, or technical details. "
+                            f"Words like 'proposal', 'archival', 'access', 'deadline', 'review process' in context of ALMA operations are KNOWLEDGE, not PAPERS.\n"
+                            f"Example: 'What are the proposal submission deadlines?', 'How do I access archival data?'\n\n"
+                            f"Reply with ONLY one word: PAPERS or KNOWLEDGE"
+                        ),
+                    }],
+                    temperature=0,
+                    max_tokens=5,
+                )
+                _intent = _intent_resp.choices[0].message.content.strip().upper()
+                _is_paper_query = "PAPERS" in _intent
+                print(f"[INTENT] Query: '{_user_query[:60]}...' → {_intent} (paper_query={_is_paper_query})")
+            except Exception as e:
+                # Fallback to keyword-based detection if LLM call fails
+                print(f"[INTENT] LLM verification failed, falling back to keyword: {e}")
+                _is_paper_query = True  # Preserve original behavior on failure
+
+        if _is_paper_query:
+            _should_rag = False
+
+        # Detect OpenAlex-targeted queries — researcher lookups, funding,
+        # metrics, popularity, and trend questions. These ALWAYS trigger the
+        # OpenAlex tool (even if RAG also runs — the two are additive).
+        # IMPORTANT: use _user_query (bare question) not _query_lower
+        # (enriched query) because the enrichment wrapper may contain ALMA
+        # terms that would falsely trigger the exclusion regex.
+        _bare_lower = _user_query.lower()
+        _is_researcher_query = bool(re.search(
+            r'\b(?:who is|who\'s|tell me about|look up|profile of|'
+            r'where does .+ work|what does .+ (?:research|study|work on)|'
+            r'what (?:topics?|areas?|fields?) does .+ (?:research|study|work)|'
+            r'how many papers has .+ (?:published|written|authored)|'
+            r'which institution|h-index|orcid|'
+            r'.+\'s research|.+\'s h.index|.+\'s publications?)\b',
+            _bare_lower,
+        )) and not bool(re.search(
+            # Exclude ALMA instrument/process questions (only in the BARE query)
+            r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b',
+            _bare_lower,
+        ))
+        _is_trend_query = bool(re.search(
+            r'\b(?:interest in .+ growing|publication trend|research trend|'
+            r'how much research|how many papers on|papers per year|'
+            r'publication volume|publication rate|research output|'
+            r'is .+ growing|field growth|who funds|funding landscape|'
+            r'bibliometric|citation metrics?|impact factor)\b',
+            _bare_lower,
+        ))
+        _is_openalex_query = _is_researcher_query or _is_trend_query
+        if _is_openalex_query:
+            # Do NOT set _should_rag = False — OpenAlex is additive, not
+            # exclusive. RAG may still provide useful ALMA-related context.
+            # The OpenAlex directive (injected later) ensures the tool is called
+            # regardless of whether RAG context is present.
+            print(f"[ROUTE] OpenAlex query detected (researcher={_is_researcher_query}, "
+                  f"trend={_is_trend_query}): '{_user_query[:60]}'")
+
+            # For researcher queries, run TWO parallel web searches:
+            #   1. General context search (bio, news, awards, personal page)
+            #   2. Targeted email/contact search (faculty page, directory)
+            # Both run concurrently with zero extra latency.
+            if _is_researcher_query and _web_thread is None and os.getenv("TAVILY_API_KEY", ""):
+                _web_search_reason = "researcher_supplement"
+                if on_status:
+                    on_status("Searching the web for researcher profile", "running")
+
+                # Extract the person's name from the query for targeted searches
+                _person_name = re.sub(
+                    r'\b(?:who is|who\'s|tell me about|look up|profile of)\b',
+                    '', _user_query, flags=re.IGNORECASE,
+                ).strip().strip('?').strip()
+
+                # Thread 1: General context search
+                def _bg_web_search_researcher():
+                    try:
+                        _web_result_holder["data"] = self._tavily_web_search(
+                            query=_user_query,
+                            max_results=10,
+                            search_depth="basic",
+                        )
+                    except Exception as _e:
+                        _web_result_holder["error"] = str(_e)
+
+                _web_thread = threading.Thread(target=_bg_web_search_researcher, daemon=True)
+                _web_thread.start()
+
+                # Thread 2: Targeted email/contact search
+                def _bg_email_search():
+                    try:
+                        _email_result_holder["data"] = self._tavily_web_search(
+                            query=f"{_person_name} email contact professor astronomy",
+                            max_results=3,
+                            search_depth="basic",
+                        )
+                    except Exception as _e:
+                        _email_result_holder["error"] = str(_e)
+
+                _email_thread = threading.Thread(target=_bg_email_search, daemon=True)
+                _email_thread.start()
+
         if _should_rag:
             try:
                 if on_status:
                     on_status("Searching ALMA Manuals & Documentation", "running")
-                docs = self.rag_service.search(query)
+
+                # ── Year-aware filtering ──────────────────────────────
+                # Auto-detect year references in the query so we prefer
+                # the most relevant version of the documentation.
+                _rag_min_year = None
+                _rag_year_matches = re.findall(r'\b(20[1-3]\d)\b', _user_query)
+                if _rag_year_matches:
+                    _rag_min_year = max(int(y) for y in _rag_year_matches)
+
+                # Also detect "Cycle N" → year mapping
+                _cycle_year_map = {
+                    "1": 2013, "2": 2014, "3": 2015, "4": 2016,
+                    "5": 2017, "6": 2018, "7": 2019, "8": 2020,
+                    "9": 2021, "10": 2022, "11": 2023, "12": 2024,
+                    "13": 2025, "14": 2026,
+                }
+                _cycle_match = re.search(r'Cycle\s+(\d{1,2})', _user_query, re.IGNORECASE)
+                if _cycle_match and _cycle_match.group(1) in _cycle_year_map:
+                    _cycle_yr = _cycle_year_map[_cycle_match.group(1)]
+                    if _rag_min_year is None or _cycle_yr > _rag_min_year:
+                        _rag_min_year = _cycle_yr
+
+                docs = self.rag_service.search(
+                    query,
+                    min_year=_rag_min_year,
+                )
                 if docs:
                     context_pieces = []
-                    for d in docs[:3]:
-                        src = d.metadata.get("source", d.metadata.get("source_file", "Unknown"))
+                    for chunk_idx, d in enumerate(docs[:3], 1):
+                        # Prefer source_file (clean filename) over source (full path)
+                        src = d.metadata.get("source_file", d.metadata.get("source", "Unknown"))
                         if "/" in src or "\\" in src:
                             src = src.replace("\\", "/").split("/")[-1]
                         page = d.metadata.get("page", "?")
-                        context_pieces.append(f"[Source: {src}, Page {page}]\n{d.page_content}")
+                        doc_year = d.metadata.get("doc_year", "?")
+                        doc_month = d.metadata.get("doc_month")
+                        score = d.metadata.get("_score", d.metadata.get("_semantic_score", "?"))
+                        if isinstance(score, float):
+                            score = round(score, 2)
+                        category = d.metadata.get("doc_category", "")
+
+                        # Build human-readable date string
+                        month_names = {
+                            1: "January", 2: "February", 3: "March",
+                            4: "April", 5: "May", 6: "June",
+                            7: "July", 8: "August", 9: "September",
+                            10: "October", 11: "November", 12: "December",
+                        }
+                        if doc_month and isinstance(doc_month, int) and doc_month in month_names:
+                            date_str = f"{month_names[doc_month]} {doc_year}"
+                        elif doc_year and doc_year != "?":
+                            date_str = str(doc_year)
+                        else:
+                            date_str = "N/A"
+
+                        # Build page string
+                        if page and page != "?" and str(page) != "?":
+                            page_str = str(page)
+                        else:
+                            page_str = "N/A"
+
+                        # Pre-build the EXACT citation the LLM must copy verbatim
+                        cite_tag = f"[Source: {src}, Page {page_str}, Date: {date_str}, Relevance: {score}]"
+
+                        # Build structured chunk with explicit CITE_AS tag
+                        context_pieces.append(
+                            f"--- DOCUMENT CHUNK {chunk_idx} ---\n"
+                            f"CITE_AS: {cite_tag}\n"
+                            f"{d.page_content}"
+                        )
                     rag_context = (
-                        "\n\n📚 DOCUMENTATION CONTEXT (from ALMA Technical Documentation — may be outdated):\n"
+                        "\n\n📚 DOCUMENTATION CONTEXT (from ALMA Technical Documentation):\n"
                         + "\n---\n".join(context_pieces)
                     )
 
@@ -3902,11 +4993,20 @@ ORDER BY target_name
                             _uq,
                         ))
 
-                        if _is_attachment_query or _has_attachments or _is_conversational:
+                        # Paper/literature queries should NEVER trigger web
+                        # search — papers come from NASA ADS, not the web.
+                        # "recent papers on X" matches _wants_current_info
+                        # because of "recent", but that's a false positive.
+                        _is_paper_query_web = bool(re.search(
+                            r'\b(?:papers?|publications?|articles?|literature|studies)\b',
+                            _uq,
+                        ))
+
+                        if _is_attachment_query or _has_attachments or _is_conversational or _is_paper_query_web:
                             _needs_web_supplement = False
-                        elif _wants_current_info:
+                        else:
+                            # Always supplement RAG with web search for fresh context
                             _needs_web_supplement = True
-                        # else: default to NOT web-searching (LLM + RAG is enough)
 
                     if _needs_web_supplement:
                         _web_search_reason = "rag_supplement"
@@ -3917,7 +5017,7 @@ ORDER BY target_name
                             try:
                                 _web_result_holder["data"] = self._tavily_web_search(
                                     query=_user_query,
-                                    max_results=5,
+                                    max_results=10,
                                     search_depth="basic",
                                 )
                             except Exception as _e:
@@ -3958,28 +5058,123 @@ ORDER BY target_name
         if rag_context:
             citation_note = (
                 "\n\nIMPORTANT CITATION & STRUCTURE RULES:\n"
-                "1. When your answer uses information from the DOCUMENTATION CONTEXT above, "
-                "you MUST cite the source at the end of the relevant sentence using this exact format: "
-                "[Source: filename, Page X]. For example: [Source: ALMA_Technical_Handbook.pdf, Page 42]. "
-                "Always include the page number.\n"
+                "1. INLINE CITATIONS: Place each citation IMMEDIATELY after the sentence that uses the information. "
+                "NEVER create a 'References:' or 'Sources:' section at the bottom. "
+                "Each document chunk above has a CITE_AS tag — you MUST copy that EXACT string verbatim as your citation. "
+                "Do NOT modify, rephrase, or invent citation fields. The CITE_AS tag already contains the correct "
+                "Page number, Date, and Relevance score. Example: if CITE_AS says "
+                "'[Source: alma-proposers-guide-cycle13.pdf, Page 36, Date: February 2026, Relevance: 0.88]', "
+                "write EXACTLY that string after the sentence that uses info from that chunk. "
+                "NEVER write 'Page unknown', 'Date: unknown', or make up your own Relevance scores.\n"
                 "2. After presenting the documentation-based answer, add a disclaimer line: "
-                "'*📚 The above is sourced from ALMA Technical Documentation and may not reflect the very latest policies.*'\n"
-                "3. If the system appends web search results after your response, the user will see "
-                "both your documentation answer AND fresh web data — DO NOT duplicate web content "
-                "in your response as it will be shown separately."
+                "'*📚 The above is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies.*'\n"
+                "3. WEB SECTION: If web search results are available in your context, you MUST present them under "
+                "'🌐 Updated Information from the Web:' with a detailed paragraph. NEVER say 'No additional updates were found'. "
+                "Always extract and present the actual content from the web results, even if it overlaps with the documentation."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}\n\nUser: {query}"
 
+        # 4b. Paper query safety net — even if RAG context leaked in above,
+        #     force the LLM to call search_papers (ADS) for paper queries.
+        #     Reuse the _has_paper_word / _is_paper_query flags from step 1.
+        # OpenAlex queries take priority over paper queries when both match.
+        # E.g. "How many papers has Paola Caselli published?" matches both
+        # _is_paper_query (contains 'papers') and _is_researcher_query,
+        # but should route to lookup_researcher, not search_papers.
+        if _is_openalex_query:
+            pass  # handled below
+        elif _is_paper_query:
+            paper_directive = (
+                "\n\nMANDATORY INSTRUCTION: The user is asking for papers/publications. "
+                "You MUST call the `search_papers` tool to query NASA ADS. "
+                "Do NOT answer from memory, web search results, or documentation context. "
+                "Do NOT use `web_search`. Call `search_papers` NOW."
+            )
+            full_input += paper_directive
+        if _is_openalex_query:
+            # Force the LLM to call the OpenAlex tool
+            if _is_researcher_query:
+                openalex_directive = (
+                    "\n\nMANDATORY INSTRUCTION: The user is asking about a researcher/scientist. "
+                    "You MUST call the `lookup_researcher` tool with their name or ORCID to get "
+                    "their academic profile (institution, h-index, ORCID, research topics, publication history). "
+                    "Present the OpenAlex profile data as the core of your answer. "
+                    "If web search results are also available, combine them with the OpenAlex profile "
+                    "to provide additional context (e.g. recent news, awards, personal webpage). "
+                    "Do NOT skip calling `lookup_researcher` — always call it first."
+                )
+
+                # Join the email search thread and inject contact info into
+                # the prompt so the LLM can include it in the profile header.
+                if _email_thread is not None:
+                    _email_thread.join(timeout=8)
+                    _email_data = _email_result_holder.get("data")
+                    if _email_data and _email_data.get("success"):
+                        _email_snippets = []
+                        for _r in _email_data.get("results", [])[:3]:
+                            _snippet = _r.get("content", "").strip()
+                            if _snippet:
+                                _email_snippets.append(_snippet)
+                        if _email_snippets:
+                            _email_context = "\n".join(_email_snippets)
+                            openalex_directive += (
+                                "\n\nCONTACT INFORMATION FROM WEB (include email "
+                                "and webpage in the profile header if found):\n"
+                                + _email_context
+                            )
+                            print(f"[EMAIL SEARCH] Injected {len(_email_snippets)} contact snippets into prompt")
+                    elif _email_result_holder.get("error"):
+                        print(f"[EMAIL SEARCH] Failed: {_email_result_holder['error']}")
+            else:
+                openalex_directive = (
+                    "\n\nMANDATORY INSTRUCTION: The user is asking about research trends or funding. "
+                    "You MUST call the `get_research_trends` tool with the topic query. "
+                    "Do NOT answer from memory or web search results. "
+                    "Do NOT use `web_search`. Call `get_research_trends` NOW."
+                )
+            full_input += openalex_directive
+        elif rag_context:
+            # Knowledge query with RAG context — explicitly prevent search_papers
+            knowledge_directive = (
+                "\n\n[SYSTEM NOTE: This is a KNOWLEDGE query answered from ALMA documentation. "
+                "Do NOT call `search_papers` — the user is asking about ALMA procedures, policies, "
+                "or technical details, NOT requesting scientific papers or publications. "
+                "Answer using the DOCUMENTATION CONTEXT provided above.]"
+            )
+            full_input += knowledge_directive
+
+        # 4c. Prevent duplicate web searches — when the parallel cutoff search
+        #     is already running, tell the LLM not to call web_search itself.
+        #     This eliminates redundant Tavily calls and speeds up response time.
+        if _web_search_query is not None:
+            full_input += (
+                "\n\n[SYSTEM NOTE: A web search is already running in parallel for this query. "
+                "Do NOT call the `web_search` tool yourself — the results will be appended "
+                "automatically after your response. Focus on answering from your knowledge.]"
+            )
+
         # 4a. Conductor check — delegate complex queries to DAG orchestration
+        #     IMPORTANT: The Conductor receives `_user_query` (the bare user question),
+        #     NOT `query` (which may be wrapped with personal RAG context, mem0 memories,
+        #     citation instructions, etc.).  The ALMA documentation RAG context is passed
+        #     separately via `context=rag_context` so the planner can use it for planning
+        #     without it polluting the DAG decomposition or synthesis prompts.
         try:
-            complexity = self.rlm.detector.assess(_user_query).score if hasattr(self, 'rlm') else 0.0
+            complexity = self.complexity_detector.assess(_user_query).score
             if complexity > Conductor.COMPLEXITY_THRESHOLD:
                 import asyncio, json as _json
-                trace_id = self.query_tracer.new_trace(query, user_id=user_id)
+                trace_id = self.query_tracer.new_trace(_user_query, user_id=user_id)
+
+                # Classify complexity tier → controls max subtasks
+                _tier_name, _tier_max = Conductor.classify_tier(complexity)
 
                 # ① Mark detection as COMPLETED immediately so the UI shows a ✓
                 if on_status:
-                    on_status(f"Complex query detected (score={complexity:.2f}) — activating multi-agent workforce", "completed")
+                    on_status(
+                        f"Complex query detected (score={complexity:.2f}, tier={_tier_name}) "
+                        f"— activating multi-agent workforce",
+                        "completed",
+                    )
 
                 # ② Build on_event emitter — forwards task_group / task_update / task_list
                 #    events through the SSE queue in api/main.py
@@ -4008,11 +5203,14 @@ ORDER BY target_name
                         try:
                             conductor_answer = loop.run_until_complete(
                                 self.conductor.orchestrate(
-                                    query,
+                                    _user_query,
                                     context=rag_context,
+                                    max_subtasks=_tier_max,
+                                    complexity_tier=_tier_name,
                                     on_status=on_status,
                                     on_token=on_token,
                                     on_event=on_event,
+                                    plan_feedback_queue=plan_feedback_queue,
                                 )
                             )
                         finally:
@@ -4059,33 +5257,32 @@ ORDER BY target_name
                             on_status(_web_status_label, "completed")
                         web_data = _web_result_holder.get("data")
                         if web_data and web_data.get("success"):
-                            if _web_search_reason == "rag_supplement":
-                                web_section = "\n\n---\n\n## 🌐 Updated Information from the Web\n\n"
-                                web_section += (
-                                    "*The following is more recent information retrieved from the web "
-                                    "to supplement the documentation-based answer above. "
-                                    "Click the links to verify.*\n\n"
-                                )
-                            else:
-                                web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
-                                web_section += (
-                                    "*The following information was retrieved from the web "
-                                    "because your query references a time period beyond "
-                                    "the model's training data cutoff.*\n\n"
-                                )
-                            if web_data.get("answer"):
-                                web_section += f"**Summary:** {web_data['answer']}\n\n"
-                            web_section += "**Sources:**\n\n"
-                            for i, r in enumerate(web_data.get("results", []), 1):
-                                title = r.get("title", "Untitled")
-                                url = r.get("url", "")
-                                snippet = r.get("snippet", "")
-                                web_section += f"{i}. **[{title}]({url})**\n"
-                                web_section += f"   {snippet[:300]}\n\n"
-                            conductor_answer += web_section
-                            if on_token:
-                                on_token(web_section)
-                            print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results ({_web_search_reason}) to conductor response")
+                            # Synthesize a query-relevant summary instead of using
+                            # the raw Tavily answer which is often generic.
+                            tavily_answer = self._synthesize_web_summary(
+                                _user_query, web_data, _web_search_reason or ""
+                            )
+                            if tavily_answer:
+                                web_section = "\n\n---\n\n"
+                                if _web_search_reason == "rag_supplement":
+                                    web_section += "🌐 **Updated Information from the Web:** "
+                                else:
+                                    web_section += "🌐 **From the Web:** "
+                                web_section += tavily_answer + "\n"
+                                conductor_answer += web_section
+                                if on_token:
+                                    on_token(web_section)
+                            print(f"[WEB SEARCH] Appended synthesized web summary ({_web_search_reason}) to conductor response")
+                            print(f"[WEB SEARCH] Images from Tavily: {len(web_data.get('images', []))}, Sources: {len(web_data.get('results', []))}")
+
+                            # Emit web_sources event for frontend source cards + image grid
+                            if on_event:
+                                on_event({
+                                    "type": "web_sources",
+                                    "sources": web_data.get("results", []),
+                                    "images": web_data.get("images", []),
+                                    "query": web_data.get("query", ""),
+                                })
                     # Re-emit accumulated images via last_run_result so the SSE
                     # loop in main.py can emit them as inline image events.
                     if hasattr(self, '_conductor_images') and self._conductor_images:
@@ -4117,7 +5314,7 @@ ORDER BY target_name
             
             # Smart token budget replaces hard MAX_TOOL_ROUNDS = 12
             _token_budget = TokenBudget(max_budget=100_000)
-            last_id = self.last_response_id
+            last_id = self._get_response_id(conversation_id)
             output_text = ""
             
             # 5. Call Responses API with manual streaming loop
@@ -4141,7 +5338,18 @@ ORDER BY target_name
                 if _round == 0 and _is_archive_fetch:
                     request_kwargs["tool_choice"] = "required"
 
-                response_stream = self.client.responses.create(**request_kwargs)
+                try:
+                    response_stream = self.client.responses.create(**request_kwargs)
+                except Exception as e:
+                    if "No tool output found for function call" in str(e) and "previous_response_id" in request_kwargs:
+                        # Recover from hanging tool call in a previous interrupted turn
+                        print(f"[WARNING] Recovering from hanging tool call state for conv={conversation_id}. Dropping previous_response_id.")
+                        del request_kwargs["previous_response_id"]
+                        last_id = None
+                        self._set_response_id(conversation_id, None)
+                        response_stream = self.client.responses.create(**request_kwargs)
+                    else:
+                        raise e
                 
                 function_calls = {} # call_id -> dict
                 item_id_to_call_id = {}  # item.id -> call_id mapping
@@ -4149,7 +5357,7 @@ ORDER BY target_name
                 for event in response_stream:
                     if event.type == "response.created":
                         last_id = event.response.id
-                        self.last_response_id = last_id
+                        self._set_response_id(conversation_id, last_id)
                     elif event.type == "response.output_text.delta":
                         output_text += event.delta
                         if on_token:
@@ -4267,18 +5475,33 @@ ORDER BY target_name
                                     for _new_idx in range(_acc_len_before, _acc_len_after):
                                         _new_rc = self._accumulated_run_results[_new_idx]
                                         if _new_rc.get("type") in ("data", "papers"):
-                                            _payload = json.dumps({"_eager_result": True, "_idx": _new_idx})
+                                            # Send the result directly (not just index) so the
+                                            # event-loop thread doesn't read thread-local state.
+                                            _payload = json.dumps({"_eager_result": True, "_idx": _new_idx, "_inline": True})
                                             on_status(f"__data_ready__{_payload}", "ready")
+                                            # Stash inline data for the SSE handler to pick up
+                                            on_status(f"__eager_data__{json.dumps(_new_rc, default=str)}", "data")
                             elif self.last_run_result is not None:
                                 # Tool didn't accumulate — add last_run_result ourselves
                                 _rc = self.last_run_result.copy()
                                 _rc["_result_id"] = id(self.last_run_result)
                                 self._accumulated_run_results.append(_rc)
                                 if on_status and _rc.get("type") in ("data", "papers"):
-                                    _payload = json.dumps({"_eager_result": True, "_idx": len(self._accumulated_run_results) - 1})
+                                    _payload = json.dumps({"_eager_result": True, "_idx": len(self._accumulated_run_results) - 1, "_inline": True})
                                     on_status(f"__data_ready__{_payload}", "ready")
+                                    on_status(f"__eager_data__{json.dumps(_rc, default=str)}", "data")
                             # Record tool calls for session memory
                             self.session_memory.record_tool_calls(1)
+
+                            # Emit web_sources event for LLM-initiated web searches
+                            # so source cards + images always appear in the UI.
+                            if tool_name == "web_search" and isinstance(result, dict) and result.get("success"):
+                                on_event({
+                                    "type": "web_sources",
+                                    "sources": result.get("results", []),
+                                    "images": result.get("images", []),
+                                    "query": result.get("query", ""),
+                                })
                         except Exception as te:
                             result_str = json.dumps({"error": str(te)})
                     else:
@@ -4310,7 +5533,7 @@ ORDER BY target_name
 
             # 7a. Append parallel web search results if available
             if _web_thread is not None:
-                _web_thread.join(timeout=15)  # wait up to 15s for web results
+                _web_thread.join(timeout=30)  # wait up to 30s for web results
                 # Close off the web status indicator
                 if on_status:
                     _web_status_label = (
@@ -4321,39 +5544,32 @@ ORDER BY target_name
                     on_status(_web_status_label, "completed")
                 web_data = _web_result_holder.get("data")
                 if web_data and web_data.get("success"):
-                    # Choose header based on why the web search was triggered
-                    if _web_search_reason == "rag_supplement":
-                        web_section = "\n\n---\n\n## 🌐 Updated Information from the Web\n\n"
-                        web_section += (
-                            "*The following is more recent information retrieved from the web "
-                            "to supplement the documentation-based answer above. "
-                            "Click the links to verify.*\n\n"
-                        )
-                    else:
-                        web_section = "\n\n---\n\n## 🌐 Web Search Results\n\n"
-                        web_section += (
-                            "*The following information was retrieved from the web "
-                            "because your query references a time period beyond "
-                            "the model's training data cutoff.*\n\n"
-                        )
+                    # Synthesize a query-relevant summary instead of using
+                    # the raw Tavily answer which is often generic.
+                    tavily_answer = self._synthesize_web_summary(
+                        _user_query, web_data, _web_search_reason or ""
+                    )
+                    if tavily_answer:
+                        web_section = "\n\n---\n\n"
+                        if _web_search_reason == "rag_supplement":
+                            web_section += "🌐 **Updated Information from the Web:** "
+                        else:
+                            web_section += "🌐 **From the Web:** "
+                        web_section += tavily_answer + "\n"
+                        output_text += web_section
+                        if on_token:
+                            on_token(web_section)
+                    print(f"[WEB SEARCH] Appended synthesized web summary ({_web_search_reason}) to response")
+                    print(f"[WEB SEARCH] Images from Tavily: {len(web_data.get('images', []))}, Sources: {len(web_data.get('results', []))}")
 
-                    # Synthesised answer from Tavily
-                    if web_data.get("answer"):
-                        web_section += f"**Summary:** {web_data['answer']}\n\n"
-
-                    # Individual sources with clickable links
-                    web_section += "**Sources:**\n\n"
-                    for i, r in enumerate(web_data.get("results", []), 1):
-                        title = r.get("title", "Untitled")
-                        url = r.get("url", "")
-                        snippet = r.get("snippet", "")
-                        web_section += f"{i}. **[{title}]({url})**\n"
-                        web_section += f"   {snippet[:300]}\n\n"
-
-                    output_text += web_section
-                    if on_token:
-                        on_token(web_section)
-                    print(f"[WEB SEARCH] Appended {len(web_data.get('results', []))} web results ({_web_search_reason}) to response")
+                    # Emit web_sources event for frontend source cards + image grid
+                    if on_event:
+                        on_event({
+                            "type": "web_sources",
+                            "sources": web_data.get("results", []),
+                            "images": web_data.get("images", []),
+                            "query": web_data.get("query", ""),
+                        })
                 elif _web_result_holder.get("error"):
                     print(f"[WEB SEARCH] Parallel web search failed: {_web_result_holder['error']}")
             
@@ -4378,6 +5594,11 @@ ORDER BY target_name
             return error_msg
             
         except Exception as e:
+            # If the error is about a hanging tool call, clear the poisoned
+            # response ID for THIS conversation so it doesn't keep failing.
+            if "No tool output found for function call" in str(e):
+                print(f"[WARNING] Clearing poisoned response_id for conv={conversation_id} to break error loop.")
+                self._set_response_id(conversation_id, None)
             error_msg = f"Error with Responses API: {str(e)}"
             print(f"[ERROR] {error_msg}")
             return error_msg
@@ -4414,9 +5635,14 @@ ORDER BY target_name
         
         return tools if tools else None
     
-    def reset_conversation_state(self):
-        """Reset conversation state for new chat session"""
-        self.last_response_id = None
+    def reset_conversation_state(self, conversation_id: Optional[str] = None):
+        """Reset conversation state for a specific or all chat sessions."""
+        if conversation_id:
+            self._set_response_id(conversation_id, None)
+        else:
+            # Clear ALL conversation states (full reset)
+            with self._conv_ids_lock:
+                self._conv_response_ids.clear()
         self.memory.clear()
         self.session_memory.clear()
         self._session_token_estimate = 0

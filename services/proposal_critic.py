@@ -2,7 +2,7 @@
 import os
 from typing import Dict, Any, Optional, Callable
 from openai import OpenAI
-from langchain_community.document_loaders.pdf import PyPDFLoader
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from core.prompts import (
     RED_TEAM_TAC_PROMPT,
     FACT_CHECKER_PROMPT,
@@ -156,7 +156,7 @@ class ProposalCriticService:
             # 1. Load and extract text from the PDF
             if progress_callback: progress_callback(f"Loading {filename}...", 10)
             
-            loader = PyPDFLoader(file_path)
+            loader = PyMuPDF4LLMLoader(file_path)
             documents = loader.load()
             
             if not documents:

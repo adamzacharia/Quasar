@@ -8,6 +8,7 @@ export interface User {
     username: string;
     display_name: string;
     auth_provider: "local" | "google";
+    picture_url?: string;
 }
 
 interface AuthStore {
@@ -40,7 +41,16 @@ export const useAuthStore = create<AuthStore>()(
         }),
         {
             name: "quasar-auth",
-            partialize: (state) => ({ token: state.token, user: state.user }), // Persist token + user
+            partialize: (state) => ({ token: state.token, user: state.user }),
+            // Re-derive isAuthenticated from the rehydrated token on page load
+            onRehydrateStorage: () => (state) => {
+                if (state && state.token && state.user) {
+                    state.isAuthenticated = true;
+                }
+                if (state) {
+                    state.isInitialized = true;
+                }
+            },
         }
     )
 );

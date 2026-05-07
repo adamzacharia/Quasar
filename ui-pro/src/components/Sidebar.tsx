@@ -53,6 +53,45 @@ function OverlayPanel({ open, onClose, title, icon: Icon, children }: {
     );
 }
 
+const MODEL_PRICING: Record<string, { in: number, out: number }> = {
+    // GPT-5 Series
+    "gpt-5.4": { in: 15.00, out: 45.00 },
+    "gpt-5.4-2026-03-05": { in: 15.00, out: 45.00 },
+    "gpt-5": { in: 10.00, out: 30.00 },
+    "gpt-5-mini": { in: 0.50, out: 1.50 },
+    "gpt-5-nano": { in: 0.10, out: 0.30 },
+    
+    // GPT-4 Series
+    "gpt-4.1": { in: 2.50, out: 10.00 },
+    "gpt-4o": { in: 2.50, out: 10.00 },
+    "gpt-4o-mini": { in: 0.15, out: 0.60 },
+    
+    // Anthropic
+    "claude-3-7-sonnet": { in: 3.00, out: 15.00 },
+    "claude-3-5-sonnet-20241022": { in: 3.00, out: 15.00 },
+    "claude-3-5-haiku-20241022": { in: 0.25, out: 1.25 },
+    "claude-3-opus-20240229": { in: 15.00, out: 75.00 },
+    
+    // Google Gemini
+    "gemini-2.5-pro": { in: 1.25, out: 5.00 },
+    "gemini-1.5-pro": { in: 1.25, out: 5.00 },
+    "gemini-1.5-flash": { in: 0.075, out: 0.30 },
+};
+
+function getModelCost(model: string) {
+    if (model.startsWith("local/")) return { in: 0, out: 0 };
+    if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+    // Fallbacks
+    if (model.includes("gpt-4o-mini")) return MODEL_PRICING["gpt-4o-mini"];
+    if (model.includes("gpt-4.1") || model.includes("gpt-4o")) return MODEL_PRICING["gpt-4o"];
+    if (model.includes("sonnet")) return MODEL_PRICING["claude-3-5-sonnet-20241022"];
+    if (model.includes("haiku")) return MODEL_PRICING["claude-3-5-haiku-20241022"];
+    if (model.includes("opus")) return MODEL_PRICING["claude-3-opus-20240229"];
+    if (model.includes("flash")) return MODEL_PRICING["gemini-1.5-flash"];
+    if (model.includes("pro") && model.includes("gemini")) return MODEL_PRICING["gemini-1.5-pro"];
+    return null;
+}
+
 /* ────────────────────────────────────────────
    MODEL DROPDOWN
    ──────────────────────────────────────────── */
@@ -82,26 +121,47 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
                 {label}
             </div>
-            {models.map((model) => (
-                <button key={model} onClick={() => { onSelect(model); setOpen(false); }}
-                    className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/10 text-primary" : "text-slate-300 hover:bg-slate-700/50 hover:text-white"}`}>
-                    <span className="font-medium truncate">{model.startsWith("local/") ? model.replace("local/", "") : model}</span>
-                    {model === selectedModel && <Check className="w-4 h-4 text-primary shrink-0 ml-1" />}
-                </button>
-            ))}
+            {models.map((model) => {
+                const cost = getModelCost(model);
+                return (
+                    <button key={model} onClick={() => { onSelect(model); setOpen(false); }}
+                        className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/10 text-primary" : "text-slate-300 hover:bg-slate-700/50 hover:text-white"}`}>
+                        <div className="flex flex-col items-start truncate overflow-hidden pr-2">
+                            <span className="font-medium truncate w-full text-left">{model.startsWith("local/") ? model.replace("local/", "") : model}</span>
+                            {cost && (
+                                <span className="text-[9px] text-slate-500 font-mono mt-0.5">
+                                    In: ${cost.in}/M · Out: ${cost.out}/M
+                                </span>
+                            )}
+                        </div>
+                        {model === selectedModel && <Check className="w-4 h-4 text-primary shrink-0" />}
+                    </button>
+                );
+            })}
         </>
     );
+
+    const currentCost = getModelCost(selectedModel);
 
     return (
         <div ref={ref} className="relative">
             <button onClick={() => setOpen(!open)}
-                className="flex items-center justify-between w-full px-3 py-2.5 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors">
-                <div className="flex items-center gap-2"><Bot className="w-4 h-4" /><span className="truncate">Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "[Local] ") : selectedModel}</span></div>
-                <ChevronDown className={`w-4 h-4 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
+                className="flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors">
+                <div className="flex items-center justify-between w-full">
+                    <div className="flex items-center gap-2"><Bot className="w-4 h-4" /><span className="truncate">Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "[Local] ") : selectedModel}</span></div>
+                    <ChevronDown className={`w-4 h-4 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
+                </div>
+                {currentCost && (
+                    <div className="flex items-center gap-2 mt-1 ml-6 text-[10px] text-slate-400/80 font-mono">
+                        <span>In: ${currentCost.in}/M</span>
+                        <span className="text-slate-600">|</span>
+                        <span>Out: ${currentCost.out}/M</span>
+                    </div>
+                )}
             </button>
 
             {open && (
-                <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-800 border border-slate-600/50 rounded-xl shadow-2xl shadow-black/40 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto">
+                <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-800 border border-slate-600/50 rounded-xl shadow-2xl shadow-black/40 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
                     {renderGroup("OpenAI", openaiModels)}
                     {claudeModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Anthropic Claude", claudeModels)}
@@ -296,9 +356,7 @@ export function Sidebar() {
         <aside className="relative w-[280px] bg-sidebar-dark border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
             {/* Logo */}
             <div className="p-6 flex items-center gap-3">
-                <div className="size-10 rounded-xl bg-gradient-to-br from-primary to-accent-purple flex items-center justify-center shadow-lg shadow-primary/20">
-                    <span className="text-white font-bold text-2xl">Q</span>
-                </div>
+                <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
                 <div className="flex flex-col">
                     <h1 className="text-lg font-bold tracking-tight text-white">QUASAR</h1>
                     <span className="text-xs text-slate-400 font-medium">Research Assistant</span>
@@ -331,13 +389,14 @@ export function Sidebar() {
                                             <span className="text-[10px] text-slate-500">{timeAgo(conv.updatedAt)}</span>
                                         </div>
                                     </button>
-                                    {/* Delete button — visible on hover */}
+                                    {/* Delete button — visible on hover, always visible when active */}
                                     <button
+                                        onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
                                         onClick={(e) => handleDeleteConversation(e, conv.id)}
                                         title="Delete conversation"
-                                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-all opacity-0 group-hover/item:opacity-100"
+                                        className={`absolute right-1 top-1/2 -translate-y-1/2 p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-all ${isActive ? "opacity-70" : "opacity-0"} group-hover/item:opacity-100`}
                                     >
-                                        <Trash2 className="w-3.5 h-3.5" />
+                                        <Trash2 className="w-4 h-4" />
                                     </button>
                                 </div>
                             );
@@ -384,9 +443,13 @@ export function Sidebar() {
                 <div className="pt-3 border-t border-slate-700/50 px-2 pb-2">
                     {isAuthenticated ? (
                         <div className="flex items-center gap-3">
-                            <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 flex items-center justify-center text-white text-xs font-bold shadow-md">
-                                {initials}
-                            </div>
+                            {user?.picture_url ? (
+                                <img src={user.picture_url} alt={user.display_name || "User"} className="size-8 rounded-full object-cover shadow-md" referrerPolicy="no-referrer" />
+                            ) : (
+                                <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 flex items-center justify-center text-white text-xs font-bold shadow-md">
+                                    {initials}
+                                </div>
+                            )}
                             <div className="flex flex-col flex-1 overflow-hidden">
                                 <span className="text-sm font-semibold text-white truncate">{user?.display_name || user?.username || "User"}</span>
                                 <span className="text-[10px] text-slate-400 truncate">{user?.username || ""}</span>

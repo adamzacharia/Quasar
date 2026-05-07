@@ -1,5 +1,6 @@
 import json
 import uuid
+from typing import Any
 
 class NotebookGenerator:
     """Service to generate Jupyter Notebooks (.ipynb) dynamically."""
@@ -190,68 +191,140 @@ def generate_conductor_notebook(
 
 def _build_code_cell(agent_type: str, description: str, result) -> str:
     """
-    Build a runnable Python code cell template for a subtask based on its agent type
-    and the actual result data.
+    Build a runnable Python code cell template for a subtask based on its
+    agent type and the actual result data.
+
+    (#10) Uses real values from the result to make notebooks executable
+    out of the box instead of requiring manual editing.
     """
     desc_lower = description.lower()
-    
-    if agent_type == "archive" or "alma" in desc_lower or "cadc" in desc_lower or "search" in desc_lower:
-        return (
-            f"# Reproducing: {description}\n"
-            "from astroquery.alma import Alma\n"
-            "import pandas as pd\n\n"
-            "# 1. Define the query parameters based on the task\n"
-            "# rs = Alma.query_object('TARGET_NAME') \n"
-            "# df = rs.to_pandas()\n"
-            "# df.head()"
-        )
+
+    # ── Extract real values from result data ───────────────────────────
+    target = _extract_target(description, result)
+    band = _extract_band(description, result)
+
+    if agent_type == "archive" or "alma" in desc_lower or "search" in desc_lower:
+        code = f"# Step: {description}\n"
+        code += "from astroquery.alma import Alma\n"
+        code += "import pandas as pd\n\n"
+        if target and target != "TARGET_NAME":
+            code += f"# Search ALMA archive for {target}\n"
+            code += f"rs = Alma.query_object('{target}'"
+            if band:
+                code += f", band_list=[{band}]"
+            code += ")\n"
+            code += "df = rs.to_pandas()\n"
+            code += f"print(f'Found {{len(df)}} ALMA observations of {target}')\n"
+            code += "df[['target_name', 'band_list', 's_resolution', 't_exptime']].head(10)"
+        else:
+            code += "# rs = Alma.query_object('TARGET_NAME')\n"
+            code += "# df = rs.to_pandas()\n"
+            code += "# df.head()"
+        return code
+
+    if "cadc" in desc_lower or "jwst" in desc_lower or "hst" in desc_lower:
+        code = f"# Step: {description}\n"
+        code += "import pyvo\n\n"
+        code += "# Query CADC TAP service\n"
+        code += "tap = pyvo.dal.TAPService('https://ws.cadc-cccs.hia-iha.nrc-cnrc.gc.ca/argus')\n"
+        if target and target != "TARGET_NAME":
+            code += f"query = \"SELECT TOP 20 * FROM caom2.Observation WHERE target_name='{target}'\"\n"
+        else:
+            code += "query = \"SELECT TOP 20 * FROM caom2.Observation WHERE target_name='TARGET_NAME'\"\n"
+        code += "results = tap.search(query)\n"
+        code += "results.to_table().to_pandas().head()"
+        return code
 
     if agent_type == "literature" or "paper" in desc_lower or "ads" in desc_lower:
-         return (
-            f"# Reproducing: {description}\n"
-            "import requests\n"
-            "import urllib.parse\n\n"
-            "# Query the NASA ADS API (requires ADS_DEV_KEY token)\n"
-            "# q = urllib.parse.quote('QUERY')\n"
-            "# url = f'https://api.adsabs.harvard.edu/v1/search/query?q={{q}}&fl=title,author,bibcode'\n"
-            "# print(f'Searching ADS: {{url}}')"
-         )
-         
+        code = f"# Step: {description}\n"
+        code += "import requests\nimport os\n\n"
+        code += "ADS_TOKEN = os.getenv('ADS_DEV_KEY', 'YOUR_ADS_TOKEN')\n"
+        search_term = target if target and target != "TARGET_NAME" else "QUERY"
+        code += f"query = '{search_term}'\n"
+        code += "url = f'https://api.adsabs.harvard.edu/v1/search/query?q={query}&fl=title,author,bibcode,year&rows=10'\n"
+        code += "headers = {'Authorization': f'Bearer {ADS_TOKEN}'}\n"
+        code += "resp = requests.get(url, headers=headers)\n"
+        code += "papers = resp.json().get('response', {}).get('docs', [])\n"
+        code += "for p in papers:\n"
+        code += "    print(f\"{p.get('year')} - {p.get('title', ['?'])[0][:80]}\")"
+        return code
+
     if agent_type == "viz" or "overlay" in desc_lower or "plot" in desc_lower or "render" in desc_lower:
-         return (
-             f"# Reproducing: {description}\n"
-             "import matplotlib.pyplot as plt\n"
-             "from astropy.io import fits\n"
-             "from astropy.visualization import astropy_mpl_style\n"
-             "plt.style.use(astropy_mpl_style)\n\n"
-             "# 1. Load the FITS file from the archive\n"
-             "# hdul = fits.open('FITS_URL_OR_PATH')\n"
-             "# data = hdul[0].data\n\n"
-             "# 2. Plot the image\n"
-             "# plt.figure(figsize=(8,8))\n"
-             "# plt.imshow(data, cmap='inferno', origin='lower')\n"
-             "# plt.colorbar()\n"
-             "# plt.show()"
-         )
-         
-    if agent_type == "analysis" or "splatalogue" in desc_lower or "line" in desc_lower:
-         return (
-             f"# Reproducing: {description}\n"
-             "from astroquery.splatalogue import Splatalogue\n"
-             "import astropy.units as u\n\n"
-             "# Query Splatalogue for molecular lines\n"
-             "# lines = Splatalogue.query_lines(\n"
-             "#     100 * u.GHz, \n"
-             "#     115 * u.GHz, \n"
-             "#     chemical_name=' CO ',\n"
-             "#     energy_max=500,\n"
-             "#     energy_type='eu_k'\n"
-             "# )\n"
-             "# lines.to_pandas().head()"
-         )
+        code = f"# Step: {description}\n"
+        code += "import matplotlib.pyplot as plt\n"
+        code += "from astropy.io import fits\n"
+        code += "from astropy.visualization import ZScaleInterval, ImageNormalize\n"
+        code += "plt.style.use('dark_background')\n\n"
+        code += "# Load the FITS file\n"
+        code += "# hdul = fits.open('FITS_URL_OR_PATH')\n"
+        code += "# data = hdul[0].data\n\n"
+        code += "# Plot with ZScale normalization\n"
+        code += "# norm = ImageNormalize(data, interval=ZScaleInterval())\n"
+        code += "# fig, ax = plt.subplots(figsize=(10, 10))\n"
+        code += "# ax.imshow(data, norm=norm, cmap='inferno', origin='lower')\n"
+        code += "# ax.set_title('" + (target or "Observation") + "')\n"
+        code += "# plt.colorbar(ax.images[0])\n"
+        code += "# plt.show()"
+        return code
+
+    if agent_type == "analysis" or "splatalogue" in desc_lower or "line" in desc_lower or "co" in desc_lower:
+        code = f"# Step: {description}\n"
+        code += "from astroquery.splatalogue import Splatalogue\n"
+        code += "import astropy.units as u\n\n"
+        # Try to extract frequency range
+        code += "# Query Splatalogue for molecular lines\n"
+        code += "lines = Splatalogue.query_lines(\n"
+        code += "    200 * u.GHz,\n"
+        code += "    300 * u.GHz,\n"
+        code += "    chemical_name=' CO ',\n"
+        code += "    energy_max=500,\n"
+        code += "    energy_type='eu_k'\n"
+        code += ")\n"
+        code += "df = lines.to_pandas()\n"
+        code += "print(f'Found {len(df)} spectral lines')\n"
+        code += "df[['Species', 'Chemical Name', 'Freq-GHz(rest frame,redshifted)']].head(20)"
+        return code
 
     return (
         f"# Perform step: {description}\n"
-        "# Ensure you configure the proper functions and custom analytical scripts below.\n"
+        "# Configure your analysis below.\n"
         "pass"
     )
+
+
+def _extract_target(description: str, result: Any) -> str:
+    """Extract a target name from description or result data."""
+    import re
+
+    # Try result data first
+    if isinstance(result, dict):
+        for key in ("target_name", "target", "object_name"):
+            if key in result:
+                return str(result[key])
+
+    # Try description
+    patterns = [
+        r'\b(M\d{1,3})\b',
+        r'\b(NGC\s*\d{1,5})\b',
+        r'\b(IC\s*\d{1,5})\b',
+        r'\b(Sgr\s*[AB]\*?)\b',
+        r'\b(3C\s*\d{1,3})\b',
+        r'\b(Sz\s*\d{1,3})\b',
+    ]
+    for pat in patterns:
+        m = re.search(pat, description, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    return "TARGET_NAME"
+
+
+def _extract_band(description: str, result: Any) -> str:
+    """Extract an ALMA band number from description or result data."""
+    import re
+    m = re.search(r'[Bb]and\s*(\d+)', description)
+    if m:
+        return m.group(1)
+    if isinstance(result, dict) and "band" in result:
+        return str(result["band"])
+    return ""
