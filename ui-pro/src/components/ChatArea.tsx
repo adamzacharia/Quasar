@@ -292,7 +292,7 @@ export function ChatArea() {
                         onTaskList: (list) => handleTaskList(list),
                         onPlanReview: (plan) => {
                             setPendingPlan({
-                                conversationId: conversationIdRef.current || plan.query || "",
+                                conversationId: conversationIdRef.current || plan.conversationId || "",
                                 title: plan.title,
                                 subtasks: plan.subtasks,
                                 reasoning: plan.reasoning,
@@ -382,7 +382,7 @@ export function ChatArea() {
 
     // ── Plan review handlers ────────────────────────────────────
     const handlePlanApprove = useCallback(async () => {
-        const cid = conversationIdRef.current;
+        const cid = conversationIdRef.current || pendingPlan?.conversationId;
         if (!cid || !pendingPlan) return;
         setPlanSubmitting(true);
         try {
@@ -390,13 +390,17 @@ export function ChatArea() {
             setPendingPlan(null);
         } catch (err) {
             console.error("Plan approval failed:", err);
+            // Surface error to the user via a status message
+            updateLastAssistantMessage(
+                `⚠️ Plan approval failed: ${err instanceof Error ? err.message : "Network error"}. Please try again.`
+            );
         } finally {
             setPlanSubmitting(false);
         }
-    }, [pendingPlan]);
+    }, [pendingPlan, updateLastAssistantMessage]);
 
     const handlePlanFeedback = useCallback(async (feedback: string) => {
-        const cid = conversationIdRef.current;
+        const cid = conversationIdRef.current || pendingPlan?.conversationId;
         if (!cid || !pendingPlan) return;
         setPlanSubmitting(true);
         try {
@@ -404,10 +408,13 @@ export function ChatArea() {
             // Don't clear pendingPlan — the Conductor will emit a new plan_review event
         } catch (err) {
             console.error("Plan feedback failed:", err);
+            updateLastAssistantMessage(
+                `⚠️ Plan feedback failed: ${err instanceof Error ? err.message : "Network error"}. Please try again.`
+            );
         } finally {
             setPlanSubmitting(false);
         }
-    }, [pendingPlan]);
+    }, [pendingPlan, updateLastAssistantMessage]);
 
     const handleSuggestionClick = (prompt: string) => { setInputValue(prompt); handleSend(prompt); };
     const hasMessages = messages.length > 0;
