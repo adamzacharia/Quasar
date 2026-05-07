@@ -9,7 +9,7 @@ Quasar pairs a registry of **35+ domain-specific tools** covering archive data s
 > **Key insight:** A general-purpose LLM becomes a capable scientific assistant not through model fine-tuning alone, but in combination with careful domain engineering.
 
 - **Live application:** [quasarassistant.com](https://www.quasarassistant.com/)
-- **Repository:** [Anonymous Repository Tracking Link](#) *(Link anonymized for double-blind review)*
+- **Repository:** [Anonymous Repository Tracking Link](https://anonymous.4open.science/r/Quasar-B2B5) *(Link anonymized for double-blind review)*
 
 ## Current Capabilities
 
