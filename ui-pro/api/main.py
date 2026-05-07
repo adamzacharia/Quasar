@@ -843,12 +843,6 @@ def _stream_chat_response(
 
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
 
-            # Emit conversation_meta EARLY so the frontend has the server UUID
-            # before plan_review events arrive (needed for HITL feedback routing).
-            if conv_id:
-                early_meta = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
-                yield f"data: {early_meta}\n\n"
-
             queue = asyncio.Queue()
 
             # ── Plan Feedback Queue (HITL) ────────────────────────────
@@ -858,6 +852,14 @@ def _stream_chat_response(
             _pfq_key = [conv_id or f"_anon_{id(_pfq)}"]  # mutable for re-keying
             with _plan_feedback_lock:
                 _plan_feedback_queues[_pfq_key[0]] = _pfq
+
+            # Emit conversation_meta EARLY so the frontend has the server UUID
+            # (or the anon queue key) BEFORE plan_review events arrive.
+            # This is critical for HITL feedback routing — the frontend must
+            # know the exact key used in _plan_feedback_queues.
+            _meta_cid = _pfq_key[0]
+            early_meta = json.dumps({"type": "conversation_meta", "conversation_id": _meta_cid})
+            yield f"data: {early_meta}\n\n"
 
             def on_token(token: str):
                 if token:
