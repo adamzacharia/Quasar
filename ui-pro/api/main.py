@@ -46,6 +46,8 @@ if PROJECT_ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
+from utils.archive_links import build_archive_link, infer_archive_kind
+
 # ── Observability: Loguru + Sentry ────────────────────────────────────────────
 from core.logger import logger, init_sentry
 init_sentry()  # no-op if SENTRY_DSN env var is not set
@@ -226,6 +228,37 @@ def _compute_demographics(df) -> tuple:
         fits_estimate = len(df) * 3  # Generic estimate for non-ALMA archives
 
     return demographics, fits_estimate
+
+
+def _default_archive_source(df, source_hint: str = "", filter_label: str = "") -> str:
+    """Return the label shown above a data card when the tool did not provide one."""
+    if filter_label:
+        return filter_label
+    if source_hint:
+        return source_hint
+
+    archive_kind = infer_archive_kind(df, source_hint=source_hint, filter_label=filter_label)
+    if archive_kind == "cadc":
+        if hasattr(df, "columns") and "obs_collection" in df.columns:
+            collections = []
+            for value in df["obs_collection"].dropna().astype(str):
+                text = value.strip()
+                if text and text not in collections:
+                    collections.append(text)
+                if len(collections) >= 3:
+                    break
+            if collections:
+                return " / ".join(collections)
+        return "CADC"
+    if archive_kind == "alma":
+        return "ALMA Archive"
+    if archive_kind == "mast":
+        return "MAST"
+    if archive_kind == "eso":
+        return "ESO"
+    if archive_kind == "irsa":
+        return "IRSA"
+    return "Archive"
 
 
 # ── CADC DataLink preview URL fetcher ─────────────────────────
@@ -492,9 +525,12 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
         sub.columns = display_cols
 
-        per_row_links = []
         _source = _run_result.get("source", "")
-        if _source == "CADC" and "obs_id" in df.columns:
+        _filter_label = _run_result.get("filter_label", "")
+        archive_kind = infer_archive_kind(df, source_hint=_source, filter_label=_filter_label)
+
+        per_row_links = []
+        if archive_kind == "cadc" and "obs_id" in df.columns:
             # Build browsable CADC archive links (not raw DataLink URLs)
             _collections = df["obs_collection"].head(_MAX_TABLE_ROWS).fillna("").tolist() if "obs_collection" in df.columns else [""] * min(len(df), _MAX_TABLE_ROWS)
             _obs_ids = df["obs_id"].head(_MAX_TABLE_ROWS).fillna("").tolist()
@@ -535,14 +571,10 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
         has_preview = False
 
-        is_cadc = False
+        is_cadc = archive_kind == "cadc"
         cadc_collections = set()
-        if "obs_collection" in df.columns:
+        if is_cadc and "obs_collection" in df.columns:
             cadc_collections = set(df["obs_collection"].dropna().astype(str).unique())
-            is_cadc = bool(cadc_collections)
-        elif "obs_publisher_did" in df.columns:
-            sample = str(df["obs_publisher_did"].dropna().iloc[0]) if not df["obs_publisher_did"].dropna().empty else ""
-            is_cadc = "cadc" in sample.lower() or "mast" in sample.lower()
 
         cadc_preview_map = {}
         if is_cadc and "obs_publisher_did" in df.columns:
@@ -596,14 +628,11 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         demographics, fits_estimate = _compute_demographics(df)
 
         # ── Detect archive source dynamically ─────────
-        _detected_source = _run_result.get("filter_label") or _run_result.get("source", "")
-        if not _detected_source:
-            if cadc_collections:
-                _detected_source = " / ".join(sorted(cadc_collections)[:3])
-            elif "member_ous_uid" in df.columns:
-                _detected_source = "ALMA Archive"
-            else:
-                _detected_source = "Archive"
+        _detected_source = _default_archive_source(
+            df,
+            source_hint=_source,
+            filter_label=_filter_label,
+        )
 
         metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
         if "band_list" in df.columns:
@@ -626,16 +655,11 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             })
 
         # ── Build archive link (per-archive) ──────────
-        archive_link = ""
-        if is_cadc and "target_name" in df.columns and not df.empty:
-            _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
-            archive_link = f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.target.name={_tgt}"
-        elif "access_url" in df.columns and not df["access_url"].isna().all():
-            archive_link = str(df["access_url"].dropna().iloc[0])
-        elif "member_ous_uid" in df.columns:
-            mous = next((str(v) for v in df["member_ous_uid"] if pd.notna(v) and str(v).strip()), "")
-            if mous:
-                archive_link = f"https://almascience.nrao.edu/aq/?member_ous_id={mous}"
+        archive_link = build_archive_link(
+            df,
+            source_hint=_source,
+            filter_label=_filter_label,
+        )
 
         table_payload = {
             "type": "data",
@@ -1732,15 +1756,15 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
                             dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
                             has_preview = False
 
-                            # Detect if this is CADC/MAST data
-                            is_cadc = False
+                            archive_kind = infer_archive_kind(
+                                df,
+                                source_hint=last_run_result.get("source", ""),
+                                filter_label=last_run_result.get("filter_label", ""),
+                            )
+                            is_cadc = archive_kind == "cadc"
                             cadc_collections = set()
-                            if "obs_collection" in df.columns:
+                            if is_cadc and "obs_collection" in df.columns:
                                 cadc_collections = set(df["obs_collection"].dropna().astype(str).unique())
-                                is_cadc = bool(cadc_collections)
-                            elif "obs_publisher_did" in df.columns:
-                                sample = str(df["obs_publisher_did"].dropna().iloc[0]) if not df["obs_publisher_did"].dropna().empty else ""
-                                is_cadc = "cadc" in sample.lower() or "mast" in sample.lower()
 
                             cadc_preview_map = {}
                             if is_cadc and "obs_publisher_did" in df.columns:
@@ -1792,25 +1816,23 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
 
                             # ── Detect archive source dynamically ─────────
                             source = last_run_result.get("source", "")
-                            filter_label = last_run_result.get("filter_label", source)
+                            filter_label = last_run_result.get("filter_label", "")
+                            source_name = _default_archive_source(
+                                df,
+                                source_hint=source,
+                                filter_label=filter_label,
+                            )
                             if not filter_label:
-                                if cadc_collections:
-                                    filter_label = " / ".join(sorted(cadc_collections)[:3])
-                                elif "member_ous_uid" in df.columns:
-                                    filter_label = "ALMA"
-                                else:
-                                    filter_label = "Archive"
+                                filter_label = source_name
                             if not source:
-                                source = filter_label
+                                source = source_name
 
                             # ── Build archive link (per-archive) ──────────
-                            archive_link = None
-                            if is_cadc and "target_name" in df.columns and not df.empty:
-                                _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
-                                archive_link = f"https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?Observation.target.name={_tgt}"
-                            elif "target_name" in df.columns and not df.empty:
-                                _tgt = str(df["target_name"].iloc[0]).replace(" ", "+")
-                                archive_link = f"https://almascience.eso.org/aq/?target={_tgt}"
+                            archive_link = build_archive_link(
+                                df,
+                                source_hint=source,
+                                filter_label=filter_label,
+                            )
 
                             # ── Demographics & FITS estimation ─────────────
                             demographics, fits_estimate = _compute_demographics(df)

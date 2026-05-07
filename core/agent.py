@@ -49,6 +49,10 @@ from services.browser import BrowserService
 from services.plotting import PlottingService
 from services.splatalogue import SplatalogueTool
 from services.multi_archive import MultiArchiveMatcher
+from integrations.mast_client import MASTClient
+from integrations.eso_tap_client import ESOTAPClient
+from integrations.irsa_client import IRSAClient
+from integrations.skyview_client import SkyViewClient
 from services.casa_generator import CASAScriptGenerator
 from services.gcn_monitor import GCNAlertMonitor
 from services.notebook_gen import generate_analysis_notebook
@@ -184,6 +188,14 @@ class QuasarAgent:
         self.splatalogue_tool = SplatalogueTool()
         print("DEBUG: Init MultiArchiveMatcher")
         self.multi_archive = MultiArchiveMatcher()
+        print("DEBUG: Init MASTClient")
+        self.mast_client = MASTClient()
+        print("DEBUG: Init ESOTAPClient")
+        self.eso_client = ESOTAPClient()
+        print("DEBUG: Init IRSAClient")
+        self.irsa_client = IRSAClient()
+        print("DEBUG: Init SkyViewClient")
+        self.skyview_client = SkyViewClient()
         print("DEBUG: Init CASAScriptGenerator")
         self.casa_generator = CASAScriptGenerator()
         print("DEBUG: Init GCNAlertMonitor")
@@ -440,8 +452,11 @@ class QuasarAgent:
         return f"""You are Quasar, an expert AI assistant for radio astronomy.
 
 You have access to the ALMA Science Archive via the 'alminer' library,
-and the Canadian Astronomy Data Centre (CADC) for multi-wavelength data
-from JWST, HST, JCMT, CFHT, and Gemini telescopes.
+the Canadian Astronomy Data Centre (CADC) for multi-wavelength data
+from JWST, HST, JCMT, CFHT, and Gemini telescopes,
+the MAST archive (JWST, HST, TESS, Kepler) via `search_mast` and `search_mast_by_criteria`,
+the ESO Science Archive (VLT/MUSE, KMOS, X-Shooter, FORS2) via `search_eso_archive`,
+and the IRSA infrared catalog services (WISE, 2MASS, Spitzer catalogs) via `search_irsa`.
 Your goal is to help users find, visualize, and analyze astronomical data.
 
 GUIDELINES:
@@ -461,7 +476,7 @@ GUIDELINES:
 - **MULTI-TARGET (SAME CONSTRAINTS)**: If the user mentions multiple targets with the SAME constraints (e.g. "M87 and Sz65", or "M87, Sz65, NGC23 and M83"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
 - **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
 - **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
-- **MULTI-WAVELENGTH / MIXED SOURCES**: When users ask about JWST, HST, Hubble, Gemini, or optical/infrared data, use `search_cadc_archive`. When the user asks for data from DIFFERENT archives (e.g. "ALMA observations of M87 and Gemini observations of NGC23"), make SEPARATE tool calls: search_by_target(target_name="M87") for ALMA, then search_cadc_archive(target_name="NGC23", collection="Gemini") for Gemini. Each produces its own data card in the UI.
+- **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` — they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **LINE COVERAGE**: When the user asks about line coverage (e.g. "Check CO(2-1) line coverage for M87"), follow this exact 2-step workflow:
@@ -955,6 +970,161 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "archives": {"type": "array", "items": {"type": "string"}, "description": "Specific archives to query, e.g. ['simbad', 'ned', 'mast']. Defaults to all."},
                 },
                 "required": ["target_name"]
+            }
+        ))
+        # ── MAST Archive Tools (JWST, HST, TESS, Kepler) ──────────
+        self.tool_registry.register(Tool(
+            name="search_mast",
+            description=(
+                "Search the MAST archive for observations from JWST, HST, TESS, Kepler, "
+                "and other space telescopes. Use this for any JWST or HST data queries. "
+                "Returns observation metadata including target, instrument, filters, "
+                "exposure time, and data product type."
+            ),
+            function=self._search_mast,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name (e.g., 'M87', 'Carina Nebula', 'TRAPPIST-1')"},
+                    "mission": {"type": "string", "description": "Filter by mission: 'JWST', 'HST', 'TESS', 'Kepler'. Leave empty for all missions."},
+                    "instrument": {"type": "string", "description": "Filter by instrument (e.g., 'NIRCAM', 'NIRSPEC', 'MIRI', 'ACS', 'WFC3'). Leave empty for all."},
+                    "radius": {"type": "string", "description": "Search radius (e.g., '30s' for 30 arcsec, '1m' for 1 arcmin). Default '30s'."},
+                    "ra": {"type": "number", "description": "RA in degrees (use instead of target_name for positional search)"},
+                    "dec": {"type": "number", "description": "Dec in degrees (use instead of target_name for positional search)"},
+                },
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="search_mast_by_criteria",
+            description=(
+                "Advanced MAST search with rich filtering: program ID, date range, "
+                "filter name, data product type, etc. Use this when users ask for "
+                "specific JWST/HST programs, particular filters (F200W, F444W), "
+                "or time-constrained searches."
+            ),
+            function=self._search_mast_by_criteria,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mission": {"type": "string", "description": "Mission name (JWST, HST, TESS, Kepler)"},
+                    "instrument": {"type": "string", "description": "Instrument name (NIRCAM, NIRSPEC, MIRI, ACS, WFC3)"},
+                    "proposal_id": {"type": "string", "description": "Specific proposal/program ID (e.g., '1345' for JADES)"},
+                    "filters": {"type": "string", "description": "Filter name (e.g., 'F200W', 'F444W', 'F115W')"},
+                    "target_name": {"type": "string", "description": "Target name for the search"},
+                    "dataproduct_type": {"type": "string", "description": "'image', 'spectrum', 'cube', 'timeseries'"},
+                    "start_date": {"type": "string", "description": "Start date for time filter (ISO format, e.g., '2022-07-01')"},
+                    "end_date": {"type": "string", "description": "End date for time filter (ISO format, e.g., '2023-07-01')"},
+                },
+                "required": []
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="get_mast_products",
+            description=(
+                "Get file-level product list for the LAST MAST search results. "
+                "Shows individual data files available for download (filenames, sizes, URLs). "
+                "Call this AFTER a search_mast or search_mast_by_criteria call."
+            ),
+            function=self._get_mast_products,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "product_type": {"type": "string", "description": "Filter by type: 'SCIENCE', 'CALIBRATION', 'PREVIEW'. Default all."},
+                    "extension": {"type": "string", "description": "Filter by file extension: 'fits', 'jpg', etc."},
+                },
+                "required": []
+            }
+        ))
+
+        # ── ESO Science Archive Tools (VLT instruments) ───────────
+        self.tool_registry.register(Tool(
+            name="search_eso_archive",
+            description=(
+                "Search the ESO Science Archive for VLT instrument observations. "
+                "Supports instruments: MUSE, KMOS, X-Shooter, FORS2, HAWK-I, UVES, "
+                "SPHERE, GRAVITY, ESPRESSO, and more. Uses TAP/ADQL queries against "
+                "the ESO ObsCore table."
+            ),
+            function=self._search_eso,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name (e.g., 'NGC 1068', 'Eta Carinae')"},
+                    "instrument": {"type": "string", "description": "ESO instrument (e.g., 'MUSE', 'KMOS', 'XSHOOTER', 'FORS2', 'HAWK-I', 'UVES', 'SPHERE')"},
+                    "ra": {"type": "number", "description": "RA in degrees (use instead of target_name)"},
+                    "dec": {"type": "number", "description": "Dec in degrees (use instead of target_name)"},
+                    "radius_arcmin": {"type": "number", "description": "Search radius in arcminutes. Default 1.0."},
+                },
+                "required": []
+            }
+        ))
+
+        # ── IRSA Infrared Archive Tools (WISE, 2MASS, Spitzer) ────
+        self.tool_registry.register(Tool(
+            name="search_irsa",
+            description=(
+                "Search the IRSA (Infrared Science Archive) catalog services for "
+                "infrared source catalogs. Catalogs include AllWISE, 2MASS Point "
+                "Source, 2MASS Extended Source, and Spitzer SEIP."
+            ),
+            function=self._search_irsa,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name (e.g., 'M31', 'NGC 253')"},
+                    "catalog": {"type": "string", "description": "IRSA catalog: 'allwise' (default), '2mass', '2mass_xsc', 'seip'. Or a specific IRSA catalog ID."},
+                    "radius_arcsec": {"type": "number", "description": "Search radius in arcseconds. Default 30."},
+                    "ra": {"type": "number", "description": "RA in degrees (use instead of target_name)"},
+                    "dec": {"type": "number", "description": "Dec in degrees (use instead of target_name)"},
+                },
+                "required": []
+            }
+        ))
+
+        # ── Sky Survey Image Tools ────────────────────────────────
+        self.tool_registry.register(Tool(
+            name="get_sky_image",
+            description=(
+                "Fetch a sky survey cutout image for a target. Returns a FITS file "
+                "and PNG preview from surveys like DSS2 (optical), 2MASS (near-IR), "
+                "SDSS (optical), WISE (mid-IR), NVSS/FIRST (radio). "
+                "Use this when users ask for 'an image of', 'show me', 'DSS image', "
+                "or 'what does X look like'."
+            ),
+            function=self._get_sky_image,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name (e.g., 'M87', 'Carina Nebula')"},
+                    "survey": {"type": "string", "description": "Survey name: 'dss2' (default optical), '2mass', 'sdss', 'wise', 'nvss', 'first'. Or specific like 'DSS2 Red', '2MASS-J'."},
+                    "radius_arcmin": {"type": "number", "description": "Image radius in arcminutes. Default 5."},
+                    "ra": {"type": "number", "description": "RA in degrees (alternative to target_name)"},
+                    "dec": {"type": "number", "description": "Dec in degrees (alternative to target_name)"},
+                },
+                "required": []
+            }
+        ))
+
+        # ── Data Download Tools ───────────────────────────────────
+        self.tool_registry.register(Tool(
+            name="download_mast_data",
+            description=(
+                "Download FITS files from the MAST archive (JWST/HST data). "
+                "Call this AFTER search_mast to download actual science data files. "
+                "Downloads to ~/quasar_data/mast/ by default. Has a safety limit of 10 files."
+            ),
+            function=self._download_mast_data,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "product_type": {"type": "string", "description": "Filter: 'SCIENCE' (default), 'CALIBRATION', 'PREVIEW'"},
+                    "extension": {"type": "string", "description": "File extension filter: 'fits' (default), 'jpg', etc."},
+                    "max_files": {"type": "integer", "description": "Max files to download (default 10, safety limit)"},
+                },
+                "required": []
             }
         ))
 
@@ -2009,6 +2179,371 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             return {"success": False, "error": "pyvo library not installed. Run: pip install pyvo"}
         except Exception as e:
             return {"success": False, "error": f"CADC TAP query failed: {str(e)}"}
+
+    # ── MAST Archive Handlers ──────────────────────────────────────────
+
+    def _search_mast(self, target_name: Optional[str] = None,
+                     mission: Optional[str] = None,
+                     instrument: Optional[str] = None,
+                     radius: str = "30s",
+                     ra: Optional[float] = None,
+                     dec: Optional[float] = None) -> Dict[str, Any]:
+        """Search MAST archive for JWST/HST/TESS observations."""
+        try:
+            if target_name:
+                df = self.mast_client.search_by_target(
+                    target=target_name, mission=mission,
+                    instrument=instrument, radius=radius
+                )
+            elif ra is not None and dec is not None:
+                df = self.mast_client.search_by_position(
+                    ra=ra, dec=dec,
+                    radius_arcmin=self.mast_client._parse_radius(radius).to("arcmin").value,
+                    mission=mission, instrument=instrument
+                )
+            else:
+                return {"success": False, "error": "Provide target_name or (ra, dec) coordinates."}
+
+            if df.empty:
+                note = f"No MAST observations found"
+                if target_name:
+                    note += f" for '{target_name}'"
+                if mission:
+                    note += f" [{mission}]"
+                if instrument:
+                    note += f" [{instrument}]"
+                self.last_run_result = {"type": "data", "data": df, "source": "MAST", "tool_name": "search_mast"}
+                return {"success": True, "total_results": 0, "note": note}
+
+            # Build source label
+            filter_label = "MAST"
+            if target_name:
+                filter_label += f" › {target_name}"
+            if mission:
+                filter_label += f" [{mission}]"
+            if instrument:
+                filter_label += f" [{instrument}]"
+
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", "data": df,
+                "source": "MAST", "filter_label": filter_label,
+                "tool_name": "search_mast"
+            }
+
+            # Build summary for LLM
+            mission_summary = df["telescope"].value_counts().to_dict() if "telescope" in df.columns else {}
+            instr_summary = df["instrument_name"].value_counts().to_dict() if "instrument_name" in df.columns else {}
+
+            return {
+                "success": True,
+                "total_results": len(df),
+                "missions": mission_summary,
+                "instruments": instr_summary,
+                "unique_targets": int(df["target_name"].nunique()) if "target_name" in df.columns else 0,
+                "unique_programs": int(df["project_code"].nunique()) if "project_code" in df.columns else 0,
+                "note": (
+                    f"Found {len(df)} MAST observations. "
+                    f"Missions: {', '.join(f'{m} ({c})' for m, c in mission_summary.items())}. "
+                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                )
+            }
+        except Exception as e:
+            return {"success": False, "error": f"MAST search failed: {str(e)}"}
+
+    def _search_mast_by_criteria(self, mission: Optional[str] = None,
+                                  instrument: Optional[str] = None,
+                                  proposal_id: Optional[str] = None,
+                                  filters: Optional[str] = None,
+                                  target_name: Optional[str] = None,
+                                  dataproduct_type: Optional[str] = None,
+                                  start_date: Optional[str] = None,
+                                  end_date: Optional[str] = None) -> Dict[str, Any]:
+        """Advanced MAST criteria search with rich filtering."""
+        try:
+            date_range = None
+            if start_date and end_date:
+                date_range = (start_date, end_date)
+
+            df = self.mast_client.search_by_criteria(
+                mission=mission, instrument=instrument,
+                proposal_id=proposal_id, filters=filters,
+                target_name=target_name,
+                dataproduct_type=dataproduct_type,
+                date_range=date_range
+            )
+
+            if df.empty:
+                criteria_parts = []
+                if mission: criteria_parts.append(f"mission={mission}")
+                if instrument: criteria_parts.append(f"instrument={instrument}")
+                if proposal_id: criteria_parts.append(f"program={proposal_id}")
+                if filters: criteria_parts.append(f"filter={filters}")
+                note = f"No MAST observations found for criteria: {', '.join(criteria_parts) or 'unspecified'}"
+                self.last_run_result = {"type": "data", "data": df, "source": "MAST", "tool_name": "search_mast_by_criteria"}
+                return {"success": True, "total_results": 0, "note": note}
+
+            # Build label
+            filter_label = "MAST Criteria"
+            if mission: filter_label += f" [{mission}]"
+            if proposal_id: filter_label += f" Program {proposal_id}"
+            if target_name: filter_label += f" › {target_name}"
+
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", "data": df,
+                "source": "MAST", "filter_label": filter_label,
+                "tool_name": "search_mast_by_criteria"
+            }
+
+            mission_summary = df["telescope"].value_counts().to_dict() if "telescope" in df.columns else {}
+            instr_summary = df["instrument_name"].value_counts().to_dict() if "instrument_name" in df.columns else {}
+            filter_summary = df["filters"].value_counts().head(10).to_dict() if "filters" in df.columns else {}
+
+            return {
+                "success": True,
+                "total_results": len(df),
+                "missions": mission_summary,
+                "instruments": instr_summary,
+                "filters_used": filter_summary,
+                "unique_targets": int(df["target_name"].nunique()) if "target_name" in df.columns else 0,
+                "note": (
+                    f"Found {len(df)} observations. "
+                    f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
+                    f"Full data shown in UI table."
+                )
+            }
+        except Exception as e:
+            return {"success": False, "error": f"MAST criteria search failed: {str(e)}"}
+
+    def _get_mast_products(self, product_type: Optional[str] = None,
+                           extension: Optional[str] = None) -> Dict[str, Any]:
+        """Get file-level product list for last MAST search results."""
+        try:
+            if self.last_search_results is None or self.last_search_results.empty:
+                return {
+                    "success": False,
+                    "error": "No MAST search results to get products for. Run search_mast or search_mast_by_criteria first.",
+                }
+            if "obsid" not in self.last_search_results.columns:
+                return {
+                    "success": False,
+                    "error": "Last cached results are not MAST observation results. Run search_mast or search_mast_by_criteria first.",
+                }
+
+            df = self.mast_client.get_product_list(
+                self.last_search_results,
+                productType=product_type,
+                extension=extension
+            )
+
+            if df.empty:
+                return {"success": True, "total_products": 0, "note": "No data products found."}
+
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", "data": df,
+                "source": "MAST Products",
+                "filter_label": "MAST Products",
+                "tool_name": "get_mast_products"
+            }
+
+            type_summary = df["productType"].value_counts().to_dict() if "productType" in df.columns else {}
+
+            return {
+                "success": True,
+                "total_products": len(df),
+                "product_types": type_summary,
+                "note": (
+                    f"Found {len(df)} data products. "
+                    f"Types: {', '.join(f'{t} ({c})' for t, c in type_summary.items())}."
+                )
+            }
+        except Exception as e:
+            return {"success": False, "error": f"MAST product listing failed: {str(e)}"}
+
+    # ── ESO Archive Handler ────────────────────────────────────────────
+
+    def _search_eso(self, target_name: Optional[str] = None,
+                    instrument: Optional[str] = None,
+                    ra: Optional[float] = None,
+                    dec: Optional[float] = None,
+                    radius_arcmin: float = 1.0) -> Dict[str, Any]:
+        """Search ESO Science Archive for VLT instrument observations."""
+        try:
+            if target_name:
+                df = self.eso_client.search_by_target(
+                    target=target_name, instrument=instrument,
+                    radius_arcmin=radius_arcmin
+                )
+            elif ra is not None and dec is not None:
+                df = self.eso_client.search_by_position(
+                    ra=ra, dec=dec, radius_arcmin=radius_arcmin,
+                    instrument=instrument
+                )
+            else:
+                return {"success": False, "error": "Provide target_name or (ra, dec) coordinates."}
+
+            if df.empty:
+                note = f"No ESO observations found"
+                if target_name:
+                    note += f" for '{target_name}'"
+                if instrument:
+                    note += f" [{instrument}]"
+                self.last_run_result = {"type": "data", "data": df, "source": "ESO", "tool_name": "search_eso_archive"}
+                return {"success": True, "total_results": 0, "note": note}
+
+            # Build source label
+            filter_label = "ESO"
+            if target_name:
+                filter_label += f" › {target_name}"
+            if instrument:
+                filter_label += f" [{instrument}]"
+
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", "data": df,
+                "source": "ESO", "filter_label": filter_label,
+                "tool_name": "search_eso_archive"
+            }
+
+            instr_summary = df["instrument_name"].value_counts().to_dict() if "instrument_name" in df.columns else {}
+            dptype_summary = df["dataproduct_type"].value_counts().to_dict() if "dataproduct_type" in df.columns else {}
+
+            return {
+                "success": True,
+                "total_results": len(df),
+                "instruments": instr_summary,
+                "data_types": dptype_summary,
+                "note": (
+                    f"Found {len(df)} ESO observations. "
+                    f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
+                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                )
+            }
+        except Exception as e:
+            return {"success": False, "error": f"ESO archive search failed: {str(e)}"}
+
+    # ── IRSA Archive Handler ───────────────────────────────────────────
+
+    def _search_irsa(self, target_name: Optional[str] = None,
+                     catalog: Optional[str] = None,
+                     radius_arcsec: float = 30.0,
+                     ra: Optional[float] = None,
+                     dec: Optional[float] = None) -> Dict[str, Any]:
+        """Search IRSA archive for infrared survey data."""
+        try:
+            catalog = catalog or "allwise"
+
+            if target_name:
+                df = self.irsa_client.search_by_target(
+                    target=target_name, catalog=catalog,
+                    radius_arcsec=radius_arcsec
+                )
+            elif ra is not None and dec is not None:
+                df = self.irsa_client.search_by_position(
+                    ra=ra, dec=dec,
+                    radius_arcsec=radius_arcsec, catalog=catalog
+                )
+            else:
+                return {"success": False, "error": "Provide target_name or (ra, dec) coordinates."}
+
+            if df.empty:
+                note = f"No IRSA sources found"
+                if target_name:
+                    note += f" for '{target_name}'"
+                note += f" in catalog '{catalog}'"
+                self.last_run_result = {"type": "data", "data": df, "source": "IRSA", "tool_name": "search_irsa"}
+                return {"success": True, "total_results": 0, "note": note}
+
+            filter_label = f"IRSA › {catalog.upper()}"
+            if target_name:
+                filter_label += f" › {target_name}"
+
+            self.last_search_results = df
+            self.last_run_result = {
+                "type": "data", "data": df,
+                "source": "IRSA", "filter_label": filter_label,
+                "tool_name": "search_irsa"
+            }
+
+            return {
+                "success": True,
+                "total_results": len(df),
+                "catalog": catalog,
+                "columns": list(df.columns[:15]),  # First 15 columns for LLM context
+                "note": (
+                    f"Found {len(df)} sources in IRSA {catalog.upper()} catalog. "
+                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                )
+            }
+        except Exception as e:
+            return {"success": False, "error": f"IRSA search failed: {str(e)}"}
+
+    # ── Sky Survey Image Handler ───────────────────────────────────────
+
+    def _get_sky_image(self, target_name: Optional[str] = None,
+                       survey: str = "dss2",
+                       radius_arcmin: float = 5.0,
+                       ra: Optional[float] = None,
+                       dec: Optional[float] = None) -> Dict[str, Any]:
+        """Fetch a sky survey cutout image (DSS2, 2MASS, SDSS, WISE, etc.)."""
+        try:
+            result = self.skyview_client.get_image(
+                target=target_name, survey=survey,
+                ra=ra, dec=dec,
+                radius_arcmin=radius_arcmin, save=True
+            )
+
+            if not result.get("success"):
+                return result
+
+            # If we have a preview PNG, set it as the run result for UI display
+            if "preview_path" in result:
+                self.last_run_result = {
+                    "type": "image",
+                    "image_path": result["preview_path"],
+                    "source": f"SkyView ({result.get('survey', 'DSS2')})",
+                    "tool_name": "get_sky_image"
+                }
+
+            label = target_name or f"RA={ra:.3f}, Dec={dec:.3f}"
+            return {
+                "success": True,
+                "target": label,
+                "survey": result.get("survey"),
+                "fits_path": result.get("fits_path", ""),
+                "preview_path": result.get("preview_path", ""),
+                "image_shape": result.get("image_shape"),
+                "note": (
+                    f"Fetched {result.get('survey')} image for {label}. "
+                    f"FITS saved to: {result.get('fits_path', 'N/A')}. "
+                    f"Preview shown in UI."
+                )
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Sky image fetch failed: {str(e)}"}
+
+    # ── MAST Data Download Handler ─────────────────────────────────────
+
+    def _download_mast_data(self, product_type: str = "SCIENCE",
+                             extension: str = "fits",
+                             max_files: int = 10) -> Dict[str, Any]:
+        """Download FITS files from MAST for the last search results."""
+        try:
+            if self.last_search_results is None or self.last_search_results.empty:
+                return {"success": False, "error": "No search results. Run search_mast first."}
+
+            result = self.mast_client.download_products(
+                observations=self.last_search_results,
+                productType=product_type,
+                extension=extension,
+                max_files=max_files
+            )
+
+            return result
+        except Exception as e:
+            return {"success": False, "error": f"MAST download failed: {str(e)}"}
 
     def _filter_results(self, column: str, operator: str, value: float) -> Dict[str, Any]:
         """

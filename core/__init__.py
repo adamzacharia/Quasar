@@ -1,17 +1,34 @@
-# core/__init__.py
 """
-Quasar Core Module
-AI agent and conversation management
+Quasar core package.
+
+Keep package-level imports optional so lightweight submodules such as
+``core.tools`` can be imported without pulling in the full agent runtime.
 """
 
-from .agent import QuasarAgent, AgentConfig
-from .memory import ConversationMemory
-from .tools import Tool, ToolRegistry
+from __future__ import annotations
 
-__all__ = [
-    'QuasarAgent',
-    'AgentConfig',
-    'ConversationMemory',
-    'Tool',
-    'ToolRegistry'
-]
+__all__ = []
+
+
+try:
+    from .agent import QuasarAgent, AgentConfig
+
+    __all__ += ["QuasarAgent", "AgentConfig"]
+except Exception:
+    QuasarAgent = None
+    AgentConfig = None
+
+try:
+    from .memory import ConversationMemory
+
+    __all__.append("ConversationMemory")
+except Exception:
+    ConversationMemory = None
+
+try:
+    from .tools import Tool, ToolRegistry
+
+    __all__ += ["Tool", "ToolRegistry"]
+except Exception:
+    Tool = None
+    ToolRegistry = None

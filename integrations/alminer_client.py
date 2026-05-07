@@ -33,11 +33,20 @@ def _resolve_simbad_cached(target_name: str):
     from astroquery.simbad import Simbad
     from astropy.coordinates import SkyCoord
     import astropy.units as u
+
     result = Simbad.query_object(target_name)
     if result is None or len(result) == 0:
         return (None, None)
-    coord = SkyCoord(result['RA'][0], result['DEC'][0], unit=(u.hourangle, u.deg))
-    return (coord.ra.deg, coord.dec.deg)
+
+    colnames = set(result.colnames)
+    if {"ra", "dec"} <= colnames:
+        return (float(result["ra"][0]), float(result["dec"][0]))
+    if {"RA_d", "DEC_d"} <= colnames:
+        return (float(result["RA_d"][0]), float(result["DEC_d"][0]))
+    if {"RA", "DEC"} <= colnames:
+        coord = SkyCoord(result["RA"][0], result["DEC"][0], unit=(u.hourangle, u.deg))
+        return (coord.ra.deg, coord.dec.deg)
+    return (None, None)
 
 
 class ALminerClient:
