@@ -22,18 +22,18 @@ interface EmptyStateProps { onSuggestionClick: (prompt: string) => void; }
 
 export function EmptyState({ onSuggestionClick }: EmptyStateProps) {
     return (
-        <div className="flex-1 flex flex-col items-center justify-center p-2 md:p-8 w-full max-w-5xl mx-auto overflow-hidden">
-            <div className="flex flex-col items-center justify-center text-center mb-2 md:mb-10">
-                <div className="relative mb-0 md:mb-2">
+        <div className="flex-1 flex flex-col items-center justify-center p-2 md:p-8 pb-4 md:pb-6 w-full max-w-5xl mx-auto overflow-hidden">
+            <div className="flex flex-col items-center justify-center text-center mb-2 md:mb-6">
+                <div className="relative mb-0 md:mb-1">
                     <div className="absolute inset-0 bg-primary/20 rounded-full blur-3xl opacity-50" />
-                    <div className="relative size-16 md:size-36 flex items-center justify-center">
-                        <img src="/quasar_logo.png" alt="Quasar" className="size-16 md:size-36 object-contain drop-shadow-[0_0_15px_rgba(45,30,209,0.5)]" />
+                    <div className="relative size-16 md:size-32 flex items-center justify-center">
+                        <img src="/quasar_logo.png" alt="Quasar" className="size-16 md:size-32 object-contain drop-shadow-[0_0_15px_rgba(45,30,209,0.5)]" />
                     </div>
                 </div>
-                <h1 className="text-xl md:text-5xl font-bold mb-1 md:mb-3 tracking-tight" style={{ color: 'var(--q-text)' }}>
+                <h1 className="text-xl md:text-4xl font-bold mb-1 md:mb-2 tracking-tight" style={{ color: 'var(--q-text)' }}>
                     <span className="text-gradient">QUASAR</span>
                 </h1>
-                <p className="text-sm md:text-lg font-light max-w-md mx-auto leading-relaxed" style={{ color: 'var(--q-text-secondary)' }}>
+                <p className="text-sm md:text-base font-light max-w-md mx-auto leading-relaxed" style={{ color: 'var(--q-text-secondary)' }}>
                     Your AI assistant for radio astronomy research, data analysis, and literature review.
                 </p>
             </div>
