@@ -4,7 +4,7 @@ core/logger.py — Quasar Observability Layer
 Provides:
   - Loguru-based structured logging (file + console)
   - @log_tool decorator: auto-logs every agent tool call (entry, exit, timing, errors)
-  - Sentry integration (graceful no-op if SENTRY_DSN is not set)
+  - Rollbar integration (graceful no-op if ROLLBAR_ACCESS_TOKEN is not set)
 
 Usage:
     from core.logger import logger, log_tool
@@ -67,34 +67,28 @@ _loguru_logger.add(
 logger = _loguru_logger
 
 
-# ── Sentry integration (graceful no-op if DSN not set) ────────────────────────
-def init_sentry():
+# ── Rollbar integration (graceful no-op if token not set) ────────────────────
+def init_rollbar():
     """
-    Initialise Sentry SDK if SENTRY_DSN is set.
+    Initialise Rollbar if ROLLBAR_ACCESS_TOKEN is set.
     Safe to call multiple times — subsequent calls are no-ops.
+    Signup: https://rollbar.com (free tier: 5,000 errors/month)
     """
-    dsn = os.getenv("SENTRY_DSN", "")
-    if not dsn:
-        logger.info("[Sentry] SENTRY_DSN not set — Sentry disabled")
+    token = os.getenv("ROLLBAR_ACCESS_TOKEN", "")
+    if not token:
+        logger.info("[Rollbar] ROLLBAR_ACCESS_TOKEN not set — Rollbar disabled")
         return
     try:
-        import sentry_sdk
-        from sentry_sdk.integrations.fastapi import FastApiIntegration
-        from sentry_sdk.integrations.starlette import StarletteIntegration
-        sentry_sdk.init(
-            dsn=dsn,
-            traces_sample_rate=float(os.getenv("SENTRY_TRACES_RATE", "0.1")),
-            profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_RATE", "0.1")),
+        import rollbar
+        rollbar.init(
+            access_token=token,
             environment=os.getenv("ENVIRONMENT", "production"),
-            integrations=[
-                StarletteIntegration(transaction_style="endpoint"),
-                FastApiIntegration(transaction_style="endpoint"),
-            ],
-            send_default_pii=False,
+            code_version="3.3.0",
+            suppress_reinit_warning=True,
         )
-        logger.success(f"[Sentry] Initialised (env={os.getenv('ENVIRONMENT','production')})")
+        logger.success(f"[Rollbar] Initialised (env={os.getenv('ENVIRONMENT','production')})")
     except Exception as e:
-        logger.warning(f"[Sentry] Initialisation failed: {e}")
+        logger.warning(f"[Rollbar] Initialisation failed: {e}")
 
 
 # ── @log_tool decorator ────────────────────────────────────────────────────────
@@ -103,8 +97,8 @@ def log_tool(fn):
     Decorator that wraps any agent tool method with:
       - Entry log  (DEBUG): function name + kwargs
       - Exit log   (SUCCESS): execution time
-      - Error log  (ERROR): full exception with Sentry capture
-    
+      - Error log  (ERROR): full exception with Rollbar capture
+
     Usage:
         @log_tool
         def _my_tool(self, param: str) -> dict:
@@ -131,10 +125,12 @@ def log_tool(fn):
         except Exception as exc:
             elapsed = time.perf_counter() - t0
             logger.exception(f"[TOOL ✗] {fn.__name__} raised after {elapsed:.2f}s: {exc}")
-            # Report to Sentry if available
+            # Report to Rollbar with tool name as extra context
             try:
-                import sentry_sdk
-                sentry_sdk.capture_exception(exc)
+                import rollbar
+                rollbar.report_exc_info(
+                    extra_data={"tool": fn.__name__, "kwargs": kw_str[:200]}
+                )
             except Exception:
                 pass
             raise

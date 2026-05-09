@@ -313,76 +313,32 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     if (message.type === "notebook" && message.notebookData) {
         const nbData = message.notebookData.data as Record<string, unknown> | undefined;
         const cells = (nbData?.cells ?? []) as { cell_type: string; source: string[] }[];
+        const cellCount = cells.length;
+        const title = message.notebookData.title || "Analysis Notebook";
         return (
             <div className="pl-11">
-                <div className="mt-4 rounded-xl border border-indigo-500/30 bg-indigo-950/20 overflow-hidden">
-                    {/* Header */}
-                    <div className="flex items-center gap-3 px-4 py-3 border-b border-indigo-500/20">
-                        <div className="p-2 bg-indigo-500/20 rounded-lg shrink-0">
-                            <svg className="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                        </div>
-                        <div className="min-w-0">
-                            <h4 className="text-sm font-semibold text-slate-200 truncate">{message.notebookData.title || "Data Analysis Notebook"}</h4>
-                            <p className="text-xs text-slate-400">{cells.length} cells · Jupyter Notebook (.ipynb)</p>
-                        </div>
-                    </div>
-
-                    {/* Cell previews */}
-                    <div className="max-h-[500px] overflow-y-auto custom-scrollbar">
-                        {cells.map((cell, ci) => {
-                            const source = Array.isArray(cell.source) ? cell.source.join("") : String(cell.source || "");
-                            if (!source.trim()) return null;
-                            if (cell.cell_type === "markdown") {
-                                return (
-                                    <div key={ci} className="px-4 py-3 border-b border-slate-800/50">
-                                        <div className="prose prose-invert prose-sm max-w-none text-slate-300">
-                                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>
-                                        </div>
-                                    </div>
-                                );
-                            }
-                            if (cell.cell_type === "code") {
-                                return (
-                                    <div key={ci} className="border-b border-slate-800/50">
-                                        <div className="flex items-center gap-2 px-4 py-1.5 bg-slate-900/50">
-                                            <span className="text-[10px] font-mono text-slate-500 uppercase">In [{ci}]</span>
-                                        </div>
-                                        <SyntaxHighlighter
-                                            language="python"
-                                            style={oneDark}
-                                            customStyle={{ margin: 0, borderRadius: 0, fontSize: "12px", background: "#0d1117" }}
-                                            showLineNumbers
-                                        >
-                                            {source}
-                                        </SyntaxHighlighter>
-                                    </div>
-                                );
-                            }
-                            return null;
-                        })}
-                    </div>
-
-                    {/* Download button */}
-                    <div className="flex justify-end px-4 py-3 border-t border-indigo-500/20 bg-indigo-950/30">
-                        <button
-                            onClick={() => {
-                                const blob = new Blob([JSON.stringify(nbData, null, 2)], { type: "application/json" });
-                                const url = URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.href = url;
-                                a.download = `${(message.notebookData?.title || 'analysis').replace(/\s+/g, '_').toLowerCase()}.ipynb`;
-                                document.body.appendChild(a);
-                                a.click();
-                                document.body.removeChild(a);
-                                URL.revokeObjectURL(url);
-                            }}
-                            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg transition-colors shadow-lg shadow-indigo-500/20"
-                        >
-                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                            Download .ipynb
-                        </button>
-                    </div>
-                </div>
+                <button
+                    onClick={() => {
+                        const blob = new Blob([JSON.stringify(nbData, null, 2)], { type: "application/json" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `${title.replace(/\s+/g, '_').toLowerCase()}.ipynb`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                    }}
+                    className="inline-flex items-center gap-2 mt-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all hover:brightness-110 active:scale-[0.97]"
+                    style={{
+                        background: "rgba(99, 102, 241, 0.15)",
+                        border: "1px solid rgba(99, 102, 241, 0.3)",
+                        color: "rgb(165, 180, 252)",
+                    }}
+                >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                    {title} · {cellCount} cells
+                </button>
             </div>
         );
     }

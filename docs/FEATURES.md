@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 11    | 8     | 1           | 2       | 73%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 26    | 5     | 0           | 21      | 19%    |
-| **Total**              |**90** |**37** | **2**       | **51**  |**41%** |
+| Polish & Scale         | 27    | 8     | 0           | 19      | 30%    |
+| **Total**              |**91** |**40** | **2**       | **49**  |**44%** |
 
 ---
 
@@ -133,7 +133,7 @@ Without them, even great features feel broken.
 ### Error Handling & Reliability
 
 - [ ] **PS1** Replace bare `except: pass` -- Specific exception handling + logging for all 8 instances
-- [ ] **PS2** Structured Logging -- Trace IDs per query throughout the stack
+- [x] **PS2** Structured Logging -- Langfuse trace spans across Conductor DAG execution + thread-local LLM call parenting; Sentry breadcrumbs per DAG node (core/langfuse_integration.py + core/conductor.py)
 - [ ] **PS3** Rate Limiting -- Add rate limits to public API endpoints
 - [ ] **PS4** Input Validation -- Sanitize all tool parameters before execution
 - [ ] **PS5** Graceful Degradation -- Fallback behavior when external services (ADS, ALMA, MAST) are down
@@ -167,9 +167,10 @@ Without them, even great features feel broken.
 - [ ] **PS22** API Key Rotation -- Mechanism to rotate API keys without downtime
 - [ ] **PS23** Usage Quotas -- Per-user usage limits
 - [ ] **PS24** Abuse Detection -- Detect prompt injection, excessive API calls
-- [ ] **PS25** Error Monitoring -- Sentry or equivalent for production error tracking
+- [x] **PS25** Error Monitoring -- Sentry trace correlation with quasar.trace_id and quasar.tool tags; breadcrumbs for DAG node failures; tool tagging in @log_tool decorator (core/logger.py + core/conductor.py)
 - [x] **PS26** Astronomy Acronym Expansion -- Expand ALMA/VLA/JWST/AGN etc. to full forms in web search queries so generic engines return astronomy results (core/agent.py _expand_astro_query)
 - [x] **PS27** Response Feedback Collection -- Like/dislike buttons on assistant messages, persisted to analytics DB for RLHF/improvement (services/analytics_service.py + ui-pro/src/components/ChatMessage.tsx)
+- [x] **PS28** LLM Cost Analytics & Tracing -- Helicone OpenAI proxy for automatic cost dashboards; Langfuse generation logging per LLM call with token usage and latency (core/llm_client.py + core/langfuse_integration.py)
 
 ---
 
@@ -195,4 +196,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-04-28 -- Quasar v3.2.0*
+*Last updated: 2026-05-09 -- Quasar v3.3.0 (Observability stack: Langfuse + Helicone + Sentry)*
