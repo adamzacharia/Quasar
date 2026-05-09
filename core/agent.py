@@ -5339,8 +5339,7 @@ IMPORTANT RULES:
                     request_kwargs["tool_choice"] = "required"
 
                 # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini)
-                from core.llm_client import LLMClient as _LLMClient
-                _no_temp = _LLMClient._NO_TEMPERATURE_MODELS
+                _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini"}
                 if request_kwargs.get("model", "") in _no_temp:
                     request_kwargs.pop("temperature", None)
 
