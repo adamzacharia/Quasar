@@ -34,9 +34,17 @@ from core.workflow_memory import WorkflowMemory
 from core.dag_cache import DAGCache
 from core.result_cache import ResultCache
 from core.observability import estimate_cost
+from core.langfuse_integration import get_langfuse, langfuse_trace, langfuse_generation
 from services.notebook_gen import generate_conductor_notebook
 
 logger = logging.getLogger(__name__)
+
+# ── Rollbar helpers (graceful no-op if Rollbar is not initialised) ────────────
+try:
+    import rollbar as _rollbar
+    _ROLLBAR_AVAILABLE = True
+except ImportError:
+    _ROLLBAR_AVAILABLE = False
 
 # ── Agent type → Display name mapping ───────────────────────────────────
 # Icons are rendered as custom SVG components on the frontend.
@@ -422,6 +430,44 @@ class Conductor:
         logger.info(msg)
         self._emit_status(msg, "completed", status_fn)
 
+        # ── Rollbar: attach trace context so any crash in this orchestration
+        # is labelled with trace_id and query info ────────────────────────────
+        _trace_id = f"conductor-{id(self.dag)}"
+        if _ROLLBAR_AVAILABLE:
+            try:
+                _rollbar.report_message(
+                    f"[conductor] Orchestration started: {query[:100]}",
+                    level="debug",
+                    extra_data={
+                        "trace_id": _trace_id,
+                        "subtask_count": len(subtasks),
+                        "complexity_tier": complexity_tier or "unknown",
+                        "task_ids": [s["id"] for s in subtasks],
+                    },
+                )
+            except Exception:
+                pass
+
+        # ── Langfuse: open a trace that spans the full orchestration ─────
+        lf_client = get_langfuse()
+        lf_trace = None
+        if lf_client:
+            try:
+                lf_trace = lf_client.trace(
+                    name=f"conductor: {query[:80]}",
+                    user_id="anonymous",
+                    metadata={
+                        "complexity_tier": complexity_tier or "unknown",
+                        "subtask_count": len(subtasks),
+                        "task_summary": task_summary,
+                    },
+                    tags=["conductor", complexity_tier or "unknown"],
+                )
+            except Exception as e:
+                logger.debug("[Langfuse] trace creation failed: %s", e)
+        # Store on self so _execute_dag_with_events can create child spans
+        self._lf_trace = lf_trace
+
         # (#12) Human-in-the-loop: emit plan for review and await approval
         effective_max = max_subtasks or self.MAX_SUBTASKS
         MAX_REPLAN_ITERATIONS = 3
@@ -532,6 +578,19 @@ class Conductor:
 
         self._emit_status("Answer ready", "completed", status_fn)
 
+        # ── Langfuse: close the orchestration trace ──────────────────────
+        if lf_trace:
+            try:
+                lf_trace.update(metadata={
+                    "status": "completed",
+                    "subtask_count": len(subtasks),
+                    "result_length": len(final_answer) if final_answer else 0,
+                })
+            except Exception:
+                pass
+
+        # ── Rollbar: no teardown needed (context is per-request in rollbar) ─
+
         # (#14) Store successful decomposition for future reuse
         dag_summary = self.dag.get_execution_summary()
         self.dag_cache.store(query, subtasks, execution_summary=dag_summary)
@@ -600,6 +659,37 @@ class Conductor:
             # Execute all ready tasks in parallel
             async def _run_one(node: TaskNode):
                 self.dag.mark_running(node.id)
+
+                # ── Langfuse: create a child span for this DAG node ──
+                lf_span = None
+                if getattr(self, '_lf_trace', None):
+                    try:
+                        lf_span = self._lf_trace.span(
+                            name=f"{node.id} ({node.agent_type})",
+                            metadata={
+                                "agent_type": node.agent_type,
+                                "description": node.description[:200],
+                                "depends_on": node.depends_on,
+                            },
+                        )
+                        # Set as thread-local parent so LLM calls inside
+                        # the tool executor are parented to this span
+                        from core.llm_client import set_langfuse_parent
+                        set_langfuse_parent(lf_span)
+                    except Exception:
+                        pass
+
+                # ── Rollbar: log breadcrumb for this task start ──
+                if _ROLLBAR_AVAILABLE:
+                    try:
+                        _rollbar.report_message(
+                            f"[conductor] Starting {node.id} ({node.agent_type}): {node.description[:80]}",
+                            level="debug",
+                            extra_data={"trace_id": _trace_id},
+                        )
+                    except Exception:
+                        pass
+
                 try:
                     # Build dependency context summary for the RecoveryEngine.
                     # This lets _replan() and _reassign() see what predecessors
@@ -649,17 +739,61 @@ class Conductor:
                         detail = self._summarize_result(result)
                         self.dag.mark_completed(node.id, result)
                         self._emit_task_update(node, "error", detail, group_id, on_event)
+                        # ── Langfuse: end span with soft-failure marker ──
+                        if lf_span:
+                            try:
+                                lf_span.end(output=detail, metadata={"soft_failure": True})
+                            except Exception:
+                                pass
                     else:
                         self.dag.mark_completed(node.id, result)
                         detail = self._summarize_result(result)
                         self._emit_task_update(node, "completed", detail, group_id, on_event)
+                        # ── Langfuse: end span with success ──
+                        if lf_span:
+                            try:
+                                lf_span.end(output=detail)
+                            except Exception:
+                                pass
 
                 except asyncio.TimeoutError:
                     self.dag.mark_failed(node.id, f"Timeout after {node.sla_seconds}s")
                     self._emit_task_update(node, "error", f"Timed out after {node.sla_seconds}s", group_id, on_event)
+                    # ── Langfuse: record timeout on span ──
+                    if lf_span:
+                        try:
+                            lf_span.end(output=f"TIMEOUT after {node.sla_seconds}s")
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.dag.mark_failed(node.id, str(e))
                     self._emit_task_update(node, "error", str(e)[:100], group_id, on_event)
+                    # ── Rollbar: report actual failure with task context ──
+                    if _ROLLBAR_AVAILABLE:
+                        try:
+                            _rollbar.report_exc_info(
+                                extra_data={
+                                    "task_id": node.id,
+                                    "agent_type": node.agent_type,
+                                    "description": node.description[:100],
+                                    "trace_id": _trace_id,
+                                }
+                            )
+                        except Exception:
+                            pass
+                    # ── Langfuse: record error on span ──
+                    if lf_span:
+                        try:
+                            lf_span.end(output=f"ERROR: {e}")
+                        except Exception:
+                            pass
+                finally:
+                    # Clear thread-local Langfuse parent
+                    try:
+                        from core.llm_client import set_langfuse_parent
+                        set_langfuse_parent(None)
+                    except Exception:
+                        pass
 
             await asyncio.gather(*[_run_one(node) for node in ready])
 

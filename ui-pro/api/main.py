@@ -50,8 +50,8 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 from utils.archive_links import build_archive_link, infer_archive_kind
 
 # ── Observability: Loguru + Sentry ────────────────────────────────────────────
-from core.logger import logger, init_sentry
-init_sentry()  # no-op if SENTRY_DSN env var is not set
+from core.logger import logger, init_rollbar
+init_rollbar()  # no-op if ROLLBAR_ACCESS_TOKEN env var is not set
 logger.info("[QUASAR API] Starting up")
 
 app = FastAPI(
@@ -59,6 +59,12 @@ app = FastAPI(
     description="Backend API for the QUASAR Professional Chat Interface",
     version="2.0.0",
 )
+
+try:
+    from rollbar.contrib.fastapi import add_to as rollbar_add_to
+    rollbar_add_to(app)
+except Exception as e:
+    logger.warning(f"Could not attach Rollbar to FastAPI: {e}")
 
 # NOTE: CORSMiddleware is added AFTER LoggingMiddleware below (line ~115)
 # so it becomes the OUTERMOST middleware (Starlette uses LIFO order).
@@ -2515,11 +2521,7 @@ async def personalization_delete(doc_id: str, current_user: dict = Depends(get_c
     return {"success": True}
 
 
-@app.get("/api/conversations")
 
-async def list_conversations():
-    """Return conversation list — placeholder for future DB integration."""
-    return {"conversations": []}
 
 
 @app.post("/api/conversations")

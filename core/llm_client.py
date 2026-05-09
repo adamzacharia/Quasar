@@ -39,8 +39,23 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
 from core.retry import with_retry
+from core.langfuse_integration import get_langfuse, _safe_serialize
 
 logger = logging.getLogger(__name__)
+
+# ── Thread-local Langfuse trace context ──────────────────────────────────
+# The Conductor sets this before executing DAG nodes so that LLM calls
+# made inside tool executors are automatically parented to the right trace.
+import threading as _threading
+_langfuse_tls = _threading.local()
+
+def set_langfuse_parent(parent):
+    """Set the current thread's Langfuse trace/span parent for LLM calls."""
+    _langfuse_tls.parent = parent
+
+def get_langfuse_parent():
+    """Get the current thread's Langfuse parent (trace/span), or None."""
+    return getattr(_langfuse_tls, 'parent', None)
 
 
 # ---------------------------------------------------------------------------
@@ -156,31 +171,90 @@ class ResponsesShim:
           - text: dict         (e.g. {"format": {"type": "json_object"}})
           - previous_response_id: str  (conversation continuity — OpenAI only)
         """
+        import time as _time
+
         model = kwargs.get("model", self._llm.default_model)
         provider = detect_provider(model)
         stream = kwargs.get("stream", False)
         attachments = kwargs.pop("attachments", None)
 
-        if provider == "openai":
-            return self._call_openai(kwargs, attachments=attachments)
-        elif provider == "anthropic":
-            if stream:
-                return self._stream_anthropic(kwargs, attachments=attachments)
-            return self._call_anthropic(kwargs, attachments=attachments)
-        elif provider == "google":
-            if stream:
-                return self._stream_google(kwargs, attachments=attachments)
-            return self._call_google(kwargs, attachments=attachments)
-        elif provider == "local":
-            if attachments:
-                raise ValueError(
-                    "Document attachments are not supported for local models in this path."
-                )
-            if stream:
-                return self._stream_local(kwargs)
-            return self._call_local(kwargs)
-        else:
-            raise ValueError(f"Unknown provider for model: {model}")
+        # ── Langfuse: create a generation span if a parent trace exists ──
+        lf_gen = None
+        lf_parent = get_langfuse_parent()
+        lf_client = get_langfuse()
+        if lf_parent or lf_client:
+            try:
+                parent = lf_parent or (lf_client.trace(name="llm_call") if lf_client else None)
+                if parent:
+                    from core.langfuse_integration import langfuse_generation
+                    lf_gen = langfuse_generation(
+                        parent,
+                        name=f"{provider}/{model}",
+                        model=model,
+                        input_data=kwargs.get("input", ""),
+                        metadata={"provider": provider, "stream": stream},
+                    )
+            except Exception:
+                pass  # Never let tracing break the LLM call
+
+        t0 = _time.perf_counter()
+
+        try:
+            if provider == "openai":
+                result = self._call_openai(kwargs, attachments=attachments)
+            elif provider == "anthropic":
+                if stream:
+                    result = self._stream_anthropic(kwargs, attachments=attachments)
+                else:
+                    result = self._call_anthropic(kwargs, attachments=attachments)
+            elif provider == "google":
+                if stream:
+                    result = self._stream_google(kwargs, attachments=attachments)
+                else:
+                    result = self._call_google(kwargs, attachments=attachments)
+            elif provider == "local":
+                if attachments:
+                    raise ValueError(
+                        "Document attachments are not supported for local models in this path."
+                    )
+                if stream:
+                    result = self._stream_local(kwargs)
+                else:
+                    result = self._call_local(kwargs)
+            else:
+                raise ValueError(f"Unknown provider for model: {model}")
+
+            # ── Langfuse: end generation with output/usage (non-streaming only) ──
+            if lf_gen and not stream:
+                elapsed_ms = (_time.perf_counter() - t0) * 1000
+                try:
+                    output_text = getattr(result, 'output_text', '') or ''
+                    # Try to extract usage from OpenAI native responses
+                    usage = {}
+                    if hasattr(result, 'usage') and result.usage:
+                        usage = {
+                            "input": getattr(result.usage, 'input_tokens', 0),
+                            "output": getattr(result.usage, 'output_tokens', 0),
+                        }
+                    lf_gen.end(
+                        output=output_text[:2000],
+                        usage=usage if usage else None,
+                        metadata={"latency_ms": round(elapsed_ms)},
+                    )
+                except Exception:
+                    pass
+
+            return result
+
+        except Exception as e:
+            # ── Langfuse: record the error on the generation ──
+            if lf_gen:
+                try:
+                    lf_gen.update(metadata={"error": str(e)[:500]})
+                    lf_gen.end(output=f"ERROR: {e}")
+                except Exception:
+                    pass
+            raise
 
     # ── OpenAI (passthrough — native Responses API) ──────────────────────
 
@@ -853,7 +927,12 @@ class LLMClient:
     # ── Provider client getters (lazy init) ─────────────────────────────
 
     def _get_openai_client(self):
-        """Get or create OpenAI client."""
+        """Get or create OpenAI client.
+
+        If HELICONE_API_KEY is set, routes through Helicone's proxy for
+        automatic cost analytics, rate limiting, and request logging.
+        Sign up free at https://helicone.ai (100k requests/month free).
+        """
         if self._openai_client is None:
             from openai import OpenAI
             api_key = os.getenv("OPENAI_API_KEY", "")
@@ -862,7 +941,22 @@ class LLMClient:
                     "OPENAI_API_KEY is required for OpenAI models. "
                     "Set it in .env or use a local model (prefix with 'local/')."
                 )
-            self._openai_client = OpenAI(api_key=api_key)
+
+            helicone_key = os.getenv("HELICONE_API_KEY", "")
+            if helicone_key:
+                self._openai_client = OpenAI(
+                    api_key=api_key,
+                    base_url="https://oai.helicone.ai/v1",
+                    default_headers={
+                        "Helicone-Auth": f"Bearer {helicone_key}",
+                    },
+                )
+                logger.info(
+                    "[Helicone] OpenAI calls routed through Helicone proxy. "
+                    "Dashboard: https://helicone.ai/dashboard"
+                )
+            else:
+                self._openai_client = OpenAI(api_key=api_key)
         return self._openai_client
 
     def _get_anthropic_client(self):
