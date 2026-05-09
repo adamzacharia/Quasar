@@ -5338,6 +5338,12 @@ IMPORTANT RULES:
                 if _round == 0 and _is_archive_fetch:
                     request_kwargs["tool_choice"] = "required"
 
+                # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini)
+                from core.llm_client import LLMClient as _LLMClient
+                _no_temp = _LLMClient._NO_TEMPERATURE_MODELS
+                if request_kwargs.get("model", "") in _no_temp:
+                    request_kwargs.pop("temperature", None)
+
                 try:
                     response_stream = self.client.responses.create(**request_kwargs)
                 except Exception as e:
