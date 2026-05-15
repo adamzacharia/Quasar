@@ -1525,7 +1525,10 @@ async def create_conversation_endpoint(req: ConversationCreate, current_user: di
 @app.get("/api/conversations/{conversation_id}/messages")
 async def get_conversation_messages(conversation_id: str, current_user: dict = Depends(get_current_user)):
     """Fetch all messages for a conversation."""
-    messages = conversation_service.get_conversation_messages(conversation_id)
+    user_id = current_user["sub"]
+    messages = conversation_service.get_conversation_messages_for_user(conversation_id, user_id)
+    if messages is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return {"messages": messages}
 
 
@@ -1539,7 +1542,14 @@ async def update_conversation_title_endpoint(
     current_user: dict = Depends(get_current_user),
 ):
     """Update a conversation's title."""
-    conversation_service.update_conversation_title(conversation_id, req.title)
+    user_id = current_user["sub"]
+    updated = conversation_service.update_conversation_title_for_user(
+        conversation_id,
+        user_id,
+        req.title,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return {"status": "ok"}
 
 
@@ -1547,9 +1557,14 @@ async def update_conversation_title_endpoint(
 async def delete_conversation_endpoint(conversation_id: str, current_user: dict = Depends(get_current_user)):
     """Delete a conversation and all its messages."""
     try:
-        conversation_service.delete_conversation(conversation_id)
+        user_id = current_user["sub"]
+        deleted = conversation_service.delete_conversation_for_user(conversation_id, user_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Conversation not found")
         print(f"[INFO] Deleted conversation {conversation_id} for user {current_user.get('sub', 'unknown')}")
         return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] Failed to delete conversation {conversation_id}: {e}")
         import traceback; traceback.print_exc()
@@ -1943,10 +1958,6 @@ async def personalization_delete(doc_id: str, current_user: dict = Depends(get_c
 
 
 
-@app.post("/api/conversations")
-async def create_conversation(req: ConversationCreate):
-    """Create a new conversation."""
-    return {"id": str(uuid.uuid4()), "title": req.title}
 
 
 # ── Red Team TAC (Proposal Critic) Endpoint ────────────────

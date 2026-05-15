@@ -14,8 +14,50 @@ from pathlib import Path
 from services.db import get_connection
 import jwt
 
-# Secure default or loaded from env
-JWT_SECRET = os.environ.get("JWT_SECRET", "quasar-research-assistant-super-secret-key-2026")
+_LOCAL_JWT_SECRET = "quasar-local-development-jwt-secret"
+_PRODUCTION_ENVIRONMENTS = {"production", "prod"}
+_UNSAFE_PRODUCTION_SECRETS = {
+    _LOCAL_JWT_SECRET,
+    "quasar-research-assistant-super-secret-key-2026",
+    "change-me",
+    "change-me-in-production",
+}
+
+
+def _current_environment() -> str:
+    """Return the configured app environment."""
+    return (
+        os.environ.get("QUASAR_ENV")
+        or os.environ.get("APP_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+
+
+def resolve_jwt_secret(secret: Optional[str] = None, environment: Optional[str] = None) -> str:
+    """Resolve the JWT signing secret and fail fast when production is unsafe."""
+    raw_secret = os.environ.get("JWT_SECRET") if secret is None else secret
+    env = (_current_environment() if environment is None else environment.strip().lower())
+
+    if raw_secret and raw_secret.strip():
+        resolved_secret = raw_secret.strip()
+        if env in _PRODUCTION_ENVIRONMENTS and resolved_secret in _UNSAFE_PRODUCTION_SECRETS:
+            raise RuntimeError(
+                "JWT_SECRET must be a private deployment-specific value in production. "
+                "Replace the default/example value with a long random secret."
+            )
+        return resolved_secret
+
+    if env in _PRODUCTION_ENVIRONMENTS:
+        raise RuntimeError(
+            "JWT_SECRET is required when QUASAR_ENV=production. "
+            "Set it to a long random value in the deployment environment."
+        )
+
+    return _LOCAL_JWT_SECRET
+
+
+JWT_SECRET = resolve_jwt_secret()
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24 * 7  # 1 week
 
