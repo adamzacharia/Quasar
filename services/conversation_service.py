@@ -147,8 +147,6 @@ class ConversationService:
         
         Properly serializes DataFrames and all message fields.
         """
-        import pandas as pd
-        
         conn = self._get_conn()
         cursor = conn.cursor()
         
@@ -213,8 +211,6 @@ class ConversationService:
         
         Properly deserializes DataFrames and restores all message fields.
         """
-        import pandas as pd
-        
         conn = self._get_conn()
         cursor = conn.cursor()
         
@@ -242,6 +238,7 @@ class ConversationService:
                     if "data_json" in metadata:
                         try:
                             if isinstance(metadata["data_json"], list):
+                                import pandas as pd
                                 msg["data"] = pd.DataFrame(metadata["data_json"])
                             else:
                                 msg["data"] = metadata["data_json"]
@@ -273,6 +270,28 @@ class ConversationService:
         
         conn.close()
         return messages
+
+    def conversation_belongs_to_user(self, conversation_id: str, user_id: str) -> bool:
+        """Return True when the conversation exists and belongs to user_id."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT 1 FROM conversations WHERE id = ? AND user_id = ?',
+            (conversation_id, user_id),
+        )
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+
+    def get_conversation_messages_for_user(
+        self,
+        conversation_id: str,
+        user_id: str,
+    ) -> Optional[List[Dict]]:
+        """Get messages only when the conversation belongs to user_id."""
+        if not self.conversation_belongs_to_user(conversation_id, user_id):
+            return None
+        return self.get_conversation_messages(conversation_id)
     
     def get_user_conversations(self, user_id: str, limit: int = 20) -> List[Dict]:
         """Get list of conversations for a user, most recent first"""
@@ -310,6 +329,31 @@ class ConversationService:
         
         conn.commit()
         conn.close()
+
+    def update_conversation_title_for_user(
+        self,
+        conversation_id: str,
+        user_id: str,
+        title: str,
+    ) -> bool:
+        """Update a conversation title only when it belongs to user_id."""
+        now = datetime.now().isoformat()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            UPDATE conversations
+            SET title = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            ''',
+            (title, now, conversation_id, user_id),
+        )
+        updated = cursor.rowcount > 0
+
+        conn.commit()
+        conn.close()
+        return updated
     
     def generate_title_from_message(self, first_message: str) -> str:
         """Generate a short title from the first message"""
@@ -347,6 +391,34 @@ class ConversationService:
         conn.commit()
         conn.close()
         print(f"[INFO] delete_conversation: successfully deleted {conversation_id}")
+
+    def delete_conversation_for_user(self, conversation_id: str, user_id: str) -> bool:
+        """Delete a conversation only when it belongs to user_id."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            'SELECT id FROM conversations WHERE id = ? AND user_id = ?',
+            (conversation_id, user_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False
+
+        cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
+        cursor.execute(
+            'DELETE FROM conversation_file_refs WHERE user_id = ? AND conversation_id = ?',
+            (user_id, conversation_id),
+        )
+        cursor.execute(
+            'DELETE FROM conversations WHERE id = ? AND user_id = ?',
+            (conversation_id, user_id),
+        )
+
+        conn.commit()
+        conn.close()
+        return True
     
     def get_or_create_current(self, user_id: str) -> str:
         """Get most recent conversation or create new one"""

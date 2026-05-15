@@ -107,7 +107,7 @@ Create a repository root `.env` file before starting the backend.
 | `QDRANT_API_KEY` | No | Authentication for Qdrant Cloud |
 | `TURSO_DATABASE_URL` | No | Cloud SQL storage |
 | `TURSO_AUTH_TOKEN` | No | Authentication for Turso |
-| `JWT_SECRET` | No | JWT signing secret for authentication |
+| `JWT_SECRET` | Production | JWT signing secret for authentication; must be a private random value when `QUASAR_ENV=production` |
 | `NEXT_PUBLIC_API_URL` | No | Frontend API base URL override |
 | `DEFAULT_LLM_MODEL` | No | Backbone LLM model (default: `gpt-4.1`) |
 
