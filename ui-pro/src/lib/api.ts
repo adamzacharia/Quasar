@@ -179,7 +179,7 @@ export async function submitPlanFeedback(
 
 export async function getModels(): Promise<string[]> {
     try { const res = await fetch(`${API_BASE}/api/models`); const data = await res.json(); return data.models; }
-    catch { return ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "claude-3-7-sonnet-20250219", "gemini-3.1-pro"]; }
+    catch { return ["gpt-4.1", "gpt-4o-mini"]; }
 }
 
 export async function reviewProposal(file: File, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {

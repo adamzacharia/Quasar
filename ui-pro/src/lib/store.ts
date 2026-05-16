@@ -180,14 +180,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     streamingContent: "",
     selectedModel: "gpt-4.1",
     availableModels: [
-        // OpenAI
-        "gpt-4o", "gpt-4o-mini", "gpt-4.1", "claude-3-7-sonnet-20250219", "gemini-3.1-pro",
-        // Gemini free tier
-        "gemini-2.5-flash-preview-05-20",
-        "gemini-2.5-flash-lite-preview-06-17",
-        "gemini-3-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
+        "gpt-4.1", "gpt-4o-mini",
     ],
     sidebarOpen: true,
     thinkingSteps: [],
