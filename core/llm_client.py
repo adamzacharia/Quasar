@@ -263,7 +263,7 @@ class ResponsesShim:
         "o1", "o1-mini", "o1-pro",
         "o3", "o3-mini", "o3-pro",
         "o4-mini",
-        "gpt-5-nano", "gpt-5-mini",
+        "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini",
     })
 
     def _strip_unsupported_params(self, kwargs: dict) -> dict:

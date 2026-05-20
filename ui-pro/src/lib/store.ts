@@ -178,9 +178,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     messages: [],
     isStreaming: false,
     streamingContent: "",
-    selectedModel: "gpt-4.1",
+    selectedModel: "gpt-5.4-mini",
     availableModels: [
-        "gpt-4.1", "gpt-4o-mini",
+        "gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini",
     ],
     sidebarOpen: true,
     thinkingSteps: [],

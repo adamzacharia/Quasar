@@ -56,6 +56,7 @@ function OverlayPanel({ open, onClose, title, icon: Icon, children }: {
 const MODEL_PRICING: Record<string, { in: number, out: number }> = {
     // GPT-5 Series
     "gpt-5.4": { in: 15.00, out: 45.00 },
+    "gpt-5.4-mini": { in: 0.75, out: 4.50 },
     "gpt-5.4-2026-03-05": { in: 15.00, out: 45.00 },
     "gpt-5": { in: 10.00, out: 30.00 },
     "gpt-5-mini": { in: 0.50, out: 1.50 },
@@ -83,6 +84,8 @@ function getModelCost(model: string) {
     if (MODEL_PRICING[model]) return MODEL_PRICING[model];
     // Fallbacks
     if (model.includes("gpt-4o-mini")) return MODEL_PRICING["gpt-4o-mini"];
+    if (model.includes("gpt-5.4-mini")) return MODEL_PRICING["gpt-5.4-mini"];
+    if (model.includes("gpt-5.4")) return MODEL_PRICING["gpt-5.4"];
     if (model.includes("gpt-4.1") || model.includes("gpt-4o")) return MODEL_PRICING["gpt-4o"];
     if (model.includes("sonnet")) return MODEL_PRICING["claude-3-5-sonnet-20241022"];
     if (model.includes("haiku")) return MODEL_PRICING["claude-3-5-haiku-20241022"];
