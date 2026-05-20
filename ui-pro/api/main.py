@@ -1272,10 +1272,11 @@ async def root():
 
 @app.get("/api/models")
 async def list_models():
-    cloud_models = [
-            "gpt-4.1",                 # GPT-4.1
-            "gpt-4o-mini",             # GPT-4o Mini
-    ]
+    cloud_models = [
+            "gpt-5.4-mini",             # GPT-5.4 Mini (default — adaptive reasoning, cost-effective)
+            "gpt-4.1",                 # GPT-4.1
+            "gpt-4o-mini",             # GPT-4o Mini
+    ]
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
     local_models = []

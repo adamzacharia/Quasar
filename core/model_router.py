@@ -4,7 +4,7 @@ Model Router — Route each Conductor subtask to the optimal OpenAI model.
 
 Uses a 3-tier OpenAI cost ladder:
   Tier 1 (heavy):  GPT-5.4      -- synthesis, scientific reasoning (expensive, smart)
-  Tier 2 (solid):  GPT-4.1      -- archive search, analysis, viz (solid tool-calling)
+  Tier 2 (solid):  GPT-5.4-mini -- archive search, analysis, viz (adaptive reasoning, cost-effective)
   Tier 3 (cheap):  GPT-4.1-mini -- simple QA, web search, literature (cheap + fast)
 
 The routing table maps agent_type → model.  Falls back to text classification
@@ -33,24 +33,24 @@ class ModelRouter:
 
     # -- OpenAI-only cost ladder --------------------------------------------------
     # Tier 1 (heavy): GPT-5.4      -- synthesis, scientific reasoning
-    # Tier 2 (solid): GPT-4.1      -- archive search, analysis, viz, code
+    # Tier 2 (solid): GPT-5.4-mini -- archive search, analysis, viz, code
     # Tier 3 (cheap): GPT-4.1-mini -- simple QA, web search, literature
     #
     # Rationale: GPT-5.4 is ~10-20× more expensive than 4.1-mini.
     # Reserve it for tasks that genuinely need intelligence (combining
     # results, multi-step reasoning).  Archive search is tool-calling —
-    # GPT-4.1 handles that perfectly.  Literature search is just calling
-    # search_papers with a query — 4.1-mini is fine.
+    # GPT-5.4-mini handles that with adaptive reasoning.  Literature
+    # search is just calling search_papers with a query — 4.1-mini is fine.
     ROUTING_TABLE: Dict[str, Dict[str, str]] = {
-        "archive_search":       {"model": "gpt-4.1",       "reason": "Solid tool-calling for archive queries"},
+        "archive_search":       {"model": "gpt-5.4-mini",  "reason": "Adaptive reasoning + solid tool-calling"},
         "literature_review":    {"model": "gpt-4.1-mini",  "reason": "Simple ADS search — cheap + fast"},
         "scientific_reasoning": {"model": "gpt-5.4",       "reason": "Complex multi-step reasoning needs intelligence"},
-        "code_generation":      {"model": "gpt-4.1",       "reason": "Reliable code generation + tool calling"},
-        "data_analysis":        {"model": "gpt-4.1",       "reason": "Structured output for spectral analysis"},
+        "code_generation":      {"model": "gpt-5.4-mini",  "reason": "Adaptive reasoning + reliable code generation"},
+        "data_analysis":        {"model": "gpt-5.4-mini",  "reason": "Structured output for spectral analysis"},
         "synthesis":            {"model": "gpt-5.4",       "reason": "Combining results requires deep reasoning"},
         "simple_qa":            {"model": "gpt-4.1-mini",  "reason": "Fast + cheap for trivial questions"},
         "web_search":           {"model": "gpt-4.1-mini",  "reason": "Simple tool calls"},
-        "visualization":        {"model": "gpt-4.1",       "reason": "Tool calling for FITS rendering"},
+        "visualization":        {"model": "gpt-5.4-mini",  "reason": "Tool calling for FITS rendering"},
     }
 
     # Keywords for heuristic classification
@@ -89,7 +89,7 @@ class ModelRouter:
         ],
     }
 
-    def __init__(self, default_model: str = "gpt-4.1"):
+    def __init__(self, default_model: str = "gpt-5.4-mini"):
         self.default_model = default_model
         self.health_monitor = None  # Injected by agent.py
 

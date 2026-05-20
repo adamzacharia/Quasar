@@ -23,7 +23,7 @@ if PROJECT_ROOT not in sys.path:
 _DUMMY_KEYS = {
     "OPENAI_API_KEY": "sk-test-dummy-key-for-unit-tests",
     "NASA_ADS_API_KEY": "test-dummy-ads-key",
-    "DEFAULT_LLM_MODEL": "gpt-4.1",
+    "DEFAULT_LLM_MODEL": "gpt-5.4-mini",
     "QUASAR_ENV": "testing",
 }
 for key, val in _DUMMY_KEYS.items():
@@ -50,7 +50,7 @@ def project_root():
 def dummy_config():
     """Return a minimal config dict for testing."""
     return {
-        "model": "gpt-4.1",
+        "model": "gpt-5.4-mini",
         "temperature": 0.7,
         "max_tokens": 1000,
     }

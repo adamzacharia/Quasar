@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 MODEL_PRICING = {
     # model_name: (input_per_1k, output_per_1k)
     "gpt-5.4":       (0.010, 0.030),
+    "gpt-5.4-mini":  (0.00075, 0.0045),
     "gpt-4.1":       (0.002, 0.008),
     "gpt-4.1-mini":  (0.0004, 0.0016),
     "gpt-4.1-nano":  (0.0001, 0.0004),
@@ -38,17 +39,17 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """
     Estimate the cost of an API call in USD.
 
-    Falls back to gpt-4.1 pricing if the model is unknown.
+    Falls back to gpt-5.4-mini pricing if the model is unknown.
     """
     pricing = MODEL_PRICING.get(model)
     if not pricing:
-        # Try prefix match (e.g. "gpt-4.1-2026-04-14" → "gpt-4.1")
+        # Try prefix match (e.g. "gpt-5.4-mini-2026-04-14" → "gpt-5.4-mini")
         for known_model, p in MODEL_PRICING.items():
             if model.startswith(known_model):
                 pricing = p
                 break
     if not pricing:
-        pricing = MODEL_PRICING.get("gpt-4.1", (0.002, 0.008))
+        pricing = MODEL_PRICING.get("gpt-5.4-mini", (0.00075, 0.0045))
 
     input_cost = (input_tokens / 1000) * pricing[0]
     output_cost = (output_tokens / 1000) * pricing[1]

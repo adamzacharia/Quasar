@@ -5339,9 +5339,25 @@ IMPORTANT RULES:
                     request_kwargs["tool_choice"] = "required"
 
                 # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini)
-                _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini"}
+                _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini"}
                 if request_kwargs.get("model", "") in _no_temp:
                     request_kwargs.pop("temperature", None)
+
+                # Enable reasoning summary streaming for thinking models
+                # These models support the `reasoning` parameter which returns
+                # a summarized chain-of-thought that we stream to the UI.
+                _thinking_models = {
+                    "o1", "o1-mini", "o1-pro",
+                    "o3", "o3-mini", "o3-pro",
+                    "o4-mini",
+                }
+                _current_model = request_kwargs.get("model", "")
+                _is_thinking_model = (
+                    _current_model in _thinking_models
+                    or _current_model.startswith("gpt-5")  # GPT-5.x adaptive thinking
+                )
+                if _is_thinking_model:
+                    request_kwargs["reasoning"] = {"summary": "auto"}
 
                 try:
                     response_stream = self.client.responses.create(**request_kwargs)
@@ -5359,11 +5375,42 @@ IMPORTANT RULES:
                 function_calls = {} # call_id -> dict
                 item_id_to_call_id = {}  # item.id -> call_id mapping
                 
+                _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
+                _reasoning_emitted = False     # Track if we emitted the reasoning header
+
                 for event in response_stream:
                     if event.type == "response.created":
                         last_id = event.response.id
                         self._set_response_id(conversation_id, last_id)
+                    elif event.type == "response.reasoning_summary_text.delta":
+                        # Stream reasoning summary as a thinking step in the UI
+                        _reasoning_summary_text += event.delta
+                        if not _reasoning_emitted and on_status:
+                            on_status("🧠 Reasoning", "running")
+                            _reasoning_emitted = True
+                    elif event.type == "response.reasoning_summary_text.done":
+                        # Reasoning summary complete — emit the full text as a thinking step
+                        if _reasoning_summary_text and on_status:
+                            # Split into individual lines for readable thinking steps
+                            for line in _reasoning_summary_text.strip().splitlines():
+                                line = line.strip()
+                                if line:
+                                    on_status(f"💭 {line}", "completed")
+                            on_status("🧠 Reasoning", "completed")
+                        _reasoning_summary_text = ""
+                        _reasoning_emitted = False
                     elif event.type == "response.output_text.delta":
+                        # If reasoning was still accumulating when text starts,
+                        # finalize it now (edge case: some models skip the .done event)
+                        if _reasoning_summary_text and on_status:
+                            for line in _reasoning_summary_text.strip().splitlines():
+                                line = line.strip()
+                                if line:
+                                    on_status(f"💭 {line}", "completed")
+                            if _reasoning_emitted:
+                                on_status("🧠 Reasoning", "completed")
+                            _reasoning_summary_text = ""
+                            _reasoning_emitted = False
                         output_text += event.delta
                         if on_token:
                             on_token(event.delta)

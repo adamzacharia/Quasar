@@ -19,10 +19,10 @@ Last audited against the codebase: 2026-04-25
 | High-Energy            | 5     | 0     | 0           | 5       | 0%     |
 | Optical / UV           | 7     | 1     | 0           | 6       | 14%    |
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
-| Next-Gen               | 11    | 8     | 1           | 2       | 73%    |
+| Next-Gen               | 12    | 9     | 1           | 2       | 75%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
 | Polish & Scale         | 27    | 8     | 0           | 19      | 30%    |
-| **Total**              |**91** |**40** | **2**       | **49**  |**44%** |
+| **Total**              |**92** |**41** | **2**       | **49**  |**45%** |
 
 ---
 
@@ -57,6 +57,7 @@ hours and adds immediate user value.
 - [x] **W8** Tiered Complexity DAG Control -- 3-tier complexity classification (moderate/complex/expert) with per-tier max subtask caps to prevent over-decomposition (core/conductor.py + core/agent.py)
 - [x] **W9** Hybrid BM25 Reranking -- Client-side BM25 keyword reranking over Qdrant semantic results using Reciprocal Rank Fusion; catches exact acronym/keyword matches without re-ingestion (services/rag_service.py)
 - [x] **W10** Human-in-the-Loop Plan Review -- Conductor blocks on user approval before executing DAG; users can approve or provide feedback to trigger LLM re-decomposition with labeled prompt sections; max 3 revision iterations (core/conductor.py + ui-pro/api/main.py + ui-pro/src/components/PlanReviewWidget.tsx)
+- [x] **W12** Reasoning Summary Streaming -- Stream OpenAI reasoning model chain-of-thought summaries to the UI Thought panel in real-time; auto-detects thinking models (o-series, GPT-5.x); displays reasoning lines as individual thinking steps with brain/thought-bubble emojis (core/agent.py stream_response_api)
 - [x] **W11** OpenAlex Researcher & Bibliometrics -- Researcher profile lookup (h-index, institution, ORCID, topics, publication history); bibliometric trend aggregation (papers-per-year); silent batch DOI enrichment of ADS paper results (FWCI, citation percentiles, funding tags, OA PDFs); dual parallel web search for researcher profiles (general context + dedicated email/contact lookup); additive routing (OpenAlex runs alongside RAG, never exclusive); branding hidden from user-facing output (integrations/openalex_client.py + core/agent.py lookup_researcher + get_research_trends)
 - [x] **U9** Redshift Calculator -- Convert between z, Mpc, lookback time, physical scale, angular size (services/astro_calculators.py)
 - [x] **U10** Coordinate Converter -- RA/Dec to Galactic to Ecliptic, epoch conversions J2000/B1950 (services/astro_calculators.py)
@@ -196,4 +197,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-09 -- Quasar v3.3.0 (Observability stack: Langfuse + Helicone + Sentry)*
+*Last updated: 2026-05-20 -- Quasar v3.3.1 (Added reasoning summary streaming for thinking models)*

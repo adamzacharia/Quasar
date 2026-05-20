@@ -38,11 +38,11 @@ class Config:
 
     @property
     def default_model(self):
-        return os.getenv("DEFAULT_LLM_MODEL", "gpt-4.1")
+        return os.getenv("DEFAULT_LLM_MODEL", "gpt-5.4-mini")
 
     @property
     def ads_query_model(self):
-        return os.getenv("ADS_QUERY_MODEL", "gpt-4.1")
+        return os.getenv("ADS_QUERY_MODEL", "gpt-5.4-mini")
 
     @property
     def verbose(self):
