@@ -5211,6 +5211,8 @@ IMPORTANT RULES:
                                     on_token=on_token,
                                     on_event=on_event,
                                     plan_feedback_queue=plan_feedback_queue,
+                                    user_id=user_id,
+                                    session_id=conversation_id,
                                 )
                             )
                         finally:
@@ -5328,6 +5330,8 @@ IMPORTANT RULES:
                     "temperature": self.config.temperature,
                     "max_output_tokens": self.config.max_tokens,
                     "stream": True,
+                    "user_id": user_id,
+                    "session_id": conversation_id,
                 }
                 if _round == 0 and attachments:
                     request_kwargs["attachments"] = attachments

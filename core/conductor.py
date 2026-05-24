@@ -377,6 +377,8 @@ class Conductor:
         on_token: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         plan_feedback_queue: Optional[stdlib_queue.Queue] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Main entry point for complex query orchestration.
@@ -455,7 +457,8 @@ class Conductor:
             try:
                 lf_trace = lf_client.trace(
                     name=f"conductor: {query[:80]}",
-                    user_id="anonymous",
+                    user_id=user_id or "anonymous",
+                    session_id=session_id,
                     metadata={
                         "complexity_tier": complexity_tier or "unknown",
                         "subtask_count": len(subtasks),
