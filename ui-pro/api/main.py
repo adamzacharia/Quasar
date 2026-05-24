@@ -138,6 +138,7 @@ _plan_feedback_lock = _threading.Lock()
 
 # Map conversation_id -> latest_trace_id for score ingestion
 _latest_traces: Dict[str, str] = {}
+_last_trace_id: Optional[str] = None
 
 # ── Catch-all exception handler — ensures a proper JSON 500 with CORS headers ──
 from starlette.responses import JSONResponse
@@ -805,7 +806,9 @@ def _stream_chat_response(
                 },
                 tags=["chat"],
             )
-            # Store the latest trace_id for this conversation
+            # Store the latest trace_id for this conversation and globally
+            global _last_trace_id
+            _last_trace_id = lf_trace.id
             if conv_id or request.conversation_id:
                 _latest_traces[conv_id or request.conversation_id] = lf_trace.id
         except Exception as lf_err:
@@ -2133,7 +2136,8 @@ async def submit_feedback(req: Request, authorization: Optional[str] = Header(No
     if lf_client:
         try:
             conv_id = body.get("conversation_id", "")
-            trace_id = _latest_traces.get(conv_id) if conv_id else None
+            # Look up trace_id from latest traces, or fall back to _last_trace_id globally
+            trace_id = (_latest_traces.get(conv_id) if conv_id else None) or _last_trace_id
             
             # Score target: if trace_id is known, attach directly to the trace, else attach to session
             score_kwargs = {
@@ -2146,13 +2150,15 @@ async def submit_feedback(req: Request, authorization: Optional[str] = Header(No
                 score_kwargs["trace_id"] = trace_id
             elif conv_id:
                 score_kwargs["session_id"] = conv_id
+            else:
+                score_kwargs["trace_id"] = _last_trace_id
 
-            if "trace_id" in score_kwargs or "session_id" in score_kwargs:
+            if score_kwargs.get("trace_id") or score_kwargs.get("session_id"):
                 await loop.run_in_executor(
                     _executor,
-                    lambda: lf_client.create_score(**score_kwargs)
+                    lambda: lf_client.score(**score_kwargs)
                 )
-                print(f"[Langfuse] Ingested user feedback score ({feedback}) for trace {trace_id or conv_id}", flush=True)
+                print(f"[Langfuse] Ingested user feedback score ({feedback}) for trace {score_kwargs.get('trace_id') or score_kwargs.get('session_id')}", flush=True)
         except Exception as lf_err:
             print(f"[Langfuse] Failed to ingest feedback score: {lf_err}", flush=True)
 
