@@ -177,6 +177,8 @@ class ResponsesShim:
         provider = detect_provider(model)
         stream = kwargs.get("stream", False)
         attachments = kwargs.pop("attachments", None)
+        user_id = kwargs.pop("user_id", None)
+        session_id = kwargs.pop("session_id", None) or kwargs.pop("conversation_id", None)
 
         # ── Langfuse: create a generation span if a parent trace exists ──
         lf_gen = None
@@ -184,7 +186,11 @@ class ResponsesShim:
         lf_client = get_langfuse()
         if lf_parent or lf_client:
             try:
-                parent = lf_parent or (lf_client.trace(name="llm_call") if lf_client else None)
+                parent = lf_parent or (lf_client.trace(
+                    name="llm_call",
+                    user_id=user_id or "anonymous",
+                    session_id=session_id,
+                ) if lf_client else None)
                 if parent:
                     from core.langfuse_integration import langfuse_generation
                     lf_gen = langfuse_generation(
