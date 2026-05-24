@@ -49,6 +49,7 @@ We use the collected information for the following specific purposes:
 * **Core Functionality:** To authenticate your session, stream real-time chat responses, compose Observational Conductor DAGs, and generate downloadable Jupyter notebooks.
 * **Observability & Bug Fixes:** To audit tool execution logs, review failed subtasks, and track cost/latency analytics.
 * **Personalization:** To build preference memory models that learn your specific observational bands and academic areas of interest over time.
+* **Training & Model Improvement:** Your queries, conversation histories, uploaded documents, and search parameters may be used to train, fine-tune, evaluate, or otherwise improve Quasar's systems, models, and associated Large Language Models (LLMs). This helps us build better astronomical reasoning and improve tool accuracy for all users.
 * **Security & Fair Use:** To monitor access rates, verify JWT tokens, detect prompt injection attacks, and block automated scrapers.
 
 ---

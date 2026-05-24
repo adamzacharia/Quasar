@@ -143,6 +143,9 @@ export default function TermsPage() {
               <p>
                 To keep Quasar fast and help us fix bugs when things break, your queries are traced for performance metrics, and your chat history is stored securely in our database.
               </p>
+              <p>
+                <strong>Training & Improvement:</strong> Any data you share with Quasar—including queries, conversations, uploaded documents, and search parameters—may be used to train, fine-tune, or improve Quasar and its associated AI models. This helps us build better astronomical reasoning and improve accuracy for everyone.
+              </p>
             </div>
           </section>
 
