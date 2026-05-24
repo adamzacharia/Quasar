@@ -5,13 +5,13 @@ import Link from "next/link";
 
 export default function TermsPage() {
   const sections = [
-    { id: "intro", title: "1. Scope & System Access", icon: Shield },
-    { id: "collection", title: "2. Data We Collect", icon: Eye },
-    { id: "processing", title: "3. Langfuse & Turso Pipelines", icon: Activity },
-    { id: "fits-policy", title: "4. Astronomical FITS Data", icon: FileText },
-    { id: "storage", title: "5. Thread Continuity & Storage", icon: Database },
-    { id: "control", title: "6. User Control & Deletion", icon: Trash2 },
-    { id: "support", title: "7. Compliance & Support", icon: HelpCircle },
+    { id: "intro", title: "1. Scope & Access", icon: Shield },
+    { id: "collection", title: "2. What We Collect", icon: Eye },
+    { id: "processing", title: "3. Tech Stack & Tracing", icon: Activity },
+    { id: "fits-policy", title: "4. Your FITS & Science Data", icon: FileText },
+    { id: "storage", title: "5. Storage & Continuity", icon: Database },
+    { id: "control", title: "6. You Own Your Data", icon: Trash2 },
+    { id: "support", title: "7. Questions & Support", icon: HelpCircle },
   ];
 
   const scrollToSection = (id: string) => {
@@ -74,13 +74,13 @@ export default function TermsPage() {
           {/* Header Title */}
           <div className="space-y-4 border-b border-slate-900 pb-8">
             <h1 className="text-4xl md:text-5xl text-white font-[400] font-serif tracking-tight">
-              Terms & Conditions & Privacy Policy
+              Terms of Service & Privacy Policy
             </h1>
             <p className="text-sm text-slate-500">
-              Last Updated: May 24, 2026 • Security Protocol Version 1.4.2
+              Last Updated: May 24, 2026 • Version 2.0 (The human-readable edition)
             </p>
             <p className="text-slate-400 leading-relaxed text-sm md:text-base">
-              Welcome to the QUASAR Astronomical Assistant platform. As a public service utilized globally by professional investigators, academic institutions, and independent researchers, we maintain absolute transparency regarding data collection, operational tracing, and user security. By provisioning an account or accessing the Quasar workspaces, you explicitly consent to these security covenants.
+              Welcome to the QUASAR Astronomical Assistant! We built Quasar to make radio astronomy research faster, simpler, and actually enjoyable. Below, we maintain absolute transparency regarding data collection, operational tracing, and user security in plain English—no corporate legal jargon required. By signing up or using Quasar, you agree to these simple guidelines.
             </p>
           </div>
 
@@ -90,14 +90,14 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/10">
                 <Shield className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">1. Scope & System Access</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">1. Scope & Access</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-3 text-sm leading-relaxed text-slate-400">
               <p>
-                Quasar grants authorized investigators a non-transferable, revocable license to utilize the natural language celestial query interface, observational conductor pipeline, and spectral FITS processing environments.
+                You are completely free to use our natural language query interface, agent pipelines, and spectral FITS processing tools to explore the cosmos.
               </p>
               <p>
-                <strong>Mandatory Account Control:</strong> Guest access is strictly prohibited. You must create and authenticate through verified credentials (email/password or SSO) to access any Quasar APIs, coordinate queries, or workspace buffers.
+                <strong>No Guest Access:</strong> To protect our APIs, avoid spam, and keep our services fast, guest access is disabled. You must create a verified account (via Email or Google login) to access any Quasar APIs, coordinate query pipelines, or workspace buffers.
               </p>
             </div>
           </section>
@@ -108,24 +108,24 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-pink-500/10 text-pink-400 border border-pink-500/10">
                 <Eye className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">2. Data We Collect</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">2. What We Collect</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-4 text-sm leading-relaxed text-slate-400">
               <p>
-                To provide deterministic radio astronomy agent orchestration and trace complex astronomical sub-queries, Quasar collects the following parameters during system interactions:
+                We only collect what's necessary to make Quasar work and keep your sessions alive. This includes:
               </p>
               <ul className="list-disc pl-5 space-y-2">
                 <li>
-                  <strong className="text-slate-200">Conversation Buffers:</strong> Input queries, structural research outlines, and agent output records.
+                  <strong className="text-slate-200">Your Chats:</strong> Prompt histories, research outlines, and agent responses, so you don't lose your work.
                 </li>
                 <li>
-                  <strong className="text-slate-200">Scientific Metadata:</strong> Right Ascension (RA) coordinates, declination (Dec) inputs, frequency parameters, and target designations.
+                  <strong className="text-slate-200">Celestial Metadata:</strong> Coordinate lookups (RA/Dec), spectral frequencies, and target names you search.
                 </li>
                 <li>
-                  <strong className="text-slate-200">FITS File Metadata:</strong> Dimensions, headers, spectral coordinates, and pixel metrics extracted from uploaded Flexible Image Transport System files.
+                  <strong className="text-slate-200">FITS Metadata:</strong> Pixel counts, headers, and coordinate grids extracted when you analyze files.
                 </li>
                 <li>
-                  <strong className="text-slate-200">Telemetry & Client Metrics:</strong> IP addresses, browser footprints, and active session tokens required to authenticate websocket streaming channels.
+                  <strong className="text-slate-200">Session Info:</strong> IP address and browser headers, strictly to keep your real-time WebSocket connection stable.
                 </li>
               </ul>
             </div>
@@ -137,11 +137,11 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/10">
                 <Activity className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">3. Langfuse Tracing & Turso Pipeline</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">3. Tech Stack & Tracing</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-4 text-sm leading-relaxed text-slate-400">
               <p>
-                Quasar processes user inputs using advanced analytical pipelines. This telemetry is handled through two major integrations:
+                We process your queries using a clean, modern observability pipeline:
               </p>
               
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
@@ -151,16 +151,16 @@ export default function TermsPage() {
                     Langfuse Observability
                   </h4>
                   <p className="text-[12px] leading-relaxed text-slate-400">
-                    To maintain strict debugging pipelines and audit LLM scores, every scientific sub-query, web-search routing (Tavily/SIMBAD), and internal tool run is traced dynamically under secure spans in Langfuse. This ensures perfect observability and performance validation.
+                    When you run a complex query (like searching ALMA or VizieR), we trace the steps in Langfuse. This logs LLM token usage and tool times so we can debug things when they break and keep everything running at peak performance.
                   </p>
                 </div>
                 <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800/60">
                   <h4 className="text-xs font-semibold text-slate-200 uppercase tracking-wider mb-2 flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-blue-400" />
-                    Turso Thread Continuity
+                    Turso Thread Storage
                   </h4>
                   <p className="text-[12px] leading-relaxed text-slate-400">
-                    Your conversation indexes, workflow nodes, and user profile registries are securely stored in a globally-distributed Turso SQLite database (hosted securely with enterprise LibSQL engines), ensuring fast latency and seamless device transition.
+                    Your profile, chat histories, and settings are stored in a distributed Turso database. This ensures your sessions load instantly no matter where in the world you are logging in from.
                   </p>
                 </div>
               </div>
@@ -173,17 +173,17 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-pink-500/10 text-pink-400 border border-pink-500/10">
                 <FileText className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">4. Astronomical FITS Data Policy</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">4. Your FITS & Science Data</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-3 text-sm leading-relaxed text-slate-400">
               <p>
-                Flexible Image Transport System (FITS) files contain sensitive astronomical and spatial research data.
+                Flexible Image Transport System (FITS) files are the lifeblood of astronomy. We treat your science with absolute respect:
               </p>
               <p>
-                <strong>Scientific Confidentiality:</strong> Quasar acts purely as an automated analytical processor. We do not claim any proprietary rights, Intellectual Property, or publication claims over the observations or findings generated by processing your FITS files.
+                <strong>Scientific Sovereignty:</strong> Quasar acts strictly as an automated processing assistant. We claim zero ownership, intellectual property rights, or publication claims over the observations, FITS images, or scientific findings you generate here. Your science is yours, period.
               </p>
               <p>
-                <strong>Processing Environment:</strong> Uploaded FITS files are processed within dedicated production containers. Temporary visual plots and header extractions are cached securely and are completely isolated from other platform users.
+                <strong>Isolated Processing:</strong> Uploaded FITS files are processed inside isolated, temporary containers and visual plots are cached securely, meaning other users cannot see or access your data.
               </p>
             </div>
           </section>
@@ -194,11 +194,11 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-teal-500/10 text-teal-400 border border-teal-500/10">
                 <Database className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">5. Thread Continuity & Storage</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">5. Storage & Continuity</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-3 text-sm leading-relaxed text-slate-400">
               <p>
-                To provide cohesive conversation flow, your research threads remain active inside our database indefinitely unless explicit deletion commands are executed. Platform caches and session headers are automatically scrubbed upon logout or JWT expiration.
+                We keep your chat threads safe in our database so your notes don't vanish. If you log out, your browser token is safely wiped.
               </p>
             </div>
           </section>
@@ -209,14 +209,14 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-red-500/10 text-red-400 border border-red-500/10">
                 <Trash2 className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">6. User Control & Deletion</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">6. You Own Your Data</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-3 text-sm leading-relaxed text-slate-400">
               <p>
-                We believe in absolute investigator sovereignty. You retain full control over your scientific search history:
+                You retain complete control over your scientific search history and profile:
               </p>
               <p>
-                <strong>Session Clearing & Account Wipe:</strong> At any point, you can manually delete individual research threads from the Sidebar interface, or request a complete database wipe of your verified account metrics through the user dashboard settings. Once confirmed, all referenced keys, files, and conversation indexes are permanently deleted from our active Turso instances.
+                <strong>Instant Wiping:</strong> You can delete individual chat threads from the sidebar at any time, or trigger a complete account wipe in your Settings. Once you click delete, your records are permanently purged from our Turso database. No hidden back-ups, no keeping your data forever.
               </p>
             </div>
           </section>
@@ -227,14 +227,14 @@ export default function TermsPage() {
               <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/10">
                 <HelpCircle className="w-5 h-5" />
               </div>
-              <h2 className="text-xl font-serif text-white font-[400]">7. Compliance & Support</h2>
+              <h2 className="text-xl font-serif text-white font-[400]">7. Questions & Support</h2>
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-3 text-sm leading-relaxed text-slate-400">
               <p>
-                For further clarification regarding astronomical data privacy, legal tracing architectures, or integration configurations, please consult the system logs or reach out to the project maintainers.
+                Got questions about how we handle coordinates, FITS files, or telemetry? We are astronomers and engineers—just check our repository logs or reach out to the project maintainers, and we will happily walk you through the codebase.
               </p>
               <p className="text-xs text-slate-500 pt-2 border-t border-slate-900">
-                QUASAR System Authority — Advanced Astronomy Orchestration and Security Registry.
+                QUASAR Observatory — Astronomy Orchestration and Data Security.
               </p>
             </div>
           </section>
