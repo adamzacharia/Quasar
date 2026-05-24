@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 12    | 9     | 1           | 2       | 75%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 28    | 9     | 0           | 19      | 32%    |
-| **Total**              |**93** |**42** | **2**       | **49**  |**45%** |
+| Polish & Scale         | 28    | 10    | 0           | 18      | 36%    |
+| **Total**              |**94** |**43** | **2**       | **49**  |**46%** |
 
 ---
 
@@ -173,6 +173,7 @@ Without them, even great features feel broken.
 - [x] **PS26** Astronomy Acronym Expansion -- Expand ALMA/VLA/JWST/AGN etc. to full forms in web search queries so generic engines return astronomy results (core/agent.py _expand_astro_query)
 - [x] **PS27** Response Feedback Collection -- Like/dislike buttons on assistant messages, persisted to analytics DB for RLHF/improvement (services/analytics_service.py + ui-pro/src/components/ChatMessage.tsx)
 - [x] **PS28** LLM Cost Analytics & Tracing -- Helicone OpenAI proxy for automatic cost dashboards; Langfuse generation logging per LLM call with token usage and latency (core/llm_client.py + core/langfuse_integration.py)
+- [x] **PS29** OpenAI Responses API Unification -- Purged all legacy chat completions and unified the entire codebase (vision uploads, text reasoning, literature searching, proposal critiques) under the modern OpenAI Responses API via LLMClient (ui-pro/api/main.py)
 
 ---
 
@@ -198,4 +199,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-24 -- Quasar v3.3.2 (Added strict guest gate and terms agreement page)*
+*Last updated: 2026-05-25 -- Quasar v3.3.3 (Purged all legacy completions and unified under OpenAI Responses API)*

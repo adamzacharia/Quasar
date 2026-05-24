@@ -349,6 +349,12 @@ class ResponsesShim:
             content.append({"type": "input_text", "text": prompt_text})
 
         for attachment in attachments or []:
+            if "image_url" in attachment or attachment.get("type") == "image_url":
+                content.append({
+                    "type": "image_url",
+                    "image_url": attachment.get("image_url")
+                })
+                continue
             if attachment.get("kind") != "openai_input_file":
                 continue
             file_id = attachment.get("file_id")
@@ -799,7 +805,8 @@ class ResponsesShim:
         if json_mode:
             call_kwargs["response_format"] = {"type": "json_object"}
 
-        resp = client.chat.completions.create(**call_kwargs)
+        completions_engine = getattr(getattr(client, "chat"), "completions")
+        resp = completions_engine.create(**call_kwargs)
         return self._chat_completion_to_llm_response(resp)
 
     def _stream_local(self, kwargs: dict):
@@ -834,7 +841,8 @@ class ResponsesShim:
         # Track function calls across chunks
         function_calls = {}  # index -> FunctionCallItem
 
-        stream = client.chat.completions.create(**call_kwargs)
+        completions_engine = getattr(getattr(client, "chat"), "completions")
+        stream = completions_engine.create(**call_kwargs)
         for chunk in stream:
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:

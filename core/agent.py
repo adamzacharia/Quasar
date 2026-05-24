@@ -2176,18 +2176,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         )
 
         try:
-            from openai import OpenAI
-            client = OpenAI()
-            resp = client.chat.completions.create(
+            from core.llm_client import LLMClient
+            client = LLMClient(model="gpt-4.1-mini")
+            resp = client.responses.create(
                 model="gpt-4.1-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=200,
+                instructions=system_prompt,
+                input=user_prompt,
+                max_output_tokens=200,
                 temperature=0.2,
             )
-            summary = resp.choices[0].message.content.strip()
+            summary = resp.output_text.strip()
             if summary:
                 return summary
         except Exception as e:
@@ -3867,17 +3865,15 @@ IMPORTANT RULES:
 - If a question is too narrow or the papers don't directly address it, say so honestly
 """
 
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.config.model,
-                messages=[
-                    {"role": "system", "content": "You are a meticulous scientific literature analyst who produces rigorous, well-cited consensus evaluations."},
-                    {"role": "user", "content": consensus_prompt}
-                ],
+                instructions="You are a meticulous scientific literature analyst who produces rigorous, well-cited consensus evaluations.",
+                input=consensus_prompt,
                 temperature=0.1,
-                max_tokens=4000,
+                max_output_tokens=4000,
             )
             
-            analysis = response.choices[0].message.content.strip()
+            analysis = response.output_text.strip()
             
             # Store for UI rendering
             self.last_run_result = {
@@ -3969,17 +3965,15 @@ IMPORTANT RULES:
             # Step 3: Generate reproduction script using LIT_TO_CODE_PROMPT
             prompt = LIT_TO_CODE_PROMPT.format(methodology_text=methodology_text)
 
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.config.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert radio astronomy data reduction specialist."},
-                    {"role": "user", "content": prompt}
-                ],
+                instructions="You are an expert radio astronomy data reduction specialist.",
+                input=prompt,
                 temperature=0.2,
-                max_tokens=4000
+                max_output_tokens=4000
             )
 
-            script = response.choices[0].message.content.strip()
+            script = response.output_text.strip()
 
             self.last_run_result = {
                 "type": "code",
@@ -4778,27 +4772,24 @@ IMPORTANT RULES:
         if _has_paper_word and not _is_document_analysis:
             # Fast LLM intent verification (~200ms with gpt-4o-mini)
             try:
-                from openai import OpenAI as _OAI
-                _mini = _OAI()
-                _intent_resp = _mini.chat.completions.create(
+                from core.llm_client import LLMClient
+                _mini = LLMClient(model="gpt-4o-mini")
+                _intent_resp = _mini.responses.create(
                     model="gpt-4o-mini",
-                    messages=[{
-                        "role": "user",
-                        "content": (
-                            f"Classify this astronomy query into exactly one category.\n\n"
-                            f"Query: \"{_user_query}\"\n\n"
-                            f"PAPERS = The user wants to FIND scientific papers, publications, or literature from NASA ADS or arXiv. "
-                            f"Example: 'Find papers about protoplanetary disks', 'Recent publications on galaxy mergers'.\n"
-                            f"KNOWLEDGE = The user wants general information, how-to guides, ALMA policies, procedures, or technical details. "
-                            f"Words like 'proposal', 'archival', 'access', 'deadline', 'review process' in context of ALMA operations are KNOWLEDGE, not PAPERS.\n"
-                            f"Example: 'What are the proposal submission deadlines?', 'How do I access archival data?'\n\n"
-                            f"Reply with ONLY one word: PAPERS or KNOWLEDGE"
-                        ),
-                    }],
+                    input=(
+                        f"Classify this astronomy query into exactly one category.\n\n"
+                        f"Query: \"{_user_query}\"\n\n"
+                        f"PAPERS = The user wants to FIND scientific papers, publications, or literature from NASA ADS or arXiv. "
+                        f"Example: 'Find papers about protoplanetary disks', 'Recent publications on galaxy mergers'.\n"
+                        f"KNOWLEDGE = The user wants general information, how-to guides, ALMA policies, procedures, or technical details. "
+                        f"Words like 'proposal', 'archival', 'access', 'deadline', 'review process' in context of ALMA operations are KNOWLEDGE, not PAPERS.\n"
+                        f"Example: 'What are the proposal submission deadlines?', 'How do I access archival data?'\n\n"
+                        f"Reply with ONLY one word: PAPERS or KNOWLEDGE"
+                    ),
                     temperature=0,
-                    max_tokens=5,
+                    max_output_tokens=5,
                 )
-                _intent = _intent_resp.choices[0].message.content.strip().upper()
+                _intent = _intent_resp.output_text.strip().upper()
                 _is_paper_query = "PAPERS" in _intent
                 print(f"[INTENT] Query: '{_user_query[:60]}...' → {_intent} (paper_query={_is_paper_query})")
             except Exception as e:
