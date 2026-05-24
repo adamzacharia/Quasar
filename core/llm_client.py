@@ -956,6 +956,136 @@ class ResponsesShim:
             output=output_items,
         )
 
+    @with_retry(max_retries=3, backoff_base=1.0)
+    def _call_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
+        """Translate responses.create() to DeepSeek Chat Completions API."""
+        client = self._llm._get_deepseek_client()
+        model = kwargs.get("model", self._llm.default_model)
+        instructions = kwargs.get("instructions", "")
+        input_data = kwargs.get("input", "")
+        max_tokens = kwargs.get("max_output_tokens", 2000)
+        tools_raw = kwargs.get("tools", None)
+        json_mode = False
+        text_opt = kwargs.get("text", None)
+        if text_opt and isinstance(text_opt, dict):
+            fmt = text_opt.get("format", {})
+            if fmt.get("type") == "json_object":
+                json_mode = True
+
+        messages = self._build_chat_messages(instructions, input_data, json_mode)
+        openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
+
+        call_kwargs = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if openai_tools:
+            call_kwargs["tools"] = openai_tools
+        if json_mode:
+            call_kwargs["response_format"] = {"type": "json_object"}
+
+        # highest thinking settings as requested
+        call_kwargs["reasoning_effort"] = "high"
+        call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+
+        completions_engine = getattr(getattr(client, "chat"), "completions")
+        resp = completions_engine.create(**call_kwargs)
+        return self._chat_completion_to_llm_response(resp)
+
+    def _stream_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
+        """Streaming DeepSeek call — returns an iterator of StreamEvents."""
+        client = self._llm._get_deepseek_client()
+        model = kwargs.get("model", self._llm.default_model)
+        instructions = kwargs.get("instructions", "")
+        input_data = kwargs.get("input", "")
+        max_tokens = kwargs.get("max_output_tokens", 2000)
+        tools_raw = kwargs.get("tools", None)
+
+        messages = self._build_chat_messages(instructions, input_data)
+        openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
+
+        call_kwargs = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if openai_tools:
+            call_kwargs["tools"] = openai_tools
+
+        # highest thinking settings as requested
+        call_kwargs["reasoning_effort"] = "high"
+        call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+
+        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+        yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
+
+        function_calls = {}
+        reasoning_done_emitted = False
+
+        completions_engine = getattr(getattr(client, "chat"), "completions")
+        stream = completions_engine.create(**call_kwargs)
+        for chunk in stream:
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+
+            delta = choice.delta
+
+            # 1. Real-time Chain of Thought (CoT) reasoning content
+            reasoning_delta = getattr(delta, "reasoning_content", None)
+            if reasoning_delta:
+                yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
+                continue
+
+            # If we were streaming reasoning but it has now stopped, emit done event
+            if not reasoning_done_emitted:
+                if delta.content or delta.tool_calls:
+                    yield StreamEvent(type="response.reasoning_summary_text.done")
+                    reasoning_done_emitted = True
+
+            # 2. Text content
+            if delta.content:
+                yield StreamEvent(type="response.output_text.delta", delta=delta.content)
+
+            # 3. Tool calls
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in function_calls:
+                        fc = FunctionCallItem(
+                            name=tc.function.name if tc.function else "",
+                            call_id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
+                        )
+                        function_calls[idx] = fc
+                        yield StreamEvent(type="response.output_item.added", item=fc)
+                    
+                    fc = function_calls[idx]
+                    if tc.function and tc.function.arguments:
+                        fc.arguments += tc.function.arguments
+                        yield StreamEvent(
+                            type="response.function_call_arguments.delta",
+                            call_id=fc.call_id,
+                            delta=tc.function.arguments,
+                        )
+
+        if not reasoning_done_emitted:
+            yield StreamEvent(type="response.reasoning_summary_text.done")
+
+        for fc in function_calls.values():
+            yield StreamEvent(type="response.output_item.done", item=fc)
+
+        completed_items = [fc for fc in function_calls.values()]
+        yield StreamEvent(
+            type="response.completed",
+            response=LLMResponse(
+                id=resp_id,
+                output=completed_items,
+            )
+        )
+
+
 
 # ---------------------------------------------------------------------------
 # Main LLM Client
@@ -1087,132 +1217,3 @@ class LLMClient:
             base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
             self._deepseek_client = OpenAI(api_key=api_key, base_url=base_url)
         return self._deepseek_client
-
-    @with_retry(max_retries=3, backoff_base=1.0)
-    def _call_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
-        """Translate responses.create() to DeepSeek Chat Completions API."""
-        client = self._get_deepseek_client()
-        model = kwargs.get("model", self.default_model)
-        instructions = kwargs.get("instructions", "")
-        input_data = kwargs.get("input", "")
-        max_tokens = kwargs.get("max_output_tokens", 2000)
-        tools_raw = kwargs.get("tools", None)
-        json_mode = False
-        text_opt = kwargs.get("text", None)
-        if text_opt and isinstance(text_opt, dict):
-            fmt = text_opt.get("format", {})
-            if fmt.get("type") == "json_object":
-                json_mode = True
-
-        messages = self._build_chat_messages(instructions, input_data, json_mode)
-        openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
-
-        call_kwargs = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }
-        if openai_tools:
-            call_kwargs["tools"] = openai_tools
-        if json_mode:
-            call_kwargs["response_format"] = {"type": "json_object"}
-
-        # highest thinking settings as requested
-        call_kwargs["reasoning_effort"] = "high"
-        call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-
-        completions_engine = getattr(getattr(client, "chat"), "completions")
-        resp = completions_engine.create(**call_kwargs)
-        return self._chat_completion_to_llm_response(resp)
-
-    def _stream_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
-        """Streaming DeepSeek call — returns an iterator of StreamEvents."""
-        client = self._get_deepseek_client()
-        model = kwargs.get("model", self.default_model)
-        instructions = kwargs.get("instructions", "")
-        input_data = kwargs.get("input", "")
-        max_tokens = kwargs.get("max_output_tokens", 2000)
-        tools_raw = kwargs.get("tools", None)
-
-        messages = self._build_chat_messages(instructions, input_data)
-        openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
-
-        call_kwargs = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if openai_tools:
-            call_kwargs["tools"] = openai_tools
-
-        # highest thinking settings as requested
-        call_kwargs["reasoning_effort"] = "high"
-        call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-
-        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
-        yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
-
-        function_calls = {}
-        reasoning_done_emitted = False
-
-        completions_engine = getattr(getattr(client, "chat"), "completions")
-        stream = completions_engine.create(**call_kwargs)
-        for chunk in stream:
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                continue
-
-            delta = choice.delta
-
-            # 1. Real-time Chain of Thought (CoT) reasoning content
-            reasoning_delta = getattr(delta, "reasoning_content", None)
-            if reasoning_delta:
-                yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
-                continue
-
-            # If we were streaming reasoning but it has now stopped, emit done event
-            if not reasoning_done_emitted:
-                if delta.content or delta.tool_calls:
-                    yield StreamEvent(type="response.reasoning_summary_text.done")
-                    reasoning_done_emitted = True
-
-            # 2. Text content
-            if delta.content:
-                yield StreamEvent(type="response.output_text.delta", delta=delta.content)
-
-            # 3. Tool calls
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in function_calls:
-                        fc = FunctionCallItem(
-                            name=tc.function.name if tc.function else "",
-                            call_id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
-                        )
-                        function_calls[idx] = fc
-                        yield StreamEvent(type="response.output_item.added", item=fc)
-                    
-                    fc = function_calls[idx]
-                    if tc.function and tc.function.arguments:
-                        fc.arguments += tc.function.arguments
-                        yield StreamEvent(
-                            type="response.function_call_arguments.delta",
-                            call_id=fc.call_id,
-                            delta=tc.function.arguments,
-                        )
-
-        if not reasoning_done_emitted:
-            yield StreamEvent(type="response.reasoning_summary_text.done")
-
-        for fc in function_calls.values():
-            yield StreamEvent(type="response.output_item.done", item=fc)
-
-        completed_items = [fc for fc in function_calls.values()]
-        yield StreamEvent(
-            type="response.completed",
-            response=LLMResponse(
-                id=resp_id,
-                output=completed_items,
-            )
-        )
