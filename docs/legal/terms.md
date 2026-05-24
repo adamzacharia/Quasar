@@ -55,8 +55,11 @@ We respect the intellectual property of the scientific community.
 * **Ownership:** You retain 100% ownership, intellectual property rights, and publication claims over all files, observational images, scientific parameters, and raw FITS data you upload to the Platform.
 * **Platform Rights:** Quasar acts strictly as an automated processing assistant. We do not claim any rights, titles, or licensing options over your discoveries.
 
-### 4.2 Temporary isolated Processing
+### 4.2 Temporary Isolated Processing
 Any FITS files or observation logs uploaded to the Platform are processed inside isolated, temporary containers. These files are securely cached and isolated so that other platform users cannot access, view, or scrape your proprietary observational findings.
+
+### 4.3 Training & Model Improvement
+By using the Platform, you acknowledge and agree that any data you share with Quasar—including but not limited to queries, conversation histories, uploaded documents, and search parameters—may be used to train, fine-tune, evaluate, or otherwise improve Quasar's systems, models, and associated Large Language Models (LLMs). This data helps us build better astronomical reasoning, improve tool accuracy, and enhance the overall quality of the Service for all users.
 
 ---
 
