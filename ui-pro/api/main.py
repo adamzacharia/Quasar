@@ -758,6 +758,12 @@ def _stream_chat_response(
     requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or "gpt-4o"
     provider = detect_provider(requested_model)
     current_user_id = current_user.get("sub") if current_user else None
+    
+    if not current_user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please sign in to your Quasar account to access the system."
+        )
 
     # ── Conversation persistence: auto-create + save user message ──────
     conv_id = request.conversation_id

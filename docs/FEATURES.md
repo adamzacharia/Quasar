@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 12    | 9     | 1           | 2       | 75%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 27    | 8     | 0           | 19      | 30%    |
-| **Total**              |**92** |**41** | **2**       | **49**  |**45%** |
+| Polish & Scale         | 28    | 9     | 0           | 19      | 32%    |
+| **Total**              |**93** |**42** | **2**       | **49**  |**45%** |
 
 ---
 
@@ -164,6 +164,7 @@ Without them, even great features feel broken.
 
 ### Security & Operations
 
+- [x] **PS20** Guest Gate & Auth Lockout -- Lock down the entire interface and backend endpoints to registered investigators, adding a mandatory Terms & Conditions checkbox agreement during login/signup and a beautiful cosmic /terms policy page detailing Langfuse & Turso data collection (ui-pro/src/components/AuthModal.tsx + ui-pro/src/app/terms/page.tsx + ui-pro/api/main.py)
 - [ ] **PS21** Remove Hardcoded JWT Secret -- Require env var for JWT signing key
 - [ ] **PS22** API Key Rotation -- Mechanism to rotate API keys without downtime
 - [ ] **PS23** Usage Quotas -- Per-user usage limits
@@ -197,4 +198,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-20 -- Quasar v3.3.1 (Added reasoning summary streaming for thinking models)*
+*Last updated: 2026-05-24 -- Quasar v3.3.2 (Added strict guest gate and terms agreement page)*
