@@ -1329,6 +1329,7 @@ async def list_models():
             "gpt-5.4-mini",             # GPT-5.4 Mini (default — adaptive reasoning, cost-effective)
             "gpt-4.1",                 # GPT-4.1
             "gpt-4o-mini",             # GPT-4o Mini
+            "deepseek-v4-pro",          # DeepSeek V4 Pro (thinking reasoning model)
     ]
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
