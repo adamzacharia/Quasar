@@ -1681,56 +1681,6 @@ async def chat_with_files(
         )
         mixed_document_previews.append(_extract_document_preview_text(filename, content_type, raw))
 
-    if image_contents:
-        import openai as _openai
-
-        if mixed_document_previews:
-            enriched_text += "".join(preview for preview in mixed_document_previews if preview)
-
-        client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        content_parts = []
-        if enriched_text:
-            content_parts.append({"type": "text", "text": enriched_text})
-        content_parts.extend(image_contents)
-
-        async def vision_stream():
-            try:
-                yield _sse_status("Analyzing image with vision model", "running")
-                loop = asyncio.get_event_loop()
-
-                def _call():
-                    params = {
-                        "model": selected_model,
-                        "messages": [{"role": "user", "content": content_parts}],
-                        "stream": True,
-                    }
-                    if selected_model.startswith(("o1", "o3", "gpt-5")) or "gpt-5" in selected_model:
-                        params["max_completion_tokens"] = 20000
-                    else:
-                        params["max_tokens"] = 20000
-                    return client.chat.completions.create(**params)
-
-                stream = await loop.run_in_executor(_executor, _call)
-                yield _sse_status("Analyzing image with vision model", "completed")
-
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content if chunk.choices else None
-                    if delta:
-                        data = json.dumps({"type": "token", "content": delta})
-                        yield f"data: {data}\n\n"
-
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                err = json.dumps({"type": "error", "content": str(e)})
-                yield f"data: {err}\n\n"
-                yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            vision_stream(),
-            media_type="text/event-stream",
-            headers=_stream_headers(),
-        )
-
     attachment_context = None
     if document_uploads:
         try:
@@ -1744,138 +1694,25 @@ async def chat_with_files(
         except ProviderFileError as exc:
             return _sse_error_response(str(exc))
 
+    if image_contents:
+        attachment_context = attachment_context or {
+            "provider": provider,
+            "attachments": [],
+            "messages": []
+        }
+        for img in image_contents:
+            attachment_context["attachments"].append({
+                "provider": provider,
+                "type": "image_url",
+                "image_url": img["image_url"]
+            })
+
     req = ChatRequest(
-        message=message.strip() or message,
+        message=enriched_text or message,
         conversation_id=conversation_id,
         model=selected_model,
     )
     return _stream_chat_response(req, authorization=auth_header, attachment_context=attachment_context)
-
-    import base64, io
-    logger.info(f"[UPLOAD] Received {len(files)} file(s), message={message[:80]!r}")
-
-    # Split files into images vs documents
-    image_contents = []   # OpenAI vision content dicts
-    enriched_text = message.strip()
-
-    for f in files:
-        content_type = f.content_type or ""
-        raw = await f.read()
-
-        if content_type.startswith("image/"):
-            # Build vision content block
-            b64 = base64.b64encode(raw).decode("utf-8")
-            image_contents.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{content_type};base64,{b64}", "detail": "auto"},
-            })
-
-        elif content_type == "application/pdf":
-            try:
-                import fitz  # PyMuPDF
-                doc = fitz.open(stream=raw, filetype="pdf")
-                text = "\n".join(page.get_text() for page in doc)
-                doc.close()
-                enriched_text += f"\n\n### Attached PDF: {f.filename}\n{text[:8000]}"
-            except ImportError:
-                enriched_text += f"\n\n[PDF: {f.filename} — install pymupdf to extract text]"
-            except Exception as e:
-                enriched_text += f"\n\n[PDF: {f.filename} — extraction failed: {e}]"
-
-        elif f.filename and (f.filename.endswith(".fits") or f.filename.endswith(".fit")):
-            try:
-                from services.fits_processing import FITSProcessingService
-                
-                # Extract header text
-                metadata = FITSProcessingService.extract_metadata(raw)
-                header_str = "\n".join([f"{k}: {v}" for k, v in metadata.items() if k != "error"])
-                err = metadata.get("error", "")
-                
-                if hdrs := header_str.strip():
-                    enriched_text += f"\n\n### Attached FITS: {f.filename}\n**Header Metadata:**\n```yaml\n{hdrs}\n```\n"
-                if err:
-                    enriched_text += f"\n[FITS Metadata Error: {err}]"
-                    
-                # Render visual preview
-                b64_img = FITSProcessingService.generate_preview(raw)
-                if b64_img:
-                    image_contents.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64_img}", "detail": "high"}
-                    })
-                    enriched_text += f"*(A 2D visual representation of this FITS file has been attached as an image for your analysis.)*\n"
-                else:
-                    enriched_text += f"*(Could not generate a 2D preview image for this FITS data.)*\n"
-            except Exception as e:
-                enriched_text += f"\n\n[FITS: {f.filename} — extraction failed: {e}]"
-
-        elif content_type in ("text/plain", "text/csv", "text/markdown", "application/json") or \
-             (f.filename and any(f.filename.endswith(ext) for ext in [".csv", ".txt", ".md", ".json"])):
-            try:
-                text = raw.decode("utf-8", errors="replace")[:8000]
-                enriched_text += f"\n\n### Attached file: {f.filename}\n```\n{text}\n```"
-            except Exception:
-                enriched_text += f"\n\n[Binary file: {f.filename} ({len(raw)/1024:.1f} KB)]"
-        else:
-            enriched_text += f"\n\n[Attached file: {f.filename} ({len(raw)/1024:.1f} KB)]"
-
-    # ── If there are images, use OpenAI vision directly (streaming) ─────────
-    if image_contents:
-        import openai as _openai
-        client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        # Build the multimodal content array
-        content_parts = []
-        if enriched_text:
-            content_parts.append({"type": "text", "text": enriched_text})
-        content_parts.extend(image_contents)
-
-        async def vision_stream():
-            def _vstatus(step: str, state: str = "running") -> str:
-                return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
-            try:
-                yield _vstatus("Analyzing image with vision model", "running")
-                # Run the blocking OpenAI call in a thread
-                loop = asyncio.get_event_loop()
-
-                def _call():
-                    params = {
-                        "model": model or "gpt-4o",
-                        "messages": [{"role": "user", "content": content_parts}],
-                        "stream": True,
-                    }
-                    target_model = model or "gpt-4o"
-                    if target_model.startswith(("o1", "o3", "gpt-5")) or "gpt-5" in target_model:
-                        params["max_completion_tokens"] = 20000
-                    else:
-                        params["max_tokens"] = 20000
-                    return client.chat.completions.create(**params)
-
-                stream = await loop.run_in_executor(_executor, _call)
-                yield _vstatus("Analyzing image with vision model", "completed")
-
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content if chunk.choices else None
-                    if delta:
-                        data = json.dumps({"type": "token", "content": delta})
-                        yield f"data: {data}\n\n"
-
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                err = json.dumps({"type": "error", "content": str(e)})
-                yield f"data: {err}\n\n"
-                yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            vision_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-        )
-
-    # ── No images — delegate to regular chat endpoint ────────────────────────
-    req = ChatRequest(message=enriched_text or message, conversation_id=conversation_id, model=model)
-    return _stream_chat_response(req, authorization=authorization)
-
 
 # ── Personalization Endpoints ────────────────────────────────────────────────
 

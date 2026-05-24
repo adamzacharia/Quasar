@@ -24,10 +24,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import requests
 
-try:
-    from openai import OpenAI  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    OpenAI = None
+from core.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -759,19 +756,15 @@ Return JSON with exactly these keys:
             },
         }
 
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": self._SYSTEM_PROMPT},
-                {"role": "user", "content": "Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload)},
-            ],
+            instructions=self._SYSTEM_PROMPT,
+            input="Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload),
             temperature=0.2,
-            response_format={"type": "json_object"},
+            text={"format": {"type": "json_object"}},
         )
 
-        return response.choices[0].message.content or ""
-
-
+        return response.output_text or ""
 
     def _parse_response(self, content: str) -> Dict[str, Any]:
         if not content:
@@ -799,12 +792,9 @@ Return JSON with exactly these keys:
         if self._client:
             return self._client
 
-        if OpenAI is None:
-            raise ADSQueryBuilderError("OpenAI SDK not installed")
-
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ADSQueryBuilderError("OPENAI_API_KEY not configured")
 
-        self._client = OpenAI(api_key=api_key)
+        self._client = LLMClient(model=self.model)
         return self._client

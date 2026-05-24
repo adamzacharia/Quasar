@@ -427,9 +427,9 @@ For tool_usage, evaluate whether the system used appropriate tools (archive quer
 
 def judge_response(question_data: dict, response: str, judge_model: str) -> dict:
     """Use an LLM to judge the response quality."""
-    import openai
+    from core.llm_client import LLMClient
 
-    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = LLMClient(model=judge_model)
 
     criteria_text = "\n".join(f"  {i}. {c}" for i, c in enumerate(question_data["criteria"]))
 
@@ -444,19 +444,17 @@ def judge_response(question_data: dict, response: str, judge_model: str) -> dict
 
 Please evaluate this response and return your JSON scoring."""
 
-    resp = client.chat.completions.create(
+    resp = client.responses.create(
         model=judge_model,
-        messages=[
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
+        instructions=JUDGE_SYSTEM_PROMPT,
+        input=user_prompt,
+        text={"format": {"type": "json_object"}},
         temperature=0.1,
     )
 
     try:
-        return json.loads(resp.choices[0].message.content)
-    except (json.JSONDecodeError, IndexError):
+        return json.loads(resp.output_text)
+    except (json.JSONDecodeError, AttributeError):
         return {
             "correctness": 0, "completeness": 0, "code_quality": None,
             "presentation": 0, "tool_usage": 0, "criteria_met": [],

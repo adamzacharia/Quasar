@@ -1,7 +1,7 @@
 # services/proposal_critic.py
 import os
 from typing import Dict, Any, Optional, Callable
-from openai import OpenAI
+from core.llm_client import LLMClient
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from core.prompts import (
     RED_TEAM_TAC_PROMPT,
@@ -21,11 +21,8 @@ class ProposalCriticService:
     
     def __init__(self, api_key: Optional[str] = None, ads_service: Optional[ADSService] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required for Proposal Critic.")
-        
-        self.client = OpenAI(api_key=self.api_key)
         self.model = "gpt-4o"
+        self.client = LLMClient(model=self.model) if self.api_key else None
         self.ads_client = ads_service or ADSService()
 
     def _run_fact_checker(self, proposal_text: str) -> str:
@@ -41,16 +38,14 @@ class ProposalCriticService:
         extraction_prompt = "Generate a single relevant NASA ADS search query (max 20 chars) to fact-check this proposal. Focus on the main astronomical object or method. Return ONLY the search query string, nothing else."
         
         try:
-            extraction_res = self.client.chat.completions.create(
+            extraction_res = self.client.responses.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Output only the requested string."},
-                    {"role": "user", "content": f"{extraction_prompt}\n\nProposal Snippet:\n{proposal_text[:2000]}"}
-                ],
+                instructions="You are a helpful assistant. Output only the requested string.",
+                input=f"{extraction_prompt}\n\nProposal Snippet:\n{proposal_text[:2000]}",
                 temperature=0.1,
-                max_tokens=30
+                max_output_tokens=30
             )
-            search_query = extraction_res.choices[0].message.content.strip().strip("'\"")
+            search_query = extraction_res.output_text.strip().strip("'\"")
             
             # Step 2: Search ADS
             literature_context = "No literature found."
@@ -58,11 +53,11 @@ class ProposalCriticService:
                 try:
                     ads_results = self.ads_client.search_papers(query=search_query, max_results=3)
                     if not ads_results.get("error"):
-                        papers = ads_results.get("papers", [])
-                        if papers:
-                            literature_context = "Recent relevant literature retrieved from NASA ADS:\n\n"
-                            for p in papers:
-                                literature_context += f"- {p.get('title', '')} by {p.get('author_str', '')} ({p.get('year', '')}): {p.get('abstract', '')}\n"
+                         papers = ads_results.get("papers", [])
+                         if papers:
+                             literature_context = "Recent relevant literature retrieved from NASA ADS:\n\n"
+                             for p in papers:
+                                 literature_context += f"- {p.get('title', '')} by {p.get('author_str', '')} ({p.get('year', '')}): {p.get('abstract', '')}\n"
                 except Exception as e:
                     literature_context = f"Error retrieving literature: {e}"
         except Exception:
@@ -74,17 +69,15 @@ class ProposalCriticService:
             literature_context=literature_context
         )
         
-        response = self.client.chat.completions.create(
+        response = self.client.responses.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": "You are the rigorous Fact Checker agent."},
-                {"role": "user", "content": prompt}
-            ],
+            instructions="You are the rigorous Fact Checker agent.",
+            input=prompt,
             temperature=0.2, # Low temperature for factual analysis
-            max_tokens=2000
+            max_output_tokens=2000
         )
         
-        return response.choices[0].message.content
+        return response.output_text
 
     def _run_rubric_grader(self, proposal_text: str, rag_service: RAGService) -> str:
         """
@@ -107,17 +100,15 @@ class ProposalCriticService:
             proposal_text=proposal_text
         )
         
-        response = self.client.chat.completions.create(
+        response = self.client.responses.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": "You are the strict Rubric Grader agent."},
-                {"role": "user", "content": prompt}
-            ],
+            instructions="You are the strict Rubric Grader agent.",
+            input=prompt,
             temperature=0.2,
-            max_tokens=2000
+            max_output_tokens=2000
         )
         
-        return response.choices[0].message.content
+        return response.output_text
 
     def _run_synthesizer(self, fact_check_report: str, rubric_report: str) -> str:
         """
@@ -129,17 +120,15 @@ class ProposalCriticService:
             rubric_report=rubric_report
         )
         
-        response = self.client.chat.completions.create(
+        response = self.client.responses.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": "You are the Synthesizer and Lead Chair of the TAC."},
-                {"role": "user", "content": prompt}
-            ],
+            instructions="You are the Synthesizer and Lead Chair of the TAC.",
+            input=prompt,
             temperature=0.4,
-            max_tokens=2500
+            max_output_tokens=2500
         )
         
-        return response.choices[0].message.content
+        return response.output_text
 
     def review_proposal(
         self, 

@@ -10,7 +10,7 @@ import tempfile
 import logging
 from typing import Optional, Dict, Any
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
-from openai import OpenAI
+from core.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +19,8 @@ class PDFProcessingService:
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            logger.warning("OpenAI API key not found. LLM-based extractions will fail.")
-        
-        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
         self.model = "gpt-4o-mini" # Fast, cheap model for extraction tasks
+        self.client = LLMClient(model=self.model) if self.api_key else None
         
     def download_pdf(self, url: str) -> Optional[str]:
         """Download a PDF from a URL to a temporary file and return the path."""
@@ -85,17 +82,15 @@ class PDFProcessingService:
         )
         
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Extract the methodology from this paper:\n\n{truncated_text}"}
-                ],
+                instructions=system_prompt,
+                input=f"Extract the methodology from this paper:\n\n{truncated_text}",
                 temperature=0.0,
-                max_tokens=4000
+                max_output_tokens=4000
             )
             
-            extracted_text = response.choices[0].message.content.strip()
+            extracted_text = response.output_text.strip()
             
             if extracted_text == "METHODOLOGY_NOT_FOUND":
                 return {"success": False, "error": "Could not identify a clear methodology section in the text."}
@@ -153,17 +148,15 @@ class PDFProcessingService:
                 "state that clearly rather than hallucinating."
             )
             
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Paper text:\n\n{truncated_text}\n\nQuestion: {query}"}
-                ],
+                instructions=system_prompt,
+                input=f"Paper text:\n\n{truncated_text}\n\nQuestion: {query}",
                 temperature=0.0,
-                max_tokens=2000
+                max_output_tokens=2000
             )
 
-            answer = response.choices[0].message.content.strip()
+            answer = response.output_text.strip()
             return {"success": True, "answer": answer}
 
         except Exception as e:
