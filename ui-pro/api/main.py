@@ -1704,7 +1704,7 @@ async def chat_with_files(
                         "messages": [{"role": "user", "content": content_parts}],
                         "stream": True,
                     }
-                    if selected_model.startswith(("o1", "o3")):
+                    if selected_model.startswith(("o1", "o3", "gpt-5")) or "gpt-5" in selected_model:
                         params["max_completion_tokens"] = 1024
                     else:
                         params["max_tokens"] = 1024
@@ -1845,7 +1845,7 @@ async def chat_with_files(
                         "stream": True,
                     }
                     target_model = model or "gpt-4o"
-                    if target_model.startswith(("o1", "o3")):
+                    if target_model.startswith(("o1", "o3", "gpt-5")) or "gpt-5" in target_model:
                         params["max_completion_tokens"] = 1024
                     else:
                         params["max_tokens"] = 1024
