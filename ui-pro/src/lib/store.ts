@@ -180,7 +180,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     streamingContent: "",
     selectedModel: "gpt-5.4-mini",
     availableModels: [
-        "gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini",
+        "gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro",
     ],
     sidebarOpen: true,
     thinkingSteps: [],

@@ -5358,8 +5358,8 @@ IMPORTANT RULES:
                 if _round == 0 and _is_archive_fetch:
                     request_kwargs["tool_choice"] = "required"
 
-                # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini)
-                _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini"}
+                # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini/deepseek-v4-pro)
+                _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini", "deepseek-v4-pro"}
                 if request_kwargs.get("model", "") in _no_temp:
                     request_kwargs.pop("temperature", None)
 
@@ -5370,6 +5370,7 @@ IMPORTANT RULES:
                     "o1", "o1-mini", "o1-pro",
                     "o3", "o3-mini", "o3-pro",
                     "o4-mini",
+                    "deepseek-v4-pro",
                 }
                 _current_model = request_kwargs.get("model", "")
                 _is_thinking_model = (

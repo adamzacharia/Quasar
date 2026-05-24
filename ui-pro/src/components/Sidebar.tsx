@@ -77,12 +77,16 @@ const MODEL_PRICING: Record<string, { in: number, out: number }> = {
     "gemini-2.5-pro": { in: 1.25, out: 5.00 },
     "gemini-1.5-pro": { in: 1.25, out: 5.00 },
     "gemini-1.5-flash": { in: 0.075, out: 0.30 },
+
+    // DeepSeek
+    "deepseek-v4-pro": { in: 0.14, out: 0.28 },
 };
 
 function getModelCost(model: string) {
     if (model.startsWith("local/")) return { in: 0, out: 0 };
     if (MODEL_PRICING[model]) return MODEL_PRICING[model];
     // Fallbacks
+    if (model.includes("deepseek")) return MODEL_PRICING["deepseek-v4-pro"];
     if (model.includes("gpt-4o-mini")) return MODEL_PRICING["gpt-4o-mini"];
     if (model.includes("gpt-5.4-mini")) return MODEL_PRICING["gpt-5.4-mini"];
     if (model.includes("gpt-5.4")) return MODEL_PRICING["gpt-5.4"];
@@ -115,6 +119,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
     }, []);
 
     const openaiModels = availableModels.filter(m => m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4"));
+    const deepseekModels = availableModels.filter(m => m.toLowerCase().includes("deepseek"));
     const geminiModels = availableModels.filter(m => m.startsWith("gemini-") || m.startsWith("gemma-"));
     const claudeModels = availableModels.filter(m => m.startsWith("claude-"));
     const localModels = availableModels.filter(m => m.startsWith("local/"));
@@ -166,9 +171,11 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             {open && (
                 <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-800 border border-slate-600/50 rounded-xl shadow-2xl shadow-black/40 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
                     {renderGroup("OpenAI", openaiModels)}
+                    {deepseekModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
+                    {renderGroup("DeepSeek", deepseekModels)}
                     {claudeModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Anthropic Claude", claudeModels)}
-                    {geminiModels.length > 0 && (openaiModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
+                    {geminiModels.length > 0 && (openaiModels.length > 0 || deepseekModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Google Gemini", geminiModels)}
                     {localModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Local LLM", localModels)}

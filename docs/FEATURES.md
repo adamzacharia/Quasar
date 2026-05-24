@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 12    | 9     | 1           | 2       | 75%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 28    | 10    | 0           | 18      | 36%    |
-| **Total**              |**94** |**43** | **2**       | **49**  |**46%** |
+| Polish & Scale         | 28    | 11    | 0           | 17      | 39%    |
+| **Total**              |**95** |**44** | **2**       | **49**  |**46%** |
 
 ---
 
@@ -174,6 +174,7 @@ Without them, even great features feel broken.
 - [x] **PS27** Response Feedback Collection -- Like/dislike buttons on assistant messages, persisted to analytics DB for RLHF/improvement (services/analytics_service.py + ui-pro/src/components/ChatMessage.tsx)
 - [x] **PS28** LLM Cost Analytics & Tracing -- Helicone OpenAI proxy for automatic cost dashboards; Langfuse generation logging per LLM call with token usage and latency (core/llm_client.py + core/langfuse_integration.py)
 - [x] **PS29** OpenAI Responses API Unification -- Purged all legacy chat completions and unified the entire codebase (vision uploads, text reasoning, literature searching, proposal critiques) under the modern OpenAI Responses API via LLMClient (ui-pro/api/main.py)
+- [x] **PS30** DeepSeek Thinking Mode Integration -- Added full support for the new 'deepseek-v4-pro' model in the backend and frontend; maps the native real-time 'reasoning_content' chain-of-thought tokens directly to SSE events to display raw reasoning steps in the UI Thought widget; configures reasoning effort controls and thinking parameter shimming (core/llm_client.py + ui-pro/src/components/Sidebar.tsx)
 
 ---
 
@@ -199,4 +200,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-25 -- Quasar v3.3.3 (Purged all legacy completions and unified under OpenAI Responses API)*
+*Last updated: 2026-05-25 -- Quasar v3.3.4 (Integrated DeepSeek v4 Pro thinking mode)*
