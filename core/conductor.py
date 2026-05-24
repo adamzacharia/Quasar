@@ -455,19 +455,32 @@ class Conductor:
         lf_trace = None
         if lf_client:
             try:
-                lf_trace = lf_client.trace(
-                    name=f"conductor: {query[:80]}",
-                    user_id=user_id or "anonymous",
-                    session_id=session_id,
-                    metadata={
-                        "complexity_tier": complexity_tier or "unknown",
-                        "subtask_count": len(subtasks),
-                        "task_summary": task_summary,
-                    },
-                    tags=["conductor", complexity_tier or "unknown"],
-                )
+                from core.llm_client import get_langfuse_parent
+                parent = get_langfuse_parent()
+                if parent:
+                    # Create a child span instead of a new root trace!
+                    lf_trace = parent.span(
+                        name=f"conductor: {query[:80]}",
+                        metadata={
+                            "complexity_tier": complexity_tier or "unknown",
+                            "subtask_count": len(subtasks),
+                            "task_summary": task_summary,
+                        },
+                    )
+                else:
+                    lf_trace = lf_client.trace(
+                        name=f"conductor: {query[:80]}",
+                        user_id=user_id or "anonymous",
+                        session_id=session_id,
+                        metadata={
+                            "complexity_tier": complexity_tier or "unknown",
+                            "subtask_count": len(subtasks),
+                            "task_summary": task_summary,
+                        },
+                        tags=["conductor", complexity_tier or "unknown"],
+                    )
             except Exception as e:
-                logger.debug("[Langfuse] trace creation failed: %s", e)
+                logger.debug("[Langfuse] trace/span creation failed: %s", e)
         # Store on self so _execute_dag_with_events can create child spans
         self._lf_trace = lf_trace
 
@@ -584,11 +597,18 @@ class Conductor:
         # ── Langfuse: close the orchestration trace ──────────────────────
         if lf_trace:
             try:
-                lf_trace.update(metadata={
-                    "status": "completed",
-                    "subtask_count": len(subtasks),
-                    "result_length": len(final_answer) if final_answer else 0,
-                })
+                if hasattr(lf_trace, "end"):
+                    lf_trace.end(metadata={
+                        "status": "completed",
+                        "subtask_count": len(subtasks),
+                        "result_length": len(final_answer) if final_answer else 0,
+                    })
+                else:
+                    lf_trace.update(metadata={
+                        "status": "completed",
+                        "subtask_count": len(subtasks),
+                        "result_length": len(final_answer) if final_answer else 0,
+                    })
             except Exception:
                 pass
 

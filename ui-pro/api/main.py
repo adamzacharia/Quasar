@@ -785,6 +785,26 @@ def _stream_chat_response(
     attachment_context = attachment_context or {}
     active_attachments = attachment_context.get("attachments") or []
 
+    # ── Langfuse parent trace creation ──────────────────────────────────────────
+    from core.langfuse_integration import get_langfuse
+    lf_client = get_langfuse()
+    lf_trace = None
+    if lf_client:
+        try:
+            lf_trace = lf_client.trace(
+                name=f"chat: {request.message[:80]}",
+                user_id=current_user_id or "anonymous",
+                session_id=conv_id or request.conversation_id or "anonymous_session",
+                metadata={
+                    "model": requested_model,
+                    "client_ip": client_ip,
+                    "attachment_count": len(active_attachments),
+                },
+                tags=["chat"],
+            )
+        except Exception as lf_err:
+            logger.warning(f"[Langfuse] Failed to create parent trace: {lf_err}")
+
     async def generate():
         if agent is None:
             err = get_agent_error() or "Unknown initialization error"
@@ -872,41 +892,49 @@ def _stream_chat_response(
                     asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
 
             def _run_agent():
+                if lf_trace:
+                    from core.llm_client import set_langfuse_parent
+                    set_langfuse_parent(lf_trace)
                 try:
-                    effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
-
-                    def _on_status(step: str, state: str):
-                        asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
-
                     try:
-                        res = agent.stream_response_api(
-                            effective_request.message,
-                            message_placeholder=None,
-                            user_id=effective_user_id,
-                            on_token=on_token,
-                            on_status=_on_status,
-                            attachments=active_attachments,
-                            raw_query=request.message,
-                            conversation_id=conv_id,
-                            plan_feedback_queue=_pfq,
-                        )
-                    finally:
-                        # Clean up the plan feedback queue
-                        with _plan_feedback_lock:
-                            _plan_feedback_queues.pop(_pfq_key[0], None)
+                        effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
 
-                    # Snapshot thread-local results BEFORE leaving this thread.
-                    # The async generator runs on the event-loop thread where
-                    # these thread-local values would be invisible.
-                    done_payload = {
-                        "text": res,
-                        "all_results": list(getattr(agent, '_accumulated_run_results', []) or []),
-                        "last_result": agent.last_run_result,
-                    }
-                    asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
-                except Exception as e:
-                    print(f"Agent error: {e}")
-                    asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+                        def _on_status(step: str, state: str):
+                            asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
+
+                        try:
+                            res = agent.stream_response_api(
+                                effective_request.message,
+                                message_placeholder=None,
+                                user_id=effective_user_id,
+                                on_token=on_token,
+                                on_status=_on_status,
+                                attachments=active_attachments,
+                                raw_query=request.message,
+                                conversation_id=conv_id,
+                                plan_feedback_queue=_pfq,
+                            )
+                        finally:
+                            # Clean up the plan feedback queue
+                            with _plan_feedback_lock:
+                                _plan_feedback_queues.pop(_pfq_key[0], None)
+
+                        # Snapshot thread-local results BEFORE leaving this thread.
+                        # The async generator runs on the event-loop thread where
+                        # these thread-local values would be invisible.
+                        done_payload = {
+                            "text": res,
+                            "all_results": list(getattr(agent, '_accumulated_run_results', []) or []),
+                            "last_result": agent.last_run_result,
+                        }
+                        asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
+                    except Exception as e:
+                        print(f"Agent error: {e}")
+                        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+                finally:
+                    if lf_trace:
+                        from core.llm_client import set_langfuse_parent
+                        set_langfuse_parent(None)
 
             loop.run_in_executor(_executor, _run_agent)
 
@@ -1218,6 +1246,16 @@ def _stream_chat_response(
             yield f"data: {error_data}\n\n"
             yield "data: [DONE]\n\n"
         finally:
+            if lf_trace:
+                try:
+                    lf_trace.update(
+                        metadata={
+                            "response_length": len(response_text) if response_text else 0,
+                            "response_preview": response_text[:200] if response_text else "",
+                        }
+                    )
+                except Exception:
+                    pass
             # Free memory between requests — critical on 2GB instances
             import gc
             gc.collect()
@@ -2032,6 +2070,27 @@ async def analytics_hit(req: Request):
         _executor,
         lambda: analytics_service.log_page_view(ip_address=ip, user_agent=ua, country=country),
     )
+
+    # ── Langfuse: log page hit as a custom event ──────────────────
+    from core.langfuse_integration import get_langfuse
+    lf_client = get_langfuse()
+    if lf_client:
+        try:
+            await loop.run_in_executor(
+                _executor,
+                lambda: lf_client.event(
+                    name="page_view",
+                    user_id="anonymous",
+                    metadata={
+                        "ip_address": ip,
+                        "user_agent": ua,
+                        "country": country,
+                    }
+                )
+            )
+        except Exception as lf_err:
+            print(f"[Langfuse] Failed to log page hit: {lf_err}", flush=True)
+
     return {"hits": total}
 
 

@@ -230,25 +230,70 @@ class ResponsesShim:
             else:
                 raise ValueError(f"Unknown provider for model: {model}")
 
-            # ── Langfuse: end generation with output/usage (non-streaming only) ──
-            if lf_gen and not stream:
-                elapsed_ms = (_time.perf_counter() - t0) * 1000
-                try:
-                    output_text = getattr(result, 'output_text', '') or ''
-                    # Try to extract usage from OpenAI native responses
-                    usage = {}
-                    if hasattr(result, 'usage') and result.usage:
-                        usage = {
-                            "input": getattr(result.usage, 'input_tokens', 0),
-                            "output": getattr(result.usage, 'output_tokens', 0),
-                        }
-                    lf_gen.end(
-                        output=output_text[:2000],
-                        usage=usage if usage else None,
-                        metadata={"latency_ms": round(elapsed_ms)},
-                    )
-                except Exception:
-                    pass
+            # ── Langfuse: end generation with output/usage ──
+            if lf_gen:
+                if not stream:
+                    elapsed_ms = (_time.perf_counter() - t0) * 1000
+                    try:
+                        output_text = getattr(result, 'output_text', '') or ''
+                        # Try to extract usage from OpenAI native responses
+                        usage = {}
+                        if hasattr(result, 'usage') and result.usage:
+                            usage = {
+                                "input": getattr(result.usage, 'input_tokens', 0),
+                                "output": getattr(result.usage, 'output_tokens', 0),
+                            }
+                        lf_gen.end(
+                            output=output_text[:2000],
+                            usage=usage if usage else None,
+                            metadata={"latency_ms": round(elapsed_ms)},
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # For streaming, wrap the generator/iterator to end the Langfuse generation when it completes!
+                    def wrap_generator(gen, gen_span, start_time):
+                        accumulated_text = []
+                        usage = None
+                        try:
+                            for event in gen:
+                                yield event
+                                try:
+                                    event_type = getattr(event, 'type', '')
+                                    delta = getattr(event, 'delta', '') or ''
+                                    if delta and (
+                                        "delta" in event_type 
+                                        or event_type in ("response.output_text.delta", "response.reasoning_summary_text.delta", "text_delta")
+                                    ):
+                                        accumulated_text.append(delta)
+                                    elif event_type == "response.done":
+                                        resp = getattr(event, 'response', None)
+                                        if resp and hasattr(resp, 'usage') and resp.usage:
+                                            usage = {
+                                                "input": getattr(resp.usage, 'input_tokens', 0),
+                                                "output": getattr(resp.usage, 'output_tokens', 0),
+                                            }
+                                except Exception:
+                                    pass
+                        except Exception as e_stream:
+                            try:
+                                gen_span.update(metadata={"error": str(e_stream)[:500]})
+                            except Exception:
+                                pass
+                            raise e_stream
+                        finally:
+                            elapsed_ms = (_time.perf_counter() - start_time) * 1000
+                            try:
+                                full_output = "".join(accumulated_text)
+                                gen_span.end(
+                                    output=full_output[:2000],
+                                    usage=usage,
+                                    metadata={"latency_ms": round(elapsed_ms), "streamed": True},
+                                )
+                            except Exception:
+                                pass
+
+                    result = wrap_generator(result, lf_gen, t0)
 
             return result
 
