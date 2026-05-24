@@ -2203,6 +2203,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         Returns source URLs + related images for ChatGPT-style inline display.
         Falls back to BrowserService if Tavily key is unavailable.
         """
+        # ── Langfuse: create a child span for this tool call ──
+        from core.llm_client import get_langfuse_parent
+        parent = get_langfuse_parent()
+        lf_span = None
+        if parent:
+            try:
+                lf_span = parent.span(
+                    name="tool: tavily_web_search",
+                    input=query,
+                    metadata={"max_results": max_results, "search_depth": search_depth}
+                )
+            except Exception:
+                pass
+
         # Expand astronomy acronyms — only needed for dumb keyword search
         # engines (BrowserService fallback). Tavily is AI-powered and handles
         # acronyms natively; expanding pollutes the query and returns generic
@@ -2211,6 +2225,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         if search_query != query:
             print(f"[WEB SEARCH] Expanded query (for fallback): {query!r} → {search_query!r}")
 
+        ret_val = None
         tavily_key = os.getenv("TAVILY_API_KEY", "")
         if tavily_key:
             try:
@@ -2247,7 +2262,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     elif isinstance(img, str):
                         images.append({"url": img, "description": ""})
 
-                return {
+                ret_val = {
                     "success":      True,
                     "provider":     "Tavily",
                     "query":        query,
@@ -2260,11 +2275,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 print(f"[WARN] Tavily search failed: {e}. Falling back to BrowserService.")
 
         # -- Fallback: BrowserService --
-        try:
-            fallback = self.browser_service.web_search(query=search_query)
-            return {"success": True, "provider": "BrowserService (fallback)", "results": fallback, "images": []}
-        except Exception as e2:
-            return {"success": False, "error": str(e2)}
+        if not ret_val:
+            try:
+                fallback = self.browser_service.web_search(query=search_query)
+                ret_val = {"success": True, "provider": "BrowserService (fallback)", "results": fallback, "images": []}
+            except Exception:
+                ret_val = {"success": False, "error": "Search failed"}
+
+        # ── Langfuse: end the span with the results ──
+        if lf_span:
+            try:
+                lf_span.end(output=ret_val)
+            except Exception:
+                pass
+
+        return ret_val
 
     @log_tool
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
