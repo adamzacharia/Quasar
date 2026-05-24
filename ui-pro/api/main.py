@@ -136,6 +136,9 @@ import threading as _threading
 _plan_feedback_queues: Dict[str, stdlib_queue.Queue] = {}
 _plan_feedback_lock = _threading.Lock()
 
+# Map conversation_id -> latest_trace_id for score ingestion
+_latest_traces: Dict[str, str] = {}
+
 # ── Catch-all exception handler — ensures a proper JSON 500 with CORS headers ──
 from starlette.responses import JSONResponse
 
@@ -802,6 +805,9 @@ def _stream_chat_response(
                 },
                 tags=["chat"],
             )
+            # Store the latest trace_id for this conversation
+            if conv_id or request.conversation_id:
+                _latest_traces[conv_id or request.conversation_id] = lf_trace.id
         except Exception as lf_err:
             logger.warning(f"[Langfuse] Failed to create parent trace: {lf_err}")
 
@@ -2120,6 +2126,36 @@ async def submit_feedback(req: Request, authorization: Optional[str] = Header(No
             response_preview=body.get("response_preview", ""),
         ),
     )
+
+    # ── Langfuse: ingest user feedback score in real-time ──────────
+    from core.langfuse_integration import get_langfuse
+    lf_client = get_langfuse()
+    if lf_client:
+        try:
+            conv_id = body.get("conversation_id", "")
+            trace_id = _latest_traces.get(conv_id) if conv_id else None
+            
+            # Score target: if trace_id is known, attach directly to the trace, else attach to session
+            score_kwargs = {
+                "name": "user_feedback",
+                "value": 1.0 if feedback == "like" else 0.0,
+                "data_type": "BOOLEAN",
+                "comment": f"User voted {feedback} on message {message_id}",
+            }
+            if trace_id:
+                score_kwargs["trace_id"] = trace_id
+            elif conv_id:
+                score_kwargs["session_id"] = conv_id
+
+            if "trace_id" in score_kwargs or "session_id" in score_kwargs:
+                await loop.run_in_executor(
+                    _executor,
+                    lambda: lf_client.create_score(**score_kwargs)
+                )
+                print(f"[Langfuse] Ingested user feedback score ({feedback}) for trace {trace_id or conv_id}", flush=True)
+        except Exception as lf_err:
+            print(f"[Langfuse] Failed to ingest feedback score: {lf_err}", flush=True)
+
     return {"success": True, "feedback": feedback}
 
 
