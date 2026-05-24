@@ -98,6 +98,7 @@ def log_tool(fn):
       - Entry log  (DEBUG): function name + kwargs
       - Exit log   (SUCCESS): execution time
       - Error log  (ERROR): full exception with Rollbar capture
+      - Langfuse Span logging: creates a nested span under the active parent trace.
 
     Usage:
         @log_tool
@@ -110,6 +111,23 @@ def log_tool(fn):
         kw_str = ", ".join(f"{k}={repr(v)[:60]}" for k, v in kwargs.items())
         logger.debug(f"[TOOL →] {fn.__name__}({kw_str})")
         t0 = time.perf_counter()
+
+        # ── Langfuse: create a child span for the tool execution ──
+        from core.llm_client import get_langfuse_parent
+        parent = get_langfuse_parent()
+        lf_span = None
+        if parent:
+            try:
+                # Clean up tool name for display (e.g. _search_by_target -> search_by_target)
+                display_name = fn.__name__.lstrip('_')
+                lf_span = parent.span(
+                    name=f"tool: {display_name}",
+                    input={k: str(v)[:500] for k, v in kwargs.items()},
+                    metadata={"tool_function": fn.__name__}
+                )
+            except Exception:
+                pass
+
         try:
             result = fn(*args, **kwargs)
             elapsed = time.perf_counter() - t0
@@ -119,12 +137,31 @@ def log_tool(fn):
                     f"[TOOL ✗] {fn.__name__} returned error in {elapsed:.2f}s "
                     f"— {result.get('error', '?')}"
                 )
+                if lf_span:
+                    try:
+                        lf_span.end(output={"success": False, "error": result.get('error')})
+                    except Exception:
+                        pass
             else:
                 logger.success(f"[TOOL ✓] {fn.__name__} completed in {elapsed:.2f}s")
+                if lf_span:
+                    try:
+                        # Safely serialize output snippet to avoid giant payloads
+                        from core.langfuse_integration import _safe_serialize
+                        lf_span.end(output=_safe_serialize(result, max_len=2000))
+                    except Exception:
+                        pass
             return result
         except Exception as exc:
             elapsed = time.perf_counter() - t0
             logger.exception(f"[TOOL ✗] {fn.__name__} raised after {elapsed:.2f}s: {exc}")
+            
+            if lf_span:
+                try:
+                    lf_span.end(output={"success": False, "error": str(exc)})
+                except Exception:
+                    pass
+
             # Report to Rollbar with tool name as extra context
             try:
                 import rollbar
