@@ -7,11 +7,12 @@ import { Loader2, Mail, Lock, User as UserIcon, X, Chrome } from "lucide-react";
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export function AuthModal() {
-    const { isAuthModalOpen, closeAuthModal, setAuth } = useAuthStore();
+    const { isAuthModalOpen, closeAuthModal, setAuth, isAuthenticated } = useAuthStore();
     const [isLogin, setIsLogin] = useState(true);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [showEmailForm, setShowEmailForm] = useState(false);
+    const [isAgreed, setIsAgreed] = useState(false);
 
     // Form states
     const [email, setEmail] = useState("");
@@ -114,18 +115,20 @@ export function AuthModal() {
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-in fade-in duration-300">
             {/* Click outside to close */}
-            <div className="absolute inset-0" onClick={closeAuthModal} />
+            <div className="absolute inset-0" onClick={isAuthenticated ? closeAuthModal : undefined} />
 
             {/* Modal Content */}
             <div className="relative w-full max-w-[400px] bg-[#1c1c1c] border border-slate-800 rounded-3xl shadow-2xl p-8 animate-in zoom-in-95 duration-300">
-                <button
-                    onClick={closeAuthModal}
-                    className="absolute top-4 right-4 text-slate-500 hover:text-white transition-colors"
-                >
-                    <X className="w-5 h-5" />
-                </button>
+                {isAuthenticated && (
+                    <button
+                        onClick={closeAuthModal}
+                        className="absolute top-4 right-4 text-slate-500 hover:text-white transition-colors"
+                    >
+                        <X className="w-5 h-5" />
+                    </button>
+                )}
 
-                <div className="text-center mb-8">
+                <div className="text-center mb-6">
                     <h2 className="text-2xl text-white font-[400] tracking-tight mb-2 font-serif">
                         Sign in to QUASAR
                     </h2>
@@ -134,10 +137,79 @@ export function AuthModal() {
                     </p>
                 </div>
 
+                {/* Terms and Conditions Checkbox */}
+                <div className="bg-[#242424]/40 border border-slate-800/80 rounded-2xl p-4 mb-5 transition-all duration-300 hover:border-slate-700/60 select-none">
+                    <label className="flex items-start gap-3 cursor-pointer group text-left">
+                        <div className="relative flex items-center mt-0.5 shrink-0">
+                            <input
+                                type="checkbox"
+                                checked={isAgreed}
+                                onChange={(e) => {
+                                    setIsAgreed(e.target.checked);
+                                    if (e.target.checked) setError(null);
+                                }}
+                                className="sr-only peer"
+                            />
+                            <div className="w-5 h-5 border border-slate-700 peer-checked:border-white peer-checked:bg-white rounded-md flex items-center justify-center transition-all duration-200">
+                                <svg
+                                    className="w-3.5 h-3.5 text-black opacity-0 peer-checked:opacity-100 transition-opacity duration-200"
+                                    fill="none"
+                                    viewBox="0 0 24 24"
+                                    stroke="currentColor"
+                                    strokeWidth="4"
+                                >
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                </svg>
+                            </div>
+                        </div>
+                        <span className="text-[12px] text-slate-400 leading-normal group-hover:text-slate-300 transition-colors">
+                            I accept the{" "}
+                            <a
+                                href="/terms"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-slate-200 underline font-medium hover:text-white transition-colors"
+                            >
+                                Terms & Conditions
+                            </a>{" "}
+                            and{" "}
+                            <a
+                                href="/terms"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-slate-200 underline font-medium hover:text-white transition-colors"
+                            >
+                                Privacy Policy
+                            </a>{" "}
+                            detailing how my astronomical queries, telemetry, and uploaded FITS data are securely processed.
+                        </span>
+                    </label>
+                </div>
+
                 <div className="space-y-4">
+                    {error && (
+                        <div className="bg-red-500/10 border border-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg text-center animate-in fade-in duration-200">
+                            {error}
+                        </div>
+                    )}
+
                     {/* Google Button Container */}
-                    <div className="flex justify-center w-full min-h-[44px]">
-                        <div id="google-signin-button" className="w-full max-w-[320px] flex justify-center [&>div]:w-full" />
+                    <div className="relative">
+                        <div className="flex justify-center w-full min-h-[44px]">
+                            <div id="google-signin-button" className="w-full max-w-[320px] flex justify-center [&>div]:w-full" />
+                        </div>
+                        {!isAgreed && (
+                            <div
+                                className="absolute inset-0 z-10 cursor-not-allowed bg-transparent"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    setError("Please accept the Terms & Conditions and Privacy Policy to continue.");
+                                }}
+                                title="Please accept the Terms & Conditions to continue"
+                            />
+                        )}
                     </div>
 
                     {!showEmailForm ? (
@@ -149,10 +221,6 @@ export function AuthModal() {
                                 <Mail className="w-4 h-4" />
                                 Continue with Email
                             </button>
-
-                            <p className="text-center text-[11px] text-slate-500 mt-6 px-4">
-                                By continuing, you agree to our Terms of Service and Privacy Policy.
-                            </p>
                         </>
                     ) : (
                         <div className="animate-in fade-in slide-in-from-top-2 duration-300">
@@ -172,12 +240,6 @@ export function AuthModal() {
                             </div>
 
                             <form onSubmit={handleSubmit} className="space-y-4">
-                                {error && (
-                                    <div className="bg-red-500/10 border border-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg text-center">
-                                        {error}
-                                    </div>
-                                )}
-
                                 {!isLogin && (
                                     <div className="relative">
                                         <UserIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
@@ -218,8 +280,8 @@ export function AuthModal() {
 
                                 <button
                                     type="submit"
-                                    disabled={isLoading}
-                                    className="w-full bg-white hover:bg-slate-200 text-black font-semibold text-sm py-3 px-4 rounded-xl transition-all disabled:opacity-70 flex items-center justify-center mt-2 group"
+                                    disabled={isLoading || !isAgreed}
+                                    className="w-full bg-white hover:bg-slate-200 text-black font-semibold text-sm py-3 px-4 rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center mt-2 group"
                                 >
                                     {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : (isLogin ? "Sign In" : "Create Account")}
                                 </button>
