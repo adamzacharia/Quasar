@@ -986,7 +986,7 @@ class ResponsesShim:
             call_kwargs["response_format"] = {"type": "json_object"}
 
         # highest thinking settings as requested
-        call_kwargs["reasoning_effort"] = "high"
+        call_kwargs["reasoning_effort"] = "max"
         call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
@@ -1015,7 +1015,7 @@ class ResponsesShim:
             call_kwargs["tools"] = openai_tools
 
         # highest thinking settings as requested
-        call_kwargs["reasoning_effort"] = "high"
+        call_kwargs["reasoning_effort"] = "max"
         call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
 
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
