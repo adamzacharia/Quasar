@@ -80,12 +80,14 @@ const MODEL_PRICING: Record<string, { in: number, out: number }> = {
 
     // DeepSeek
     "deepseek-v4-pro": { in: 0.14, out: 0.28 },
+    "deepseek-v4-flash": { in: 0.07, out: 0.14 },
 };
 
 function getModelCost(model: string) {
     if (model.startsWith("local/")) return { in: 0, out: 0 };
     if (MODEL_PRICING[model]) return MODEL_PRICING[model];
     // Fallbacks
+    if (model.includes("deepseek-v4-flash")) return MODEL_PRICING["deepseek-v4-flash"];
     if (model.includes("deepseek")) return MODEL_PRICING["deepseek-v4-pro"];
     if (model.includes("gpt-4o-mini")) return MODEL_PRICING["gpt-4o-mini"];
     if (model.includes("gpt-5.4-mini")) return MODEL_PRICING["gpt-5.4-mini"];

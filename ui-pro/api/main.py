@@ -1330,6 +1330,7 @@ async def list_models():
             "gpt-4.1",                 # GPT-4.1
             "gpt-4o-mini",             # GPT-4o Mini
             "deepseek-v4-pro",          # DeepSeek V4 Pro (thinking reasoning model)
+            "deepseek-v4-flash",        # DeepSeek V4 Flash (fast reasoning model)
     ]
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
