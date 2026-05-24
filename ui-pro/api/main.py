@@ -1699,12 +1699,16 @@ async def chat_with_files(
                 loop = asyncio.get_event_loop()
 
                 def _call():
-                    return client.chat.completions.create(
-                        model=selected_model,
-                        messages=[{"role": "user", "content": content_parts}],
-                        stream=True,
-                        max_tokens=1024,
-                    )
+                    params = {
+                        "model": selected_model,
+                        "messages": [{"role": "user", "content": content_parts}],
+                        "stream": True,
+                    }
+                    if selected_model.startswith(("o1", "o3")):
+                        params["max_completion_tokens"] = 1024
+                    else:
+                        params["max_tokens"] = 1024
+                    return client.chat.completions.create(**params)
 
                 stream = await loop.run_in_executor(_executor, _call)
                 yield _sse_status("Analyzing image with vision model", "completed")
@@ -1835,12 +1839,17 @@ async def chat_with_files(
                 loop = asyncio.get_event_loop()
 
                 def _call():
-                    return client.chat.completions.create(
-                        model=model or "gpt-4o",
-                        messages=[{"role": "user", "content": content_parts}],
-                        stream=True,
-                        max_tokens=1024,
-                    )
+                    params = {
+                        "model": model or "gpt-4o",
+                        "messages": [{"role": "user", "content": content_parts}],
+                        "stream": True,
+                    }
+                    target_model = model or "gpt-4o"
+                    if target_model.startswith(("o1", "o3")):
+                        params["max_completion_tokens"] = 1024
+                    else:
+                        params["max_tokens"] = 1024
+                    return client.chat.completions.create(**params)
 
                 stream = await loop.run_in_executor(_executor, _call)
                 yield _vstatus("Analyzing image with vision model", "completed")
