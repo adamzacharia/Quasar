@@ -916,8 +916,6 @@ class ResponsesShim:
         """Convert Responses API flat tool format to Chat Completions nested format."""
         cc_tools = []
         for t in tools:
-            if t.get("type") == "mcp":
-                continue  # Skip MCP tools for non-OpenAI providers
             cc_tools.append({
                 "type": "function",
                 "function": {
