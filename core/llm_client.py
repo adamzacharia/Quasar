@@ -1066,8 +1066,8 @@ class ResponsesShim:
                         fc.arguments += tc.function.arguments
                         yield StreamEvent(
                             type="response.function_call_arguments.delta",
-                            call_id=fc.call_id,
                             delta=tc.function.arguments,
+                            item=fc,
                         )
 
         if not reasoning_done_emitted:
