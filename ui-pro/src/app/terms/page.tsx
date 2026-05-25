@@ -99,6 +99,9 @@ export default function TermsPage() {
               <p>
                 <strong>No Guest Access:</strong> To keep our services running fast and prevent abuse, guest access is disabled. You will need to log in or create an account to access Quasar.
               </p>
+              <p>
+                <strong>Age Requirements &amp; Protection of Minors:</strong> You must be at least 13 years of age to use the Service. We do not knowingly collect, store, or process personal data from children under the age of 13. If we become aware that an account belongs to an individual under 13, we will immediately terminate the account and permanently purge all associated data from our systems.
+              </p>
             </div>
           </section>
 

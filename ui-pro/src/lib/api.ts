@@ -10,6 +10,7 @@ export interface ChatRequest {
 
 export interface StreamCallbacks {
     onToken: (token: string) => void;
+    onThought?: (thought: string) => void;
     onToolCall?: (toolName: string, input: string) => void;
     onData?: (data: Record<string, unknown>) => void;
     onPapers?: (papers: Record<string, unknown>[]) => void;
@@ -103,6 +104,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                         if (parsed.type === "token") {
                             fullText += parsed.content;
                             callbacks.onToken(parsed.content);
+                        } else if (parsed.type === "thought" && callbacks.onThought) {
+                            callbacks.onThought(parsed.content);
                         } else if (parsed.type === "status" && callbacks.onStatus) {
                             callbacks.onStatus(parsed.step, parsed.state);
                         } else if (parsed.type === "tool_call") {

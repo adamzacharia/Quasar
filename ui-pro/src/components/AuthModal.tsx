@@ -182,8 +182,8 @@ export function AuthModal() {
                                 className="text-slate-200 underline font-medium hover:text-white transition-colors"
                             >
                                 Privacy Policy
-                            </a>{" "}
-                            detailing how my astronomical queries, telemetry, and uploaded FITS data are securely processed.
+                            </a>{", "}
+                            and certify that I am at least 13 years of age.
                         </span>
                     </label>
                 </div>

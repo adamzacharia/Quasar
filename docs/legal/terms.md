@@ -19,6 +19,12 @@ To keep our platform secure, fast, and free from abuse, guest or anonymous acces
 * **Information Accuracy:** You agree to provide accurate, current, and complete information during registration.
 * **Security Responsibility:** You are solely responsible for maintaining the confidentiality of your session tokens, passwords, and account credentials. Any activities that occur under your authenticated account are deemed your responsibility. You must notify us immediately at `security@quasarassistant.com` of any unauthorized use of your account.
 
+### 1.3 Age Restrictions & COPPA Compliance
+The Service is intended solely for users who are thirteen (13) years of age or older. By registering an account or using the Platform, you represent, warrant, and certify that you are at least 13 years of age. 
+We do not knowingly collect, store, or solicit personal information from children under the age of 13. In accordance with the Children's Online Privacy Protection Act (COPPA) and global minor data protection regulations:
+* **Detection & Wiping:** If we detect, learn, or receive a credible notification that we have inadvertently collected personal information from a child under the age of 13, we will immediately and without notice terminate the associated user account and take all necessary measures to permanently purge such information from our databases, logs, and server cache systems.
+* **Inquiries:** If you have reason to believe that we might have any information from or about a child under 13, please contact our Legal Department immediately at `legal@quasarassistant.com`.
+
 ---
 
 ## 2. Platform Usage & License Grant

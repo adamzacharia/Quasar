@@ -36,6 +36,7 @@ interface ChatStore {
     setActiveConversation: (id: string | null) => void;
     addMessage: (message: Message) => void;
     updateLastAssistantMessage: (content: string) => void;
+    updateLastAssistantThinking: (thinking: string) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -82,6 +83,9 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
         base.thinkingSteps = (meta.thinkingSteps as { step: string; state: string }[]).map(
             (s) => ({ text: s.step, status: s.state as "running" | "completed" })
         );
+    }
+    if (meta.thinking) {
+        base.thinking = meta.thinking as string;
     }
 
     const messages: Message[] = [base];
@@ -258,6 +262,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i].role === "assistant" && msgs[i].type === "text") {
                 msgs[i] = { ...msgs[i], content };
+                break;
+            }
+        }
+        return { messages: msgs };
+    }),
+
+    updateLastAssistantThinking: (thinking) => set((state) => {
+        const msgs = [...state.messages];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === "assistant" && msgs[i].type === "text") {
+                msgs[i] = { ...msgs[i], thinking };
                 break;
             }
         }
