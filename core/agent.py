@@ -4977,51 +4977,16 @@ IMPORTANT RULES:
                     if _web_thread is None and os.getenv("TAVILY_API_KEY", ""):
                         _uq = _user_query.lower()
 
-                        # ── Blocklist: never web-search for these patterns ──
-                        _is_attachment_query = bool(re.search(
-                            r'\b(?:summarize|summarise|summary|explain|describe|extract|'
-                            r'read|analyze|analyse|parse|review|translate|what does|'
-                            r'tell me about)\b.*'
-                            r'\b(?:pdf|document|file|paper|thesis|article|attachment|'
-                            r'uploaded|attached|this)\b',
-                            _uq,
-                        )) or bool(re.search(
-                            r'\b(?:pdf|document|file|paper|thesis|attachment)\b.*'
-                            r'\b(?:summarize|summarise|summary|explain|about|says?|'
-                            r'contain|content|mean)\b',
-                            _uq,
-                        ))
-                        _has_attachments = bool(attachments)
-
-                        _is_conversational = bool(re.search(
-                            r'^(?:thank|thanks|yes|no|ok|okay|sure|got it|'
-                            r'explain more|continue|go on|what do you mean|'
-                            r'can you elaborate|tell me more|great)\b',
-                            _uq.strip(),
+                        # Check if the user explicitly requested NOT to use web search
+                        _explicit_no_web = bool(re.search(
+                            r'\b(?:no web search|dont search the web|dont use web search|without web search|no internet search)\b',
+                            _uq
                         ))
 
-                        # ── Allowlist: web-search IS useful here ──
-                        _wants_current_info = bool(re.search(
-                            r'\b(?:current|latest|recent|upcoming|deadline|'
-                            r'schedule|status|call for|cfp|cycle \d|'
-                            r'when is|when does|how to apply|'
-                            r'policy|policies|regulation)\b',
-                            _uq,
-                        ))
-
-                        # Paper/literature queries should NEVER trigger web
-                        # search — papers come from NASA ADS, not the web.
-                        # "recent papers on X" matches _wants_current_info
-                        # because of "recent", but that's a false positive.
-                        _is_paper_query_web = bool(re.search(
-                            r'\b(?:papers?|publications?|articles?|literature|studies)\b',
-                            _uq,
-                        ))
-
-                        if _is_attachment_query or _has_attachments or _is_conversational or _is_paper_query_web:
+                        if _explicit_no_web:
                             _needs_web_supplement = False
                         else:
-                            # Always supplement RAG with web search for fresh context
+                            # As per user directive: RAG queries always trigger web search
                             _needs_web_supplement = True
 
                     if _needs_web_supplement:
