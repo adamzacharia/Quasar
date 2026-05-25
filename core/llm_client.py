@@ -1008,6 +1008,10 @@ class ResponsesShim:
         resp = completions_engine.create(**call_kwargs)
         result = self._chat_completion_to_llm_response(resp)
 
+        # Extract reasoning_content from the response message
+        msg = resp.choices[0].message if resp.choices else None
+        reasoning_content = getattr(msg, "reasoning_content", None) if msg else None
+
         # Cache the generated response history
         new_messages = list(messages)
         tool_calls = [out for out in result.output if getattr(out, 'type', None) == 'function_call']
@@ -1015,6 +1019,7 @@ class ResponsesShim:
             new_messages.append({
                 "role": "assistant",
                 "content": result.output_text or None,
+                "reasoning_content": reasoning_content or None,
                 "tool_calls": [
                     {
                         "id": tc.call_id,
@@ -1031,6 +1036,7 @@ class ResponsesShim:
             new_messages.append({
                 "role": "assistant",
                 "content": result.output_text,
+                "reasoning_content": reasoning_content or None,
             })
         
         self._history_cache[result.id] = new_messages
@@ -1081,6 +1087,7 @@ class ResponsesShim:
         function_calls = {}
         reasoning_done_emitted = False
         output_text = ""
+        reasoning_content = ""
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         stream = completions_engine.create(**call_kwargs)
@@ -1094,6 +1101,7 @@ class ResponsesShim:
             # 1. Real-time Chain of Thought (CoT) reasoning content
             reasoning_delta = getattr(delta, "reasoning_content", None)
             if reasoning_delta:
+                reasoning_content += reasoning_delta
                 yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
                 continue
 
@@ -1151,6 +1159,7 @@ class ResponsesShim:
             new_messages.append({
                 "role": "assistant",
                 "content": output_text or None,
+                "reasoning_content": reasoning_content or None,
                 "tool_calls": [
                     {
                         "id": tc.call_id,
@@ -1167,6 +1176,7 @@ class ResponsesShim:
             new_messages.append({
                 "role": "assistant",
                 "content": output_text,
+                "reasoning_content": reasoning_content or None,
             })
         
         self._history_cache[resp_id] = new_messages
