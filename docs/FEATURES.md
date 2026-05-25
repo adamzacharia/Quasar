@@ -175,6 +175,7 @@ Without them, even great features feel broken.
 - [x] **PS28** LLM Cost Analytics & Tracing -- Helicone OpenAI proxy for automatic cost dashboards; Langfuse generation logging per LLM call with token usage and latency (core/llm_client.py + core/langfuse_integration.py)
 - [x] **PS29** OpenAI Responses API Unification -- Purged all legacy chat completions and unified the entire codebase (vision uploads, text reasoning, literature searching, proposal critiques) under the modern OpenAI Responses API via LLMClient (ui-pro/api/main.py)
 - [x] **PS30** DeepSeek Thinking Mode Integration -- Added full support for the new 'deepseek-v4-pro' model in the backend and frontend; maps the native real-time 'reasoning_content' chain-of-thought tokens directly to SSE events to display raw reasoning steps in the UI Thought widget; configures reasoning effort controls and thinking parameter shimming (core/llm_client.py + ui-pro/src/components/Sidebar.tsx)
+- [x] **PS31** DeepSeek Tool Calling Parity -- Fixed three bugs preventing data cards, tables, and charts from appearing when using DeepSeek models: (1) tool_choice parameter was not forwarded to the DeepSeek Chat Completions API, so archive fetch queries did not force tool execution; (2) function call argument deltas used an unreachable call_id lookup path, leaving tool arguments empty; (3) response.completed handler did not backfill missing arguments/names for already-tracked function calls. All non-OpenAI providers now produce identical data card and table output as OpenAI. (core/llm_client.py + core/agent.py)
 
 ---
 
@@ -200,4 +201,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-25 -- Quasar v3.3.4 (Integrated DeepSeek v4 Pro thinking mode)*
+*Last updated: 2026-05-25 -- Quasar v3.3.5 (DeepSeek tool calling parity fix)*

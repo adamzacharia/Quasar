@@ -5437,15 +5437,23 @@ IMPORTANT RULES:
                                 elif item_id in function_calls:
                                     function_calls[item_id]["call_id"] = final_call_id
                     elif event.type == "response.function_call_arguments.delta":
-                        # Try all possible ID fields the API might use
-                        raw_id = getattr(event, 'call_id', None) or getattr(event, 'item_id', None)
+                        # Try all possible ID fields the API might use.
+                        # OpenAI native: call_id / item_id on event top-level.
+                        # DeepSeek/shim: call_id lives on event.item (FunctionCallItem).
+                        raw_id = (
+                            getattr(event, 'call_id', None)
+                            or getattr(event, 'item_id', None)
+                            or (getattr(event.item, 'call_id', None) if getattr(event, 'item', None) else None)
+                        )
                         # Resolve to the canonical call_id we stored
                         cid = item_id_to_call_id.get(raw_id, raw_id)
                         if cid and cid in function_calls:
                             function_calls[cid]["arguments"] += event.delta
                     elif event.type == "response.completed":
-                        # Final sweep: reconcile call_ids from the completed response
-                        # The streaming events may miss the final call_id assignment.
+                        # Final sweep: reconcile call_ids AND arguments from the
+                        # completed response.  The streaming deltas may have
+                        # failed to accumulate arguments (e.g. if call_id was
+                        # not resolvable during delta events).
                         completed_resp = getattr(event, 'response', None)
                         if completed_resp and hasattr(completed_resp, 'output'):
                             for out_item in completed_resp.output:
@@ -5459,8 +5467,17 @@ IMPORTANT RULES:
                                         old_key = item_id_to_call_id.get(item_id, item_id)
                                         if old_key in function_calls:
                                             function_calls[old_key]["call_id"] = final_cid
+                                            # Backfill arguments if streaming failed to accumulate them
+                                            if fn_args and not function_calls[old_key]["arguments"]:
+                                                function_calls[old_key]["arguments"] = fn_args
+                                            if fn_name and not function_calls[old_key]["name"]:
+                                                function_calls[old_key]["name"] = fn_name
                                         elif item_id in function_calls:
                                             function_calls[item_id]["call_id"] = final_cid
+                                            if fn_args and not function_calls[item_id]["arguments"]:
+                                                function_calls[item_id]["arguments"] = fn_args
+                                            if fn_name and not function_calls[item_id]["name"]:
+                                                function_calls[item_id]["name"] = fn_name
                                         elif final_cid not in function_calls:
                                             # Entirely new — create the entry
                                             function_calls[final_cid] = {
