@@ -157,6 +157,7 @@ class ResponsesShim:
 
     def __init__(self, llm_client: "LLMClient"):
         self._llm = llm_client
+        self._history_cache = {}  # response_id -> list of chat messages
 
     def create(self, **kwargs) -> Any:
         """
@@ -965,6 +966,7 @@ class ResponsesShim:
         input_data = kwargs.get("input", "")
         max_tokens = kwargs.get("max_output_tokens", 2000)
         tools_raw = kwargs.get("tools", None)
+        prev_id = kwargs.get("previous_response_id", None)
         json_mode = False
         text_opt = kwargs.get("text", None)
         if text_opt and isinstance(text_opt, dict):
@@ -972,7 +974,20 @@ class ResponsesShim:
             if fmt.get("type") == "json_object":
                 json_mode = True
 
-        messages = self._build_chat_messages(instructions, input_data, json_mode)
+        # Load from history cache if available to chain message history
+        if prev_id and prev_id in self._history_cache:
+            messages = list(self._history_cache[prev_id])
+            if isinstance(input_data, list):
+                for item in input_data:
+                    if isinstance(item, dict) and item.get("type") == "function_call_output":
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": item.get("call_id", ""),
+                            "content": item.get("output", ""),
+                        })
+        else:
+            messages = self._build_chat_messages(instructions, input_data, json_mode)
+
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
 
         call_kwargs = {
@@ -991,7 +1006,35 @@ class ResponsesShim:
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         resp = completions_engine.create(**call_kwargs)
-        return self._chat_completion_to_llm_response(resp)
+        result = self._chat_completion_to_llm_response(resp)
+
+        # Cache the generated response history
+        new_messages = list(messages)
+        tool_calls = [out for out in result.output if getattr(out, 'type', None) == 'function_call']
+        if tool_calls:
+            new_messages.append({
+                "role": "assistant",
+                "content": result.output_text or None,
+                "tool_calls": [
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                    }
+                    for tc in tool_calls
+                ]
+            })
+        else:
+            new_messages.append({
+                "role": "assistant",
+                "content": result.output_text,
+            })
+        
+        self._history_cache[result.id] = new_messages
+        return result
 
     def _stream_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
         """Streaming DeepSeek call — returns an iterator of StreamEvents."""
@@ -1001,8 +1044,22 @@ class ResponsesShim:
         input_data = kwargs.get("input", "")
         max_tokens = kwargs.get("max_output_tokens", 2000)
         tools_raw = kwargs.get("tools", None)
+        prev_id = kwargs.get("previous_response_id", None)
 
-        messages = self._build_chat_messages(instructions, input_data)
+        # Load from history cache if available to chain message history
+        if prev_id and prev_id in self._history_cache:
+            messages = list(self._history_cache[prev_id])
+            if isinstance(input_data, list):
+                for item in input_data:
+                    if isinstance(item, dict) and item.get("type") == "function_call_output":
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": item.get("call_id", ""),
+                            "content": item.get("output", ""),
+                        })
+        else:
+            messages = self._build_chat_messages(instructions, input_data)
+
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
 
         call_kwargs = {
@@ -1023,6 +1080,7 @@ class ResponsesShim:
 
         function_calls = {}
         reasoning_done_emitted = False
+        output_text = ""
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         stream = completions_engine.create(**call_kwargs)
@@ -1047,6 +1105,7 @@ class ResponsesShim:
 
             # 2. Text content
             if delta.content:
+                output_text += delta.content
                 yield StreamEvent(type="response.output_text.delta", delta=delta.content)
 
             # 3. Tool calls
@@ -1084,6 +1143,33 @@ class ResponsesShim:
                 output=completed_items,
             )
         )
+
+        # Cache the generated response history at the end of streaming
+        new_messages = list(messages)
+        tool_calls = completed_items
+        if tool_calls:
+            new_messages.append({
+                "role": "assistant",
+                "content": output_text or None,
+                "tool_calls": [
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                    }
+                    for tc in tool_calls
+                ]
+            })
+        else:
+            new_messages.append({
+                "role": "assistant",
+                "content": output_text,
+            })
+        
+        self._history_cache[resp_id] = new_messages
 
 
 
