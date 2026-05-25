@@ -997,7 +997,9 @@ class ResponsesShim:
         if openai_tools:
             call_kwargs["tools"] = openai_tools
             if tool_choice:
-                call_kwargs["tool_choice"] = tool_choice
+                # DeepSeek thinking mode only supports "auto" or "none".
+                # Omit/translate forced choices (like "required" or dict structures) to "auto" to avoid 400 error.
+                call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
         if json_mode:
             call_kwargs["response_format"] = {"type": "json_object"}
 
@@ -1079,7 +1081,9 @@ class ResponsesShim:
         if openai_tools:
             call_kwargs["tools"] = openai_tools
             if tool_choice:
-                call_kwargs["tool_choice"] = tool_choice
+                # DeepSeek thinking mode only supports "auto" or "none".
+                # Omit/translate forced choices (like "required" or dict structures) to "auto" to avoid 400 error.
+                call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
 
         # highest thinking settings as requested
         call_kwargs["reasoning_effort"] = "max"
