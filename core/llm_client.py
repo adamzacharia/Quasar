@@ -987,6 +987,7 @@ class ResponsesShim:
             messages = self._build_chat_messages(instructions, input_data, json_mode)
 
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
+        tool_choice = kwargs.get("tool_choice", None)
 
         call_kwargs = {
             "model": model,
@@ -995,6 +996,8 @@ class ResponsesShim:
         }
         if openai_tools:
             call_kwargs["tools"] = openai_tools
+            if tool_choice:
+                call_kwargs["tool_choice"] = tool_choice
         if json_mode:
             call_kwargs["response_format"] = {"type": "json_object"}
 
@@ -1065,6 +1068,7 @@ class ResponsesShim:
             messages = self._build_chat_messages(instructions, input_data)
 
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
+        tool_choice = kwargs.get("tool_choice", None)
 
         call_kwargs = {
             "model": model,
@@ -1074,6 +1078,8 @@ class ResponsesShim:
         }
         if openai_tools:
             call_kwargs["tools"] = openai_tools
+            if tool_choice:
+                call_kwargs["tool_choice"] = tool_choice
 
         # highest thinking settings as requested
         call_kwargs["reasoning_effort"] = "max"
@@ -1120,19 +1126,24 @@ class ResponsesShim:
                     idx = tc.index
                     if idx not in function_calls:
                         fc = FunctionCallItem(
-                            name=tc.function.name if tc.function else "",
+                            name=tc.function.name or "" if tc.function else "",
                             call_id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
                         )
                         function_calls[idx] = fc
                         yield StreamEvent(type="response.output_item.added", item=fc)
                     
                     fc = function_calls[idx]
+                    # Update name if it arrives in a later chunk
+                    if tc.function and tc.function.name and not fc.name:
+                        fc.name = tc.function.name
                     if tc.function and tc.function.arguments:
                         fc.arguments += tc.function.arguments
                         yield StreamEvent(
                             type="response.function_call_arguments.delta",
                             delta=tc.function.arguments,
                             item=fc,
+                            # NOTE: We don't set call_id on StreamEvent — the
+                            # agent must read it from item.call_id instead.
                         )
 
         if not reasoning_done_emitted:

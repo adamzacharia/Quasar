@@ -6,7 +6,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Copy, Check, Database, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
-import { useState, type ReactNode } from "react";
+import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message } from "../lib/types";
 import { useAuthStore } from "../lib/auth-store";
 import { DataTableCard } from "./DataTableCard";
@@ -170,6 +170,30 @@ function replaceEmojisInString(text: string, keyBase: number): ReactNode {
     return parts.length === 1 ? parts[0] : <>{parts}</>;
 }
 
+function StreamingThinking({ text }: { text: string }) {
+    const containerRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (containerRef.current) {
+            containerRef.current.scrollTop = containerRef.current.scrollHeight;
+        }
+    }, [text]);
+
+    return (
+        <div
+            ref={containerRef}
+            className="text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none overflow-y-hidden transition-all duration-300 max-h-[5.5rem] relative"
+            style={{
+                WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.3) 15%, black 60%)',
+                maskImage: 'linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.3) 15%, black 60%)',
+            }}
+        >
+            <p className="font-sans text-slate-300/90 whitespace-pre-wrap animate-in fade-in duration-300">
+                {text}
+            </p>
+        </div>
+    );
+}
 
 interface ChatMessageProps {
     message: Message;
@@ -408,50 +432,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         >
                             {message.thinking && (() => {
                                 if (thinkingStatus === "running") {
-                                    // LM Studio sliding-window: only render the latest 4 non-empty lines
-                                    const allLines = message.thinking.split("\n");
-                                    
-                                    const nonEmptyIndices: number[] = [];
-                                    allLines.forEach((line, i) => {
-                                        if (line.trim()) {
-                                            nonEmptyIndices.push(i);
-                                        }
-                                    });
-
-                                    if (nonEmptyIndices.length === 0) {
-                                        return (
-                                            <div className="space-y-1.5 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none">
-                                                <p className="font-sans text-slate-300/90">{message.thinking}</p>
-                                            </div>
-                                        );
-                                    }
-
-                                    const maxVisibleLines = 4;
-                                    const activeIndices = nonEmptyIndices.slice(-maxVisibleLines);
-
-                                    return (
-                                        <div className="space-y-1.5 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none transition-all duration-300">
-                                            {activeIndices.map((idx, activeSeqIdx) => {
-                                                const line = allLines[idx];
-                                                const distance = activeIndices.length - 1 - activeSeqIdx;
-                                                
-                                                let opacity = 0.15;
-                                                if (distance === 0) opacity = 1.0;
-                                                else if (distance === 1) opacity = 0.45;
-                                                else if (distance === 2) opacity = 0.25;
-
-                                                return (
-                                                    <p
-                                                        key={idx}
-                                                        className="transition-all duration-300 font-sans text-slate-300/90 animate-in fade-in slide-in-from-bottom-1 duration-300"
-                                                        style={{ opacity }}
-                                                    >
-                                                        {line}
-                                                    </p>
-                                                );
-                                            })}
-                                        </div>
-                                    );
+                                    return <StreamingThinking text={message.thinking} />;
                                 }
 
                                 // When thinking is completed, display full markdown at normal 100% opacity
