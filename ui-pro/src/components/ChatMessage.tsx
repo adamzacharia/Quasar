@@ -406,11 +406,48 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             steps={thinkingSteps || []}
                             forceCollapsed={hasContent}
                         >
-                            {message.thinking && (
-                                <div className="text-slate-300 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 prose prose-invert prose-xs">
-                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.thinking}</ReactMarkdown>
-                                </div>
-                            )}
+                            {message.thinking && (() => {
+                                if (thinkingStatus === "running") {
+                                    // LM Studio style real-time fading streaming
+                                    const allLines = message.thinking.split("\n");
+                                    let lastNonEmptyIdx = allLines.length - 1;
+                                    while (lastNonEmptyIdx >= 0 && !allLines[lastNonEmptyIdx].trim()) {
+                                        lastNonEmptyIdx--;
+                                    }
+                                    if (lastNonEmptyIdx < 0) lastNonEmptyIdx = 0;
+
+                                    return (
+                                        <div className="space-y-1.5 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none">
+                                            {allLines.map((line, idx) => {
+                                                if (idx > lastNonEmptyIdx) return null;
+                                                
+                                                const distance = lastNonEmptyIdx - idx;
+                                                let opacity = 0.15;
+                                                if (distance === 0) opacity = 1.0;
+                                                else if (distance === 1) opacity = 0.45;
+                                                else if (distance === 2) opacity = 0.25;
+
+                                                return (
+                                                    <p
+                                                        key={idx}
+                                                        className="transition-opacity duration-300 font-sans text-slate-300/90"
+                                                        style={{ opacity }}
+                                                    >
+                                                        {line || "\u00A0"}
+                                                    </p>
+                                                );
+                                            })}
+                                        </div>
+                                    );
+                                }
+
+                                // When thinking is completed, display full markdown at normal 100% opacity
+                                return (
+                                    <div className="text-slate-300 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 prose prose-invert prose-xs">
+                                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.thinking}</ReactMarkdown>
+                                    </div>
+                                );
+                            })()}
                         </ThoughtProcessWidget>
                     )}
 
