@@ -408,20 +408,33 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         >
                             {message.thinking && (() => {
                                 if (thinkingStatus === "running") {
-                                    // LM Studio style real-time fading streaming
+                                    // LM Studio sliding-window: only render the latest 4 non-empty lines
                                     const allLines = message.thinking.split("\n");
-                                    let lastNonEmptyIdx = allLines.length - 1;
-                                    while (lastNonEmptyIdx >= 0 && !allLines[lastNonEmptyIdx].trim()) {
-                                        lastNonEmptyIdx--;
+                                    
+                                    const nonEmptyIndices: number[] = [];
+                                    allLines.forEach((line, i) => {
+                                        if (line.trim()) {
+                                            nonEmptyIndices.push(i);
+                                        }
+                                    });
+
+                                    if (nonEmptyIndices.length === 0) {
+                                        return (
+                                            <div className="space-y-1.5 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none">
+                                                <p className="font-sans text-slate-300/90">{message.thinking}</p>
+                                            </div>
+                                        );
                                     }
-                                    if (lastNonEmptyIdx < 0) lastNonEmptyIdx = 0;
+
+                                    const maxVisibleLines = 4;
+                                    const activeIndices = nonEmptyIndices.slice(-maxVisibleLines);
 
                                     return (
-                                        <div className="space-y-1.5 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none">
-                                            {allLines.map((line, idx) => {
-                                                if (idx > lastNonEmptyIdx) return null;
+                                        <div className="space-y-1.5 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 select-none transition-all duration-300">
+                                            {activeIndices.map((idx, activeSeqIdx) => {
+                                                const line = allLines[idx];
+                                                const distance = activeIndices.length - 1 - activeSeqIdx;
                                                 
-                                                const distance = lastNonEmptyIdx - idx;
                                                 let opacity = 0.15;
                                                 if (distance === 0) opacity = 1.0;
                                                 else if (distance === 1) opacity = 0.45;
@@ -430,10 +443,10 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                                 return (
                                                     <p
                                                         key={idx}
-                                                        className="transition-opacity duration-300 font-sans text-slate-300/90"
+                                                        className="transition-all duration-300 font-sans text-slate-300/90 animate-in fade-in slide-in-from-bottom-1 duration-300"
                                                         style={{ opacity }}
                                                     >
-                                                        {line || "\u00A0"}
+                                                        {line}
                                                     </p>
                                                 );
                                             })}
