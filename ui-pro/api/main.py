@@ -906,6 +906,10 @@ def _stream_chat_response(
                 if token:
                     asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
 
+            def on_thought(thought: str):
+                if thought:
+                    asyncio.run_coroutine_threadsafe(queue.put(("thought", thought)), loop)
+
             def _run_agent():
                 if lf_trace:
                     from core.llm_client import set_langfuse_parent
@@ -928,6 +932,7 @@ def _stream_chat_response(
                                 raw_query=request.message,
                                 conversation_id=conv_id,
                                 plan_feedback_queue=_pfq,
+                                on_thought=on_thought,
                             )
                         finally:
                             # Clean up the plan feedback queue
@@ -955,6 +960,7 @@ def _stream_chat_response(
 
             first_token = True
             response_text = ""
+            _rich_thinking_text = ""
             # Accumulators for rich UI events — persisted to Turso for history replay
             _rich_data_tables = []  # list of data tables (multi-target support)
             _rich_data_table = None  # last data table (backward compat)
@@ -1054,6 +1060,9 @@ def _stream_chat_response(
                 if msg_type == "token":
                     first_token = False
                     data = json.dumps({"type": "token", "content": payload})
+                    yield f"data: {data}\n\n"
+                if msg_type == "thought":
+                    data = json.dumps({"type": "thought", "content": payload})
                     yield f"data: {data}\n\n"
 
             # ── Collect all accumulated results (multi-target support) ──
@@ -1219,6 +1228,8 @@ def _stream_chat_response(
                         rich_meta["image"] = _rich_image
                     if _rich_thinking:
                         rich_meta["thinkingSteps"] = _rich_thinking
+                    if _rich_thinking_text:
+                        rich_meta["thinking"] = _rich_thinking_text
                     conversation_service.save_message(
                         conv_id, "assistant", response_text,
                         metadata=rich_meta if rich_meta else None,

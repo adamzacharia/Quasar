@@ -182,7 +182,7 @@ interface ChatMessageProps {
 export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState }: ChatMessageProps) {
     const isUser = message.role === "user";
     const hasContent = !!message.content;
-    const hasThinking = thinkingSteps && thinkingSteps.length > 0;
+    const hasThinking = (thinkingSteps && thinkingSteps.length > 0) || !!message.thinking;
 
     const { user, isAuthenticated } = useAuthStore();
     const userInitials = user?.display_name
@@ -403,9 +403,15 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         <ThoughtProcessWidget
                             title="Thinking"
                             status={thinkingStatus === "running" && !hasContent ? "running" : "completed"}
-                            steps={thinkingSteps}
+                            steps={thinkingSteps || []}
                             forceCollapsed={hasContent}
-                        />
+                        >
+                            {message.thinking && (
+                                <div className="text-slate-300 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 prose prose-invert prose-xs">
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.thinking}</ReactMarkdown>
+                                </div>
+                            )}
+                        </ThoughtProcessWidget>
                     )}
 
                     {/* Multi-Agent Workforce — always visible (full when active, collapsed when done) */}

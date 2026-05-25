@@ -30,6 +30,7 @@ export interface Message {
     imageUrl?: string;
     imageCaption?: string;
     thinkingSteps?: ThoughtStep[];
+    thinking?: string;
     attachmentPreviews?: string[];  // base64 data URLs for images
     attachmentNames?: string[];     // names of attached documents
     webSources?: WebSource[];       // clickable source cards from web search

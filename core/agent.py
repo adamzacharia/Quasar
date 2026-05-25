@@ -4616,6 +4616,7 @@ IMPORTANT RULES:
         raw_query: Optional[str] = None,
         conversation_id: Optional[str] = None,
         plan_feedback_queue=None,
+        on_thought=None,
     ) -> str:
         # Assign a unique conversation_id if none provided (isolates anonymous
         # concurrent requests so they never share OpenAI response state).
@@ -5371,12 +5372,14 @@ IMPORTANT RULES:
                     elif event.type == "response.reasoning_summary_text.delta":
                         # Stream reasoning summary as a thinking step in the UI
                         _reasoning_summary_text += event.delta
-                        if not _reasoning_emitted and on_status:
+                        if on_thought:
+                            on_thought(event.delta)
+                        elif not _reasoning_emitted and on_status:
                             on_status("🧠 Reasoning", "running")
                             _reasoning_emitted = True
                     elif event.type == "response.reasoning_summary_text.done":
                         # Reasoning summary complete — emit the full text as a thinking step
-                        if _reasoning_summary_text and on_status:
+                        if not on_thought and _reasoning_summary_text and on_status:
                             # Split into individual lines for readable thinking steps
                             for line in _reasoning_summary_text.strip().splitlines():
                                 line = line.strip()
@@ -5388,7 +5391,7 @@ IMPORTANT RULES:
                     elif event.type == "response.output_text.delta":
                         # If reasoning was still accumulating when text starts,
                         # finalize it now (edge case: some models skip the .done event)
-                        if _reasoning_summary_text and on_status:
+                        if not on_thought and _reasoning_summary_text and on_status:
                             for line in _reasoning_summary_text.strip().splitlines():
                                 line = line.strip()
                                 if line:

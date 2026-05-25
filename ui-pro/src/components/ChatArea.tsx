@@ -19,7 +19,7 @@ function generateId(): string { return Date.now().toString(36) + Math.random().t
 
 export function ChatArea() {
     const {
-        messages, addMessage, updateLastAssistantMessage,
+        messages, addMessage, updateLastAssistantMessage, updateLastAssistantThinking,
         isStreaming, setStreaming, streamingContent,
         sidebarOpen, toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -148,6 +148,7 @@ export function ChatArea() {
         addMessage(assistantMsg);
 
         let accumulated = "";
+        let accumulatedThought = "";
 
         // Build message with file context
         let messageWithContext = text.trim();
@@ -198,6 +199,10 @@ export function ChatArea() {
                         onToken: (token: string) => {
                             accumulated += token;
                             updateLastAssistantMessage(accumulated);
+                        },
+                        onThought: (thought: string) => {
+                            accumulatedThought += thought;
+                            updateLastAssistantThinking(accumulatedThought);
                         },
                         onToolCall: (toolName: string, input: string) => {
                             const displayName = toolName.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
