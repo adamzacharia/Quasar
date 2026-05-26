@@ -177,6 +177,7 @@ Without them, even great features feel broken.
 - [x] **PS30** DeepSeek Thinking Mode Integration -- Added full support for the new 'deepseek-v4-pro' model in the backend and frontend; maps the native real-time 'reasoning_content' chain-of-thought tokens directly to SSE events to display raw reasoning steps in the UI Thought widget; configures reasoning effort controls and thinking parameter shimming (core/llm_client.py + ui-pro/src/components/Sidebar.tsx)
 - [x] **PS31** DeepSeek Tool Calling Parity -- Fixed three bugs preventing data cards, tables, and charts from appearing when using DeepSeek models: (1) tool_choice parameter was not forwarded to the DeepSeek Chat Completions API, so archive fetch queries did not force tool execution; (2) function call argument deltas used an unreachable call_id lookup path, leaving tool arguments empty; (3) response.completed handler did not backfill missing arguments/names for already-tracked function calls. All non-OpenAI providers now produce identical data card and table output as OpenAI. (core/llm_client.py + core/agent.py)
 - [x] **PS32** DeepSeek V4 Flash Full Integration -- Added 'deepseek-v4-flash' as a selectable model across the entire stack: backend model list, frontend fallback/default lists, temperature-stripping set, and thinking-models set; Flash runs with thinking enabled at max reasoning effort, identical to V4 Pro; pricing and observability cost tracking were already in place (ui-pro/api/main.py + ui-pro/src/lib/api.ts + ui-pro/src/lib/store.ts + core/agent.py)
+- [x] **PS33** Langfuse Token & Cost Tracking Parity -- Fixed a major issue where DeepSeek, Anthropic, Google, and Local models were missing token usage and cost metrics in the Langfuse dashboard. (1) Defined standardized LLMUsage and updated LLMResponse to store usage; (2) Populated usage in non-streaming mapping functions; (3) Added stream_options to DeepSeek and Local streaming, and extracted final message/chunk usage in Anthropic and Google streams to yield usage metadata on completion. (core/llm_client.py)
 
 ---
 
@@ -202,4 +203,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-26 -- Quasar v3.3.6 (DeepSeek V4 Flash full integration)*
+*Last updated: 2026-05-26 -- Quasar v3.3.7 (Langfuse token and cost tracking parity)*
