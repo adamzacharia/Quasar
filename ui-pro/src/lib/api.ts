@@ -182,7 +182,7 @@ export async function submitPlanFeedback(
 
 export async function getModels(): Promise<string[]> {
     try { const res = await fetch(`${API_BASE}/api/models`); const data = await res.json(); return data.models; }
-    catch { return ["gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro"]; }
+    catch { return ["gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro", "deepseek-v4-flash"]; }
 }
 
 export async function reviewProposal(file: File, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
