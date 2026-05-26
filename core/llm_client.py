@@ -111,6 +111,13 @@ class MessageOutputItem:
 
 
 @dataclass
+class LLMUsage:
+    """Standardized usage token counting for all LLM providers."""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class LLMResponse:
     """
     Mimics OpenAI's Response object so all existing code works.
@@ -123,6 +130,7 @@ class LLMResponse:
     output_text: str = ""
     id: str = ""
     output: List[Any] = field(default_factory=list)
+    usage: Optional[LLMUsage] = None
 
     def __post_init__(self):
         if not self.id:
@@ -244,12 +252,14 @@ class ResponsesShim:
                     elapsed_ms = (_time.perf_counter() - t0) * 1000
                     try:
                         output_text = getattr(result, 'output_text', '') or ''
-                        # Try to extract usage from OpenAI native responses
+                        # Try to extract usage from OpenAI native responses or custom LLMResponse
                         usage = {}
                         if hasattr(result, 'usage') and result.usage:
+                            input_tokens = getattr(result.usage, 'input_tokens', 0) or getattr(result.usage, 'prompt_tokens', 0)
+                            output_tokens = getattr(result.usage, 'output_tokens', 0) or getattr(result.usage, 'completion_tokens', 0)
                             usage = {
-                                "input": getattr(result.usage, 'input_tokens', 0),
-                                "output": getattr(result.usage, 'output_tokens', 0),
+                                "input": input_tokens,
+                                "output": output_tokens,
                             }
                         lf_gen.end(
                             output=output_text[:2000],
@@ -274,13 +284,16 @@ class ResponsesShim:
                                         or event_type in ("response.output_text.delta", "response.reasoning_summary_text.delta", "text_delta")
                                     ):
                                         accumulated_text.append(delta)
-                                    elif event_type == "response.done":
-                                        resp = getattr(event, 'response', None)
-                                        if resp and hasattr(resp, 'usage') and resp.usage:
-                                            usage = {
-                                                "input": getattr(resp.usage, 'input_tokens', 0),
-                                                "output": getattr(resp.usage, 'output_tokens', 0),
-                                            }
+                                    
+                                    # Extract usage from completed/done event response
+                                    resp = getattr(event, 'response', None)
+                                    if resp and hasattr(resp, 'usage') and resp.usage:
+                                        input_tokens = getattr(resp.usage, 'input_tokens', 0) or getattr(resp.usage, 'prompt_tokens', 0)
+                                        output_tokens = getattr(resp.usage, 'output_tokens', 0) or getattr(resp.usage, 'completion_tokens', 0)
+                                        usage = {
+                                            "input": input_tokens,
+                                            "output": output_tokens,
+                                        }
                                 except Exception:
                                     pass
                         except Exception as e_stream:
@@ -510,6 +523,28 @@ class ResponsesShim:
                                     item=fc,
                                 )
 
+        # Extract final message usage
+        usage_obj = None
+        try:
+            final_msg = stream.get_final_message()
+            if final_msg and hasattr(final_msg, 'usage') and final_msg.usage:
+                usage_obj = LLMUsage(
+                    input_tokens=getattr(final_msg.usage, 'input_tokens', 0),
+                    output_tokens=getattr(final_msg.usage, 'output_tokens', 0),
+                )
+        except Exception:
+            pass
+
+        completed_items = [fc for fc in function_calls.values()]
+        yield StreamEvent(
+            type="response.completed",
+            response=LLMResponse(
+                id=resp_id,
+                output=completed_items,
+                usage=usage_obj,
+            )
+        )
+
     def _build_anthropic_messages(self, input_data, attachments: Optional[List[Dict[str, Any]]] = None) -> list:
         """Convert responses.create() input to Anthropic messages format."""
         if isinstance(input_data, str):
@@ -582,10 +617,18 @@ class ResponsesShim:
                 )
                 output_items.append(fc)
 
+        usage = None
+        if hasattr(resp, 'usage') and resp.usage:
+            usage = LLMUsage(
+                input_tokens=getattr(resp.usage, 'input_tokens', 0),
+                output_tokens=getattr(resp.usage, 'output_tokens', 0),
+            )
+
         return LLMResponse(
             output_text=output_text,
             id=resp.id if hasattr(resp, 'id') else f"resp_{uuid.uuid4().hex[:16]}",
             output=output_items or [MessageOutputItem(content=[TextContentItem(text=output_text)])],
+            usage=usage,
         )
 
     # ── Google Gemini ────────────────────────────────────────────────────
@@ -676,8 +719,17 @@ class ResponsesShim:
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
 
+        usage_obj = None
+        function_calls = []
+
         stream = client.models.generate_content_stream(**call_kwargs)
         for chunk in stream:
+            if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                usage_obj = LLMUsage(
+                    input_tokens=getattr(chunk.usage_metadata, 'prompt_token_count', 0),
+                    output_tokens=getattr(chunk.usage_metadata, 'candidates_token_count', 0),
+                )
+
             text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
             if text:
                 yield StreamEvent(type="response.output_text.delta", delta=text)
@@ -692,7 +744,17 @@ class ResponsesShim:
                                     name=part.function_call.name,
                                     arguments=json.dumps(dict(part.function_call.args)) if part.function_call.args else "{}",
                                 )
+                                function_calls.append(fc)
                                 yield StreamEvent(type="response.output_item.added", item=fc)
+
+        yield StreamEvent(
+            type="response.completed",
+            response=LLMResponse(
+                id=resp_id,
+                output=function_calls,
+                usage=usage_obj,
+            )
+        )
 
     def _translate_tools_for_google(self, tools: list) -> list:
         """Convert OpenAI tool format to Google GenAI function declarations."""
@@ -736,9 +798,17 @@ class ResponsesShim:
                             )
                             output_items.append(fc)
 
+        usage = None
+        if hasattr(resp, 'usage_metadata') and resp.usage_metadata:
+            usage = LLMUsage(
+                input_tokens=getattr(resp.usage_metadata, 'prompt_token_count', 0),
+                output_tokens=getattr(resp.usage_metadata, 'candidates_token_count', 0),
+            )
+
         return LLMResponse(
             output_text=output_text,
             output=output_items or [MessageOutputItem(content=[TextContentItem(text=output_text)])],
+            usage=usage,
         )
 
     def _build_google_contents(
@@ -838,6 +908,7 @@ class ResponsesShim:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if openai_tools:
             call_kwargs["tools"] = openai_tools
@@ -848,10 +919,17 @@ class ResponsesShim:
 
         # Track function calls across chunks
         function_calls = {}  # index -> FunctionCallItem
+        usage_obj = None
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         stream = completions_engine.create(**call_kwargs)
         for chunk in stream:
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_obj = LLMUsage(
+                    input_tokens=getattr(chunk.usage, 'prompt_tokens', 0),
+                    output_tokens=getattr(chunk.usage, 'completion_tokens', 0),
+                )
+
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
@@ -884,6 +962,16 @@ class ResponsesShim:
                             delta=tc.function.arguments,
                             item=fc,
                         )
+
+        completed_items = [fc for fc in function_calls.values()]
+        yield StreamEvent(
+            type="response.completed",
+            response=LLMResponse(
+                id=resp_id,
+                output=completed_items,
+                usage=usage_obj,
+            )
+        )
 
     def _build_chat_messages(self, instructions: str, input_data, json_mode: bool = False) -> list:
         """Build Chat Completions messages from responses.create() args."""
@@ -949,10 +1037,18 @@ class ResponsesShim:
         if not output_items:
             output_items = [MessageOutputItem(content=[TextContentItem(text=output_text)])]
 
+        usage = None
+        if hasattr(resp, 'usage') and resp.usage:
+            usage = LLMUsage(
+                input_tokens=getattr(resp.usage, 'prompt_tokens', 0),
+                output_tokens=getattr(resp.usage, 'completion_tokens', 0),
+            )
+
         return LLMResponse(
             output_text=output_text,
             id=resp.id if hasattr(resp, 'id') else f"resp_{uuid.uuid4().hex[:16]}",
             output=output_items,
+            usage=usage,
         )
 
     @with_retry(max_retries=3, backoff_base=1.0)
@@ -1088,6 +1184,7 @@ class ResponsesShim:
         # highest thinking settings as requested
         call_kwargs["reasoning_effort"] = "max"
         call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        call_kwargs["stream_options"] = {"include_usage": True}
 
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
@@ -1096,10 +1193,17 @@ class ResponsesShim:
         reasoning_done_emitted = False
         output_text = ""
         reasoning_content = ""
+        usage_obj = None
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         stream = completions_engine.create(**call_kwargs)
         for chunk in stream:
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_obj = LLMUsage(
+                    input_tokens=getattr(chunk.usage, 'prompt_tokens', 0),
+                    output_tokens=getattr(chunk.usage, 'completion_tokens', 0),
+                )
+
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
@@ -1162,6 +1266,7 @@ class ResponsesShim:
             response=LLMResponse(
                 id=resp_id,
                 output=completed_items,
+                usage=usage_obj,
             )
         )
 
