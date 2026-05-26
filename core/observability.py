@@ -32,6 +32,9 @@ MODEL_PRICING = {
     "gpt-4.1-nano":  (0.0001, 0.0004),
     "gpt-4o":        (0.0025, 0.010),
     "gpt-4o-mini":   (0.00015, 0.0006),
+    # DeepSeek
+    "deepseek-v4-pro":   (0.000435, 0.00087),
+    "deepseek-v4-flash": (0.00014, 0.00028),
 }
 
 
