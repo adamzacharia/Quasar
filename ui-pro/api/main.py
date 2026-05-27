@@ -425,6 +425,7 @@ def get_current_user(authorization: Optional[str] = Header(None)):
 
 class ConversationCreate(BaseModel):
     title: Optional[str] = "New Chat"
+    model: Optional[str] = None
 
 
 # ── Lazy-load the Quasar agent ───────────────────────────────
@@ -772,16 +773,19 @@ def _stream_chat_response(
             if not conv_id:
                 # No conversation_id from frontend — create a new one
                 title = conversation_service.generate_title_from_message(request.message)
-                conv_id = conversation_service.create_conversation(current_user_id, title)
-                logger.info(f"[CHAT] Auto-created conversation {conv_id} for user {current_user_id}")
+                conv_id = conversation_service.create_conversation(current_user_id, title, requested_model)
+                logger.info(f"[CHAT] Auto-created conversation {conv_id} with model {requested_model} for user {current_user_id}")
             else:
                 # Frontend sent a conversation_id — verify it exists in the DB
                 existing = conversation_service.get_user_conversations(current_user_id, limit=100)
                 if not any(c["id"] == conv_id for c in existing):
                     # ID doesn't exist in DB (orphan/client-generated) — create a proper one
                     title = conversation_service.generate_title_from_message(request.message)
-                    conv_id = conversation_service.create_conversation(current_user_id, title)
-                    logger.info(f"[CHAT] Client conv_id not found in DB, created new {conv_id}")
+                    conv_id = conversation_service.create_conversation(current_user_id, title, requested_model)
+                    logger.info(f"[CHAT] Client conv_id not found in DB, created new {conv_id} with model {requested_model}")
+                else:
+                    # Update model in DB to ensure it matches current selected model
+                    conversation_service.update_conversation_model(conv_id, requested_model)
             conversation_service.save_message(conv_id, "user", request.message)
         except Exception as e:
             logger.warning(f"[CHAT] Failed to persist user message: {e}")
@@ -1552,8 +1556,8 @@ async def list_conversations(current_user: dict = Depends(get_current_user)):
 async def create_conversation_endpoint(req: ConversationCreate, current_user: dict = Depends(get_current_user)):
     """Create a new empty conversation."""
     user_id = current_user["sub"]
-    conv_id = conversation_service.create_conversation(user_id, req.title)
-    return {"id": conv_id, "title": req.title}
+    conv_id = conversation_service.create_conversation(user_id, req.title, req.model)
+    return {"id": conv_id, "title": req.title, "model": req.model}
 
 
 @app.get("/api/conversations/{conversation_id}/messages")
