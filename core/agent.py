@@ -4605,6 +4605,46 @@ IMPORTANT RULES:
 
         return None
 
+    def _detect_web_search_needed_via_llm(self, query: str) -> bool:
+        """
+        Use deepseek-v4-flash to classify if a query requires web search.
+        """
+        try:
+            from core.llm_client import LLMClient
+            # Instantiate deepseek-v4-flash client
+            client = LLMClient(model="deepseek-v4-flash")
+            
+            prompt = (
+                "Classify if this user query requires searching the web for real-time, current, or highly fresh information.\n\n"
+                f"Query: \"{query}\"\n\n"
+                "Reply with YES if the query:\n"
+                "1. Asks about recent astronomical events, discoveries, or news (e.g., 'latest news from JWST', 'recent coordinate changes of X', 'who won the Nobel prize in physics recently?').\n"
+                "2. Asks about current telescope operational status, schedules, or call-for-proposals deadlines (e.g., 'ALMA Cycle 14 deadlines', 'current status of GBT').\n"
+                "3. References dates, years, or events after 2024.\n"
+                "4. Requires highly specific or real-time web facts to answer accurately.\n\n"
+                "Reply with NO if the query:\n"
+                "1. Asks for general physics/astronomy textbook knowledge, mathematical derivations, or static concepts (e.g., 'what is a black hole?', 'derive the Jeans mass', 'explain redshift').\n"
+                "2. Is purely conversational or a follow-up (e.g., 'hello', 'thank you', 'can you explain more?').\n"
+                "3. Asks you to write code, scripts, or format something (e.g., 'write a python script to plot a fits file').\n"
+                "4. Asks for scientific papers or publications (these are searched via NASA ADS/arXiv tool, not general web search).\n\n"
+                "Reply with ONLY one word: YES or NO"
+            )
+            
+            resp = client.responses.create(
+                model="deepseek-v4-flash",
+                input=prompt,
+                temperature=0,
+                max_output_tokens=1024,
+            )
+            ans = resp.output_text.strip().upper()
+            is_needed = "YES" in ans
+            print(f"[WEB SEARCH DETECTION] LLM classified query: '{query[:60]}...' -> {ans} (needed={is_needed})")
+            return is_needed
+        except Exception as e:
+            # Fallback to False on failure to be conservative and prevent unnecessary web searches
+            print(f"[WEB SEARCH DETECTION] LLM classification failed: {e}")
+            return False
+
     def stream_response_api(
         self,
         query: str,
@@ -4674,36 +4714,119 @@ IMPORTANT RULES:
             on_status("Connecting to QUASAR engine", "running")
             on_status("Connecting to QUASAR engine", "completed")
 
-        # 0a. Knowledge-cutoff detection — launch parallel web search
-        _web_search_query = self._detect_beyond_cutoff(_user_query)
+        # 0a. Refined Conditional Web Search orchestration
         _web_result_holder = {}   # will be filled by background thread
         _web_search_reason = None
         _email_result_holder = {}  # dedicated email search for researcher queries
         _email_thread = None
+        _web_thread = None
+
+        _uq = _user_query.lower()
+        # Detect explicit request to search the web
+        _explicit_web_search = bool(re.search(
+            r'\b(?:use web\s*search|search the web|web\s*search|internet search|google it|tavily|online search)\b',
+            _uq
+        ))
+        # Detect explicit request NOT to search the web
+        _explicit_no_web = bool(re.search(
+            r'\b(?:no web search|dont search the web|dont use web search|without web search|no internet search)\b',
+            _uq
+        ))
+
+        # Detect OpenAlex-targeted researcher query (copied from below for early execution)
+        _bare_lower = _user_query.lower()
+        _is_researcher_query = bool(re.search(
+            r'\b(?:who is|who\'s|tell me about|look up|profile of|'
+            r'where does .+ work|what does .+ (?:research|study|work on)|'
+            r'what (?:topics?|areas?|fields?) does .+ (?:research|study|work)|'
+            r'how many papers has .+ (?:published|written|authored)|'
+            r'which institution|h-index|orcid|'
+            r'.+\'s research|.+\'s h.index|.+\'s publications?)\b',
+            _bare_lower,
+        )) and not bool(re.search(
+            r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b',
+            _bare_lower,
+        ))
+
+        _web_search_query = None
+
+        if not _explicit_no_web:
+            if _explicit_web_search:
+                _web_search_query = _user_query
+                _web_search_reason = "explicit"
+            elif _is_researcher_query:
+                _web_search_query = _user_query
+                _web_search_reason = "researcher_supplement"
+            else:
+                # Check standard year/cutoff/freshness matches
+                _cutoff_match = self._detect_beyond_cutoff(_user_query)
+                if _cutoff_match:
+                    _web_search_query = _cutoff_match
+                    _web_search_reason = "cutoff"
+                else:
+                    # Run deepseek-v4-flash intent classification fallback
+                    if os.getenv("TAVILY_API_KEY", "") and self._detect_web_search_needed_via_llm(_user_query):
+                        _web_search_query = _user_query
+                        _web_search_reason = "intent_detection"
 
         if _web_search_query:
-            _web_search_reason = "cutoff"
-            if on_status:
-                on_status(
-                    "⚡ Time period beyond training knowledge cutoff detected — "
-                    "searching the web in parallel",
-                    "running",
-                )
+            if _web_search_reason == "researcher_supplement":
+                if on_status:
+                    on_status("Searching the web for researcher profile", "running")
+                # Extract the person's name for targeted search
+                _person_name = re.sub(
+                    r'\b(?:who is|who\'s|tell me about|look up|profile of)\b',
+                    '', _user_query, flags=re.IGNORECASE,
+                ).strip().strip('?').strip()
 
-            def _bg_web_search():
-                try:
-                    _web_result_holder["data"] = self._tavily_web_search(
-                        query=_web_search_query,
-                        max_results=5,
-                        search_depth="advanced",
-                    )
-                except Exception as _e:
-                    _web_result_holder["error"] = str(_e)
+                # Thread 1: General context search
+                def _bg_web_search_researcher():
+                    try:
+                        _web_result_holder["data"] = self._tavily_web_search(
+                            query=_user_query,
+                            max_results=10,
+                            search_depth="basic",
+                        )
+                    except Exception as _e:
+                        _web_result_holder["error"] = str(_e)
 
-            _web_thread = threading.Thread(target=_bg_web_search, daemon=True)
-            _web_thread.start()
-        else:
-            _web_thread = None
+                _web_thread = threading.Thread(target=_bg_web_search_researcher, daemon=True)
+                _web_thread.start()
+
+                # Thread 2: Targeted email search
+                def _bg_email_search():
+                    try:
+                        _email_result_holder["data"] = self._tavily_web_search(
+                            query=f"{_person_name} email contact professor astronomy",
+                            max_results=3,
+                            search_depth="basic",
+                        )
+                    except Exception as _e:
+                        _email_result_holder["error"] = str(_e)
+
+                _email_thread = threading.Thread(target=_bg_email_search, daemon=True)
+                _email_thread.start()
+            else:
+                if on_status:
+                    msg = "Searching the web in parallel"
+                    if _web_search_reason == "cutoff":
+                        msg = "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                    elif _web_search_reason == "intent_detection":
+                        msg = "🌐 Query requires real-time information — searching the web in parallel"
+                    on_status(msg, "running")
+
+                def _bg_web_search():
+                    try:
+                        _web_result_holder["data"] = self._tavily_web_search(
+                            query=_web_search_query,
+                            max_results=5,
+                            search_depth="advanced",
+                        )
+                    except Exception as _e:
+                        _web_result_holder["error"] = str(_e)
+
+                _web_thread = threading.Thread(target=_bg_web_search, daemon=True)
+                _web_thread.start()
 
         # 1. Smart RAG — only search documentation for queries that likely
         #    relate to ALMA/radio astronomy/technical documentation.
