@@ -172,7 +172,7 @@ function serverConvToLocal(conv: ServerConversation): Conversation {
         createdAt: new Date(conv.created_at),
         updatedAt: new Date(conv.updated_at),
         messages: [],
-        model: "",
+        model: conv.model || "",
     };
 }
 
@@ -203,7 +203,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (state.activeConversationId && state.messages.length > 0) {
             const updatedConversations = state.conversations.map(c =>
                 c.id === state.activeConversationId
-                    ? { ...c, messages: state.messages, updatedAt: new Date() }
+                    ? { ...c, messages: state.messages, updatedAt: new Date(), model: state.selectedModel }
                     : c
             );
             const conv = updatedConversations.find((c) => c.id === id);
@@ -211,10 +211,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 conversations: updatedConversations,
                 activeConversationId: id,
                 messages: conv?.messages || [],
+                selectedModel: conv?.model || state.selectedModel || "gpt-5.4-mini",
             };
         }
         const conv = state.conversations.find((c) => c.id === id);
-        return { activeConversationId: id, messages: conv?.messages || [] };
+        return {
+            activeConversationId: id,
+            messages: conv?.messages || [],
+            selectedModel: conv?.model || state.selectedModel || "gpt-5.4-mini",
+        };
     }),
 
     addMessage: (message) => set((state) => {
@@ -289,7 +294,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (state.activeConversationId && state.messages.length > 0) {
             updatedConversations = updatedConversations.map(c =>
                 c.id === state.activeConversationId
-                    ? { ...c, messages: state.messages, updatedAt: new Date() }
+                    ? { ...c, messages: state.messages, updatedAt: new Date(), model: state.selectedModel }
                     : c
             );
         }

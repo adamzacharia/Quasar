@@ -43,10 +43,17 @@ class ConversationService:
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 title TEXT,
+                model TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         ''')
+        
+        # Safe migration for existing installations
+        try:
+            cursor.execute('ALTER TABLE conversations ADD COLUMN model TEXT')
+        except Exception:
+            pass  # Column already exists
         
         # Messages table
         cursor.execute('''
@@ -102,7 +109,7 @@ class ConversationService:
         conn.commit()
         conn.close()
     
-    def create_conversation(self, user_id: str, title: str = None) -> str:
+    def create_conversation(self, user_id: str, title: str = None, model: str = None) -> str:
         """Create a new conversation, returns conversation ID"""
         conv_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
@@ -111,9 +118,9 @@ class ConversationService:
         cursor = conn.cursor()
         
         cursor.execute('''
-            INSERT INTO conversations (id, user_id, title, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (conv_id, user_id, title or "New Chat", now, now))
+            INSERT INTO conversations (id, user_id, title, model, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (conv_id, user_id, title or "New Chat", model, now, now))
         
         conn.commit()
         conn.close()
@@ -299,7 +306,7 @@ class ConversationService:
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT id, title, created_at, updated_at
+            SELECT id, title, created_at, updated_at, model
             FROM conversations 
             WHERE user_id = ?
             ORDER BY updated_at DESC
@@ -312,7 +319,8 @@ class ConversationService:
                 "id": row[0],
                 "title": row[1],
                 "created_at": row[2],
-                "updated_at": row[3]
+                "updated_at": row[3],
+                "model": row[4] if len(row) > 4 else None
             })
         
         conn.close()
@@ -326,6 +334,18 @@ class ConversationService:
         cursor.execute('''
             UPDATE conversations SET title = ? WHERE id = ?
         ''', (title, conversation_id))
+        
+        conn.commit()
+        conn.close()
+
+    def update_conversation_model(self, conversation_id: str, model: str):
+        """Update conversation model"""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE conversations SET model = ? WHERE id = ?
+        ''', (model, conversation_id))
         
         conn.commit()
         conn.close()

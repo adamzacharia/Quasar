@@ -250,6 +250,7 @@ export interface ServerConversation {
     title: string;
     created_at: string;
     updated_at: string;
+    model?: string;
 }
 
 export interface ServerMessage {
