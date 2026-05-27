@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 12    | 9     | 1           | 2       | 75%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 28    | 11    | 0           | 17      | 39%    |
-| **Total**              |**95** |**44** | **2**       | **49**  |**46%** |
+| Polish & Scale         | 35    | 16    | 0           | 19      | 46%    |
+| **Total**              |**100**|**49** | **2**       | **49**  |**49%** |
 
 ---
 
@@ -179,6 +179,7 @@ Without them, even great features feel broken.
 - [x] **PS32** DeepSeek V4 Flash Full Integration -- Added 'deepseek-v4-flash' as a selectable model across the entire stack: backend model list, frontend fallback/default lists, temperature-stripping set, and thinking-models set; Flash runs with thinking enabled at max reasoning effort, identical to V4 Pro; pricing and observability cost tracking were already in place (ui-pro/api/main.py + ui-pro/src/lib/api.ts + ui-pro/src/lib/store.ts + core/agent.py)
 - [x] **PS33** Langfuse Token & Cost Tracking Parity -- Fixed a major issue where DeepSeek, Anthropic, Google, and Local models were missing token usage and cost metrics in the Langfuse dashboard. (1) Defined standardized LLMUsage and updated LLMResponse to store usage; (2) Populated usage in non-streaming mapping functions; (3) Added stream_options to DeepSeek and Local streaming, and extracted final message/chunk usage in Anthropic and Google streams to yield usage metadata on completion. (core/llm_client.py)
 - [x] **PS34** Conversation Model Persistence -- Fixed a bug where a conversation's selected model would reset to default ("gpt-5.4-mini") on page reload or chat switching by adding model persistence across the entire stack: (1) added a nullable model column to the conversations SQLite/Turso database table with startup schema migration; (2) updated `/api/chat` and `/api/conversations` backend routes to save the active model on new messages; (3) updated frontend Zustand store and types to restore and sync the active model on conversation switch. (services/conversation_service.py + ui-pro/api/main.py + ui-pro/src/lib/api.ts + ui-pro/src/lib/store.ts)
+- [x] **PS35** Non-Native Model Document Upload Fallback -- Fixed the "Document uploads are not supported for provider 'deepseek'" error when uploading PDFs or other documents while using DeepSeek or other non-native providers. Implemented a robust server-side text extraction fallback: (1) detects when the selected model provider does not support native file upload APIs; (2) automatically extracts text contents from PDFs (via PyMuPDF) and other text formats (TXT, CSV, JSON, MD); (3) seamlessly appends the extracted document content directly to the user's prompt so they can converse with documents using any model. (ui-pro/api/main.py)
 
 ---
 

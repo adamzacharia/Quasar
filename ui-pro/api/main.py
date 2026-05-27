@@ -1700,16 +1700,22 @@ async def chat_with_files(
 
     attachment_context = None
     if document_uploads:
-        try:
-            attachment_context = provider_file_service.prepare_files(
-                provider=provider,
-                model=selected_model,
-                files=document_uploads,
-                conversation_id=conversation_id,
-                user_id=user_id,
-            )
-        except ProviderFileError as exc:
-            return _sse_error_response(str(exc))
+        if provider in {"openai", "anthropic", "google"}:
+            try:
+                attachment_context = provider_file_service.prepare_files(
+                    provider=provider,
+                    model=selected_model,
+                    files=document_uploads,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                )
+            except ProviderFileError as exc:
+                return _sse_error_response(str(exc))
+        else:
+            # Fallback for providers without native document upload support (e.g. DeepSeek)
+            # Extract document text server-side and append it directly to the message prompt
+            for preview in mixed_document_previews:
+                enriched_text += preview
 
     if image_contents:
         attachment_context = attachment_context or {
