@@ -36,7 +36,7 @@ MIN_TOKENS_BETWEEN_UPDATES = 8_000
 MIN_TOOL_CALLS_BETWEEN_UPDATES = 4
 
 # Model used for extraction (cheap + fast)
-EXTRACTION_MODEL = "gpt-4o-mini"
+EXTRACTION_MODEL = "deepseek-v4-flash"
 
 # Maximum size of the running memory file
 MAX_MEMORY_CHARS = 4_000
