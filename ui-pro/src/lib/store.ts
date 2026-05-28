@@ -182,7 +182,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     messages: [],
     isStreaming: false,
     streamingContent: "",
-    selectedModel: "gpt-5.4-mini",
+    selectedModel: "deepseek-v4-pro",
     availableModels: [
         "gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro", "deepseek-v4-flash",
     ],
@@ -211,14 +211,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 conversations: updatedConversations,
                 activeConversationId: id,
                 messages: conv?.messages || [],
-                selectedModel: conv?.model || state.selectedModel || "gpt-5.4-mini",
+                selectedModel: conv?.model || state.selectedModel || "deepseek-v4-pro",
             };
         }
         const conv = state.conversations.find((c) => c.id === id);
         return {
             activeConversationId: id,
             messages: conv?.messages || [],
-            selectedModel: conv?.model || state.selectedModel || "gpt-5.4-mini",
+            selectedModel: conv?.model || state.selectedModel || "deepseek-v4-pro",
         };
     }),
 
