@@ -38,11 +38,11 @@ class Config:
 
     @property
     def default_model(self):
-        return os.getenv("DEFAULT_LLM_MODEL", "gpt-5.4-mini")
+        return os.getenv("DEFAULT_LLM_MODEL", "deepseek-v4-pro")
 
     @property
     def ads_query_model(self):
-        return os.getenv("ADS_QUERY_MODEL", "gpt-5.4-mini")
+        return os.getenv("ADS_QUERY_MODEL", "deepseek-v4-pro")
 
     @property
     def verbose(self):
