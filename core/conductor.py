@@ -279,7 +279,7 @@ class Conductor:
         # Planning model: expensive, only used for DAG decomposition
         self.conductor_model = conductor_model or model
         # Synthesis model: cheaper, used for combining results into final answer
-        self.synthesis_model = synthesis_model or "gpt-5.4-mini"
+        self.synthesis_model = synthesis_model or "deepseek-v4-pro"
         self.tool_executor = tool_executor
         self.model_router = model_router
         self.recovery = recovery_engine
