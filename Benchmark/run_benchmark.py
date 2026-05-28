@@ -6,7 +6,7 @@ scores responses using an LLM judge, and generates charts/reports.
 
 Usage:
     python run_benchmark.py                             # Run against local backend
-    python run_benchmark.py --api-url https://quasar-7812.onrender.com  # Remote
+    python run_benchmark.py --api-url https://quasar-oi14.onrender.com  # Remote
     python run_benchmark.py --model gpt-4.1             # Specify model
     python run_benchmark.py --judge-model gpt-4o        # Specify judge model
     python run_benchmark.py --output-dir ./results       # Custom output directory

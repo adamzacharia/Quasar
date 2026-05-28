@@ -5,7 +5,7 @@ import argparse
 
 # The URLs to keep alive
 URLS = [
-    "https://quasar-7812.onrender.com",
+    "https://quasar-oi14.onrender.com",
     "https://quasar-alpha.vercel.app"
 ]
 

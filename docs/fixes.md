@@ -1,6 +1,6 @@
 # Quasar Deployment Fixes — Backend (Render) + Frontend (Vercel)
 
-This document lists all required changes to make Quasar production-ready for deployment with the backend at **Render** (`https://quasar-7812.onrender.com`) and the frontend at **Vercel**.
+This document lists all required changes to make Quasar production-ready for deployment with the backend at **Render** (`https://quasar-oi14.onrender.com`) and the frontend at **Vercel**.
 
 ---
 
@@ -74,7 +74,7 @@ Set these in **Vercel Dashboard > Settings > Environment Variables**:
 
 | Variable | Value |
 |----------|-------|
-| `NEXT_PUBLIC_API_URL` | `https://quasar-7812.onrender.com` |
+| `NEXT_PUBLIC_API_URL` | `https://quasar-oi14.onrender.com` |
 | `NEXT_PUBLIC_GOOGLE_CLIENT_ID` | `84870453296-jmmnt0c85sfb648hvb9sceggooutj5ee.apps.googleusercontent.com` |
 
 ---

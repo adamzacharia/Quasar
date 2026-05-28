@@ -59,7 +59,7 @@ Benchmark/
 
 ### Run the full benchmark
 ```bash
-python Benchmark/run_benchmark.py --api-url https://quasar-7812.onrender.com --model gpt-4.1
+python Benchmark/run_benchmark.py --api-url https://quasar-oi14.onrender.com --model gpt-4.1
 ```
 
 ### Run specific questions only
