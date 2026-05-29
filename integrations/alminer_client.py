@@ -378,7 +378,7 @@ class ALminerClient:
             print(f"Error plotting overview: {e}")
             return b""
 
-    def download_data(self, df: pd.DataFrame, dry_run: bool = True) -> str:
+    def download_data(self, df: pd.DataFrame, dry_run: bool = False) -> str:
         """
         Download data for the observations in the dataframe
         """

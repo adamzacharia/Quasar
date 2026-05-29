@@ -858,7 +858,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             parameters={
                 "type": "object",
                 "properties": {
-                    "dry_run": {"type": "boolean", "description": "If true, only simulates download. Default True."}
+                    "dry_run": {"type": "boolean", "description": "If true, only simulates download. Default False.", "default": False}
                 },
                 "required": []
             }
@@ -3991,7 +3991,7 @@ IMPORTANT RULES:
         except Exception as e:
             return {"success": False, "error": str(e), "identifier": identifier}
 
-    def _download_alma_data(self, dry_run: bool = True) -> Dict[str, Any]:
+    def _download_alma_data(self, dry_run: bool = False) -> Dict[str, Any]:
         """Download ALMA data for observations in current context"""
         try:
             if not hasattr(self, 'last_search_results') or self.last_search_results is None or self.last_search_results.empty:
