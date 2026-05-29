@@ -124,7 +124,7 @@ app.add_middleware(
 # ── Static file serving for rendered FITS images ─────────────────
 import os as _os
 from fastapi.staticfiles import StaticFiles
-_RENDERED_IMAGES_DIR = _os.path.join(_os.path.dirname(__file__), "..", "data", "rendered_images")
+_RENDERED_IMAGES_DIR = _os.path.join(_os.path.dirname(__file__), "..", "..", "data", "rendered_images")
 _os.makedirs(_RENDERED_IMAGES_DIR, exist_ok=True)
 app.mount("/api/images", StaticFiles(directory=_RENDERED_IMAGES_DIR), name="rendered_images")
 
@@ -1115,6 +1115,13 @@ def _stream_chat_response(
                 for idx in data_indices[:-1]:
                     _all_results[idx] = None
 
+            # If _all_results contains multiple items of type "conductor_result", keep only the last one.
+            # To avoid shifting indices, we replace intermediate "conductor_result" results with None.
+            conductor_indices = [i for i, r in enumerate(_all_results) if r and r.get("type") == "conductor_result"]
+            if len(conductor_indices) > 1:
+                for idx in conductor_indices[:-1]:
+                    _all_results[idx] = None
+
             # ── Process each accumulated result ──────────────────────
             _seen_result_ids = set()  # avoid duplicate emissions
             for _result_idx, _run_result in enumerate(_all_results):
@@ -1195,10 +1202,14 @@ def _stream_chat_response(
                 elif result_type == "conductor_result":
                     # Multiple images accumulated during Conductor orchestration
                     images = _run_result.get("images", [])
+                    _local_seen_img = set()
                     for img in images:
                         img_url = img.get("image_url", "")
                         caption = img.get("caption", "")
                         if img_url:
+                            if img_url in _local_seen_img:
+                                continue
+                            _local_seen_img.add(img_url)
                             image_event = json.dumps({
                                 "type": "image", "url": img_url, "caption": caption,
                             })
