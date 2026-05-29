@@ -81,7 +81,8 @@ class ModelRouter:
         ],
         "web_search": [
             r"web", r"search.*online", r"latest.*news",
-            r"schedule", r"announcement",
+            r"schedule", r"announcement", r"crawl", r"extract.*url",
+            r"site.*map", r"website", r"online.*research",
         ],
     }
 

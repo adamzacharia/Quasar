@@ -585,7 +585,7 @@ GUIDELINES:
   If web search results are also available, extract and include their email address, personal webpage, and recent news/awards at the top.
 - **RESEARCH TRENDS**: When the user asks about publication volume, field growth, or funding landscape — "How much research on FRBs?", "Is interest in X growing?", "Who funds research on Y?" — call `get_research_trends`. Returns papers-per-year breakdown and top funders.
 - **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
-- **WEB SEARCH**: Use the `web_search` tool ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. NEVER use web_search when the user asks for papers/publications — use `search_papers` instead.
+- **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` when the user gives URLs to read. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
@@ -956,7 +956,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "Search the web for real-time information: astronomy news, telescope schedules, "
                 "observatory announcements, instrument specs, call-for-proposals, or operational status updates. "
                 "NEVER use this for finding papers or publications — use search_papers (NASA ADS) instead. "
-                "Uses Tavily for grounded, source-cited results. "
+                "Uses Brave, Tavily, and Exa through Quasar's web search router for grounded, source-cited results. "
                 "Use the user's query as-is — do NOT add years or dates unless the user explicitly mentioned them. "
                 "Examples: 'ALMA proprietary period policy', 'JWST cycle 4 call for proposals', "
                 "'VLA sensitivity at 1.4 GHz'."
@@ -970,6 +970,119 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "'basic' for quick answers, 'advanced' for comprehensive research (default: basic)"},
                 },
                 "required": ["query"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="web_extract_url",
+            description=(
+                "Extract clean markdown/text from one or more specific URLs using Tavily Extract. "
+                "Use when the user gives URLs and asks to read, summarize, quote, or pull page content. "
+                "For JavaScript-heavy pages, set extract_depth='advanced'."
+            ),
+            function=self._tavily_extract_url,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "string",
+                        "description": "Single URL, comma-separated URLs, or list of URLs. Max 20.",
+                    },
+                    "query": {"type": "string", "description": "Optional focus query to return only relevant chunks."},
+                    "chunks_per_source": {"type": "integer", "description": "Relevant chunks per URL when query is provided. 1-5, default 3."},
+                    "extract_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "Use advanced for JS-heavy pages."},
+                    "include_images": {"type": "boolean", "description": "Whether to include image URLs from the pages."},
+                    "content_format": {"type": "string", "enum": ["markdown", "text"], "description": "Extracted content format."},
+                },
+                "required": ["urls"],
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="web_map_site",
+            description=(
+                "Discover URLs on a website using Tavily Map without extracting page content. "
+                "Use before crawling a large site, or when the user asks for site structure or to find the right page."
+            ),
+            function=self._tavily_map_site,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Root URL to map."},
+                    "instructions": {"type": "string", "description": "Optional natural-language filter, e.g. 'find API authentication docs'."},
+                    "max_depth": {"type": "integer", "description": "Crawl depth for URL discovery. 1-5, default 1."},
+                    "max_breadth": {"type": "integer", "description": "Links explored per page, default 20."},
+                    "limit": {"type": "integer", "description": "Maximum URLs to return. Default 100, hard-capped at 500."},
+                    "select_paths": {"type": "array", "items": {"type": "string"}, "description": "Regex path patterns to include."},
+                    "exclude_paths": {"type": "array", "items": {"type": "string"}, "description": "Regex path patterns to exclude."},
+                    "select_domains": {"type": "array", "items": {"type": "string"}, "description": "Regex domain patterns to include."},
+                    "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Regex domain patterns to exclude."},
+                    "allow_external": {"type": "boolean", "description": "Whether to include external links. Default false."},
+                },
+                "required": ["url"],
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="web_crawl_site",
+            description=(
+                "Crawl a bounded website section with Tavily Crawl and extract content from discovered pages. "
+                "Use for documentation sections or site areas where multiple pages are needed. Keep limit small unless the user asks for broad coverage."
+            ),
+            function=self._tavily_crawl_site,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Root URL to crawl."},
+                    "instructions": {"type": "string", "description": "Semantic focus for relevant pages/chunks."},
+                    "chunks_per_source": {"type": "integer", "description": "Chunks per page when instructions are provided. 1-5, default 3."},
+                    "max_depth": {"type": "integer", "description": "Crawl depth. 1-5, default 1."},
+                    "max_breadth": {"type": "integer", "description": "Links explored per page, default 20."},
+                    "limit": {"type": "integer", "description": "Maximum pages to extract. Default 20, hard-capped at 50."},
+                    "extract_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "Use advanced for JS-heavy pages."},
+                    "content_format": {"type": "string", "enum": ["markdown", "text"], "description": "Extracted content format."},
+                    "include_images": {"type": "boolean", "description": "Whether to include image URLs from crawled pages."},
+                    "select_paths": {"type": "array", "items": {"type": "string"}, "description": "Regex path patterns to include."},
+                    "exclude_paths": {"type": "array", "items": {"type": "string"}, "description": "Regex path patterns to exclude."},
+                    "select_domains": {"type": "array", "items": {"type": "string"}, "description": "Regex domain patterns to include."},
+                    "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Regex domain patterns to exclude."},
+                    "allow_external": {"type": "boolean", "description": "Whether to include external links. Default false."},
+                },
+                "required": ["url"],
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="web_research",
+            description=(
+                "Run Tavily Research for comprehensive multi-source web research with citations. "
+                "Use for deep web reports, market/landscape comparisons, or current-topic investigations. "
+                "Do not use for astronomy paper searches; use search_papers for publications."
+            ),
+            function=self._tavily_research,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "research_input": {"type": "string", "description": "Research task or question."},
+                    "model": {"type": "string", "enum": ["mini", "pro", "auto"], "description": "mini for narrow tasks, pro for broad comparisons, auto by default."},
+                    "citation_format": {"type": "string", "enum": ["numbered", "mla", "apa", "chicago"], "description": "Citation style."},
+                    "wait_for_completion": {"type": "boolean", "description": "Poll for completion before returning. Default true."},
+                    "timeout_seconds": {"type": "integer", "description": "Maximum polling time. Default 120 seconds."},
+                },
+                "required": ["research_input"],
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="web_research_status",
+            description="Get the status or completed content for a Tavily Research request_id.",
+            function=self._tavily_research_status,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string", "description": "Tavily Research request ID."}
+                },
+                "required": ["request_id"],
             }
         ))
 
@@ -2232,7 +2345,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             try:
                 search_query = self._expand_astro_query(query)
                 fallback = self.browser_service.web_search(query=search_query)
-                ret_val = {"success": True, "provider": "BrowserService (fallback)", "results": fallback, "images": []}
+                fallback_results = (
+                    fallback.get("results", [])
+                    if isinstance(fallback, dict)
+                    else fallback
+                )
+                if not isinstance(fallback_results, list):
+                    fallback_results = []
+                ret_val = {
+                    "success": True,
+                    "provider": "BrowserService (fallback)",
+                    "query": query,
+                    "results": fallback_results,
+                    "raw_text": fallback.get("raw_text", "") if isinstance(fallback, dict) else "",
+                    "images": [],
+                }
             except Exception:
                 ret_val = {"success": False, "error": "Search failed"}
 
@@ -2244,6 +2371,209 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 pass
 
         return ret_val
+
+    def _web_search_service(self):
+        """Create the shared web provider service."""
+        from services.web_search_service import WebSearchService
+
+        return WebSearchService(browser_service=self.browser_service)
+
+    def _has_web_provider_key(self) -> bool:
+        """Return True when Brave, Tavily, or Exa is configured."""
+        from services.web_search_service import WebSearchService
+
+        return WebSearchService.has_any_provider_key()
+
+    def _build_web_sources_event(self, web_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Normalize web-tool outputs into the frontend source-card event."""
+        if not isinstance(web_data, dict) or not web_data.get("success", True):
+            return None
+
+        def _source_from_item(item: Any) -> Optional[Dict[str, str]]:
+            if isinstance(item, str):
+                url = item.strip()
+                return {"title": url, "url": url, "snippet": ""} if url.startswith(("http://", "https://")) else None
+            if not isinstance(item, dict):
+                return None
+            url = str(item.get("url") or item.get("link") or item.get("href") or "").strip()
+            if not url:
+                return None
+            return {
+                "title": str(item.get("title") or item.get("name") or url).strip(),
+                "url": url,
+                "snippet": str(
+                    item.get("snippet")
+                    or item.get("content")
+                    or item.get("text")
+                    or item.get("description")
+                    or ""
+                ).strip()[:500],
+            }
+
+        def _image_from_item(item: Any) -> Optional[Dict[str, str]]:
+            if isinstance(item, str):
+                url = item.strip()
+                return {"url": url, "description": ""} if url else None
+            if not isinstance(item, dict):
+                return None
+            url = str(item.get("url") or item.get("src") or item.get("image_url") or "").strip()
+            if not url:
+                return None
+            return {
+                "url": url,
+                "description": str(
+                    item.get("description") or item.get("alt") or item.get("title") or ""
+                ).strip(),
+            }
+
+        source_items: List[Any] = []
+        for key in ("results", "sources"):
+            value = web_data.get(key)
+            if isinstance(value, list):
+                source_items.extend(value)
+
+        response = web_data.get("response")
+        if isinstance(response, dict):
+            for key in ("results", "sources"):
+                value = response.get(key)
+                if isinstance(value, list):
+                    source_items.extend(value)
+
+        seen_urls = set()
+        sources = []
+        for item in source_items:
+            source = _source_from_item(item)
+            if not source or source["url"] in seen_urls:
+                continue
+            seen_urls.add(source["url"])
+            sources.append(source)
+
+        image_items = web_data.get("images", [])
+        if isinstance(response, dict) and not image_items:
+            image_items = response.get("images", [])
+        images = []
+        if isinstance(image_items, list):
+            for item in image_items:
+                image = _image_from_item(item)
+                if image:
+                    images.append(image)
+
+        if not sources and not images:
+            return None
+
+        return {
+            "type": "web_sources",
+            "sources": sources,
+            "images": images,
+            "query": web_data.get("query", "") or web_data.get("url", ""),
+        }
+
+    @log_tool
+    def _tavily_extract_url(
+        self,
+        urls,
+        query: Optional[str] = None,
+        chunks_per_source: int = 3,
+        extract_depth: str = "basic",
+        include_images: bool = False,
+        content_format: str = "markdown",
+    ) -> Dict[str, Any]:
+        """Extract clean content from specific URLs via Tavily."""
+        return self._web_search_service().extract_tavily(
+            urls=urls,
+            query=query,
+            chunks_per_source=chunks_per_source,
+            extract_depth=extract_depth,
+            include_images=include_images,
+            content_format=content_format,
+        )
+
+    @log_tool
+    def _tavily_map_site(
+        self,
+        url: str,
+        instructions: Optional[str] = None,
+        max_depth: int = 1,
+        max_breadth: int = 20,
+        limit: int = 100,
+        select_paths: Optional[List[str]] = None,
+        exclude_paths: Optional[List[str]] = None,
+        select_domains: Optional[List[str]] = None,
+        exclude_domains: Optional[List[str]] = None,
+        allow_external: bool = False,
+    ) -> Dict[str, Any]:
+        """Discover URLs on a website via Tavily Map."""
+        return self._web_search_service().map_tavily(
+            url=url,
+            instructions=instructions,
+            max_depth=max_depth,
+            max_breadth=max_breadth,
+            limit=limit,
+            select_paths=select_paths,
+            exclude_paths=exclude_paths,
+            select_domains=select_domains,
+            exclude_domains=exclude_domains,
+            allow_external=allow_external,
+        )
+
+    @log_tool
+    def _tavily_crawl_site(
+        self,
+        url: str,
+        instructions: Optional[str] = None,
+        chunks_per_source: int = 3,
+        max_depth: int = 1,
+        max_breadth: int = 20,
+        limit: int = 20,
+        extract_depth: str = "basic",
+        content_format: str = "markdown",
+        include_images: bool = False,
+        select_paths: Optional[List[str]] = None,
+        exclude_paths: Optional[List[str]] = None,
+        select_domains: Optional[List[str]] = None,
+        exclude_domains: Optional[List[str]] = None,
+        allow_external: bool = False,
+    ) -> Dict[str, Any]:
+        """Crawl and extract a bounded website section via Tavily Crawl."""
+        return self._web_search_service().crawl_tavily(
+            url=url,
+            instructions=instructions,
+            chunks_per_source=chunks_per_source,
+            max_depth=max_depth,
+            max_breadth=max_breadth,
+            limit=limit,
+            extract_depth=extract_depth,
+            content_format=content_format,
+            include_images=include_images,
+            select_paths=select_paths,
+            exclude_paths=exclude_paths,
+            select_domains=select_domains,
+            exclude_domains=exclude_domains,
+            allow_external=allow_external,
+        )
+
+    @log_tool
+    def _tavily_research(
+        self,
+        research_input: str,
+        model: str = "auto",
+        citation_format: str = "numbered",
+        wait_for_completion: bool = True,
+        timeout_seconds: int = 120,
+    ) -> Dict[str, Any]:
+        """Run Tavily Research and return a cited report when available."""
+        return self._web_search_service().research_tavily(
+            research_input=research_input,
+            model=model,
+            citation_format=citation_format,
+            wait_for_completion=wait_for_completion,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @log_tool
+    def _tavily_research_status(self, request_id: str) -> Dict[str, Any]:
+        """Fetch a Tavily Research task by request_id."""
+        return self._web_search_service().get_tavily_research_status(request_id=request_id)
 
     @log_tool
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
@@ -4722,7 +5052,7 @@ IMPORTANT RULES:
                     _web_search_reason = "cutoff"
                 else:
                     # Run deepseek-v4-flash intent classification fallback
-                    if os.getenv("TAVILY_API_KEY", "") and self._detect_web_search_needed_via_llm(_user_query):
+                    if self._has_web_provider_key() and self._detect_web_search_needed_via_llm(_user_query):
                         _web_search_query = _user_query
                         _web_search_reason = "intent_detection"
 
@@ -4923,7 +5253,7 @@ IMPORTANT RULES:
             #   1. General context search (bio, news, awards, personal page)
             #   2. Targeted email/contact search (faculty page, directory)
             # Both run concurrently with zero extra latency.
-            if _is_researcher_query and _web_thread is None and os.getenv("TAVILY_API_KEY", ""):
+            if _is_researcher_query and _web_thread is None and self._has_web_provider_key():
                 _web_search_reason = "researcher_supplement"
                 if on_status:
                     on_status("Searching the web for researcher profile", "running")
@@ -5057,7 +5387,7 @@ IMPORTANT RULES:
                     # - Policy/proposal questions that change over time
                     # - Queries explicitly asking for latest/recent/current info
                     _needs_web_supplement = False
-                    if _web_thread is None and os.getenv("TAVILY_API_KEY", ""):
+                    if _web_thread is None and self._has_web_provider_key():
                         _uq = _user_query.lower()
 
                         # Check if the user explicitly requested NOT to use web search
@@ -5348,12 +5678,9 @@ IMPORTANT RULES:
 
                             # Emit web_sources event for frontend source cards + image grid
                             if on_event:
-                                on_event({
-                                    "type": "web_sources",
-                                    "sources": web_data.get("results", []),
-                                    "images": web_data.get("images", []),
-                                    "query": web_data.get("query", ""),
-                                })
+                                web_event = self._build_web_sources_event(web_data)
+                                if web_event:
+                                    on_event(web_event)
                     # Re-emit accumulated images via last_run_result so the SSE
                     # loop in main.py can emit them as inline image events.
                     if hasattr(self, '_conductor_images') and self._conductor_images:
@@ -5647,13 +5974,17 @@ IMPORTANT RULES:
 
                             # Emit web_sources event for LLM-initiated web searches
                             # so source cards + images always appear in the UI.
-                            if tool_name == "web_search" and isinstance(result, dict) and result.get("success"):
-                                on_event({
-                                    "type": "web_sources",
-                                    "sources": result.get("results", []),
-                                    "images": result.get("images", []),
-                                    "query": result.get("query", ""),
-                                })
+                            if tool_name in {
+                                "web_search",
+                                "web_extract_url",
+                                "web_map_site",
+                                "web_crawl_site",
+                                "web_research",
+                                "web_research_status",
+                            } and isinstance(result, dict) and result.get("success"):
+                                web_event = self._build_web_sources_event(result)
+                                if web_event:
+                                    on_event(web_event)
                         except Exception as te:
                             result_str = json.dumps({"error": str(te)})
                     else:
@@ -5719,12 +6050,9 @@ IMPORTANT RULES:
 
                     # Emit web_sources event for frontend source cards + image grid
                     if on_event:
-                        on_event({
-                            "type": "web_sources",
-                            "sources": web_data.get("results", []),
-                            "images": web_data.get("images", []),
-                            "query": web_data.get("query", ""),
-                        })
+                        web_event = self._build_web_sources_event(web_data)
+                        if web_event:
+                            on_event(web_event)
                 elif _web_result_holder.get("error"):
                     print(f"[WEB SEARCH] Parallel web search failed: {_web_result_holder['error']}")
             

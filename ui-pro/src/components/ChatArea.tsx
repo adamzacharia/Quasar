@@ -10,7 +10,7 @@ import { ChatMessage } from "./ChatMessage";
 import { DownloadProgress } from "./DownloadProgress";
 import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
-import type { Message, DataTableResult, Paper, ToolCall, NotebookData } from "../lib/types";
+import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
 import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
@@ -20,8 +20,8 @@ function generateId(): string { return Date.now().toString(36) + Math.random().t
 export function ChatArea() {
     const {
         messages, addMessage, updateLastAssistantMessage, updateLastAssistantThinking,
-        isStreaming, setStreaming, streamingContent,
-        sidebarOpen, toggleSidebar,
+        isStreaming, setStreaming,
+        toggleSidebar,
         activeConversationId, setActiveConversation,
         selectedModel, conversations,
         toggleStar,
@@ -40,7 +40,6 @@ export function ChatArea() {
         tokenRef.current = token ?? null;
     }, [token]);
 
-    const messagesEndRef = useRef<HTMLDivElement>(null);
     const [inputValue, setInputValue] = useState("");
     const abortControllerRef = useRef<AbortController | null>(null);
     const [downloadProgress, setDownloadProgress] = useState<{
@@ -65,23 +64,60 @@ export function ChatArea() {
     // Only scroll to bottom if the user hasn't manually scrolled up.
     // This lets users read earlier messages while the agent is streaming.
     const userScrolledUpRef = useRef(false);
+    const userScrollIntentRef = useRef(false);
+    const scrollIntentTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const autoScrollRafRef = useRef<number | null>(null);
     const [showScrollBtn, setShowScrollBtn] = useState(false);
+
+    const markUserScrollIntent = useCallback(() => {
+        userScrollIntentRef.current = true;
+        if (scrollIntentTimeoutRef.current) {
+            clearTimeout(scrollIntentTimeoutRef.current);
+        }
+        scrollIntentTimeoutRef.current = setTimeout(() => {
+            userScrollIntentRef.current = false;
+        }, 250);
+    }, []);
 
     const handleScroll = useCallback(() => {
         if (!scrollRef.current) return;
         const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
         const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-        // If user is more than 150px from bottom, they've scrolled up intentionally
-        const scrolledUp = distanceFromBottom > 150;
-        userScrolledUpRef.current = scrolledUp;
-        setShowScrollBtn(scrolledUp);
+        const nearBottom = distanceFromBottom <= 80;
+
+        if (nearBottom) {
+            userScrolledUpRef.current = false;
+            setShowScrollBtn(false);
+            return;
+        }
+
+        if (userScrollIntentRef.current) {
+            userScrolledUpRef.current = true;
+            setShowScrollBtn(true);
+        }
     }, []);
 
     useEffect(() => {
-        if (scrollRef.current && !userScrolledUpRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        if (!scrollRef.current || userScrolledUpRef.current) return;
+
+        if (autoScrollRafRef.current !== null) {
+            cancelAnimationFrame(autoScrollRafRef.current);
         }
-    }, [messages, thinkingSteps]);
+
+        autoScrollRafRef.current = requestAnimationFrame(() => {
+            if (scrollRef.current && !userScrolledUpRef.current) {
+                scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+            }
+            autoScrollRafRef.current = null;
+        });
+    }, [messages, thinkingSteps, taskGroups, taskItems, taskChecklist]);
+
+    useEffect(() => {
+        return () => {
+            if (scrollIntentTimeoutRef.current) clearTimeout(scrollIntentTimeoutRef.current);
+            if (autoScrollRafRef.current !== null) cancelAnimationFrame(autoScrollRafRef.current);
+        };
+    }, []);
 
     // Reset scroll lock when the user sends a new message
     useEffect(() => {
@@ -98,6 +134,50 @@ export function ChatArea() {
             userScrolledUpRef.current = false;
             setShowScrollBtn(false);
         }
+    }, []);
+
+    const normalizeWebSourcesPayload = useCallback((data: { sources?: unknown; images?: unknown }) => {
+        const isWebSource = (source: WebSource | null): source is WebSource => source !== null;
+        const isWebImage = (image: WebImage | null): image is WebImage => image !== null;
+
+        const normalizeWebSource = (source: unknown): WebSource | null => {
+            if (!source || typeof source !== "object") return null;
+            const item = source as Record<string, unknown>;
+            const url = String(item.url || item.link || item.href || "").trim();
+            if (!url) return null;
+            return {
+                title: String(item.title || item.name || url).trim(),
+                url,
+                snippet: String(item.snippet || item.content || item.text || item.description || "").trim(),
+            };
+        };
+
+        const normalizeWebImage = (image: unknown): WebImage | null => {
+            if (typeof image === "string") {
+                const url = image.trim();
+                return url ? { url, description: "" } : null;
+            }
+            if (!image || typeof image !== "object") return null;
+            const item = image as Record<string, unknown>;
+            const url = String(item.url || item.src || item.image_url || "").trim();
+            if (!url) return null;
+            return {
+                url,
+                description: String(item.description || item.alt || item.title || "").trim(),
+            };
+        };
+
+        const rawSources = Array.isArray(data.sources)
+            ? data.sources
+            : data.sources && typeof data.sources === "object" && Array.isArray((data.sources as Record<string, unknown>).results)
+                ? ((data.sources as Record<string, unknown>).results as unknown[])
+                : [];
+        const rawImages = Array.isArray(data.images) ? data.images : [];
+
+        return {
+            sources: rawSources.map(normalizeWebSource).filter(isWebSource),
+            images: rawImages.map(normalizeWebImage).filter(isWebImage),
+        };
     }, []);
 
     const handleStop = useCallback(() => {
@@ -307,14 +387,17 @@ export function ChatArea() {
                             });
                         },
                         onWebSources: (data) => {
+                            const normalized = normalizeWebSourcesPayload(data);
+                            if (normalized.sources.length === 0 && normalized.images.length === 0) return;
+
                             addMessage({
                                 id: generateId(),
                                 role: "assistant",
                                 content: "",
                                 type: "web_sources",
                                 timestamp: new Date(),
-                                webSources: data.sources,
-                                webImages: data.images,
+                                webSources: normalized.sources,
+                                webImages: normalized.images,
                             });
                         },
                         onDownloadProgress: (data) => {
@@ -366,6 +449,7 @@ export function ChatArea() {
     }, [
         addMessage,
         updateLastAssistantMessage,
+        updateLastAssistantThinking,
         setStreaming,
         isStreaming,
         activeConversationId,
@@ -382,7 +466,7 @@ export function ChatArea() {
         setActiveConversationId,
         loadConversations,
         isAuthenticated,
-        pendingPlan,
+        normalizeWebSourcesPayload,
     ]);
 
     // ── Plan review handlers ────────────────────────────────────
@@ -451,7 +535,14 @@ export function ChatArea() {
             </header>
 
             {hasMessages ? (
-                <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6">
+                <div
+                    ref={scrollRef}
+                    onScroll={handleScroll}
+                    onWheel={markUserScrollIntent}
+                    onTouchStart={markUserScrollIntent}
+                    onTouchMove={markUserScrollIntent}
+                    className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6"
+                >
                     <div className="max-w-4xl mx-auto space-y-6">
                         {(() => {
                             // Find the last text-type assistant message for attaching thinking/task state

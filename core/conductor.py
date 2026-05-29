@@ -85,6 +85,10 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
 
 **Web tools (agent_type: "web")**:
 - web_search: Web search for real-time info, news, schedules. NEVER for papers — use search_papers instead.
+- web_extract_url: Extract clean content from specific URLs.
+- web_map_site: Discover URLs and site structure before extraction/crawl.
+- web_crawl_site: Crawl bounded documentation/site sections.
+- web_research: Comprehensive current web research reports with citations. NEVER for papers — use search_papers instead.
 
 **CRITICAL**: We do NOT have VLA, VLBA, or GBT archive search. Do NOT create tasks to search VLA or any non-ALMA radio archive.
 
@@ -169,7 +173,7 @@ or modify sub-tasks. Keep the same JSON format. Ensure dependencies remain valid
 Available agent types: "archive", "literature", "analysis", "compute", "web", "synthesis".
 Available tools: search_by_target, search_by_position, search_cadc_archive, resolve_target,
 check_co_lines, check_line_coverage, search_lines_by_molecule, filter_results,
-search_papers, web_search.
+search_papers, web_search, web_extract_url, web_map_site, web_crawl_site, web_research.
 
 Respond with ONLY valid JSON:
 {{
