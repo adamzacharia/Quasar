@@ -1235,7 +1235,11 @@ def _stream_chat_response(
                 yield f"data: {data}\n\n"
 
             # ── Persist assistant response + rich UI data to DB ─────
-            if current_user_id and conv_id and response_text:
+            if current_user_id and conv_id and (
+                response_text or _rich_data_tables or _rich_data_table or
+                _rich_papers or _rich_notebook or _rich_image or
+                _rich_thinking or _rich_thinking_text
+            ):
                 try:
                     rich_meta = {}
                     if _rich_data_tables:
@@ -1258,7 +1262,7 @@ def _stream_chat_response(
                     if _rich_thinking_text:
                         rich_meta["thinking"] = _rich_thinking_text
                     conversation_service.save_message(
-                        conv_id, "assistant", response_text,
+                        conv_id, "assistant", response_text or "",
                         metadata=rich_meta if rich_meta else None,
                     )
                 except Exception as e:

@@ -5412,9 +5412,14 @@ IMPORTANT RULES:
             _token_budget = TokenBudget(max_budget=100_000)
             last_id = self._get_response_id(conversation_id)
             output_text = ""
+            _had_tool_calls = False
             
             # 5. Call Responses API with manual streaming loop
             for _round in range(_token_budget.HARD_MAX_ITERATIONS if hasattr(_token_budget, 'HARD_MAX_ITERATIONS') else 25):
+                _buffer_round_text = _round == 0 and (
+                    _is_archive_fetch or _is_paper_query or _is_openalex_query
+                )
+                _round_text_buffer = ""
                 request_kwargs = {
                     "model": self.config.model,
                     "input": full_input if _round == 0 else tool_results,
@@ -5512,8 +5517,11 @@ IMPORTANT RULES:
                                 on_status("🧠 Reasoning", "completed")
                             _reasoning_summary_text = ""
                             _reasoning_emitted = False
-                        output_text += event.delta
-                        if on_token:
+                        if _buffer_round_text:
+                            _round_text_buffer += event.delta
+                        else:
+                            output_text += event.delta
+                        if on_token and not _buffer_round_text:
                             on_token(event.delta)
                     elif event.type == "response.output_item.added":
                         # Check if it's a function_call item
@@ -5600,7 +5608,18 @@ IMPORTANT RULES:
                                             }
                 
                 if not function_calls:
+                    if _buffer_round_text and _round_text_buffer:
+                        output_text += _round_text_buffer
+                        if on_token:
+                            on_token(_round_text_buffer)
                     break  # No tool calls — we have the final text
+
+                _had_tool_calls = True
+                if _buffer_round_text and _round_text_buffer:
+                    print(
+                        f"[STREAM] Suppressed pre-tool assistant text "
+                        f"({len(_round_text_buffer)} chars)"
+                    )
 
                 # Track output growth for smart budget
                 _token_budget.record_output(len(output_text))
@@ -5694,7 +5713,10 @@ IMPORTANT RULES:
                 on_status("Generating response", "running")
                 on_status("Generating response", "completed")
 
-            if not output_text:
+            _has_rich_tool_output = bool(
+                getattr(self, "_accumulated_run_results", None) or self.last_run_result
+            )
+            if not output_text and (not _had_tool_calls or not _has_rich_tool_output):
                 output_text = "I processed your query but didn't generate a text response. Please try rephrasing."
                 if on_token:
                     on_token(output_text)

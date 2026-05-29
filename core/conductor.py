@@ -415,7 +415,7 @@ class Conductor:
             subtasks = subtasks[:effective_max]
 
         if not subtasks:
-            self._emit_status("Query is simple — using direct response", "completed", status_fn)
+            self._emit_status("Planner selected direct tool-calling path", "completed", status_fn)
             return None  # Caller falls back to standard path
 
         # Build the DAG
