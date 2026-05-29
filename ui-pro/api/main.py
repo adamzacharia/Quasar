@@ -1014,16 +1014,20 @@ def _stream_chat_response(
                                 # Use inline data if available
                                 _eager_result = _pending_eager_data.pop(0) if _pending_eager_data else None
                                 if _eager_result:
-                                    card = _build_data_card_event(_eager_result)
-                                    if card:
-                                        _event_str, _rich = card
-                                        _tn = _eager_result.get("tool_name", "search_alma_archive")
-                                        yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results'})}\n\n"
-                                        yield _event_str
-                                        _rich_data_tables.append(_rich)
-                                        _rich_data_table = _rich
-                                        _eagerly_emitted.add(_eager_idx)
-                                        print(f"[EAGER] Data card emitted for idx={_eager_idx} during streaming")
+                                    if _eager_result.get("type") == "data":
+                                        # Do not eagerly emit data cards during streaming to avoid showing intermediate results
+                                        print(f"[EAGER] Bypassed eager emission for data card idx={_eager_idx} during streaming")
+                                    else:
+                                        card = _build_data_card_event(_eager_result)
+                                        if card:
+                                            _event_str, _rich = card
+                                            _tn = _eager_result.get("tool_name", "search_alma_archive")
+                                            yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results'})}\n\n"
+                                            yield _event_str
+                                            _rich_data_tables.append(_rich)
+                                            _rich_data_table = _rich
+                                            _eagerly_emitted.add(_eager_idx)
+                                            print(f"[EAGER] Data card emitted for idx={_eager_idx} during streaming")
                             except Exception as _eager_err:
                                 print(f"[WARN] Eager data card emission failed: {_eager_err}")
                         elif isinstance(step, str) and step.startswith("__event__"):
@@ -1102,6 +1106,14 @@ def _stream_chat_response(
                         break
                 if not _already_present:
                     _all_results.append(_last_result)
+
+            # If _all_results contains multiple items of type "data", keep only the last one.
+            # To avoid shifting indices of other results (which would break _eagerly_emitted check),
+            # we replace intermediate "data" results with None.
+            data_indices = [i for i, r in enumerate(_all_results) if r and r.get("type") == "data"]
+            if len(data_indices) > 1:
+                for idx in data_indices[:-1]:
+                    _all_results[idx] = None
 
             # ── Process each accumulated result ──────────────────────
             _seen_result_ids = set()  # avoid duplicate emissions
