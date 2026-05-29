@@ -64,10 +64,6 @@ interface ChatStore {
     clearAllConversations: () => void;
 }
 
-function generateId(): string {
-    return Date.now().toString(36) + Math.random().toString(36).slice(2);
-}
-
 function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     const base: Message = {
         id: `srv-${index}-${Date.now().toString(36)}`,
@@ -159,6 +155,22 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             timestamp: new Date(),
             imageUrl: imageUrl,
             imageCaption: img.caption || "",
+        });
+    }
+
+    // Restore web source cards from metadata (same as live SSE)
+    if (
+        (meta.webSources && Array.isArray(meta.webSources) && meta.webSources.length > 0) ||
+        (meta.webImages && Array.isArray(meta.webImages) && meta.webImages.length > 0)
+    ) {
+        messages.push({
+            id: `srv-${index}-web-${Date.now().toString(36)}`,
+            role: "assistant",
+            content: "",
+            type: "web_sources",
+            timestamp: new Date(),
+            webSources: (meta.webSources as Message["webSources"]) || [],
+            webImages: (meta.webImages as Message["webImages"]) || [],
         });
     }
 

@@ -972,6 +972,8 @@ def _stream_chat_response(
             _rich_papers = None
             _rich_notebook = None
             _rich_image = None
+            _rich_web_sources = []
+            _rich_web_images = []
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
@@ -1045,6 +1047,9 @@ def _stream_chat_response(
                                             _plan_feedback_queues[new_cid] = _pfq
                                         _pfq_key[0] = new_cid
                                         print(f"[HITL] Re-keyed plan feedback queue: {old_key[:20]}... → {new_cid[:20]}...")
+                                if event_parsed.get("type") == "web_sources":
+                                    _rich_web_sources = event_parsed.get("sources") or []
+                                    _rich_web_images = event_parsed.get("images") or []
                                 yield f"data: {event_json}\n\n"
                             except Exception:
                                 yield _sse_status(step, state)
@@ -1239,6 +1244,7 @@ def _stream_chat_response(
             if current_user_id and conv_id and (
                 response_text or _rich_data_tables or _rich_data_table or
                 _rich_papers or _rich_notebook or _rich_image or
+                _rich_web_sources or _rich_web_images or
                 _rich_thinking or _rich_thinking_text
             ):
                 try:
@@ -1258,6 +1264,10 @@ def _stream_chat_response(
                         rich_meta["notebook"] = _rich_notebook
                     if _rich_image:
                         rich_meta["image"] = _rich_image
+                    if _rich_web_sources:
+                        rich_meta["webSources"] = _rich_web_sources
+                    if _rich_web_images:
+                        rich_meta["webImages"] = _rich_web_images
                     if _rich_thinking:
                         rich_meta["thinkingSteps"] = _rich_thinking
                     if _rich_thinking_text:
