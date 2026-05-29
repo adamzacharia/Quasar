@@ -1066,6 +1066,50 @@ class ResponsesShim:
             usage=usage,
         )
 
+    @staticmethod
+    def _inject_images_into_messages(
+        messages: list,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> list:
+        """Inject image attachments into the last user message for vision-capable models.
+
+        DeepSeek V4 supports the same multimodal content format as OpenAI:
+            content = [{"type": "text", "text": ...}, {"type": "image_url", "image_url": {...}}]
+
+        This method finds the last user message and converts its plain-text
+        ``content`` string into a multimodal content array.
+        """
+        if not attachments:
+            return messages
+
+        # Collect image_url attachments
+        image_parts = []
+        for att in attachments:
+            if att.get("type") == "image_url" or "image_url" in att:
+                image_parts.append({
+                    "type": "image_url",
+                    "image_url": att.get("image_url") or att,
+                })
+
+        if not image_parts:
+            return messages
+
+        # Find the last user message and convert to multimodal
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                existing = messages[i]["content"]
+                if isinstance(existing, str):
+                    content_parts = [{"type": "text", "text": existing}]
+                elif isinstance(existing, list):
+                    content_parts = list(existing)
+                else:
+                    content_parts = [{"type": "text", "text": str(existing)}]
+                content_parts.extend(image_parts)
+                messages[i] = dict(messages[i], content=content_parts)
+                break
+
+        return messages
+
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
         """Translate responses.create() to DeepSeek Chat Completions API."""
@@ -1089,6 +1133,9 @@ class ResponsesShim:
             self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data, json_mode)
+
+        # Inject image attachments for vision support
+        messages = self._inject_images_into_messages(messages, attachments)
 
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
         tool_choice = kwargs.get("tool_choice", None)
@@ -1165,6 +1212,9 @@ class ResponsesShim:
             self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data)
+
+        # Inject image attachments for vision support
+        messages = self._inject_images_into_messages(messages, attachments)
 
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
         tool_choice = kwargs.get("tool_choice", None)
