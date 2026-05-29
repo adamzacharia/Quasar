@@ -5823,7 +5823,16 @@ IMPORTANT RULES:
                 try:
                     response_stream = self.client.responses.create(**request_kwargs)
                 except Exception as e:
-                    if "No tool output found for function call" in str(e) and "previous_response_id" in request_kwargs:
+                    _is_hanging_tool_err = any(
+                        msg in str(e)
+                        for msg in [
+                            "No tool output found for function call",
+                            "must be followed by tool messages",
+                            "insufficient tool messages",
+                            "tool_calls",
+                        ]
+                    )
+                    if _is_hanging_tool_err and "previous_response_id" in request_kwargs:
                         # Recover from hanging tool call in a previous interrupted turn
                         print(f"[WARNING] Recovering from hanging tool call state for conv={conversation_id}. Dropping previous_response_id.")
                         del request_kwargs["previous_response_id"]
@@ -6155,7 +6164,16 @@ IMPORTANT RULES:
         except Exception as e:
             # If the error is about a hanging tool call, clear the poisoned
             # response ID for THIS conversation so it doesn't keep failing.
-            if "No tool output found for function call" in str(e):
+            _is_hanging_tool_err = any(
+                msg in str(e)
+                for msg in [
+                    "No tool output found for function call",
+                    "must be followed by tool messages",
+                    "insufficient tool messages",
+                    "tool_calls",
+                ]
+            )
+            if _is_hanging_tool_err:
                 print(f"[WARNING] Clearing poisoned response_id for conv={conversation_id} to break error loop.")
                 self._set_response_id(conversation_id, None)
             error_msg = f"Error with Responses API: {str(e)}"
