@@ -71,7 +71,7 @@ class ComplexityDetector:
 
     THRESHOLD = 0.7  # queries scoring above this are treated as complex
 
-    def __init__(self, client: OpenAI, model: str = "gpt-4o-mini"):
+    def __init__(self, client: OpenAI, model: str = "deepseek-v4-flash"):
         self.client = client
         self.model = model
 

@@ -257,7 +257,7 @@ class QuasarAgent:
         # Initialize complexity detector (gates Conductor activation)
         print("DEBUG: Init ComplexityDetector")
         self.complexity_detector = ComplexityDetector(
-            client=self.client, model="gpt-4o-mini"
+            client=self.client, model="deepseek-v4-flash"
         )
 
         # Initialize sandbox executor (for Conductor "compute" agent type)
