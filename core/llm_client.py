@@ -1000,6 +1000,21 @@ class ResponsesShim:
 
         return messages
 
+    def _append_chat_input(self, messages: list, input_data) -> None:
+        """Append Responses-style input to an existing Chat Completions history."""
+        if isinstance(input_data, str):
+            messages.append({"role": "user", "content": input_data})
+        elif isinstance(input_data, list):
+            for item in input_data:
+                if isinstance(item, dict) and item.get("type") == "function_call_output":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", ""),
+                        "content": item.get("output", ""),
+                    })
+        else:
+            messages.append({"role": "user", "content": str(input_data)})
+
     def _translate_tools_for_chat_completions(self, tools: list) -> list:
         """Convert Responses API flat tool format to Chat Completions nested format."""
         cc_tools = []
@@ -1071,14 +1086,7 @@ class ResponsesShim:
         # Load from history cache if available to chain message history
         if prev_id and prev_id in self._history_cache:
             messages = list(self._history_cache[prev_id])
-            if isinstance(input_data, list):
-                for item in input_data:
-                    if isinstance(item, dict) and item.get("type") == "function_call_output":
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": item.get("call_id", ""),
-                            "content": item.get("output", ""),
-                        })
+            self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data, json_mode)
 
@@ -1154,14 +1162,7 @@ class ResponsesShim:
         # Load from history cache if available to chain message history
         if prev_id and prev_id in self._history_cache:
             messages = list(self._history_cache[prev_id])
-            if isinstance(input_data, list):
-                for item in input_data:
-                    if isinstance(item, dict) and item.get("type") == "function_call_output":
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": item.get("call_id", ""),
-                            "content": item.get("output", ""),
-                        })
+            self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data)
 
