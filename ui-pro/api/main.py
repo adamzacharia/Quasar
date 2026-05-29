@@ -844,7 +844,8 @@ def _stream_chat_response(
 
         # Personal RAG retrieval for authenticated users only.
         enriched_message = request.message
-        if current_user:
+        from services.rag_service import is_domain_relevant
+        if current_user and is_domain_relevant(request.message):
             user_id = current_user.get("sub")
             if user_id:
                 try:

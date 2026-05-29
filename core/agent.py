@@ -2197,9 +2197,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     @log_tool
     def _tavily_web_search(self, query: str, max_results: int = 10, search_depth: str = "basic") -> Dict[str, Any]:
         """
-        Real-time web search powered by Tavily.
+        Real-time web search routed dynamically between Brave, Tavily, and Exa.
         Returns source URLs + related images for ChatGPT-style inline display.
-        Falls back to BrowserService if Tavily key is unavailable.
+        Falls back to BrowserService if keys are unavailable.
         """
         # ── Langfuse: create a child span for this tool call ──
         from core.llm_client import get_langfuse_parent
@@ -2208,73 +2208,29 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         if parent:
             try:
                 lf_span = parent.span(
-                    name="tool: tavily_web_search",
+                    name="tool: web_search",
                     input=query,
                     metadata={"max_results": max_results, "search_depth": search_depth}
                 )
             except Exception:
                 pass
 
-        # Expand astronomy acronyms — only needed for dumb keyword search
-        # engines (BrowserService fallback). Tavily is AI-powered and handles
-        # acronyms natively; expanding pollutes the query and returns generic
-        # results instead of matching the user's specific intent.
-        search_query = self._expand_astro_query(query)
-        if search_query != query:
-            print(f"[WEB SEARCH] Expanded query (for fallback): {query!r} → {search_query!r}")
-
         ret_val = None
-        tavily_key = os.getenv("TAVILY_API_KEY", "")
-        if tavily_key:
+        try:
+            from services.web_search_service import WebSearchService
+            search_service = WebSearchService(browser_service=self.browser_service)
+            ret_val = search_service.route_and_search(
+                query=query,
+                max_results=max_results,
+                search_depth=search_depth
+            )
+        except Exception as e:
+            print(f"[SEARCH ROUTER] Router execution failed: {e}. Falling back to basic BrowserService.")
+
+        # -- Ultimate Fallback: BrowserService --
+        if not ret_val or not ret_val.get("success"):
             try:
-                from tavily import TavilyClient
-                client = TavilyClient(api_key=tavily_key)
-                max_results = min(int(max_results), 10)
-                # Use the RAW query — Tavily's AI understands acronyms
-                response = client.search(
-                    query=query,
-                    max_results=max_results,
-                    search_depth=search_depth,
-                    include_answer=True,
-                    include_images=True,
-                    include_image_descriptions=True,
-                    include_raw_content=False,
-                )
-                # Build source results with full URLs for citation cards
-                results = []
-                for r in response.get("results", []):
-                    results.append({
-                        "title":   r.get("title", ""),
-                        "url":     r.get("url", ""),
-                        "snippet": r.get("content", "")[:500],
-                    })
-
-                # Extract images (top-level query images from Tavily)
-                images = []
-                for img in response.get("images", []):
-                    if isinstance(img, dict):
-                        images.append({
-                            "url": img.get("url", ""),
-                            "description": img.get("description", ""),
-                        })
-                    elif isinstance(img, str):
-                        images.append({"url": img, "description": ""})
-
-                ret_val = {
-                    "success":      True,
-                    "provider":     "Tavily",
-                    "query":        query,
-                    "answer":       response.get("answer", ""),
-                    "results":      results,
-                    "images":       images[:6],  # cap at 6 images
-                    "result_count": len(results),
-                }
-            except Exception as e:
-                print(f"[WARN] Tavily search failed: {e}. Falling back to BrowserService.")
-
-        # -- Fallback: BrowserService --
-        if not ret_val:
-            try:
+                search_query = self._expand_astro_query(query)
                 fallback = self.browser_service.web_search(query=search_query)
                 ret_val = {"success": True, "provider": "BrowserService (fallback)", "results": fallback, "images": []}
             except Exception:
@@ -4849,8 +4805,9 @@ IMPORTANT RULES:
             "millimeter", "ghz", "mhz", "jy", "arcsec",
             "fits", "measurement set", "uvfits", "clean", "tclean",
         }
-        _query_lower = query.lower()
-        _should_rag = any(kw in _query_lower for kw in _rag_keywords)
+        _query_lower = _user_query.lower()
+        from services.rag_service import is_domain_relevant
+        _should_rag = is_domain_relevant(_user_query) and any(kw in _query_lower for kw in _rag_keywords)
 
         # Skip RAG for pure archive data-fetch queries — the user wants data
         # from the live archive, not ALMA technical documentation.
@@ -5032,8 +4989,9 @@ IMPORTANT RULES:
                         _rag_min_year = _cycle_yr
 
                 docs = self.rag_service.search(
-                    query,
+                    _user_query,
                     min_year=_rag_min_year,
+                    min_score=0.35,
                 )
                 if docs:
                     context_pieces = []
@@ -5111,8 +5069,13 @@ IMPORTANT RULES:
                         if _explicit_no_web:
                             _needs_web_supplement = False
                         else:
-                            # As per user directive: RAG queries always trigger web search
-                            _needs_web_supplement = True
+                            # Trigger web search only if the query asks for fresh/current info
+                            _FRESHNESS_KEYWORDS = re.compile(
+                                r'\b(?:latest|current|recent|today|now|deadline|schedule|'
+                                r'status|update|20(?:2[5-9]|[3-9]\d)|cycle\s*\d{1,2})\b',
+                                re.IGNORECASE,
+                            )
+                            _needs_web_supplement = bool(_FRESHNESS_KEYWORDS.search(_user_query))
 
                     if _needs_web_supplement:
                         _web_search_reason = "rag_supplement"

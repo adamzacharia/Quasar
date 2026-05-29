@@ -104,6 +104,54 @@ CATEGORY_MAP = {
     "mem0":                   "internal",
 }
 
+# Smalltalk / off-domain patterns — fast reject
+_OFFDOMAIN_PATTERNS = re.compile(
+    r'^\s*(?:'
+    r'(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|howdy|yo)\b'
+    r'|(?:tell\s+me\s+a\s+joke|make\s+me\s+laugh|something\s+funny)'
+    r'|(?:thanks?|thank\s+you|thx|cheers|great|ok|okay|cool|nice|awesome|perfect|got\s+it)'
+    r'|(?:bye|goodbye|see\s+you|later|ciao)'
+    r'|(?:who\s+are\s+you|what\s+(?:are|can)\s+you|your\s+name)'
+    r'|(?:what\s+(?:is|are)\s+\d+\s*[\+\-\*/x×÷]\s*\d+)'  # basic arithmetic
+    r'|(?:write\s+(?:a\s+)?(?:poem|song|story|essay|haiku))'
+    r'|(?:translate\s+.+\s+(?:to|into)\s+\w+)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Curated domain keywords — fast accept
+_DOMAIN_KEYWORDS = {
+    "alma", "band", "frequency", "calibration", "correlator", "antenna",
+    "baseline", "spectral", "continuum", "imaging", "pipeline", "casa",
+    "interferometry", "receiver", "sensitivity", "proposal", "proprietary",
+    "archive", "cycle", "mosaic", "polarization", "flux", "beam",
+    "spectral window", "spw", "bandwidth", "scheduling", "phase",
+    "technical handbook", "vla", "vlba", "gbt", "radio", "submillimeter",
+    "millimeter", "ghz", "mhz", "jy", "arcsec", "fits", "measurement set",
+    "uvfits", "tclean", "galaxy", "quasar", "pulsar", "nebula", "star",
+    "planet", "redshift", "luminosity", "magnitude", "photometry",
+    "spectroscopy", "emission", "absorption", "telescope", "observatory",
+    "observation", "survey", "catalog", "astrometry", "cosmology",
+    "dark matter", "dark energy", "supernova", "black hole", "exoplanet",
+    "protoplanetary", "molecular cloud", "interstellar", "circumstellar",
+    "agn", "smbh", "ism", "igm", "cmb", "h2", "co ", "hcn", "sio",
+    "jwst", "hst", "hubble", "chandra", "xmm", "spitzer", "herschel",
+    "noema", "iram", "jcmt", "sofia", "ska", "lofar", "meerkat",
+    "atacama", "eso", "nasa", "esa",
+}
+
+def is_domain_relevant(query: str) -> bool:
+    """Fast, zero-LLM-call domain relevance check."""
+    # 1. Fast reject: known off-domain patterns
+    if _OFFDOMAIN_PATTERNS.match(query):
+        return False
+    # 2. Fast accept: any astronomy/ALMA keyword present
+    q_lower = query.lower()
+    if any(kw in q_lower for kw in _DOMAIN_KEYWORDS):
+        return True
+    # 3. Ambiguous — default to False (conservative)
+    return False
+
 # ALMA cycle → approximate year mapping
 CYCLE_YEAR_MAP = {
     "1": 2013, "2": 2014, "3": 2015, "4": 2016, "5": 2017,
@@ -577,6 +625,7 @@ class RAGService:
         max_year: Optional[int] = None,
         category: Optional[str] = None,
         source_file: Optional[str] = None,
+        min_score: float = 0.0,
     ) -> List[Document]:
         """
         Hybrid search: semantic (Qdrant) + keyword (BM25) reranking.
@@ -676,6 +725,10 @@ class RAGService:
             # Not enough candidates to rerank — just set _score = _semantic_score
             for doc in results:
                 doc.metadata["_score"] = doc.metadata.get("_semantic_score", 0.0)
+
+        # Filter out vectors below the semantic relevance threshold
+        if min_score > 0.0:
+            results = [d for d in results if d.metadata.get("_semantic_score", 0.0) >= min_score]
 
         return results
 
