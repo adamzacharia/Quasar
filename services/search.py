@@ -86,7 +86,7 @@ class SearchService:
             return self.alminer_client.plot_overview(df)
         return b""
 
-    def download_alma_data(self, df: pd.DataFrame, dry_run: bool = True) -> str:
+    def download_alma_data(self, df: pd.DataFrame, dry_run: bool = False) -> str:
         """Download data"""
         return self.alminer_client.download_data(df, dry_run=dry_run)
 
