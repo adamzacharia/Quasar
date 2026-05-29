@@ -4443,7 +4443,7 @@ IMPORTANT RULES:
 
                 # Continue conversation with tool results
                 response = self.client.responses.create(
-                    model=self.config.model,
+                    model=model_to_use,
                     previous_response_id=response.id,
                     input=tool_results,
                     tools=tools,
