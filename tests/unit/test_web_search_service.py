@@ -112,7 +112,7 @@ def test_advanced_research_routes_to_exa_deep(monkeypatch, isolated_usage_file):
     monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
     calls = {}
 
-    def fake_search_exa(self, query, num_results=5, search_type="auto"):
+    def fake_search_exa(self, query, num_results=5, search_type="deep"):
         calls["query"] = query
         calls["num_results"] = num_results
         calls["search_type"] = search_type
@@ -139,6 +139,75 @@ def test_advanced_research_routes_to_exa_deep(monkeypatch, isolated_usage_file):
         "num_results": 4,
         "search_type": "deep",
     }
+
+
+def test_exa_routes_deep_reasoning_for_complex_questions(monkeypatch, isolated_usage_file):
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
+    calls = {}
+
+    def fake_search_exa(self, query, num_results=5, search_type="deep"):
+        calls["search_type"] = search_type
+        return {"success": True, "provider": "Exa", "results": [], "images": []}
+
+    monkeypatch.setattr(WebSearchService, "search_exa", fake_search_exa)
+
+    # 1. Tradeoffs example (strong reasoning word)
+    WebSearchService().route_and_search(
+        "Compare CASA tclean strategies for extended emission versus compact sources and explain parameter tradeoffs.",
+        max_results=5
+    )
+    assert calls["search_type"] == "deep-reasoning"
+
+    # 2. Risk/Competing example (strong reasoning word)
+    WebSearchService().route_and_search(
+        "Review competing ALMA calibration strategies for weak spectral line imaging and rank them by risk.",
+        max_results=5
+    )
+    assert calls["search_type"] == "deep-reasoning"
+
+    # 3. Long comparison question (>= 10 words + compare verb)
+    WebSearchService().route_and_search(
+        "Compare current literature on dust mass estimation from ALMA continuum and identify methodological disagreements.",
+        max_results=5
+    )
+    assert calls["search_type"] == "deep-reasoning"
+
+
+def test_exa_routes_deep_for_simple_documentation_searches(monkeypatch, isolated_usage_file):
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
+    calls = {}
+
+    def fake_search_exa(self, query, num_results=5, search_type="deep"):
+        calls["search_type"] = search_type
+        return {"success": True, "provider": "Exa", "results": [], "images": []}
+
+    monkeypatch.setattr(WebSearchService, "search_exa", fake_search_exa)
+
+    # 1. Simple documentation find (no tradeoffs/competing/long comparison)
+    WebSearchService().route_and_search(
+        "Find CASA tclean documentation for multiscale cleaning.",
+        max_results=5
+    )
+    assert calls["search_type"] == "deep"
+
+    # 2. Simple paper find
+    WebSearchService().route_and_search(
+        "Find papers about ALMA Band 6 protoplanetary disk observations.",
+        max_results=5
+    )
+    assert calls["search_type"] == "deep"
+
+    # 3. Simple summary request
+    WebSearchService().route_and_search(
+        "Summarize recent ALMA documentation on continuum subtraction.",
+        max_results=5
+    )
+    assert calls["search_type"] == "deep"
+
 
 
 def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
