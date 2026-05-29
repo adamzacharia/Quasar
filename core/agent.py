@@ -272,7 +272,7 @@ class QuasarAgent:
         self.conductor = Conductor(
             client=self.client,
             model=self.config.model,
-            conductor_model="gpt-5.4",  # Stronger model for planning/synthesis
+            conductor_model="deepseek-v4-pro",  # DeepSeek model for planning/synthesis
             tool_executor=self._conductor_tool_executor,
             recovery_engine=self.recovery_engine,
             model_router=self.model_router,
@@ -4333,7 +4333,7 @@ IMPORTANT RULES:
         ----------
         subtask_model : str, optional
             The model to use for this subtask, as determined by ModelRouter.
-            If empty, falls back to conductor_model (GPT-5.4).
+            If empty, falls back to conductor_model (deepseek-v4-pro).
         """
         system_instructions = (
             "You are a radio astronomy specialist executing one step of a larger analysis. "
@@ -4361,7 +4361,7 @@ IMPORTANT RULES:
             tools = self._build_tools_for_responses_api()
 
             # ── Model selection: use the routed model if provided,
-            # otherwise fall back to conductor_model (GPT-5.4)
+            # otherwise fall back to conductor_model (deepseek-v4-pro)
             if subtask_model:
                 model_to_use = subtask_model
             else:
