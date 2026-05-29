@@ -4468,7 +4468,8 @@ IMPORTANT RULES:
             return f"[Tool execution error: {e}]"
         finally:
             # Images already captured in the loop above — just clean up.
-            self.last_search_results = None
+            # CRITICAL: Preserve self.last_search_results so that subsequent sequential subtasks
+            # (e.g. check_co_lines following search_by_target) can access the cached DataFrame.
             self.last_run_result = None
             self._accumulated_run_results = []
             import gc; gc.collect()
