@@ -4962,7 +4962,8 @@ IMPORTANT RULES:
                 "1. Asks about recent astronomical events, discoveries, or news (e.g., 'latest news from JWST', 'recent coordinate changes of X', 'who won the Nobel prize in physics recently?').\n"
                 "2. Asks about current telescope operational status, schedules, or call-for-proposals deadlines (e.g., 'ALMA Cycle 14 deadlines', 'current status of GBT').\n"
                 "3. References dates, years, or events after 2024.\n"
-                "4. Requires highly specific or real-time web facts to answer accurately.\n\n"
+                "4. Requires highly specific or real-time web facts to answer accurately.\n"
+                "5. Asks about telescope rules, guidelines, policies, regulations, or proprietary periods that may change or be updated in real-time.\n\n"
                 "Reply with NO if the query:\n"
                 "1. Asks for general physics/astronomy textbook knowledge, mathematical derivations, or static concepts (e.g., 'what is a black hole?', 'derive the Jeans mass', 'explain redshift').\n"
                 "2. Is purely conversational or a follow-up (e.g., 'hello', 'thank you', 'can you explain more?').\n"
@@ -5454,9 +5455,12 @@ IMPORTANT RULES:
                             _needs_web_supplement = False
                         else:
                             # Trigger web search only if the query asks for fresh/current info
+                            # Note: policies, rules, regulations, and proprietary periods can be updated in real-time,
+                            # so it is always safer to add a web search supplement to retrieve the latest version.
                             _FRESHNESS_KEYWORDS = re.compile(
                                 r'\b(?:latest|current|recent|today|now|deadline|schedule|'
-                                r'status|update|20(?:2[5-9]|[3-9]\d)|cycle\s*\d{1,2})\b',
+                                r'status|update|20(?:2[5-9]|[3-9]\d)|cycle\s*\d{1,2}|'
+                                r'policy|policies|rules?|regulations?|proprietary|period)\b',
                                 re.IGNORECASE,
                             )
                             _needs_web_supplement = bool(_FRESHNESS_KEYWORDS.search(_user_query))
