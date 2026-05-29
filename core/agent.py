@@ -5399,19 +5399,7 @@ IMPORTANT RULES:
                             "images": self._conductor_images,
                         }
 
-                    # Attach companion notebook if the Conductor generated one
-                    notebook = getattr(self.conductor, '_notebook', None)
-                    if notebook:
-                        if self.last_run_result is None:
-                            self.last_run_result = {"type": "conductor_result"}
-                        else:
-                            self.last_run_result["type"] = "conductor_result"
-                        # Store notebook data so main.py can emit it for history
-                        self.last_run_result["notebook_data"] = notebook
-                        
-                        words = [w for w in re.split(r'\W+', query) if w]
-                        short_title = "_".join(words[:2]) if words else "Analysis"
-                        self.last_run_result["title"] = short_title
+                    # Companion notebook attachment has been disabled for Conductor tasks as per requirements.
 
                     return conductor_answer
                 # Conductor returned None → not complex enough, fall through to standard path
