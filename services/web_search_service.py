@@ -209,7 +209,7 @@ class WebSearchService:
                 exa_type = "deep" if search_depth == "advanced" else "auto"
                 res = self.search_exa(query, num_results=max_results, search_type=exa_type)
                 if res.get("success"):
-                    return res
+                    return self._enrich_with_tavily_images(query, res)
                 print("[SEARCH ROUTER] Exa failed, falling back to Brave/Tavily")
             elif self.exa_key:
                 print("[SEARCH ROUTER] Exa monthly free limit (1000) reached. Falling back.")
@@ -220,7 +220,7 @@ class WebSearchService:
             print(f"[SEARCH ROUTER] Routed to Brave (Primary) for: {query!r}")
             res = self.search_brave(query, max_results=max_results)
             if res.get("success"):
-                return res
+                return self._enrich_with_tavily_images(query, res)
             print("[SEARCH ROUTER] Brave failed, falling back to Tavily")
         elif self.brave_key:
             print("[SEARCH ROUTER] Brave monthly free limit (1000) reached. Falling back.")
@@ -250,7 +250,7 @@ class WebSearchService:
                     "query": query,
                     "results": fallback_results,
                     "raw_text": fallback.get("raw_text", "") if isinstance(fallback, dict) else "",
-                    "images": []
+                    "images": self._fetch_tavily_images(query) if self.tavily_key else []
                 }
             except Exception as e:
                 return {"success": False, "error": f"Scraping fallback failed: {e}"}
@@ -326,6 +326,82 @@ class WebSearchService:
 
         return results
 
+    @staticmethod
+    def _normalize_image_items(items: Any) -> List[Dict[str, str]]:
+        """Normalize provider image payloads into Quasar's web image shape."""
+        if not isinstance(items, list):
+            return []
+
+        images: List[Dict[str, str]] = []
+        seen_urls = set()
+        for item in items:
+            if isinstance(item, str):
+                url = item.strip()
+                description = ""
+            elif isinstance(item, dict):
+                url = str(item.get("url") or item.get("src") or item.get("image_url") or "").strip()
+                description = str(
+                    item.get("description")
+                    or item.get("title")
+                    or item.get("alt")
+                    or ""
+                ).strip()
+            else:
+                continue
+
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            images.append({"url": url, "description": description})
+
+        return images
+
+    def _fetch_tavily_images(self, query: str, max_images: int = 6) -> List[Dict[str, str]]:
+        """Fetch image tiles for a search result using Tavily's REST API."""
+        if not self.tavily_key:
+            return []
+
+        payload = {
+            "query": query,
+            "max_results": min(max(max_images, 1), 10),
+            "include_answer": False,
+            "include_images": True,
+            "include_image_descriptions": True,
+        }
+        response = self._tavily_post("search", payload, timeout=30)
+        if isinstance(response, dict) and response.get("success") is False:
+            return []
+        return self._normalize_image_items(response.get("images", []))[:max_images]
+
+    def _enrich_with_tavily_images(
+        self,
+        query: str,
+        result: Dict[str, Any],
+        max_images: int = 6,
+    ) -> Dict[str, Any]:
+        """Attach image tiles to otherwise text-only Brave/Exa results."""
+        if (
+            not isinstance(result, dict)
+            or not result.get("success")
+            or result.get("images")
+            or not self.tavily_key
+        ):
+            return result
+
+        try:
+            images = self._fetch_tavily_images(query, max_images=max_images)
+        except Exception as e:
+            print(f"[SEARCH ROUTER] Tavily image enrichment failed: {e}")
+            images = []
+
+        if not images:
+            return result
+
+        enriched = dict(result)
+        enriched["images"] = images
+        enriched["image_provider"] = "Tavily Images"
+        return enriched
+
     def search_brave(self, query: str, max_results: int = 5) -> Dict[str, Any]:
         """Perform search using Brave LLM Context (primary RAG) or Web Search."""
         if not self.brave_key:
@@ -385,34 +461,55 @@ class WebSearchService:
 
         return {"success": False, "error": "Brave API request failed"}
 
-    def search_tavily(self, query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
-        """Perform search using Tavily client."""
+    def search_tavily(
+        self,
+        query: str,
+        max_results: int = 5,
+        search_depth: str = "basic",
+        include_images: bool = True,
+    ) -> Dict[str, Any]:
+        """Perform Tavily search with source and optional image metadata."""
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
-            
+
+        payload = {
+            "query": query,
+            "max_results": min(int(max_results), 10),
+            "search_depth": search_depth,
+            "include_answer": True,
+            "include_images": include_images,
+            "include_image_descriptions": include_images,
+        }
+
         try:
-            from tavily import TavilyClient
-            client = TavilyClient(api_key=self.tavily_key)
-            response = client.search(
-                query=query,
-                max_results=min(int(max_results), 10),
-                search_depth=search_depth,
-                include_answer=True
-            )
+            try:
+                client = self._get_tavily_client()
+                response = client.search(**payload)
+            except Exception as sdk_error:
+                print(f"[SEARCH ROUTER] Tavily SDK search unavailable, using REST: {sdk_error}")
+                response = self._tavily_post("search", payload, timeout=60)
+
+            if isinstance(response, dict) and response.get("success") is False:
+                return response
+
             results = []
-            for r in response.get("results", []):
+            for r in response.get("results", []) if isinstance(response, dict) else []:
                 results.append({
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
                     "snippet": r.get("content", "")
                 })
+            images = self._normalize_image_items(response.get("images", [])) if isinstance(response, dict) else []
+            if not images and isinstance(response, dict):
+                for r in response.get("results", []):
+                    images.extend(self._normalize_image_items(r.get("images", [])))
             return {
                 "success": True,
                 "provider": "Tavily",
                 "query": query,
-                "answer": response.get("answer", ""),
+                "answer": response.get("answer", "") if isinstance(response, dict) else "",
                 "results": results,
-                "images": []
+                "images": images[:6]
             }
         except Exception as e:
             return {"success": False, "error": f"Tavily search failed: {e}"}
@@ -744,23 +841,23 @@ class WebSearchService:
         # 1. Primary: Tavily Image Search (gives rich descriptions)
         if self.tavily_key:
             try:
-                from tavily import TavilyClient
-                client = TavilyClient(api_key=self.tavily_key)
-                response = client.search(
-                    query=query,
-                    max_results=min(max_results, 10),
-                    include_images=True,
-                    include_image_descriptions=True
-                )
-                images = []
-                for img in response.get("images", []):
-                    if isinstance(img, dict):
-                        images.append({
-                            "url": img.get("url", ""),
-                            "description": img.get("description", "")
-                        })
-                    elif isinstance(img, str):
-                        images.append({"url": img, "description": ""})
+                payload = {
+                    "query": query,
+                    "max_results": min(max_results, 10),
+                    "include_images": True,
+                    "include_image_descriptions": True,
+                }
+                try:
+                    client = self._get_tavily_client()
+                    response = client.search(**payload)
+                except Exception as sdk_error:
+                    print(f"[SEARCH ROUTER] Tavily SDK image search unavailable, using REST: {sdk_error}")
+                    response = self._tavily_post("search", payload, timeout=60)
+
+                if isinstance(response, dict) and response.get("success") is False:
+                    response = {}
+
+                images = self._normalize_image_items(response.get("images", []))
                 
                 # Also collect web references to go alongside images
                 results = []

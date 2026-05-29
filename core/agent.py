@@ -2389,17 +2389,41 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         if not isinstance(web_data, dict) or not web_data.get("success", True):
             return None
 
+        def _normalize_web_url(value: Any) -> str:
+            url = str(value or "").strip().strip("<>")
+            url = url.rstrip(".,;:)]}'\"")
+            if not url:
+                return ""
+            if url.startswith(("http://", "https://")):
+                return url
+            if url.startswith("www."):
+                return f"https://{url}"
+            # Text summaries sometimes include a schemeless URL with a path.
+            if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}/\S+$", url):
+                return f"https://{url}"
+            return ""
+
+        def _title_from_url(url: str) -> str:
+            clean = re.sub(r"^https?://", "", url).split("/", 1)[0]
+            return clean.replace("www.", "") or url
+
         def _source_from_item(item: Any) -> Optional[Dict[str, str]]:
             if isinstance(item, str):
-                url = item.strip()
-                return {"title": url, "url": url, "snippet": ""} if url.startswith(("http://", "https://")) else None
+                url = _normalize_web_url(item)
+                return {"title": _title_from_url(url), "url": url, "snippet": ""} if url else None
             if not isinstance(item, dict):
                 return None
-            url = str(item.get("url") or item.get("link") or item.get("href") or "").strip()
+            url = _normalize_web_url(
+                item.get("url")
+                or item.get("link")
+                or item.get("href")
+                or item.get("source_url")
+                or ""
+            )
             if not url:
                 return None
             return {
-                "title": str(item.get("title") or item.get("name") or url).strip(),
+                "title": str(item.get("title") or item.get("name") or _title_from_url(url)).strip(),
                 "url": url,
                 "snippet": str(
                     item.get("snippet")
@@ -2426,11 +2450,33 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 ).strip(),
             }
 
+        def _source_items_from_text(text: Any) -> List[Dict[str, str]]:
+            if not isinstance(text, str) or "." not in text:
+                return []
+            matches = re.findall(
+                r"https?://[^\s<>\]\)\"']+|www\.[^\s<>\]\)\"']+|[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[^\s<>\]\)\"']+",
+                text,
+            )
+            sources_from_text = []
+            for match in matches:
+                url = _normalize_web_url(match)
+                if url:
+                    sources_from_text.append({
+                        "title": _title_from_url(url),
+                        "url": url,
+                        "snippet": "",
+                    })
+            return sources_from_text
+
         source_items: List[Any] = []
         for key in ("results", "sources"):
             value = web_data.get(key)
             if isinstance(value, list):
                 source_items.extend(value)
+            elif isinstance(value, dict):
+                nested = value.get("results") or value.get("sources")
+                if isinstance(nested, list):
+                    source_items.extend(nested)
 
         response = web_data.get("response")
         if isinstance(response, dict):
@@ -2438,6 +2484,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 value = response.get(key)
                 if isinstance(value, list):
                     source_items.extend(value)
+                elif isinstance(value, dict):
+                    nested = value.get("results") or value.get("sources")
+                    if isinstance(nested, list):
+                        source_items.extend(nested)
+
+        for container in (web_data, response if isinstance(response, dict) else {}):
+            for key in ("answer", "content", "raw_text", "text", "summary"):
+                source_items.extend(_source_items_from_text(container.get(key)))
 
         seen_urls = set()
         sources = []
@@ -5678,7 +5732,16 @@ IMPORTANT RULES:
 
                             # Emit web_sources event for frontend source cards + image grid
                             if on_event:
-                                web_event = self._build_web_sources_event(web_data)
+                                web_event_payload = dict(web_data)
+                                if tavily_answer:
+                                    web_event_payload["answer"] = "\n".join(
+                                        part for part in [
+                                            str(web_data.get("answer", "") or ""),
+                                            tavily_answer,
+                                        ]
+                                        if part.strip()
+                                    )
+                                web_event = self._build_web_sources_event(web_event_payload)
                                 if web_event:
                                     on_event(web_event)
                     # Re-emit accumulated images via last_run_result so the SSE
@@ -6050,7 +6113,16 @@ IMPORTANT RULES:
 
                     # Emit web_sources event for frontend source cards + image grid
                     if on_event:
-                        web_event = self._build_web_sources_event(web_data)
+                        web_event_payload = dict(web_data)
+                        if tavily_answer:
+                            web_event_payload["answer"] = "\n".join(
+                                part for part in [
+                                    str(web_data.get("answer", "") or ""),
+                                    tavily_answer,
+                                ]
+                                if part.strip()
+                            )
+                        web_event = self._build_web_sources_event(web_event_payload)
                         if web_event:
                             on_event(web_event)
                 elif _web_result_holder.get("error"):

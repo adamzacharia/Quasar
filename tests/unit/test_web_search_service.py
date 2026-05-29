@@ -141,6 +141,76 @@ def test_advanced_research_routes_to_exa_deep(monkeypatch, isolated_usage_file):
     }
 
 
+def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.delitem(sys.modules, "tavily", raising=False)
+    calls = {}
+
+    def fake_tavily_post(self, endpoint, payload, timeout=60):
+        calls["endpoint"] = endpoint
+        calls["payload"] = payload
+        return {
+            "answer": "Current answer",
+            "results": [
+                {
+                    "title": "Policy Page",
+                    "url": "https://example.com/policy",
+                    "content": "Policy snippet",
+                }
+            ],
+            "images": [
+                {
+                    "url": "https://example.com/image.jpg",
+                    "description": "Image description",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(WebSearchService, "_tavily_post", fake_tavily_post)
+
+    result = WebSearchService().search_tavily("current policy", max_results=3)
+
+    assert result["success"] is True
+    assert result["provider"] == "Tavily"
+    assert result["results"][0]["url"] == "https://example.com/policy"
+    assert result["images"] == [
+        {
+            "url": "https://example.com/image.jpg",
+            "description": "Image description",
+        }
+    ]
+    assert calls["endpoint"] == "search"
+    assert calls["payload"]["include_images"] is True
+    assert calls["payload"]["include_image_descriptions"] is True
+
+
+def test_route_enriches_brave_results_with_tavily_images(monkeypatch, isolated_usage_file):
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+
+    def fake_search_brave(self, query, max_results=5):
+        return {
+            "success": True,
+            "provider": "Brave LLM Context",
+            "query": query,
+            "results": [{"title": "Result", "url": "https://example.com", "snippet": ""}],
+            "images": [],
+        }
+
+    def fake_fetch_images(self, query, max_images=6):
+        return [{"url": "https://example.com/img.jpg", "description": "Result image"}]
+
+    monkeypatch.setattr(WebSearchService, "search_brave", fake_search_brave)
+    monkeypatch.setattr(WebSearchService, "_fetch_tavily_images", fake_fetch_images)
+
+    result = WebSearchService().route_and_search("current observatory policy", max_results=5)
+
+    assert result["success"] is True
+    assert result["provider"] == "Brave LLM Context"
+    assert result["image_provider"] == "Tavily Images"
+    assert result["images"][0]["url"] == "https://example.com/img.jpg"
+
+
 def test_tavily_extract_urls_uses_sdk_and_trims_content(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     calls = {}

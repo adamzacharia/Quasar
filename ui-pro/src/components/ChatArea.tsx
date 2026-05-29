@@ -140,13 +140,34 @@ export function ChatArea() {
         const isWebSource = (source: WebSource | null): source is WebSource => source !== null;
         const isWebImage = (image: WebImage | null): image is WebImage => image !== null;
 
+        const normalizeUrl = (value: unknown): string => {
+            const raw = String(value || "").trim().replace(/^<|>$/g, "").replace(/[.,;:)\]}"']+$/g, "");
+            if (!raw) return "";
+            if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+            if (raw.startsWith("www.")) return `https://${raw}`;
+            if (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}\/\S+$/.test(raw)) return `https://${raw}`;
+            return "";
+        };
+
+        const titleFromUrl = (url: string): string => {
+            try {
+                return new URL(url).hostname.replace("www.", "");
+            } catch {
+                return url;
+            }
+        };
+
         const normalizeWebSource = (source: unknown): WebSource | null => {
+            if (typeof source === "string") {
+                const url = normalizeUrl(source);
+                return url ? { title: titleFromUrl(url), url, snippet: "" } : null;
+            }
             if (!source || typeof source !== "object") return null;
             const item = source as Record<string, unknown>;
-            const url = String(item.url || item.link || item.href || "").trim();
+            const url = normalizeUrl(item.url || item.link || item.href || item.source_url || "");
             if (!url) return null;
             return {
-                title: String(item.title || item.name || url).trim(),
+                title: String(item.title || item.name || titleFromUrl(url)).trim(),
                 url,
                 snippet: String(item.snippet || item.content || item.text || item.description || "").trim(),
             };
