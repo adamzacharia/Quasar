@@ -19,10 +19,10 @@ Last audited against the codebase: 2026-04-25
 | High-Energy            | 5     | 0     | 0           | 5       | 0%     |
 | Optical / UV           | 7     | 1     | 0           | 6       | 14%    |
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
-| Next-Gen               | 12    | 9     | 1           | 2       | 75%    |
+| Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
 | Polish & Scale         | 36    | 17    | 0           | 19      | 47%    |
-| **Total**              |**101**|**50** | **2**       | **49**  |**50%** |
+| **Total**              |**102**|**51** | **2**       | **49**  |**50%** |
 
 ---
 
@@ -65,6 +65,7 @@ hours and adds immediate user value.
 - [x] **R4** ALMA Sensitivity Calculator -- Radiometer equation per band with Tsys and PWV scaling (services/astro_calculators.py)
 - [x] **O6** Finding Chart Generator -- DSS/PanSTARRS chart with WCS, crosshair, N/E arrows, scale bar (integrations/skyview_client.py)
 - [x] **R3** Spectral Line Profile Plotter -- Extract spectrum from cube, fit Gaussian, report FWHM and integrated flux (services/fits_service.py)
+- [x] **W13** Search Provider Router & RAG Filtration -- A premium multi-provider search router directing queries to Brave Search (primary LLM context), Tavily (fallback & image search), and Exa (specialist deep semantic/technical). Persistent calendar-month rate-limiting caps free API requests at 1,000/month. Fast zero-LLM pre-RAG domain relevancy gates out casual chitchat while a 0.35 semantic cosine score floor and time-sensitive keyword triggers filter search results (services/web_search_service.py + core/agent.py + ui-pro/api/main.py + services/rag_service.py)
 
 ---
 
