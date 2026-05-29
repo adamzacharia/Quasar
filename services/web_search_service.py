@@ -187,6 +187,30 @@ class WebSearchService:
             usage["exa_count"] = usage.get("exa_count", 0) + 1
         self._save_usage(usage)
 
+    def _determine_exa_type(self, query: str) -> str:
+        """Determine if Exa should use 'deep' or 'deep-reasoning' based on complexity."""
+        q_lower = query.lower()
+        word_count = len(query.split())
+        
+        # Keywords indicating high-value, complex comparison/research questions
+        reasoning_keywords = [
+            "tradeoff", "trade-off", "trade off",
+            "disagreement", "disagree", "methodological",
+            "competing", "risk", "ranking", "rank",
+            "parameter tradeoff", "parameter trade-off"
+        ]
+        
+        # Trigger deep-reasoning for strong reasoning indicators
+        if any(kw in q_lower for kw in reasoning_keywords):
+            return "deep-reasoning"
+            
+        # Trigger deep-reasoning for complex comparison questions (at least 10 words + comparison verbs)
+        if any(kw in q_lower for kw in ["compare", "versus", "vs"]) and word_count >= 10:
+            return "deep-reasoning"
+            
+        # Normal Exa specialist searches get deep search
+        return "deep"
+
     def route_and_search(
         self, 
         query: str, 
@@ -206,7 +230,7 @@ class WebSearchService:
             usage = self._get_usage()
             if self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT:
                 print(f"[SEARCH ROUTER] Routed to Exa (Specialist) for: {query!r}")
-                exa_type = "deep" if search_depth == "advanced" else "auto"
+                exa_type = self._determine_exa_type(query)
                 res = self.search_exa(query, num_results=max_results, search_type=exa_type)
                 if res.get("success"):
                     return self._enrich_with_tavily_images(query, res)
@@ -789,7 +813,7 @@ class WebSearchService:
         except Exception as e:
             return {"success": False, "error": f"Tavily research status failed: {e}"}
 
-    def search_exa(self, query: str, num_results: int = 5, search_type: str = "auto") -> Dict[str, Any]:
+    def search_exa(self, query: str, num_results: int = 5, search_type: str = "deep") -> Dict[str, Any]:
         """Perform semantic research search using Exa."""
         if not self.exa_key:
             return {"success": False, "error": "Exa API key missing"}
