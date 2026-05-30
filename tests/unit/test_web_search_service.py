@@ -317,6 +317,17 @@ def test_tavily_extract_urls_uses_sdk_and_trims_content(monkeypatch):
     assert "truncated" in result["results"][0]["raw_content"]
 
 
+def test_tavily_extract_rejects_keyword_queries(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+
+    result = WebSearchService().extract_tavily(
+        "ALMA calibration strategies weak spectral line bandpass phas",
+    )
+
+    assert result["success"] is False
+    assert "full http(s) URL" in result["error"]
+
+
 def test_tavily_map_site_normalizes_filters_and_caps_limit(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     calls = {}

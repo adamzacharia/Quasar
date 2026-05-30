@@ -978,6 +978,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             description=(
                 "Extract clean markdown/text from one or more specific URLs using Tavily Extract. "
                 "Use when the user gives URLs and asks to read, summarize, quote, or pull page content. "
+                "Do not pass search terms here; call web_search first unless you already have a full http(s) URL. "
                 "For JavaScript-heavy pages, set extract_depth='advanced'."
             ),
             function=self._tavily_extract_url,
@@ -986,7 +987,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "properties": {
                     "urls": {
                         "type": "string",
-                        "description": "Single URL, comma-separated URLs, or list of URLs. Max 20.",
+                        "description": "Single full http(s) URL, comma-separated URLs, or list of URLs. Max 20. Not a keyword query.",
                     },
                     "query": {"type": "string", "description": "Optional focus query to return only relevant chunks."},
                     "chunks_per_source": {"type": "integer", "description": "Relevant chunks per URL when query is provided. 1-5, default 3."},
@@ -2307,6 +2308,72 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # Fallback to raw Tavily answer
         return web_data.get("answer", "").strip()
 
+    def _synthesize_web_tool_answer(self, query: str, web_results: List[Dict[str, Any]]) -> str:
+        """Create a final answer when web tools returned sources but the model emitted no text."""
+        snippets = []
+        for web_data in web_results[:4]:
+            provider = web_data.get("provider", "Web")
+            answer = str(web_data.get("answer") or web_data.get("content") or "").strip()
+            if answer:
+                snippets.append(f"{provider} answer: {answer[:900]}")
+
+            result_items = web_data.get("results", [])
+            if not isinstance(result_items, list):
+                response = web_data.get("response")
+                result_items = response.get("results", []) if isinstance(response, dict) else []
+
+            for result in result_items[:6]:
+                if not isinstance(result, dict):
+                    continue
+                title = str(result.get("title") or result.get("url") or "Source").strip()
+                url = str(result.get("url") or result.get("link") or "").strip()
+                snippet = str(
+                    result.get("snippet")
+                    or result.get("content")
+                    or result.get("raw_content")
+                    or result.get("text")
+                    or ""
+                ).strip()
+                if snippet:
+                    snippets.append(f"[{title}]({url}): {snippet[:700]}")
+
+        if not snippets:
+            return ""
+
+        context_block = "\n\n".join(snippets)[:9000]
+        system_prompt = (
+            "You are a careful astronomy research assistant. Use only the provided web "
+            "and documentation snippets. Answer the user's question directly. If the "
+            "evidence is incomplete, say what is incomplete. Include source links inline "
+            "where URLs are provided."
+        )
+        user_prompt = (
+            f"User question: {query}\n\n"
+            f"Retrieved source snippets:\n{context_block}\n\n"
+            "Write a concise but useful final answer."
+        )
+
+        try:
+            from core.llm_client import LLMClient
+            client = LLMClient(model="gpt-4.1-mini")
+            resp = client.responses.create(
+                model="gpt-4.1-mini",
+                instructions=system_prompt,
+                input=user_prompt,
+                max_output_tokens=700,
+                temperature=0.2,
+            )
+            answer = resp.output_text.strip()
+            if answer:
+                return answer
+        except Exception as e:
+            print(f"[WEB SEARCH] Tool-answer synthesis failed: {e}")
+
+        return (
+            "I found relevant web sources, but the model did not synthesize a final answer. "
+            "Open the source cards below for the retrieved material."
+        )
+
     @log_tool
     def _tavily_web_search(self, query: str, max_results: int = 10, search_depth: str = "basic") -> Dict[str, Any]:
         """
@@ -2383,6 +2450,48 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         from services.web_search_service import WebSearchService
 
         return WebSearchService.has_any_provider_key()
+
+    def _web_tool_status_label(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Return user-facing tool labels for the Thought panel."""
+        query_hint = str(
+            args.get("query")
+            or args.get("url")
+            or args.get("urls")
+            or ""
+        ).strip()
+        query_lower = query_hint.lower()
+
+        if tool_name == "web_search":
+            exa_keywords = {
+                "compare", "versus", "vs", "formula", "equations", "papers",
+                "documentation", "handbook", "innovations", "architecture",
+                "literature", "review", "research", "academic",
+            }
+            is_advanced = (
+                args.get("search_depth") == "advanced"
+                or any(keyword in query_lower for keyword in exa_keywords)
+            )
+            label = (
+                "Calling advanced web search agent"
+                if is_advanced
+                else "Calling web search agent"
+            )
+        elif tool_name == "web_extract_url":
+            label = "Extracting web source"
+        elif tool_name == "web_map_site":
+            label = "Mapping website"
+        elif tool_name == "web_crawl_site":
+            label = "Crawling website"
+        elif tool_name == "web_research":
+            label = "Calling deep web research agent"
+        elif tool_name == "web_research_status":
+            label = "Checking web research status"
+        else:
+            label = f"Calling tool: {tool_name}"
+
+        if query_hint:
+            label += f' ("{query_hint[:60]}")'
+        return label
 
     def _build_web_sources_event(self, web_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize web-tool outputs into the frontend source-card event."""
@@ -5770,6 +5879,7 @@ IMPORTANT RULES:
             last_id = self._get_response_id(conversation_id)
             output_text = ""
             _had_tool_calls = False
+            _web_tool_results: List[Dict[str, Any]] = []
             
             # 5. Call Responses API with manual streaming loop
             for _round in range(_token_budget.HARD_MAX_ITERATIONS if hasattr(_token_budget, 'HARD_MAX_ITERATIONS') else 25):
@@ -5805,7 +5915,7 @@ IMPORTANT RULES:
 
                 # Enable reasoning summary streaming for thinking models
                 # These models support the `reasoning` parameter which returns
-                # a summarized chain-of-thought that we stream to the UI.
+                # a model-provided reasoning summary that we stream to the UI.
                 _thinking_models = {
                     "o1", "o1-mini", "o1-pro",
                     "o3", "o3-mini", "o3-pro",
@@ -5847,13 +5957,14 @@ IMPORTANT RULES:
                 
                 _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
                 _reasoning_emitted = False     # Track if we emitted the reasoning header
+                _emit_reasoning_details = True  # Stream the model-provided reasoning summary.
 
                 for event in response_stream:
                     if event.type == "response.created":
                         last_id = event.response.id
                         self._set_response_id(conversation_id, last_id)
                     elif event.type == "response.reasoning_summary_text.delta":
-                        # Stream reasoning summary as a thinking step in the UI
+                        # Stream the model-provided reasoning summary to the Thinking box.
                         _reasoning_summary_text += event.delta
                         if on_thought:
                             on_thought(event.delta)
@@ -5862,7 +5973,7 @@ IMPORTANT RULES:
                             _reasoning_emitted = True
                     elif event.type == "response.reasoning_summary_text.done":
                         # Reasoning summary complete — emit the full text as a thinking step
-                        if not on_thought and _reasoning_summary_text and on_status:
+                        if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
                             # Split into individual lines for readable thinking steps
                             for line in _reasoning_summary_text.strip().splitlines():
                                 line = line.strip()
@@ -5874,7 +5985,7 @@ IMPORTANT RULES:
                     elif event.type == "response.output_text.delta":
                         # If reasoning was still accumulating when text starts,
                         # finalize it now (edge case: some models skip the .done event)
-                        if not on_thought and _reasoning_summary_text and on_status:
+                        if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
                             for line in _reasoning_summary_text.strip().splitlines():
                                 line = line.strip()
                                 if line:
@@ -6006,10 +6117,13 @@ IMPORTANT RULES:
                     print(f"[TOOL CALL] {tool_name}({args})")
 
                     # Emit tool call status to Processing Pipeline
-                    query_hint = args.get("query", args.get("author", args.get("bibcode", "")))
-                    step_label = f"Calling tool: {tool_name}"
-                    if query_hint:
-                        step_label += f' ("{str(query_hint)[:60]}")'
+                    if tool_name.startswith("web_") or tool_name == "web_search":
+                        step_label = self._web_tool_status_label(tool_name, args)
+                    else:
+                        query_hint = args.get("query", args.get("author", args.get("bibcode", "")))
+                        step_label = f"Calling tool: {tool_name}"
+                        if query_hint:
+                            step_label += f' ("{str(query_hint)[:60]}")'
                     if on_status:
                         on_status(step_label, "running")
 
@@ -6058,6 +6172,7 @@ IMPORTANT RULES:
                                 "web_research",
                                 "web_research_status",
                             } and isinstance(result, dict) and result.get("success"):
+                                _web_tool_results.append(result)
                                 web_event = self._build_web_sources_event(result)
                                 if web_event:
                                     on_event(web_event)
@@ -6086,6 +6201,10 @@ IMPORTANT RULES:
             _has_rich_tool_output = bool(
                 getattr(self, "_accumulated_run_results", None) or self.last_run_result
             )
+            if not output_text and _web_tool_results:
+                output_text = self._synthesize_web_tool_answer(_user_query, _web_tool_results)
+                if output_text and on_token:
+                    on_token(output_text)
             if not output_text and (not _had_tool_calls or not _has_rich_tool_output):
                 output_text = "I processed your query but didn't generate a text response. Please try rephrasing."
                 if on_token:

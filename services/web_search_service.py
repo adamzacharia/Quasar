@@ -107,7 +107,11 @@ class WebSearchService:
     def _normalize_urls(cls, urls: Any) -> List[str]:
         """Normalize URL input from tool calls into a bounded URL list."""
         normalized = cls._normalize_string_list(urls) or []
-        return normalized[:20]
+        valid_urls = []
+        for url in normalized:
+            if re.match(r"^https?://[^\s/$.?#].[^\s]*$", url):
+                valid_urls.append(url)
+        return valid_urls[:20]
 
     @staticmethod
     def _truncate_text(value: Any, max_chars: int) -> Any:
@@ -551,7 +555,10 @@ class WebSearchService:
         """Extract clean content from one or more URLs using Tavily Extract."""
         clean_urls = self._normalize_urls(urls)
         if not clean_urls:
-            return {"success": False, "error": "At least one URL is required"}
+            return {
+                "success": False,
+                "error": "web_extract_url requires at least one full http(s) URL. Use web_search for keyword queries.",
+            }
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
 
