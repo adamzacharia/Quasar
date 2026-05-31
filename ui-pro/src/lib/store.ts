@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist } from "./types";
+import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist, WebImage, WebSource } from "./types";
 import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 import {
     fetchConversations as apiFetchConversations,
@@ -10,6 +10,13 @@ import {
     type ServerConversation,
     type ServerMessage,
 } from "./api";
+import {
+    attachThinkingStepsToLastAssistant,
+    findLastAssistantTextIndex,
+    updateLastAssistantContent,
+    updateLastAssistantThinking as updateAssistantThinking,
+} from "./chat-message-updaters";
+import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
 
 interface ChatStore {
     conversations: Conversation[];
@@ -35,6 +42,14 @@ interface ChatStore {
 
     setActiveConversation: (id: string | null) => void;
     addMessage: (message: Message) => void;
+    mergeWebSourcesMessage: (payload: {
+        sources?: WebSource[];
+        images?: WebImage[];
+        provider?: string;
+        imageProvider?: string;
+        searchType?: string;
+        query?: string;
+    }) => void;
     updateLastAssistantMessage: (content: string) => void;
     updateLastAssistantThinking: (thinking: string) => void;
     setStreaming: (streaming: boolean) => void;
@@ -62,6 +77,80 @@ interface ChatStore {
     deleteConversation: (conversationId: string, token: string) => Promise<void>;
     setActiveConversationId: (id: string | null) => void;
     clearAllConversations: () => void;
+}
+
+function normalizeWebUrl(value: unknown): string {
+    const raw = String(value || "").trim().replace(/^<|>$/g, "").replace(/[.,;:)\]}"']+$/g, "");
+    if (!raw) return "";
+    if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+    if (raw.startsWith("www.")) return `https://${raw}`;
+    if (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}\/\S+$/.test(raw)) return `https://${raw}`;
+    return "";
+}
+
+function mergeWebSources(existing: WebSource[] = [], incoming: WebSource[] = []): WebSource[] {
+    const merged: WebSource[] = [];
+    const byUrl = new Map<string, number>();
+
+    [...existing, ...incoming].forEach((source) => {
+        const url = normalizeWebUrl(source.url);
+        if (!url) return;
+        const key = url.toLowerCase().replace(/\/$/, "");
+        if (byUrl.has(key)) {
+            const current = merged[byUrl.get(key)!];
+            if (!current.title && source.title) current.title = source.title;
+            if (!current.snippet && source.snippet) current.snippet = source.snippet;
+            current.evidenceQuality = mergeEvidenceQuality(current.evidenceQuality, source.evidenceQuality);
+            return;
+        }
+        byUrl.set(key, merged.length);
+        merged.push({ ...source, url });
+    });
+
+    return rankWebSources(merged);
+}
+
+function mergeWebImages(existing: WebImage[] = [], incoming: WebImage[] = []): WebImage[] {
+    const merged: WebImage[] = [];
+    const byUrl = new Map<string, number>();
+
+    [...existing, ...incoming].forEach((image) => {
+        const url = normalizeWebUrl(image.url) || String(image.url || "").trim();
+        if (!url) return;
+        const key = url.toLowerCase().replace(/\/$/, "");
+        if (byUrl.has(key)) {
+            const current = merged[byUrl.get(key)!];
+            if (!current.description && image.description) current.description = image.description;
+            return;
+        }
+        byUrl.set(key, merged.length);
+        merged.push({ ...image, url });
+    });
+
+    return merged;
+}
+
+function mergeLabel(existing?: string, incoming?: string): string | undefined {
+    const label = String(incoming || "").trim();
+    if (!label) return existing || undefined;
+    if (!existing) return label;
+    const parts = existing.split(" + ").map((part) => part.trim()).filter(Boolean);
+    if (parts.includes(label)) return existing;
+    return `${existing} + ${label}`;
+}
+
+function syncActiveConversationMessages(state: ChatStore, messages: Message[]): Conversation[] {
+    if (!state.activeConversationId) return state.conversations;
+    return state.conversations.map((conversation) =>
+        conversation.id === state.activeConversationId
+            ? {
+                ...conversation,
+                messages,
+                updatedAt: new Date(),
+                model: state.selectedModel,
+            }
+            : conversation
+    );
 }
 
 function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
@@ -119,6 +208,17 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             isTop10Percent: Boolean(p.is_top_10_percent || p.isTop10Percent),
             funders: Array.isArray(p.funders) ? (p.funders as { name: string; id: string }[]) : undefined,
             oaPdfUrl: (p.oa_pdf_url as string) || (p.oaPdfUrl as string) || undefined,
+            observationLinks: Array.isArray(p.observation_links)
+                ? (p.observation_links as Record<string, unknown>[]).map((link) => ({
+                    identifier: String(link.identifier || ""),
+                    identifierType: String(link.identifier_type || link.identifierType || ""),
+                    relation: String(link.relation || ""),
+                    confidence: String(link.confidence || ""),
+                    adsQuery: String(link.ads_query || link.adsQuery || ""),
+                })).filter((link) => link.identifier)
+                : Array.isArray(p.observationLinks)
+                    ? p.observationLinks as Paper["observationLinks"]
+                    : undefined,
         }));
         messages.push({
             id: `srv-${index}-pp-${Date.now().toString(36)}`,
@@ -171,6 +271,10 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             timestamp: new Date(),
             webSources: (meta.webSources as Message["webSources"]) || [],
             webImages: (meta.webImages as Message["webImages"]) || [],
+            webProvider: meta.webProvider as string | undefined,
+            webImageProvider: meta.webImageProvider as string | undefined,
+            webSearchType: meta.webSearchType as string | undefined,
+            webQuery: meta.webQuery as string | undefined,
         });
     }
 
@@ -274,26 +378,70 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         return { messages: newMessages, conversations: updatedConversations };
     }),
 
-    updateLastAssistantMessage: (content) => set((state) => {
-        const msgs = [...state.messages];
-        for (let i = msgs.length - 1; i >= 0; i--) {
-            if (msgs[i].role === "assistant" && msgs[i].type === "text") {
-                msgs[i] = { ...msgs[i], content };
+    mergeWebSourcesMessage: (payload) => set((state) => {
+        const incomingSources = payload.sources || [];
+        const incomingImages = payload.images || [];
+        if (incomingSources.length === 0 && incomingImages.length === 0) return {};
+
+        const messages = [...state.messages];
+        let lastUserIdx = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === "user") {
+                lastUserIdx = i;
                 break;
             }
         }
-        return { messages: msgs };
+
+        let existingIdx = -1;
+        for (let i = messages.length - 1; i > lastUserIdx; i--) {
+            if (messages[i].role === "assistant" && messages[i].type === "web_sources") {
+                existingIdx = i;
+                break;
+            }
+        }
+
+        if (existingIdx >= 0) {
+            const existing = messages[existingIdx];
+            messages[existingIdx] = {
+                ...existing,
+                webSources: mergeWebSources(existing.webSources || [], incomingSources),
+                webImages: mergeWebImages(existing.webImages || [], incomingImages),
+                webProvider: mergeLabel(existing.webProvider, payload.provider),
+                webImageProvider: mergeLabel(existing.webImageProvider, payload.imageProvider),
+                webSearchType: mergeLabel(existing.webSearchType, payload.searchType),
+                webQuery: existing.webQuery || payload.query,
+            };
+        } else {
+            messages.push({
+                id: `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+                role: "assistant",
+                content: "",
+                type: "web_sources",
+                timestamp: new Date(),
+                webSources: mergeWebSources([], incomingSources),
+                webImages: mergeWebImages([], incomingImages),
+                webProvider: payload.provider,
+                webImageProvider: payload.imageProvider,
+                webSearchType: payload.searchType,
+                webQuery: payload.query,
+            });
+        }
+
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
+        };
+    }),
+
+    updateLastAssistantMessage: (content) => set((state) => {
+        return { messages: updateLastAssistantContent(state.messages, content) };
     }),
 
     updateLastAssistantThinking: (thinking) => set((state) => {
-        const msgs = [...state.messages];
-        for (let i = msgs.length - 1; i >= 0; i--) {
-            if (msgs[i].role === "assistant" && msgs[i].type === "text") {
-                msgs[i] = { ...msgs[i], thinking };
-                break;
-            }
-        }
-        return { messages: msgs };
+        return {
+            messages: updateAssistantThinking(state.messages, thinking),
+            thinkingStatus: "running",
+        };
     }),
 
     setStreaming: (streaming) => set({ isStreaming: streaming }),
@@ -352,19 +500,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     },
 
     attachThinkingToLastMessage: () => set((s) => {
-        if (s.thinkingSteps.length === 0) return {};
-        // Mark any still-running steps as completed (streaming is done)
-        const finalSteps = s.thinkingSteps.map(step =>
-            step.status === "running" ? { ...step, status: "completed" as const } : step
-        );
-        const msgs = [...s.messages];
-        for (let i = msgs.length - 1; i >= 0; i--) {
-            if (msgs[i].role === "assistant" && msgs[i].type === "text") {
-                msgs[i] = { ...msgs[i], thinkingSteps: finalSteps };
-                break;
-            }
-        }
-        return { messages: msgs };
+        const targetAssistantIdx = findLastAssistantTextIndex(s.messages);
+        const hasThinkingText = targetAssistantIdx >= 0 && !!s.messages[targetAssistantIdx].thinking;
+        if (s.thinkingSteps.length === 0 && !hasThinkingText) return {};
+        return {
+            messages: attachThinkingStepsToLastAssistant(s.messages, s.thinkingSteps).messages,
+            thinkingStatus: "completed",
+        };
     }),
 
     // ── Task Execution Actions ──────────────────────────────────────────────

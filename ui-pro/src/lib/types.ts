@@ -35,12 +35,25 @@ export interface Message {
     attachmentNames?: string[];     // names of attached documents
     webSources?: WebSource[];       // clickable source cards from web search
     webImages?: WebImage[];         // image grid from web search
+    webProvider?: string;           // confirmed web provider returned by router
+    webImageProvider?: string;      // provider used for image enrichment
+    webSearchType?: string;         // provider-specific search mode, e.g. Exa deep
+    webQuery?: string;              // original web query or URL
 }
 
 export interface WebSource {
     title: string;
     url: string;
     snippet: string;
+    evidenceQuality?: EvidenceQuality;
+}
+
+export interface EvidenceQuality {
+    score: number;
+    tier: "primary" | "peer_reviewed" | "preprint" | "institutional" | "reference" | "general" | string;
+    label: string;
+    reason?: string;
+    signals?: string[];
 }
 
 export interface WebImage {
@@ -69,6 +82,7 @@ export interface DataTableResult {
     columns: string[];
     rows: Record<string, string | number>[];
     sourceName: string;
+    tableKind?: string;   // e.g. "alma_products" or "alma_project_picker"
     archiveLink?: string;  // Footer link to full dataset on ALMA/ESO portal
     hasRowLinks?: boolean; // Whether rows include per-row _link field
     hasPreview?: boolean;  // Whether rows include per-row _preview sky thumbnail URL
@@ -106,6 +120,15 @@ export interface Paper {
     isTop10Percent?: boolean;
     funders?: { name: string; id: string }[];
     oaPdfUrl?: string;
+    observationLinks?: ObservationPaperLink[];
+}
+
+export interface ObservationPaperLink {
+    identifier: string;
+    identifierType?: string;
+    relation?: string;
+    confidence?: string;
+    adsQuery?: string;
 }
 
 export interface ToolCall {

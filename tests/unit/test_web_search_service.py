@@ -141,6 +141,29 @@ def test_advanced_research_routes_to_exa_deep(monkeypatch, isolated_usage_file):
     }
 
 
+def test_advanced_search_routes_to_exa_deep_by_default(monkeypatch, isolated_usage_file):
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
+    calls = {}
+
+    def fake_search_exa(self, query, num_results=10, search_type="deep"):
+        calls["num_results"] = num_results
+        calls["search_type"] = search_type
+        return {"success": True, "provider": "Exa", "results": [], "images": []}
+
+    monkeypatch.setattr(WebSearchService, "search_exa", fake_search_exa)
+
+    result = WebSearchService().route_and_search(
+        "ALMA antenna setup",
+        search_depth="advanced",
+    )
+
+    assert result["success"] is True
+    assert result["provider"] == "Exa"
+    assert calls == {"num_results": 10, "search_type": "deep"}
+
+
 def test_exa_routes_deep_reasoning_for_complex_questions(monkeypatch, isolated_usage_file):
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)

@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Bookmark, Award, TrendingUp, FileText } from "lucide-react";
+import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Bookmark, Award, TrendingUp, FileText, GitBranch } from "lucide-react";
 import { useState } from "react";
 import type { Paper } from "../lib/types";
 import { useChatStore } from "../lib/store";
@@ -41,6 +41,7 @@ export function PaperCard({ paper }: PaperCardProps) {
     // Enrichment badge helpers
     const hasFunders = paper.funders && paper.funders.length > 0;
     const hasFwci = paper.fwci != null && paper.fwci > 0;
+    const linkedIdentifier = paper.observationLinks?.[0]?.identifier;
 
     return (
         <div className="bg-sidebar-dark rounded-2xl border border-slate-700/50 hover:border-emerald-500/50 transition-colors group flex flex-col justify-between h-full">
@@ -75,6 +76,14 @@ export function PaperCard({ paper }: PaperCardProps) {
                                 title="Open Access PDF"
                             >
                                 <FileText className="w-2.5 h-2.5" />PDF
+                            </span>
+                        )}
+                        {linkedIdentifier && (
+                            <span
+                                className="px-1.5 py-0.5 rounded-md text-[9px] font-bold uppercase tracking-wider bg-cyan-500/15 text-cyan-300 flex items-center gap-0.5"
+                                title={`Explicit archive identifier match: ${linkedIdentifier}`}
+                            >
+                                <GitBranch className="w-2.5 h-2.5" />ID linked
                             </span>
                         )}
                     </div>
@@ -161,4 +170,3 @@ export function PaperCard({ paper }: PaperCardProps) {
         </div>
     );
 }
-

@@ -128,5 +128,11 @@ cloned_repos/
 # ============================================
 user_tools/
 
-# Local scripts (not tracked)
-scripts/local/
+# Local scripts (only checked-in helpers are tracked)
+scripts/local/*
+!scripts/local/
+!scripts/local/start_quasar.ps1
+
+# Test and preview data
+data/local_previews/
+data/rendered_images/

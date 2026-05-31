@@ -19,6 +19,7 @@ import json
 import re
 import uuid
 import threading
+import time
 import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -28,6 +29,7 @@ from openai import OpenAI
 from core.llm_client import LLMClient, detect_provider
 
 from core.logger import logger, log_tool
+from services.evidence_quality import annotate_web_source_evidence, rank_web_sources
 
 
 from core.memory import ConversationMemory
@@ -61,6 +63,35 @@ from services.gcn_monitor import GCNAlertMonitor
 from services.notebook_gen import generate_analysis_notebook
 from services.pdf_processing import PDFProcessingService
 from services.fits_processing import FITSProcessingService
+from services.data_product_triage import (
+    build_product_row,
+    classify_alma_product_request,
+    filter_observations_by_band,
+    is_fits_product,
+    product_rank,
+    summarize_project_options,
+    unique_values,
+)
+from services.alma_science_queries import (
+    LINE_REST_FREQ_GHZ,
+    bandwidth_switching_candidates,
+    filter_band as science_filter_band,
+    filter_resolution as science_filter_resolution,
+    line_names_for_species,
+    normalize_target_alias,
+    projects_covering_all_lines,
+    projects_with_array_combo,
+    project_prefix_where,
+    redshifted_line_projects,
+    select_obscore_query,
+    summarize_projects,
+)
+from services.cross_archive_matcher import (
+    PERSEUS_PROTOSTARS,
+    alma_bulk_cone_adql,
+    attach_nearest_source,
+    summarize_alma_jwst_matches,
+)
 from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
 from services.astro_calculators import (
     calculate_redshift, convert_coordinates, calculate_beam,
@@ -185,6 +216,8 @@ class QuasarAgent:
         # cross-user state poisoning on the shared agent instance.
         self._conv_response_ids: Dict[str, str] = {}
         self._conv_ids_lock = threading.Lock()
+        self._alma_project_picker_by_conversation: Dict[str, Dict[str, Any]] = {}
+        self._alma_project_picker_lock = threading.Lock()
 
         self._session_token_estimate = 0  # Running token count estimate (legacy — kept for compat)
         self._session_token_limit = 90000  # Legacy threshold (superseded by ContextManager)
@@ -566,7 +599,7 @@ GUIDELINES:
   If the query is asking HOW something works, WHAT something is, or about ALMA procedures/policies/deadlines — it is a KNOWLEDGE query. NEVER call search_papers for these.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
-- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). Do NOT try to construct ADS field syntax — the tool has an internal AI query builder that translates natural language into optimal ADS queries using keyword searches, bibgroup filters, SIMBAD object linking, and second-order discovery operators. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
+- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
 - **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer — "Who is X?", "Tell me about X", "Where does X work?" — call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
   1. **Header**: "## Profile: [Full Name]" with email and personal webpage (from web search if available)
   2. **Identity**: ORCID, alternative name forms, current institution(s)
@@ -583,9 +616,11 @@ GUIDELINES:
   6. **Recent Research Activity** — ALWAYS as a markdown table with Year / Works / Citations columns (last 5–10 years)
   7. **Summary**: A brief narrative paragraph about the researcher
   If web search results are also available, extract and include their email address, personal webpage, and recent news/awards at the top.
+- **ALMA DATA PRODUCT TRIAGE**: When the user asks to fetch, inspect, list, or triage ALMA FITS/data products, call `triage_alma_data_products`. If they provide a project/proposal code, MOUS UID, ASDM UID, or dataset ID, triage that exact identifier directly. If they provide only a target name such as "M87", first use `triage_alma_data_products` to show available project codes and ask the user which project to triage; do NOT guess. If the previous turn showed a project-code picker and the user replies with a row number like "#4", "number 4", or "use the fourth one", call `triage_alma_data_products` with that reply exactly. If they provide a band preference, pass it so the picker is filtered first. Never auto-download huge products; remote header inspection and product listing are safe.
 - **RESEARCH TRENDS**: When the user asks about publication volume, field growth, or funding landscape — "How much research on FRBs?", "Is interest in X growing?", "Who funds research on Y?" — call `get_research_trends`. Returns papers-per-year breakdown and top funders.
 - **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
-- **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` when the user gives URLs to read. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
+- **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
+- **WEB TOOL ROUTING**: Keyword query → `web_search`. Full URL(s) to read/summarize/quote → `web_extract_url`. Site root URL plus "find pages" → `web_map_site`. Site section plus "crawl/docs" → `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
@@ -596,6 +631,7 @@ GUIDELINES:
 - **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
 - **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
 - **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` — they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
+- **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **LINE COVERAGE**: When the user asks about line coverage (e.g. "Check CO(2-1) line coverage for M87"), follow this exact 2-step workflow:
@@ -849,6 +885,102 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
+        self.tool_registry.register(Tool(
+            name="query_alma_science_archive",
+            description=(
+                "Run deterministic ALMA Science Archive query templates for hard archive-science questions. "
+                "Use this instead of raw ADQL for: Cycle N project counts, Sun/solar projects, projects using "
+                "12m+7m+total-power arrays, high-resolution Band N continuum candidates for a target, projects "
+                "covering a required molecular line set such as 12CO/13CO/C18O in the same project, and "
+                "bandwidth-switching calibration diagnostics."
+            ),
+            function=self._query_alma_science_archive,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": [
+                            "cycle_solar_projects",
+                            "cycle_array_combo_projects",
+                            "high_resolution_band_data",
+                            "line_set_projects",
+                            "redshifted_line_projects",
+                            "bandwidth_switching_candidates",
+                        ],
+                        "description": "Specific ALMA science/archive query template to run."
+                    },
+                    "cycle": {"type": "integer", "description": "ALMA cycle number, e.g. 10."},
+                    "target": {"type": "string", "description": "Target/source name, e.g. HH212."},
+                    "band": {"type": "integer", "description": "ALMA band number, e.g. 6 or 7."},
+                    "max_resolution_arcsec": {"type": "number", "description": "Maximum angular resolution in arcsec for high-resolution data."},
+                    "arrays": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Required array types, e.g. ['12m','7m','TP']."
+                    },
+                    "lines": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Required lines, e.g. ['12CO','13CO','C18O']."
+                    },
+                    "topic_filter": {"type": "string", "description": "Optional science keyword/category filter such as protostellar disks."},
+                    "redshift_min": {"type": "number", "description": "Minimum redshift for redshifted rest-line searches."},
+                    "redshift_max": {"type": "number", "description": "Maximum redshift for redshifted rest-line searches."},
+                    "rest_species": {"type": "string", "description": "Rest species for line searches, e.g. CO, 12CO, 13CO, C18O."},
+                    "science_category": {"type": "string", "description": "Optional ALMA science category filter, e.g. Galaxy evolution."},
+                    "require_same_project": {"type": "boolean", "description": "Require requested line matches in the same proposal_id. Default true."},
+                    "include_adql": {"type": "boolean", "description": "Include executed ADQL in provenance. Default true."},
+                    "max_results": {"type": "integer", "description": "Maximum TAP rows to fetch before grouping. Default 5000."},
+                },
+                "required": ["query_type"]
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="match_cross_archive_sources",
+            description=(
+                "Cross-match a source catalog against ALMA and MAST/JWST observations. "
+                "Use this for source-list location questions such as Perseus protostars observed with ALMA and JWST."
+            ),
+            function=self._match_cross_archive_sources,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog_name": {"type": "string", "description": "Catalog key. Currently supports 'perseus_protostars'."},
+                    "archives": {"type": "array", "items": {"type": "string"}, "description": "Archives to match, e.g. ['ALMA','JWST']."},
+                    "radius_arcsec": {"type": "number", "description": "Match radius in arcsec. Default 5."},
+                    "max_sources": {"type": "integer", "description": "Max catalog sources to test. Default 12."},
+                    "max_alma_rows": {"type": "integer", "description": "Max ALMA TAP rows to fetch. Default 5000."},
+                    "max_mast_results_per_source": {"type": "integer", "description": "Max MAST/JWST rows per source. Default 80."},
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="match_perseus_protostars_alma_jwst",
+            description=(
+                "Cross-match a built-in Perseus protostar source list against ALMA and MAST/JWST observations. "
+                "Use this for questions like 'Show locations of protostars in Perseus observed with ALMA and JWST'. "
+                "Returns sources with both ALMA and JWST matches, counts, project/program IDs, and sky coordinates."
+            ),
+            function=self._match_perseus_protostars_alma_jwst,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "radius_arcsec": {"type": "number", "description": "Match radius in arcsec. Default 5."},
+                    "max_sources": {"type": "integer", "description": "Max built-in Perseus sources to test. Default 12."},
+                    "max_alma_rows": {"type": "integer", "description": "Max ALMA TAP rows to fetch. Default 5000."},
+                    "max_mast_results_per_source": {"type": "integer", "description": "Max MAST/JWST rows per source. Default 80."},
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+
         # plot_alma_results is registered once below under "Publication Plotting Tools"
         
         self.tool_registry.register(Tool(
@@ -958,6 +1090,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "NEVER use this for finding papers or publications — use search_papers (NASA ADS) instead. "
                 "Uses Brave, Tavily, and Exa through Quasar's web search router for grounded, source-cited results. "
                 "Use the user's query as-is — do NOT add years or dates unless the user explicitly mentioned them. "
+                "For keyword queries, use this tool directly and answer from its returned sources. "
+                "Do NOT call navigate_to_url after web_search unless the user explicitly asks to open a specific result URL "
+                "or the search result is insufficient and you need one full page from a known http(s) URL. "
                 "Examples: 'ALMA proprietary period policy', 'JWST cycle 4 call for proposals', "
                 "'VLA sensitivity at 1.4 GHz'."
             ),
@@ -966,8 +1101,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Web search query string"},
-                    "max_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"},
-                    "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "'basic' for quick answers, 'advanced' for comprehensive research (default: basic)"},
+                    "max_results": {"type": "integer", "description": "Number of results to return (default 10, max 10)"},
+                    "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "'basic' for quick real-time search, 'advanced' for Exa deep search; very hard comparisons/research route to Exa deep-reasoning (default: basic)"},
                 },
                 "required": ["query"]
             }
@@ -978,7 +1113,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             description=(
                 "Extract clean markdown/text from one or more specific URLs using Tavily Extract. "
                 "Use when the user gives URLs and asks to read, summarize, quote, or pull page content. "
-                "Do not pass search terms here; call web_search first unless you already have a full http(s) URL. "
+                "Only pass full http(s) URLs. Never pass search terms or keyword queries here; use web_search for those. "
+                "Do not call this immediately after web_search unless the final answer truly needs full-page text "
+                "from a specific result URL. "
                 "For JavaScript-heavy pages, set extract_depth='advanced'."
             ),
             function=self._tavily_extract_url,
@@ -1089,7 +1226,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="navigate_to_url",
-            description="Navigate to a specific URL and return its page content. Use for ALMA archive, NASA ADS, ESO portal, VizieR, arXiv paper pages, etc.",
+            description=(
+                "Navigate the browser to a specific full http(s) URL and return its page content. "
+                "Use for interactive browser-only tasks on ALMA archive, NASA ADS, ESO portal, VizieR, arXiv pages, etc. "
+                "Do NOT use this for keyword searches and do NOT call it after web_search unless the user explicitly "
+                "asked to open/navigate to a specific URL."
+            ),
             function=lambda **kw: self.browser_service.navigate_to_url(**kw),
             parameters={
                 "type": "object",
@@ -1507,6 +1649,34 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
 
         self.tool_registry.register(Tool(
+            name="search_papers_by_observation_id",
+            description=(
+                "Find NASA ADS papers explicitly connected to a specific archive identifier. "
+                "Use this instead of generic search_papers when the user provides an ALMA project/proposal code "
+                "(e.g. 2019.1.00123.S), MOUS/member_ous_uid (uid://...), ASDM UID, or archive dataset ID. "
+                "The lookup uses exact identifier searches and returns provenance metadata for the graph."
+            ),
+            function=lambda identifier, max_results=20, facility="ALMA", **kw: (
+                self._search_papers_by_observation_identifier(
+                    identifier=identifier,
+                    max_results=max_results,
+                    facility=facility,
+                )
+                if self.ads_client else {"error": "ADS client not configured"}
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "identifier": {"type": "string", "description": "Project/proposal code, MOUS UID, ASDM UID, or archive dataset identifier."},
+                    "facility": {"type": "string", "description": "Facility/bibgroup hint, default ALMA."},
+                    "max_results": {"type": "integer", "description": "Number of results to return (default 20, max 50)"},
+                },
+                "required": ["identifier"]
+            },
+            category="literature"
+        ))
+
+        self.tool_registry.register(Tool(
             name="get_author_papers",
             description="Find all papers published by a specific author. Use 'Last, First' format for best results.",
             function=lambda author, max_results=20, **kw: (
@@ -1870,6 +2040,30 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
 
         self.tool_registry.register(Tool(
+            name="overlay_archive_images",
+            description=(
+                "End-to-end archive image overlay workflow. Queries MAST/JWST for a "
+                "background FITS image and ALMA/DataLink for contour FITS near a named "
+                "region, WCS-aligns them, and renders a PNG. Use for requests like "
+                "'Overlay ALMA contours on JWST image for HUDF'."
+            ),
+            function=self._overlay_archive_images,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "region": {"type": "string", "description": "Named region. Currently supports HUDF."},
+                    "base_archive": {"type": "string", "description": "Base image archive, default MAST."},
+                    "base_collection": {"type": "string", "description": "Base collection/mission, default JWST."},
+                    "contour_archive": {"type": "string", "description": "Contour archive, default ALMA."},
+                    "radius_arcmin": {"type": "number", "description": "Search radius around the region center. Default 1."},
+                    "max_product_mb": {"type": "number", "description": "Maximum FITS product size to select. Default 150."},
+                },
+                "required": ["region"]
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
             name="compute_moment_map",
             description=(
                 "Download a FITS spectral cube and compute a moment map. "
@@ -2096,6 +2290,52 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
 
         self.tool_registry.register(Tool(
+            name="triage_alma_data_products",
+            description=(
+                "Discover and triage ALMA deliverable data products. Use this when the user asks "
+                "to fetch, list, inspect, or triage ALMA FITS/data products. Exact project/proposal "
+                "codes, MOUS UIDs, ASDM UIDs, and dataset IDs are routed directly. Generic target "
+                "names are treated as ambiguous: the tool returns a project-code picker table and "
+                "asks the user to choose before product triage. If a project picker was just shown, "
+                "row-number replies such as '#4' or 'use number 4' are resolved to that project. "
+                "It lists DataLink products and reads "
+                "remote FITS headers only; it does not download large science files."
+            ),
+            function=self._triage_alma_data_products,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "identifier_or_target": {
+                        "type": "string",
+                        "description": "ALMA project code, MOUS UID, dataset ID, or target name from the user request."
+                    },
+                    "band": {
+                        "type": "string",
+                        "description": "Optional ALMA band preference, e.g. '6' or 'Band 7'."
+                    },
+                    "max_projects": {
+                        "type": "integer",
+                        "description": "Optional max project-code options to show for ambiguous target searches. By default all matched projects are shown."
+                    },
+                    "max_mous": {
+                        "type": "integer",
+                        "description": "Max MOUS datasets to inspect for exact IDs. Default 5."
+                    },
+                    "max_products": {
+                        "type": "integer",
+                        "description": "Max product rows to list. Default 40."
+                    },
+                    "max_header_checks": {
+                        "type": "integer",
+                        "description": "Max FITS products to inspect with remote header reads. Default 6."
+                    },
+                },
+                "required": ["identifier_or_target"]
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
             name="inspect_fits_header",
             description=(
                 "Read key metadata from a remote FITS file header WITHOUT downloading "
@@ -2173,7 +2413,429 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e), "url": access_url}
 
+    def _route_alma_science_archive_query(self, query: str) -> Optional[Dict[str, Any]]:
+        """Map known hard ALMA science prompts to deterministic tool args."""
+        raw = str(query or "")
+        q = raw.lower()
+        cycle_match = re.search(r"\bcycle\s+(\d{1,2})\b", q)
+        cycle = int(cycle_match.group(1)) if cycle_match else None
+
+        if cycle is not None and re.search(r"\b(?:sun|solar)\b", q):
+            return {"query_type": "cycle_solar_projects", "cycle": cycle}
+
+        if cycle is not None and all(term in q for term in ("12m", "7m")) and re.search(r"total\s+power|\btp\b", q):
+            return {"query_type": "cycle_array_combo_projects", "cycle": cycle, "arrays": ["12m", "7m", "TP"]}
+
+        if re.search(r"\bhh\s*212\b", q) and re.search(r"band\s*7|\bb7\b", q):
+            return {
+                "query_type": "high_resolution_band_data",
+                "target": "HH 212",
+                "band": 7,
+                "max_resolution_arcsec": 0.1,
+            }
+
+        if all(term in q for term in ("12co", "13co", "c18o")):
+            args: Dict[str, Any] = {
+                "query_type": "line_set_projects",
+                "band": 6,
+                "lines": ["12CO", "13CO", "C18O"],
+                "require_same_project": True,
+            }
+            if re.search(r"protostellar|proto-stellar|disk", q):
+                args["topic_filter"] = "protostellar disks"
+            return args
+
+        z_match = re.search(r"\bz\s*[=~]?\s*(\d+(?:\.\d+)?)\s*(?:-|to|\u2013)\s*(\d+(?:\.\d+)?)", q)
+        if z_match and re.search(r"\bco\b|carbon monoxide|rest frequenc", q):
+            return {
+                "query_type": "redshifted_line_projects",
+                "redshift_min": float(z_match.group(1)),
+                "redshift_max": float(z_match.group(2)),
+                "rest_species": "CO",
+                "science_category": "Galaxy",
+                "require_same_project": True,
+            }
+
+        if re.search(r"bandwidth\s+switching|spectral\s+setup", q):
+            args: Dict[str, Any] = {"query_type": "bandwidth_switching_candidates"}
+            if cycle is not None:
+                args["cycle"] = cycle
+            return args
+
+        return None
+
     # ── Astronomy acronym dictionary for web search disambiguation ─────
+    def _ensure_alma_project_picker_state(self) -> None:
+        if not hasattr(self, "_alma_project_picker_by_conversation"):
+            self._alma_project_picker_by_conversation = {}
+        if not hasattr(self, "_alma_project_picker_lock"):
+            self._alma_project_picker_lock = threading.Lock()
+
+    def _current_conversation_id(self) -> str:
+        return str(getattr(getattr(self, "_tls", None), "current_conversation_id", "") or "")
+
+    def _store_alma_project_picker(
+        self,
+        picker: pd.DataFrame,
+        *,
+        target: str = "",
+        band: str = "",
+    ) -> None:
+        conversation_id = self._current_conversation_id()
+        if not conversation_id or picker is None or not hasattr(picker, "empty") or picker.empty:
+            return
+        self._ensure_alma_project_picker_state()
+        with self._alma_project_picker_lock:
+            self._alma_project_picker_by_conversation[conversation_id] = {
+                "target": target,
+                "band": band,
+                "projects": picker.to_dict("records"),
+            }
+
+    def _clear_alma_project_picker(self) -> None:
+        conversation_id = self._current_conversation_id()
+        if not conversation_id:
+            return
+        self._ensure_alma_project_picker_state()
+        with self._alma_project_picker_lock:
+            self._alma_project_picker_by_conversation.pop(conversation_id, None)
+
+    def _has_pending_alma_project_picker(self, conversation_id: str) -> bool:
+        if not conversation_id:
+            return False
+        self._ensure_alma_project_picker_state()
+        with self._alma_project_picker_lock:
+            pending = self._alma_project_picker_by_conversation.get(conversation_id)
+        return bool(pending and pending.get("projects"))
+
+    @staticmethod
+    def _parse_project_picker_selection_index(text: str) -> Optional[int]:
+        clean = str(text or "").strip().lower()
+        if not clean:
+            return None
+
+        ordinal_map = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+        }
+        ordinal_match = re.search(
+            r"\b(?:use|choose|select|pick|triage|fetch|inspect)?\s*"
+            r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
+            clean,
+        )
+        if ordinal_match:
+            return ordinal_map[ordinal_match.group(1)]
+
+        bare_number = re.fullmatch(r"#?\s*(\d{1,3})", clean)
+        if bare_number:
+            return int(bare_number.group(1))
+
+        numbered = re.search(
+            r"\b(?:#|row|option|number|no\.?|use|choose|select|pick|triage|fetch|inspect)\s*#?\s*(\d{1,3})\b",
+            clean,
+        )
+        if numbered:
+            return int(numbered.group(1))
+
+        return None
+
+    def _resolve_alma_project_picker_selection(self, text: str) -> str:
+        conversation_id = self._current_conversation_id()
+        if not conversation_id:
+            return ""
+        index = self._parse_project_picker_selection_index(text)
+        if index is None:
+            return ""
+
+        self._ensure_alma_project_picker_state()
+        with self._alma_project_picker_lock:
+            pending = self._alma_project_picker_by_conversation.get(conversation_id) or {}
+            projects = list(pending.get("projects") or [])
+
+        if index < 1 or index > len(projects):
+            return ""
+        return str(projects[index - 1].get("proposal_id") or "").strip()
+
+    @log_tool
+    def _triage_alma_data_products(
+        self,
+        identifier_or_target: str,
+        band: str = "",
+        max_projects: int = None,
+        max_mous: int = 5,
+        max_products: int = 40,
+        max_header_checks: int = 6,
+    ) -> Dict[str, Any]:
+        """Discover ALMA products and perform safe remote FITS-header triage."""
+        request = classify_alma_product_request(identifier_or_target)
+        if request.get("kind") == "target":
+            selected_project = self._resolve_alma_project_picker_selection(identifier_or_target)
+            if selected_project:
+                request = {
+                    "kind": "project_code",
+                    "identifier": selected_project,
+                    "target": "",
+                    "band": request.get("band", ""),
+                }
+        band_value = str(band or request.get("band") or "").replace("Band", "").replace("band", "").strip()
+        max_projects = max(1, min(int(max_projects), 500)) if max_projects else None
+        max_mous = max(1, min(int(max_mous or 5), 20))
+        max_products = max(1, min(int(max_products or 40), 200))
+        max_header_checks = max(0, min(int(max_header_checks or 6), 20))
+
+        kind = request.get("kind", "target")
+        identifier = request.get("identifier", "")
+        target = request.get("target", "") or str(identifier_or_target or "").strip()
+
+        try:
+            if kind == "mous_uid":
+                self._clear_alma_project_picker()
+                return self._triage_alma_mous_products(
+                    mous_uids=[identifier],
+                    label=identifier,
+                    band=band_value,
+                    max_products=max_products,
+                    max_header_checks=max_header_checks,
+                )
+
+            if kind in {"project_code", "dataset_id"}:
+                observations = self._search_alma_observations_for_identifier(kind, identifier)
+                lookup_label = identifier
+            else:
+                observations = self.search_service.search_by_target(target, facility="ALMA", max_results=200)
+                lookup_label = target
+
+            if observations is None or not hasattr(observations, "empty") or observations.empty:
+                return {
+                    "success": False,
+                    "mode": "no_observations",
+                    "query": identifier_or_target,
+                    "message": f"No public ALMA observations were found for {lookup_label}.",
+                }
+
+            if band_value:
+                observations = filter_observations_by_band(observations, band_value)
+                if observations.empty:
+                    return {
+                        "success": False,
+                        "mode": "no_band_match",
+                        "query": identifier_or_target,
+                        "band": band_value,
+                        "message": f"No ALMA observations for {lookup_label} matched Band {band_value}.",
+                    }
+
+            if kind == "target":
+                picker = summarize_project_options(observations, max_projects=max_projects)
+                project_count = len(picker) if picker is not None else 0
+                if project_count != 1:
+                    self._store_alma_project_picker(picker, target=target, band=band_value)
+                    self.last_search_results = observations
+                    self.last_run_result = {
+                        "type": "data",
+                        "data": picker,
+                        "source": "ALMA Project Picker",
+                        "filter_label": f"ALMA project options for {target}" + (f" Band {band_value}" if band_value else ""),
+                        "tool_name": "triage_alma_data_products",
+                        "table_kind": "alma_project_picker",
+                    }
+                    return {
+                        "success": True,
+                        "mode": "needs_project_selection",
+                        "target": target,
+                        "band": band_value or None,
+                        "project_count": project_count,
+                        "message": (
+                            f"I found {project_count} possible ALMA project codes for {target}"
+                            + (f" in Band {band_value}" if band_value else "")
+                            + ". Ask the user to choose one project code before fetching products."
+                        ),
+                        "project_options": picker.to_dict("records") if picker is not None else [],
+                    }
+
+                identifier = str(picker.iloc[0]["proposal_id"])
+                lookup_label = identifier
+
+            self._clear_alma_project_picker()
+            proposal_id = self._best_observation_value(observations, ["proposal_id", "project_code"]) or identifier
+            target_name = self._best_observation_value(observations, ["target_name"]) or target
+            mous_uids = unique_values(observations, ["member_ous_uid"], limit=max_mous)
+            if not mous_uids:
+                self.last_search_results = observations
+                self.last_run_result = {
+                    "type": "data",
+                    "data": observations,
+                    "source": "ALMA observations",
+                    "filter_label": f"ALMA observations for {lookup_label}",
+                    "tool_name": "triage_alma_data_products",
+                }
+                return {
+                    "success": False,
+                    "mode": "no_mous_uid",
+                    "project_code": proposal_id,
+                    "observation_count": len(observations),
+                    "message": "Observation rows were found, but no MOUS UID was available for DataLink product discovery.",
+                }
+
+            return self._triage_alma_mous_products(
+                mous_uids=mous_uids,
+                label=lookup_label,
+                band=band_value,
+                proposal_id=proposal_id,
+                target_name=target_name,
+                observation_count=len(observations),
+                max_products=max_products,
+                max_header_checks=max_header_checks,
+            )
+        except Exception as e:
+            return {"success": False, "mode": "error", "error": str(e), "query": identifier_or_target}
+
+    def _search_alma_observations_for_identifier(self, kind: str, identifier: str) -> pd.DataFrame:
+        clean = str(identifier or "").strip()
+        if not clean:
+            return pd.DataFrame()
+
+        safe = clean.replace("'", "''")
+        if kind == "project_code":
+            direct_query = (
+                "SELECT TOP 500 * FROM ivoa.obscore "
+                f"WHERE proposal_id = '{safe}' OR obs_publisher_did LIKE '%{safe}%'"
+            )
+        else:
+            direct_query = (
+                "SELECT TOP 500 * FROM ivoa.obscore "
+                f"WHERE obs_publisher_did = '{safe}' OR obs_publisher_did LIKE '%{safe}%'"
+            )
+        try:
+            alma_client = getattr(self.search_service, "alminer_client", None)
+            if alma_client is not None and hasattr(alma_client, "_get_tap_service"):
+                service = alma_client._get_tap_service()
+                result = service.search(direct_query)
+                df = result.to_table().to_pandas()
+                if df is not None and not df.empty:
+                    if hasattr(alma_client, "_standardize_columns"):
+                        return alma_client._standardize_columns(df)
+                    return df
+        except Exception as tap_err:
+            print(f"[ALMA product triage] Direct TAP identifier query failed: {tap_err}")
+
+        keyword_attempts: List[Dict[str, Any]] = []
+        if kind == "project_code":
+            keyword_attempts.extend([
+                {"project_code": clean},
+                {"proposal_id": clean},
+            ])
+        elif kind == "dataset_id":
+            keyword_attempts.append({"obs_publisher_did": clean})
+
+        for keywords in keyword_attempts:
+            df = self.search_service.search_alma_with_keywords(keywords)
+            if df is not None and hasattr(df, "empty") and not df.empty:
+                return df
+
+        return self.search_service.advanced_search(direct_query)
+
+    def _triage_alma_mous_products(
+        self,
+        mous_uids: List[str],
+        label: str,
+        band: str = "",
+        proposal_id: str = "",
+        target_name: str = "",
+        observation_count: int = 0,
+        max_products: int = 40,
+        max_header_checks: int = 6,
+    ) -> Dict[str, Any]:
+        product_rows: List[Dict[str, Any]] = []
+        all_files: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        for mous_uid in mous_uids:
+            result = self.datalink_client.list_files(mous_uid=mous_uid)
+            if not result.get("success"):
+                errors.append(f"{mous_uid}: {result.get('error', 'DataLink query failed')}")
+                continue
+            for file_info in result.get("files", []):
+                enriched = dict(file_info)
+                enriched["_mous_uid"] = mous_uid
+                all_files.append(enriched)
+
+        ranked_files = sorted(all_files, key=product_rank)
+        selected_files = ranked_files[:max_products]
+
+        header_checks = 0
+        header_summaries: List[Dict[str, Any]] = []
+        for file_info in selected_files:
+            metadata = None
+            if header_checks < max_header_checks and is_fits_product(file_info) and file_info.get("access_url"):
+                metadata = self.fits_service.extract_metadata_from_url(str(file_info["access_url"]))
+                header_checks += 1
+                header_summaries.append({
+                    "filename": file_info.get("filename"),
+                    "success": bool(metadata.get("success")) if isinstance(metadata, dict) else False,
+                    "object_name": metadata.get("object_name") if isinstance(metadata, dict) else None,
+                    "beam_major_arcsec": metadata.get("beam_major_arcsec") if isinstance(metadata, dict) else None,
+                    "beam_minor_arcsec": metadata.get("beam_minor_arcsec") if isinstance(metadata, dict) else None,
+                    "rest_freq_ghz": metadata.get("rest_freq_ghz") if isinstance(metadata, dict) else None,
+                    "image_size": metadata.get("image_size") if isinstance(metadata, dict) else None,
+                    "bunit": metadata.get("bunit") if isinstance(metadata, dict) else None,
+                })
+            product_rows.append(build_product_row(
+                file_info,
+                member_ous_uid=str(file_info.get("_mous_uid") or ""),
+                proposal_id=proposal_id,
+                target_name=target_name,
+                metadata=metadata,
+            ))
+
+        product_df = pd.DataFrame(product_rows)
+        if not product_df.empty:
+            self.last_run_result = {
+                "type": "data",
+                "data": product_df,
+                "source": "ALMA Data Products",
+                "filter_label": f"ALMA products for {label}" + (f" Band {band}" if band else ""),
+                "tool_name": "triage_alma_data_products",
+                "table_kind": "alma_products",
+            }
+
+        fits_count = sum(1 for item in all_files if is_fits_product(item))
+        large_count = sum(1 for item in all_files if float(item.get("size_mb") or 0) > 500)
+        return {
+            "success": True,
+            "mode": "triage",
+            "label": label,
+            "project_code": proposal_id or None,
+            "target_name": target_name or None,
+            "band": band or None,
+            "observation_count": observation_count,
+            "mous_checked": len(mous_uids),
+            "total_products_found": len(all_files),
+            "products_listed": len(product_rows),
+            "fits_products_found": fits_count,
+            "header_checks": header_checks,
+            "large_products_over_500mb": large_count,
+            "header_summaries": header_summaries,
+            "errors": errors,
+            "message": (
+                f"Found {len(all_files)} ALMA DataLink product(s) across {len(mous_uids)} MOUS dataset(s); "
+                f"listed {len(product_rows)} and inspected {header_checks} FITS header(s) without downloading full files."
+            ),
+            "safety": "No large science files were downloaded. Header checks used remote FITS header reads only.",
+        }
+
+    @staticmethod
+    def _best_observation_value(df: pd.DataFrame, columns: List[str]) -> str:
+        values = unique_values(df, columns, limit=1)
+        return values[0] if values else ""
+
     _ASTRO_ACRONYMS: dict = {
         # Telescopes & Observatories
         "ALMA":   "ALMA (Atacama Large Millimeter/submillimeter Array)",
@@ -2516,10 +3178,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             clean = re.sub(r"^https?://", "", url).split("/", 1)[0]
             return clean.replace("www.", "") or url
 
-        def _source_from_item(item: Any) -> Optional[Dict[str, str]]:
+        def _source_from_item(item: Any) -> Optional[Dict[str, Any]]:
             if isinstance(item, str):
                 url = _normalize_web_url(item)
-                return {"title": _title_from_url(url), "url": url, "snippet": ""} if url else None
+                return annotate_web_source_evidence({"title": _title_from_url(url), "url": url, "snippet": ""}) if url else None
             if not isinstance(item, dict):
                 return None
             url = _normalize_web_url(
@@ -2531,7 +3193,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             if not url:
                 return None
-            return {
+            return annotate_web_source_evidence({
                 "title": str(item.get("title") or item.get("name") or _title_from_url(url)).strip(),
                 "url": url,
                 "snippet": str(
@@ -2541,7 +3203,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     or item.get("description")
                     or ""
                 ).strip()[:500],
-            }
+                "evidenceQuality": item.get("evidenceQuality") or item.get("evidence_quality") or {},
+            })
 
         def _image_from_item(item: Any) -> Optional[Dict[str, str]]:
             if isinstance(item, str):
@@ -2610,25 +3273,45 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 continue
             seen_urls.add(source["url"])
             sources.append(source)
+        sources = rank_web_sources(sources)
 
         image_items = web_data.get("images", [])
         if isinstance(response, dict) and not image_items:
             image_items = response.get("images", [])
         images = []
+        seen_image_urls = set()
         if isinstance(image_items, list):
             for item in image_items:
                 image = _image_from_item(item)
-                if image:
+                if image and image["url"] not in seen_image_urls:
+                    seen_image_urls.add(image["url"])
                     images.append(image)
 
         if not sources and not images:
             return None
 
+        provider = (
+            web_data.get("provider")
+            or (response.get("provider") if isinstance(response, dict) else None)
+            or ""
+        )
+        image_provider = web_data.get("image_provider") or ""
+        search_type = web_data.get("search_type") or ""
+        query_value = (
+            web_data.get("query")
+            or web_data.get("url")
+            or ", ".join(web_data.get("urls", []) if isinstance(web_data.get("urls"), list) else [])
+            or ""
+        )
+
         return {
             "type": "web_sources",
             "sources": sources,
             "images": images,
-            "query": web_data.get("query", "") or web_data.get("url", ""),
+            "query": query_value,
+            "provider": str(provider),
+            "image_provider": str(image_provider),
+            "search_type": str(search_type),
         }
 
     @log_tool
@@ -3873,6 +4556,301 @@ ORDER BY target_name
             logger.error("CO redshift search failed: %s\n%s", e, traceback.format_exc())
             return {"success": False, "error": str(e)}
 
+    def _tap_obscore_dataframe(self, where_clause: str, *, max_results: int = 5000, order_by: str = "proposal_id") -> pd.DataFrame:
+        query = select_obscore_query(where_clause, top=max_results, order_by=order_by)
+        self._last_alma_tap_query = query
+        self._last_alma_tap_url = "https://almascience.nrao.edu/tap"
+        service = self.search_service.alminer_client._get_tap_service()
+        result = service.search(query)
+        df = result.to_table().to_pandas()
+        if hasattr(self.search_service.alminer_client, "_standardize_columns"):
+            return self.search_service.alminer_client._standardize_columns(df)
+        return df
+
+    def _redshifted_line_where(
+        self,
+        rest_species: str,
+        redshift_min: float,
+        redshift_max: float,
+        science_category: str = "",
+    ) -> Tuple[str, List[str]]:
+        z_min = float(redshift_min)
+        z_max = float(redshift_max)
+        line_names = line_names_for_species(rest_species or "CO")
+        conditions = []
+        for line_name in line_names:
+            rest_freq = LINE_REST_FREQ_GHZ[line_name]
+            nu_low = rest_freq / (1.0 + max(z_min, z_max))
+            nu_high = rest_freq / (1.0 + min(z_min, z_max))
+            conditions.append(
+                f"((frequency - 0.5*bandwidth/1e9) < {nu_high:.6f} "
+                f"AND (frequency + 0.5*bandwidth/1e9) > {nu_low:.6f})"
+            )
+        where = "(" + " OR ".join(conditions) + ")"
+        if science_category:
+            safe_category = str(science_category).replace("'", "''")
+            where += f" AND LOWER(scientific_category) LIKE '%{safe_category.lower()}%'"
+        else:
+            where += (
+                " AND (LOWER(scientific_category) LIKE '%galaxy%' "
+                "OR LOWER(scientific_category) LIKE '%cosmology%' "
+                "OR LOWER(scientific_category) LIKE '%active%')"
+            )
+        return where, line_names
+
+    def _query_alma_science_archive(
+        self,
+        query_type: str,
+        cycle: int = None,
+        target: str = "",
+        band: int = None,
+        max_resolution_arcsec: float = None,
+        arrays: List[str] = None,
+        lines: List[str] = None,
+        topic_filter: str = "",
+        redshift_min: float = None,
+        redshift_max: float = None,
+        rest_species: str = "CO",
+        science_category: str = "",
+        require_same_project: bool = True,
+        include_adql: bool = True,
+        max_results: int = 5000,
+    ) -> Dict[str, Any]:
+        """Run deterministic ALMA archive query templates for science questions."""
+        started = time.perf_counter()
+        query_type = str(query_type or "").strip()
+        max_results = max(1, min(int(max_results or 5000), 20000))
+        self._last_alma_tap_query = None
+        self._last_alma_tap_url = None
+        warnings: List[str] = []
+        query_summary = ""
+        try:
+            if query_type == "cycle_solar_projects":
+                if cycle is None:
+                    return {"success": False, "error": "cycle is required"}
+                where = (
+                    f"{project_prefix_where(int(cycle))} AND ("
+                    "LOWER(target_name) LIKE '%sun%' "
+                    "OR LOWER(science_keyword) LIKE '%sun%' "
+                    "OR LOWER(scientific_category) LIKE '%sun%' "
+                    "OR LOWER(obs_title) LIKE '%sun%'"
+                    ")"
+                )
+                df = self._tap_obscore_dataframe(where, max_results=max_results)
+                result_df = summarize_projects(df)
+                source = f"ALMA Cycle {cycle} solar projects"
+                mode = "cycle_solar_projects"
+                query_summary = f"Cycle {cycle} projects with solar/Sun terms in target, keyword, category, or title."
+
+            elif query_type == "cycle_array_combo_projects":
+                if cycle is None:
+                    return {"success": False, "error": "cycle is required"}
+                required_arrays = arrays or ["12m", "7m", "TP"]
+                df = self._tap_obscore_dataframe(project_prefix_where(int(cycle)), max_results=max_results)
+                result_df = projects_with_array_combo(df, required_arrays)
+                source = f"ALMA Cycle {cycle} array combo projects"
+                mode = "cycle_array_combo_projects"
+                query_summary = f"Cycle {cycle} projects grouped by proposal_id requiring arrays {', '.join(required_arrays)}."
+
+            elif query_type == "high_resolution_band_data":
+                if not target:
+                    return {"success": False, "error": "target is required"}
+                normalized_target = normalize_target_alias(target)
+                if max_resolution_arcsec is None:
+                    max_resolution_arcsec = 0.1
+                    warnings.append("Defaulted high-resolution threshold to <0.1 arcsec.")
+                df = self.search_service.search_by_target(normalized_target, facility="ALMA", max_results=max_results)
+                df = science_filter_band(df, band)
+                df = science_filter_resolution(df, max_resolution_arcsec)
+                if "dataproduct_type" in df.columns:
+                    image_mask = df["dataproduct_type"].astype(str).str.contains("image|cube", case=False, regex=True, na=False)
+                    df = df[image_mask].copy()
+                result_df = summarize_projects(df)
+                source = f"ALMA {normalized_target} Band {band or 'any'} high-resolution candidates"
+                mode = "high_resolution_band_data"
+                query_summary = (
+                    f"Target search for {normalized_target}, Band {band or 'any'}, "
+                    f"resolution < {max_resolution_arcsec} arcsec, image/cube products when available."
+                )
+
+            elif query_type == "line_set_projects":
+                required_lines = lines or ["12CO", "13CO", "C18O"]
+                requested_band = band or 6
+                topic = str(topic_filter or "").strip()
+                where_parts = [f"(band_list LIKE '%{requested_band}%')"]
+                if topic:
+                    safe_topic = topic.replace("'", "''").lower()
+                    where_parts.append(
+                        "("
+                        f"LOWER(science_keyword) LIKE '%{safe_topic}%' "
+                        f"OR LOWER(scientific_category) LIKE '%{safe_topic}%' "
+                        f"OR LOWER(obs_title) LIKE '%{safe_topic}%'"
+                        ")"
+                    )
+                where = " AND ".join(where_parts)
+                df = self._tap_obscore_dataframe(where, max_results=max_results)
+                result_df = projects_covering_all_lines(df, required_lines, z=0.0)
+                source = f"ALMA Band {requested_band} projects covering {', '.join(required_lines)}"
+                mode = "line_set_projects"
+                query_summary = (
+                    f"Band {requested_band} rows grouped by proposal_id; retained projects covering all requested "
+                    f"rest-frame lines: {', '.join(required_lines)}."
+                )
+
+            elif query_type == "redshifted_line_projects":
+                z_min = 1.0 if redshift_min is None else float(redshift_min)
+                z_max = 2.0 if redshift_max is None else float(redshift_max)
+                where, line_names = self._redshifted_line_where(rest_species or "CO", z_min, z_max, science_category)
+                df = self._tap_obscore_dataframe(where, max_results=max_results)
+                result_df = redshifted_line_projects(df, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max)
+                source = f"ALMA {rest_species or 'CO'} redshifted line projects z={z_min:g}-{z_max:g}"
+                mode = "redshifted_line_projects"
+                if require_same_project is False:
+                    warnings.append("require_same_project=False is accepted for API compatibility; this summary is still grouped by proposal_id.")
+                query_summary = (
+                    f"Frequency-containment query for {', '.join(line_names)} shifted to z={z_min:g}-{z_max:g}, "
+                    "restricted to extragalactic science categories unless science_category is supplied."
+                )
+
+            elif query_type == "bandwidth_switching_candidates":
+                where = project_prefix_where(int(cycle)) if cycle is not None else "proposal_id IS NOT NULL"
+                df = self._tap_obscore_dataframe(where, max_results=max_results)
+                result_df = bandwidth_switching_candidates(df)
+                source = "ALMA bandwidth-switching calibration candidates" + (f" Cycle {cycle}" if cycle is not None else "")
+                mode = "bandwidth_switching_candidates"
+                warnings.append("Bandwidth Switching likelihood is inferred from public spectral setup metadata; it is not proof of calibration intent.")
+                query_summary = "Projects scored by spectral-window count, bandwidth diversity, tuning diversity, and calibration-like metadata."
+
+            else:
+                return {"success": False, "error": f"Unknown query_type: {query_type}"}
+
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+            provenance = {
+                "archive": "ALMA Science Archive",
+                "tap_url": getattr(self, "_last_alma_tap_url", None),
+                "adql": getattr(self, "_last_alma_tap_query", None) if include_adql else None,
+                "elapsed_ms": elapsed_ms,
+                "fresh_query": True,
+            }
+            self.last_search_results = result_df
+            self.last_run_result = {
+                "type": "data",
+                "data": result_df,
+                "source": source,
+                "filter_label": source,
+                "tool_name": "query_alma_science_archive",
+            }
+            unique_projects = int(result_df["proposal_id"].nunique()) if "proposal_id" in result_df.columns else len(result_df)
+            return {
+                "success": True,
+                "mode": mode,
+                "count": len(result_df),
+                "unique_projects": unique_projects,
+                "source": source,
+                "query_summary": query_summary,
+                "results": result_df.head(100).to_dict("records") if not result_df.empty else [],
+                "warnings": warnings,
+                "provenance": provenance,
+                "note": "Full result table is shown in the UI data card.",
+            }
+        except Exception as e:
+            import traceback
+            logger.error("ALMA science query failed: %s\n%s", e, traceback.format_exc())
+            return {"success": False, "error": str(e), "query_type": query_type}
+
+    def _match_cross_archive_sources(
+        self,
+        catalog_name: str = "perseus_protostars",
+        archives: List[str] = None,
+        radius_arcsec: float = 5.0,
+        max_sources: int = 12,
+        max_alma_rows: int = 5000,
+        max_mast_results_per_source: int = 80,
+    ) -> Dict[str, Any]:
+        """Cross-match a supported source catalog against ALMA and MAST/JWST."""
+        catalog_key = str(catalog_name or "perseus_protostars").strip().lower()
+        if catalog_key not in {"perseus_protostars", "perseus"}:
+            return {"success": False, "error": f"Unsupported catalog_name: {catalog_name}"}
+
+        requested_archives = {str(a).upper() for a in (archives or ["ALMA", "JWST"])}
+        radius_arcsec = max(0.5, min(float(radius_arcsec or 5.0), 60.0))
+        max_sources = max(1, min(int(max_sources or 12), len(PERSEUS_PROTOSTARS)))
+        sources = PERSEUS_PROTOSTARS[:max_sources]
+
+        try:
+            alma_df = pd.DataFrame()
+            alma_matches = pd.DataFrame()
+            if "ALMA" in requested_archives:
+                service = self.search_service.alminer_client._get_tap_service()
+                query = alma_bulk_cone_adql(sources, radius_arcsec=radius_arcsec, top=max_alma_rows)
+                self._last_alma_tap_query = query
+                self._last_alma_tap_url = "https://almascience.nrao.edu/tap"
+                alma_result = service.search(query)
+                alma_df = alma_result.to_table().to_pandas()
+                if hasattr(self.search_service.alminer_client, "_standardize_columns"):
+                    alma_df = self.search_service.alminer_client._standardize_columns(alma_df)
+                alma_matches = attach_nearest_source(alma_df, sources, radius_arcsec=radius_arcsec)
+
+            mast_by_source: Dict[str, pd.DataFrame] = {}
+            if {"JWST", "MAST"} & requested_archives:
+                for source in sources:
+                    mast_by_source[source["source_name"]] = self.mast_client.search_by_position(
+                        float(source["ra"]),
+                        float(source["dec"]),
+                        radius_arcmin=radius_arcsec / 60.0,
+                        mission="JWST" if "JWST" in requested_archives else None,
+                        max_results=max_mast_results_per_source,
+                    )
+
+            summary = summarize_alma_jwst_matches(sources, alma_matches, mast_by_source)
+            self.last_search_results = summary
+            self.last_run_result = {
+                "type": "data",
+                "data": summary,
+                "source": "ALMA + JWST Perseus Cross-match",
+                "filter_label": f"Perseus protostars within {radius_arcsec:g} arcsec",
+                "tool_name": "match_cross_archive_sources",
+            }
+
+            return {
+                "success": True,
+                "mode": "cross_archive_source_match",
+                "catalog_name": "perseus_protostars",
+                "archives": sorted(requested_archives),
+                "sources_tested": len(sources),
+                "matched_sources": len(summary),
+                "radius_arcsec": radius_arcsec,
+                "alma_rows": len(alma_df) if alma_df is not None else 0,
+                "results": summary.head(100).to_dict("records") if not summary.empty else [],
+                "note": "Full cross-match table is shown in the UI data card with sky coordinates.",
+            }
+        except Exception as e:
+            import traceback
+            logger.error("Cross-archive source match failed: %s\n%s", e, traceback.format_exc())
+            return {"success": False, "error": str(e)}
+
+    def _match_perseus_protostars_alma_jwst(
+        self,
+        radius_arcsec: float = 5.0,
+        max_sources: int = 12,
+        max_alma_rows: int = 5000,
+        max_mast_results_per_source: int = 80,
+    ) -> Dict[str, Any]:
+        """Backward-compatible wrapper for the generic cross-archive matcher."""
+        result = self._match_cross_archive_sources(
+            catalog_name="perseus_protostars",
+            archives=["ALMA", "JWST"],
+            radius_arcsec=radius_arcsec,
+            max_sources=max_sources,
+            max_alma_rows=max_alma_rows,
+            max_mast_results_per_source=max_mast_results_per_source,
+        )
+        if result.get("success") and self.last_run_result:
+            self.last_run_result["tool_name"] = "match_perseus_protostars_alma_jwst"
+        if result.get("success"):
+            result["mode"] = "perseus_alma_jwst_cross_match"
+        return result
+
     def _merged_plot_alma_results(self, plot_type: str = None,
                                     x_column: str = None, y_column: str = None,
                                     color_by: str = None, title: str = None,
@@ -3923,6 +4901,149 @@ ORDER BY target_name
             return result
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _overlay_region_coordinates(self, region: str) -> Optional[Tuple[float, float, str]]:
+        key = str(region or "").strip().lower().replace(" ", "")
+        if key in {"hudf", "hubbleultradeepfield", "ultradeepfield"}:
+            return 53.1625, -27.7914, "HUDF"
+        return None
+
+    def _mast_product_access_url(self, row: Dict[str, Any]) -> str:
+        import urllib.parse
+
+        for key in ("access_url", "dataURL", "data_url", "url"):
+            value = str(row.get(key) or "").strip()
+            if value.startswith("http"):
+                return value
+        data_uri = str(row.get("dataURI") or row.get("data_uri") or "").strip()
+        if data_uri:
+            return "https://mast.stsci.edu/api/v0.1/Download/file?uri=" + urllib.parse.quote(data_uri, safe="")
+        return ""
+
+    def _pick_mast_fits_product(self, products: pd.DataFrame, max_product_mb: float) -> Optional[Dict[str, Any]]:
+        if products is None or products.empty:
+            return None
+        candidates = products.copy()
+        filename_col = next((c for c in ("productFilename", "filename", "File") if c in candidates.columns), None)
+        if filename_col:
+            candidates = candidates[candidates[filename_col].astype(str).str.contains(r"\.fits?(\.gz)?$", case=False, regex=True, na=False)]
+        type_col = next((c for c in ("productType", "product_type") if c in candidates.columns), None)
+        if type_col:
+            science = candidates[candidates[type_col].astype(str).str.upper().str.contains("SCIENCE", na=False)]
+            if not science.empty:
+                candidates = science
+        size_col = next((c for c in ("size_mb", "Size (MB)", "productSize", "size") if c in candidates.columns), None)
+        if size_col:
+            sizes = pd.to_numeric(candidates[size_col], errors="coerce")
+            if size_col not in {"size_mb", "Size (MB)"}:
+                sizes = sizes / (1024 * 1024)
+            under = candidates[(sizes.isna()) | (sizes <= float(max_product_mb))]
+            if not under.empty:
+                candidates = under
+        for _, product in candidates.iterrows():
+            row = product.to_dict()
+            url = self._mast_product_access_url(row)
+            if url:
+                row["access_url"] = url
+                return row
+        return None
+
+    def _find_alma_overlay_product(self, ra_deg: float, dec_deg: float, radius_arcmin: float, max_product_mb: float) -> Optional[Dict[str, Any]]:
+        radius_deg = max(float(radius_arcmin or 1.0), 0.1) / 60.0
+        query = f"""
+SELECT TOP 100
+       target_name, proposal_id, member_ous_uid, s_ra, s_dec, band_list,
+       dataproduct_type, s_resolution, frequency, bandwidth
+FROM ivoa.obscore
+WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {ra_deg:.8f}, {dec_deg:.8f}, {radius_deg:.8f})) = 1
+ORDER BY s_resolution
+"""
+        service = self.search_service.alminer_client._get_tap_service()
+        result = service.search(query)
+        alma_df = result.to_table().to_pandas()
+        if hasattr(self.search_service.alminer_client, "_standardize_columns"):
+            alma_df = self.search_service.alminer_client._standardize_columns(alma_df)
+        for mous_uid in unique_values(alma_df, ["member_ous_uid"], limit=8):
+            listing = self.datalink_client.list_files(mous_uid=mous_uid)
+            if not listing.get("success"):
+                continue
+            files = sorted(listing.get("files", []), key=product_rank)
+            for file_info in files:
+                size_mb = float(file_info.get("size_mb") or 0)
+                if size_mb and size_mb > float(max_product_mb):
+                    continue
+                if is_fits_product(file_info) and file_info.get("access_url"):
+                    selected = dict(file_info)
+                    selected["member_ous_uid"] = mous_uid
+                    return selected
+        return None
+
+    def _overlay_archive_images(
+        self,
+        region: str,
+        base_archive: str = "MAST",
+        base_collection: str = "JWST",
+        contour_archive: str = "ALMA",
+        radius_arcmin: float = 1.0,
+        max_product_mb: float = 150.0,
+    ) -> Dict[str, Any]:
+        """Find archive FITS products around a region and overlay ALMA contours."""
+        coords = self._overlay_region_coordinates(region)
+        if not coords:
+            return {"success": False, "error": f"Unsupported region for overlay workflow: {region}"}
+        if str(base_archive or "MAST").upper() != "MAST" or str(contour_archive or "ALMA").upper() != "ALMA":
+            return {"success": False, "error": "overlay_archive_images currently supports MAST/JWST base images with ALMA contours."}
+
+        ra_deg, dec_deg, label = coords
+        try:
+            mast_obs = self.mast_client.search_by_position(
+                ra_deg,
+                dec_deg,
+                radius_arcmin=float(radius_arcmin or 1.0),
+                mission=base_collection or "JWST",
+                max_results=80,
+            )
+            if mast_obs is None or mast_obs.empty:
+                return {"success": False, "error": f"No {base_collection or 'JWST'} MAST observations found near {label}."}
+            mast_products = self.mast_client.get_product_list(mast_obs, productType="SCIENCE", extension="fits")
+            base_product = self._pick_mast_fits_product(mast_products, max_product_mb=max_product_mb)
+            if not base_product:
+                return {"success": False, "error": f"No small science FITS product found in MAST near {label}."}
+
+            contour_product = self._find_alma_overlay_product(ra_deg, dec_deg, float(radius_arcmin or 1.0), max_product_mb)
+            if not contour_product:
+                return {"success": False, "error": f"No small public ALMA FITS product found near {label}."}
+
+            from services.fits_service import overlay_fits_images
+            result = overlay_fits_images(
+                base_product["access_url"],
+                contour_product["access_url"],
+                base_label=f"{base_collection or 'JWST'} {label}",
+                contour_label=f"ALMA {label}",
+                base_cmap="inferno",
+                contour_levels=8,
+            )
+            result["region"] = label
+            result["selected_products"] = {
+                "base": {
+                    "filename": base_product.get("productFilename") or base_product.get("filename"),
+                    "access_url": base_product.get("access_url"),
+                },
+                "contour": {
+                    "filename": contour_product.get("filename"),
+                    "access_url": contour_product.get("access_url"),
+                    "member_ous_uid": contour_product.get("member_ous_uid"),
+                },
+            }
+            if result.get("success"):
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                }
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e), "region": region}
 
     def _overlay_fits_images(self, base_url: str, contour_url: str,
                              base_label: str = "JWST", contour_label: str = "ALMA",
@@ -4159,6 +5280,130 @@ ORDER BY target_name
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    @log_tool
+    def _search_papers_by_observation_identifier(
+        self,
+        identifier: str,
+        max_results: int = 20,
+        facility: str = "ALMA",
+    ) -> Dict[str, Any]:
+        """Search ADS for papers explicitly tied to an archive/project identifier."""
+        try:
+            if not self.ads_client:
+                return {"success": False, "error": "NASA ADS Client not initialized (check API Key)"}
+
+            identifiers_to_search = [str(identifier or "").strip()]
+            derived_identifiers = []
+            try:
+                derived_identifiers = self._derive_archive_identifiers_for_paper_search(identifier)
+                for derived in derived_identifiers:
+                    if derived and derived not in identifiers_to_search:
+                        identifiers_to_search.append(derived)
+            except Exception as _derive_err:
+                print(f"[ADS identifier] Archive identifier derivation failed (non-fatal): {_derive_err}")
+
+            merged_papers: Dict[str, Dict[str, Any]] = {}
+            ads_queries = []
+            identifier_types = {}
+            for search_identifier in identifiers_to_search:
+                result = self.ads_client.search_by_observation_identifier(
+                    identifier=search_identifier,
+                    max_results=max_results,
+                    facility=facility,
+                )
+                ads_queries.append(result.get("query", ""))
+                identifier_types[search_identifier] = result.get("identifier_type", "identifier")
+                for paper in result.get("papers", []):
+                    key = paper.get("bibcode") or paper.get("doi") or paper.get("title") or str(id(paper))
+                    if key not in merged_papers:
+                        merged_papers[key] = paper
+                    else:
+                        current_links = merged_papers[key].setdefault("observation_links", [])
+                        for link in paper.get("observation_links", []):
+                            if link not in current_links:
+                                current_links.append(link)
+
+            papers_list = list(merged_papers.values())[:max_results]
+            ads_query = " OR ".join(q for q in ads_queries if q)
+
+            try:
+                oalex = self.openalex_client
+                dois = [p.get("doi", "") for p in papers_list if p.get("doi")]
+                if dois and oalex:
+                    enrichments = oalex.enrich_batch_dois(dois)
+                    if enrichments:
+                        for paper in papers_list:
+                            doi = paper.get("doi", "")
+                            if doi and doi in enrichments:
+                                e = enrichments[doi]
+                                paper["fwci"] = e.get("fwci")
+                                paper["citation_percentile"] = e.get("citation_percentile")
+                                paper["is_top_1_percent"] = e.get("is_top_1_percent", False)
+                                paper["is_top_10_percent"] = e.get("is_top_10_percent", False)
+                                paper["funders"] = e.get("funders", [])
+                                paper["oa_pdf_url"] = e.get("oa_pdf_url", "")
+                                paper["openalex_topics"] = e.get("topics", [])
+            except Exception as _enrich_err:
+                print(f"[OpenAlex] Enrichment failed (non-fatal): {_enrich_err}")
+
+            self.last_run_result = {
+                "type": "papers",
+                "papers": papers_list,
+                "source": f"ADS identifier: {identifier}",
+                "paper_provenance": {
+                    "identifier": identifier,
+                    "identifier_type": identifier_types.get(str(identifier or "").strip(), "identifier"),
+                    "derived_identifiers": derived_identifiers,
+                    "ads_query": ads_query,
+                    "facility": facility,
+                },
+            }
+            return {
+                "success": True,
+                "count": len(papers_list),
+                "identifier": identifier,
+                "identifier_type": identifier_types.get(str(identifier or "").strip(), "identifier"),
+                "derived_identifiers": derived_identifiers,
+                "ads_query": ads_query,
+                "papers": papers_list,
+                "top_title": papers_list[0]["title"] if papers_list else "No results",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _derive_archive_identifiers_for_paper_search(self, identifier: str) -> List[str]:
+        """Resolve a MOUS/dataset identifier to proposal/project IDs when possible."""
+        raw = str(identifier or "").strip()
+        if not raw or not self.search_service:
+            return []
+
+        id_type = self.ads_client.classify_observation_identifier(raw) if self.ads_client else "identifier"
+        if id_type == "project_code":
+            return []
+
+        keyword_by_type = {
+            "mous_uid": "member_ous_uid",
+            "asdm_uid": "asdm_uid",
+            "dataset_id": "obs_publisher_did",
+            "uid": "member_ous_uid",
+        }
+        keyword = keyword_by_type.get(id_type)
+        if not keyword:
+            return []
+
+        df = self.search_service.search_alma_with_keywords({keyword: raw})
+        if df is None or not hasattr(df, "columns") or df.empty:
+            return []
+
+        derived = []
+        for col in ("proposal_id", "project_code"):
+            if col in df.columns:
+                for value in df[col].dropna().astype(str).unique().tolist()[:5]:
+                    clean = value.strip()
+                    if clean and clean not in derived:
+                        derived.append(clean)
+        return derived
 
     # ------------------------------------------------------------------
     # OpenAlex tool handlers
@@ -5121,6 +6366,7 @@ IMPORTANT RULES:
         self._accumulated_run_results = []
         self.last_run_result = None
         self.last_search_results = None
+        self._tls.current_conversation_id = conversation_id
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -5270,8 +6516,8 @@ IMPORTANT RULES:
                     try:
                         _web_result_holder["data"] = self._tavily_web_search(
                             query=_web_search_query,
-                            max_results=5,
-                            search_depth="advanced",
+                            max_results=10,
+                            search_depth="basic",
                         )
                     except Exception as _e:
                         _web_result_holder["error"] = str(_e)
@@ -5319,6 +6565,47 @@ IMPORTANT RULES:
             _query_lower,
         ))
         if _is_archive_fetch:
+            _should_rag = False
+
+        _is_alma_project_picker_selection_followup = (
+            self._has_pending_alma_project_picker(conversation_id)
+            and self._parse_project_picker_selection_index(_user_query) is not None
+        )
+
+        _is_data_product_triage_query = _is_alma_project_picker_selection_followup or bool(
+            re.search(r'\b(?:fetch|get|list|show|inspect|triage|analy[sz]e)\b', _query_lower)
+            and re.search(r'\b(?:alma|project\s+code|proposal\s+id|mous|member_ous|asdm|fits|data\s+products?|products?|files?)\b', _query_lower)
+            and re.search(r'\b(?:fits|data\s+products?|products?|files?|mous|member_ous|asdm)\b', _query_lower)
+        )
+        if _is_data_product_triage_query:
+            _should_rag = False
+
+        _alma_science_route = self._route_alma_science_archive_query(_user_query)
+        _is_alma_science_archive_query = bool(_alma_science_route) or bool(
+            re.search(
+                r"\b(?:cycle\s+\d{1,2}|observed\s+the\s+sun|solar\s+projects?|"
+                r"12m|7m|total\s+power|hh\s*212|high[-\s]?resolution|"
+                r"12co|13co|c18o|bandwidth\s+switching|spectral\s+setup|z\s*[=~]?\s*\d+(?:\.\d+)?\s*(?:-|to|\u2013)\s*\d+(?:\.\d+)?)\b",
+                _query_lower,
+            )
+            and re.search(r"\b(?:alma|archive|projects?|observations?|band\s*\d|data|co|continuum)\b", _query_lower)
+        )
+        if _is_alma_science_archive_query:
+            _should_rag = False
+
+        _is_cross_archive_source_match_query = bool(
+            re.search(r"\bperseus\b", _query_lower)
+            and re.search(r"\bprotostar", _query_lower)
+            and re.search(r"\balma\b", _query_lower)
+            and re.search(r"\bjwst|mast\b", _query_lower)
+        )
+        _is_archive_overlay_query = bool(
+            re.search(r"\boverlay|contours?\b", _query_lower)
+            and re.search(r"\balma\b", _query_lower)
+            and re.search(r"\bjwst|mast\b", _query_lower)
+            and re.search(r"\bhudf|ultra\s+deep\s+field\b", _query_lower)
+        )
+        if _is_cross_archive_source_match_query or _is_archive_overlay_query:
             _should_rag = False
 
         # Skip RAG for paper/literature queries — these go through NASA ADS
@@ -5699,6 +6986,51 @@ IMPORTANT RULES:
                     "Do NOT use `web_search`. Call `get_research_trends` NOW."
                 )
             full_input += openalex_directive
+        elif _is_data_product_triage_query:
+            if _is_alma_project_picker_selection_followup:
+                product_directive = (
+                    "\n\nMANDATORY INSTRUCTION: The user is selecting a row from the previously displayed ALMA project-code picker. "
+                    "You MUST call `triage_alma_data_products` now with the user's reply exactly as `identifier_or_target`. "
+                    "Do NOT ask them to copy the project code. The tool will resolve the row number to the stored project code. "
+                    "If the tool returns mode `triage`, summarize the product counts, header checks, warnings, and safety note."
+                )
+            else:
+                product_directive = (
+                    "\n\nMANDATORY INSTRUCTION: The user is asking for ALMA FITS/data-product discovery or triage. "
+                    "You MUST call `triage_alma_data_products` now. Pass the user-provided project code, MOUS UID, "
+                    "dataset ID, or target name as `identifier_or_target`, and pass a band only if the user specified one. "
+                    "If the tool returns mode `needs_project_selection`, ask the user to choose from the displayed project-code table. "
+                    "If the tool returns mode `triage`, summarize the product counts, header checks, warnings, and safety note. "
+                    "Do NOT call generic `search_by_target` first and do NOT claim files were downloaded."
+                )
+            full_input += product_directive
+        elif _is_archive_overlay_query:
+            full_input += (
+                "\n\nMANDATORY INSTRUCTION: The user is asking for a real archive image overlay. "
+                "You MUST call `overlay_archive_images` now with region='HUDF', base_archive='MAST', "
+                "base_collection='JWST', and contour_archive='ALMA'. Do NOT describe the workflow without calling the tool."
+            )
+        elif _is_cross_archive_source_match_query:
+            full_input += (
+                "\n\nMANDATORY INSTRUCTION: The user is asking for cross-archive source locations. "
+                "You MUST call `match_cross_archive_sources` now with catalog_name='perseus_protostars', "
+                "archives=['ALMA','JWST'], and radius_arcsec=5. Do NOT answer from memory."
+            )
+        elif _is_alma_science_archive_query:
+            route_text = json.dumps(_alma_science_route) if _alma_science_route else "{}"
+            science_directive = (
+                "\n\nMANDATORY INSTRUCTION: The user is asking a live ALMA Science Archive count/filter/diagnostic question. "
+                "You MUST call `query_alma_science_archive` now. Map the request as follows: "
+                "Cycle Sun/solar projects -> query_type='cycle_solar_projects'; "
+                "Cycle array combo with 12m/7m/total power -> query_type='cycle_array_combo_projects' and arrays=['12m','7m','TP']; "
+                "HH212 or target Band high-resolution continuum -> query_type='high_resolution_band_data'; "
+                "12CO/13CO/C18O in Band 6 same project -> query_type='line_set_projects' with lines=['12CO','13CO','C18O']; "
+                "Galaxies at z=1-2 with CO -> query_type='redshifted_line_projects'; "
+                "Bandwidth Switching -> query_type='bandwidth_switching_candidates'. "
+                f"If an exact argument mapping is provided here, use it exactly: {route_text}. "
+                "Do NOT answer from memory or documentation context."
+            )
+            full_input += science_directive
         elif rag_context:
             # Knowledge query with RAG context — explicitly prevent search_papers
             knowledge_directive = (
@@ -5885,6 +7217,8 @@ IMPORTANT RULES:
             for _round in range(_token_budget.HARD_MAX_ITERATIONS if hasattr(_token_budget, 'HARD_MAX_ITERATIONS') else 25):
                 _buffer_round_text = _round == 0 and (
                     _is_archive_fetch or _is_paper_query or _is_openalex_query
+                    or _is_data_product_triage_query or _is_alma_science_archive_query
+                    or _is_cross_archive_source_match_query or _is_archive_overlay_query
                 )
                 _round_text_buffer = ""
                 request_kwargs = {
@@ -5905,7 +7239,10 @@ IMPORTANT RULES:
                 # Force tool call on first round for data-fetch queries.
                 # This prevents the LLM from answering from conversation
                 # memory and ensures a fresh data card is always shown.
-                if _round == 0 and _is_archive_fetch:
+                if _round == 0 and (
+                    _is_archive_fetch or _is_data_product_triage_query or _is_alma_science_archive_query
+                    or _is_cross_archive_source_match_query or _is_archive_overlay_query
+                ):
                     request_kwargs["tool_choice"] = "required"
 
                 # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini/deepseek-v4-pro)

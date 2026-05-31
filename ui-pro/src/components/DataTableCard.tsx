@@ -1,10 +1,31 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Download, Link2, X, Telescope, BarChart3, Map } from "lucide-react";
+import { Download, Eye, Link2, Loader2, X, Telescope, BarChart3, Map } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
+import { useAuthStore } from "../lib/auth-store";
 
 interface DataTableCardProps { data: DataTableResult; }
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+interface FitsPreviewResult {
+    imageDataUrl: string;
+    downloadUrl: string;
+    filename: string;
+    metadata: {
+        object?: string;
+        unit?: string;
+        shape?: number[];
+        beamMajorArcsec?: number | null;
+        beamMinorArcsec?: number | null;
+        restFreqGhz?: number | null;
+        min?: number;
+        max?: number;
+        sizeBytes?: number;
+    };
+    suggestedActions?: string[];
+}
 
 /* ── Donut chart via CSS conic-gradient ── */
 const CHART_COLORS = [
@@ -508,6 +529,128 @@ function PreviewLightbox({
 }
 
 /* ── Inline thumbnail component ── */
+function FitsPreviewLightbox({
+    preview,
+    row,
+    onClose,
+}: {
+    preview: FitsPreviewResult;
+    row: Record<string, string | number>;
+    onClose: () => void;
+}) {
+    const metadata = preview.metadata || {};
+    const fmt = (value: number | null | undefined, digits = 3) =>
+        typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "-";
+
+    return (
+        <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm"
+            onClick={onClose}
+        >
+            <div
+                className="relative bg-[#0a1220] border border-slate-600/60 rounded-2xl shadow-2xl w-[min(920px,calc(100vw-32px))] max-h-[calc(100vh-32px)] overflow-y-auto"
+                onClick={e => e.stopPropagation()}
+            >
+                <button
+                    onClick={onClose}
+                    className="absolute top-3 right-3 p-1.5 bg-slate-900/90 border border-slate-700 rounded-full hover:bg-red-500/20 transition-colors z-10"
+                    aria-label="Close FITS preview"
+                >
+                    <X className="w-4 h-4 text-slate-300" />
+                </button>
+
+                <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px]">
+                    <div className="p-4 border-b lg:border-b-0 lg:border-r border-slate-800">
+                        <div className="mb-3 pr-10">
+                            <p className="text-xs text-slate-500 uppercase tracking-wider">FITS Preview</p>
+                            <h3 className="text-sm font-semibold text-slate-100 truncate" title={preview.filename}>
+                                {preview.filename}
+                            </h3>
+                        </div>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                            src={preview.imageDataUrl}
+                            alt={`Rendered FITS preview for ${preview.filename}`}
+                            className="w-full rounded-xl bg-slate-950 border border-slate-800"
+                        />
+                    </div>
+
+                    <div className="p-4 space-y-4">
+                        <div>
+                            <p className="text-xs text-slate-500 uppercase tracking-wider mb-2">Product</p>
+                            <dl className="space-y-1.5 text-xs">
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Type</dt>
+                                    <dd className="text-slate-200 text-right">{String(row.Product || "-")}</dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Proposal</dt>
+                                    <dd className="text-slate-200 text-right font-mono">{String(row["Proposal ID"] || "-")}</dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Object</dt>
+                                    <dd className="text-slate-200 text-right">{metadata.object || String(row.Target || "-")}</dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Shape</dt>
+                                    <dd className="text-slate-200 text-right font-mono">{metadata.shape?.join(" x ") || "-"}</dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Unit</dt>
+                                    <dd className="text-slate-200 text-right">{metadata.unit || "-"}</dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Beam</dt>
+                                    <dd className="text-slate-200 text-right font-mono">
+                                        {fmt(metadata.beamMajorArcsec)} x {fmt(metadata.beamMinorArcsec)} arcsec
+                                    </dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Rest freq</dt>
+                                    <dd className="text-slate-200 text-right font-mono">{fmt(metadata.restFreqGhz, 2)} GHz</dd>
+                                </div>
+                            </dl>
+                        </div>
+
+                        <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                            <p className="text-xs font-semibold text-slate-200 mb-1">What do you want to do with it?</p>
+                            <p className="text-xs text-slate-400 leading-relaxed">
+                                Ask Quasar to measure peak flux/RMS, compare spectral windows, explain the header, or prepare a CASA/Python analysis.
+                            </p>
+                            <div className="mt-2 space-y-1">
+                                {(preview.suggestedActions || []).map(action => (
+                                    <div key={action} className="text-[11px] text-slate-300 border border-slate-800 rounded px-2 py-1">
+                                        {action}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="flex flex-col gap-2">
+                            <a
+                                href={preview.downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-white text-black text-xs font-semibold hover:bg-slate-200 transition-colors"
+                            >
+                                <Download className="w-3.5 h-3.5" />Download FITS
+                            </a>
+                            <a
+                                href={preview.downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-700 text-slate-200 text-xs font-semibold hover:bg-slate-800 transition-colors"
+                            >
+                                <Link2 className="w-3.5 h-3.5" />Open ALMA link
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function SkyThumbnail({
     src, target, onClick,
 }: { src: string; target?: string; onClick: () => void }) {
@@ -549,10 +692,18 @@ function SkyThumbnail({
 export function DataTableCard({ data }: DataTableCardProps) {
     const columns = data.columns ?? [];
     const rows = data.rows ?? [];
+    const isAlmaProducts = data.tableKind === "alma_products";
+    const { token } = useAuthStore();
     const [lightbox, setLightbox] = useState<{
         src: string; target?: string; ra?: string; dec?: string;
     } | null>(null);
     const [skyMapOpen, setSkyMapOpen] = useState(false);
+    const [fitsPreview, setFitsPreview] = useState<{
+        preview: FitsPreviewResult;
+        row: Record<string, string | number>;
+    } | null>(null);
+    const [previewLoadingRow, setPreviewLoadingRow] = useState<number | null>(null);
+    const [previewError, setPreviewError] = useState<string | null>(null);
 
     const skyCoords = data.demographics?.skyCoords;
     const hasDemographics = data.demographics && (
@@ -578,6 +729,35 @@ export function DataTableCard({ data }: DataTableCardProps) {
         URL.revokeObjectURL(url);
     };
 
+    const handlePreviewFits = async (row: Record<string, string | number>, rowIndex: number) => {
+        const url = String(row["_link"] || "");
+        if (!url) return;
+        setPreviewError(null);
+        setPreviewLoadingRow(rowIndex);
+        try {
+            const response = await fetch(`${API_BASE}/api/fits/preview`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                },
+                body: JSON.stringify({
+                    url,
+                    filename: String(row.File || ""),
+                }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(payload.detail || "Could not render FITS preview.");
+            }
+            setFitsPreview({ preview: payload as FitsPreviewResult, row });
+        } catch (error) {
+            setPreviewError(error instanceof Error ? error.message : "Could not render FITS preview.");
+        } finally {
+            setPreviewLoadingRow(null);
+        }
+    };
+
     return (
         <>
             {/* Lightbox modals */}
@@ -595,6 +775,13 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     coords={skyCoords}
                     sourceName={data.sourceName}
                     onClose={() => setSkyMapOpen(false)}
+                />
+            )}
+            {fitsPreview && (
+                <FitsPreviewLightbox
+                    preview={fitsPreview.preview}
+                    row={fitsPreview.row}
+                    onClose={() => setFitsPreview(null)}
                 />
             )}
 
@@ -658,6 +845,12 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 )}
 
                 {/* ── Table ── */}
+                {previewError && (
+                    <div className="px-4 py-2 border-b text-xs text-red-300 bg-red-950/30" style={{ borderColor: 'var(--q-border)' }}>
+                        {previewError}
+                    </div>
+                )}
+
                 {columns.length > 0 && rows.length > 0 ? (
                     <div className="overflow-x-auto overflow-y-auto max-h-[420px] custom-scrollbar">
                         <table className="w-full text-left border-collapse min-w-max">
@@ -667,6 +860,11 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                     {data.hasPreview && (
                                         <th className="py-2.5 px-3 text-[11px] font-semibold text-slate-400 uppercase tracking-wider whitespace-nowrap w-14">
                                             <Telescope className="w-3.5 h-3.5 inline-block" />
+                                        </th>
+                                    )}
+                                    {isAlmaProducts && (
+                                        <th className="py-2.5 px-3 text-[11px] font-semibold text-slate-400 uppercase tracking-wider whitespace-nowrap">
+                                            Actions
                                         </th>
                                     )}
                                     {columns.map((col, i) => (
@@ -720,6 +918,37 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                                 )}
                                             </td>
                                         )}
+                                        {isAlmaProducts && (
+                                            <td className="py-2 px-3">
+                                                {row["_link"] ? (
+                                                    <div className="flex items-center gap-1.5 whitespace-nowrap">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handlePreviewFits(row, ri)}
+                                                            disabled={previewLoadingRow === ri}
+                                                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/10 rounded-md transition-colors disabled:opacity-60"
+                                                        >
+                                                            {previewLoadingRow === ri ? (
+                                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                            ) : (
+                                                                <Eye className="w-3 h-3" />
+                                                            )}
+                                                            Preview
+                                                        </button>
+                                                        <a
+                                                            href={String(row["_link"])}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-slate-200 border border-slate-600/50 hover:bg-slate-700 rounded-md transition-colors"
+                                                        >
+                                                            <Download className="w-3 h-3" />Download
+                                                        </a>
+                                                    </div>
+                                                ) : (
+                                                    <span className="text-slate-600 text-xs">-</span>
+                                                )}
+                                            </td>
+                                        )}
                                         {columns.map((col, ci) => {
                                             const val = row[col];
                                             const isFirst = ci === 0;
@@ -770,7 +999,11 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     <span className="text-xs text-slate-500">
                         {rows.length} row{rows.length !== 1 ? "s" : ""} · {columns.length} col{columns.length !== 1 ? "s" : ""}
                         {data.hasPreview && " · Sky previews"}
-                        {data.fitsEstimate && data.fitsEstimate > 0 && ` · ~${data.fitsEstimate} FITS files`}
+                        {data.fitsEstimate && data.fitsEstimate > 0 && (
+                            data.tableKind === "alma_products"
+                                ? ` · ${data.fitsEstimate} FITS files`
+                                : ` · ~${data.fitsEstimate} FITS files`
+                        )}
                     </span>
                     <div className="flex gap-2 flex-wrap justify-end">
                         <button

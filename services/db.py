@@ -21,7 +21,28 @@ from typing import Any, List, Optional, Tuple
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
-_USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
+
+def _truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _current_environment() -> str:
+    return (
+        os.environ.get("QUASAR_ENV")
+        or os.environ.get("APP_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+
+
+_FORCE_LOCAL_DB = _truthy(os.environ.get("QUASAR_FORCE_LOCAL_DB"))
+_IS_PRODUCTION = _current_environment() in {"production", "prod"}
+if _FORCE_LOCAL_DB and _IS_PRODUCTION:
+    raise RuntimeError(
+        "QUASAR_FORCE_LOCAL_DB cannot be used when QUASAR_ENV/ENVIRONMENT is production."
+    )
+
+_USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and not _FORCE_LOCAL_DB)
 
 
 # ---------------------------------------------------------------------------

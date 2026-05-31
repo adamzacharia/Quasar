@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -222,6 +223,96 @@ class ADSService:
         query += ' AND (radio OR observation OR survey)'
         
         return self.search_papers(query, max_results)
+
+    def search_by_observation_identifier(
+        self,
+        identifier: str,
+        max_results: int = 20,
+        facility: str = "ALMA",
+        filters: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Find papers that explicitly mention an observation/project identifier."""
+        clean_identifier = str(identifier or "").strip()
+        if not clean_identifier:
+            return {
+                "query": "",
+                "identifier": "",
+                "identifier_type": "unknown",
+                "papers": [],
+            }
+
+        identifier_type = self.classify_observation_identifier(clean_identifier)
+        variants = self._observation_identifier_variants(clean_identifier)
+        exact_terms = []
+        for variant in variants:
+            escaped = variant.replace('"', r'\"')
+            exact_terms.extend([
+                f'body:"{escaped}"',
+                f'abstract:"{escaped}"',
+                f'title:"{escaped}"',
+                f'identifier:"{escaped}"',
+            ])
+
+        query = "(" + " OR ".join(exact_terms) + ")"
+        facility_clean = str(facility or "").strip().upper()
+        if facility_clean == "ALMA" or identifier_type in {"project_code", "mous_uid", "asdm_uid"}:
+            query = f"bibgroup:ALMA AND {query}"
+
+        papers = self.search_papers(
+            query,
+            max_results=max_results,
+            sort="score desc",
+            filters=filters if filters is not None else ["property:refereed"],
+        )
+
+        for paper in papers:
+            paper["observation_links"] = [
+                {
+                    "identifier": clean_identifier,
+                    "identifier_type": identifier_type,
+                    "relation": "explicit_identifier_search",
+                    "confidence": "explicit",
+                    "ads_query": query,
+                }
+            ]
+
+        return {
+            "query": query,
+            "identifier": clean_identifier,
+            "identifier_type": identifier_type,
+            "papers": papers,
+        }
+
+    @staticmethod
+    def classify_observation_identifier(identifier: str) -> str:
+        text = str(identifier or "").strip()
+        if re.search(r"\b\d{4}\.\d\.\d{5}\.[A-Z]\b", text, re.IGNORECASE):
+            return "project_code"
+        if text.lower().startswith("uid://"):
+            return "mous_uid" if "/x" in text.lower() else "uid"
+        if text.lower().startswith("ivo://"):
+            return "dataset_id"
+        if text.lower().startswith("asdm"):
+            return "asdm_uid"
+        return "identifier"
+
+    @staticmethod
+    def _observation_identifier_variants(identifier: str) -> List[str]:
+        text = str(identifier or "").strip()
+        variants = [text]
+        if text.lower().startswith("uid://"):
+            variants.append(text.replace("uid://", "", 1))
+        if "/" in text:
+            variants.append(text.replace("/", " "))
+        seen = set()
+        result = []
+        for variant in variants:
+            clean = variant.strip()
+            key = clean.lower()
+            if clean and key not in seen:
+                seen.add(key)
+                result.append(clean)
+        return result
     
     def get_paper_details(self, bibcode: str) -> Optional[Dict[str, Any]]:
         """Get detailed information about a specific paper"""

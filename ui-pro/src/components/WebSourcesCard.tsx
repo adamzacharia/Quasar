@@ -1,8 +1,10 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element */
 import { useState } from "react";
-import { ExternalLink, Globe, ChevronRight } from "lucide-react";
+import { ExternalLink, Globe, ChevronRight, ShieldCheck } from "lucide-react";
 import type { WebSource, WebImage } from "../lib/types";
+import { rankWebSources } from "../lib/evidence-quality";
 
 interface WebSourcesCardProps {
     sources?: WebSource[];
@@ -26,82 +28,115 @@ function getDomain(url: string): string {
     }
 }
 
+function getQualityColor(tier?: string): string {
+    switch (tier) {
+        case "primary":
+            return "#7dd3fc";
+        case "peer_reviewed":
+            return "#86efac";
+        case "preprint":
+            return "#facc15";
+        case "institutional":
+            return "#c4b5fd";
+        case "reference":
+            return "#f9a8d4";
+        default:
+            return "#94a3b8";
+    }
+}
+
 export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProps) {
     const [showAllSources, setShowAllSources] = useState(false);
     const [failedImages, setFailedImages] = useState<Set<number>>(new Set());
 
-    const visibleSources = showAllSources ? sources : sources.slice(0, 4);
+    const rankedSources = rankWebSources(sources) as WebSource[];
+    const visibleSources = showAllSources ? rankedSources : rankedSources.slice(0, 4);
     const validImages = images.filter((_, i) => !failedImages.has(i));
 
     const handleImageError = (index: number) => {
         setFailedImages(prev => new Set(prev).add(index));
     };
 
-    if (sources.length === 0 && validImages.length === 0) return null;
+    if (rankedSources.length === 0 && validImages.length === 0) return null;
 
     return (
         <div className="space-y-4 my-3">
             {/* Source Pills */}
-            {sources.length > 0 && (
+            {rankedSources.length > 0 && (
                 <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-xs uppercase tracking-wider font-medium"
+                    <div className="flex items-center gap-2 text-xs uppercase font-medium"
                          style={{ color: 'var(--q-text-muted)' }}>
                         <Globe className="w-3.5 h-3.5" />
-                        <span>Sources</span>
-                        <span style={{ color: 'var(--q-text-muted)', opacity: 0.6 }}>({sources.length})</span>
+                        <span>Evidence-ranked sources</span>
+                        <span style={{ color: 'var(--q-text-muted)', opacity: 0.6 }}>({rankedSources.length})</span>
                     </div>
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-                        {visibleSources.map((source, i) => (
-                            <a
-                                key={i}
-                                href={source.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="group flex items-start gap-2.5 p-2.5 rounded-xl
+                        {visibleSources.map((source, i) => {
+                            const quality = source.evidenceQuality;
+                            const qualityColor = getQualityColor(quality?.tier);
+                            return (
+                                <a
+                                    key={`${source.url}-${i}`}
+                                    href={source.url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="group flex items-start gap-2.5 p-2.5 rounded-lg
                                            transition-all duration-200 cursor-pointer
                                            overflow-hidden hover:scale-[1.02]"
-                                style={{
-                                    background: 'var(--q-glass-bg)',
-                                    border: '1px solid var(--q-glass-border)',
-                                }}
-                                title={source.snippet}
-                                onMouseEnter={(e) => {
-                                    e.currentTarget.style.borderColor = 'rgba(244, 113, 181, 0.4)';
-                                    e.currentTarget.style.background = 'var(--q-glass-hover)';
-                                }}
-                                onMouseLeave={(e) => {
-                                    e.currentTarget.style.borderColor = 'var(--q-glass-border)';
-                                    e.currentTarget.style.background = 'var(--q-glass-bg)';
-                                }}
-                            >
-                                <img
-                                    src={getFavicon(source.url)}
-                                    alt=""
-                                    className="w-4 h-4 rounded-sm mt-0.5 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity"
-                                    onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                                />
-                                <div className="min-w-0 flex-1">
-                                    <div className="text-xs font-medium truncate group-hover:text-primary transition-colors"
-                                         style={{ color: 'var(--q-text)' }}>
-                                        {source.title || "Untitled"}
+                                    style={{
+                                        background: 'var(--q-glass-bg)',
+                                        border: '1px solid var(--q-glass-border)',
+                                    }}
+                                    title={quality?.reason || source.snippet}
+                                    onMouseEnter={(e) => {
+                                        e.currentTarget.style.borderColor = 'rgba(244, 113, 181, 0.4)';
+                                        e.currentTarget.style.background = 'var(--q-glass-hover)';
+                                    }}
+                                    onMouseLeave={(e) => {
+                                        e.currentTarget.style.borderColor = 'var(--q-glass-border)';
+                                        e.currentTarget.style.background = 'var(--q-glass-bg)';
+                                    }}
+                                >
+                                    <div className="shrink-0 mt-0.5 space-y-1">
+                                        <img
+                                            src={getFavicon(source.url)}
+                                            alt=""
+                                            className="w-4 h-4 rounded-sm opacity-70 group-hover:opacity-100 transition-opacity"
+                                            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                                        />
+                                        {quality && (
+                                            <ShieldCheck className="w-4 h-4" style={{ color: qualityColor }} />
+                                        )}
                                     </div>
-                                    <div className="text-[10px] truncate mt-0.5"
-                                         style={{ color: 'var(--q-text-muted)' }}>
-                                        {getDomain(source.url)}
+                                    <div className="min-w-0 flex-1">
+                                        {quality && (
+                                            <div className="text-[10px] font-medium truncate mb-0.5"
+                                                 style={{ color: qualityColor }}>
+                                                {quality.label}
+                                            </div>
+                                        )}
+                                        <div className="text-xs font-medium truncate group-hover:text-primary transition-colors"
+                                             style={{ color: 'var(--q-text)' }}>
+                                            {source.title || "Untitled"}
+                                        </div>
+                                        <div className="text-[10px] truncate mt-0.5"
+                                             style={{ color: 'var(--q-text-muted)' }}>
+                                            {getDomain(source.url)}
+                                        </div>
                                     </div>
-                                </div>
-                                <ExternalLink className="w-3 h-3 shrink-0 mt-0.5 group-hover:text-primary transition-colors"
-                                              style={{ color: 'var(--q-text-muted)' }} />
-                            </a>
-                        ))}
+                                    <ExternalLink className="w-3 h-3 shrink-0 mt-0.5 group-hover:text-primary transition-colors"
+                                                  style={{ color: 'var(--q-text-muted)' }} />
+                                </a>
+                            );
+                        })}
                     </div>
-                    {sources.length > 4 && !showAllSources && (
+                    {rankedSources.length > 4 && !showAllSources && (
                         <button
                             onClick={() => setShowAllSources(true)}
                             className="flex items-center gap-1 text-xs hover:text-primary transition-colors mt-1"
                             style={{ color: 'var(--q-text-muted)' }}
                         >
-                            <span>View all {sources.length} sources</span>
+                            <span>View all {rankedSources.length} sources</span>
                             <ChevronRight className="w-3 h-3" />
                         </button>
                     )}
@@ -120,7 +155,7 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                                     href={image.url}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="group relative aspect-square rounded-xl overflow-hidden
+                                    className="group relative aspect-square rounded-lg overflow-hidden
                                                hover:scale-[1.03]
                                                transition-all duration-200 cursor-pointer"
                                     style={{

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { PanelLeft, Star, ArrowDown } from "lucide-react";
 import { useChatStore } from "../lib/store";
 import { sendChatMessage, reviewProposal, submitPlanFeedback } from "../lib/api";
@@ -11,6 +11,9 @@ import { DownloadProgress } from "./DownloadProgress";
 import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
+import { normalizeEvidenceQuality } from "../lib/evidence-quality";
+import { buildObservationPaperGraph } from "../lib/research-graph";
+import { ObservationPaperGraph } from "./ObservationPaperGraph";
 import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
@@ -19,7 +22,7 @@ function generateId(): string { return Date.now().toString(36) + Math.random().t
 
 export function ChatArea() {
     const {
-        messages, addMessage, updateLastAssistantMessage, updateLastAssistantThinking,
+        messages, addMessage, mergeWebSourcesMessage, updateLastAssistantMessage, updateLastAssistantThinking,
         isStreaming, setStreaming,
         toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -59,6 +62,7 @@ export function ChatArea() {
     const activeConversation = conversations.find(c => c.id === activeConversationId);
     const isStarred = activeConversation?.isStarred || false;
     const scrollRef = useRef<HTMLDivElement>(null);
+    const observationPaperGraph = useMemo(() => buildObservationPaperGraph(messages), [messages]);
 
     // ── Smart auto-scroll ──────────────────────────────────────
     // Only scroll to bottom if the user hasn't manually scrolled up.
@@ -136,7 +140,14 @@ export function ChatArea() {
         }
     }, []);
 
-    const normalizeWebSourcesPayload = useCallback((data: { sources?: unknown; images?: unknown }) => {
+    const normalizeWebSourcesPayload = useCallback((data: {
+        sources?: unknown;
+        images?: unknown;
+        query?: unknown;
+        provider?: unknown;
+        image_provider?: unknown;
+        search_type?: unknown;
+    }) => {
         const isWebSource = (source: WebSource | null): source is WebSource => source !== null;
         const isWebImage = (image: WebImage | null): image is WebImage => image !== null;
 
@@ -170,6 +181,7 @@ export function ChatArea() {
                 title: String(item.title || item.name || titleFromUrl(url)).trim(),
                 url,
                 snippet: String(item.snippet || item.content || item.text || item.description || "").trim(),
+                evidenceQuality: normalizeEvidenceQuality(item.evidenceQuality || item.evidence_quality),
             };
         };
 
@@ -198,6 +210,10 @@ export function ChatArea() {
         return {
             sources: rawSources.map(normalizeWebSource).filter(isWebSource),
             images: rawImages.map(normalizeWebImage).filter(isWebImage),
+            provider: String(data.provider || "").trim(),
+            imageProvider: String(data.image_provider || "").trim(),
+            searchType: String(data.search_type || "").trim(),
+            query: String(data.query || "").trim(),
         };
     }, []);
 
@@ -359,6 +375,15 @@ export function ChatArea() {
                                 isTop10Percent: Boolean(p.is_top_10_percent),
                                 funders: Array.isArray(p.funders) ? (p.funders as { name: string; id: string }[]) : undefined,
                                 oaPdfUrl: (p.oa_pdf_url as string) || undefined,
+                                observationLinks: Array.isArray(p.observation_links)
+                                    ? (p.observation_links as Record<string, unknown>[]).map((link) => ({
+                                        identifier: String(link.identifier || ""),
+                                        identifierType: String(link.identifier_type || link.identifierType || ""),
+                                        relation: String(link.relation || ""),
+                                        confidence: String(link.confidence || ""),
+                                        adsQuery: String(link.ads_query || link.adsQuery || ""),
+                                    })).filter((link) => link.identifier)
+                                    : undefined,
                             }));
                             addMessage({
                                 id: generateId(),
@@ -411,14 +436,13 @@ export function ChatArea() {
                             const normalized = normalizeWebSourcesPayload(data);
                             if (normalized.sources.length === 0 && normalized.images.length === 0) return;
 
-                            addMessage({
-                                id: generateId(),
-                                role: "assistant",
-                                content: "",
-                                type: "web_sources",
-                                timestamp: new Date(),
-                                webSources: normalized.sources,
-                                webImages: normalized.images,
+                            mergeWebSourcesMessage({
+                                sources: normalized.sources,
+                                images: normalized.images,
+                                provider: normalized.provider,
+                                imageProvider: normalized.imageProvider,
+                                searchType: normalized.searchType,
+                                query: normalized.query,
                             });
                         },
                         onDownloadProgress: (data) => {
@@ -469,6 +493,7 @@ export function ChatArea() {
         }
     }, [
         addMessage,
+        mergeWebSourcesMessage,
         updateLastAssistantMessage,
         updateLastAssistantThinking,
         setStreaming,
@@ -598,6 +623,9 @@ export function ChatArea() {
                                 );
                             });
                         })()}
+                        {observationPaperGraph && (
+                            <ObservationPaperGraph graph={observationPaperGraph} />
+                        )}
                         {pendingPlan && (
                             <PlanReviewWidget
                                 plan={pendingPlan}

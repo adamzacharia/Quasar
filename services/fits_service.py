@@ -14,6 +14,7 @@ import uuid
 import math
 import tempfile
 import logging
+import shutil
 from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -46,6 +47,13 @@ def _pick_science_hdu(hdul) -> Tuple[Any, int]:
 def _download_fits(url: str, label: str = "FITS") -> str:
     """Download a FITS file from URL to a temp file. Returns path."""
     logger.info(f"[FITS] Downloading {label} from {url}")
+
+    if url.startswith("file://") or os.path.exists(url):
+        src = url.replace("file://", "", 1)
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        tmp.close()
+        shutil.copyfile(src, tmp.name)
+        return tmp.name
 
     resp = http_requests.get(url, timeout=DOWNLOAD_TIMEOUT_S, stream=True)
     resp.raise_for_status()
@@ -195,8 +203,8 @@ def overlay_fits_images(
         base_path = _download_fits(base_url, f"{base_label} base")
         contour_path = _download_fits(contour_url, f"{contour_label} contour")
 
-        with afits.open(base_path, memmap=True) as base_hdul, \
-             afits.open(contour_path, memmap=True) as cont_hdul:
+        with afits.open(base_path, memmap=False) as base_hdul, \
+             afits.open(contour_path, memmap=False) as cont_hdul:
 
             base_data, base_idx = _pick_science_hdu(base_hdul)
             cont_data, cont_idx = _pick_science_hdu(cont_hdul)
@@ -231,11 +239,12 @@ def overlay_fits_images(
             valid = cont_reproj[np.isfinite(cont_reproj)]
             if len(valid) > 0:
                 vmin, vmax = np.nanpercentile(valid, [30, 99.5])
-                levels = np.linspace(vmin, vmax, contour_levels)
-                ax.contour(
-                    cont_reproj, levels=levels, colors="cyan",
-                    linewidths=0.8, alpha=0.85, origin="lower",
-                )
+                if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
+                    levels = np.linspace(vmin, vmax, contour_levels)
+                    ax.contour(
+                        cont_reproj, levels=levels, colors="cyan",
+                        linewidths=0.8, alpha=0.85, origin="lower",
+                    )
 
             ax.set_title(
                 f"{base_label} (color) + {contour_label} (contours)",
@@ -268,7 +277,10 @@ def overlay_fits_images(
     finally:
         for p in (base_path, contour_path):
             if p and os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except PermissionError:
+                    logger.warning(f"[FITS] Could not remove temp file still in use: {p}")
         gc.collect()
 
 
@@ -747,4 +759,3 @@ def fit_spectral_line(
         if fits_path and os.path.exists(fits_path):
             os.unlink(fits_path)
         gc.collect()
-
