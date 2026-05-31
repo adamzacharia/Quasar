@@ -5,7 +5,7 @@ Provides RESTful + SSE endpoints wrapping the existing QuasarAgent.
 Run with:  uvicorn api.main:app --reload --port 8000
 """
 
-import sys, os, json, asyncio, uuid
+import sys, os, json, asyncio, uuid, re
 import queue as stdlib_queue
 
 # ── Windows fix: langchain_community.document_loaders.pebblo imports 'pwd' (Unix-only) ──
@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 from utils.archive_links import build_archive_link, infer_archive_kind
+from services.evidence_quality import annotate_web_source_evidence, choose_better_evidence_quality, rank_web_sources
 
 # ── Observability: Loguru + Sentry ────────────────────────────────────────────
 from core.logger import logger, init_rollbar
@@ -115,7 +116,7 @@ app.add_middleware(LoggingMiddleware)
 # This guarantees every response (including errors) carries CORS headers.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|https://(www\.)?quasarassistant\.com|http://localhost:3000|http://127\.0\.0\.1:3000",
+    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.onrender\.com|https://(www\.)?quasarassistant\.com|http://localhost:300[0-9]|http://127\.0\.0\.1:300[0-9]",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -397,6 +398,10 @@ class LoginRequest(BaseModel):
 class GoogleLoginRequest(BaseModel):
     credential: str
 
+class FitsPreviewRequest(BaseModel):
+    url: str
+    filename: Optional[str] = None
+
 # ── Auth Service Instance ──
 from services.auth import AuthService
 from services.conversation_service import ConversationService
@@ -480,6 +485,85 @@ def _sse_status(step: str, state: str = "running") -> str:
     return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
 
 
+def _normalize_web_url(value: Any) -> str:
+    url = str(value or "").strip().strip("<>")
+    url = url.rstrip(".,;:)]}'\"")
+    if not url:
+        return ""
+    if url.startswith(("http://", "https://")):
+        return url
+    if url.startswith("www."):
+        return f"https://{url}"
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}/\S+$", url):
+        return f"https://{url}"
+    return ""
+
+
+def _merge_web_items(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    by_url: Dict[str, int] = {}
+
+    for item in [*(existing or []), *(incoming or [])]:
+        if not isinstance(item, dict):
+            continue
+        url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("source_url"))
+        if not url:
+            continue
+        key = url.lower().rstrip("/")
+        clean = dict(item)
+        clean["url"] = url
+        if key in by_url:
+            current = merged[by_url[key]]
+            for field in ("title", "snippet", "description"):
+                if not current.get(field) and clean.get(field):
+                    current[field] = clean[field]
+            continue
+        by_url[key] = len(merged)
+        merged.append(clean)
+
+    return merged
+
+
+def _merge_web_sources(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    by_url: Dict[str, int] = {}
+
+    for item in [*(existing or []), *(incoming or [])]:
+        if not isinstance(item, dict):
+            continue
+        url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("source_url"))
+        if not url:
+            continue
+        key = url.lower().rstrip("/")
+        clean = annotate_web_source_evidence({**item, "url": url})
+        if key in by_url:
+            current = merged[by_url[key]]
+            for field in ("title", "snippet", "description"):
+                if not current.get(field) and clean.get(field):
+                    current[field] = clean[field]
+            current["evidenceQuality"] = choose_better_evidence_quality(
+                current.get("evidenceQuality"),
+                clean.get("evidenceQuality"),
+            )
+            continue
+        by_url[key] = len(merged)
+        merged.append(clean)
+
+    return rank_web_sources(merged)
+
+
+def _merge_web_label(existing: str, incoming: Any) -> str:
+    label = str(incoming or "").strip()
+    if not label:
+        return existing
+    if not existing:
+        return label
+    parts = [part.strip() for part in existing.split(" + ") if part.strip()]
+    if label in parts:
+        return existing
+    return f"{existing} + {label}"
+
+
 def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
     """Build a data card SSE event from a run_result dict.
     
@@ -499,6 +583,29 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         return None
 
     try:
+        table_kind = str(_run_result.get("table_kind", "") or "")
+        product_display_cols = [
+            ("filename", "File"),
+            ("product_kind", "Product"),
+            ("size_mb", "Size (MB)"),
+            ("proposal_id", "Proposal ID"),
+            ("target_name", "Target"),
+            ("member_ous_uid", "MOUS ID"),
+            ("triage_status", "Triage"),
+            ("readiness_score", "Readiness"),
+            ("warnings", "Warnings"),
+        ]
+        project_picker_cols = [
+            ("proposal_id", "Proposal ID"),
+            ("target_name", "Target"),
+            ("band_list", "Band"),
+            ("observations", "Observations"),
+            ("member_ous_count", "MOUS Count"),
+            ("dataproduct_type", "Type"),
+            ("pi_name", "PI"),
+            ("obs_title", "Project Title"),
+            ("obs_release_date", "Release Date"),
+        ]
         alma_display_cols = [
             ("obs_publisher_did", "Project"),
             ("target_name", "Target"),
@@ -532,6 +639,10 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             ("group_ous_uid", "Group OUS ID"),
             ("asdm_uid", "ASDM UID"),
         ]
+        if table_kind == "alma_products":
+            alma_display_cols = product_display_cols
+        elif table_kind == "alma_project_picker":
+            alma_display_cols = project_picker_cols
         seen_display = set()
         sel_cols, display_cols = [], []
         for raw, nice in alma_display_cols:
@@ -553,7 +664,9 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         archive_kind = infer_archive_kind(df, source_hint=_source, filter_label=_filter_label)
 
         per_row_links = []
-        if archive_kind == "cadc" and "obs_id" in df.columns:
+        if table_kind == "alma_products" and "access_url" in df.columns:
+            per_row_links = df["access_url"].head(_MAX_TABLE_ROWS).fillna("").tolist()
+        elif archive_kind == "cadc" and "obs_id" in df.columns:
             # Build browsable CADC archive links (not raw DataLink URLs)
             _collections = df["obs_collection"].head(_MAX_TABLE_ROWS).fillna("").tolist() if "obs_collection" in df.columns else [""] * min(len(df), _MAX_TABLE_ROWS)
             _obs_ids = df["obs_id"].head(_MAX_TABLE_ROWS).fillna("").tolist()
@@ -649,6 +762,16 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
 
         # ── Demographics & FITS estimation ─────────────
         demographics, fits_estimate = _compute_demographics(df)
+        if table_kind == "alma_products":
+            demographics = {}
+            if "filename" in df.columns:
+                fits_estimate = int(
+                    df["filename"].astype(str).str.contains(r"\.fits?(\.gz)?$", case=False, regex=True, na=False).sum()
+                )
+            else:
+                fits_estimate = len(df)
+        elif table_kind == "alma_project_picker":
+            fits_estimate = 0
 
         # ── Detect archive source dynamically ─────────
         _detected_source = _default_archive_source(
@@ -666,8 +789,8 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             })
         if fits_estimate > 0:
             metrics.append({
-                "label": "Est. FITS",
-                "value": f"~{fits_estimate}",
+                "label": "FITS" if table_kind == "alma_products" else "Est. FITS",
+                "value": f"{fits_estimate}" if table_kind == "alma_products" else f"~{fits_estimate}",
                 "color": "amber",
             })
         if "obs_collection" in df.columns:
@@ -695,6 +818,7 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             "hasPreview": has_preview,
             "demographics": demographics if demographics else None,
             "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
+            "tableKind": table_kind or None,
         }
         table_event_str = f"data: {json.dumps(table_payload)}\n\n"
         rich_dt = table_payload.copy()
@@ -974,6 +1098,10 @@ def _stream_chat_response(
             _rich_image = None
             _rich_web_sources = []
             _rich_web_images = []
+            _rich_web_provider = ""
+            _rich_web_image_provider = ""
+            _rich_web_search_type = ""
+            _rich_web_query = ""
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
@@ -1048,8 +1176,34 @@ def _stream_chat_response(
                                         _pfq_key[0] = new_cid
                                         print(f"[HITL] Re-keyed plan feedback queue: {old_key[:20]}... → {new_cid[:20]}...")
                                 if event_parsed.get("type") == "web_sources":
-                                    _rich_web_sources = event_parsed.get("sources") or []
-                                    _rich_web_images = event_parsed.get("images") or []
+                                    _rich_web_sources = _merge_web_sources(
+                                        _rich_web_sources,
+                                        event_parsed.get("sources") or [],
+                                    )
+                                    _rich_web_images = _merge_web_items(
+                                        _rich_web_images,
+                                        event_parsed.get("images") or [],
+                                    )
+                                    _rich_web_provider = _merge_web_label(
+                                        _rich_web_provider,
+                                        event_parsed.get("provider"),
+                                    )
+                                    _rich_web_image_provider = _merge_web_label(
+                                        _rich_web_image_provider,
+                                        event_parsed.get("image_provider"),
+                                    )
+                                    _rich_web_search_type = _merge_web_label(
+                                        _rich_web_search_type,
+                                        event_parsed.get("search_type"),
+                                    )
+                                    _rich_web_query = _rich_web_query or str(event_parsed.get("query") or "")
+                                    event_parsed["sources"] = _rich_web_sources
+                                    event_parsed["images"] = _rich_web_images
+                                    event_parsed["provider"] = _rich_web_provider
+                                    event_parsed["image_provider"] = _rich_web_image_provider
+                                    event_parsed["search_type"] = _rich_web_search_type
+                                    event_parsed["query"] = _rich_web_query
+                                    event_json = json.dumps(event_parsed)
                                 yield f"data: {event_json}\n\n"
                             except Exception:
                                 yield _sse_status(step, state)
@@ -1076,6 +1230,7 @@ def _stream_chat_response(
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
                 if msg_type == "thought":
+                    _rich_thinking_text += payload
                     data = json.dumps({"type": "thought", "content": payload})
                     yield f"data: {data}\n\n"
 
@@ -1268,6 +1423,14 @@ def _stream_chat_response(
                         rich_meta["webSources"] = _rich_web_sources
                     if _rich_web_images:
                         rich_meta["webImages"] = _rich_web_images
+                    if _rich_web_provider:
+                        rich_meta["webProvider"] = _rich_web_provider
+                    if _rich_web_image_provider:
+                        rich_meta["webImageProvider"] = _rich_web_image_provider
+                    if _rich_web_search_type:
+                        rich_meta["webSearchType"] = _rich_web_search_type
+                    if _rich_web_query:
+                        rich_meta["webQuery"] = _rich_web_query
                     if _rich_thinking:
                         rich_meta["thinkingSteps"] = _rich_thinking
                     if _rich_thinking_text:
@@ -1581,6 +1744,118 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 
 # ── Conversation History Endpoints ──────────────────────────────
+
+@app.post("/api/fits/preview")
+async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get_current_user)):
+    """Download a small ALMA FITS product and return a rendered PNG preview."""
+    from urllib.parse import urlparse
+    import base64
+    import io
+    import math
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import requests
+    from astropy.io import fits
+    from astropy.visualization import simple_norm
+
+    parsed = urlparse(str(req.url or "").strip())
+    allowed_hosts = {"almascience.nrao.edu", "almascience.eso.org", "almascience.nao.ac.jp"}
+    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+        raise HTTPException(status_code=400, detail="Only HTTPS ALMA data product URLs can be previewed.")
+
+    max_bytes = 50 * 1024 * 1024
+    try:
+        with requests.get(req.url, stream=True, timeout=90) as response:
+            response.raise_for_status()
+            length = response.headers.get("content-length")
+            if length and int(length) > max_bytes:
+                raise HTTPException(status_code=413, detail="This FITS file is too large for in-browser preview. Open or download it from ALMA instead.")
+
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail="This FITS file is too large for in-browser preview. Open or download it from ALMA instead.")
+                chunks.append(chunk)
+        fits_bytes = b"".join(chunks)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch FITS product: {exc}")
+
+    try:
+        with fits.open(io.BytesIO(fits_bytes), memmap=False) as hdul:
+            hdu = next((item for item in hdul if getattr(item, "data", None) is not None), None)
+            if hdu is None:
+                raise ValueError("No image data found in FITS file.")
+            data = np.asarray(hdu.data, dtype=float)
+            header = hdu.header
+            while data.ndim > 2:
+                data = data[0]
+            data = np.squeeze(data)
+            if data.ndim != 2:
+                raise ValueError("Only 2D image previews are supported right now.")
+            if not np.isfinite(data).any():
+                raise ValueError("Image data contains no finite values.")
+
+            norm = simple_norm(data, "asinh", percent=99.5)
+            fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+            image = ax.imshow(data, origin="lower", cmap="inferno", norm=norm)
+            object_name = str(header.get("OBJECT") or req.filename or "ALMA FITS")
+            unit = str(header.get("BUNIT") or "")
+            ax.set_title(f"{object_name} | {unit}".strip(" |"), fontsize=10)
+            ax.set_xlabel("Pixel")
+            ax.set_ylabel("Pixel")
+            cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(unit or "value", fontsize=8)
+            fig.tight_layout()
+            png = io.BytesIO()
+            fig.savefig(png, format="png", bbox_inches="tight")
+            plt.close(fig)
+
+            def _finite_float(value):
+                try:
+                    number = float(value)
+                    return number if math.isfinite(number) else None
+                except (TypeError, ValueError):
+                    return None
+
+            bmaj = _finite_float(header.get("BMAJ"))
+            bmin = _finite_float(header.get("BMIN"))
+            restfreq = _finite_float(header.get("RESTFRQ"))
+            metadata = {
+                "object": object_name,
+                "unit": unit,
+                "shape": list(data.shape),
+                "beamMajorArcsec": bmaj * 3600 if bmaj is not None else None,
+                "beamMinorArcsec": bmin * 3600 if bmin is not None else None,
+                "restFreqGhz": restfreq / 1e9 if restfreq is not None else None,
+                "min": float(np.nanmin(data)),
+                "max": float(np.nanmax(data)),
+                "sizeBytes": len(fits_bytes),
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not render FITS preview: {exc}")
+
+    return {
+        "imageDataUrl": "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii"),
+        "metadata": metadata,
+        "downloadUrl": req.url,
+        "filename": req.filename or Path(parsed.path).name,
+        "suggestedActions": [
+            "Measure peak flux and RMS noise",
+            "Compare this spectral window with another FITS product",
+            "Open/download the FITS for DS9, CARTA, CASA, or Python",
+        ],
+    }
 
 @app.get("/api/conversations")
 async def list_conversations(current_user: dict = Depends(get_current_user)):

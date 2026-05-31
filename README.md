@@ -158,6 +158,25 @@ npm run dev
 
 The frontend runs on `http://localhost:3000`. If `NEXT_PUBLIC_API_URL` is not set, it defaults to `http://localhost:8000`.
 
+### One-command local testing on Windows
+
+For local UI testing with SQLite auth and the disposable `1@1` / `1` login:
+
+```powershell
+.\scripts\local\start_quasar.ps1 -Restart
+```
+
+This starts the backend on `http://localhost:8000` and the frontend on `http://localhost:3001` with Turso disabled for that local process.
+
+### Regression checks
+
+The frontend has a focused regression test to ensure streamed thinking stays separate from the final answer:
+
+```bash
+cd ui-pro
+npm run test:thinking
+```
+
 ### 4. Run the CLI
 
 From the repository root:

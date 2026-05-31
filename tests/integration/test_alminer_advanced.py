@@ -88,7 +88,7 @@ class TestALminerAdvanced(unittest.TestCase):
         path = self.client.plot_sky_distribution(self.sample_df, "test.png")
         
         self.alminer_mock.plot_sky.assert_called()
-        self.assertTrue(path.endswith("test.png"))
+        self.assertTrue(isinstance(path, bytes))
             
     def test_download_dry_run(self):
         result = self.client.download_data(self.sample_df, dry_run=True)

@@ -24,11 +24,16 @@ def _fresh_auth_import(monkeypatch, *, env: str, jwt_secret: Optional[str]):
     monkeypatch.setenv("QUASAR_ENV", env)
     monkeypatch.delenv("APP_ENV", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("QUASAR_FORCE_LOCAL_DB", raising=False)
+    monkeypatch.delenv("QUASAR_ENABLE_LOCAL_TEST_LOGIN", raising=False)
     if jwt_secret is None:
         monkeypatch.delenv("JWT_SECRET", raising=False)
     else:
         monkeypatch.setenv("JWT_SECRET", jwt_secret)
 
+    sys.modules.pop("services.db", None)
     sys.modules.pop("services.auth", None)
     return importlib.import_module("services.auth")
 
@@ -61,3 +66,29 @@ def test_non_production_uses_local_only_fallback(monkeypatch):
     auth = _fresh_auth_import(monkeypatch, env="testing", jwt_secret=None)
 
     assert auth.JWT_SECRET == "quasar-local-development-jwt-secret"
+
+
+def test_local_test_login_seeds_local_user_when_enabled(monkeypatch, tmp_path):
+    auth = _fresh_auth_import(monkeypatch, env="testing", jwt_secret=None)
+    monkeypatch.setenv("QUASAR_ENABLE_LOCAL_TEST_LOGIN", "1")
+
+    svc = auth.AuthService(db_path=str(tmp_path / "users.db"))
+
+    success, user_id, email, display_name, message = svc.login_user("1@1", "1")
+    assert success is True
+    assert user_id
+    assert email == "1@1"
+    assert display_name == "1"
+    assert message == "Login successful"
+
+
+def test_local_test_login_rejected_in_production(monkeypatch, tmp_path):
+    auth = _fresh_auth_import(
+        monkeypatch,
+        env="production",
+        jwt_secret="real-production-secret-value",
+    )
+    monkeypatch.setenv("QUASAR_ENABLE_LOCAL_TEST_LOGIN", "1")
+
+    with pytest.raises(RuntimeError, match="not allowed in production"):
+        auth.AuthService(db_path=str(tmp_path / "users.db"))

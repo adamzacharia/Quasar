@@ -11,7 +11,7 @@ import uuid
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
-from services.db import get_connection
+from services.db import get_connection, is_using_turso
 import jwt
 
 _LOCAL_JWT_SECRET = "quasar-local-development-jwt-secret"
@@ -70,6 +70,10 @@ def _default_db_path() -> str:
     return str(data_dir / "users.db")
 
 
+def _truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class AuthService:
     """
     Authentication Service
@@ -79,6 +83,7 @@ class AuthService:
     def __init__(self, db_path: str = None):
         self._local_db_path = db_path or _default_db_path()
         self._init_db()
+        self._seed_local_test_user_if_enabled()
 
     def _get_conn(self):
         """Get a database connection (Turso cloud or local SQLite)."""
@@ -121,6 +126,61 @@ class AuthService:
             except Exception:
                 pass
 
+            conn.commit()
+
+    def _seed_local_test_user_if_enabled(self) -> None:
+        """Create a disposable local-only login for manual development testing."""
+        if not _truthy(os.environ.get("QUASAR_ENABLE_LOCAL_TEST_LOGIN")):
+            return
+        if _current_environment() in _PRODUCTION_ENVIRONMENTS:
+            raise RuntimeError(
+                "QUASAR_ENABLE_LOCAL_TEST_LOGIN is not allowed in production mode."
+            )
+        if is_using_turso():
+            raise RuntimeError(
+                "QUASAR_ENABLE_LOCAL_TEST_LOGIN is local-only. Set QUASAR_FORCE_LOCAL_DB=1 "
+                "or unset TURSO_DATABASE_URL/TURSO_AUTH_TOKEN before enabling it."
+            )
+
+        username = os.environ.get("QUASAR_LOCAL_TEST_USERNAME", "1@1").strip()
+        email = os.environ.get("QUASAR_LOCAL_TEST_EMAIL", username).strip()
+        display_name = os.environ.get("QUASAR_LOCAL_TEST_DISPLAY_NAME", "1").strip()
+        password = os.environ.get("QUASAR_LOCAL_TEST_PASSWORD", "1")
+
+        if not username or not password:
+            raise RuntimeError("Local test username and password cannot be empty.")
+
+        pwd_hash, salt = self._hash_password(password)
+        created_at = datetime.now().isoformat()
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    """UPDATE users
+                       SET password_hash = ?, salt = ?, email = ?, display_name = ?,
+                           auth_provider = 'local'
+                       WHERE username = ?""",
+                    (pwd_hash, salt, email, display_name, username),
+                )
+            else:
+                cursor.execute(
+                    """INSERT INTO users
+                       (id, username, password_hash, salt, created_at, email, display_name, auth_provider)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        username,
+                        pwd_hash,
+                        salt,
+                        created_at,
+                        email,
+                        display_name,
+                        "local",
+                    ),
+                )
             conn.commit()
 
     def generate_token(self, user_id: str, email: str = None, display_name: str = None, picture_url: str = None) -> str:

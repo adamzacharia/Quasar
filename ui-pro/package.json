@@ -2,11 +2,15 @@
   "name": "ui-pro",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:thinking": "node --test tests/thinking-regression.test.mjs",
+    "test:evidence": "node --test tests/evidence-quality.test.mjs",
+    "test:graph": "node --test tests/research-graph.test.mjs"
   },
   "dependencies": {
     "@vercel/speed-insights": "^2.0.0",

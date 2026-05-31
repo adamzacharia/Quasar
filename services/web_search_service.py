@@ -25,6 +25,7 @@ from typing import Dict, Any, List, Optional
 # Constants
 USAGE_FILE = "./data/search_usage.json"
 MAX_FREE_LIMIT = 1000
+DEFAULT_MAX_RESULTS = 10
 
 class WebSearchService:
     """Intelligent router and rate-limiter for web search providers."""
@@ -195,42 +196,66 @@ class WebSearchService:
         """Determine if Exa should use 'deep' or 'deep-reasoning' based on complexity."""
         q_lower = query.lower()
         word_count = len(query.split())
-        
-        # Keywords indicating high-value, complex comparison/research questions
+
+        # Reserve deep-reasoning for genuinely hard synthesis/comparison work.
+        # Normal advanced searches should stay on Exa deep.
         reasoning_keywords = [
             "tradeoff", "trade-off", "trade off",
             "disagreement", "disagree", "methodological",
             "competing", "risk", "ranking", "rank",
-            "parameter tradeoff", "parameter trade-off"
+            "parameter tradeoff", "parameter trade-off",
+            "systematic review", "meta-analysis", "evidence landscape",
+            "conflicting evidence", "which approach", "pros and cons",
         ]
-        
-        # Trigger deep-reasoning for strong reasoning indicators
+
         if any(kw in q_lower for kw in reasoning_keywords):
             return "deep-reasoning"
-            
-        # Trigger deep-reasoning for complex comparison questions (at least 10 words + comparison verbs)
-        if any(kw in q_lower for kw in ["compare", "versus", "vs"]) and word_count >= 10:
+
+        comparison_terms = ["compare", "comparison", "versus", " vs "]
+        complexity_terms = [
+            "identify", "explain", "evaluate", "synthesize", "recommend",
+            "why", "best", "limitations", "assumptions", "implications",
+        ]
+        if (
+            any(kw in q_lower for kw in comparison_terms)
+            and word_count >= 12
+            and any(kw in q_lower for kw in complexity_terms)
+        ):
             return "deep-reasoning"
-            
-        # Normal Exa specialist searches get deep search
+
         return "deep"
 
     def route_and_search(
         self, 
         query: str, 
-        max_results: int = 5, 
+        max_results: int = DEFAULT_MAX_RESULTS,
         search_depth: str = "basic"
     ) -> Dict[str, Any]:
         """Classify search intent and route to the optimal provider with fallbacks."""
         q_lower = query.lower()
+        try:
+            max_results = max(1, min(int(max_results), 10))
+        except (TypeError, ValueError):
+            max_results = DEFAULT_MAX_RESULTS
         
         # 1. Image or Plot intent -> route to Image Search
         if any(kw in q_lower for kw in ["image", "photo", "chart", "map", "plot", "spectrum"]):
             print(f"[SEARCH ROUTER] Routed to Image Search for: {query!r}")
             return self.search_images(query, max_results=max_results)
             
-        # 2. Deep Technical / Research intent -> route to Exa
-        if any(kw in q_lower for kw in ["compare", "versus", "vs", "formula", "equations", "papers", "documentation", "handbook", "innovations", "architecture", "literature", "review", "research", "academic"]):
+        # 2. Advanced / deep technical / research intent -> route to Exa.
+        # Normal advanced search uses Exa deep; only very hard synthesis uses
+        # Exa deep-reasoning inside _determine_exa_type().
+        exa_intent = (
+            search_depth == "advanced"
+            or any(kw in q_lower for kw in [
+                "compare", "versus", "vs", "formula", "equations",
+                "papers", "documentation", "handbook", "innovations",
+                "architecture", "literature", "review", "research",
+                "academic",
+            ])
+        )
+        if exa_intent:
             usage = self._get_usage()
             if self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT:
                 print(f"[SEARCH ROUTER] Routed to Exa (Specialist) for: {query!r}")
@@ -430,10 +455,11 @@ class WebSearchService:
         enriched["image_provider"] = "Tavily Images"
         return enriched
 
-    def search_brave(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+    def search_brave(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> Dict[str, Any]:
         """Perform search using Brave LLM Context (primary RAG) or Web Search."""
         if not self.brave_key:
             return {"success": False, "error": "Brave API key missing"}
+        max_results = max(1, min(int(max_results), 10))
 
         # Attempt Brave LLM Context endpoint (highly pre-summarized and optimized)
         url = "https://api.search.brave.com/res/v1/llm/context"
@@ -492,7 +518,7 @@ class WebSearchService:
     def search_tavily(
         self,
         query: str,
-        max_results: int = 5,
+        max_results: int = DEFAULT_MAX_RESULTS,
         search_depth: str = "basic",
         include_images: bool = True,
     ) -> Dict[str, Any]:
@@ -500,9 +526,10 @@ class WebSearchService:
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
 
+        max_results = max(1, min(int(max_results), 10))
         payload = {
             "query": query,
-            "max_results": min(int(max_results), 10),
+            "max_results": max_results,
             "search_depth": search_depth,
             "include_answer": True,
             "include_images": include_images,
@@ -820,10 +847,11 @@ class WebSearchService:
         except Exception as e:
             return {"success": False, "error": f"Tavily research status failed: {e}"}
 
-    def search_exa(self, query: str, num_results: int = 5, search_type: str = "deep") -> Dict[str, Any]:
+    def search_exa(self, query: str, num_results: int = DEFAULT_MAX_RESULTS, search_type: str = "deep") -> Dict[str, Any]:
         """Perform semantic research search using Exa."""
         if not self.exa_key:
             return {"success": False, "error": "Exa API key missing"}
+        num_results = max(1, min(int(num_results), 10))
             
         try:
             # We can use direct requests to remain lightweight and fully custom
@@ -835,7 +863,7 @@ class WebSearchService:
             payload = {
                 "query": query,
                 "type": search_type,
-                "numResults": min(num_results, 10),
+                "numResults": num_results,
                 "contents": {
                     "highlights": True
                 }
@@ -867,8 +895,9 @@ class WebSearchService:
         except Exception as e:
             return {"success": False, "error": f"Exa search failed: {e}"}
 
-    def search_images(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+    def search_images(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> Dict[str, Any]:
         """Specialized image-only search leveraging Tavily or Brave's visual index."""
+        max_results = max(1, min(int(max_results), 10))
         # 1. Primary: Tavily Image Search (gives rich descriptions)
         if self.tavily_key:
             try:

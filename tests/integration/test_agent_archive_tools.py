@@ -8,7 +8,7 @@ import pandas as pd
 
 from core.tools import ToolRegistry
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENT_MODULE_NAME = "quasar_agent_test_module"
 
 
@@ -184,6 +184,53 @@ class _StubIRSAClient:
         return self.df.copy()
 
 
+class _FakeTableResult:
+    def __init__(self, df):
+        self.df = df
+
+    def to_table(self):
+        return self
+
+    def to_pandas(self):
+        return self.df.copy()
+
+
+class _FakeTapService:
+    def __init__(self, df):
+        self.df = df
+        self.query = ""
+
+    def search(self, query):
+        self.query = query
+        return _FakeTableResult(self.df)
+
+
+class _FakeAlminerClient:
+    def __init__(self, df):
+        self.tap = _FakeTapService(df)
+
+    def _get_tap_service(self):
+        return self.tap
+
+    def _standardize_columns(self, df):
+        return df
+
+
+class _FakeSearchService:
+    def __init__(self, df):
+        self.alminer_client = _FakeAlminerClient(df)
+
+
+class _PositionalMASTClient:
+    def __init__(self, df):
+        self.df = df
+        self.calls = []
+
+    def search_by_position(self, ra, dec, radius_arcmin=1.0, mission=None, max_results=500):
+        self.calls.append((ra, dec, radius_arcmin, mission, max_results))
+        return self.df.copy()
+
+
 class AgentArchiveToolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -191,10 +238,12 @@ class AgentArchiveToolTests(unittest.TestCase):
 
     def _make_agent(self):
         agent = self.agent_module.QuasarAgent.__new__(self.agent_module.QuasarAgent)
+        agent._tls = __import__("threading").local()
         agent.tool_registry = ToolRegistry()
         agent.last_search_results = None
         agent.last_run_result = None
         agent.ads_client = None
+        agent.openalex_client = None
         return agent
 
     def test_register_tools_includes_new_archive_tools(self):
@@ -208,8 +257,96 @@ class AgentArchiveToolTests(unittest.TestCase):
             "get_mast_products",
             "search_eso_archive",
             "search_irsa",
+            "query_alma_science_archive",
+            "match_cross_archive_sources",
+            "match_perseus_protostars_alma_jwst",
+            "overlay_archive_images",
         ]:
             self.assertIsNotNone(agent.tool_registry.get_tool(tool_name))
+
+    def test_alma_science_router_maps_known_prompts(self):
+        agent = self._make_agent()
+
+        cases = [
+            ("How many Cycle 10 projects observed the Sun?", {"query_type": "cycle_solar_projects", "cycle": 10}),
+            (
+                "How many Cycle 9 projects used 12m, 7m, and total power?",
+                {"query_type": "cycle_array_combo_projects", "cycle": 9, "arrays": ["12m", "7m", "TP"]},
+            ),
+            (
+                "HH212 Band 7 high-resolution continuum candidate summary.",
+                {"query_type": "high_resolution_band_data", "target": "HH 212", "band": 7, "max_resolution_arcsec": 0.1},
+            ),
+            (
+                "Protostellar disks with 12CO, 13CO, C18O Band 6 in same project.",
+                {"query_type": "line_set_projects", "band": 6, "lines": ["12CO", "13CO", "C18O"], "require_same_project": True, "topic_filter": "protostellar disks"},
+            ),
+            (
+                "Galaxies at z=1-2 with CO rest frequency in spectral setup.",
+                {"query_type": "redshifted_line_projects", "redshift_min": 1.0, "redshift_max": 2.0, "rest_species": "CO", "science_category": "Galaxy", "require_same_project": True},
+            ),
+            (
+                "Which projects likely needed Bandwidth Switching for calibration?",
+                {"query_type": "bandwidth_switching_candidates"},
+            ),
+        ]
+
+        for prompt, expected in cases:
+            self.assertEqual(agent._route_alma_science_archive_query(prompt), expected)
+
+    def test_generic_cross_archive_match_sets_data_result(self):
+        agent = self._make_agent()
+        source = self.agent_module.PERSEUS_PROTOSTARS[0]
+        alma_df = pd.DataFrame([
+            {
+                "target_name": source["source_name"],
+                "proposal_id": "2022.1.00001.S",
+                "s_ra": source["ra"],
+                "s_dec": source["dec"],
+            }
+        ])
+        mast_df = pd.DataFrame([
+            {
+                "target_name": source["source_name"],
+                "telescope": "JWST",
+                "instrument_name": "NIRCAM",
+                "project_code": "1234",
+            }
+        ])
+        agent.search_service = _FakeSearchService(alma_df)
+        agent.mast_client = _PositionalMASTClient(mast_df)
+
+        result = agent._match_cross_archive_sources(max_sources=1)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["matched_sources"], 1)
+        self.assertEqual(agent.last_run_result["tool_name"], "match_cross_archive_sources")
+        self.assertEqual(agent.last_run_result["data"].iloc[0]["source_name"], source["source_name"])
+
+    def test_alma_science_query_returns_provenance_for_redshifted_lines(self):
+        agent = self._make_agent()
+        agent.search_service = _FakeSearchService(pd.DataFrame([
+            {
+                "proposal_id": "2023.1.00010.S",
+                "target_name": "z galaxy",
+                "frequency_support": "172.8..173.1GHz",
+                "band_list": "5",
+            }
+        ]))
+
+        result = agent._query_alma_science_archive(
+            query_type="redshifted_line_projects",
+            redshift_min=1,
+            redshift_max=2,
+            rest_species="CO",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["mode"], "redshifted_line_projects")
+        self.assertEqual(result["unique_projects"], 1)
+        self.assertIn("query_summary", result)
+        self.assertIn("provenance", result)
+        self.assertIn("SELECT TOP", result["provenance"]["adql"])
 
     def test_search_mast_sets_last_search_results(self):
         df = pd.DataFrame(

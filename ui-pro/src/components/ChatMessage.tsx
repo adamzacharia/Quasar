@@ -315,19 +315,17 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     }
 
     if (message.type === "papers" && message.papers && message.papers.length > 0) {
-        const VISIBLE_MAX = 10;
-        const shown = message.papers.slice(0, VISIBLE_MAX);
-        const hasMore = message.papers.length > VISIBLE_MAX;
+        const shouldScroll = message.papers.length > 6;
         return (
             <div className="pl-11">
-                <div className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${hasMore ? "max-h-[680px] overflow-y-auto pr-1 custom-scrollbar" : ""}`}>
-                    {shown.map((paper) => (
+                <div className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${shouldScroll ? "max-h-[680px] overflow-y-auto pr-1 custom-scrollbar" : ""}`}>
+                    {message.papers.map((paper) => (
                         <PaperCard key={paper.id} paper={paper} />
                     ))}
                 </div>
-                {hasMore && (
+                {shouldScroll && (
                     <p className="text-xs text-slate-500 mt-2 text-right">
-                        Showing {VISIBLE_MAX} of {message.papers.length} papers
+                        All {message.papers.length} papers loaded
                     </p>
                 )}
             </div>
@@ -401,7 +399,10 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     if (message.type === "web_sources" && (message.webSources?.length || message.webImages?.length)) {
         return (
             <div className="pl-11">
-                <WebSourcesCard sources={message.webSources} images={message.webImages} />
+                <WebSourcesCard
+                    sources={message.webSources}
+                    images={message.webImages}
+                />
             </div>
         );
     }

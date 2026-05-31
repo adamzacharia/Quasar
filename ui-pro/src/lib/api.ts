@@ -29,7 +29,14 @@ export interface StreamCallbacks {
         maxIterations: number;
         query: string;
     }) => void;
-    onWebSources?: (data: { sources: { title: string; url: string; snippet: string }[]; images: { url: string; description: string }[]; query: string }) => void;
+    onWebSources?: (data: {
+        sources: { title: string; url: string; snippet: string; evidenceQuality?: Record<string, unknown>; evidence_quality?: Record<string, unknown> }[];
+        images: { url: string; description: string }[];
+        query: string;
+        provider?: string;
+        image_provider?: string;
+        search_type?: string;
+    }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null }) => void;
     onComplete: (fullResponse: string) => void;
