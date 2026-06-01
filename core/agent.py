@@ -90,7 +90,8 @@ from services.cross_archive_matcher import (
     PERSEUS_PROTOSTARS,
     alma_bulk_cone_adql,
     attach_nearest_source,
-    summarize_alma_jwst_matches,
+    normalize_source_catalog,
+    summarize_cross_archive_matches,
 )
 from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
 from services.astro_calculators import (
@@ -942,13 +943,27 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             name="match_cross_archive_sources",
             description=(
                 "Cross-match a source catalog against ALMA and MAST/JWST observations. "
-                "Use this for source-list location questions such as Perseus protostars observed with ALMA and JWST."
+                "Use this for source-list location questions such as Perseus protostars observed with ALMA and JWST, "
+                "or pass explicit source coordinates for any catalog."
             ),
             function=self._match_cross_archive_sources,
             parameters={
                 "type": "object",
                 "properties": {
-                    "catalog_name": {"type": "string", "description": "Catalog key. Currently supports 'perseus_protostars'."},
+                    "catalog_name": {"type": "string", "description": "Catalog key. Built-in: 'perseus_protostars'. For arbitrary catalogs, pass sources."},
+                    "sources": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_name": {"type": "string"},
+                                "ra": {"type": "number", "description": "ICRS right ascension in degrees."},
+                                "dec": {"type": "number", "description": "ICRS declination in degrees."},
+                            },
+                            "required": ["ra", "dec"],
+                        },
+                        "description": "Optional inline coordinate catalog. Each item needs source_name/name plus ra and dec in degrees."
+                    },
                     "archives": {"type": "array", "items": {"type": "string"}, "description": "Archives to match, e.g. ['ALMA','JWST']."},
                     "radius_arcsec": {"type": "number", "description": "Match radius in arcsec. Default 5."},
                     "max_sources": {"type": "integer", "description": "Max catalog sources to test. Default 12."},
@@ -2051,7 +2066,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             parameters={
                 "type": "object",
                 "properties": {
-                    "region": {"type": "string", "description": "Named region. Currently supports HUDF."},
+                    "region": {"type": "string", "description": "Named region or source, e.g. HUDF, M87, HH 212. Can also contain decimal RA/Dec."},
+                    "ra_deg": {"type": "number", "description": "Optional ICRS right ascension in degrees. Use with dec_deg for arbitrary regions."},
+                    "dec_deg": {"type": "number", "description": "Optional ICRS declination in degrees. Use with ra_deg for arbitrary regions."},
                     "base_archive": {"type": "string", "description": "Base image archive, default MAST."},
                     "base_collection": {"type": "string", "description": "Base collection/mission, default JWST."},
                     "contour_archive": {"type": "string", "description": "Contour archive, default ALMA."},
@@ -4761,63 +4778,68 @@ ORDER BY target_name
     def _match_cross_archive_sources(
         self,
         catalog_name: str = "perseus_protostars",
+        sources: List[Dict[str, Any]] = None,
         archives: List[str] = None,
         radius_arcsec: float = 5.0,
         max_sources: int = 12,
         max_alma_rows: int = 5000,
         max_mast_results_per_source: int = 80,
     ) -> Dict[str, Any]:
-        """Cross-match a supported source catalog against ALMA and MAST/JWST."""
-        catalog_key = str(catalog_name or "perseus_protostars").strip().lower()
-        if catalog_key not in {"perseus_protostars", "perseus"}:
-            return {"success": False, "error": f"Unsupported catalog_name: {catalog_name}"}
-
+        """Cross-match a built-in or inline source catalog against archives."""
         requested_archives = {str(a).upper() for a in (archives or ["ALMA", "JWST"])}
         radius_arcsec = max(0.5, min(float(radius_arcsec or 5.0), 60.0))
-        max_sources = max(1, min(int(max_sources or 12), len(PERSEUS_PROTOSTARS)))
-        sources = PERSEUS_PROTOSTARS[:max_sources]
+        requested_mast_missions = sorted(requested_archives & {"JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"})
+        try:
+            catalog_label, source_catalog = normalize_source_catalog(
+                catalog_name=catalog_name,
+                sources=sources,
+                max_sources=max_sources,
+            )
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
 
         try:
             alma_df = pd.DataFrame()
             alma_matches = pd.DataFrame()
             if "ALMA" in requested_archives:
                 service = self.search_service.alminer_client._get_tap_service()
-                query = alma_bulk_cone_adql(sources, radius_arcsec=radius_arcsec, top=max_alma_rows)
+                query = alma_bulk_cone_adql(source_catalog, radius_arcsec=radius_arcsec, top=max_alma_rows)
                 self._last_alma_tap_query = query
                 self._last_alma_tap_url = "https://almascience.nrao.edu/tap"
                 alma_result = service.search(query)
                 alma_df = alma_result.to_table().to_pandas()
                 if hasattr(self.search_service.alminer_client, "_standardize_columns"):
                     alma_df = self.search_service.alminer_client._standardize_columns(alma_df)
-                alma_matches = attach_nearest_source(alma_df, sources, radius_arcsec=radius_arcsec)
+                alma_matches = attach_nearest_source(alma_df, source_catalog, radius_arcsec=radius_arcsec)
 
             mast_by_source: Dict[str, pd.DataFrame] = {}
-            if {"JWST", "MAST"} & requested_archives:
-                for source in sources:
+            if {"MAST", "JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"} & requested_archives:
+                mission = requested_mast_missions[0] if len(requested_mast_missions) == 1 else None
+                for source in source_catalog:
                     mast_by_source[source["source_name"]] = self.mast_client.search_by_position(
                         float(source["ra"]),
                         float(source["dec"]),
                         radius_arcmin=radius_arcsec / 60.0,
-                        mission="JWST" if "JWST" in requested_archives else None,
+                        mission=mission,
                         max_results=max_mast_results_per_source,
                     )
 
-            summary = summarize_alma_jwst_matches(sources, alma_matches, mast_by_source)
+            summary = summarize_cross_archive_matches(source_catalog, alma_matches, mast_by_source, sorted(requested_archives))
             self.last_search_results = summary
             self.last_run_result = {
                 "type": "data",
                 "data": summary,
-                "source": "ALMA + JWST Perseus Cross-match",
-                "filter_label": f"Perseus protostars within {radius_arcsec:g} arcsec",
+                "source": f"{' + '.join(sorted(requested_archives))} {catalog_label} Cross-match",
+                "filter_label": f"{catalog_label} within {radius_arcsec:g} arcsec",
                 "tool_name": "match_cross_archive_sources",
             }
 
             return {
                 "success": True,
                 "mode": "cross_archive_source_match",
-                "catalog_name": "perseus_protostars",
+                "catalog_name": catalog_label,
                 "archives": sorted(requested_archives),
-                "sources_tested": len(sources),
+                "sources_tested": len(source_catalog),
                 "matched_sources": len(summary),
                 "radius_arcsec": radius_arcsec,
                 "alma_rows": len(alma_df) if alma_df is not None else 0,
@@ -4902,10 +4924,56 @@ ORDER BY target_name
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def _overlay_region_coordinates(self, region: str) -> Optional[Tuple[float, float, str]]:
+    def _overlay_region_coordinates(
+        self,
+        region: str,
+        ra_deg: float = None,
+        dec_deg: float = None,
+    ) -> Optional[Tuple[float, float, str]]:
+        if ra_deg is not None and dec_deg is not None:
+            try:
+                ra = float(ra_deg)
+                dec = float(dec_deg)
+                if 0.0 <= ra < 360.0 and -90.0 <= dec <= 90.0:
+                    return ra, dec, str(region or f"RA {ra:.5f} Dec {dec:.5f}").strip()
+            except (TypeError, ValueError):
+                return None
+
+        text = str(region or "").strip()
+        coord_match = re.search(
+            r"(?:ra\s*[=:]?\s*)?(\d+(?:\.\d+)?)\s*[, ]+\s*(?:dec\s*[=:]?\s*)?([+-]?\d+(?:\.\d+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if coord_match:
+            try:
+                ra = float(coord_match.group(1))
+                dec = float(coord_match.group(2))
+                if 0.0 <= ra < 360.0 and -90.0 <= dec <= 90.0:
+                    return ra, dec, text
+            except (TypeError, ValueError):
+                pass
+
         key = str(region or "").strip().lower().replace(" ", "")
         if key in {"hudf", "hubbleultradeepfield", "ultradeepfield"}:
             return 53.1625, -27.7914, "HUDF"
+        if not text:
+            return None
+
+        try:
+            from integrations.alminer_client import _resolve_simbad_cached
+            resolved_ra, resolved_dec = _resolve_simbad_cached(text)
+            if resolved_ra is not None and resolved_dec is not None:
+                return float(resolved_ra), float(resolved_dec), text
+        except Exception:
+            pass
+
+        try:
+            from astropy.coordinates import SkyCoord
+            coord = SkyCoord.from_name(text)
+            return float(coord.ra.deg), float(coord.dec.deg), text
+        except Exception:
+            return None
         return None
 
     def _mast_product_access_url(self, row: Dict[str, Any]) -> str:
@@ -4981,6 +5049,8 @@ ORDER BY s_resolution
     def _overlay_archive_images(
         self,
         region: str,
+        ra_deg: float = None,
+        dec_deg: float = None,
         base_archive: str = "MAST",
         base_collection: str = "JWST",
         contour_archive: str = "ALMA",
@@ -4988,9 +5058,9 @@ ORDER BY s_resolution
         max_product_mb: float = 150.0,
     ) -> Dict[str, Any]:
         """Find archive FITS products around a region and overlay ALMA contours."""
-        coords = self._overlay_region_coordinates(region)
+        coords = self._overlay_region_coordinates(region, ra_deg=ra_deg, dec_deg=dec_deg)
         if not coords:
-            return {"success": False, "error": f"Unsupported region for overlay workflow: {region}"}
+            return {"success": False, "error": f"Could not resolve overlay region: {region}. Provide ra_deg and dec_deg for arbitrary regions."}
         if str(base_archive or "MAST").upper() != "MAST" or str(contour_archive or "ALMA").upper() != "ALMA":
             return {"success": False, "error": "overlay_archive_images currently supports MAST/JWST base images with ALMA contours."}
 
@@ -6603,7 +6673,6 @@ IMPORTANT RULES:
             re.search(r"\boverlay|contours?\b", _query_lower)
             and re.search(r"\balma\b", _query_lower)
             and re.search(r"\bjwst|mast\b", _query_lower)
-            and re.search(r"\bhudf|ultra\s+deep\s+field\b", _query_lower)
         )
         if _is_cross_archive_source_match_query or _is_archive_overlay_query:
             _should_rag = False
@@ -7007,8 +7076,10 @@ IMPORTANT RULES:
         elif _is_archive_overlay_query:
             full_input += (
                 "\n\nMANDATORY INSTRUCTION: The user is asking for a real archive image overlay. "
-                "You MUST call `overlay_archive_images` now with region='HUDF', base_archive='MAST', "
-                "base_collection='JWST', and contour_archive='ALMA'. Do NOT describe the workflow without calling the tool."
+                "You MUST call `overlay_archive_images` now. Use the user's named region/source as `region`; "
+                "if they provided explicit coordinates, pass `ra_deg` and `dec_deg`. Use base_archive='MAST', "
+                "base_collection='JWST', and contour_archive='ALMA' unless the user specified another MAST collection. "
+                "Do NOT describe the workflow without calling the tool."
             )
         elif _is_cross_archive_source_match_query:
             full_input += (

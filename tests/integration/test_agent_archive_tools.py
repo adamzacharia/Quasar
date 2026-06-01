@@ -323,6 +323,41 @@ class AgentArchiveToolTests(unittest.TestCase):
         self.assertEqual(agent.last_run_result["tool_name"], "match_cross_archive_sources")
         self.assertEqual(agent.last_run_result["data"].iloc[0]["source_name"], source["source_name"])
 
+    def test_cross_archive_match_accepts_inline_catalog(self):
+        agent = self._make_agent()
+        source = {"source_name": "Custom Source", "ra": 150.1234, "dec": 2.3456}
+        alma_df = pd.DataFrame([
+            {
+                "target_name": source["source_name"],
+                "proposal_id": "2024.1.00099.S",
+                "s_ra": source["ra"],
+                "s_dec": source["dec"],
+            }
+        ])
+        mast_df = pd.DataFrame([
+            {
+                "target_name": source["source_name"],
+                "telescope": "HST",
+                "instrument_name": "WFC3",
+                "project_code": "9999",
+            }
+        ])
+        agent.search_service = _FakeSearchService(alma_df)
+        agent.mast_client = _PositionalMASTClient(mast_df)
+
+        result = agent._match_cross_archive_sources(
+            catalog_name="inline",
+            sources=[source],
+            archives=["ALMA", "HST"],
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["catalog_name"], "inline_sources")
+        self.assertEqual(result["matched_sources"], 1)
+        row = agent.last_run_result["data"].iloc[0]
+        self.assertEqual(row["source_name"], "Custom Source")
+        self.assertEqual(row["mast_collections"], "HST")
+
     def test_alma_science_query_returns_provenance_for_redshifted_lines(self):
         agent = self._make_agent()
         agent.search_service = _FakeSearchService(pd.DataFrame([
@@ -347,6 +382,15 @@ class AgentArchiveToolTests(unittest.TestCase):
         self.assertIn("query_summary", result)
         self.assertIn("provenance", result)
         self.assertIn("SELECT TOP", result["provenance"]["adql"])
+
+    def test_overlay_region_coordinates_accept_arbitrary_coordinates(self):
+        agent = self._make_agent()
+
+        explicit = agent._overlay_region_coordinates("Custom field", ra_deg=150.1, dec_deg=2.3)
+        parsed = agent._overlay_region_coordinates("150.1, 2.3")
+
+        self.assertEqual(explicit, (150.1, 2.3, "Custom field"))
+        self.assertEqual(parsed, (150.1, 2.3, "150.1, 2.3"))
 
     def test_search_mast_sets_last_search_results(self):
         df = pd.DataFrame(

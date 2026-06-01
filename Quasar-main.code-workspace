@@ -4,5 +4,8 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"python.defaultInterpreterPath": "C:\\Users\\adama\\anaconda3\\envs\\quasar\\python.exe",
+		"python.terminal.activateEnvironment": true
+	}
 }
