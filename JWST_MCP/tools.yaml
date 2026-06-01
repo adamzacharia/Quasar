@@ -1,0 +1,18 @@
+name: quasar-jwst
+description: JWST-focused MAST MCP tools extracted from Quasar.
+tools:
+  - name: jwst_search_by_target
+    use_case: Find JWST observations for a named astronomical target.
+    example: {target_name: "NGC 1333", instrument: "NIRCAM", radius: "30s"}
+  - name: jwst_search_by_position
+    use_case: Run a JWST cone search around exact ICRS coordinates.
+    example: {ra: 52.265, dec: 31.267, radius_arcmin: 1.0}
+  - name: jwst_search_by_criteria
+    use_case: Search JWST by program ID, instrument, filter, target, date, or product type.
+    example: {proposal_id: "1180", instrument: "NIRCAM", filters: "F200W"}
+  - name: jwst_get_products
+    use_case: List FITS products for the last JWST observation search.
+    example: {product_type: "SCIENCE", extension: "fits"}
+  - name: jwst_observation_summary
+    use_case: Summarize previously returned JWST rows.
+    example: {rows: []}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square } from "lucide-react";
+import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -12,7 +12,7 @@ interface AttachedFile {
 }
 
 interface ChatInputProps {
-    onSend: (message: string, attachments?: AttachedFile[]) => void;
+    onSend: (message: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean }) => void;
     onStop?: () => void;
     isStreaming: boolean;
     initialValue?: string;
@@ -22,6 +22,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
     const [value, setValue] = useState(initialValue);
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
     const [hitCount, setHitCount] = useState<number | null>(null);
+    const [groundedSummary, setGroundedSummary] = useState(false);
     const inputRef = useRef<HTMLInputElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -68,7 +69,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
         e.preventDefault();
         const hasContent = value.trim() || attachments.length > 0;
         if (hasContent && !isStreaming) {
-            onSend(value.trim(), attachments.length > 0 ? attachments : undefined);
+            onSend(value.trim(), attachments.length > 0 ? attachments : undefined, { groundedSummary });
             setValue("");
             setAttachments([]);
         }
@@ -130,6 +131,21 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                 title="Attach image or document"
                             >
                                 <PlusCircle className="w-5 h-5" />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setGroundedSummary(value => !value)}
+                                disabled={isStreaming}
+                                aria-pressed={groundedSummary}
+                                title="Grounded summary mode: only summarize rows retrieved in this run"
+                                className={`inline-flex h-9 items-center gap-1.5 rounded-full border px-2.5 text-xs font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+                                    groundedSummary
+                                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                                        : "border-slate-700/80 bg-slate-900/30 text-slate-500 hover:border-slate-600 hover:text-slate-300"
+                                }`}
+                            >
+                                <ShieldCheck className="w-4 h-4" />
+                                <span className="hidden sm:inline">Grounded</span>
                             </button>
                             <input
                                 ref={inputRef}

@@ -6,6 +6,7 @@ export interface ChatRequest {
     model?: string;
     attachments?: File[];
     token?: string;  // auth token for personal RAG
+    grounded_summary?: boolean;
 }
 
 export interface StreamCallbacks {
@@ -69,6 +70,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             form.append("message", request.message);
             if (request.conversation_id) form.append("conversation_id", request.conversation_id);
             if (request.model) form.append("model", request.model);
+            if (request.grounded_summary) form.append("grounded_summary", "true");
             request.attachments.forEach(f => form.append("files", f));
             const headers: Record<string, string> = {};
             if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
@@ -79,7 +81,12 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             response = await fetch(`${API_BASE}/api/chat`, {
                 method: "POST",
                 headers,
-                body: JSON.stringify({ message: request.message, conversation_id: request.conversation_id, model: request.model }),
+                body: JSON.stringify({
+                    message: request.message,
+                    conversation_id: request.conversation_id,
+                    model: request.model,
+                    grounded_summary: Boolean(request.grounded_summary),
+                }),
                 signal,
             });
         }

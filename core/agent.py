@@ -678,6 +678,7 @@ FORMATTING RULES:
 - **BOLD** key values, observatory names, and important findings.
 - **BULLET LISTS**: Use - for lists of items or key points.
 - **SCIENTIFIC TONE**: Avoid decorative emoji in scientific headings. Do not use lab-themed emoji; prefer plain Markdown headings or astronomy terms such as ALMA, JWST, HST, telescope, archive, source, and observation.
+- **GROUNDED SUMMARY MODE**: If the user prompt contains `[GROUNDED_SUMMARY_MODE]`, your final answer must be constrained to data retrieved by tools in the current run. Only summarize returned rows, counts, identifiers, coordinates, links, and explicit tool errors. Do not add outside background knowledge, inferred archive coverage, likely targets, or unstated counts. If no rows were retrieved, say that the current run returned no rows and do not fill gaps from memory.
 - **NO IMAGE URLS**: NEVER use markdown image syntax ![alt](url) in your responses. You cannot verify image URLs and they will often be broken or incorrect. Describe visuals in text instead. The system has its own image retrieval tools -- do not embed external URLs.
 - Keep your response well-structured, scannable, and visually organized.
 
@@ -3245,6 +3246,68 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             label += f' ("{query_hint[:60]}")'
         return label
 
+    def _tool_status_label(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Return archive-aware status labels for the live run phase UI."""
+        if tool_name.startswith("web_") or tool_name == "web_search":
+            return self._web_tool_status_label(tool_name, args)
+
+        target = str(args.get("target_name") or args.get("target") or "").strip()
+        query = str(args.get("query") or "").strip()
+        mission = str(args.get("mission") or "").strip().upper()
+        instrument = str(args.get("instrument") or "").strip().upper()
+        archives = args.get("archives") or []
+        if isinstance(archives, str):
+            archive_label = archives
+        else:
+            archive_label = " + ".join(str(a).upper() for a in archives if str(a).strip())
+
+        tool_labels = {
+            "search_by_target": "Querying ALMA by target",
+            "search_by_position": "Querying ALMA cone search",
+            "search_by_frequency": "Querying ALMA frequency range",
+            "advanced_search": "Running ALMA TAP query",
+            "search_alma_with_keywords": "Searching ALMA project metadata",
+            "search_alma_co_in_redshift_range": "Searching ALMA CO redshift coverage",
+            "query_alma_science_archive": "Querying ALMA Science Archive",
+            "triage_alma_data_products": "Inspecting ALMA data products",
+            "list_alma_files": "Listing ALMA files",
+            "download_alma_data": "Downloading ALMA data",
+            "match_cross_archive_sources": f"Cross-matching {archive_label or 'archives'}",
+            "match_perseus_protostars_alma_jwst": "Cross-matching Perseus protostars in ALMA + JWST",
+            "search_mast": f"Searching {mission or 'MAST'} archive",
+            "search_mast_by_criteria": f"Searching {mission or 'MAST'} archive by criteria",
+            "get_mast_products": "Listing MAST products",
+            "download_mast_data": "Downloading MAST products",
+            "search_cadc_archive": "Searching CADC archive",
+            "search_eso_archive": "Searching ESO Science Archive",
+            "search_irsa": "Searching IRSA catalogs",
+            "get_sky_image": "Fetching sky image",
+            "overlay_archive_images": "Overlaying archive images",
+            "overlay_fits_images": "Overlaying FITS images",
+            "render_fits_image": "Rendering FITS image",
+            "inspect_fits_header": "Inspecting FITS header",
+            "extract_spectrum": "Extracting spectrum",
+            "compute_moment_map": "Computing moment map",
+            "fit_spectral_line": "Fitting spectral line",
+            "search_papers": "Searching astronomy literature",
+            "search_papers_by_observation_id": "Searching papers linked to observation",
+            "lookup_researcher": "Looking up researcher profile",
+        }
+        label = tool_labels.get(tool_name, f"Running {tool_name.replace('_', ' ')}")
+
+        hint_parts = []
+        if target:
+            hint_parts.append(target)
+        if query:
+            hint_parts.append(query)
+        if instrument:
+            hint_parts.append(instrument)
+        if args.get("ra") is not None and args.get("dec") is not None:
+            hint_parts.append(f"RA {args.get('ra')}, Dec {args.get('dec')}")
+        if hint_parts:
+            label += f' ("{", ".join(hint_parts)[:80]}")'
+        return label
+
     def _build_web_sources_event(self, web_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize web-tool outputs into the frontend source-card event."""
         if not isinstance(web_data, dict) or not web_data.get("success", True):
@@ -4922,6 +4985,8 @@ ORDER BY target_name
             "source": f"{' + '.join(sorted(requested_archives))} {catalog_label} Cross-match",
             "filter_label": f"{catalog_label} within {radius_arcsec:g} arcsec",
             "tool_name": "match_cross_archive_sources",
+            "warnings": archive_errors,
+            "partial": bool(archive_errors),
         }
 
         return {
@@ -6261,11 +6326,16 @@ IMPORTANT RULES:
                     fn_name = getattr(tc, "name", "")
                     fn_args = getattr(tc, "arguments", "{}")
                     call_id = getattr(tc, "call_id", "")
+                    try:
+                        _status_args = json.loads(fn_args) if fn_args else {}
+                    except Exception:
+                        _status_args = {}
+                    _status_label = self._tool_status_label(fn_name, _status_args)
                     if on_status := getattr(self, "_last_on_status", None):
-                        on_status(f"Calling tool: {fn_name}", "running")
+                        on_status(_status_label, "running")
                     result = self._dispatch_tool_call(fn_name, fn_args)
                     if on_status:
-                        on_status(f"Calling tool: {fn_name}", "completed")
+                        on_status(_status_label, "completed")
 
                     # ── Capture image results IMMEDIATELY after each tool call ──
                     if self.last_run_result and self.last_run_result.get("type") == "image":
@@ -7615,14 +7685,8 @@ IMPORTANT RULES:
                     
                     print(f"[TOOL CALL] {tool_name}({args})")
 
-                    # Emit tool call status to Processing Pipeline
-                    if tool_name.startswith("web_") or tool_name == "web_search":
-                        step_label = self._web_tool_status_label(tool_name, args)
-                    else:
-                        query_hint = args.get("query", args.get("author", args.get("bibcode", "")))
-                        step_label = f"Calling tool: {tool_name}"
-                        if query_hint:
-                            step_label += f' ("{str(query_hint)[:60]}")'
+                    # Emit archive-aware tool status to the live phase tracker.
+                    step_label = self._tool_status_label(tool_name, args)
                     if on_status:
                         on_status(step_label, "running")
 

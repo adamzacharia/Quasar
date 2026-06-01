@@ -392,6 +392,7 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
     model: Optional[str] = "gpt-4o"
+    grounded_summary: bool = False
 
 class RegisterRequest(BaseModel):
     username: str
@@ -821,6 +822,8 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             "columns": list(sub.columns),
             "rows": rows,
             "sourceName": _detected_source,
+            "warnings": list(_run_result.get("warnings") or []),
+            "partial": bool(_run_result.get("partial") or _run_result.get("warnings")),
             "archiveLink": archive_link,
             "hasRowLinks": any(bool(r.get("_link")) for r in rows),
             "hasPreview": has_preview,
@@ -976,8 +979,10 @@ def _stream_chat_response(
 
         # Personal RAG retrieval for authenticated users only.
         enriched_message = request.message
+        if request.grounded_summary:
+            yield _sse_status("Grounded summary mode enabled", "completed")
         from services.rag_service import is_domain_relevant
-        if current_user and is_domain_relevant(request.message):
+        if current_user and not request.grounded_summary and is_domain_relevant(request.message):
             user_id = current_user.get("sub")
             if user_id:
                 try:
@@ -1006,10 +1011,23 @@ def _stream_chat_response(
                 except Exception as e:
                     print(f"[WARN] Personal RAG search failed: {e}")
 
+        if request.grounded_summary:
+            enriched_message = (
+                "[GROUNDED_SUMMARY_MODE]\n"
+                "For this response, use only rows, counts, identifiers, coordinates, links, "
+                "and errors returned by tools in this current run. Do not add background "
+                "facts, likely interpretations, unstated targets, or archive counts that "
+                "are not present in the retrieved result rows. If tool results are partial "
+                "or one archive fails, state that explicitly and summarize only the rows "
+                "that were returned.\n\n"
+                f"User request: {enriched_message}"
+            )
+
         effective_request = ChatRequest(
             message=enriched_message,
             conversation_id=request.conversation_id,
             model=requested_model,
+            grounded_summary=request.grounded_summary,
         )
 
         if requested_model != agent.config.model:
@@ -1950,6 +1968,7 @@ async def chat_with_files(
     message: str = Form(""),
     conversation_id: Optional[str] = Form(None),
     model: Optional[str] = Form("gpt-4o"),
+    grounded_summary: bool = Form(False),
     files: PyList[UploadFile] = File(default=[]),
     authorization: Optional[str] = Header(None),
 ):
@@ -2059,6 +2078,7 @@ async def chat_with_files(
         message=enriched_text or message,
         conversation_id=conversation_id,
         model=selected_model,
+        grounded_summary=grounded_summary,
     )
     return _stream_chat_response(req, authorization=auth_header, attachment_context=attachment_context)
 

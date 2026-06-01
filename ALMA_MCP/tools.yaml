@@ -1,0 +1,21 @@
+name: quasar-alma
+description: ALMA-focused MCP tools extracted from Quasar.
+tools:
+  - name: alma_search_by_target
+    use_case: Find ALMA observations for a named astronomical target.
+    example: {target_name: "M87", max_rows: 50}
+  - name: alma_search_by_position
+    use_case: Run a cone search around exact ICRS coordinates.
+    example: {ra: 83.6331, dec: 22.0145, radius_deg: 0.003}
+  - name: alma_search_by_frequency
+    use_case: Find ALMA observations overlapping a frequency interval.
+    example: {min_freq_ghz: 220.0, max_freq_ghz: 235.0}
+  - name: alma_tap_query
+    use_case: Run bounded expert ADQL against ALMA TAP.
+    example: {adql: "SELECT TOP 20 * FROM ivoa.obscore WHERE obs_collection='ALMA'"}
+  - name: alma_keyword_search
+    use_case: Search project metadata by project code, PI, keyword, or band.
+    example: {project_code: "2017.1.00053.S"}
+  - name: alma_line_coverage_from_rows
+    use_case: Check whether returned rows cover a rest frequency at a redshift.
+    example: {line_freq_ghz: 230.538, redshift: 0.0, line_name: "CO(2-1)", rows: []}
