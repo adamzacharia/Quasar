@@ -106,7 +106,7 @@ These are genuine research contributions that produce publishable papers, not ju
 
 ---
 
-### 🔬 Project 1: ALMA-CLIP — Physical Language Model for Radio Astronomy
+### Project 1: ALMA-CLIP — Physical Language Model for Radio Astronomy
 
 **What it is:** Apply the exact AstroMind method to ALMA. Build a contrastive model that aligns ALMA observation metadata (frequency, resolution, bandwidth, integration time, array config) with paper abstracts and proposal text.
 
@@ -126,7 +126,7 @@ We take them up on that — for the world's most powerful radio telescope.
 
 ---
 
-### 🔬 Project 2: Automated Anomaly-Driven Discovery Engine
+### Project 2: Automated Anomaly-Driven Discovery Engine
 
 **What it is:** Use the ALMA-CLIP latent space to systematically scan the entire ALMA archive for anomalous observations — ones that don't match what the associated papers describe, or that sit in unusual regions of the embedding space.
 
@@ -142,7 +142,7 @@ We take them up on that — for the world's most powerful radio telescope.
 
 ---
 
-### 🔬 Project 3: Cross-Archive Source Unification via Multimodal Embeddings
+### Project 3: Cross-Archive Source Unification via Multimodal Embeddings
 
 **What it is:** Extend beyond ALMA. Train separate encoders for ALMA metadata, MAST/JWST metadata, Chandra metadata, and paper text. Align ALL of them into a single shared space using multi-way contrastive learning.
 

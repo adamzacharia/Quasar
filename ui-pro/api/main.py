@@ -55,6 +55,14 @@ from core.logger import logger, init_rollbar
 init_rollbar()  # no-op if ROLLBAR_ACCESS_TOKEN env var is not set
 logger.info("[QUASAR API] Starting up")
 
+_LAB_SCIENCE_EMOJI_RE = re.compile(
+    f"(?:{chr(0x1F9D1)}\u200d)?{chr(0x1F52C)}\\s*"
+)
+
+
+def _sanitize_assistant_text(text: str) -> str:
+    return _LAB_SCIENCE_EMOJI_RE.sub("", text or "")
+
 app = FastAPI(
     title="QUASAR API",
     description="Backend API for the QUASAR Professional Chat Interface",
@@ -1033,11 +1041,15 @@ def _stream_chat_response(
 
             def on_token(token: str):
                 if token:
-                    asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+                    clean_token = _sanitize_assistant_text(token)
+                    if clean_token:
+                        asyncio.run_coroutine_threadsafe(queue.put(("token", clean_token)), loop)
 
             def on_thought(thought: str):
                 if thought:
-                    asyncio.run_coroutine_threadsafe(queue.put(("thought", thought)), loop)
+                    clean_thought = _sanitize_assistant_text(thought)
+                    if clean_thought:
+                        asyncio.run_coroutine_threadsafe(queue.put(("thought", clean_thought)), loop)
 
             def _run_agent():
                 if lf_trace:
@@ -1216,7 +1228,7 @@ def _stream_chat_response(
                 msg_type, payload = msg[0], msg[1]
                 if msg_type == "done":
                     # payload is a dict with text + snapshotted thread-local results
-                    response_text = payload["text"] if isinstance(payload, dict) else payload
+                    response_text = _sanitize_assistant_text(payload["text"] if isinstance(payload, dict) else payload)
                     _snapshot_all = payload.get("all_results", []) if isinstance(payload, dict) else []
                     _snapshot_last = payload.get("last_result") if isinstance(payload, dict) else None
                     break

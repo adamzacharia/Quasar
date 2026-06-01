@@ -76,7 +76,7 @@ flowchart TB
     subgraph Agents["NEW: Specialist Sub-Agents"]
         AA["🔭 ArchiveAgent\n(agents/archive_agent.py)"]
         LA["📚 LiteratureAgent\n(agents/literature_agent.py)"]
-        AnA["🔬 AnalysisAgent\n(agents/analysis_agent.py)"]
+        AnA["AnalysisAgent\n(agents/analysis_agent.py)"]
         VA["📊 VizAgent\n(agents/viz_agent.py)"]
         WA["🌐 WebAgent\n(agents/web_agent.py)"]
         SA["🧬 SynthesisAgent\n(agents/synthesis_agent.py)"]

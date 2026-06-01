@@ -205,6 +205,11 @@ class _FakeTapService:
         return _FakeTableResult(self.df)
 
 
+class _FailingTapService:
+    def search(self, query):
+        raise RuntimeError("temporary TAP outage")
+
+
 class _FakeAlminerClient:
     def __init__(self, df):
         self.tap = _FakeTapService(df)
@@ -219,6 +224,15 @@ class _FakeAlminerClient:
 class _FakeSearchService:
     def __init__(self, df):
         self.alminer_client = _FakeAlminerClient(df)
+
+
+class _FailingSearchService:
+    def __init__(self):
+        self.alminer_client = type(
+            "FailingAlminerClient",
+            (),
+            {"_get_tap_service": lambda self: _FailingTapService()},
+        )()
 
 
 class _PositionalMASTClient:
@@ -294,6 +308,31 @@ class AgentArchiveToolTests(unittest.TestCase):
         for prompt, expected in cases:
             self.assertEqual(agent._route_alma_science_archive_query(prompt), expected)
 
+    def test_cross_archive_router_maps_inline_sources(self):
+        agent = self._make_agent()
+
+        result = agent._route_cross_archive_source_match_query(
+            "Cross-match these sources with ALMA and HST: Source A at RA 150.1234 Dec 2.3456, "
+            "Source B at RA 83.6331 Dec 22.0145. Use a 10 arcsec radius."
+        )
+
+        self.assertEqual(result["catalog_name"], "inline")
+        self.assertEqual(result["archives"], ["ALMA", "HST"])
+        self.assertEqual(result["radius_arcsec"], 10.0)
+        self.assertEqual(len(result["sources"]), 2)
+        self.assertEqual(result["sources"][0]["source_name"], "Source A")
+
+    def test_cross_archive_router_maps_perseus_both_prompt(self):
+        agent = self._make_agent()
+
+        result = agent._route_cross_archive_source_match_query(
+            "Find which Perseus protostars have both ALMA and JWST observations within 5 arcsec."
+        )
+
+        self.assertEqual(result["catalog_name"], "perseus_protostars")
+        self.assertEqual(result["archives"], ["ALMA", "JWST"])
+        self.assertTrue(result["require_all_archives"])
+
     def test_generic_cross_archive_match_sets_data_result(self):
         agent = self._make_agent()
         source = self.agent_module.PERSEUS_PROTOSTARS[0]
@@ -356,6 +395,33 @@ class AgentArchiveToolTests(unittest.TestCase):
         self.assertEqual(result["matched_sources"], 1)
         row = agent.last_run_result["data"].iloc[0]
         self.assertEqual(row["source_name"], "Custom Source")
+        self.assertEqual(row["mast_collections"], "HST")
+
+    def test_cross_archive_match_returns_partial_results_when_alma_fails(self):
+        agent = self._make_agent()
+        source = {"source_name": "Custom Source", "ra": 150.1234, "dec": 2.3456}
+        mast_df = pd.DataFrame([
+            {
+                "target_name": source["source_name"],
+                "telescope": "HST",
+                "instrument_name": "WFC3",
+                "project_code": "9999",
+            }
+        ])
+        agent.search_service = _FailingSearchService()
+        agent.mast_client = _PositionalMASTClient(mast_df)
+
+        result = agent._match_cross_archive_sources(
+            catalog_name="inline",
+            sources=[source],
+            archives=["ALMA", "HST"],
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["matched_sources"], 1)
+        self.assertIn("ALMA TAP failed", result["archive_errors"][0])
+        row = agent.last_run_result["data"].iloc[0]
+        self.assertEqual(row["alma_projects"], 0)
         self.assertEqual(row["mast_collections"], "HST")
 
     def test_alma_science_query_returns_provenance_for_redshifted_lines(self):
