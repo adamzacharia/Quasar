@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, CheckCircle2, Circle, Wrench } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message } from "../lib/types";
@@ -101,34 +101,6 @@ function formatElapsed(seconds: number): string {
     const minutes = Math.floor(seconds / 60);
     const remainingSeconds = seconds % 60;
     return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
-}
-
-function AnswerGenerationStatus({ startedAt }: { startedAt: Date }) {
-    const [nowMs, setNowMs] = useState(() => Date.now());
-
-    useEffect(() => {
-        const interval = window.setInterval(() => {
-            setNowMs(Date.now());
-        }, 1000);
-        return () => window.clearInterval(interval);
-    }, []);
-
-    const elapsed = elapsedSecondsSince(startedAt, nowMs);
-
-    return (
-        <div
-            role="status"
-            aria-live="polite"
-            className="inline-flex h-8 max-w-full items-center gap-2 rounded-lg border border-primary/25 bg-slate-900/70 px-3 text-xs text-slate-300 shadow-sm shadow-primary/5"
-        >
-            <Loader2 className="size-4 shrink-0 animate-spin text-primary" aria-hidden="true" />
-            <span className="font-medium whitespace-nowrap">Generating answer</span>
-            <span className="h-4 w-px bg-slate-700/80" aria-hidden="true" />
-            <span className="min-w-[2.5rem] text-right font-mono tabular-nums text-slate-500">
-                {formatElapsed(elapsed)}
-            </span>
-        </div>
-    );
 }
 
 /**
@@ -242,9 +214,93 @@ interface ChatMessageProps {
     thinkingSteps?: ThoughtStep[];
     thinkingStatus?: "idle" | "running" | "completed";
     taskExecutionState?: TaskExecutionState | null;
+    streamPhase?: "idle" | "thinking" | "tools" | "generating" | "done";
+    streamStatusLabel?: string;
+    groundedSummary?: boolean;
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState }: ChatMessageProps) {
+function StreamPhaseTracker({
+    phase = "idle",
+    statusLabel = "",
+    groundedSummary,
+}: {
+    phase?: "idle" | "thinking" | "tools" | "generating" | "done";
+    statusLabel?: string;
+    groundedSummary?: boolean;
+}) {
+    const phaseStartedAtRef = useRef(Date.now());
+    const previousPhaseRef = useRef(phase);
+    const [nowMs, setNowMs] = useState(() => Date.now());
+
+    useEffect(() => {
+        if (previousPhaseRef.current !== phase) {
+            previousPhaseRef.current = phase;
+            phaseStartedAtRef.current = Date.now();
+            setNowMs(Date.now());
+        }
+    }, [phase]);
+
+    useEffect(() => {
+        if (phase === "idle" || phase === "done") return;
+        const interval = window.setInterval(() => setNowMs(Date.now()), 1000);
+        return () => window.clearInterval(interval);
+    }, [phase]);
+
+    if (phase === "idle") return null;
+
+    const phases = [
+        { id: "thinking", label: "Thinking" },
+        { id: "tools", label: "Running tools" },
+        { id: "generating", label: "Generating answer" },
+        { id: "done", label: "Done" },
+    ] as const;
+    const currentIndex = phases.findIndex(item => item.id === phase);
+    const elapsed = elapsedSecondsSince(phaseStartedAtRef.current, nowMs);
+    const label = statusLabel || phases[Math.max(currentIndex, 0)]?.label || "Working";
+
+    return (
+        <div className="max-w-2xl rounded-xl border border-slate-700/60 bg-slate-900/45 px-3 py-2 shadow-sm">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                {phases.map((item, index) => {
+                    const isActive = item.id === phase;
+                    const isComplete = currentIndex > index || phase === "done";
+                    return (
+                        <div key={item.id} className="flex items-center gap-1.5 text-xs">
+                            {isActive && phase !== "done" ? (
+                                item.id === "tools"
+                                    ? <Wrench className="size-3.5 shrink-0 animate-pulse text-primary" />
+                                    : <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" />
+                            ) : isComplete ? (
+                                <CheckCircle2 className="size-3.5 shrink-0 text-emerald-400" />
+                            ) : (
+                                <Circle className="size-3.5 shrink-0 text-slate-600" />
+                            )}
+                            <span className={isActive ? "font-semibold text-slate-100" : isComplete ? "text-slate-300" : "text-slate-600"}>
+                                {item.label}
+                            </span>
+                        </div>
+                    );
+                })}
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                <span className="truncate max-w-full">{label}</span>
+                {phase !== "done" && (
+                    <>
+                        <span className="h-3 w-px bg-slate-700" aria-hidden="true" />
+                        <span className="font-mono tabular-nums text-slate-500">{formatElapsed(elapsed)}</span>
+                    </>
+                )}
+                {groundedSummary && (
+                    <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
+                        Grounded
+                    </span>
+                )}
+            </div>
+        </div>
+    );
+}
+
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, streamPhase, streamStatusLabel, groundedSummary }: ChatMessageProps) {
     const isUser = message.role === "user";
     const hasContent = !!message.content;
     const hasThinking = (thinkingSteps && thinkingSteps.length > 0) || !!message.thinking;
@@ -464,6 +520,12 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         <span className="text-[10px] text-slate-500">{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
                     </div>
 
+                    <StreamPhaseTracker
+                        phase={streamPhase}
+                        statusLabel={streamStatusLabel}
+                        groundedSummary={groundedSummary}
+                    />
+
                     {/* Thinking Process Widget — rendered ABOVE content */}
                     {hasThinking && (
                         <ThoughtProcessWidget
@@ -548,9 +610,6 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             }}>{message.content.replace(/!\[([^\]]*)\]\([^)]+\)/g, '')}</ReactMarkdown>
                         </div>
                     )}
-
-                    {/* Answer streaming state */}
-                    {isStreaming && <AnswerGenerationStatus startedAt={message.timestamp} />}
 
                     {/* Action bar: copy, like, dislike — shown at bottom on hover */}
                     {hasContent && !isStreaming && <MessageActions message={message} />}

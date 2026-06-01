@@ -1,0 +1,4 @@
+mcp>=1.2.0
+astroquery
+astropy
+pandas

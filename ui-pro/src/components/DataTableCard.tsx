@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Download, Eye, Link2, Loader2, X, Telescope, BarChart3, Map } from "lucide-react";
+import { Download, Eye, Link2, Loader2, X, Telescope, BarChart3, Map, AlertTriangle } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
 import { useAuthStore } from "../lib/auth-store";
 
@@ -786,6 +786,18 @@ export function DataTableCard({ data }: DataTableCardProps) {
             )}
 
             <div className="rounded-2xl overflow-hidden shadow-sm" style={{ background: 'var(--q-card)', border: '1px solid var(--q-border)' }}>
+
+                {data.partial && (
+                    <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2 text-xs text-amber-200 bg-amber-500/10" style={{ borderColor: 'var(--q-border)' }}>
+                        <AlertTriangle className="w-4 h-4 shrink-0 text-amber-300" />
+                        <span className="font-semibold">Partial results</span>
+                        {data.warnings && data.warnings.length > 0 && (
+                            <span className="text-amber-100/80 truncate">
+                                {data.warnings.slice(0, 2).join(" | ")}
+                            </span>
+                        )}
+                    </div>
+                )}
 
                 {/* ── Metrics bar ── */}
                 {data.metrics && data.metrics.length > 0 && (

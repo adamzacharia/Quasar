@@ -82,6 +82,8 @@ export interface DataTableResult {
     columns: string[];
     rows: Record<string, string | number>[];
     sourceName: string;
+    warnings?: string[];
+    partial?: boolean;
     tableKind?: string;   // e.g. "alma_products" or "alma_project_picker"
     archiveLink?: string;  // Footer link to full dataset on ALMA/ESO portal
     hasRowLinks?: boolean; // Whether rows include per-row _link field
