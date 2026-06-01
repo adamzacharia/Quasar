@@ -677,6 +677,7 @@ FORMATTING RULES:
 - **HEADINGS**: Use ## and ### for sections, not numbered lists for top-level categories.
 - **BOLD** key values, observatory names, and important findings.
 - **BULLET LISTS**: Use - for lists of items or key points.
+- **SCIENTIFIC TONE**: Avoid decorative emoji in scientific headings. Do not use lab-themed emoji; prefer plain Markdown headings or astronomy terms such as ALMA, JWST, HST, telescope, archive, source, and observation.
 - **NO IMAGE URLS**: NEVER use markdown image syntax ![alt](url) in your responses. You cannot verify image URLs and they will often be broken or incorrect. Describe visuals in text instead. The system has its own image retrieval tools -- do not embed external URLs.
 - Keep your response well-structured, scannable, and visually organized.
 
@@ -969,6 +970,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "max_sources": {"type": "integer", "description": "Max catalog sources to test. Default 12."},
                     "max_alma_rows": {"type": "integer", "description": "Max ALMA TAP rows to fetch. Default 5000."},
                     "max_mast_results_per_source": {"type": "integer", "description": "Max MAST/JWST rows per source. Default 80."},
+                    "require_all_archives": {"type": "boolean", "description": "If true, only return sources matched in every requested archive. Default false for diagnostic cross-match tables."},
                 },
                 "required": []
             },
@@ -2482,6 +2484,77 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         return None
 
     # ── Astronomy acronym dictionary for web search disambiguation ─────
+    def _route_cross_archive_source_match_query(self, query: str) -> Optional[Dict[str, Any]]:
+        """Map custom coordinate cross-match prompts to deterministic tool args."""
+        raw = str(query or "")
+        q = raw.lower()
+        archive_aliases = {
+            "alma": "ALMA",
+            "jwst": "JWST",
+            "hst": "HST",
+            "mast": "MAST",
+            "tess": "TESS",
+            "kepler": "KEPLER",
+            "k2": "K2",
+            "galex": "GALEX",
+            "swift": "SWIFT",
+        }
+        archives: List[str] = []
+        for needle, label in archive_aliases.items():
+            if re.search(rf"\b{re.escape(needle)}\b", q) and label not in archives:
+                archives.append(label)
+        if not archives:
+            return None
+
+        has_match_intent = bool(re.search(r"\bcross[- ]?match|crossmatch|match\b", q))
+        has_coverage_intent = bool(re.search(r"\bboth\b|all requested|every archive|in all\b|which\b|coverage", q))
+        has_catalog_signal = bool(re.search(r"\bperseus\b|\bprotostar|\bsource\b|\bRA\s*\d", raw, flags=re.IGNORECASE))
+        if not (has_match_intent or (has_coverage_intent and has_catalog_signal)):
+            return None
+
+        radius_arcsec = 5.0
+        radius_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:arcsec|arcsecond|arcseconds|as|['\"]{2})\b", q)
+        if radius_match:
+            radius_arcsec = float(radius_match.group(1))
+
+        sources: List[Dict[str, Any]] = []
+        source_re = re.compile(
+            r"(?P<name>[A-Za-z0-9_.+/-][A-Za-z0-9_.+/-]*(?:\s+[A-Za-z0-9_.+/-]+){0,4})"
+            r"\s+(?:at\s+)?RA\s*[=:]?\s*(?P<ra>\d+(?:\.\d+)?)"
+            r"\s*(?:,|\s)+Dec\s*[=:]?\s*(?P<dec>[+-]?\d+(?:\.\d+)?)",
+            flags=re.IGNORECASE,
+        )
+        for match in source_re.finditer(raw):
+            name = re.sub(
+                r"^(?:and|with|sources|catalog|target)\s+",
+                "",
+                match.group("name").strip(" ,.;:"),
+                flags=re.IGNORECASE,
+            ).strip()
+            name = re.sub(r"\s+at$", "", name, flags=re.IGNORECASE).strip() or f"source_{len(sources) + 1}"
+            try:
+                ra = float(match.group("ra"))
+                dec = float(match.group("dec"))
+            except (TypeError, ValueError):
+                continue
+            sources.append({"source_name": name, "ra": ra, "dec": dec})
+
+        args: Dict[str, Any] = {
+            "archives": archives,
+            "radius_arcsec": radius_arcsec,
+            "require_all_archives": bool(re.search(r"\bboth\b|all requested|every archive|in all\b", q)),
+        }
+        if sources:
+            args["catalog_name"] = "inline"
+            args["sources"] = sources
+            args["max_sources"] = len(sources)
+        elif "perseus" in q and "protostar" in q:
+            args["catalog_name"] = "perseus_protostars"
+            args["require_all_archives"] = True
+        else:
+            return None
+        return args
+
     def _ensure_alma_project_picker_state(self) -> None:
         if not hasattr(self, "_alma_project_picker_by_conversation"):
             self._alma_project_picker_by_conversation = {}
@@ -4784,6 +4857,7 @@ ORDER BY target_name
         max_sources: int = 12,
         max_alma_rows: int = 5000,
         max_mast_results_per_source: int = 80,
+        require_all_archives: bool = False,
     ) -> Dict[str, Any]:
         """Cross-match a built-in or inline source catalog against archives."""
         requested_archives = {str(a).upper() for a in (archives or ["ALMA", "JWST"])}
@@ -4798,10 +4872,12 @@ ORDER BY target_name
         except ValueError as e:
             return {"success": False, "error": str(e)}
 
-        try:
-            alma_df = pd.DataFrame()
-            alma_matches = pd.DataFrame()
-            if "ALMA" in requested_archives:
+        archive_errors: List[str] = []
+        alma_df = pd.DataFrame()
+        alma_matches = pd.DataFrame()
+        mast_by_source: Dict[str, pd.DataFrame] = {}
+        if "ALMA" in requested_archives:
+            try:
                 service = self.search_service.alminer_client._get_tap_service()
                 query = alma_bulk_cone_adql(source_catalog, radius_arcsec=radius_arcsec, top=max_alma_rows)
                 self._last_alma_tap_query = query
@@ -4811,11 +4887,15 @@ ORDER BY target_name
                 if hasattr(self.search_service.alminer_client, "_standardize_columns"):
                     alma_df = self.search_service.alminer_client._standardize_columns(alma_df)
                 alma_matches = attach_nearest_source(alma_df, source_catalog, radius_arcsec=radius_arcsec)
+            except Exception as e:
+                import traceback
+                logger.error("ALMA cross-match query failed: %s\n%s", e, traceback.format_exc())
+                archive_errors.append(f"ALMA TAP failed: {e}")
 
-            mast_by_source: Dict[str, pd.DataFrame] = {}
-            if {"MAST", "JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"} & requested_archives:
-                mission = requested_mast_missions[0] if len(requested_mast_missions) == 1 else None
-                for source in source_catalog:
+        if {"MAST", "JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"} & requested_archives:
+            mission = requested_mast_missions[0] if len(requested_mast_missions) == 1 else None
+            for source in source_catalog:
+                try:
                     mast_by_source[source["source_name"]] = self.mast_client.search_by_position(
                         float(source["ra"]),
                         float(source["dec"]),
@@ -4823,33 +4903,40 @@ ORDER BY target_name
                         mission=mission,
                         max_results=max_mast_results_per_source,
                     )
+                except Exception as e:
+                    logger.error("MAST cross-match query failed for %s: %s", source["source_name"], e)
+                    archive_errors.append(f"MAST query failed for {source['source_name']}: {e}")
+                    mast_by_source[source["source_name"]] = pd.DataFrame()
 
-            summary = summarize_cross_archive_matches(source_catalog, alma_matches, mast_by_source, sorted(requested_archives))
-            self.last_search_results = summary
-            self.last_run_result = {
-                "type": "data",
-                "data": summary,
-                "source": f"{' + '.join(sorted(requested_archives))} {catalog_label} Cross-match",
-                "filter_label": f"{catalog_label} within {radius_arcsec:g} arcsec",
-                "tool_name": "match_cross_archive_sources",
-            }
+        summary = summarize_cross_archive_matches(
+            source_catalog,
+            alma_matches,
+            mast_by_source,
+            sorted(requested_archives),
+            require_all_archives=bool(require_all_archives),
+        )
+        self.last_search_results = summary
+        self.last_run_result = {
+            "type": "data",
+            "data": summary,
+            "source": f"{' + '.join(sorted(requested_archives))} {catalog_label} Cross-match",
+            "filter_label": f"{catalog_label} within {radius_arcsec:g} arcsec",
+            "tool_name": "match_cross_archive_sources",
+        }
 
-            return {
-                "success": True,
-                "mode": "cross_archive_source_match",
-                "catalog_name": catalog_label,
-                "archives": sorted(requested_archives),
-                "sources_tested": len(source_catalog),
-                "matched_sources": len(summary),
-                "radius_arcsec": radius_arcsec,
-                "alma_rows": len(alma_df) if alma_df is not None else 0,
-                "results": summary.head(100).to_dict("records") if not summary.empty else [],
-                "note": "Full cross-match table is shown in the UI data card with sky coordinates.",
-            }
-        except Exception as e:
-            import traceback
-            logger.error("Cross-archive source match failed: %s\n%s", e, traceback.format_exc())
-            return {"success": False, "error": str(e)}
+        return {
+            "success": True,
+            "mode": "cross_archive_source_match",
+            "catalog_name": catalog_label,
+            "archives": sorted(requested_archives),
+            "sources_tested": len(source_catalog),
+            "matched_sources": len(summary),
+            "radius_arcsec": radius_arcsec,
+            "alma_rows": len(alma_df) if alma_df is not None else 0,
+            "archive_errors": archive_errors,
+            "results": summary.head(100).to_dict("records") if not summary.empty else [],
+            "note": "Full cross-match table is shown in the UI data card with sky coordinates.",
+        }
 
     def _match_perseus_protostars_alma_jwst(
         self,
@@ -4866,6 +4953,7 @@ ORDER BY target_name
             max_sources=max_sources,
             max_alma_rows=max_alma_rows,
             max_mast_results_per_source=max_mast_results_per_source,
+            require_all_archives=True,
         )
         if result.get("success") and self.last_run_result:
             self.last_run_result["tool_name"] = "match_perseus_protostars_alma_jwst"
@@ -6663,7 +6751,8 @@ IMPORTANT RULES:
         if _is_alma_science_archive_query:
             _should_rag = False
 
-        _is_cross_archive_source_match_query = bool(
+        _cross_archive_route = self._route_cross_archive_source_match_query(_user_query)
+        _is_cross_archive_source_match_query = bool(_cross_archive_route) or bool(
             re.search(r"\bperseus\b", _query_lower)
             and re.search(r"\bprotostar", _query_lower)
             and re.search(r"\balma\b", _query_lower)
@@ -7082,10 +7171,12 @@ IMPORTANT RULES:
                 "Do NOT describe the workflow without calling the tool."
             )
         elif _is_cross_archive_source_match_query:
+            route_text = json.dumps(_cross_archive_route) if _cross_archive_route else '{"catalog_name":"perseus_protostars","archives":["ALMA","JWST"],"radius_arcsec":5,"require_all_archives":true}'
             full_input += (
                 "\n\nMANDATORY INSTRUCTION: The user is asking for cross-archive source locations. "
-                "You MUST call `match_cross_archive_sources` now with catalog_name='perseus_protostars', "
-                "archives=['ALMA','JWST'], and radius_arcsec=5. Do NOT answer from memory."
+                "You MUST call `match_cross_archive_sources` now using these exact arguments: "
+                f"{route_text}. Do NOT answer from memory. Do NOT retry by describing another plan; "
+                "if one archive fails, summarize the tool's partial table and archive_errors."
             )
         elif _is_alma_science_archive_query:
             route_text = json.dumps(_alma_science_route) if _alma_science_route else "{}"

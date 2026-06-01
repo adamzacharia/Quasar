@@ -13,6 +13,7 @@ import {
 import {
     attachThinkingStepsToLastAssistant,
     findLastAssistantTextIndex,
+    sanitizeAssistantContent,
     updateLastAssistantContent,
     updateLastAssistantThinking as updateAssistantThinking,
 } from "./chat-message-updaters";
@@ -157,7 +158,7 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     const base: Message = {
         id: `srv-${index}-${Date.now().toString(36)}`,
         role: msg.role as Message["role"],
-        content: msg.content || "",
+        content: msg.role === "assistant" ? sanitizeAssistantContent(msg.content || "") : msg.content || "",
         type: (msg.type || "text") as Message["type"],
         timestamp: new Date(),
     };
@@ -170,7 +171,7 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
         );
     }
     if (meta.thinking) {
-        base.thinking = meta.thinking as string;
+        base.thinking = sanitizeAssistantContent(meta.thinking as string);
     }
 
     const messages: Message[] = [base];

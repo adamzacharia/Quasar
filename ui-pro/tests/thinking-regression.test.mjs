@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
     attachThinkingStepsToLastAssistant,
+    sanitizeAssistantContent,
     updateLastAssistantContent,
     updateLastAssistantThinking,
 } from "../src/lib/chat-message-updaters.js";
@@ -64,4 +65,13 @@ test("finalizing thinking attaches to the assistant text message even after sour
     ]);
     assert.equal(result.messages[1].type, "web_sources");
     assert.equal(result.messages[1].webSources.length, 1);
+});
+
+test("assistant text strips lab-science emoji from streamed content", () => {
+    let messages = [assistantText()];
+
+    messages = updateLastAssistantContent(messages, "\u{1F52C} ALMA Band 6 results");
+
+    assert.equal(messages[0].content, "ALMA Band 6 results");
+    assert.equal(sanitizeAssistantContent("\u{1F9D1}\u200D\u{1F52C} User"), "User");
 });

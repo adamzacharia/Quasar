@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Database, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message } from "../lib/types";
@@ -86,6 +86,47 @@ function MessageActions({ message }: { message: Message }) {
                 className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
                 <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
             </button>
+        </div>
+    );
+}
+
+function elapsedSecondsSince(startedAt: Date | number | string, nowMs = Date.now()): number {
+    const startedMs = startedAt instanceof Date ? startedAt.getTime() : new Date(startedAt).getTime();
+    if (!Number.isFinite(startedMs)) return 0;
+    return Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+}
+
+function formatElapsed(seconds: number): string {
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
+}
+
+function AnswerGenerationStatus({ startedAt }: { startedAt: Date }) {
+    const [nowMs, setNowMs] = useState(() => Date.now());
+
+    useEffect(() => {
+        const interval = window.setInterval(() => {
+            setNowMs(Date.now());
+        }, 1000);
+        return () => window.clearInterval(interval);
+    }, []);
+
+    const elapsed = elapsedSecondsSince(startedAt, nowMs);
+
+    return (
+        <div
+            role="status"
+            aria-live="polite"
+            className="inline-flex h-8 max-w-full items-center gap-2 rounded-lg border border-primary/25 bg-slate-900/70 px-3 text-xs text-slate-300 shadow-sm shadow-primary/5"
+        >
+            <Loader2 className="size-4 shrink-0 animate-spin text-primary" aria-hidden="true" />
+            <span className="font-medium whitespace-nowrap">Generating answer</span>
+            <span className="h-4 w-px bg-slate-700/80" aria-hidden="true" />
+            <span className="min-w-[2.5rem] text-right font-mono tabular-nums text-slate-500">
+                {formatElapsed(elapsed)}
+            </span>
         </div>
     );
 }
@@ -508,8 +549,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         </div>
                     )}
 
-                    {/* Streaming cursor */}
-                    {isStreaming && <div className="w-2 h-5 bg-primary/80 animate-pulse rounded-sm" />}
+                    {/* Answer streaming state */}
+                    {isStreaming && <AnswerGenerationStatus startedAt={message.timestamp} />}
 
                     {/* Action bar: copy, like, dislike — shown at bottom on hover */}
                     {hasContent && !isStreaming && <MessageActions message={message} />}

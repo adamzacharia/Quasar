@@ -442,7 +442,7 @@ def generate_data_flow_graph(all_files) -> str:
     """Generate a user-request data flow diagram showing how a query flows through the system."""
     return """```mermaid
 graph TD
-    User["🧑‍🔬 User"] --> UI["ui-pro/api/main.py<br/><i>FastAPI + SSE</i>"]
+    User["User"] --> UI["ui-pro/api/main.py<br/><i>FastAPI + SSE</i>"]
     UI --> Agent["core/agent.py<br/><i>QuasarAgent</i>"]
 
     Agent --> RLM["core/rlm.py<br/><i>Complexity Detection</i>"]

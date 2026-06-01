@@ -7,12 +7,17 @@ export function findLastAssistantTextIndex(messages) {
     return -1;
 }
 
+export function sanitizeAssistantContent(content) {
+    const text = String(content ?? "");
+    return text.replace(/(?:\u{1F9D1}\u200D)?\u{1F52C}\s*/gu, "");
+}
+
 export function updateLastAssistantContent(messages, content) {
     const index = findLastAssistantTextIndex(messages);
     if (index < 0) return messages;
 
     const next = [...messages];
-    next[index] = { ...next[index], content };
+    next[index] = { ...next[index], content: sanitizeAssistantContent(content) };
     return next;
 }
 
@@ -21,7 +26,7 @@ export function updateLastAssistantThinking(messages, thinking) {
     if (index < 0) return messages;
 
     const next = [...messages];
-    next[index] = { ...next[index], thinking };
+    next[index] = { ...next[index], thinking: sanitizeAssistantContent(thinking) };
     return next;
 }
 

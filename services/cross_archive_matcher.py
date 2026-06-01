@@ -164,6 +164,7 @@ def summarize_cross_archive_matches(
     alma_matches: pd.DataFrame,
     mast_by_source: Dict[str, pd.DataFrame],
     archives: Sequence[str],
+    require_all_archives: bool = False,
 ) -> pd.DataFrame:
     """Summarize per-source matches across the requested archive families."""
     requested = {as_text(a).upper() for a in (archives or ["ALMA", "JWST"])}
@@ -181,10 +182,11 @@ def summarize_cross_archive_matches(
                 pattern = "|".join(mission_filters)
                 mast_filtered = mast[mast[collection_col].astype(str).str.upper().str.contains(pattern, na=False)].copy()
 
-        if "ALMA" in requested and alma.empty:
-            continue
-        if mast_requested and mast_filtered.empty:
-            continue
+        if require_all_archives:
+            if "ALMA" in requested and alma.empty:
+                continue
+            if mast_requested and mast_filtered.empty:
+                continue
 
         mast_id_col = "project_code" if "project_code" in mast_filtered.columns else "proposal_id"
         collection_col = "telescope" if "telescope" in mast_filtered.columns else "obs_collection"
