@@ -35,6 +35,7 @@ def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line("markers", "unit: Fast tests with no network or API calls")
     config.addinivalue_line("markers", "integration: Tests that call real APIs (need valid keys)")
+    config.addinivalue_line("markers", "live: Opt-in tests that call public external archive services")
     config.addinivalue_line("markers", "smoke: End-to-end smoke tests against a live server")
     config.addinivalue_line("markers", "slow: Tests that take > 30 seconds")
 

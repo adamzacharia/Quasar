@@ -20,6 +20,7 @@ spectral-cube
 pyvo
 alminer
 altair==4.2.2
+legacy-cgi>=2.6; python_version >= "3.13"
 
 # AI / LLM
 openai>=2.26.0

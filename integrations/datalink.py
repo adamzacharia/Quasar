@@ -400,7 +400,7 @@ class DataLinkClient:
             if fnmatch.fnmatch(f["filename"], pattern)
             or fnmatch.fnmatch(f["filename"].lower(), pattern.lower())
         ]
-        print(f"[DataLink] Pattern '{pattern}' filtered {len(files)} → {len(filtered)} files")
+        print(f"[DataLink] Pattern '{pattern}' filtered {len(files)} -> {len(filtered)} files")
         return filtered
 
     @staticmethod
