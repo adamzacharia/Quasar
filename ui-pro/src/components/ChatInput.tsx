@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -23,8 +23,11 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
     const [hitCount, setHitCount] = useState<number | null>(null);
     const [groundedSummary, setGroundedSummary] = useState(false);
+    const [menuOpen, setMenuOpen] = useState(false);
     const inputRef = useRef<HTMLInputElement>(null);
-    const fileInputRef = useRef<HTMLInputElement>(null);
+    const imageInputRef = useRef<HTMLInputElement>(null);
+    const documentInputRef = useRef<HTMLInputElement>(null);
+    const menuRef = useRef<HTMLDivElement>(null);
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (initialValue) { setValue(initialValue); inputRef.current?.focus(); } }, [initialValue]);
@@ -43,10 +46,34 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
         return () => { controller.abort(); clearTimeout(timeout); };
     }, []);
 
-    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    useEffect(() => {
+        if (!menuOpen) return;
+
+        const handlePointerDown = (event: MouseEvent | TouchEvent) => {
+            const target = event.target as Node | null;
+            if (target && menuRef.current?.contains(target)) return;
+            setMenuOpen(false);
+        };
+
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === "Escape") setMenuOpen(false);
+        };
+
+        document.addEventListener("mousedown", handlePointerDown);
+        document.addEventListener("touchstart", handlePointerDown);
+        document.addEventListener("keydown", handleKeyDown);
+
+        return () => {
+            document.removeEventListener("mousedown", handlePointerDown);
+            document.removeEventListener("touchstart", handlePointerDown);
+            document.removeEventListener("keydown", handleKeyDown);
+        };
+    }, [menuOpen]);
+
+    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, selectedType?: "image" | "document") => {
         const files = Array.from(e.target.files || []);
         files.forEach(file => {
-            const type = file.type.startsWith("image/") ? "image" : "document";
+            const type = selectedType ?? (file.type.startsWith("image/") ? "image" : "document");
             if (type === "image") {
                 const reader = new FileReader();
                 reader.onload = (ev) => {
@@ -114,39 +141,95 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
 
                         {/* Input row */}
                         <div className="flex items-center gap-2 p-2">
-                            {/* Hidden file input */}
+                            {/* Hidden file inputs */}
                             <input
-                                ref={fileInputRef}
+                                ref={imageInputRef}
                                 type="file"
                                 multiple
-                                accept="image/*,.pdf,.txt,.csv,.md,.json,.fits"
+                                accept="image/*"
                                 className="hidden"
-                                onChange={handleFileChange}
+                                onChange={(event) => handleFileChange(event, "image")}
                             />
-                            <button
-                                type="button"
-                                onClick={() => fileInputRef.current?.click()}
-                                disabled={isStreaming}
-                                className="p-2.5 text-slate-400 hover:text-primary hover:bg-slate-700/50 rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-                                title="Attach image or document"
-                            >
-                                <PlusCircle className="w-5 h-5" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setGroundedSummary(value => !value)}
-                                disabled={isStreaming}
-                                aria-pressed={groundedSummary}
-                                title="Grounded summary mode: only summarize rows retrieved in this run"
-                                className={`inline-flex h-9 items-center gap-1.5 rounded-full border px-2.5 text-xs font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-                                    groundedSummary
-                                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                                        : "border-slate-700/80 bg-slate-900/30 text-slate-500 hover:border-slate-600 hover:text-slate-300"
-                                }`}
-                            >
-                                <ShieldCheck className="w-4 h-4" />
-                                <span className="hidden sm:inline">Grounded</span>
-                            </button>
+                            <input
+                                ref={documentInputRef}
+                                type="file"
+                                multiple
+                                accept=".pdf,.txt,.csv,.md,.json,.fits,.fit,.fits.gz,.uvfits,.doc,.docx"
+                                className="hidden"
+                                onChange={(event) => handleFileChange(event, "document")}
+                            />
+                            <div ref={menuRef} className="relative shrink-0">
+                                <button
+                                    type="button"
+                                    onClick={() => setMenuOpen(open => !open)}
+                                    disabled={isStreaming}
+                                    aria-haspopup="menu"
+                                    aria-expanded={menuOpen}
+                                    className="relative p-2.5 text-slate-400 hover:text-primary hover:bg-slate-700/50 rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                                    title="Add files or modes"
+                                >
+                                    <PlusCircle className="w-5 h-5" />
+                                    {groundedSummary && (
+                                        <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-card-dark" aria-hidden="true" />
+                                    )}
+                                </button>
+
+                                {menuOpen && (
+                                    <div
+                                        role="menu"
+                                        className="absolute bottom-full left-0 z-30 mb-2 w-56 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950/95 p-1.5 shadow-2xl shadow-black/30 backdrop-blur-xl"
+                                    >
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            onClick={() => {
+                                                setMenuOpen(false);
+                                                imageInputRef.current?.click();
+                                            }}
+                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                        >
+                                            <ImageIcon className="h-4 w-4 text-primary" />
+                                            <span>Upload images</span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            onClick={() => {
+                                                setMenuOpen(false);
+                                                documentInputRef.current?.click();
+                                            }}
+                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                        >
+                                            <FileText className="h-4 w-4 text-primary" />
+                                            <span>Upload documents</span>
+                                        </button>
+                                        <div className="my-1 h-px bg-slate-800" />
+                                        <button
+                                            type="button"
+                                            role="menuitemcheckbox"
+                                            aria-checked={groundedSummary}
+                                            onClick={() => setGroundedSummary(value => !value)}
+                                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                        >
+                                            <span className="flex min-w-0 items-center gap-3">
+                                                <ShieldCheck className={`h-4 w-4 ${groundedSummary ? "text-emerald-300" : "text-slate-500"}`} />
+                                                <span>Grounded</span>
+                                            </span>
+                                            <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                                                groundedSummary
+                                                    ? "border-emerald-400/50 bg-emerald-500/25"
+                                                    : "border-slate-700 bg-slate-900"
+                                            }`}>
+                                                <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
+                                                    groundedSummary
+                                                        ? "translate-x-4 bg-emerald-300"
+                                                        : "translate-x-1 bg-slate-500"
+                                                }`} />
+                                            </span>
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
                             <input
                                 ref={inputRef}
                                 type="text"
