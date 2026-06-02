@@ -219,7 +219,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     const hasThinking = hasThinkingSteps || !!message.thinking;
     const hasRunningThinkingStep = thinkingSteps?.some(step => step.status === "running") ?? false;
     const thinkingIsRunning = thinkingStatus === "running" && !hasContent && (!hasThinkingSteps || hasRunningThinkingStep);
-    const showAnswerBuffer = Boolean(isStreaming && !hasContent && hasThinking && !thinkingIsRunning);
+    const showAnswerBuffer = Boolean(isStreaming && !thinkingIsRunning);
 
     const { user } = useAuthStore();
     const userInitials = user?.display_name
@@ -459,8 +459,6 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         </ThoughtProcessWidget>
                     )}
 
-                    {showAnswerBuffer && <AnswerBuffer />}
-
                     {/* Multi-Agent Workforce — always visible (full when active, collapsed when done) */}
                     {taskExecutionState && (
                         <TaskExecutionWidget state={taskExecutionState} />
@@ -522,6 +520,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             }}>{message.content.replace(/!\[([^\]]*)\]\([^)]+\)/g, '')}</ReactMarkdown>
                         </div>
                     )}
+
+                    {showAnswerBuffer && <AnswerBuffer />}
 
                     {/* Action bar: copy, like, dislike — shown at bottom on hover */}
                     {hasContent && !isStreaming && <MessageActions message={message} />}
