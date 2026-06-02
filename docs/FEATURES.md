@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 36    | 17    | 0           | 19      | 47%    |
-| **Total**              |**102**|**51** | **2**       | **49**  |**50%** |
+| Polish & Scale         | 37    | 18    | 0           | 19      | 49%    |
+| **Total**              |**103**|**52** | **2**       | **49**  |**50%** |
 
 ---
 
@@ -182,6 +182,7 @@ Without them, even great features feel broken.
 - [x] **PS34** Conversation Model Persistence -- Fixed a bug where a conversation's selected model would reset to default ("gpt-5.4-mini") on page reload or chat switching by adding model persistence across the entire stack: (1) added a nullable model column to the conversations SQLite/Turso database table with startup schema migration; (2) updated `/api/chat` and `/api/conversations` backend routes to save the active model on new messages; (3) updated frontend Zustand store and types to restore and sync the active model on conversation switch. (services/conversation_service.py + ui-pro/api/main.py + ui-pro/src/lib/api.ts + ui-pro/src/lib/store.ts)
 - [x] **PS35** Non-Native Model Document Upload Fallback -- Fixed the "Document uploads are not supported for provider 'deepseek'" error when uploading PDFs or other documents while using DeepSeek or other non-native providers. Implemented a robust server-side text extraction fallback: (1) detects when the selected model provider does not support native file upload APIs; (2) automatically extracts text contents from PDFs (via PyMuPDF) and other text formats (TXT, CSV, JSON, MD); (3) seamlessly appends the extracted document content directly to the user's prompt so they can converse with documents using any model. (ui-pro/api/main.py)
 - [x] **PS36** Conditional Web Search Triggering & LLM-Based Intent Classification -- Resolved the issue of redundant web searches launching on every query by implementing conditional search logic: (1) web searches are always launched early and in parallel for researcher profile queries, explicit user search requests, and whenever RAG documentation searches yield relevant chunks; (2) otherwise, a fast intent classification call is made via deepseek-v4-flash to analyze the query and determine if it requires real-time information or fresh web data, routing standard textbook queries purely local/offline. (core/agent.py)
+- [x] **PS37** DeepSeek Cache-Aware Langfuse Cost Tracking -- Fixed Langfuse cost reporting that inflated DeepSeek costs by ~3× because all input tokens were priced at the expensive cache-miss rate. DeepSeek's API returns prompt_cache_hit_tokens and prompt_cache_miss_tokens separately (cache hits are 50-120× cheaper). (1) Extended LLMUsage dataclass with cache_hit_tokens/cache_miss_tokens fields; (2) Built _build_langfuse_usage() helper that emits cache-aware usage dicts for DeepSeek and standard input/output for other providers; (3) Updated both streaming and non-streaming Langfuse generation tracking to use the new builder; (4) Added scripts/setup_langfuse_models.py to configure custom model definitions with per-tier pricing in Langfuse. (core/llm_client.py + scripts/setup_langfuse_models.py)
 
 ---
 
@@ -207,4 +208,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-05-26 -- Quasar v3.3.7 (Langfuse token and cost tracking parity)*
+*Last updated: 2026-06-02 -- Quasar v3.3.8 (DeepSeek cache-aware Langfuse cost tracking)*

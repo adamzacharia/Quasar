@@ -374,6 +374,10 @@ export default function WorkbenchPage() {
     const cacheRecord = prepareResult?.cache ?? metadata?.cache ?? {};
     const cacheStatus = asText(cacheRecord.status, "not_prepared");
     const cachedBytes = asNumber(cacheRecord.cached_bytes);
+    const previewRecord = asRecord(cacheRecord.preview);
+    const previewStatus = asText(previewRecord.status, "not_prepared");
+    const previewBytes = asNumber(previewRecord.bytes);
+    const previewShape = Array.isArray(previewRecord.shape) ? previewRecord.shape.map(String).join(" x ") : "";
     const userCache = asRecord(cacheRecord.user_cache);
     const userCachedBytes = asNumber(userCache.cached_bytes);
     const userCacheLimitBytes = asNumber(userCache.limit_bytes);
@@ -1304,6 +1308,9 @@ export default function WorkbenchPage() {
                                                     {renderPlan?.stats?.rms !== undefined && renderPlan.stats.rms !== null && (
                                                         <span>RMS {formatNumber(renderPlan.stats.rms, 4)} {renderPlan.stats.unit || ""} ({renderPlan.stats.rms_method || "auto"})</span>
                                                     )}
+                                                    {renderPlan?.image?.analysis_product && (
+                                                        <span>Analysis {renderPlan.image.analysis_product}</span>
+                                                    )}
                                                     {renderPlan?.contours?.levels && renderPlan.contours.levels.length > 0 && (
                                                         <span>Contours {renderPlan.contours.levels.map((level) => formatNumber(level, 3)).join(", ")}</span>
                                                     )}
@@ -1349,6 +1356,12 @@ export default function WorkbenchPage() {
                                                         <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Samples</div>
                                                         <div className="mt-1 font-mono text-slate-200">{spectrumPlan.series.x.length} planned</div>
                                                     </div>
+                                                    {spectrumPlan.series.analysis_product && (
+                                                        <div>
+                                                            <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Analysis</div>
+                                                            <div className="mt-1 font-mono text-slate-200">{spectrumPlan.series.analysis_product}</div>
+                                                        </div>
+                                                    )}
                                                 </div>
                                                 <div className="px-4 pb-4">
                                                     <SpectrumMiniPlot series={spectrumPlan.series} lineData={lineData} />
@@ -1384,6 +1397,12 @@ export default function WorkbenchPage() {
                                                         <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Spectral Axis</div>
                                                         <div className="mt-1 font-mono text-slate-200">{asText(asRecord(pvSlicePlan.spectral_axis).label)}</div>
                                                     </div>
+                                                    {pvSlicePlan.image.analysis_product && (
+                                                        <div>
+                                                            <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Analysis</div>
+                                                            <div className="mt-1 font-mono text-slate-200">{pvSlicePlan.image.analysis_product}</div>
+                                                        </div>
+                                                    )}
                                                 </div>
                                                 {pvSlicePlan.image.data_url && (
                                                     <div className="px-4 pb-4">
@@ -1511,6 +1530,14 @@ export default function WorkbenchPage() {
                                         <dt className="text-slate-500">Cache</dt>
                                         <dd className="font-mono text-slate-200">
                                             {cacheStatus}{cachedBytes ? ` / ${(cachedBytes / (1024 * 1024)).toFixed(1)} MB` : ""}
+                                        </dd>
+                                    </div>
+                                    <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3 px-4 py-3">
+                                        <dt className="text-slate-500">Preview</dt>
+                                        <dd className="font-mono text-slate-200">
+                                            {previewStatus}
+                                            {previewBytes ? ` / ${formatBytes(previewBytes)}` : ""}
+                                            {previewShape ? ` / ${previewShape}` : ""}
                                         </dd>
                                     </div>
                                     <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3 px-4 py-3">

@@ -292,6 +292,8 @@ export interface WorkbenchRenderPlan {
         shape?: number[];
         channel?: number | null;
         line_labels?: Array<Record<string, unknown>>;
+        analysis_product?: string;
+        preview?: Record<string, unknown> | null;
     };
     stats?: {
         rms?: number | null;
@@ -302,6 +304,8 @@ export interface WorkbenchRenderPlan {
         mean?: number | null;
         unit?: string;
         shape?: number[];
+        analysis_product?: string;
+        preview?: Record<string, unknown> | null;
     };
     contours?: {
         sigma?: number[];
@@ -340,6 +344,8 @@ export interface WorkbenchSpectrumPlan {
         x_label: string;
         y_label: string;
         data_status: string;
+        analysis_product?: string;
+        preview?: Record<string, unknown> | null;
     };
     next_phase?: string;
     evidence: Record<string, unknown>;
@@ -356,6 +362,8 @@ export interface WorkbenchPvSlicePlan {
     image: {
         data_url: string | null;
         data_status: string;
+        analysis_product?: string;
+        preview?: Record<string, unknown> | null;
     };
     next_phase?: string;
     evidence: Record<string, unknown>;
