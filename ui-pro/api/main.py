@@ -411,9 +411,61 @@ class FitsPreviewRequest(BaseModel):
     url: str
     filename: Optional[str] = None
 
+class WorkbenchSessionCreate(BaseModel):
+    source_url: str
+    filename: Optional[str] = None
+    project_code: Optional[str] = None
+    mous_uid: Optional[str] = None
+
+class WorkbenchRenderRequest(BaseModel):
+    mode: Optional[str] = "image"
+    channel: Optional[int] = None
+    moment: Optional[int] = None
+    colormap: Optional[str] = "inferno"
+    stretch: Optional[str] = "asinh"
+    contour_sigma: Optional[List[float]] = None
+    rms_region: Optional[Dict[str, float]] = None
+
+class WorkbenchPrepareRequest(BaseModel):
+    max_bytes: Optional[int] = None
+    user_cache_bytes: Optional[int] = None
+    cache_ttl_seconds: Optional[int] = None
+    force: Optional[bool] = False
+
+class WorkbenchSpectrumRequest(BaseModel):
+    x_pixel: Optional[float] = None
+    y_pixel: Optional[float] = None
+    aperture_radius_pixels: Optional[float] = 3.0
+    aperture_radius_arcsec: Optional[float] = None
+    max_points: Optional[int] = 512
+
+class WorkbenchPvSliceRequest(BaseModel):
+    path: Optional[List[Dict[str, float]]] = None
+    width_pixels: Optional[float] = 3.0
+    max_points: Optional[int] = 512
+
+class WorkbenchLineOverlayRequest(BaseModel):
+    observed_frequency_ghz: Optional[float] = None
+    line_preset_key: Optional[str] = None
+    redshift: Optional[float] = 0.0
+    tolerance_ghz: Optional[float] = 0.01
+    top_n: Optional[int] = 8
+
+class WorkbenchExportRequest(BaseModel):
+    formats: Optional[List[str]] = None
+
+class WorkbenchJobStartRequest(BaseModel):
+    operation: str
+    payload: Optional[Dict[str, Any]] = None
+
 # ── Auth Service Instance ──
 from services.auth import AuthService
 from services.conversation_service import ConversationService
+from services.cube_workbench import (
+    CubeWorkbenchForbidden,
+    CubeWorkbenchNotFound,
+    CubeWorkbenchService,
+)
 from services.provider_file_service import (
     ProviderFileError,
     ProviderFileService,
@@ -422,6 +474,7 @@ from services.provider_file_service import (
 from core.llm_client import detect_provider
 auth_service = AuthService()
 conversation_service = ConversationService()
+cube_workbench_service = CubeWorkbenchService()
 provider_file_service = ProviderFileService()
 
 from services.analytics_service import AnalyticsService
@@ -1777,7 +1830,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/fits/preview")
 async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get_current_user)):
-    """Download a small ALMA FITS product and return a rendered PNG preview."""
+    """Download a small ALMA FITS product and return workbench-ready previews."""
     from urllib.parse import urlparse
     import base64
     import io
@@ -1786,6 +1839,7 @@ async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
     import numpy as np
     import requests
     from astropy.io import fits
@@ -1820,54 +1874,305 @@ async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get
         raise HTTPException(status_code=502, detail=f"Could not fetch FITS product: {exc}")
 
     try:
+        def _finite_float(value):
+            try:
+                number = float(value)
+                return number if math.isfinite(number) else None
+            except (TypeError, ValueError):
+                return None
+
+        def _figure_data_url(fig) -> str:
+            png_buf = io.BytesIO()
+            fig.savefig(png_buf, format="png", bbox_inches="tight")
+            plt.close(fig)
+            return "data:image/png;base64," + base64.b64encode(png_buf.getvalue()).decode("ascii")
+
+        def _robust_rms(values) -> Optional[float]:
+            arr = np.asarray(values, dtype=float).ravel()
+            if arr.size > 250000:
+                step = int(math.ceil(arr.size / 250000))
+                arr = arr[::step]
+            arr = arr[np.isfinite(arr)]
+            if arr.size < 10:
+                return None
+            median = float(np.nanmedian(arr))
+            mad = float(np.nanmedian(np.abs(arr - median)))
+            if mad > 0:
+                return 1.4826 * mad
+            std = float(np.nanstd(arr))
+            return std if math.isfinite(std) and std > 0 else None
+
+        def _safe_minmax(values) -> tuple[Optional[float], Optional[float]]:
+            arr = np.asarray(values, dtype=float)
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                return None, None
+            return float(np.nanmin(finite)), float(np.nanmax(finite))
+
+        def _spectral_axis(header, nchan: int):
+            crval = _finite_float(header.get("CRVAL3"))
+            cdelt = _finite_float(header.get("CDELT3"))
+            crpix = _finite_float(header.get("CRPIX3")) or 1.0
+            ctype = str(header.get("CTYPE3") or "Channel").strip()
+            cunit = str(header.get("CUNIT3") or "").strip()
+            if crval is None or cdelt is None:
+                return np.arange(nchan, dtype=float), "Channel", "channel", None
+
+            axis = crval + ((np.arange(nchan, dtype=float) + 1.0 - crpix) * cdelt)
+            unit_lower = cunit.lower()
+            ctype_upper = ctype.upper()
+            overlay_unit = cunit or ""
+            if "hz" in unit_lower or ("freq" in ctype_upper and np.nanmedian(np.abs(axis)) > 1e5):
+                if unit_lower == "ghz":
+                    converted = axis
+                elif unit_lower == "mhz":
+                    converted = axis / 1000.0
+                elif unit_lower == "khz":
+                    converted = axis / 1e6
+                else:
+                    converted = axis / 1e9
+                return converted, f"{ctype or 'Frequency'} (GHz)", "GHz", "frequency"
+            if unit_lower in {"m/s", "ms-1", "meter/s", "metre/s"}:
+                return axis / 1000.0, f"{ctype or 'Velocity'} (km/s)", "km/s", "velocity"
+            if unit_lower in {"km/s", "kms-1"}:
+                return axis, f"{ctype or 'Velocity'} (km/s)", "km/s", "velocity"
+            return axis, f"{ctype or 'Axis 3'}{f' ({overlay_unit})' if overlay_unit else ''}", overlay_unit, None
+
+        def _render_image(image, title: str, unit: str, header, rms_value: Optional[float], add_contours: bool):
+            fig, ax = plt.subplots(figsize=(6.2, 6.0), dpi=150)
+            try:
+                norm = simple_norm(image, "asinh", percent=99.5)
+            except Exception:
+                norm = None
+            im = ax.imshow(image, origin="lower", cmap="inferno", norm=norm)
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Pixel")
+            ax.set_ylabel("Pixel")
+            contour_levels = []
+            if add_contours and rms_value and rms_value > 0:
+                image_max = _safe_minmax(image)[1]
+                contour_levels = [
+                    level for level in (3 * rms_value, 5 * rms_value, 10 * rms_value)
+                    if image_max is not None and image_max > level
+                ]
+                if contour_levels:
+                    ax.contour(image, levels=contour_levels, colors="white", linewidths=0.45, alpha=0.6)
+
+            bmaj = _finite_float(header.get("BMAJ"))
+            bmin = _finite_float(header.get("BMIN"))
+            bpa = _finite_float(header.get("BPA")) or 0.0
+            cdelt1 = abs(_finite_float(header.get("CDELT1")) or 0)
+            cdelt2 = abs(_finite_float(header.get("CDELT2")) or 0)
+            if bmaj and bmin and cdelt1 and cdelt2:
+                ny, nx = image.shape[-2], image.shape[-1]
+                width_px = max(1.0, (bmaj * 3600.0) / (cdelt1 * 3600.0))
+                height_px = max(1.0, (bmin * 3600.0) / (cdelt2 * 3600.0))
+                beam = Ellipse(
+                    (max(10, nx * 0.12), max(10, ny * 0.1)),
+                    width=width_px,
+                    height=height_px,
+                    angle=bpa,
+                    facecolor="none",
+                    edgecolor="white",
+                    linewidth=1.0,
+                    alpha=0.9,
+                )
+                ax.add_patch(beam)
+                ax.text(max(10, nx * 0.12), max(6, ny * 0.1 - height_px * 0.8), "beam",
+                        color="white", fontsize=6, ha="center", alpha=0.85)
+
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(unit or "value", fontsize=8)
+            fig.tight_layout()
+            return _figure_data_url(fig), [float(level) for level in contour_levels]
+
+        def _render_channel_maps(cube, spectral_values, spectral_label: str, unit: str):
+            nchan = int(cube.shape[0])
+            sample_count = min(9, nchan)
+            indices = np.unique(np.linspace(0, nchan - 1, sample_count, dtype=int))
+            cols = 3 if len(indices) > 2 else len(indices)
+            rows_n = int(math.ceil(len(indices) / cols))
+            fig, axes = plt.subplots(rows_n, cols, figsize=(cols * 2.4, rows_n * 2.25), dpi=145)
+            axes_arr = np.asarray(axes).reshape(-1)
+            for ax, idx in zip(axes_arr, indices):
+                plane = cube[int(idx)]
+                try:
+                    norm = simple_norm(plane, "asinh", percent=99.3)
+                except Exception:
+                    norm = None
+                ax.imshow(plane, origin="lower", cmap="inferno", norm=norm)
+                if spectral_values is not None and len(spectral_values) > int(idx):
+                    ax.set_title(f"ch {int(idx)} | {float(spectral_values[int(idx)]):.4g}", fontsize=7)
+                else:
+                    ax.set_title(f"ch {int(idx)}", fontsize=7)
+                ax.set_xticks([])
+                ax.set_yticks([])
+            for ax in axes_arr[len(indices):]:
+                ax.axis("off")
+            fig.suptitle(f"Channel maps | {spectral_label}", fontsize=9)
+            fig.text(0.5, 0.02, unit or "image value", ha="center", fontsize=7)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            return _figure_data_url(fig)
+
+        def _render_pv_slice(cube, y_index: int, spectral_label: str, unit: str):
+            pv = cube[:, int(y_index), :]
+            fig, ax = plt.subplots(figsize=(6.4, 3.6), dpi=150)
+            try:
+                norm = simple_norm(pv, "asinh", percent=99.5)
+            except Exception:
+                norm = None
+            im = ax.imshow(pv, origin="lower", aspect="auto", cmap="magma", norm=norm)
+            ax.set_title("Central PV slice through peak row", fontsize=10)
+            ax.set_xlabel("Spatial pixel X")
+            ax.set_ylabel(spectral_label)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(unit or "value", fontsize=8)
+            fig.tight_layout()
+            return _figure_data_url(fig)
+
         with fits.open(io.BytesIO(fits_bytes), memmap=False) as hdul:
             hdu = next((item for item in hdul if getattr(item, "data", None) is not None), None)
             if hdu is None:
                 raise ValueError("No image data found in FITS file.")
-            data = np.asarray(hdu.data, dtype=float)
+            raw_data = np.asarray(hdu.data, dtype=float)
             header = hdu.header
-            while data.ndim > 2:
-                data = data[0]
-            data = np.squeeze(data)
-            if data.ndim != 2:
-                raise ValueError("Only 2D image previews are supported right now.")
-            if not np.isfinite(data).any():
+
+            squeezed = np.squeeze(raw_data)
+            if squeezed.ndim < 2:
+                raise ValueError("FITS data is not image-like.")
+            cube = None
+            cube_shape = None
+            if squeezed.ndim == 2:
+                image = squeezed
+                primary_label = "Image preview with beam/contour overlay"
+            else:
+                if squeezed.ndim > 3:
+                    squeezed = squeezed.reshape((-1, squeezed.shape[-2], squeezed.shape[-1]))
+                cube = squeezed
+                cube_shape = list(cube.shape)
+                image = np.nansum(cube, axis=0)
+                primary_label = "Moment-0 style cube collapse with beam/contour overlay"
+
+            if not np.isfinite(image).any():
                 raise ValueError("Image data contains no finite values.")
 
-            norm = simple_norm(data, "asinh", percent=99.5)
-            fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-            image = ax.imshow(data, origin="lower", cmap="inferno", norm=norm)
             object_name = str(header.get("OBJECT") or req.filename or "ALMA FITS")
             unit = str(header.get("BUNIT") or "")
-            ax.set_title(f"{object_name} | {unit}".strip(" |"), fontsize=10)
-            ax.set_xlabel("Pixel")
-            ax.set_ylabel("Pixel")
-            cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label(unit or "value", fontsize=8)
-            fig.tight_layout()
-            png = io.BytesIO()
-            fig.savefig(png, format="png", bbox_inches="tight")
-            plt.close(fig)
-
-            def _finite_float(value):
-                try:
-                    number = float(value)
-                    return number if math.isfinite(number) else None
-                except (TypeError, ValueError):
-                    return None
+            rms_value = _robust_rms(cube if cube is not None else image)
+            image_data_url, contour_levels = _render_image(
+                image,
+                f"{object_name} | {unit}".strip(" |"),
+                unit,
+                header,
+                rms_value,
+                add_contours=True,
+            )
 
             bmaj = _finite_float(header.get("BMAJ"))
             bmin = _finite_float(header.get("BMIN"))
+            bpa = _finite_float(header.get("BPA"))
             restfreq = _finite_float(header.get("RESTFRQ"))
+            cdelt1 = abs(_finite_float(header.get("CDELT1")) or 0) or None
+            cdelt2 = abs(_finite_float(header.get("CDELT2")) or 0) or None
+            min_value, max_value = _safe_minmax(image)
+
+            spectral_values = None
+            spectral_label = "Channel"
+            spectral_unit = "channel"
+            spectral_kind = None
+            spectrum_payload = None
+            channel_maps_data_url = None
+            pv_slice_data_url = None
+            line_overlays = []
+            assumptions = [
+                "Preview renders a downloaded copy limited to 50 MB.",
+                "RMS is a robust MAD estimate from previewed pixel values.",
+            ]
+            confidence = "medium"
+
+            if cube is not None:
+                nchan = int(cube.shape[0])
+                spectral_values, spectral_label, spectral_unit, spectral_kind = _spectral_axis(header, nchan)
+                assumptions.append("For cube-like FITS files, the first non-spatial axis after squeezing is treated as the channel/spectral axis.")
+
+                peak_source = np.asarray(image, dtype=float)
+                if np.isfinite(peak_source).any():
+                    peak_y, peak_x = np.unravel_index(np.nanargmax(np.abs(peak_source)), peak_source.shape)
+                    spectrum_values = cube[:, int(peak_y), int(peak_x)]
+                    extraction = f"peak pixel x={int(peak_x)}, y={int(peak_y)}"
+                else:
+                    peak_y = cube.shape[1] // 2
+                    peak_x = cube.shape[2] // 2
+                    spectrum_values = np.nanmedian(cube, axis=(1, 2))
+                    extraction = "spatial median"
+
+                finite_spec = np.isfinite(spectrum_values)
+                if finite_spec.any():
+                    max_points = 360
+                    step = max(1, int(math.ceil(len(spectrum_values) / max_points)))
+                    xs = spectral_values[::step]
+                    ys = spectrum_values[::step]
+                    spec_pairs = [
+                        (float(x_val), float(y_val))
+                        for x_val, y_val in zip(xs, ys)
+                        if math.isfinite(float(x_val)) and math.isfinite(float(y_val))
+                    ]
+                    spectrum_payload = {
+                        "x": [round(x_val, 8) for x_val, _ in spec_pairs],
+                        "y": [round(y_val, 8) for _, y_val in spec_pairs],
+                        "xLabel": spectral_label,
+                        "yLabel": unit or "Value",
+                        "extraction": extraction,
+                    }
+                    confidence = "high" if restfreq or str(header.get("CTYPE3") or "").strip() else "medium"
+
+                channel_maps_data_url = _render_channel_maps(cube, spectral_values, spectral_label, unit)
+                pv_slice_data_url = _render_pv_slice(cube, int(peak_y), spectral_label, unit)
+
+                if restfreq and spectral_kind == "frequency":
+                    rest_ghz = restfreq / 1e9
+                    axis_min, axis_max = float(np.nanmin(spectral_values)), float(np.nanmax(spectral_values))
+                    line_overlays.append({
+                        "label": "Header RESTFRQ",
+                        "value": round(rest_ghz, 8),
+                        "unit": "GHz",
+                        "source": "FITS header",
+                        "inRange": bool(min(axis_min, axis_max) <= rest_ghz <= max(axis_min, axis_max)),
+                    })
+
+            if bmaj and bmin and cdelt1 and cdelt2:
+                confidence = "high" if confidence == "medium" else confidence
+
+            filename = req.filename or Path(parsed.path).name or "alma_product.fits"
+            casa_script = (
+                f"from casatasks import importfits\n"
+                f"importfits(fitsimage='{filename}', imagename='{Path(filename).stem}.image', overwrite=True)\n"
+                f"# Then inspect in CASA viewer or run imstat/imhead on {Path(filename).stem}.image"
+            )
+            if cube is not None:
+                casa_script += "\n# For cube products, use immoments or specfit after checking the spectral axis."
+
             metadata = {
                 "object": object_name,
                 "unit": unit,
-                "shape": list(data.shape),
+                "shape": list(image.shape),
+                "rawShape": list(raw_data.shape),
+                "cubeShape": cube_shape,
+                "isCube": cube is not None,
+                "channelCount": int(cube.shape[0]) if cube is not None else None,
                 "beamMajorArcsec": bmaj * 3600 if bmaj is not None else None,
                 "beamMinorArcsec": bmin * 3600 if bmin is not None else None,
+                "beamPaDeg": bpa,
                 "restFreqGhz": restfreq / 1e9 if restfreq is not None else None,
-                "min": float(np.nanmin(data)),
-                "max": float(np.nanmax(data)),
+                "pixelScaleArcsec": {
+                    "x": cdelt1 * 3600 if cdelt1 is not None else None,
+                    "y": cdelt2 * 3600 if cdelt2 is not None else None,
+                },
+                "spectralAxisLabel": spectral_label if cube is not None else None,
+                "rms": rms_value,
+                "rmsUnit": unit or None,
+                "min": min_value,
+                "max": max_value,
                 "sizeBytes": len(fits_bytes),
             }
     except HTTPException:
@@ -1876,16 +2181,267 @@ async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get
         raise HTTPException(status_code=422, detail=f"Could not render FITS preview: {exc}")
 
     return {
-        "imageDataUrl": "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii"),
+        "imageDataUrl": image_data_url,
         "metadata": metadata,
         "downloadUrl": req.url,
-        "filename": req.filename or Path(parsed.path).name,
+        "filename": filename,
+        "workbench": {
+            "kind": "cube" if metadata.get("isCube") else "image",
+            "primaryImageLabel": primary_label,
+            "channelMapsDataUrl": channel_maps_data_url,
+            "pvSliceDataUrl": pv_slice_data_url,
+            "spectrum": spectrum_payload,
+            "rms": rms_value,
+            "rmsUnit": unit or None,
+            "contourLevels": [round(float(level), 8) for level in contour_levels],
+            "lineOverlays": line_overlays,
+            "exports": [
+                {"label": "CASA", "command": casa_script},
+                {"label": "CARTA", "command": f"carta '{filename}'"},
+                {"label": "DS9", "command": f"ds9 '{filename}' -scale zscale -cmap inferno"},
+            ],
+            "evidence": {
+                "dataAccess": f"Fetched {round(len(fits_bytes) / (1024 * 1024), 2)} MB from {parsed.hostname}",
+                "headersInspected": [
+                    key for key in ["OBJECT", "BUNIT", "BMAJ", "BMIN", "BPA", "RESTFRQ", "CTYPE3", "CUNIT3", "CRVAL3", "CDELT3"]
+                    if header.get(key) is not None
+                ],
+                "assumptions": assumptions,
+                "confidence": confidence,
+            },
+        },
         "suggestedActions": [
             "Measure peak flux and RMS noise",
-            "Compare this spectral window with another FITS product",
-            "Open/download the FITS for DS9, CARTA, CASA, or Python",
+            "Inspect channel maps and the spectrum before choosing line windows",
+            "Export/open the FITS in CASA, CARTA, DS9, or Python",
         ],
     }
+
+
+def _workbench_user_id(current_user: dict) -> str:
+    return str(current_user.get("sub") or current_user.get("id") or "anonymous")
+
+
+def _raise_workbench_error(exc: Exception):
+    if isinstance(exc, CubeWorkbenchNotFound):
+        raise HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, CubeWorkbenchForbidden):
+        raise HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc))
+    raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/workbench/session")
+async def create_workbench_session(
+    req: WorkbenchSessionCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a durable first-class cube/product workbench session."""
+    try:
+        return cube_workbench_service.create_session(
+            user_id=_workbench_user_id(current_user),
+            source_url=req.source_url,
+            filename=req.filename,
+            project_code=req.project_code,
+            mous_uid=req.mous_uid,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.get("/api/workbench/{session_id}/metadata")
+async def get_workbench_metadata(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return FITS/workbench metadata, state, and evidence for a session."""
+    try:
+        return cube_workbench_service.get_metadata(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.post("/api/workbench/{session_id}/jobs")
+async def start_workbench_job(
+    session_id: str,
+    req: WorkbenchJobStartRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Start a durable asynchronous workbench operation."""
+    try:
+        return cube_workbench_service.start_job(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            operation=req.operation,
+            payload=req.payload,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.get("/api/workbench/{session_id}/jobs/{job_id}")
+async def get_workbench_job(
+    session_id: str,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return durable progress/result state for a workbench job."""
+    try:
+        return cube_workbench_service.get_job(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            job_id=job_id,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.delete("/api/workbench/{session_id}/jobs/{job_id}")
+async def cancel_workbench_job(
+    session_id: str,
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Request cancellation for a queued/running workbench job."""
+    try:
+        return cube_workbench_service.cancel_job(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            job_id=job_id,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.post("/api/workbench/{session_id}/render")
+async def plan_workbench_render(
+    session_id: str,
+    req: WorkbenchRenderRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist render controls for the future WCS-aware workbench renderer."""
+    try:
+        return cube_workbench_service.render_plan(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            mode=req.mode or "image",
+            channel=req.channel,
+            moment=req.moment,
+            colormap=req.colormap or "inferno",
+            stretch=req.stretch or "asinh",
+            contour_sigma=req.contour_sigma,
+            rms_region=req.rms_region,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.post("/api/workbench/{session_id}/prepare")
+async def prepare_workbench_product(
+    session_id: str,
+    req: WorkbenchPrepareRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Stage a FITS product in the bounded workbench cache for real cube operations."""
+    try:
+        return cube_workbench_service.prepare_product(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            max_bytes=req.max_bytes or 500 * 1024 * 1024,
+            user_cache_bytes=req.user_cache_bytes or 2 * 1024 * 1024 * 1024,
+            cache_ttl_seconds=req.cache_ttl_seconds or 24 * 60 * 60,
+            force=bool(req.force),
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.post("/api/workbench/{session_id}/spectrum")
+async def plan_workbench_spectrum(
+    session_id: str,
+    req: WorkbenchSpectrumRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist a spectrum extraction request and return spectral-axis metadata."""
+    try:
+        return cube_workbench_service.spectrum_plan(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            x_pixel=req.x_pixel,
+            y_pixel=req.y_pixel,
+            aperture_radius_pixels=req.aperture_radius_pixels or 3.0,
+            aperture_radius_arcsec=req.aperture_radius_arcsec,
+            max_points=req.max_points or 512,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.post("/api/workbench/{session_id}/pv-slice")
+async def plan_workbench_pv_slice(
+    session_id: str,
+    req: WorkbenchPvSliceRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist a PV-slice path and return axis planning metadata."""
+    try:
+        return cube_workbench_service.pv_slice_plan(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            path=req.path,
+            width_pixels=req.width_pixels or 3.0,
+            max_points=req.max_points or 512,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.post("/api/workbench/{session_id}/line-overlays")
+async def get_workbench_line_overlays(
+    session_id: str,
+    req: WorkbenchLineOverlayRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return redshift-aware Splatalogue line overlays for a workbench session."""
+    try:
+        return cube_workbench_service.line_overlays(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            observed_frequency_ghz=req.observed_frequency_ghz,
+            line_preset_key=req.line_preset_key,
+            redshift=req.redshift or 0.0,
+            tolerance_ghz=req.tolerance_ghz or 0.01,
+            top_n=req.top_n or 8,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
+
+
+@app.get("/api/workbench/line-presets")
+async def get_workbench_line_presets():
+    """Return common ALMA/mm spectral-line presets for workbench line ID."""
+    return cube_workbench_service.line_presets()
+
+
+@app.post("/api/workbench/{session_id}/export")
+async def get_workbench_exports(
+    session_id: str,
+    req: WorkbenchExportRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return reproducible export scripts/commands for a workbench session."""
+    try:
+        return cube_workbench_service.export_plan(
+            session_id=session_id,
+            user_id=_workbench_user_id(current_user),
+            formats=req.formats,
+        )
+    except Exception as exc:
+        _raise_workbench_error(exc)
 
 @app.get("/api/conversations")
 async def list_conversations(current_user: dict = Depends(get_current_user)):

@@ -199,6 +199,373 @@ export async function getModels(): Promise<string[]> {
     catch { return ["gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro", "deepseek-v4-flash"]; }
 }
 
+export interface WorkbenchSession {
+    session_id: string;
+    source_url: string;
+    filename: string;
+    archive: string;
+    project_code?: string;
+    mous_uid?: string;
+    status: string;
+    metadata: Record<string, unknown>;
+    evidence: Record<string, unknown>;
+    state?: Record<string, unknown>;
+    cache?: Record<string, unknown>;
+    jobs?: WorkbenchJob[];
+}
+
+export interface WorkbenchMetadata {
+    session_id: string;
+    filename: string;
+    source_url: string;
+    archive: string;
+    project_code?: string;
+    mous_uid?: string;
+    status: string;
+    metadata: Record<string, unknown>;
+    state: Record<string, unknown>;
+    cache: Record<string, unknown>;
+    jobs: WorkbenchJob[];
+    evidence: Record<string, unknown>;
+}
+
+export type WorkbenchJobStatus = "queued" | "running" | "succeeded" | "failed" | "canceled" | "orphaned";
+
+export interface WorkbenchJob {
+    job_id: string;
+    operation: string;
+    status: WorkbenchJobStatus | string;
+    phase: string;
+    progress: number;
+    created_at: number;
+    started_at?: number | null;
+    finished_at?: number | null;
+    cancel_requested?: boolean;
+    request?: Record<string, unknown>;
+    result?: Record<string, unknown> | null;
+    error?: string;
+    metrics?: Record<string, unknown>;
+}
+
+export interface WorkbenchJobResponse {
+    session_id: string;
+    job: WorkbenchJob;
+    jobs: WorkbenchJob[];
+}
+
+export interface WorkbenchLineOverlays {
+    session_id: string;
+    query_observed_frequency_ghz: number;
+    query_rest_frequency_ghz: number;
+    redshift: number;
+    tolerance_ghz: number;
+    preset?: WorkbenchLinePreset | null;
+    presets?: WorkbenchLinePreset[];
+    n_matches: number;
+    lines: Record<string, unknown>[];
+    evidence: Record<string, unknown>;
+}
+
+export interface WorkbenchLinePreset {
+    key: string;
+    label: string;
+    rest_frequency_ghz: number;
+    family: string;
+}
+
+export interface WorkbenchLinePresetResponse {
+    presets: WorkbenchLinePreset[];
+    evidence: Record<string, unknown>;
+}
+
+export interface WorkbenchRenderPlan {
+    session_id: string;
+    status: string;
+    operation: string;
+    state: Record<string, unknown>;
+    image?: {
+        data_url: string | null;
+        data_status: string;
+        label?: string;
+        axis_labels?: Record<string, string>;
+        wcs_status?: string;
+        shape?: number[];
+        channel?: number | null;
+        line_labels?: Array<Record<string, unknown>>;
+    };
+    stats?: {
+        rms?: number | null;
+        rms_region?: Record<string, number> | null;
+        rms_method?: string | null;
+        min?: number | null;
+        max?: number | null;
+        mean?: number | null;
+        unit?: string;
+        shape?: number[];
+    };
+    contours?: {
+        sigma?: number[];
+        levels?: Array<number | null>;
+        unit?: string;
+    };
+    next_phase?: string;
+    evidence: Record<string, unknown>;
+}
+
+export interface WorkbenchPrepareResult {
+    session_id: string;
+    status: string;
+    cache: Record<string, unknown>;
+    cache_path: string;
+    evidence: Record<string, unknown>;
+}
+
+export interface WorkbenchSpectrumPlan {
+    session_id: string;
+    status: string;
+    operation: string;
+    extraction: Record<string, unknown>;
+    spectral_axis: {
+        label: string;
+        unit: string;
+        channel_count: number;
+        downsample_step: number;
+        values: number[];
+        indices: number[];
+        rest_frequency_ghz?: number | null;
+    };
+    series: {
+        x: number[];
+        y: number[];
+        x_label: string;
+        y_label: string;
+        data_status: string;
+    };
+    next_phase?: string;
+    evidence: Record<string, unknown>;
+}
+
+export interface WorkbenchPvSlicePlan {
+    session_id: string;
+    status: string;
+    operation: string;
+    path: { x: number; y: number }[];
+    width_pixels: number;
+    spatial_axis: Record<string, unknown>;
+    spectral_axis: Record<string, unknown>;
+    image: {
+        data_url: string | null;
+        data_status: string;
+    };
+    next_phase?: string;
+    evidence: Record<string, unknown>;
+}
+
+export interface WorkbenchExports {
+    session_id: string;
+    formats: string[];
+    exports: Record<string, { filename: string; content: string; mime_type?: string; encoding?: string }>;
+    evidence: Record<string, unknown>;
+}
+
+async function parseJsonResponse<T>(res: Response): Promise<T> {
+    if (!res.ok) throw new Error(await getErrorMessage(res));
+    return res.json() as Promise<T>;
+}
+
+export async function createWorkbenchSession(
+    input: {
+        source_url: string;
+        filename?: string;
+        project_code?: string;
+        mous_uid?: string;
+    },
+    token?: string | null,
+): Promise<WorkbenchSession> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/session`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchSession>(res);
+}
+
+export async function getWorkbenchMetadata(sessionId: string, token?: string | null): Promise<WorkbenchMetadata> {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/metadata`, { headers });
+    return parseJsonResponse<WorkbenchMetadata>(res);
+}
+
+export async function startWorkbenchJob(
+    sessionId: string,
+    input: {
+        operation: string;
+        payload?: Record<string, unknown>;
+    },
+    token?: string | null,
+): Promise<WorkbenchJobResponse> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchJobResponse>(res);
+}
+
+export async function getWorkbenchJob(
+    sessionId: string,
+    jobId: string,
+    token?: string | null,
+): Promise<WorkbenchJobResponse> {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, { headers });
+    return parseJsonResponse<WorkbenchJobResponse>(res);
+}
+
+export async function cancelWorkbenchJob(
+    sessionId: string,
+    jobId: string,
+    token?: string | null,
+): Promise<WorkbenchJobResponse> {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, {
+        method: "DELETE",
+        headers,
+    });
+    return parseJsonResponse<WorkbenchJobResponse>(res);
+}
+
+export async function planWorkbenchRender(
+    sessionId: string,
+    input: {
+        mode?: string;
+        channel?: number | null;
+        moment?: number | null;
+        colormap?: string;
+        stretch?: string;
+        contour_sigma?: number[];
+        rms_region?: { x1: number; y1: number; x2: number; y2: number } | null;
+    },
+    token?: string | null,
+): Promise<WorkbenchRenderPlan> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/render`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchRenderPlan>(res);
+}
+
+export async function prepareWorkbenchProduct(
+    sessionId: string,
+    input: {
+        max_bytes?: number;
+        user_cache_bytes?: number;
+        cache_ttl_seconds?: number;
+        force?: boolean;
+    } = {},
+    token?: string | null,
+): Promise<WorkbenchPrepareResult> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/prepare`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchPrepareResult>(res);
+}
+
+export async function planWorkbenchSpectrum(
+    sessionId: string,
+    input: {
+        x_pixel?: number | null;
+        y_pixel?: number | null;
+        aperture_radius_pixels?: number;
+        aperture_radius_arcsec?: number | null;
+        max_points?: number;
+    },
+    token?: string | null,
+): Promise<WorkbenchSpectrumPlan> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/spectrum`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchSpectrumPlan>(res);
+}
+
+export async function planWorkbenchPvSlice(
+    sessionId: string,
+    input: {
+        path?: { x: number; y: number }[];
+        width_pixels?: number;
+        max_points?: number;
+    },
+    token?: string | null,
+): Promise<WorkbenchPvSlicePlan> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/pv-slice`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchPvSlicePlan>(res);
+}
+
+export async function getWorkbenchLineOverlays(
+    sessionId: string,
+    input: {
+        observed_frequency_ghz?: number;
+        line_preset_key?: string;
+        redshift?: number;
+        tolerance_ghz?: number;
+        top_n?: number;
+    },
+    token?: string | null,
+): Promise<WorkbenchLineOverlays> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/line-overlays`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<WorkbenchLineOverlays>(res);
+}
+
+export async function getWorkbenchLinePresets(): Promise<WorkbenchLinePresetResponse> {
+    const res = await fetch(`${API_BASE}/api/workbench/line-presets`);
+    return parseJsonResponse<WorkbenchLinePresetResponse>(res);
+}
+
+export async function getWorkbenchExports(
+    sessionId: string,
+    formats: string[] = ["casa", "carta", "ds9", "python"],
+    token?: string | null,
+): Promise<WorkbenchExports> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/export`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ formats }),
+    });
+    return parseJsonResponse<WorkbenchExports>(res);
+}
+
 export async function reviewProposal(file: File, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
     try {
         const form = new FormData();

@@ -1,13 +1,20 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Download, Eye, Link2, Loader2, X, Telescope, BarChart3, Map, AlertTriangle } from "lucide-react";
+import { Download, Eye, ExternalLink, Link2, Loader2, X, Telescope, BarChart3, Map, AlertTriangle, Activity, Layers, FileCode, Radio, Copy, Check } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
+import { createWorkbenchSession } from "../lib/api";
 import { useAuthStore } from "../lib/auth-store";
 
 interface DataTableCardProps { data: DataTableResult; }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+function optionalCellText(value: unknown): string | undefined {
+    const text = String(value ?? "").trim();
+    if (!text || text === "nan" || text === "None" || text === "-") return undefined;
+    return text;
+}
 
 interface FitsPreviewResult {
     imageDataUrl: string;
@@ -19,10 +26,49 @@ interface FitsPreviewResult {
         shape?: number[];
         beamMajorArcsec?: number | null;
         beamMinorArcsec?: number | null;
+        beamPaDeg?: number | null;
         restFreqGhz?: number | null;
+        pixelScaleArcsec?: { x?: number | null; y?: number | null };
+        spectralAxisLabel?: string | null;
+        isCube?: boolean;
+        rawShape?: number[];
+        cubeShape?: number[] | null;
+        channelCount?: number | null;
+        rms?: number | null;
+        rmsUnit?: string | null;
         min?: number;
         max?: number;
         sizeBytes?: number;
+    };
+    workbench?: {
+        kind: "image" | "cube";
+        primaryImageLabel?: string;
+        channelMapsDataUrl?: string | null;
+        pvSliceDataUrl?: string | null;
+        spectrum?: {
+            x: number[];
+            y: number[];
+            xLabel: string;
+            yLabel: string;
+            extraction?: string;
+        } | null;
+        rms?: number | null;
+        rmsUnit?: string | null;
+        contourLevels?: number[];
+        lineOverlays?: {
+            label: string;
+            value: number;
+            unit: string;
+            source: string;
+            inRange?: boolean;
+        }[];
+        exports?: { label: string; command: string }[];
+        evidence?: {
+            dataAccess?: string;
+            headersInspected?: string[];
+            assumptions?: string[];
+            confidence?: string;
+        };
     };
     suggestedActions?: string[];
 }
@@ -529,6 +575,99 @@ function PreviewLightbox({
 }
 
 /* ── Inline thumbnail component ── */
+function SpectrumPlot({
+    spectrum,
+    lineOverlays,
+}: {
+    spectrum: NonNullable<NonNullable<FitsPreviewResult["workbench"]>["spectrum"]>;
+    lineOverlays?: NonNullable<FitsPreviewResult["workbench"]>["lineOverlays"];
+}) {
+    const pointCount = Math.min(spectrum.x.length, spectrum.y.length);
+    if (pointCount < 2) return null;
+
+    const pairs = spectrum.x.slice(0, pointCount).map((x, i) => ({ x, y: spectrum.y[i] }))
+        .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (pairs.length < 2) return null;
+
+    const xMin = Math.min(...pairs.map(p => p.x));
+    const xMax = Math.max(...pairs.map(p => p.x));
+    const yMin = Math.min(...pairs.map(p => p.y));
+    const yMax = Math.max(...pairs.map(p => p.y));
+    const yPad = Math.max((yMax - yMin) * 0.08, Math.abs(yMax || 1) * 0.02, 1e-12);
+    const plotW = 560;
+    const plotH = 190;
+    const padL = 44;
+    const padR = 12;
+    const padT = 16;
+    const padB = 34;
+    const innerW = plotW - padL - padR;
+    const innerH = plotH - padT - padB;
+    const sx = (x: number) => padL + ((x - xMin) / Math.max(xMax - xMin, 1e-12)) * innerW;
+    const sy = (y: number) => padT + (1 - ((y - (yMin - yPad)) / Math.max((yMax + yPad) - (yMin - yPad), 1e-12))) * innerH;
+    const d = pairs.map((p, i) => `${i === 0 ? "M" : "L"}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(" ");
+    const overlayUnit = spectrum.xLabel.match(/\(([^)]+)\)/)?.[1] || "";
+    const usableOverlays = (lineOverlays || []).filter(line =>
+        line.inRange !== false && (!overlayUnit || line.unit.toLowerCase() === overlayUnit.toLowerCase())
+    );
+
+    return (
+        <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+            <div className="flex items-center justify-between gap-2 mb-2">
+                <div className="flex items-center gap-2">
+                    <Activity className="w-3.5 h-3.5 text-cyan-300" />
+                    <span className="text-xs font-semibold text-slate-200">Spectrum</span>
+                </div>
+                {spectrum.extraction && (
+                    <span className="text-[10px] text-slate-500 font-mono truncate">{spectrum.extraction}</span>
+                )}
+            </div>
+            <svg viewBox={`0 0 ${plotW} ${plotH}`} className="w-full h-auto max-h-[220px]">
+                <rect x={padL} y={padT} width={innerW} height={innerH} rx="4" fill="#020617" stroke="rgba(148,163,184,0.18)" />
+                <line x1={padL} y1={sy(0)} x2={plotW - padR} y2={sy(0)} stroke="rgba(148,163,184,0.16)" strokeDasharray="4 4" />
+                {usableOverlays.map(line => {
+                    const xPos = sx(line.value);
+                    return (
+                        <g key={`${line.label}-${line.value}`}>
+                            <line x1={xPos} y1={padT} x2={xPos} y2={padT + innerH} stroke="rgba(250,204,21,0.55)" strokeDasharray="3 3" />
+                            <text x={xPos + 4} y={padT + 12} fill="#fde68a" fontSize="9">{line.label}</text>
+                        </g>
+                    );
+                })}
+                <path d={d} fill="none" stroke="#22d3ee" strokeWidth="1.5" />
+                <text x={padL} y={plotH - 10} fill="#94a3b8" fontSize="10">{xMin.toPrecision(5)}</text>
+                <text x={plotW - padR} y={plotH - 10} fill="#94a3b8" fontSize="10" textAnchor="end">{xMax.toPrecision(5)}</text>
+                <text x={plotW / 2} y={plotH - 8} fill="#cbd5e1" fontSize="10" textAnchor="middle">{spectrum.xLabel}</text>
+                <text x="12" y={plotH / 2} fill="#cbd5e1" fontSize="10" transform={`rotate(-90 12 ${plotH / 2})`} textAnchor="middle">{spectrum.yLabel}</text>
+            </svg>
+        </div>
+    );
+}
+
+function CopyCommandButton({ label, command }: { label: string; command: string }) {
+    const [copied, setCopied] = useState(false);
+    const handleCopy = async () => {
+        try {
+            await navigator.clipboard.writeText(command);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1200);
+        } catch {
+            setCopied(false);
+        }
+    };
+
+    return (
+        <button
+            type="button"
+            onClick={handleCopy}
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-slate-700 text-[10px] font-semibold text-slate-200 hover:bg-slate-800 transition-colors"
+            title={command}
+        >
+            {copied ? <Check className="w-3 h-3 text-emerald-300" /> : <Copy className="w-3 h-3 text-slate-400" />}
+            {label}
+        </button>
+    );
+}
+
 function FitsPreviewLightbox({
     preview,
     row,
@@ -539,8 +678,13 @@ function FitsPreviewLightbox({
     onClose: () => void;
 }) {
     const metadata = preview.metadata || {};
+    const workbench = preview.workbench;
+    const isCube = Boolean(metadata.isCube || workbench?.kind === "cube");
     const fmt = (value: number | null | undefined, digits = 3) =>
         typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "-";
+    const fmtSci = (value: number | null | undefined, digits = 3) =>
+        typeof value === "number" && Number.isFinite(value) ? value.toExponential(digits) : "-";
+    const sizeMb = typeof metadata.sizeBytes === "number" ? metadata.sizeBytes / (1024 * 1024) : null;
 
     return (
         <div
@@ -548,7 +692,7 @@ function FitsPreviewLightbox({
             onClick={onClose}
         >
             <div
-                className="relative bg-[#0a1220] border border-slate-600/60 rounded-2xl shadow-2xl w-[min(920px,calc(100vw-32px))] max-h-[calc(100vh-32px)] overflow-y-auto"
+                className="relative bg-[#0a1220] border border-slate-600/60 rounded-2xl shadow-2xl w-[min(1180px,calc(100vw-32px))] max-h-[calc(100vh-32px)] overflow-y-auto"
                 onClick={e => e.stopPropagation()}
             >
                 <button
@@ -559,20 +703,72 @@ function FitsPreviewLightbox({
                     <X className="w-4 h-4 text-slate-300" />
                 </button>
 
-                <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px]">
+                <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px]">
                     <div className="p-4 border-b lg:border-b-0 lg:border-r border-slate-800">
                         <div className="mb-3 pr-10">
-                            <p className="text-xs text-slate-500 uppercase tracking-wider">FITS Preview</p>
+                            <p className="text-xs text-slate-500 uppercase tracking-wider">Cube/Product Workbench</p>
                             <h3 className="text-sm font-semibold text-slate-100 truncate" title={preview.filename}>
                                 {preview.filename}
                             </h3>
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <span className="inline-flex items-center gap-1 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-semibold text-cyan-200">
+                                    {isCube ? <Layers className="w-3 h-3" /> : <Radio className="w-3 h-3" />}
+                                    {isCube ? "Spectral cube" : "Image product"}
+                                </span>
+                                {metadata.channelCount && (
+                                    <span className="rounded-md border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300">
+                                        {metadata.channelCount} channels
+                                    </span>
+                                )}
+                                {workbench?.rms && (
+                                    <span className="rounded-md border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300">
+                                        RMS {fmtSci(workbench.rms)} {workbench.rmsUnit || ""}
+                                    </span>
+                                )}
+                            </div>
                         </div>
+                        {workbench?.primaryImageLabel && (
+                            <p className="mb-2 text-[11px] text-slate-500">{workbench.primaryImageLabel}</p>
+                        )}
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
                             src={preview.imageDataUrl}
                             alt={`Rendered FITS preview for ${preview.filename}`}
                             className="w-full rounded-xl bg-slate-950 border border-slate-800"
                         />
+                        {workbench?.spectrum && (
+                            <div className="mt-3">
+                                <SpectrumPlot spectrum={workbench.spectrum} lineOverlays={workbench.lineOverlays} />
+                            </div>
+                        )}
+                        {workbench?.channelMapsDataUrl && (
+                            <div className="mt-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                                <div className="mb-2 flex items-center gap-2">
+                                    <Layers className="w-3.5 h-3.5 text-cyan-300" />
+                                    <span className="text-xs font-semibold text-slate-200">Channel Maps</span>
+                                </div>
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                    src={workbench.channelMapsDataUrl}
+                                    alt={`Channel map grid for ${preview.filename}`}
+                                    className="w-full rounded-md bg-slate-950"
+                                />
+                            </div>
+                        )}
+                        {workbench?.pvSliceDataUrl && (
+                            <div className="mt-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                                <div className="mb-2 flex items-center gap-2">
+                                    <Activity className="w-3.5 h-3.5 text-cyan-300" />
+                                    <span className="text-xs font-semibold text-slate-200">PV Slice</span>
+                                </div>
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                    src={workbench.pvSliceDataUrl}
+                                    alt={`PV slice for ${preview.filename}`}
+                                    className="w-full rounded-md bg-slate-950"
+                                />
+                            </div>
+                        )}
                     </div>
 
                     <div className="p-4 space-y-4">
@@ -595,6 +791,18 @@ function FitsPreviewLightbox({
                                     <dt className="text-slate-500">Shape</dt>
                                     <dd className="text-slate-200 text-right font-mono">{metadata.shape?.join(" x ") || "-"}</dd>
                                 </div>
+                                {metadata.rawShape && metadata.rawShape.length > 0 && (
+                                    <div className="flex justify-between gap-3">
+                                        <dt className="text-slate-500">Raw shape</dt>
+                                        <dd className="text-slate-200 text-right font-mono">{metadata.rawShape.join(" x ")}</dd>
+                                    </div>
+                                )}
+                                {metadata.cubeShape && metadata.cubeShape.length > 0 && (
+                                    <div className="flex justify-between gap-3">
+                                        <dt className="text-slate-500">Cube shape</dt>
+                                        <dd className="text-slate-200 text-right font-mono">{metadata.cubeShape.join(" x ")}</dd>
+                                    </div>
+                                )}
                                 <div className="flex justify-between gap-3">
                                     <dt className="text-slate-500">Unit</dt>
                                     <dd className="text-slate-200 text-right">{metadata.unit || "-"}</dd>
@@ -606,9 +814,29 @@ function FitsPreviewLightbox({
                                     </dd>
                                 </div>
                                 <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Beam PA</dt>
+                                    <dd className="text-slate-200 text-right font-mono">{fmt(metadata.beamPaDeg, 1)} deg</dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
                                     <dt className="text-slate-500">Rest freq</dt>
                                     <dd className="text-slate-200 text-right font-mono">{fmt(metadata.restFreqGhz, 2)} GHz</dd>
                                 </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">Pixel scale</dt>
+                                    <dd className="text-slate-200 text-right font-mono">
+                                        {fmt(metadata.pixelScaleArcsec?.x)} x {fmt(metadata.pixelScaleArcsec?.y)} arcsec
+                                    </dd>
+                                </div>
+                                <div className="flex justify-between gap-3">
+                                    <dt className="text-slate-500">RMS</dt>
+                                    <dd className="text-slate-200 text-right font-mono">{fmtSci(metadata.rms)} {metadata.rmsUnit || ""}</dd>
+                                </div>
+                                {sizeMb !== null && (
+                                    <div className="flex justify-between gap-3">
+                                        <dt className="text-slate-500">Preview fetch</dt>
+                                        <dd className="text-slate-200 text-right font-mono">{fmt(sizeMb, 2)} MB</dd>
+                                    </div>
+                                )}
                             </dl>
                         </div>
 
@@ -625,6 +853,74 @@ function FitsPreviewLightbox({
                                 ))}
                             </div>
                         </div>
+
+                        {workbench?.lineOverlays && workbench.lineOverlays.length > 0 && (
+                            <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                                <div className="flex items-center gap-2 mb-2">
+                                    <Radio className="w-3.5 h-3.5 text-amber-300" />
+                                    <p className="text-xs font-semibold text-slate-200">Line Overlays</p>
+                                </div>
+                                <div className="space-y-1">
+                                    {workbench.lineOverlays.map(line => (
+                                        <div key={`${line.label}-${line.value}`} className="flex items-center justify-between gap-2 text-[11px]">
+                                            <span className="text-slate-300">{line.label}</span>
+                                            <span className={`font-mono ${line.inRange === false ? "text-slate-500" : "text-amber-200"}`}>
+                                                {fmt(line.value, 5)} {line.unit}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {workbench?.contourLevels && workbench.contourLevels.length > 0 && (
+                            <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                                <p className="text-xs font-semibold text-slate-200 mb-1">Contours</p>
+                                <p className="text-[11px] text-slate-400 font-mono">
+                                    {workbench.contourLevels.map(level => fmtSci(level, 2)).join(", ")} {workbench.rmsUnit || metadata.unit || ""}
+                                </p>
+                            </div>
+                        )}
+
+                        {workbench?.exports && workbench.exports.length > 0 && (
+                            <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                                <div className="flex items-center gap-2 mb-2">
+                                    <FileCode className="w-3.5 h-3.5 text-cyan-300" />
+                                    <p className="text-xs font-semibold text-slate-200">Export Commands</p>
+                                </div>
+                                <div className="flex flex-wrap gap-1.5">
+                                    {workbench.exports.map(item => (
+                                        <CopyCommandButton key={item.label} label={item.label} command={item.command} />
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {workbench?.evidence && (
+                            <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                                <div className="flex items-center justify-between gap-2 mb-2">
+                                    <p className="text-xs font-semibold text-slate-200">Evidence</p>
+                                    <span className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-400">
+                                        {workbench.evidence.confidence || "medium"} confidence
+                                    </span>
+                                </div>
+                                {workbench.evidence.dataAccess && (
+                                    <p className="text-[11px] text-slate-400 leading-relaxed">{workbench.evidence.dataAccess}</p>
+                                )}
+                                {workbench.evidence.headersInspected && workbench.evidence.headersInspected.length > 0 && (
+                                    <p className="mt-2 text-[10px] text-slate-500 font-mono">
+                                        Headers: {workbench.evidence.headersInspected.join(", ")}
+                                    </p>
+                                )}
+                                {workbench.evidence.assumptions && workbench.evidence.assumptions.length > 0 && (
+                                    <ul className="mt-2 space-y-1 text-[10px] text-slate-500">
+                                        {workbench.evidence.assumptions.slice(0, 3).map(item => (
+                                            <li key={item}>{item}</li>
+                                        ))}
+                                    </ul>
+                                )}
+                            </div>
+                        )}
 
                         <div className="flex flex-col gap-2">
                             <a
@@ -693,7 +989,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const columns = data.columns ?? [];
     const rows = data.rows ?? [];
     const isAlmaProducts = data.tableKind === "alma_products";
-    const { token } = useAuthStore();
+    const { token, openAuthModal } = useAuthStore();
     const [lightbox, setLightbox] = useState<{
         src: string; target?: string; ra?: string; dec?: string;
     } | null>(null);
@@ -703,6 +999,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
         row: Record<string, string | number>;
     } | null>(null);
     const [previewLoadingRow, setPreviewLoadingRow] = useState<number | null>(null);
+    const [workbenchLoadingRow, setWorkbenchLoadingRow] = useState<number | null>(null);
     const [previewError, setPreviewError] = useState<string | null>(null);
 
     const skyCoords = data.demographics?.skyCoords;
@@ -755,6 +1052,31 @@ export function DataTableCard({ data }: DataTableCardProps) {
             setPreviewError(error instanceof Error ? error.message : "Could not render FITS preview.");
         } finally {
             setPreviewLoadingRow(null);
+        }
+    };
+
+    const handleOpenWorkbench = async (row: Record<string, string | number>, rowIndex: number) => {
+        const url = String(row["_link"] || "");
+        if (!url) return;
+        if (!token) {
+            setPreviewError("Sign in to open a persistent FITS workbench session.");
+            openAuthModal();
+            return;
+        }
+        setPreviewError(null);
+        setWorkbenchLoadingRow(rowIndex);
+        try {
+            const session = await createWorkbenchSession({
+                source_url: url,
+                filename: optionalCellText(row.File),
+                project_code: optionalCellText(row["Proposal ID"]),
+                mous_uid: optionalCellText(row["MOUS ID"]),
+            }, token);
+            window.open(`/workbench/${encodeURIComponent(session.session_id)}`, "_blank", "noopener,noreferrer");
+        } catch (error) {
+            setPreviewError(error instanceof Error ? error.message : "Could not open FITS workbench.");
+        } finally {
+            setWorkbenchLoadingRow(null);
         }
     };
 
@@ -937,7 +1259,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                                         <button
                                                             type="button"
                                                             onClick={() => handlePreviewFits(row, ri)}
-                                                            disabled={previewLoadingRow === ri}
+                                                            disabled={previewLoadingRow === ri || workbenchLoadingRow === ri}
                                                             className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/10 rounded-md transition-colors disabled:opacity-60"
                                                         >
                                                             {previewLoadingRow === ri ? (
@@ -946,6 +1268,19 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                                                 <Eye className="w-3 h-3" />
                                                             )}
                                                             Preview
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleOpenWorkbench(row, ri)}
+                                                            disabled={workbenchLoadingRow === ri || previewLoadingRow === ri}
+                                                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/10 rounded-md transition-colors disabled:opacity-60"
+                                                        >
+                                                            {workbenchLoadingRow === ri ? (
+                                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                            ) : (
+                                                                <ExternalLink className="w-3 h-3" />
+                                                            )}
+                                                            Workbench
                                                         </button>
                                                         <a
                                                             href={String(row["_link"])}
