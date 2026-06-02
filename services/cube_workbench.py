@@ -32,6 +32,8 @@ DEFAULT_MAX_CACHE_BYTES = 500 * 1024 * 1024
 DEFAULT_USER_CACHE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_HEADER_RANGE_BYTES = 2 * 1024 * 1024
+DEFAULT_PREVIEW_MAX_SPATIAL_PIXELS = 512
+DEFAULT_PREVIEW_MAX_CHANNELS = 160
 WORKBENCH_JOB_OPERATIONS = {"prepare", "render", "spectrum", "pv_slice", "line_overlays", "export"}
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "canceled", "orphaned"}
 
@@ -129,6 +131,10 @@ class CubeWorkbenchService:
                 "ttl_seconds": DEFAULT_CACHE_TTL_SECONDS,
                 "prepared_at": None,
                 "error": "",
+                "preview": {
+                    "status": "not_prepared",
+                    "path": "",
+                },
             },
             "metadata": metadata,
             "evidence": evidence,
@@ -340,6 +346,7 @@ class CubeWorkbenchService:
         existing_path = Path(raw_existing_path) if raw_existing_path else None
         if existing_path and existing_path.exists() and not force:
             cached_bytes = existing_path.stat().st_size
+            preview = self._ensure_preview_product(session, existing_path)
             cache.update({
                 "status": "cached",
                 "cached_bytes": cached_bytes,
@@ -348,8 +355,15 @@ class CubeWorkbenchService:
                 "ttl_seconds": int(cache_ttl_seconds or DEFAULT_CACHE_TTL_SECONDS),
                 "prepared_at": cache.get("prepared_at") or int(time.time()),
                 "error": "",
+                "preview": preview,
             })
             session["status"] = "cached"
+            if preview.get("status") == "ready":
+                evidence = session.setdefault("evidence", {})
+                operations = list(evidence.get("operations") or [])
+                if "preview_product" not in operations:
+                    operations.append("preview_product")
+                evidence["operations"] = operations
             self._write_session(session)
             if progress_callback:
                 progress_callback(cached_bytes, cached_bytes)
@@ -400,6 +414,7 @@ class CubeWorkbenchService:
             tmp_path.replace(target_path)
             session["cache_path"] = str(target_path)
             session["status"] = "cached"
+            preview = self._ensure_preview_product(session, target_path)
             cache.update({
                 "status": "cached",
                 "cached_bytes": cached_bytes,
@@ -410,15 +425,24 @@ class CubeWorkbenchService:
                 "last_evictions": quota_result.get("evicted", []),
                 "prepared_at": int(time.time()),
                 "error": "",
+                "preview": preview,
             })
             evidence = session.setdefault("evidence", {})
             evidence["downloaded_bytes"] = cached_bytes
             operations = list(evidence.get("operations") or [])
             if "product_cache" not in operations:
                 operations.append("product_cache")
+            if preview.get("status") == "ready" and "preview_product" not in operations:
+                operations.append("preview_product")
             if quota_result.get("evicted") and "cache_eviction" not in operations:
                 operations.append("cache_eviction")
             evidence["operations"] = operations
+            if preview.get("status") == "failed":
+                warnings = list(evidence.get("warnings") or [])
+                message = f"Preview product generation failed: {preview.get('error')}"
+                if message not in warnings:
+                    warnings.append(message)
+                evidence["warnings"] = warnings
             if quota_result.get("evicted"):
                 evidence["cache_evictions"] = quota_result.get("evicted")
             self._write_session(session)
@@ -1258,6 +1282,160 @@ class CubeWorkbenchService:
             "evidence": session.get("evidence", {}),
         }
 
+    def _ensure_preview_product(self, session: Dict[str, Any], source_path: Path) -> Dict[str, Any]:
+        """Create a downsampled FITS preview product when the staged product is large enough."""
+        preview_path = self._preview_path_for(session)
+        max_spatial = self._preview_max_spatial_pixels()
+        max_channels = self._preview_max_channels()
+        try:
+            preview = self._build_preview_product(
+                source_path=source_path,
+                preview_path=preview_path,
+                max_spatial=max_spatial,
+                max_channels=max_channels,
+            )
+            return preview
+        except Exception as exc:
+            try:
+                if preview_path.exists():
+                    preview_path.unlink()
+            except OSError:
+                pass
+            return {
+                "status": "failed",
+                "path": "",
+                "error": str(exc),
+                "generated_at": int(time.time()),
+                "max_spatial_pixels": max_spatial,
+                "max_channels": max_channels,
+            }
+
+    def _build_preview_product(
+        self,
+        *,
+        source_path: Path,
+        preview_path: Path,
+        max_spatial: int,
+        max_channels: int,
+    ) -> Dict[str, Any]:
+        import numpy as np
+        from astropy.io import fits
+
+        with fits.open(source_path, memmap=True) as hdul:
+            hdu = self._science_hdu(hdul)
+            arr = np.asarray(hdu.data).squeeze()
+            if arr.ndim > 3:
+                arr = arr.reshape((-1, arr.shape[-2], arr.shape[-1]))
+            if arr.ndim < 2:
+                return {
+                    "status": "not_applicable",
+                    "path": "",
+                    "reason": "science HDU is not image-like",
+                    "source_shape": list(arr.shape),
+                    "generated_at": int(time.time()),
+                }
+
+            source_shape = list(arr.shape)
+            ny = int(arr.shape[-2])
+            nx = int(arr.shape[-1])
+            spatial_stride_y = max(1, int(math.ceil(ny / max(1, max_spatial))))
+            spatial_stride_x = max(1, int(math.ceil(nx / max(1, max_spatial))))
+            spectral_stride = 1
+            if arr.ndim >= 3:
+                spectral_stride = max(1, int(math.ceil(int(arr.shape[-3]) / max(1, max_channels))))
+
+            if spectral_stride == 1 and spatial_stride_y == 1 and spatial_stride_x == 1:
+                if preview_path.exists():
+                    preview_path.unlink()
+                return {
+                    "status": "not_needed",
+                    "path": "",
+                    "reason": "product is within preview limits",
+                    "source_shape": source_shape,
+                    "shape": source_shape,
+                    "spectral_stride": 1,
+                    "spatial_stride_y": 1,
+                    "spatial_stride_x": 1,
+                    "generated_at": int(time.time()),
+                    "max_spatial_pixels": max_spatial,
+                    "max_channels": max_channels,
+                }
+
+            if arr.ndim >= 3:
+                preview_data = arr[::spectral_stride, ::spatial_stride_y, ::spatial_stride_x]
+            else:
+                preview_data = arr[::spatial_stride_y, ::spatial_stride_x]
+            preview_data = np.asarray(preview_data, dtype=np.float32)
+            header = hdu.header.copy()
+            self._scale_preview_header(
+                header,
+                spectral_stride=spectral_stride,
+                spatial_stride_y=spatial_stride_y,
+                spatial_stride_x=spatial_stride_x,
+            )
+            fits.PrimaryHDU(data=preview_data, header=header).writeto(preview_path, overwrite=True)
+            return {
+                "status": "ready",
+                "path": str(preview_path),
+                "bytes": preview_path.stat().st_size,
+                "source_shape": source_shape,
+                "shape": list(preview_data.shape),
+                "spectral_stride": spectral_stride,
+                "spatial_stride_y": spatial_stride_y,
+                "spatial_stride_x": spatial_stride_x,
+                "generated_at": int(time.time()),
+                "max_spatial_pixels": max_spatial,
+                "max_channels": max_channels,
+            }
+
+    @staticmethod
+    def _scale_preview_header(
+        header: Any,
+        *,
+        spectral_stride: int,
+        spatial_stride_y: int,
+        spatial_stride_x: int,
+    ) -> None:
+        for axis, stride in ((1, spatial_stride_x), (2, spatial_stride_y), (3, spectral_stride)):
+            if stride <= 1:
+                continue
+            cdelt_key = f"CDELT{axis}"
+            crpix_key = f"CRPIX{axis}"
+            cdelt = CubeWorkbenchService._safe_float(header.get(cdelt_key))
+            crpix = CubeWorkbenchService._safe_float(header.get(crpix_key))
+            if cdelt is not None:
+                header[cdelt_key] = cdelt * stride
+            if crpix is not None:
+                header[crpix_key] = (crpix - 1.0) / stride + 1.0
+        history = (
+            "QUASAR preview product: "
+            f"spectral stride={spectral_stride}, y stride={spatial_stride_y}, x stride={spatial_stride_x}"
+        )
+        try:
+            header.add_history(history)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _preview_max_spatial_pixels() -> int:
+        return max(
+            64,
+            min(
+                4096,
+                CubeWorkbenchService._safe_int(os.getenv("QUASAR_WORKBENCH_PREVIEW_MAX_SPATIAL")) or DEFAULT_PREVIEW_MAX_SPATIAL_PIXELS,
+            ),
+        )
+
+    @staticmethod
+    def _preview_max_channels() -> int:
+        return max(
+            16,
+            min(
+                2048,
+                CubeWorkbenchService._safe_int(os.getenv("QUASAR_WORKBENCH_PREVIEW_MAX_CHANNELS")) or DEFAULT_PREVIEW_MAX_CHANNELS,
+            ),
+        )
+
     def _enforce_cache_limits(
         self,
         *,
@@ -1351,11 +1529,22 @@ class CubeWorkbenchService:
                 cached_bytes = cache_path.stat().st_size
             except OSError:
                 continue
+            preview_info = self._session_preview_info(session)
+            preview_path = Path(str(preview_info.get("path"))) if preview_info else None
+            preview_bytes = 0
+            if preview_path and preview_path.exists():
+                try:
+                    preview_bytes = preview_path.stat().st_size
+                except OSError:
+                    preview_bytes = 0
             records.append({
                 "session": session,
                 "session_path": path,
                 "cache_path": cache_path,
-                "bytes": cached_bytes,
+                "preview_path": preview_path,
+                "bytes": cached_bytes + preview_bytes,
+                "product_bytes": cached_bytes,
+                "preview_bytes": preview_bytes,
             })
         return records
 
@@ -1388,10 +1577,13 @@ class CubeWorkbenchService:
             if session_id in self._active_jobs:
                 return None
         cache_path = record.get("cache_path")
+        preview_path = record.get("preview_path")
         cached_bytes = int(record.get("bytes") or 0)
         try:
             if isinstance(cache_path, Path) and cache_path.exists():
                 cache_path.unlink()
+            if isinstance(preview_path, Path) and preview_path.exists():
+                preview_path.unlink()
         except OSError:
             return None
 
@@ -1403,6 +1595,12 @@ class CubeWorkbenchService:
             "eviction_reason": reason,
             "error": "",
         })
+        cache["preview"] = {
+            "status": "evicted",
+            "path": "",
+            "bytes": 0,
+            "evicted_at": int(time.time()),
+        }
         session["cache_path"] = ""
         if str(session.get("status") or "") == "cached":
             session["status"] = "cache_evicted"
@@ -1431,12 +1629,90 @@ class CubeWorkbenchService:
             suffix = ".fits"
         return self.cache_dir / f"{session['session_id']}{suffix}"
 
+    def _preview_path_for(self, session: Dict[str, Any]) -> Path:
+        return self.cache_dir / f"{session['session_id']}.preview.fits"
+
     @staticmethod
     def _session_cache_path(session: Dict[str, Any]) -> Path:
         raw_path = str(session.get("cache_path") or "")
         if not raw_path:
             return Path("__missing_workbench_cache__")
         return Path(raw_path)
+
+    @staticmethod
+    def _session_preview_info(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        cache = session.get("cache") if isinstance(session.get("cache"), dict) else {}
+        preview = cache.get("preview") if isinstance(cache.get("preview"), dict) else {}
+        preview_path = Path(str(preview.get("path") or ""))
+        if preview.get("status") == "ready" and preview_path.exists():
+            return dict(preview)
+        return None
+
+    @staticmethod
+    def _analysis_product_path(session: Dict[str, Any]) -> tuple[Path, Optional[Dict[str, Any]]]:
+        preview = CubeWorkbenchService._session_preview_info(session)
+        if preview:
+            return Path(str(preview["path"])), preview
+        return CubeWorkbenchService._session_cache_path(session), None
+
+    @staticmethod
+    def _preview_summary(preview: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not preview:
+            return None
+        return {
+            "status": preview.get("status"),
+            "bytes": preview.get("bytes"),
+            "source_shape": preview.get("source_shape"),
+            "shape": preview.get("shape"),
+            "spectral_stride": preview.get("spectral_stride"),
+            "spatial_stride_y": preview.get("spatial_stride_y"),
+            "spatial_stride_x": preview.get("spatial_stride_x"),
+        }
+
+    @staticmethod
+    def _scale_value_for_preview(value: Optional[float], stride: Any) -> Optional[float]:
+        if value is None:
+            return None
+        divisor = max(1.0, float(stride or 1.0))
+        return value / divisor
+
+    @staticmethod
+    def _scale_radius_for_preview(value: float, preview: Optional[Dict[str, Any]]) -> float:
+        if not preview:
+            return value
+        stride_x = max(1.0, float(preview.get("spatial_stride_x") or 1.0))
+        stride_y = max(1.0, float(preview.get("spatial_stride_y") or 1.0))
+        return max(0.5, value / ((stride_x + stride_y) / 2.0))
+
+    @staticmethod
+    def _scale_region_for_preview(region: Optional[Dict[str, float]], preview: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        clean = CubeWorkbenchService._clean_region(region)
+        if not clean or not preview:
+            return clean
+        stride_x = max(1.0, float(preview.get("spatial_stride_x") or 1.0))
+        stride_y = max(1.0, float(preview.get("spatial_stride_y") or 1.0))
+        return {
+            "x1": clean["x1"] / stride_x,
+            "y1": clean["y1"] / stride_y,
+            "x2": clean["x2"] / stride_x,
+            "y2": clean["y2"] / stride_y,
+        }
+
+    @staticmethod
+    def _scale_path_for_preview(path: List[Dict[str, float]], preview: Optional[Dict[str, Any]]) -> List[Dict[str, float]]:
+        clean = CubeWorkbenchService._clean_path(path)
+        if not preview:
+            return clean
+        stride_x = max(1.0, float(preview.get("spatial_stride_x") or 1.0))
+        stride_y = max(1.0, float(preview.get("spatial_stride_y") or 1.0))
+        return [{"x": point["x"] / stride_x, "y": point["y"] / stride_y} for point in clean]
+
+    @staticmethod
+    def _scale_channel_for_preview(channel: int, preview: Optional[Dict[str, Any]]) -> int:
+        if not preview:
+            return channel
+        stride = max(1, int(float(preview.get("spectral_stride") or 1)))
+        return int(round(channel / stride))
 
     @staticmethod
     def _copy_or_download(
@@ -1535,8 +1811,8 @@ class CubeWorkbenchService:
         import numpy as np
         from astropy.io import fits
 
-        cache_path = self._session_cache_path(session)
-        with fits.open(cache_path, memmap=True) as hdul:
+        product_path, preview = self._analysis_product_path(session)
+        with fits.open(product_path, memmap=True) as hdul:
             hdu = self._science_hdu(hdul)
             cube = self._cube_from_data(hdu.data)
             if cube is None:
@@ -1544,11 +1820,14 @@ class CubeWorkbenchService:
             nchan, ny, nx = cube.shape
             x = self._safe_float(extraction.get("x_pixel"))
             y = self._safe_float(extraction.get("y_pixel"))
+            x = self._scale_value_for_preview(x, preview.get("spatial_stride_x") if preview else 1)
+            y = self._scale_value_for_preview(y, preview.get("spatial_stride_y") if preview else 1)
             x_idx = int(round(x if x is not None else nx / 2))
             y_idx = int(round(y if y is not None else ny / 2))
             x_idx = max(0, min(nx - 1, x_idx))
             y_idx = max(0, min(ny - 1, y_idx))
             radius = max(0.5, float(extraction.get("aperture_radius_pixels") or 3.0))
+            radius = self._scale_radius_for_preview(radius, preview)
             r_int = int(math.ceil(radius))
             x0, x1 = max(0, x_idx - r_int), min(nx, x_idx + r_int + 1)
             y0, y1 = max(0, y_idx - r_int), min(ny, y_idx + r_int + 1)
@@ -1579,6 +1858,8 @@ class CubeWorkbenchService:
                 "x_label": axis.get("label", "Channel"),
                 "y_label": str(hdu.header.get("BUNIT") or metadata.get("unit") or "Intensity"),
                 "data_status": "computed",
+                "analysis_product": "preview" if preview else "full",
+                "preview": self._preview_summary(preview),
             }
 
     def _render_from_cache(
@@ -1596,8 +1877,8 @@ class CubeWorkbenchService:
         import numpy as np
         from astropy.io import fits
 
-        cache_path = self._session_cache_path(session)
-        with fits.open(cache_path, memmap=True) as hdul:
+        product_path, preview = self._analysis_product_path(session)
+        with fits.open(product_path, memmap=True) as hdul:
             hdu = self._science_hdu(hdul)
             data = np.array(hdu.data, copy=True).squeeze()
             cube = self._cube_from_data(data)
@@ -1611,9 +1892,11 @@ class CubeWorkbenchService:
                 nchan = cube.shape[0]
                 selected_mode = str(mode or "image").lower()
                 if selected_mode == "channel":
-                    channel_index = max(0, min(nchan - 1, int(channel if channel is not None else nchan // 2)))
+                    requested_channel = int(channel if channel is not None else nchan // 2)
+                    analysis_channel = self._scale_channel_for_preview(requested_channel, preview)
+                    channel_index = max(0, min(nchan - 1, analysis_channel))
                     image = np.asarray(cube[channel_index], dtype=float)
-                    label = f"Channel {channel_index}"
+                    label = f"Channel {requested_channel}" if not preview else f"Channel {requested_channel} (preview {channel_index})"
                 elif selected_mode == "moment":
                     moment_order = int(moment if moment is not None else 0)
                     image = self._moment_image(cube, moment_order)
@@ -1633,7 +1916,8 @@ class CubeWorkbenchService:
             if cube is None:
                 line_labels = []
 
-            rms, rms_payload = self._estimate_rms_with_region(image, rms_region)
+            analysis_rms_region = self._scale_region_for_preview(rms_region, preview)
+            rms, rms_payload = self._estimate_rms_with_region(image, analysis_rms_region)
             finite = image[np.isfinite(image)]
             stats = {
                 "rms": self._json_float(rms),
@@ -1644,6 +1928,8 @@ class CubeWorkbenchService:
                 "mean": self._json_float(np.nanmean(finite)) if finite.size else None,
                 "unit": str(hdu.header.get("BUNIT") or (session.get("metadata") or {}).get("unit") or ""),
                 "shape": list(image.shape),
+                "analysis_product": "preview" if preview else "full",
+                "preview": self._preview_summary(preview),
             }
             levels = [float(sigma) * rms for sigma in contour_sigma if rms and math.isfinite(float(sigma) * rms)]
             image_payload = self._render_image_data_url(
@@ -1659,6 +1945,8 @@ class CubeWorkbenchService:
             image_payload["channel"] = channel_index
             image_payload["line_labels"] = line_labels
             image_payload["data_status"] = "computed"
+            image_payload["analysis_product"] = "preview" if preview else "full"
+            image_payload["preview"] = self._preview_summary(preview)
             return image_payload, stats, {
                 "sigma": contour_sigma,
                 "levels": [self._json_float(level) for level in levels],
@@ -1932,15 +2220,17 @@ class CubeWorkbenchService:
         import numpy as np
         from astropy.io import fits
 
-        cache_path = self._session_cache_path(session)
-        with fits.open(cache_path, memmap=True) as hdul:
+        product_path, preview = self._analysis_product_path(session)
+        with fits.open(product_path, memmap=True) as hdul:
             hdu = self._science_hdu(hdul)
             cube = self._cube_from_data(hdu.data)
             if cube is None:
                 raise ValueError("Cached FITS product is not a spectral cube")
             nchan, ny, nx = cube.shape
-            points = self._sample_path_points(path, max_points=max_points)
-            radius = max(0, int(math.ceil(width_pixels / 2.0)))
+            analysis_path = self._scale_path_for_preview(path, preview)
+            points = self._sample_path_points(analysis_path, max_points=max_points)
+            analysis_width = self._scale_radius_for_preview(float(width_pixels or 3.0), preview)
+            radius = max(0, int(math.ceil(analysis_width / 2.0)))
             columns = []
             for point in points:
                 x_idx = max(0, min(nx - 1, int(round(point["x"]))))
@@ -1964,6 +2254,8 @@ class CubeWorkbenchService:
                 "data_url": image_url,
                 "data_status": "computed",
                 "shape": list(pv.shape),
+                "analysis_product": "preview" if preview else "full",
+                "preview": self._preview_summary(preview),
             }
 
     @staticmethod

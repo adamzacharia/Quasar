@@ -65,12 +65,15 @@ The second slice adds the first durable workbench boundary:
 - bounded remote FITS header inspection for workbench session creation, using
   streamed HTTP range bytes and first image/cube HDU detection without
   downloading full remote products
+- downsampled FITS preview products generated beside prepared products when
+  channel/spatial dimensions exceed preview limits, with render, spectrum, and
+  PV operations preferring the preview product and reporting that analysis source
 
 It still does not yet provide a tiled or background-rendered large-cube engine.
 Prepared products can now produce spectrum, PV, channel, and moment outputs, but
-tiled/downsampled remote previews, distributed/background worker execution,
-sky-coordinate region drawing, and richer multi-format figure export options still need to be
-completed.
+remote pixel-data range reads, tiled previews, distributed/background worker
+execution, sky-coordinate region drawing, and richer multi-format figure export
+options still need to be completed.
 
 ## Required Subsystems
 
@@ -193,9 +196,12 @@ Recommended starting limits:
 Current implementation has step 1 for workbench session creation using bounded,
 streamed range bytes and first image/cube HDU header detection. It has step 2
 with a per-request 500 MB default cap and explicit user-triggered preparation.
-It also has in-process durable job polling for long workbench actions plus
-per-user quota eviction for staged products. Step 3 and production worker
-orchestration are still pending.
+It now generates downsampled FITS preview products from staged products when
+channel/spatial dimensions exceed configured preview limits, and render,
+spectrum, and PV operations prefer that preview product. It also has in-process
+durable job polling for long workbench actions plus per-user quota eviction for
+staged products. Remote pixel-data range reads, tiled previews, and production
+worker orchestration are still pending.
 
 ### 6. Trust Layer
 
@@ -235,8 +241,10 @@ The frontend should display this as a persistent panel, not only as prose.
 - Persist and apply an RMS region for render-time noise estimates
 - Status: implemented for local/server-staged products under the configured
   cache cap. Bounded remote header range reads are implemented for session
-  metadata, but pixel-data range reads, distributed/background worker
-  orchestration, and preview-product generation are not complete.
+  metadata. Staged products can now generate downsampled FITS preview products
+  for faster render/spectrum/PV operations. Pixel-data range reads,
+  distributed/background worker orchestration, and tiled remote previews are not
+  complete.
 
 ### Phase B: Interactive Science Controls
 
@@ -289,9 +297,10 @@ The frontend should display this as a persistent panel, not only as prose.
   results. Staged products now have per-user cache accounting, default 2 GB
   quota enforcement, age/size eviction, and evicted-session state updates.
   Session creation now uses bounded remote FITS header range reads, including
-  extension-HDU image/cube header detection. A production worker queue,
-  resumability after restart, pixel-data range-read previews, and generated
-  downsampled preview products remain.
+  extension-HDU image/cube header detection. Prepared products now generate
+  downsampled preview FITS products when needed, and cache accounting/eviction
+  includes those preview files. A production worker queue, resumability after
+  restart, pixel-data range-read previews, and tiled previews remain.
 
 ## Decisions Needed
 

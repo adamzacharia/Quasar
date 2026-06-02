@@ -112,9 +112,19 @@ class MessageOutputItem:
 
 @dataclass
 class LLMUsage:
-    """Standardized usage token counting for all LLM providers."""
+    """Standardized usage token counting for all LLM providers.
+
+    For DeepSeek: the API returns prompt_cache_hit_tokens and
+    prompt_cache_miss_tokens which are priced at vastly different rates
+    (cache hits are 50-120× cheaper).  We carry both so Langfuse can
+    compute accurate costs instead of pricing everything at the
+    expensive cache-miss rate.
+    """
     input_tokens: int = 0
     output_tokens: int = 0
+    # DeepSeek cache-aware breakdown (None = not applicable / unknown)
+    cache_hit_tokens: Optional[int] = None
+    cache_miss_tokens: Optional[int] = None
 
 
 @dataclass
@@ -151,6 +161,70 @@ class StreamEvent:
     delta: str = ""
     # For response.output_item.added
     item: Optional[Any] = None
+
+
+# ---------------------------------------------------------------------------
+# Langfuse usage builder — cache-aware cost tracking
+# ---------------------------------------------------------------------------
+
+def _build_langfuse_usage(result: Any, provider: str) -> Optional[Dict[str, Any]]:
+    """Build a Langfuse-compatible usage dict from an LLM response.
+
+    For DeepSeek, the API returns prompt_cache_hit_tokens and
+    prompt_cache_miss_tokens which are priced at 50-120× lower rates
+    than cache misses.  Langfuse supports custom usage types in its
+    model pricing configuration, so we pass these as separate keys
+    so that costs are computed at the correct tier.
+
+    To make this work, create a custom model definition in Langfuse
+    (Settings → Models) for each DeepSeek model with usage types:
+        - prompt_cache_hit_tokens   → e.g. $0.003625 / 1M tokens
+        - prompt_cache_miss_tokens  → e.g. $0.435 / 1M tokens
+        - completion_tokens         → e.g. $0.87 / 1M tokens
+
+    For other providers, we pass standard input/output counts which
+    Langfuse prices using its built-in model definitions.
+    """
+    if result is None:
+        return None
+
+    usage_obj = getattr(result, 'usage', None)
+    if usage_obj is None:
+        return None
+
+    input_tokens = (
+        getattr(usage_obj, 'input_tokens', 0)
+        or getattr(usage_obj, 'prompt_tokens', 0)
+        or 0
+    )
+    output_tokens = (
+        getattr(usage_obj, 'output_tokens', 0)
+        or getattr(usage_obj, 'completion_tokens', 0)
+        or 0
+    )
+
+    # DeepSeek: use cache-aware breakdown for accurate Langfuse pricing
+    if provider == "deepseek":
+        cache_hit = getattr(usage_obj, 'cache_hit_tokens', None) or getattr(usage_obj, 'prompt_cache_hit_tokens', None)
+        cache_miss = getattr(usage_obj, 'cache_miss_tokens', None) or getattr(usage_obj, 'prompt_cache_miss_tokens', None)
+
+        if cache_hit is not None or cache_miss is not None:
+            return {
+                "prompt_cache_hit_tokens": int(cache_hit or 0),
+                "prompt_cache_miss_tokens": int(cache_miss or 0),
+                "completion_tokens": int(output_tokens),
+                "total": int(input_tokens) + int(output_tokens),
+                "unit": "TOKENS",
+            }
+
+    # All other providers: standard input/output
+    if input_tokens or output_tokens:
+        return {
+            "input": int(input_tokens),
+            "output": int(output_tokens),
+        }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -252,15 +326,7 @@ class ResponsesShim:
                     elapsed_ms = (_time.perf_counter() - t0) * 1000
                     try:
                         output_text = getattr(result, 'output_text', '') or ''
-                        # Try to extract usage from OpenAI native responses or custom LLMResponse
-                        usage = {}
-                        if hasattr(result, 'usage') and result.usage:
-                            input_tokens = getattr(result.usage, 'input_tokens', 0) or getattr(result.usage, 'prompt_tokens', 0)
-                            output_tokens = getattr(result.usage, 'output_tokens', 0) or getattr(result.usage, 'completion_tokens', 0)
-                            usage = {
-                                "input": input_tokens,
-                                "output": output_tokens,
-                            }
+                        usage = _build_langfuse_usage(result, provider)
                         lf_gen.end(
                             output=output_text[:2000],
                             usage=usage if usage else None,
@@ -270,9 +336,9 @@ class ResponsesShim:
                         pass
                 else:
                     # For streaming, wrap the generator/iterator to end the Langfuse generation when it completes!
-                    def wrap_generator(gen, gen_span, start_time):
+                    def wrap_generator(gen, gen_span, start_time, _provider=provider):
                         accumulated_text = []
-                        usage = None
+                        last_usage_obj = None
                         try:
                             for event in gen:
                                 yield event
@@ -288,12 +354,7 @@ class ResponsesShim:
                                     # Extract usage from completed/done event response
                                     resp = getattr(event, 'response', None)
                                     if resp and hasattr(resp, 'usage') and resp.usage:
-                                        input_tokens = getattr(resp.usage, 'input_tokens', 0) or getattr(resp.usage, 'prompt_tokens', 0)
-                                        output_tokens = getattr(resp.usage, 'output_tokens', 0) or getattr(resp.usage, 'completion_tokens', 0)
-                                        usage = {
-                                            "input": input_tokens,
-                                            "output": output_tokens,
-                                        }
+                                        last_usage_obj = resp
                                 except Exception:
                                     pass
                         except Exception as e_stream:
@@ -306,6 +367,7 @@ class ResponsesShim:
                             elapsed_ms = (_time.perf_counter() - start_time) * 1000
                             try:
                                 full_output = "".join(accumulated_text)
+                                usage = _build_langfuse_usage(last_usage_obj, _provider) if last_usage_obj else None
                                 gen_span.end(
                                     output=full_output[:2000],
                                     usage=usage,
@@ -1057,6 +1119,9 @@ class ResponsesShim:
             usage = LLMUsage(
                 input_tokens=getattr(resp.usage, 'prompt_tokens', 0),
                 output_tokens=getattr(resp.usage, 'completion_tokens', 0),
+                # DeepSeek cache-aware fields (present in DeepSeek API responses)
+                cache_hit_tokens=getattr(resp.usage, 'prompt_cache_hit_tokens', None),
+                cache_miss_tokens=getattr(resp.usage, 'prompt_cache_miss_tokens', None),
             )
 
         return LLMResponse(
@@ -1253,6 +1318,8 @@ class ResponsesShim:
                 usage_obj = LLMUsage(
                     input_tokens=getattr(chunk.usage, 'prompt_tokens', 0),
                     output_tokens=getattr(chunk.usage, 'completion_tokens', 0),
+                    cache_hit_tokens=getattr(chunk.usage, 'prompt_cache_hit_tokens', None),
+                    cache_miss_tokens=getattr(chunk.usage, 'prompt_cache_miss_tokens', None),
                 )
 
             choice = chunk.choices[0] if chunk.choices else None
