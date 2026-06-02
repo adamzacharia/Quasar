@@ -17,7 +17,6 @@ import { ObservationPaperGraph } from "./ObservationPaperGraph";
 import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
-type StreamPhase = "idle" | "thinking" | "tools" | "generating" | "done";
 
 function generateId(): string { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
 
@@ -50,10 +49,6 @@ export function ChatArea() {
         filename: string; downloaded_bytes: number;
         total_bytes: number | null; speed_kbps: number; percent: number | null;
     } | null>(null);
-    const [streamPhase, setStreamPhase] = useState<StreamPhase>("idle");
-    const [streamStatusLabel, setStreamStatusLabel] = useState("");
-    const [streamGrounded, setStreamGrounded] = useState(false);
-
     // ── Plan Review (Human-in-the-Loop) ─────────────────────────
     const [pendingPlan, setPendingPlan] = useState<PlanReviewData | null>(null);
     const [planSubmitting, setPlanSubmitting] = useState(false);
@@ -227,26 +222,8 @@ export function ChatArea() {
             abortControllerRef.current = null;
         }
         attachThinkingToLastMessage();
-        setStreamPhase("done");
-        setStreamStatusLabel("Stopped");
         setStreaming(false);
     }, [attachThinkingToLastMessage, setStreaming]);
-
-    const statusLooksLikeToolWork = useCallback((step: string): boolean => {
-        const normalized = step.toLowerCase();
-        return (
-            normalized.includes("calling tool")
-            || normalized.includes("querying ")
-            || normalized.includes("searching ")
-            || normalized.includes("cross-match")
-            || normalized.includes("alma")
-            || normalized.includes("mast")
-            || normalized.includes("jwst")
-            || normalized.includes("hst")
-            || normalized.includes("archive")
-            || normalized.includes("tap")
-        );
-    }, []);
 
     const handleSend = useCallback(async (text: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean }) => {
         const hasContent = text.trim() || (attachments && attachments.length > 0);
@@ -275,9 +252,6 @@ export function ChatArea() {
         addMessage(userMsg);
         setInputValue("");
         setStreaming(true);
-        setStreamPhase("thinking");
-        setStreamStatusLabel("Preparing request");
-        setStreamGrounded(Boolean(options?.groundedSummary));
         clearThinking();
         clearTaskExecution();
         setPendingPlan(null);
@@ -310,29 +284,19 @@ export function ChatArea() {
                 // RED TEAM TAC Workflow
                 await reviewProposal(firstPdf, {
                     onToken: (token: string) => {
-                        setStreamPhase("generating");
-                        setStreamStatusLabel("Writing final answer");
                         accumulated += token;
                         updateLastAssistantMessage(accumulated);
                     },
                     onStatus: (step: string, state: string) => {
-                        if (state === "running") {
-                            setStreamPhase(statusLooksLikeToolWork(step) ? "tools" : "thinking");
-                            setStreamStatusLabel(step);
-                        }
                         addThinkingStep(step, state as "running" | "completed");
                     },
                     onComplete: () => {
                         attachThinkingToLastMessage();
-                        setStreamPhase("done");
-                        setStreamStatusLabel("Done");
                         setStreaming(false);
                     },
                     onError: (error: string) => {
                         attachThinkingToLastMessage();
                         updateLastAssistantMessage(`Error: ${error}`);
-                        setStreamPhase("done");
-                        setStreamStatusLabel("Error");
                         setStreaming(false);
                     }
                 }, controller.signal);
@@ -350,16 +314,10 @@ export function ChatArea() {
                     },
                     {
                         onToken: (token: string) => {
-                            setStreamPhase("generating");
-                            setStreamStatusLabel(options?.groundedSummary ? "Writing grounded summary" : "Writing final answer");
                             accumulated += token;
                             updateLastAssistantMessage(accumulated);
                         },
                         onThought: (thought: string) => {
-                            if (!accumulated) {
-                                setStreamPhase("thinking");
-                                setStreamStatusLabel("Reasoning");
-                            }
                             accumulatedThought += thought;
                             updateLastAssistantThinking(accumulatedThought);
                         },
@@ -384,17 +342,6 @@ export function ChatArea() {
                             });
                         },
                         onStatus: (step: string, state: string) => {
-                            if (state === "running") {
-                                if (statusLooksLikeToolWork(step)) {
-                                    setStreamPhase("tools");
-                                    setStreamStatusLabel(step.replace(/^Calling tool:\s*/i, ""));
-                                } else if (!accumulated) {
-                                    setStreamPhase("thinking");
-                                    setStreamStatusLabel(step);
-                                }
-                            } else if (state === "completed" && !accumulated) {
-                                setStreamStatusLabel(step);
-                            }
                             addThinkingStep(step, state as "running" | "completed");
                         },
                         onData: (data: Record<string, unknown>) => {
@@ -524,8 +471,6 @@ export function ChatArea() {
                         },
                         onComplete: () => {
                             attachThinkingToLastMessage();
-                            setStreamPhase("done");
-                            setStreamStatusLabel("Done");
                             setStreaming(false);
                             // Reload conversation list from server so new/updated chats appear in sidebar
                             if (isAuthenticated && tokenRef.current) {
@@ -535,8 +480,6 @@ export function ChatArea() {
                         onError: (error: string) => {
                             attachThinkingToLastMessage();
                             updateLastAssistantMessage(`Error: ${error}`);
-                            setStreamPhase("done");
-                            setStreamStatusLabel("Error");
                             setStreaming(false);
                         },
                     },
@@ -546,8 +489,6 @@ export function ChatArea() {
         } catch (err) {
             const message = err instanceof Error ? err.message : "Request failed.";
             updateLastAssistantMessage(`Error: ${message}`);
-            setStreamPhase("done");
-            setStreamStatusLabel("Error");
             setStreaming(false);
         }
     }, [
@@ -572,7 +513,6 @@ export function ChatArea() {
         loadConversations,
         isAuthenticated,
         normalizeWebSourcesPayload,
-        statusLooksLikeToolWork,
     ]);
 
     // ── Plan review handlers ────────────────────────────────────
@@ -679,9 +619,6 @@ export function ChatArea() {
                                         thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
                                         thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
                                         taskExecutionState={execState}
-                                        streamPhase={isLastAssistantMsg ? streamPhase : "idle"}
-                                        streamStatusLabel={isLastAssistantMsg ? streamStatusLabel : ""}
-                                        groundedSummary={isLastAssistantMsg ? streamGrounded : false}
                                     />
                                 );
                             });

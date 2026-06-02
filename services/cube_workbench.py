@@ -31,6 +31,7 @@ DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "workbench
 DEFAULT_MAX_CACHE_BYTES = 500 * 1024 * 1024
 DEFAULT_USER_CACHE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_HEADER_RANGE_BYTES = 2 * 1024 * 1024
 WORKBENCH_JOB_OPERATIONS = {"prepare", "render", "spectrum", "pv_slice", "line_overlays", "export"}
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "canceled", "orphaned"}
 
@@ -2040,37 +2041,207 @@ class CubeWorkbenchService:
 
     def _metadata_for_source(self, source_url: str) -> Dict[str, Any]:
         local_path = self._local_path_from_source(source_url)
-        if not local_path:
-            return FITSProcessingService.extract_metadata_from_url(source_url)
+        if local_path:
+            try:
+                from astropy.io import fits
+
+                with fits.open(local_path, memmap=True) as hdul:
+                    hdu = self._science_hdu(hdul)
+                    header = hdu.header
+                    result = self._metadata_from_header(header, source_url, local_path.name)
+                    result["local_header_read"] = True
+                    return result
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "url": source_url,
+                    "filename": local_path.name,
+                    "error": f"Could not read local FITS header: {exc}",
+                }
+
+        metadata = self._metadata_for_remote_header_only(source_url)
+        if metadata.get("success") or metadata.get("header_only"):
+            return metadata
+
+        allow_full_fallback = str(os.getenv("QUASAR_WORKBENCH_ALLOW_FULL_HEADER_FALLBACK", "")).lower() in {"1", "true", "yes"}
+        if allow_full_fallback:
+            fallback = FITSProcessingService.extract_metadata_from_url(source_url)
+            if isinstance(fallback, dict):
+                fallback["full_header_fallback"] = True
+            return fallback
+        return metadata
+
+    def _metadata_for_remote_header_only(self, source_url: str) -> Dict[str, Any]:
+        """Read remote FITS metadata through bounded range bytes, never a full download."""
+        parsed = urlparse(source_url)
+        filename = Path(parsed.path).name or "remote_product.fits"
+        max_bytes = self._safe_int(os.getenv("QUASAR_WORKBENCH_HEADER_RANGE_BYTES")) or DEFAULT_HEADER_RANGE_BYTES
+        max_bytes = max(2880, min(int(max_bytes), 16 * 1024 * 1024))
+
+        base_payload: Dict[str, Any] = {
+            "success": False,
+            "url": source_url,
+            "filename": filename,
+            "header_only": True,
+            "range_header_read": True,
+            "header_range_limit_bytes": max_bytes,
+        }
 
         try:
-            from astropy.io import fits
+            response = requests.get(
+                source_url,
+                headers={"Range": f"bytes=0-{max_bytes - 1}"},
+                timeout=(10, 30),
+                stream=True,
+            )
+            base_payload["range_status_code"] = response.status_code
+            if response.headers.get("Content-Length"):
+                base_payload["response_content_length"] = self._safe_int(response.headers.get("Content-Length"))
+            if response.headers.get("Content-Range"):
+                base_payload["content_range"] = response.headers.get("Content-Range")
+            if response.headers.get("Content-Length") and response.status_code == 200:
+                base_payload["content_length"] = self._safe_int(response.headers.get("Content-Length"))
 
-            with fits.open(local_path, memmap=True) as hdul:
-                hdu = self._science_hdu(hdul)
-                header = hdu.header
-                result = FITSProcessingService._extract_science_metadata(header, source_url, local_path.name)
-                naxis = self._safe_int(header.get("NAXIS")) or 0
-                shape = []
-                for idx in range(int(naxis), 0, -1):
-                    axis_len = self._safe_int(header.get(f"NAXIS{idx}"))
-                    if axis_len:
-                        shape.append(axis_len)
-                if shape:
-                    result["shape"] = shape
-                    result["raw_shape"] = shape
-                    if len(shape) >= 3:
-                        result["channel_count"] = shape[-3]
-                result["unit"] = str(header.get("BUNIT") or result.get("bunit") or "")
-                result["local_header_read"] = True
-                return result
+            if response.status_code not in (200, 206):
+                base_payload["error"] = f"Remote FITS header range request returned HTTP {response.status_code}"
+                response.close()
+                return base_payload
+
+            chunks: List[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                remaining = max_bytes - total
+                if remaining <= 0:
+                    break
+                chunks.append(chunk[:remaining])
+                total += min(len(chunk), remaining)
+                if total >= max_bytes:
+                    break
+            response.close()
+
+            raw = b"".join(chunks)
+            base_payload["header_bytes_fetched"] = len(raw)
+            base_payload["range_truncated"] = response.status_code == 200 and (base_payload.get("content_length") or 0) > len(raw)
+            if len(raw) < 2880:
+                base_payload["error"] = f"Remote FITS response was too small for a FITS header ({len(raw)} bytes)"
+                return base_payload
+
+            parsed_header = self._first_image_header_from_fits_bytes(raw)
+            if not parsed_header:
+                base_payload["error"] = (
+                    "Could not find an image/cube FITS HDU inside the bounded header range. "
+                    "Prepare the product or increase QUASAR_WORKBENCH_HEADER_RANGE_BYTES for this source."
+                )
+                return base_payload
+
+            header = parsed_header["header"]
+            result = self._metadata_from_header(header, source_url, filename)
+            result.update(base_payload)
+            result.update({
+                "success": True,
+                "data_hdu_index": parsed_header["hdu_index"],
+                "header_offset_bytes": parsed_header["header_offset_bytes"],
+                "header_block_bytes": parsed_header["header_block_bytes"],
+                "data_offset_bytes": parsed_header["data_offset_bytes"],
+                "data_bytes_estimated": parsed_header["data_bytes_estimated"],
+                "header_strategy": "bounded_remote_range",
+            })
+            return result
         except Exception as exc:
-            return {
-                "success": False,
-                "url": source_url,
-                "filename": local_path.name,
-                "error": f"Could not read local FITS header: {exc}",
-            }
+            base_payload["error"] = f"Could not read remote FITS header via bounded range request: {exc}"
+            return base_payload
+
+    @staticmethod
+    def _metadata_from_header(header: Any, source_url: str, filename: str) -> Dict[str, Any]:
+        result = FITSProcessingService._extract_science_metadata(header, source_url, filename)
+        naxis = CubeWorkbenchService._safe_int(header.get("NAXIS")) or 0
+        shape = []
+        for idx in range(int(naxis), 0, -1):
+            axis_len = CubeWorkbenchService._safe_int(header.get(f"NAXIS{idx}"))
+            if axis_len:
+                shape.append(axis_len)
+        if shape:
+            result["shape"] = shape
+            result["raw_shape"] = shape
+            if len(shape) >= 3:
+                result["cube_shape"] = shape
+                result["channel_count"] = shape[-3]
+        result["unit"] = str(header.get("BUNIT") or result.get("bunit") or "")
+        result["header_hdu_type"] = str(header.get("XTENSION") or "PRIMARY")
+        return result
+
+    @staticmethod
+    def _first_image_header_from_fits_bytes(raw: bytes) -> Optional[Dict[str, Any]]:
+        from astropy.io import fits
+
+        offset = 0
+        hdu_index = 0
+        while offset + 2880 <= len(raw) and hdu_index < 32:
+            parsed = CubeWorkbenchService._parse_fits_header_block(raw, offset, fits)
+            if parsed is None:
+                return None
+            header, header_end = parsed
+            naxis = CubeWorkbenchService._safe_int(header.get("NAXIS")) or 0
+            has_image_axes = (
+                naxis >= 2
+                and CubeWorkbenchService._safe_int(header.get("NAXIS1")) is not None
+                and CubeWorkbenchService._safe_int(header.get("NAXIS2")) is not None
+            )
+            data_bytes = CubeWorkbenchService._fits_data_size_bytes(header)
+            if has_image_axes:
+                return {
+                    "header": header,
+                    "hdu_index": hdu_index,
+                    "header_offset_bytes": offset,
+                    "header_block_bytes": header_end - offset,
+                    "data_offset_bytes": header_end,
+                    "data_bytes_estimated": data_bytes,
+                }
+            next_offset = header_end + CubeWorkbenchService._fits_padded_size(data_bytes)
+            if next_offset <= offset or next_offset > len(raw):
+                return None
+            offset = next_offset
+            hdu_index += 1
+        return None
+
+    @staticmethod
+    def _parse_fits_header_block(raw: bytes, offset: int, fits_module: Any) -> Optional[tuple[Any, int]]:
+        for cursor in range(offset, len(raw) - 79, 80):
+            card = raw[cursor:cursor + 80]
+            if card.startswith(b"END"):
+                header_end = CubeWorkbenchService._fits_padded_size(cursor + 80 - offset) + offset
+                if header_end > len(raw):
+                    return None
+                header_text = raw[offset:header_end].decode("ascii", errors="ignore")
+                return fits_module.Header.fromstring(header_text, sep=""), header_end
+        return None
+
+    @staticmethod
+    def _fits_data_size_bytes(header: Any) -> int:
+        naxis = CubeWorkbenchService._safe_int(header.get("NAXIS")) or 0
+        if naxis <= 0:
+            return 0
+        gcount = CubeWorkbenchService._safe_int(header.get("GCOUNT")) or 1
+        pcount = CubeWorkbenchService._safe_int(header.get("PCOUNT")) or 0
+        xtension = str(header.get("XTENSION") or "").upper()
+        if xtension in {"BINTABLE", "TABLE"}:
+            row_bytes = CubeWorkbenchService._safe_int(header.get("NAXIS1")) or 0
+            row_count = CubeWorkbenchService._safe_int(header.get("NAXIS2")) or 0
+            return max(0, (row_bytes * row_count + pcount) * gcount)
+        bitpix = abs(CubeWorkbenchService._safe_int(header.get("BITPIX")) or 0)
+        bytes_per_value = max(0, bitpix // 8)
+        values = 1
+        for idx in range(1, naxis + 1):
+            axis = CubeWorkbenchService._safe_int(header.get(f"NAXIS{idx}")) or 0
+            values *= max(0, axis)
+        return max(0, values * bytes_per_value * gcount + pcount)
+
+    @staticmethod
+    def _fits_padded_size(size_bytes: int) -> int:
+        size = max(0, int(size_bytes or 0))
+        return int(math.ceil(size / 2880.0) * 2880) if size else 0
 
     @staticmethod
     def _local_path_from_source(source_url: str) -> Optional[Path]:
@@ -2108,19 +2279,38 @@ class CubeWorkbenchService:
         warnings = []
         if not success:
             warnings.append(str(metadata.get("error") or "FITS header metadata could not be read"))
+        if metadata.get("range_truncated"):
+            warnings.append("The remote server did not honor the range request; Quasar stopped after the bounded header byte limit.")
+        operations = ["session_create", "header_inspection"]
+        assumptions = [
+            "Session metadata is initialized from FITS headers when available.",
+            "Full-resolution cube access is deferred until the user prepares the product or a preview product is generated.",
+        ]
+        if metadata.get("range_header_read"):
+            operations.append("range_header_inspection")
+            assumptions.append(
+                "Remote workbench metadata was read from bounded FITS header bytes; image/cube pixel data was not downloaded."
+            )
+        if metadata.get("local_header_read"):
+            operations.append("local_header_inspection")
+        if metadata.get("data_hdu_index") not in (None, 0):
+            operations.append("extension_hdu_header_detection")
         return {
             "source_url": source_url,
             "archive": archive,
             "headers_inspected": inspected,
             "wcs_status": "present" if headers and headers.get("CTYPE1") and headers.get("CTYPE2") else "unknown",
             "spectral_axis_status": "present" if headers and headers.get("CTYPE3") else "unknown",
-            "operations": ["session_create", "header_inspection"],
-            "assumptions": [
-                "Session metadata is initialized from remote FITS headers when available.",
-                "Full-resolution cube access is deferred until render/cache endpoints are implemented.",
-            ],
+            "header_strategy": metadata.get("header_strategy") or ("local_header" if metadata.get("local_header_read") else "metadata_service"),
+            "header_bytes_fetched": metadata.get("header_bytes_fetched"),
+            "header_range_limit_bytes": metadata.get("header_range_limit_bytes"),
+            "range_status_code": metadata.get("range_status_code"),
+            "data_hdu_index": metadata.get("data_hdu_index"),
+            "data_bytes_estimated": metadata.get("data_bytes_estimated"),
+            "operations": operations,
+            "assumptions": assumptions,
             "warnings": warnings,
-            "confidence": "medium" if success else "low",
+            "confidence": "high" if success and metadata.get("range_header_read") else ("medium" if success else "low"),
         }
 
     @staticmethod

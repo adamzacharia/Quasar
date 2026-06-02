@@ -58,13 +58,18 @@ The second slice adds the first durable workbench boundary:
 - line markers on computed spectrum plots
 - line labels on cached channel/moment render images when the rendered spectral
   channel or moment range overlaps the latest line-ID result
+- rendered-image selection modes for click-to-set aperture, drag-to-set RMS box,
+  and drag-to-set PV line endpoints
 - computed spectrum CSV export and current render PNG export for prepared
   products
+- bounded remote FITS header inspection for workbench session creation, using
+  streamed HTTP range bytes and first image/cube HDU detection without
+  downloading full remote products
 
 It still does not yet provide a tiled or background-rendered large-cube engine.
 Prepared products can now produce spectrum, PV, channel, and moment outputs, but
 tiled/downsampled remote previews, distributed/background worker execution,
-drag-to-select regions, and richer multi-format figure export options still need to be
+sky-coordinate region drawing, and richer multi-format figure export options still need to be
 completed.
 
 ## Required Subsystems
@@ -185,10 +190,12 @@ Recommended starting limits:
 - per-user cache: 2 GB
 - session TTL: 24 hours
 
-Current implementation has step 2 with a per-request 500 MB default cap and
-explicit user-triggered preparation. It also has in-process durable job polling
-for long workbench actions plus per-user quota eviction for staged products.
-Steps 1, 3, and production worker orchestration are still pending.
+Current implementation has step 1 for workbench session creation using bounded,
+streamed range bytes and first image/cube HDU header detection. It has step 2
+with a per-request 500 MB default cap and explicit user-triggered preparation.
+It also has in-process durable job polling for long workbench actions plus
+per-user quota eviction for staged products. Step 3 and production worker
+orchestration are still pending.
 
 ### 6. Trust Layer
 
@@ -227,8 +234,9 @@ The frontend should display this as a persistent panel, not only as prose.
 - Compute render-time RMS and contour levels
 - Persist and apply an RMS region for render-time noise estimates
 - Status: implemented for local/server-staged products under the configured
-  cache cap. Remote range reads, distributed/background worker orchestration,
-  and preview-product generation are not complete.
+  cache cap. Bounded remote header range reads are implemented for session
+  metadata, but pixel-data range reads, distributed/background worker
+  orchestration, and preview-product generation are not complete.
 
 ### Phase B: Interactive Science Controls
 
@@ -241,8 +249,10 @@ The frontend should display this as a persistent panel, not only as prose.
 - Status: partially implemented. The dedicated route, channel/moment controls,
   contour controls, aperture spectrum planning, PV path planning, and cached
   render products exist. RMS-region controls are implemented as persisted pixel
-  boxes and are applied to render statistics/contours. A drag-to-select region
-  interaction is still pending.
+  boxes and are applied to render statistics/contours. The rendered image now
+  supports click-to-set aperture plus drag-to-set RMS boxes and PV lines in
+  pixel coordinates. Sky-coordinate region drawing and exact plot-margin-aware
+  selection remain.
 
 ### Phase C: WCS and Line Science
 
@@ -277,9 +287,11 @@ The frontend should display this as a persistent panel, not only as prose.
 - Status: partially implemented. Prepare/render/spectrum/PV can now run through
   durable in-process jobs with polling, progress, cancel requests, and terminal
   results. Staged products now have per-user cache accounting, default 2 GB
-  quota enforcement, age/size eviction, and evicted-session state updates. A
-  production worker queue, resumability after restart, remote range-read
-  previews, and generated downsampled preview products remain.
+  quota enforcement, age/size eviction, and evicted-session state updates.
+  Session creation now uses bounded remote FITS header range reads, including
+  extension-HDU image/cube header detection. A production worker queue,
+  resumability after restart, pixel-data range-read previews, and generated
+  downsampled preview products remain.
 
 ## Decisions Needed
 

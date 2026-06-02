@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type PointerEvent } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
@@ -48,6 +48,9 @@ import {
 
 type RenderMode = "image" | "channel" | "moment" | "pv";
 type ExportFormat = "casa" | "carta" | "ds9" | "python" | "notebook" | "csv" | "figure_png";
+type InteractionMode = "aperture" | "rms" | "pv";
+type ImagePoint = { x: number; y: number };
+type ViewBox = { left: number; top: number; width: number; height: number };
 
 const EXPORT_FORMATS: ExportFormat[] = ["casa", "carta", "ds9", "python", "notebook", "csv", "figure_png"];
 
@@ -88,6 +91,15 @@ function formatNumber(value: unknown, digits = 4): string {
         return parsed.toExponential(3);
     }
     return parsed.toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+
+function formatBytes(value: unknown): string {
+    const parsed = asNumber(value);
+    if (parsed === null) return "-";
+    if (parsed >= 1024 * 1024 * 1024) return `${(parsed / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (parsed >= 1024 * 1024) return `${(parsed / (1024 * 1024)).toFixed(1)} MB`;
+    if (parsed >= 1024) return `${(parsed / 1024).toFixed(1)} KB`;
+    return `${parsed} B`;
 }
 
 function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
@@ -273,6 +285,34 @@ function stateValue(state: Record<string, unknown> | undefined, key: string, fal
     return state && state[key] !== undefined ? state[key] : fallback;
 }
 
+function imageFitBox(containerWidth: number, containerHeight: number, imageWidth: number | null, imageHeight: number | null): ViewBox | null {
+    if (!imageWidth || !imageHeight || containerWidth <= 0 || containerHeight <= 0) return null;
+    const imageAspect = imageWidth / imageHeight;
+    const containerAspect = containerWidth / containerHeight;
+    let width = containerWidth;
+    let height = containerHeight;
+    if (containerAspect > imageAspect) {
+        width = containerHeight * imageAspect;
+    } else {
+        height = containerWidth / imageAspect;
+    }
+    return {
+        left: (containerWidth - width) / 2,
+        top: (containerHeight - height) / 2,
+        width,
+        height,
+    };
+}
+
+function clampImagePoint(point: ImagePoint, imageWidth: number | null, imageHeight: number | null): ImagePoint {
+    const maxX = Math.max(0, (imageWidth ?? 1) - 1);
+    const maxY = Math.max(0, (imageHeight ?? 1) - 1);
+    return {
+        x: Math.max(0, Math.min(maxX, point.x)),
+        y: Math.max(0, Math.min(maxY, point.y)),
+    };
+}
+
 export default function WorkbenchPage() {
     const params = useParams<{ sessionId: string }>();
     const sessionId = String(params.sessionId || "");
@@ -316,6 +356,9 @@ export default function WorkbenchPage() {
     const [pvX2, setPvX2] = useState("");
     const [pvY2, setPvY2] = useState("");
     const [pvWidth, setPvWidth] = useState(3);
+    const [interactionMode, setInteractionMode] = useState<InteractionMode>("aperture");
+    const [dragStart, setDragStart] = useState<ImagePoint | null>(null);
+    const [dragPreview, setDragPreview] = useState<ImagePoint | null>(null);
 
     const metadataRecord = metadata?.metadata ?? {};
     const state = renderPlan?.state ?? metadata?.state;
@@ -334,6 +377,13 @@ export default function WorkbenchPage() {
     const userCache = asRecord(cacheRecord.user_cache);
     const userCachedBytes = asNumber(userCache.cached_bytes);
     const userCacheLimitBytes = asNumber(userCache.limit_bytes);
+    const headerBytesFetched = asNumber(metadataRecord.header_bytes_fetched ?? evidence.header_bytes_fetched);
+    const headerRangeLimitBytes = asNumber(metadataRecord.header_range_limit_bytes ?? evidence.header_range_limit_bytes);
+    const headerStrategy = metadataRecord.range_header_read === true
+        ? `range ${formatBytes(headerBytesFetched)}${headerRangeLimitBytes ? ` / ${formatBytes(headerRangeLimitBytes)} cap` : ""}`
+        : metadataRecord.local_header_read === true
+            ? "local FITS header"
+            : asText(evidence.header_strategy, "metadata service");
     const activeJob = useMemo(() => {
         const selected = activeJobId ? jobs.find((job) => job.job_id === activeJobId) ?? null : null;
         if (selected && !isTerminalJob(selected)) return selected;
@@ -341,6 +391,59 @@ export default function WorkbenchPage() {
     }, [activeJobId, jobs]);
     const runningJob = activeJob && !isTerminalJob(activeJob) ? activeJob : null;
     const isBusy = Boolean(actionLoading || runningJob);
+    const aperturePoint = useMemo<ImagePoint | null>(() => {
+        const x = asNumber(apertureX);
+        const y = asNumber(apertureY);
+        return x === null || y === null ? null : clampImagePoint({ x, y }, imageWidth, imageHeight);
+    }, [apertureX, apertureY, imageHeight, imageWidth]);
+    const rmsRegion = useMemo(() => {
+        const x1 = asNumber(rmsX1);
+        const y1 = asNumber(rmsY1);
+        const x2 = asNumber(rmsX2);
+        const y2 = asNumber(rmsY2);
+        if (x1 === null || y1 === null || x2 === null || y2 === null) return null;
+        const start = clampImagePoint({ x: x1, y: y1 }, imageWidth, imageHeight);
+        const end = clampImagePoint({ x: x2, y: y2 }, imageWidth, imageHeight);
+        return {
+            x1: Math.min(start.x, end.x),
+            y1: Math.min(start.y, end.y),
+            x2: Math.max(start.x, end.x),
+            y2: Math.max(start.y, end.y),
+        };
+    }, [imageHeight, imageWidth, rmsX1, rmsX2, rmsY1, rmsY2]);
+    const pvLine = useMemo(() => {
+        const x1 = asNumber(pvX1);
+        const y1 = asNumber(pvY1);
+        const x2 = asNumber(pvX2);
+        const y2 = asNumber(pvY2);
+        if (x1 === null || y1 === null || x2 === null || y2 === null) return null;
+        return {
+            start: clampImagePoint({ x: x1, y: y1 }, imageWidth, imageHeight),
+            end: clampImagePoint({ x: x2, y: y2 }, imageWidth, imageHeight),
+        };
+    }, [imageHeight, imageWidth, pvX1, pvX2, pvY1, pvY2]);
+    const pointToPercent = useCallback((point: ImagePoint | null): ImagePoint | null => {
+        if (!point || !imageWidth || !imageHeight) return null;
+        const xMax = Math.max(1, imageWidth - 1);
+        const yMax = Math.max(1, imageHeight - 1);
+        return {
+            x: (point.x / xMax) * 100,
+            y: (1 - point.y / yMax) * 100,
+        };
+    }, [imageHeight, imageWidth]);
+    const aperturePercent = pointToPercent(aperturePoint);
+    const pvLinePercent = pvLine ? {
+        start: pointToPercent(pvLine.start),
+        end: pointToPercent(pvLine.end),
+    } : null;
+    const rmsRegionPercent = rmsRegion ? {
+        left: (rmsRegion.x1 / Math.max(1, (imageWidth ?? 1) - 1)) * 100,
+        top: (1 - rmsRegion.y2 / Math.max(1, (imageHeight ?? 1) - 1)) * 100,
+        width: ((rmsRegion.x2 - rmsRegion.x1) / Math.max(1, (imageWidth ?? 1) - 1)) * 100,
+        height: ((rmsRegion.y2 - rmsRegion.y1) / Math.max(1, (imageHeight ?? 1) - 1)) * 100,
+    } : null;
+    const dragStartPercent = pointToPercent(dragStart);
+    const dragPreviewPercent = pointToPercent(dragPreview);
 
     const renderSummary = useMemo(() => {
         const activeMode = asText(stateValue(state, "mode", mode));
@@ -507,6 +610,66 @@ export default function WorkbenchPage() {
             if (timer) window.clearTimeout(timer);
         };
     }, [activeJobId, applyJobResult, sessionId, token]);
+
+    const pointFromPointer = useCallback((event: PointerEvent<HTMLDivElement>): ImagePoint | null => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const fit = imageFitBox(rect.width, rect.height, imageWidth, imageHeight);
+        if (!fit || !imageWidth || !imageHeight) return null;
+        const localX = event.clientX - rect.left - fit.left;
+        const localY = event.clientY - rect.top - fit.top;
+        if (localX < 0 || localY < 0 || localX > fit.width || localY > fit.height) return null;
+        return clampImagePoint({
+            x: (localX / fit.width) * Math.max(1, imageWidth - 1),
+            y: (1 - localY / fit.height) * Math.max(1, imageHeight - 1),
+        }, imageWidth, imageHeight);
+    }, [imageHeight, imageWidth]);
+
+    const commitImageSelection = useCallback((start: ImagePoint, end: ImagePoint) => {
+        const cleanStart = clampImagePoint(start, imageWidth, imageHeight);
+        const cleanEnd = clampImagePoint(end, imageWidth, imageHeight);
+        if (interactionMode === "aperture") {
+            setApertureX(String(Math.round(cleanEnd.x)));
+            setApertureY(String(Math.round(cleanEnd.y)));
+            return;
+        }
+        if (interactionMode === "rms") {
+            setRmsX1(String(Math.round(Math.min(cleanStart.x, cleanEnd.x))));
+            setRmsY1(String(Math.round(Math.min(cleanStart.y, cleanEnd.y))));
+            setRmsX2(String(Math.round(Math.max(cleanStart.x, cleanEnd.x))));
+            setRmsY2(String(Math.round(Math.max(cleanStart.y, cleanEnd.y))));
+            return;
+        }
+        setPvX1(String(Math.round(cleanStart.x)));
+        setPvY1(String(Math.round(cleanStart.y)));
+        setPvX2(String(Math.round(cleanEnd.x)));
+        setPvY2(String(Math.round(cleanEnd.y)));
+    }, [imageHeight, imageWidth, interactionMode]);
+
+    const handleImagePointerDown = useCallback((event: PointerEvent<HTMLDivElement>) => {
+        if (!renderPlan?.image?.data_url || isBusy) return;
+        const point = pointFromPointer(event);
+        if (!point) return;
+        event.currentTarget.setPointerCapture(event.pointerId);
+        setDragStart(point);
+        setDragPreview(point);
+        if (interactionMode === "aperture") {
+            commitImageSelection(point, point);
+        }
+    }, [commitImageSelection, interactionMode, isBusy, pointFromPointer, renderPlan?.image?.data_url]);
+
+    const handleImagePointerMove = useCallback((event: PointerEvent<HTMLDivElement>) => {
+        if (!dragStart) return;
+        const point = pointFromPointer(event);
+        if (point) setDragPreview(point);
+    }, [dragStart, pointFromPointer]);
+
+    const handleImagePointerUp = useCallback((event: PointerEvent<HTMLDivElement>) => {
+        if (!dragStart) return;
+        const point = pointFromPointer(event) ?? dragPreview ?? dragStart;
+        commitImageSelection(dragStart, point);
+        setDragStart(null);
+        setDragPreview(null);
+    }, [commitImageSelection, dragPreview, dragStart, pointFromPointer]);
 
     const applyRenderPlan = async () => {
         await startOperationJob("render", {
@@ -1022,26 +1185,117 @@ export default function WorkbenchPage() {
                                             {colormap} / {stretch}
                                         </div>
                                     </div>
+                                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-2">
+                                        <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                            <SlidersHorizontal className="h-3.5 w-3.5" />
+                                            Image Select
+                                        </div>
+                                        <div className="grid grid-cols-3 gap-1">
+                                            {(["aperture", "rms", "pv"] as InteractionMode[]).map((item) => (
+                                                <button
+                                                    key={item}
+                                                    type="button"
+                                                    onClick={() => setInteractionMode(item)}
+                                                    className={`h-7 rounded-md border px-2 text-[11px] font-semibold uppercase transition-colors ${
+                                                        interactionMode === item
+                                                            ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-100"
+                                                            : "border-slate-800 bg-slate-900 text-slate-500 hover:border-slate-700 hover:text-slate-300"
+                                                    }`}
+                                                >
+                                                    {item}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
                                     <div className="grid min-h-[360px] place-items-center px-5">
                                         <div className="w-full max-w-3xl">
-                                            <div className="relative min-h-72 overflow-hidden rounded-md border border-slate-800 bg-slate-950">
+                                            <div
+                                                className={`relative h-[520px] min-h-72 overflow-hidden rounded-md border border-slate-800 bg-slate-950 touch-none select-none ${
+                                                    renderPlan?.image?.data_url && !isBusy ? "cursor-crosshair" : ""
+                                                }`}
+                                                onPointerDown={handleImagePointerDown}
+                                                onPointerMove={handleImagePointerMove}
+                                                onPointerUp={handleImagePointerUp}
+                                                onPointerCancel={() => {
+                                                    setDragStart(null);
+                                                    setDragPreview(null);
+                                                }}
+                                            >
                                                 {renderPlan?.image?.data_url ? (
                                                     // eslint-disable-next-line @next/next/no-img-element
                                                     <img
                                                         src={renderPlan.image.data_url}
                                                         alt={renderPlan.image.label || "Rendered FITS plane"}
-                                                        className="max-h-[520px] w-full object-contain"
+                                                        className="pointer-events-none absolute inset-0 h-full w-full object-contain"
                                                     />
                                                 ) : (
-                                                    <div className="relative h-72 bg-[linear-gradient(135deg,#111827_0%,#060a12_55%,#14212d_100%)]">
+                                                    <div className="relative h-full bg-[linear-gradient(135deg,#111827_0%,#060a12_55%,#14212d_100%)]">
                                                         <div className="absolute inset-x-8 top-1/2 h-px bg-cyan-300/20" />
                                                         <div className="absolute inset-y-8 left-1/2 w-px bg-cyan-300/20" />
                                                         <div className="absolute left-[18%] top-[22%] h-20 w-28 rounded-full border border-cyan-300/25 bg-cyan-300/5 blur-[1px]" />
                                                         <div className="absolute right-[18%] bottom-[20%] h-24 w-32 rounded-full border border-amber-300/20 bg-amber-300/5 blur-[1px]" />
                                                     </div>
                                                 )}
+                                                <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                                                    {rmsRegionPercent && (
+                                                        <rect
+                                                            x={rmsRegionPercent.left}
+                                                            y={rmsRegionPercent.top}
+                                                            width={rmsRegionPercent.width}
+                                                            height={rmsRegionPercent.height}
+                                                            fill="rgba(251, 191, 36, 0.08)"
+                                                            stroke="#fbbf24"
+                                                            strokeWidth="0.35"
+                                                            strokeDasharray="1 0.8"
+                                                        />
+                                                    )}
+                                                    {pvLinePercent?.start && pvLinePercent.end && (
+                                                        <line
+                                                            x1={pvLinePercent.start.x}
+                                                            y1={pvLinePercent.start.y}
+                                                            x2={pvLinePercent.end.x}
+                                                            y2={pvLinePercent.end.y}
+                                                            stroke="#38bdf8"
+                                                            strokeWidth="0.45"
+                                                            strokeLinecap="round"
+                                                        />
+                                                    )}
+                                                    {aperturePercent && (
+                                                        <g>
+                                                            <circle cx={aperturePercent.x} cy={aperturePercent.y} r="1.25" fill="none" stroke="#34d399" strokeWidth="0.35" />
+                                                            <line x1={aperturePercent.x - 1.9} y1={aperturePercent.y} x2={aperturePercent.x + 1.9} y2={aperturePercent.y} stroke="#34d399" strokeWidth="0.25" />
+                                                            <line x1={aperturePercent.x} y1={aperturePercent.y - 1.9} x2={aperturePercent.x} y2={aperturePercent.y + 1.9} stroke="#34d399" strokeWidth="0.25" />
+                                                        </g>
+                                                    )}
+                                                    {dragStartPercent && dragPreviewPercent && interactionMode === "rms" && (
+                                                        <rect
+                                                            x={Math.min(dragStartPercent.x, dragPreviewPercent.x)}
+                                                            y={Math.min(dragStartPercent.y, dragPreviewPercent.y)}
+                                                            width={Math.abs(dragPreviewPercent.x - dragStartPercent.x)}
+                                                            height={Math.abs(dragPreviewPercent.y - dragStartPercent.y)}
+                                                            fill="rgba(251, 191, 36, 0.12)"
+                                                            stroke="#fde68a"
+                                                            strokeWidth="0.35"
+                                                        />
+                                                    )}
+                                                    {dragStartPercent && dragPreviewPercent && interactionMode === "pv" && (
+                                                        <line
+                                                            x1={dragStartPercent.x}
+                                                            y1={dragStartPercent.y}
+                                                            x2={dragPreviewPercent.x}
+                                                            y2={dragPreviewPercent.y}
+                                                            stroke="#7dd3fc"
+                                                            strokeWidth="0.5"
+                                                            strokeLinecap="round"
+                                                            strokeDasharray="1 0.8"
+                                                        />
+                                                    )}
+                                                </svg>
                                                 <div className="absolute bottom-4 left-4 rounded border border-slate-700 bg-slate-950/90 px-2 py-1 font-mono text-[11px] text-slate-400">
                                                     {renderPlan?.image?.wcs_status === "present" ? "RA/Dec WCS" : shape.length ? `${shape.at(-2)} x ${shape.at(-1)}` : "image plane"}
+                                                </div>
+                                                <div className="absolute bottom-4 right-4 rounded border border-slate-700 bg-slate-950/90 px-2 py-1 font-mono text-[11px] text-slate-400">
+                                                    {interactionMode === "aperture" ? "click aperture" : interactionMode === "rms" ? "drag RMS box" : "drag PV line"}
                                                 </div>
                                             </div>
                                             <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
@@ -1250,6 +1504,10 @@ export default function WorkbenchPage() {
                                         <dd className="font-mono text-slate-200">{asText(metadataRecord.unit || metadataRecord.bunit || metadataRecord.BUNIT)}</dd>
                                     </div>
                                     <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3 px-4 py-3">
+                                        <dt className="text-slate-500">Header</dt>
+                                        <dd className="font-mono text-slate-200">{headerStrategy}</dd>
+                                    </div>
+                                    <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3 px-4 py-3">
                                         <dt className="text-slate-500">Cache</dt>
                                         <dd className="font-mono text-slate-200">
                                             {cacheStatus}{cachedBytes ? ` / ${(cachedBytes / (1024 * 1024)).toFixed(1)} MB` : ""}
@@ -1284,6 +1542,18 @@ export default function WorkbenchPage() {
                                         <div className="mb-1 font-semibold uppercase tracking-wide text-slate-500">Spectral Axis</div>
                                         <div className="text-slate-200">{asText(evidence.spectral_axis_status, "unknown")}</div>
                                     </div>
+                                    {Array.isArray(evidence.operations) && evidence.operations.length > 0 && (
+                                        <div>
+                                            <div className="mb-1 font-semibold uppercase tracking-wide text-slate-500">Operations</div>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {evidence.operations.slice(0, 8).map((item) => (
+                                                    <span key={String(item)} className="rounded-md border border-slate-800 bg-slate-900 px-2 py-1 font-mono text-[10px] text-slate-300">
+                                                        {String(item)}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
                                     {Array.isArray(evidence.headers_inspected) && evidence.headers_inspected.length > 0 && (
                                         <div>
                                             <div className="mb-1 font-semibold uppercase tracking-wide text-slate-500">Headers</div>
@@ -1297,6 +1567,16 @@ export default function WorkbenchPage() {
                                             <div className="mb-1 font-semibold uppercase tracking-wide text-slate-500">Assumptions</div>
                                             <ul className="space-y-1.5">
                                                 {evidence.assumptions.slice(0, 4).map((item) => (
+                                                    <li key={String(item)} className="leading-5">{String(item)}</li>
+                                                ))}
+                                            </ul>
+                                        </div>
+                                    )}
+                                    {Array.isArray(evidence.warnings) && evidence.warnings.length > 0 && (
+                                        <div>
+                                            <div className="mb-1 font-semibold uppercase tracking-wide text-slate-500">Warnings</div>
+                                            <ul className="space-y-1.5 text-amber-200">
+                                                {evidence.warnings.slice(0, 4).map((item) => (
                                                     <li key={String(item)} className="leading-5">{String(item)}</li>
                                                 ))}
                                             </ul>

@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, CheckCircle2, Circle, Wrench } from "lucide-react";
+import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message } from "../lib/types";
@@ -88,19 +88,6 @@ function MessageActions({ message }: { message: Message }) {
             </button>
         </div>
     );
-}
-
-function elapsedSecondsSince(startedAt: Date | number | string, nowMs = Date.now()): number {
-    const startedMs = startedAt instanceof Date ? startedAt.getTime() : new Date(startedAt).getTime();
-    if (!Number.isFinite(startedMs)) return 0;
-    return Math.max(0, Math.floor((nowMs - startedMs) / 1000));
-}
-
-function formatElapsed(seconds: number): string {
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
 }
 
 /**
@@ -208,104 +195,33 @@ function StreamingThinking({ text }: { text: string }) {
     );
 }
 
+function AnswerBuffer() {
+    return (
+        <div className="flex max-w-2xl items-center gap-2 px-1 text-xs text-slate-500">
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+            <span>Generating answer</span>
+        </div>
+    );
+}
+
 interface ChatMessageProps {
     message: Message;
     isStreaming?: boolean;
     thinkingSteps?: ThoughtStep[];
     thinkingStatus?: "idle" | "running" | "completed";
     taskExecutionState?: TaskExecutionState | null;
-    streamPhase?: "idle" | "thinking" | "tools" | "generating" | "done";
-    streamStatusLabel?: string;
-    groundedSummary?: boolean;
 }
 
-function StreamPhaseTracker({
-    phase = "idle",
-    statusLabel = "",
-    groundedSummary,
-}: {
-    phase?: "idle" | "thinking" | "tools" | "generating" | "done";
-    statusLabel?: string;
-    groundedSummary?: boolean;
-}) {
-    const phaseStartedAtRef = useRef(Date.now());
-    const previousPhaseRef = useRef(phase);
-    const [nowMs, setNowMs] = useState(() => Date.now());
-
-    useEffect(() => {
-        if (previousPhaseRef.current !== phase) {
-            previousPhaseRef.current = phase;
-            phaseStartedAtRef.current = Date.now();
-            setNowMs(Date.now());
-        }
-    }, [phase]);
-
-    useEffect(() => {
-        if (phase === "idle" || phase === "done") return;
-        const interval = window.setInterval(() => setNowMs(Date.now()), 1000);
-        return () => window.clearInterval(interval);
-    }, [phase]);
-
-    if (phase === "idle") return null;
-
-    const phases = [
-        { id: "thinking", label: "Thinking" },
-        { id: "tools", label: "Running tools" },
-        { id: "generating", label: "Generating answer" },
-        { id: "done", label: "Done" },
-    ] as const;
-    const currentIndex = phases.findIndex(item => item.id === phase);
-    const elapsed = elapsedSecondsSince(phaseStartedAtRef.current, nowMs);
-    const label = statusLabel || phases[Math.max(currentIndex, 0)]?.label || "Working";
-
-    return (
-        <div className="max-w-2xl rounded-xl border border-slate-700/60 bg-slate-900/45 px-3 py-2 shadow-sm">
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                {phases.map((item, index) => {
-                    const isActive = item.id === phase;
-                    const isComplete = currentIndex > index || phase === "done";
-                    return (
-                        <div key={item.id} className="flex items-center gap-1.5 text-xs">
-                            {isActive && phase !== "done" ? (
-                                item.id === "tools"
-                                    ? <Wrench className="size-3.5 shrink-0 animate-pulse text-primary" />
-                                    : <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" />
-                            ) : isComplete ? (
-                                <CheckCircle2 className="size-3.5 shrink-0 text-emerald-400" />
-                            ) : (
-                                <Circle className="size-3.5 shrink-0 text-slate-600" />
-                            )}
-                            <span className={isActive ? "font-semibold text-slate-100" : isComplete ? "text-slate-300" : "text-slate-600"}>
-                                {item.label}
-                            </span>
-                        </div>
-                    );
-                })}
-            </div>
-            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
-                <span className="truncate max-w-full">{label}</span>
-                {phase !== "done" && (
-                    <>
-                        <span className="h-3 w-px bg-slate-700" aria-hidden="true" />
-                        <span className="font-mono tabular-nums text-slate-500">{formatElapsed(elapsed)}</span>
-                    </>
-                )}
-                {groundedSummary && (
-                    <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
-                        Grounded
-                    </span>
-                )}
-            </div>
-        </div>
-    );
-}
-
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, streamPhase, streamStatusLabel, groundedSummary }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState }: ChatMessageProps) {
     const isUser = message.role === "user";
     const hasContent = !!message.content;
-    const hasThinking = (thinkingSteps && thinkingSteps.length > 0) || !!message.thinking;
+    const hasThinkingSteps = !!thinkingSteps?.length;
+    const hasThinking = hasThinkingSteps || !!message.thinking;
+    const hasRunningThinkingStep = thinkingSteps?.some(step => step.status === "running") ?? false;
+    const thinkingIsRunning = thinkingStatus === "running" && !hasContent && (!hasThinkingSteps || hasRunningThinkingStep);
+    const showAnswerBuffer = Boolean(isStreaming && !hasContent && hasThinking && !thinkingIsRunning);
 
-    const { user, isAuthenticated } = useAuthStore();
+    const { user } = useAuthStore();
     const userInitials = user?.display_name
         ? user.display_name.split(' ').filter(Boolean).map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
         : user?.username
@@ -520,17 +436,11 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         <span className="text-[10px] text-slate-500">{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
                     </div>
 
-                    <StreamPhaseTracker
-                        phase={streamPhase}
-                        statusLabel={streamStatusLabel}
-                        groundedSummary={groundedSummary}
-                    />
-
                     {/* Thinking Process Widget — rendered ABOVE content */}
                     {hasThinking && (
                         <ThoughtProcessWidget
                             title="Thinking"
-                            status={thinkingStatus === "running" && !hasContent ? "running" : "completed"}
+                            status={thinkingIsRunning ? "running" : "completed"}
                             steps={thinkingSteps || []}
                             forceCollapsed={hasContent}
                         >
@@ -548,6 +458,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             })()}
                         </ThoughtProcessWidget>
                     )}
+
+                    {showAnswerBuffer && <AnswerBuffer />}
 
                     {/* Multi-Agent Workforce — always visible (full when active, collapsed when done) */}
                     {taskExecutionState && (
