@@ -1056,6 +1056,28 @@ def _stream_chat_response(
                         from langchain_core.documents import Document as LCDocument
                         from services.vector_db import search_vectors, ensure_collection
 
+                        # Fast check 1: Skip short greetings / simple conversational chatter
+                        msg_clean = request.message.strip().lower().rstrip("?.! ")
+                        if msg_clean in {
+                            "hi", "hello", "hey", "hola", "thanks", "thank you", "ok", "okay", 
+                            "yes", "no", "cool", "great", "awesome", "perfect", "clear", 
+                            "how are you", "what's up", "good morning", "good afternoon", "good evening"
+                        } or len(msg_clean) < 4:
+                            return []
+
+                        # Fast check 2: Check if user has uploaded any personalization documents
+                        try:
+                            conn = _get_pers_db()
+                            row = conn.execute(
+                                "SELECT 1 FROM documents WHERE user_id=? LIMIT 1",
+                                (user_id,)
+                            ).fetchone()
+                            conn.close()
+                            if not row:
+                                return []
+                        except Exception as db_err:
+                            print(f"[PERSONAL_RAG] DB check failed: {db_err}")
+
                         collection_name = f"user_{user_id}_personal"
                         try:
                             ensure_collection(collection_name)
