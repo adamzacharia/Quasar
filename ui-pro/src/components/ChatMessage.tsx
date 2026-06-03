@@ -368,6 +368,9 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     }
 
     if (message.type === "papers" && message.papers && message.papers.length > 0) {
+        if (observationGraph) {
+            return null;
+        }
         const shouldScroll = message.papers.length > 6;
         return (
             <div className="pl-11">

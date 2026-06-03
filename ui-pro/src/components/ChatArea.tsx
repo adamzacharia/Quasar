@@ -65,21 +65,24 @@ export function ChatArea() {
         const graphs: Record<string, any> = {};
         let currentTurnMessages: Message[] = [];
         let currentTurnDataMessageIds: string[] = [];
+        let currentTurnMessageIds: string[] = [];
 
         for (const msg of messages) {
             if (msg.role === "user") {
                 if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
                     const graph = buildObservationPaperGraph(currentTurnMessages);
                     if (graph) {
-                        for (const dataId of currentTurnDataMessageIds) {
-                            graphs[dataId] = graph;
+                        for (const id of currentTurnMessageIds) {
+                            graphs[id] = graph;
                         }
                     }
                 }
                 currentTurnMessages = [];
                 currentTurnDataMessageIds = [];
+                currentTurnMessageIds = [];
             }
             currentTurnMessages.push(msg);
+            currentTurnMessageIds.push(msg.id);
             if (msg.type === "data") {
                 currentTurnDataMessageIds.push(msg.id);
             }
@@ -88,8 +91,8 @@ export function ChatArea() {
         if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
             const graph = buildObservationPaperGraph(currentTurnMessages);
             if (graph) {
-                for (const dataId of currentTurnDataMessageIds) {
-                    graphs[dataId] = graph;
+                for (const id of currentTurnMessageIds) {
+                    graphs[id] = graph;
                 }
             }
         }
