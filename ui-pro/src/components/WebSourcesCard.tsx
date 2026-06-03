@@ -2,7 +2,7 @@
 
 /* eslint-disable @next/next/no-img-element */
 import { useState } from "react";
-import { ExternalLink, Globe, ChevronRight, ShieldCheck } from "lucide-react";
+import { ExternalLink, Globe, ChevronRight, ChevronUp, ShieldCheck } from "lucide-react";
 import type { WebSource, WebImage } from "../lib/types";
 import { rankWebSources } from "../lib/evidence-quality";
 
@@ -130,15 +130,26 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                             );
                         })}
                     </div>
-                    {rankedSources.length > 4 && !showAllSources && (
-                        <button
-                            onClick={() => setShowAllSources(true)}
-                            className="flex items-center gap-1 text-xs hover:text-primary transition-colors mt-1"
-                            style={{ color: 'var(--q-text-muted)' }}
-                        >
-                            <span>View all {rankedSources.length} sources</span>
-                            <ChevronRight className="w-3 h-3" />
-                        </button>
+                    {rankedSources.length > 4 && (
+                        showAllSources ? (
+                            <button
+                                onClick={() => setShowAllSources(false)}
+                                className="flex items-center gap-1 text-xs hover:text-primary transition-colors mt-1"
+                                style={{ color: 'var(--q-text-muted)' }}
+                            >
+                                <span>Show less</span>
+                                <ChevronUp className="w-3 h-3" />
+                            </button>
+                        ) : (
+                            <button
+                                onClick={() => setShowAllSources(true)}
+                                className="flex items-center gap-1 text-xs hover:text-primary transition-colors mt-1"
+                                style={{ color: 'var(--q-text-muted)' }}
+                            >
+                                <span>View all {rankedSources.length} sources</span>
+                                <ChevronRight className="w-3 h-3" />
+                            </button>
+                        )
                     )}
                 </div>
             )}
