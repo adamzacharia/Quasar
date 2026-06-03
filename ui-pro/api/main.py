@@ -1044,8 +1044,7 @@ def _stream_chat_response(
         enriched_message = request.message
         if request.grounded_summary:
             yield _sse_status("Grounded summary mode enabled", "completed")
-        from services.rag_service import is_domain_relevant
-        if current_user and not request.grounded_summary and is_domain_relevant(request.message):
+        if current_user and not request.grounded_summary:
             user_id = current_user.get("sub")
             if user_id:
                 try:
@@ -1055,14 +1054,16 @@ def _stream_chat_response(
                         from services.rag_service import RAGService
 
                         svc = RAGService(user_id=user_id)
-                        return svc.search(request.message, k=4, include_personal=True)
+                        # Search personal collection with a 0.35 score threshold to filter out irrelevant chunks
+                        return svc.search(request.message, k=4, include_personal=True, min_score=0.35)
 
                     rag_docs = await loop2.run_in_executor(_executor, _rag_search)
-                    if rag_docs:
+                    personal_docs = [d for d in rag_docs if d.metadata.get("is_personal") is True]
+                    if personal_docs:
                         # Only show the step if there are actual personal docs
                         yield _sse_status("Searching personal knowledge base", "running")
                         ctx_lines = []
-                        for d in rag_docs:
+                        for d in personal_docs:
                             src = d.metadata.get("source_file", "personal doc")
                             ctx_lines.append(f"[From: {src}]\n{d.page_content.strip()}")
                         context_block = "\n\n---\n".join(ctx_lines)
