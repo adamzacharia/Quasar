@@ -7150,7 +7150,7 @@ IMPORTANT RULES:
                         _explicit_no_web = bool(re.search(
                             r'\b(?:no web search|dont search the web|dont use web search|without web search|no internet search)\b',
                             _uq
-                        ))
+                        )) or not web_search or "[GROUNDED_SUMMARY_MODE]" in query
 
                         if _explicit_no_web:
                             _needs_web_supplement = False
@@ -7205,6 +7205,8 @@ IMPORTANT RULES:
         
         # 3. Build tools list
         tools = self._build_tools_for_responses_api()
+        if not web_search:
+            tools = [t for t in tools if not (t.get("name", "").startswith("web_") or t.get("name", "") == "web_search")]
 
         # Emit model step
         if on_status:
