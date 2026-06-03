@@ -6576,6 +6576,17 @@ IMPORTANT RULES:
         Use deepseek-v4-flash to classify if a query requires web search.
         """
         try:
+            # 1. Direct keyword override for policy/time-sensitive queries
+            query_lower = query.lower()
+            policy_keywords = [
+                "proprietary period", "proprietary time", "deadline", "policy", "policies",
+                "guideline", "guidelines", "regulation", "regulations", "cycle 12", "cycle 13", "cycle 14",
+                "call for proposals", "call-for-proposals", "proposers guide", "proposer's guide"
+            ]
+            if any(kw in query_lower for kw in policy_keywords):
+                print(f"[WEB SEARCH DETECTION] Forcing web search due to policy keywords in query: '{query}'")
+                return True
+
             from core.llm_client import LLMClient
             # Instantiate deepseek-v4-flash client
             client = LLMClient(model="deepseek-v4-flash")
@@ -6602,7 +6613,7 @@ IMPORTANT RULES:
                 "2. Asks about current telescope operational status, schedules, or call-for-proposals deadlines (e.g., 'ALMA Cycle 14 deadlines', 'current status of GBT').\n"
                 "3. References dates, years, or events after 2024.\n"
                 "4. Requires highly specific or real-time web facts to answer accurately.\n"
-                "5. Asks about telescope rules, guidelines, policies, regulations, or proprietary periods that may change or be updated in real-time.\n\n"
+                "5. Asks about telescope rules, guidelines, policies, regulations, or proprietary periods that may change or be updated in real-time (e.g., 'What is the ALMA proprietary period?', 'HST public data policies').\n\n"
                 "Reply with NO if the query:\n"
                 "1. Asks for general physics/astronomy textbook knowledge, mathematical derivations, or static concepts (e.g., 'what is a black hole?', 'derive the Jeans mass', 'explain redshift').\n"
                 "2. Is purely conversational or a follow-up (e.g., 'hello', 'thank you', 'can you explain more?', 'now show me the band 7 of the same' when preceding messages refer to telescope observations).\n"
