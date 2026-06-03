@@ -339,6 +339,15 @@ export function ChatArea() {
                 }, controller.signal);
             } else {
                 // Standard workflow
+                let accumulatedWebSources: {
+                    sources: any[];
+                    images: any[];
+                    provider?: string;
+                    imageProvider?: string;
+                    searchType?: string;
+                    query?: string;
+                } | null = null;
+
                 await sendChatMessage(
                     {
                         message: messageWithContext,
@@ -474,14 +483,23 @@ export function ChatArea() {
                             const normalized = normalizeWebSourcesPayload(data);
                             if (normalized.sources.length === 0 && normalized.images.length === 0) return;
 
-                            mergeWebSourcesMessage({
-                                sources: normalized.sources,
-                                images: normalized.images,
-                                provider: normalized.provider,
-                                imageProvider: normalized.imageProvider,
-                                searchType: normalized.searchType,
-                                query: normalized.query,
-                            });
+                            if (!accumulatedWebSources) {
+                                accumulatedWebSources = {
+                                    sources: normalized.sources,
+                                    images: normalized.images,
+                                    provider: normalized.provider,
+                                    imageProvider: normalized.imageProvider,
+                                    searchType: normalized.searchType,
+                                    query: normalized.query,
+                                };
+                            } else {
+                                accumulatedWebSources.sources = [...accumulatedWebSources.sources, ...normalized.sources];
+                                accumulatedWebSources.images = [...accumulatedWebSources.images, ...normalized.images];
+                                if (normalized.provider) accumulatedWebSources.provider = normalized.provider;
+                                if (normalized.imageProvider) accumulatedWebSources.imageProvider = normalized.imageProvider;
+                                if (normalized.searchType) accumulatedWebSources.searchType = normalized.searchType;
+                                if (normalized.query) accumulatedWebSources.query = normalized.query;
+                            }
                         },
                         onDownloadProgress: (data) => {
                             setDownloadProgress(data);
@@ -509,6 +527,12 @@ export function ChatArea() {
                         },
                         onComplete: () => {
                             attachThinkingToLastMessage();
+                            
+                            // Merge web sources now that text generation is complete
+                            if (accumulatedWebSources) {
+                                mergeWebSourcesMessage(accumulatedWebSources);
+                            }
+                            
                             setStreaming(false);
                             // Reload conversation list from server so new/updated chats appear in sidebar
                             if (isAuthenticated && tokenRef.current) {
@@ -518,6 +542,12 @@ export function ChatArea() {
                         onError: (error: string) => {
                             attachThinkingToLastMessage();
                             updateLastAssistantMessage(`Error: ${error}`);
+                            
+                            // Merge web sources on error too if they were retrieved
+                            if (accumulatedWebSources) {
+                                mergeWebSourcesMessage(accumulatedWebSources);
+                            }
+                            
                             setStreaming(false);
                         },
                     },
