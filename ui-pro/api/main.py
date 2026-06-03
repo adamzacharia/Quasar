@@ -907,15 +907,23 @@ def _sse_error_response(message: str) -> StreamingResponse:
 
 def _extract_document_preview_text(filename: str, content_type: str, raw: bytes) -> str:
     """Best-effort text extraction used only when documents accompany images/FITS."""
-    import io
 
-    if content_type == "application/pdf":
+    # Detect PDFs by content_type OR filename extension.
+    # Browsers sometimes report application/octet-stream for PDFs, so the extension
+    # check is the reliable fallback that ensures DeepSeek always receives the text.
+    is_pdf = (
+        content_type == "application/pdf"
+        or (filename or "").lower().endswith(".pdf")
+    )
+    if is_pdf:
         try:
             import fitz  # PyMuPDF
 
             doc = fitz.open(stream=raw, filetype="pdf")
             text = "\n".join(page.get_text() for page in doc)
             doc.close()
+            if not text.strip():
+                return f"\n\n[PDF: {filename} - no extractable text (possibly a scanned image PDF)]"
             return f"\n\n### Attached PDF: {filename}\n{text[:8000]}"
         except ImportError:
             return f"\n\n[PDF: {filename} - install pymupdf to extract text]"
@@ -931,6 +939,7 @@ def _extract_document_preview_text(filename: str, content_type: str, raw: bytes)
             return f"\n\n[Binary file: {filename} ({len(raw)/1024:.1f} KB)]"
 
     return f"\n\n[Attached file: {filename} ({len(raw)/1024:.1f} KB)]"
+
 
 
 def _stream_chat_response(
