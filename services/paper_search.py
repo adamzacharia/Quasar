@@ -30,7 +30,7 @@ class NASAADSClient:
         # Build query based on what it looks like
         if self._looks_like_object(query_clean):
             # For astronomical objects, use AND to combine with radio
-            search_query = f'object:"{query_clean}" AND radio'
+            search_query = f'("{query_clean}" OR title:"{query_clean}" OR abstract:"{query_clean}") AND radio'
         else:
             # For other searches, just search for the terms
             if 'radio' not in query_clean.lower():

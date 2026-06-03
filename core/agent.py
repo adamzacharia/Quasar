@@ -601,7 +601,7 @@ GUIDELINES:
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
 - **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
-- **AUTO-LINKING LITERATURE**: Whenever you run `search_by_target` or `search_by_position` and find valid ALMA project/proposal codes in the results (e.g., "2021.1.00128.L"), you MUST automatically call `search_papers_by_observation_id` for the top 1 or 2 project codes immediately. This automatically retrieves the literature citing those projects, allowing the UI to connect them in the Observation-Paper Graph.
+- **AUTO-LINKING LITERATURE**: Whenever you run `search_by_target` or `search_by_position` and find valid ALMA project/proposal codes in the `top_project_codes` of the results (e.g., "2021.1.00128.L"), you MUST automatically call `search_papers_by_observation_id` for each of these top project codes immediately. This automatically retrieves the literature citing those projects, allowing the UI to connect them in the Observation-Paper Graph.
 - **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer — "Who is X?", "Tell me about X", "Where does X work?" — call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
   1. **Header**: "## Profile: [Full Name]" with email and personal webpage (from web search if available)
   2. **Identity**: ORCID, alternative name forms, current institution(s)
@@ -3621,12 +3621,33 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             if hasattr(results, 'columns') and 'access_url' in results.columns:
                 top_urls = results['access_url'].dropna().head(5).tolist()
 
+            # Extract unique project codes
+            top_projects = []
+            if hasattr(results, 'columns'):
+                project_col = next((col for col in ["proposal_id", "project_code", "Project", "obs_publisher_did"] if col in results.columns), None)
+                if project_col:
+                    raw_projects = results[project_col].dropna().astype(str).str.strip().unique()
+                    import re as _re_proj
+                    proj_regex = _re_proj.compile(r"\b\d{4}\.\d\.\d{5}\.[A-Za-z]\b")
+                    for p in raw_projects:
+                        match = proj_regex.search(p)
+                        if match:
+                            code = match.group(0).upper()
+                            if code not in top_projects:
+                                top_projects.append(code)
+                        elif len(p) >= 10 and '.' in p:
+                            p_upper = p.upper()
+                            if p_upper not in top_projects:
+                                top_projects.append(p_upper)
+                    top_projects = top_projects[:3]
+
             return {
                 "success": True,
                 "total_results": len(results),
                 "ra": ra, "dec": dec, "radius_deg": radius,
                 "top_mous_uids": top_mous,
                 "top_access_urls": top_urls,
+                "top_project_codes": top_projects,
                 "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
@@ -3912,6 +3933,26 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             if 'access_url' in results.columns:
                 top_urls = results['access_url'].dropna().head(5).tolist()
 
+            # Extract unique project codes
+            top_projects = []
+            if hasattr(results, 'columns'):
+                project_col = next((col for col in ["proposal_id", "project_code", "Project", "obs_publisher_did"] if col in results.columns), None)
+                if project_col:
+                    raw_projects = results[project_col].dropna().astype(str).str.strip().unique()
+                    import re as _re_proj
+                    proj_regex = _re_proj.compile(r"\b\d{4}\.\d\.\d{5}\.[A-Za-z]\b")
+                    for p in raw_projects:
+                        match = proj_regex.search(p)
+                        if match:
+                            code = match.group(0).upper()
+                            if code not in top_projects:
+                                top_projects.append(code)
+                        elif len(p) >= 10 and '.' in p:
+                            p_upper = p.upper()
+                            if p_upper not in top_projects:
+                                top_projects.append(p_upper)
+                    top_projects = top_projects[:3]
+
             return {
                 "success": True,
                 "total_results": len(results),
@@ -3919,6 +3960,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "target": target_name,
                 "top_mous_uids": top_mous,
                 "top_access_urls": top_urls,
+                "top_project_codes": top_projects,
                 "note": f"Found {len(results)} observations matching your constraints. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:

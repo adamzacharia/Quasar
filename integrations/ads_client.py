@@ -159,7 +159,7 @@ class ADSService:
     def search_by_target(self, target_name: str, max_results: int = 10) -> List[Dict[str, Any]]:
         """Search papers related to a specific astronomical target"""
         # Build query for astronomical target
-        query = f'object:"{target_name}" OR title:"{target_name}" OR abstract:"{target_name}"'
+        query = f'"{target_name}" OR title:"{target_name}" OR abstract:"{target_name}" OR keyword:"{target_name}"'
         query += ' AND (radio OR VLA OR ALMA OR "Very Large Array" OR VLBA OR GBT)'
         
         return self.search_papers(query, max_results)
@@ -529,10 +529,10 @@ class ADSService:
         if not term:
             query = "*:*"
         else:
-            # Use keyword: (ADS controlled vocabulary) + title: + object: for better precision
-            # than plain abstract: which catches tangential mentions
+            # Use keyword: (ADS controlled vocabulary) + title: + abstract: + plain text
+            # for better precision without causing SolrException
             query = (
-                f'keyword:"{term}" OR title:"{term}" OR object:"{term}"'
+                f'keyword:"{term}" OR title:"{term}" OR abstract:"{term}" OR "{term}"'
             )
         return {
             "query": query,
@@ -562,7 +562,7 @@ Return JSON with exactly these keys:
   title:"disk gaps"                — words in paper title (high precision)
   abstract:"dust continuum"        — words in abstract (medium precision, catches tangential mentions)
   body:"gap opening mechanism"     — full-text search inside the paper (use when abstract is too narrow)
-  object:"HL Tau"                  — SIMBAD/NED-linked object (catches ALL name variants automatically)
+  "HL Tau"                         — plain text search/object name (best for target/object searches)
   author:"Andrews, Sean"           — author name (Last, First)
   ^author:"Andrews, Sean"          — FIRST author only
   orcid:0000-0001-2345-6789        — search by ORCID
@@ -572,6 +572,10 @@ Return JSON with exactly these keys:
   inst:"Harvard"                   — institution/affiliation
   aff:"Max Planck"                 — affiliation text search
   facility:"ALMA"                  — facility metadata field (precise)
+
+  CRITICAL: Do NOT use "object:" or "simbad:" field prefixes (e.g. object:"HL Tau" is invalid).
+  These prefixes are not supported by the search API and cause 400 Bad Request (SolrException) errors.
+  Always search for target/object names as plain text or in title/abstract fields instead.
 
 ═══ TELESCOPE/FACILITY FILTERING ═══
 
@@ -630,8 +634,8 @@ Return JSON with exactly these keys:
    keyword: uses ADS controlled vocabulary and is far more precise.
    Only add abstract:"X" as a fallback OR if the topic is very niche.
 
-2. For OBJECT searches ("papers about HL Tau"), use object:"HL Tau".
-   This leverages SIMBAD cross-matching and catches all name variants.
+2. For OBJECT searches ("papers about HL Tau"), query the target name as plain text (e.g. "HL Tau").
+   Do NOT use "object:" or "simbad:" prefixes under any circumstances, as they cause API errors.
 
 3. For TELESCOPE searches ("ALMA papers on X"), use bibgroup:ALMA AND keyword:"X".
    Do NOT use abstract:"ALMA" — it catches papers that merely mention ALMA.
@@ -657,7 +661,7 @@ Return JSON with exactly these keys:
 → {"query": "bibgroup:ALMA AND (keyword:\\"protoplanetary disks\\" AND (title:\\"gap\\" OR title:\\"ring\\"))", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
 
 "papers about HL Tau"
-→ {"query": "object:\\"HL Tau\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+→ {"query": "\\"HL Tau\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
 
 "what are people reading about FRBs right now"
 → {"query": "trending(keyword:\\"fast radio bursts\\")", "sort": "score desc", "rows": 15}
