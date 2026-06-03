@@ -15,6 +15,7 @@ import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 import { WebSourcesCard } from "./WebSourcesCard";
 import { useChatStore } from "../lib/store";
+import { ObservationPaperGraph } from "./ObservationPaperGraph";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -235,9 +236,10 @@ interface ChatMessageProps {
     thinkingSteps?: ThoughtStep[];
     thinkingStatus?: "idle" | "running" | "completed";
     taskExecutionState?: TaskExecutionState | null;
+    observationGraph?: any;
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph }: ChatMessageProps) {
     const isUser = message.role === "user";
     const hasContent = !!message.content;
     const hasThinkingSteps = !!thinkingSteps?.length;
@@ -352,9 +354,16 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         const rows = message.dataTable.rows;
         if (!rows || rows.length === 0) return null;
         return (
-            <div className="pl-11">
-                <DataTableCard data={message.dataTable} />
-            </div>
+            <>
+                <div className="pl-11">
+                    <DataTableCard data={message.dataTable} />
+                </div>
+                {observationGraph && (
+                    <div className="mt-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                        <ObservationPaperGraph graph={observationGraph} />
+                    </div>
+                )}
+            </>
         );
     }
 

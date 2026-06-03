@@ -13,7 +13,6 @@ import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
 import { normalizeEvidenceQuality } from "../lib/evidence-quality";
 import { buildObservationPaperGraph } from "../lib/research-graph";
-import { ObservationPaperGraph } from "./ObservationPaperGraph";
 import { useAuthStore } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
@@ -61,7 +60,42 @@ export function ChatArea() {
     const activeConversation = conversations.find(c => c.id === activeConversationId);
     const isStarred = activeConversation?.isStarred || false;
     const scrollRef = useRef<HTMLDivElement>(null);
-    const observationPaperGraph = useMemo(() => buildObservationPaperGraph(messages), [messages]);
+
+    const turnGraphs = useMemo(() => {
+        const graphs: Record<string, any> = {};
+        let currentTurnMessages: Message[] = [];
+        let currentTurnDataMessageIds: string[] = [];
+
+        for (const msg of messages) {
+            if (msg.role === "user") {
+                if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
+                    const graph = buildObservationPaperGraph(currentTurnMessages);
+                    if (graph) {
+                        for (const dataId of currentTurnDataMessageIds) {
+                            graphs[dataId] = graph;
+                        }
+                    }
+                }
+                currentTurnMessages = [];
+                currentTurnDataMessageIds = [];
+            }
+            currentTurnMessages.push(msg);
+            if (msg.type === "data") {
+                currentTurnDataMessageIds.push(msg.id);
+            }
+        }
+
+        if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
+            const graph = buildObservationPaperGraph(currentTurnMessages);
+            if (graph) {
+                for (const dataId of currentTurnDataMessageIds) {
+                    graphs[dataId] = graph;
+                }
+            }
+        }
+
+        return graphs;
+    }, [messages]);
 
     // ── Smart auto-scroll ──────────────────────────────────────
     // Only scroll to bottom if the user hasn't manually scrolled up.
@@ -619,13 +653,11 @@ export function ChatArea() {
                                         thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
                                         thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
                                         taskExecutionState={execState}
+                                        observationGraph={turnGraphs[msg.id]}
                                     />
                                 );
                             });
                         })()}
-                        {observationPaperGraph && (
-                            <ObservationPaperGraph graph={observationPaperGraph} />
-                        )}
                         {pendingPlan && (
                             <PlanReviewWidget
                                 plan={pendingPlan}

@@ -23,7 +23,7 @@ function extractProjectCode(value) {
 }
 
 function normalizeMatchText(value) {
-    return asText(value).toLowerCase().replace(/\s+/g, " ");
+    return asText(value).toLowerCase().replace(/\s+/g, "");
 }
 
 function addNode(map, node) {
@@ -235,16 +235,11 @@ export function buildObservationPaperGraph(messages, options = {}) {
                 : paper.arxivId
                     ? `https://arxiv.org/abs/${paper.arxivId}`
                     : "";
-        addNode(nodes, {
-            id: paperId,
-            type: "paper",
-            label: paper.title || "Untitled paper",
-            detail: `${paper.year || "n.d."} / ${Number(paper.citationCount || 0)} citations`,
-            count: Number(paper.citationCount || 0),
-            url: paperUrl,
-        });
 
+        const localNodes = [];
+        const localEdges = [];
         let directLinks = 0;
+
         const observationLinks = normalizeObservationLinks(paper);
         for (const link of observationLinks) {
             const identifierId = nodeId("identifier", link.identifier);
@@ -254,16 +249,14 @@ export function buildObservationPaperGraph(messages, options = {}) {
                 identifierType: link.identifierType,
                 confidence: link.confidence,
             };
-            existing.count += 1;
-            explicitIdentifiers.set(identifierId, existing);
-            addNode(nodes, {
+            localNodes.push({
                 id: identifierId,
                 type: "identifier",
                 label: link.identifier,
                 detail: link.identifierType.replace(/_/g, " ") || "archive identifier",
-                count: existing.count,
+                _meta: { identifierId, existing }
             });
-            addEdge(edges, {
+            localEdges.push({
                 from: identifierId,
                 to: paperId,
                 label: link.relation || "explicit id",
@@ -273,7 +266,7 @@ export function buildObservationPaperGraph(messages, options = {}) {
         }
         for (const project of projectEntries) {
             if (paperText.includes(project.normalized.toLowerCase())) {
-                addEdge(edges, {
+                localEdges.push({
                     from: project.id,
                     to: paperId,
                     label: "mentions project",
@@ -284,7 +277,7 @@ export function buildObservationPaperGraph(messages, options = {}) {
         }
         for (const target of targetEntries) {
             if (paperText.includes(target.normalized)) {
-                addEdge(edges, {
+                localEdges.push({
                     from: target.id,
                     to: paperId,
                     label: "mentions target",
@@ -294,23 +287,30 @@ export function buildObservationPaperGraph(messages, options = {}) {
             }
         }
 
-        if (directLinks === 0 && dataTables.length > 0) {
-            const contextId = "provenance:session-literature";
-            addNode(nodes, {
-                id: contextId,
-                type: "provenance",
-                label: "Session literature",
-                detail: "Returned with this research context",
-                count: rankedPapers.length,
-            });
-            addEdge(edges, {
-                from: contextId,
-                to: paperId,
-                label: "context",
-                strength: 1,
-            });
-        } else {
+        if (directLinks > 0) {
             linkedPapers += 1;
+            addNode(nodes, {
+                id: paperId,
+                type: "paper",
+                label: paper.title || "Untitled paper",
+                detail: `${paper.year || "n.d."} / ${Number(paper.citationCount || 0)} citations`,
+                count: Number(paper.citationCount || 0),
+                url: paperUrl,
+            });
+
+            for (const node of localNodes) {
+                const { identifierId, existing } = node._meta;
+                existing.count += 1;
+                explicitIdentifiers.set(identifierId, existing);
+                
+                const cleanNode = { ...node, count: existing.count };
+                delete cleanNode._meta;
+                addNode(nodes, cleanNode);
+            }
+
+            for (const edge of localEdges) {
+                addEdge(edges, edge);
+            }
         }
     }
 
