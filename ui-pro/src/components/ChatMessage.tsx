@@ -204,6 +204,31 @@ function AnswerBuffer() {
     );
 }
 
+function InitialWaitingIndicator({ startTime }: { startTime: Date }) {
+    const [elapsed, setElapsed] = useState(() => Math.max(0, Math.round((Date.now() - startTime.getTime()) / 1000)));
+
+    useEffect(() => {
+        const interval = setInterval(() => {
+            setElapsed(Math.max(0, Math.round((Date.now() - startTime.getTime()) / 1000)));
+        }, 1000);
+        return () => clearInterval(interval);
+    }, [startTime]);
+
+    return (
+        <div className="flex items-center gap-3 py-1">
+            <div className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" style={{ animationDelay: '300ms' }} />
+            </div>
+            <span className="text-xs text-slate-500">
+                Waiting for response
+                <span className="font-mono ml-1.5 text-slate-600">{elapsed}s</span>
+            </span>
+        </div>
+    );
+}
+
 interface ChatMessageProps {
     message: Message;
     isStreaming?: boolean;
@@ -219,6 +244,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     const hasThinking = hasThinkingSteps || !!message.thinking;
     const thinkingIsRunning = thinkingStatus === "running" && !hasContent;
     const showAnswerBuffer = Boolean(isStreaming && hasContent);
+    // Show immediate waiting indicator when streaming but nothing has arrived yet
+    const showInitialWaiting = Boolean(isStreaming && !hasContent && !hasThinking && !taskExecutionState);
 
     const { user } = useAuthStore();
     const userInitials = user?.display_name
@@ -439,6 +466,9 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         <span className="text-[10px] text-slate-400 uppercase font-medium tracking-wider">Quasar AI</span>
                         <span className="text-[10px] text-slate-500">{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
                     </div>
+
+                    {/* Immediate waiting indicator — shown before any SSE events arrive */}
+                    {showInitialWaiting && <InitialWaitingIndicator startTime={message.timestamp} />}
 
                     {/* Thinking Process Widget — rendered ABOVE content */}
                     {hasThinking && (
