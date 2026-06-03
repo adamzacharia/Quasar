@@ -31,6 +31,7 @@ export interface Message {
     imageCaption?: string;
     thinkingSteps?: ThoughtStep[];
     thinking?: string;
+    thinkingDuration?: number;
     attachmentPreviews?: string[];  // base64 data URLs for images
     attachmentNames?: string[];     // names of attached documents
     webSources?: WebSource[];       // clickable source cards from web search

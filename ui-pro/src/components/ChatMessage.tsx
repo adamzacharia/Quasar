@@ -217,9 +217,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     const hasContent = !!message.content;
     const hasThinkingSteps = !!thinkingSteps?.length;
     const hasThinking = hasThinkingSteps || !!message.thinking;
-    const hasRunningThinkingStep = thinkingSteps?.some(step => step.status === "running") ?? false;
-    const thinkingIsRunning = thinkingStatus === "running" && !hasContent && (!hasThinkingSteps || hasRunningThinkingStep);
-    const showAnswerBuffer = Boolean(isStreaming && !thinkingIsRunning);
+    const thinkingIsRunning = thinkingStatus === "running" && !hasContent;
+    const showAnswerBuffer = Boolean(isStreaming && hasContent);
 
     const { user } = useAuthStore();
     const userInitials = user?.display_name
@@ -307,7 +306,12 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     <div className="size-8 rounded-xl flex items-center justify-center shrink-0 mt-1 overflow-hidden" style={{ background: 'var(--q-bg)' }}>
                         <img src="/quasar_logo.png" alt="Quasar" className="size-7 object-contain" />
                     </div>
-                    <ThoughtProcessWidget title={message.toolCall.displayName || message.toolCall.name} status={message.toolCall.status} steps={steps} />
+                    <ThoughtProcessWidget
+                        title={message.toolCall.displayName || message.toolCall.name}
+                        status={message.toolCall.status}
+                        steps={steps}
+                        startTime={message.timestamp}
+                    />
                 </div>
             </div>
         );
@@ -443,6 +447,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             status={thinkingIsRunning ? "running" : "completed"}
                             steps={thinkingSteps || []}
                             forceCollapsed={hasContent}
+                            startTime={message.timestamp}
+                            duration={message.thinkingDuration}
                         >
                             {message.thinking && (() => {
                                 if (thinkingStatus === "running") {

@@ -32,7 +32,12 @@ export function updateLastAssistantThinking(messages, thinking) {
 
 export function attachThinkingStepsToLastAssistant(messages, thinkingSteps) {
     const index = findLastAssistantTextIndex(messages);
-    const hasThinkingText = index >= 0 && Boolean(messages[index].thinking);
+    if (index < 0) {
+        return { messages, didAttach: false };
+    }
+
+    const assistantMsg = messages[index];
+    const hasThinkingText = Boolean(assistantMsg.thinking);
     if (thinkingSteps.length === 0 && !hasThinkingText) {
         return { messages, didAttach: false };
     }
@@ -40,11 +45,15 @@ export function attachThinkingStepsToLastAssistant(messages, thinkingSteps) {
     const finalSteps = thinkingSteps.map((step) =>
         step.status === "running" ? { ...step, status: "completed" } : step
     );
-    if (index < 0 || finalSteps.length === 0) {
-        return { messages, didAttach: hasThinkingText };
-    }
 
     const next = [...messages];
-    next[index] = { ...next[index], thinkingSteps: finalSteps };
+    const durationMs = Date.now() - new Date(assistantMsg.timestamp).getTime();
+    const durationSeconds = Math.max(1, Math.round(durationMs / 1000));
+
+    next[index] = {
+        ...assistantMsg,
+        thinkingSteps: finalSteps.length > 0 ? finalSteps : assistantMsg.thinkingSteps,
+        thinkingDuration: durationSeconds,
+    };
     return { messages: next, didAttach: true };
 }
