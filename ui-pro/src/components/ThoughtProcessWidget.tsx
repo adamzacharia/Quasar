@@ -15,20 +15,52 @@ interface ThoughtProcessWidgetProps {
     steps: ThoughtStep[];
     forceCollapsed?: boolean;
     children?: ReactNode;
+    startTime?: Date | string | number;
+    duration?: number;
 }
 
-export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceCollapsed, children }: ThoughtProcessWidgetProps) {
-    const [seconds, setSeconds] = useState(0);
+export function ThoughtProcessWidget({
+    title = "Thinking",
+    status,
+    steps,
+    forceCollapsed,
+    children,
+    startTime,
+    duration
+}: ThoughtProcessWidgetProps) {
+    const [seconds, setSeconds] = useState(() => {
+        if (status === "running" && startTime) {
+            const elapsed = Math.round((Date.now() - new Date(startTime).getTime()) / 1000);
+            return Math.max(0, elapsed);
+        }
+        return 0;
+    });
 
     useEffect(() => {
         if (status !== "running") return;
-        const interval = setInterval(() => setSeconds(s => s + 1), 1000);
+
+        // Update immediately on mount/status change to align with startTime
+        if (startTime) {
+            const elapsed = Math.round((Date.now() - new Date(startTime).getTime()) / 1000);
+            setSeconds(Math.max(0, elapsed));
+        }
+
+        const interval = setInterval(() => {
+            if (startTime) {
+                const elapsed = Math.round((Date.now() - new Date(startTime).getTime()) / 1000);
+                setSeconds(Math.max(0, elapsed));
+            } else {
+                setSeconds(s => s + 1);
+            }
+        }, 1000);
+
         return () => clearInterval(interval);
-    }, [status]);
+    }, [status, startTime]);
 
     const isOpen = forceCollapsed ? false : (status === "running" || steps.length <= 2);
     const isRunning = status === "running";
     const displayTitle = isRunning ? title : (title === "Thinking" ? "Thought" : title);
+    const displaySeconds = duration !== undefined ? duration : seconds;
 
     return (
         <div className="max-w-2xl my-3 rounded-xl overflow-hidden transition-all duration-300"
@@ -60,7 +92,7 @@ export function ThoughtProcessWidget({ title = "Thinking", status, steps, forceC
                                 color: 'var(--q-text-muted)',
                                 background: 'var(--q-glass-bg)',
                             }}>
-                                {isRunning ? `${seconds}s` : `${seconds}s`}
+                                {`${displaySeconds}s`}
                             </span>
                         </div>
                     </div>

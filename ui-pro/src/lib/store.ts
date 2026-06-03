@@ -173,6 +173,9 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     if (meta.thinking) {
         base.thinking = sanitizeAssistantContent(meta.thinking as string);
     }
+    if (meta.thinkingDuration || meta.thinking_duration) {
+        base.thinkingDuration = Number(meta.thinkingDuration || meta.thinking_duration);
+    }
 
     const messages: Message[] = [base];
 
