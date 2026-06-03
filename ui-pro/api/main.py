@@ -1041,6 +1041,7 @@ def _stream_chat_response(
             yield _sse_status(note, "completed")
 
         # Personal RAG retrieval for authenticated users only.
+        # Searches ONLY the user's personal Qdrant collection (not the shared ALMA docs).
         enriched_message = request.message
         if request.grounded_summary:
             yield _sse_status("Grounded summary mode enabled", "completed")
@@ -1050,17 +1051,40 @@ def _stream_chat_response(
                 try:
                     loop2 = asyncio.get_event_loop()
 
-                    def _rag_search():
-                        from services.rag_service import RAGService
+                    def _personal_rag_search():
+                        from langchain_openai import OpenAIEmbeddings
+                        from langchain_core.documents import Document as LCDocument
+                        from services.vector_db import search_vectors, ensure_collection
 
-                        svc = RAGService(user_id=user_id)
-                        # Search personal collection with a 0.35 score threshold to filter out irrelevant chunks
-                        return svc.search(request.message, k=4, include_personal=True, min_score=0.35)
+                        collection_name = f"user_{user_id}_personal"
+                        try:
+                            ensure_collection(collection_name)
+                        except Exception:
+                            return []
 
-                    rag_docs = await loop2.run_in_executor(_executor, _rag_search)
-                    personal_docs = [d for d in rag_docs if d.metadata.get("is_personal") is True]
+                        embeddings = OpenAIEmbeddings()
+                        query_vector = embeddings.embed_query(request.message)
+                        hits = search_vectors(collection_name, query_vector, limit=6)
+                        print(f"[PERSONAL_RAG] User={user_id}, Query='{request.message[:60]}', Hits={len(hits)}")
+                        if hits:
+                            for h in hits[:3]:
+                                print(f"  → score={h['score']:.4f}, file={h['payload'].get('source_file','?')}")
+
+                        # Filter by semantic score ≥ 0.25 (lower threshold for personal docs)
+                        results = []
+                        for hit in hits:
+                            if hit["score"] < 0.25:
+                                continue
+                            meta = {k: v for k, v in hit["payload"].items() if k != "text"}
+                            meta["_semantic_score"] = round(hit["score"], 4)
+                            results.append(LCDocument(
+                                page_content=hit["payload"].get("text", ""),
+                                metadata=meta,
+                            ))
+                        return results[:4]
+
+                    personal_docs = await loop2.run_in_executor(_executor, _personal_rag_search)
                     if personal_docs:
-                        # Only show the step if there are actual personal docs
                         yield _sse_status("Searching personal knowledge base", "running")
                         ctx_lines = []
                         for d in personal_docs:
