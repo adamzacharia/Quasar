@@ -21,8 +21,9 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 38    | 19    | 0           | 19      | 50%    |
-| **Total**              |**104**|**53** | **2**       | **49**  |**51%** |
+| Polish & Scale         | 40    | 21    | 0           | 19      | 53%    |
+| **Total**              |**106**|**55** | **2**       | **49**  |**52%** |
+
 
 ---
 
@@ -184,6 +185,8 @@ Without them, even great features feel broken.
 - [x] **PS36** Conditional Web Search Triggering & LLM-Based Intent Classification -- Resolved the issue of redundant web searches launching on every query by implementing conditional search logic: (1) web searches are always launched early and in parallel for researcher profile queries, explicit user search requests, and whenever RAG documentation searches yield relevant chunks; (2) otherwise, a fast intent classification call is made via deepseek-v4-flash to analyze the query and determine if it requires real-time information or fresh web data, routing standard textbook queries purely local/offline. (core/agent.py)
 - [x] **PS37** DeepSeek Cache-Aware Langfuse Cost Tracking -- Fixed Langfuse cost reporting that inflated DeepSeek costs by ~3× because all input tokens were priced at the expensive cache-miss rate. DeepSeek's API returns prompt_cache_hit_tokens and prompt_cache_miss_tokens separately (cache hits are 50-120× cheaper). (1) Extended LLMUsage dataclass with cache_hit_tokens/cache_miss_tokens fields; (2) Built _build_langfuse_usage() helper that emits cache-aware usage dicts for DeepSeek and standard input/output for other providers; (3) Updated both streaming and non-streaming Langfuse generation tracking to use the new builder; (4) Added scripts/setup_langfuse_models.py to configure custom model definitions with per-tier pricing in Langfuse. (core/llm_client.py + scripts/setup_langfuse_models.py)
 - [x] **PS38** Per-Query Observation-Paper Graph & Auto-Linking -- Moves the literature graph from a global bottom widget to an inline turn-scoped widget per data card, fixes space-insensitive target matching, removes false "Session literature" connections, and adds auto-linking in the system prompt to query papers for retrieved ALMA project codes (ui-pro/src/components/ChatArea.tsx + ui-pro/src/components/ChatMessage.tsx + ui-pro/src/lib/research-graph.js + core/agent.py)
+- [x] **PS39** Context-Aware Intent Routing & Web Search Control -- Fixed random web search triggers by passing recent conversation history to the LLM intent classifier to correctly distinguish domain terms like "Band 7" (ALMA bands) from general web terms. Added a manual Web Search Toggle to the frontend with complete override capability. (core/agent.py + ui-pro/api/main.py + ui-pro/src/components/PlusMenu.tsx)
+- [x] **PS40** Direct Personal RAG Search & Multimodal OCR Ingestion -- Bypassed combined RAG document mixing to route personal RAG queries directly to the user's specific collection, ensuring personal queries (e.g. travel dates) are retrieved. Added an automatic GPT-4o multimodal OCR vision transcription fallback for uploaded scanned/image-only PDFs while preserving original filenames in vector metadata. (services/rag_service.py + ui-pro/api/main.py)
 
 ---
 
@@ -209,4 +212,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-06-03 -- Quasar v3.3.9 (Per-query graph & literature auto-linking)*
+*Last updated: 2026-06-03 -- Quasar v3.4.0 (Personal RAG Direct Search & Multimodal OCR Ingestion)*
