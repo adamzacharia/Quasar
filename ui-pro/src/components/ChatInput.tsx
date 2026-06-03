@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck } from "lucide-react";
+import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck, Globe } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -12,7 +12,7 @@ interface AttachedFile {
 }
 
 interface ChatInputProps {
-    onSend: (message: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean }) => void;
+    onSend: (message: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean; webSearch?: boolean }) => void;
     onStop?: () => void;
     isStreaming: boolean;
     initialValue?: string;
@@ -23,6 +23,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
     const [hitCount, setHitCount] = useState<number | null>(null);
     const [groundedSummary, setGroundedSummary] = useState(false);
+    const [webSearch, setWebSearch] = useState(true);
     const [menuOpen, setMenuOpen] = useState(false);
     const inputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
@@ -96,7 +97,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
         e.preventDefault();
         const hasContent = value.trim() || attachments.length > 0;
         if (hasContent && !isStreaming) {
-            onSend(value.trim(), attachments.length > 0 ? attachments : undefined, { groundedSummary });
+            onSend(value.trim(), attachments.length > 0 ? attachments : undefined, { groundedSummary, webSearch });
             setValue("");
             setAttachments([]);
         }
@@ -170,7 +171,10 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                 >
                                     <PlusCircle className="w-5 h-5" />
                                     {groundedSummary && (
-                                        <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-card-dark" aria-hidden="true" />
+                                        <span className={`absolute ${webSearch ? "right-3.5" : "right-1.5"} top-1.5 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-card-dark`} aria-hidden="true" />
+                                    )}
+                                    {webSearch && (
+                                        <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-cyan-400 ring-2 ring-card-dark" aria-hidden="true" />
                                     )}
                                 </button>
 
@@ -223,6 +227,29 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                                 <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
                                                     groundedSummary
                                                         ? "translate-x-4 bg-emerald-300"
+                                                        : "translate-x-1 bg-slate-500"
+                                                }`} />
+                                            </span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            role="menuitemcheckbox"
+                                            aria-checked={webSearch}
+                                            onClick={() => setWebSearch(value => !value)}
+                                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                        >
+                                            <span className="flex min-w-0 items-center gap-3">
+                                                <Globe className={`h-4 w-4 ${webSearch ? "text-cyan-300" : "text-slate-500"}`} />
+                                                <span>Web Search</span>
+                                            </span>
+                                            <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                                                webSearch
+                                                    ? "border-cyan-400/50 bg-cyan-500/25"
+                                                    : "border-slate-700 bg-slate-900"
+                                            }`}>
+                                                <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
+                                                    webSearch
+                                                        ? "translate-x-4 bg-cyan-300"
                                                         : "translate-x-1 bg-slate-500"
                                                 }`} />
                                             </span>

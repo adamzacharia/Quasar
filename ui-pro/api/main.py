@@ -393,6 +393,7 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     model: Optional[str] = "gpt-4o"
     grounded_summary: bool = False
+    web_search: bool = True
 
 class RegisterRequest(BaseModel):
     username: str
@@ -1090,6 +1091,7 @@ def _stream_chat_response(
             conversation_id=request.conversation_id,
             model=requested_model,
             grounded_summary=request.grounded_summary,
+            web_search=request.web_search,
         )
 
         if requested_model != agent.config.model:
@@ -1139,6 +1141,16 @@ def _stream_chat_response(
                     try:
                         effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
 
+                        # Sync conversation memory to agent
+                        if conv_id:
+                            try:
+                                history = conversation_service.get_conversation_messages_for_user(conv_id, effective_user_id)
+                                if history:
+                                    agent.memory.sync_from_ui(history)
+                                    print(f"[MEMORY] Synced {len(history)} messages to agent memory.")
+                            except Exception as e:
+                                print(f"[WARN] Failed to sync conversation memory: {e}")
+
                         def _on_status(step: str, state: str):
                             asyncio.run_coroutine_threadsafe(queue.put(("status", step, state)), loop)
 
@@ -1154,6 +1166,7 @@ def _stream_chat_response(
                                 conversation_id=conv_id,
                                 plan_feedback_queue=_pfq,
                                 on_thought=on_thought,
+                                web_search=request.web_search,
                             )
                         finally:
                             # Clean up the plan feedback queue
@@ -2534,6 +2547,7 @@ async def chat_with_files(
     conversation_id: Optional[str] = Form(None),
     model: Optional[str] = Form("gpt-4o"),
     grounded_summary: bool = Form(False),
+    web_search: bool = Form(True),
     files: PyList[UploadFile] = File(default=[]),
     authorization: Optional[str] = Header(None),
 ):
@@ -2644,6 +2658,7 @@ async def chat_with_files(
         conversation_id=conversation_id,
         model=selected_model,
         grounded_summary=grounded_summary,
+        web_search=web_search,
     )
     return _stream_chat_response(req, authorization=auth_header, attachment_context=attachment_context)
 

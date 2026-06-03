@@ -7,6 +7,7 @@ export interface ChatRequest {
     attachments?: File[];
     token?: string;  // auth token for personal RAG
     grounded_summary?: boolean;
+    web_search?: boolean;
 }
 
 export interface StreamCallbacks {
@@ -71,6 +72,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             if (request.conversation_id) form.append("conversation_id", request.conversation_id);
             if (request.model) form.append("model", request.model);
             if (request.grounded_summary) form.append("grounded_summary", "true");
+            form.append("web_search", request.web_search !== false ? "true" : "false");
             request.attachments.forEach(f => form.append("files", f));
             const headers: Record<string, string> = {};
             if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
@@ -86,6 +88,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                     conversation_id: request.conversation_id,
                     model: request.model,
                     grounded_summary: Boolean(request.grounded_summary),
+                    web_search: request.web_search !== false,
                 }),
                 signal,
             });
