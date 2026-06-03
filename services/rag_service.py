@@ -273,18 +273,19 @@ def _classify_category(filename: str) -> str:
     return "general"
 
 
-def extract_document_metadata(file_path: str, pages_text: Optional[List[str]] = None) -> Dict[str, Any]:
+def extract_document_metadata(file_path: str, pages_text: Optional[List[str]] = None, original_filename: Optional[str] = None) -> Dict[str, Any]:
     """Extract rich metadata from a document file.
 
     Args:
         file_path:  Full path to the document.
         pages_text: Optional list of page texts (to avoid re-reading).
+        original_filename: Optional original filename if file_path is temporary.
 
     Returns:
         Dict with: doc_year, doc_category, doc_title, alma_cycle,
                    file_size_kb, total_pages, ingested_at.
     """
-    filename = os.path.basename(file_path)
+    filename = original_filename or os.path.basename(file_path)
 
     # Date detection (priority: filename → PDF metadata → content scan)
     year = _extract_year_from_filename(filename)
@@ -379,22 +380,106 @@ class RAGService:
     # Document loading
     # ------------------------------------------------------------------
 
+    def _ocr_pdf(self, file_path: str) -> List[Document]:
+        """OCR a scanned PDF using GPT-4o vision transcription."""
+        import fitz
+        import base64
+        from openai import OpenAI
+
+        print(f"[RAG] Attempting OCR vision transcription for {file_path}")
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            print("[RAG] No OPENAI_API_KEY found, cannot perform OCR.")
+            return []
+
+        client = OpenAI(api_key=openai_key)
+        documents = []
+
+        try:
+            doc = fitz.open(file_path)
+            for page_idx, page in enumerate(doc):
+                # Render page to an image
+                # 150 DPI is a good balance between speed/cost and quality
+                pix = page.get_pixmap(dpi=150)
+                img_bytes = pix.tobytes("png")
+                base64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+                # Call GPT-4o to transcribe the page
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a precise document transcription engine. "
+                                "Transcribe all text from the provided document page image exactly as it appears. "
+                                "Maintain the logical structure. Do not summarize. If there is no text, reply with nothing."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=2000,
+                    temperature=0.0,
+                )
+
+                transcribed_text = response.choices[0].message.content or ""
+                if transcribed_text.strip():
+                    documents.append(Document(
+                        page_content=transcribed_text,
+                        metadata={
+                            "page": page_idx,
+                            "source": file_path
+                        }
+                    ))
+            doc.close()
+            print(f"[RAG] Successfully OCR'd {len(documents)} pages from {file_path}")
+            return documents
+        except Exception as e:
+            print(f"[RAG] OCR fallback failed for {file_path}: {e}")
+            return []
+
     def _load_document(self, file_path: str) -> List[Document]:
         """Load document based on file type.
 
         Uses PyMuPDF4LLM for PDFs — significantly better at extracting text
         from scientific documents with multi-column layouts, equations, and tables.
+        Falls back to GPT-4o OCR if no readable text can be extracted.
         """
         ext = os.path.splitext(file_path)[1].lower()
 
         if ext == '.pdf':
-            loader = PyMuPDF4LLMLoader(file_path)
+            try:
+                loader = PyMuPDF4LLMLoader(file_path)
+                docs = loader.load()
+                # Check if it has any readable text
+                total_len = sum(len(d.page_content.strip()) for d in docs)
+                if total_len < 50:
+                    print(f"[RAG] PDF '{file_path}' has very little text ({total_len} chars). Triggering OCR vision fallback...")
+                    ocr_docs = self._ocr_pdf(file_path)
+                    if ocr_docs:
+                        return ocr_docs
+                return docs
+            except Exception as e:
+                print(f"[RAG] PyMuPDF4LLM failed to load '{file_path}': {e}. Triggering OCR vision fallback...")
+                ocr_docs = self._ocr_pdf(file_path)
+                if ocr_docs:
+                    return ocr_docs
+                raise
         elif ext in ['.txt', '.md']:
             loader = TextLoader(file_path, encoding='utf-8')
+            return loader.load()
         else:
             raise ValueError(f"Unsupported file type: {ext}")
-
-        return loader.load()
 
     # ------------------------------------------------------------------
     # Ingestion (with rich metadata)
@@ -406,6 +491,7 @@ class RAGService:
         personal: bool = False,
         progress_callback: Optional[Callable[[str, int], None]] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        original_filename: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ingest a single document into the vector store with rich metadata.
@@ -415,12 +501,13 @@ class RAGService:
             personal: If True, add to personal collection
             progress_callback: Function(status_msg, percent) for progress updates
             extra_metadata: Optional additional metadata to merge into each chunk
+            original_filename: Optional original filename if file_path is temporary
 
         Returns:
             Dict with success status, chunk count, extracted metadata, etc.
         """
         try:
-            filename = os.path.basename(file_path)
+            filename = original_filename or os.path.basename(file_path)
 
             # Step 1: Load document
             if progress_callback:
@@ -432,7 +519,7 @@ class RAGService:
                 progress_callback(f"Extracting metadata from {filename}...", 20)
 
             pages_text = [doc.page_content for doc in documents]
-            doc_meta = extract_document_metadata(file_path, pages_text)
+            doc_meta = extract_document_metadata(file_path, pages_text, original_filename=original_filename)
             total_pages = len(documents)
             doc_meta["total_pages"] = total_pages
 

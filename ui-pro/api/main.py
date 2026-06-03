@@ -2725,7 +2725,7 @@ async def personalization_upload(
             def _ingest():
                 from services.rag_service import RAGService
                 svc = RAGService(user_id=user_id)
-                return svc.ingest_document(tmp_path, personal=True)
+                return svc.ingest_document(tmp_path, personal=True, original_filename=f.filename)
 
             result = await loop.run_in_executor(_executor, _ingest)
 
