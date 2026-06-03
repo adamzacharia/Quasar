@@ -194,7 +194,7 @@ test("renders every identifier-linked paper in the graph by default", () => {
     assert.equal(graph.edges.filter((edge) => edge.label === "explicit_identifier_search").length, 14);
 });
 
-test("unmatched papers are connected through explicit session provenance", () => {
+test("unmatched papers are not connected through fallback provenance", () => {
     const graph = buildObservationPaperGraph([
         dataMessage(),
         {
@@ -218,6 +218,6 @@ test("unmatched papers are connected through explicit session provenance", () =>
 
     assert.ok(graph);
     assert.equal(graph.summary.linkedPapers, 0);
-    assert.ok(graph.nodes.some((node) => node.type === "provenance" && node.label === "Session literature"));
-    assert.ok(graph.edges.some((edge) => edge.label === "context"));
+    assert.ok(!graph.nodes.some((node) => node.type === "provenance" || node.label === "Session literature"));
+    assert.ok(!graph.edges.some((edge) => edge.label === "context"));
 });
