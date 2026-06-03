@@ -262,7 +262,7 @@ export function ChatArea() {
         setStreaming(false);
     }, [attachThinkingToLastMessage, setStreaming]);
 
-    const handleSend = useCallback(async (text: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean }) => {
+    const handleSend = useCallback(async (text: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean; webSearch?: boolean }) => {
         const hasContent = text.trim() || (attachments && attachments.length > 0);
         if (!hasContent || isStreaming) return;
 
@@ -348,6 +348,7 @@ export function ChatArea() {
                         attachments: attachments?.map(a => a.file),
                         token: tokenRef.current || undefined,  // always reads current auth state
                         grounded_summary: Boolean(options?.groundedSummary),
+                        web_search: Boolean(options?.webSearch),
                     },
                     {
                         onToken: (token: string) => {

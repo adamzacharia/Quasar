@@ -6580,9 +6580,23 @@ IMPORTANT RULES:
             # Instantiate deepseek-v4-flash client
             client = LLMClient(model="deepseek-v4-flash")
             
+            # Get recent conversation history (e.g. last 2 turns / 4 messages) to provide context
+            recent_turns = self.memory.get_last_n_turns(2)
+            history_str = ""
+            if recent_turns:
+                history_str = "Recent Conversation History:\n"
+                for msg in recent_turns:
+                    role_label = "User" if msg["role"] == "user" else "Assistant"
+                    content_preview = msg["content"]
+                    if len(content_preview) > 500:
+                        content_preview = content_preview[:500] + "... [truncated]"
+                    history_str += f"{role_label}: {content_preview}\n"
+                history_str += "\n"
+
             prompt = (
-                "Classify if this user query requires searching the web for real-time, current, or highly fresh information.\n\n"
-                f"Query: \"{query}\"\n\n"
+                "Classify if the new user query requires searching the web for real-time, current, or highly fresh information.\n\n"
+                f"{history_str}"
+                f"New Query: \"{query}\"\n\n"
                 "Reply with YES if the query:\n"
                 "1. Asks about recent astronomical events, discoveries, or news (e.g., 'latest news from JWST', 'recent coordinate changes of X', 'who won the Nobel prize in physics recently?').\n"
                 "2. Asks about current telescope operational status, schedules, or call-for-proposals deadlines (e.g., 'ALMA Cycle 14 deadlines', 'current status of GBT').\n"
@@ -6591,9 +6605,10 @@ IMPORTANT RULES:
                 "5. Asks about telescope rules, guidelines, policies, regulations, or proprietary periods that may change or be updated in real-time.\n\n"
                 "Reply with NO if the query:\n"
                 "1. Asks for general physics/astronomy textbook knowledge, mathematical derivations, or static concepts (e.g., 'what is a black hole?', 'derive the Jeans mass', 'explain redshift').\n"
-                "2. Is purely conversational or a follow-up (e.g., 'hello', 'thank you', 'can you explain more?').\n"
+                "2. Is purely conversational or a follow-up (e.g., 'hello', 'thank you', 'can you explain more?', 'now show me the band 7 of the same' when preceding messages refer to telescope observations).\n"
                 "3. Asks you to write code, scripts, or format something (e.g., 'write a python script to plot a fits file').\n"
-                "4. Asks for scientific papers or publications (these are searched via NASA ADS/arXiv tool, not general web search).\n\n"
+                "4. Asks for scientific papers or publications (these are searched via NASA ADS/arXiv tool, not general web search).\n"
+                "5. Is a follow-up query related to astronomical data, observations, or archives discussed in the recent conversation (e.g. asking for another band, project code, or target details of an observation already found).\n\n"
                 "Reply with ONLY one word: YES or NO"
             )
             
@@ -6624,6 +6639,7 @@ IMPORTANT RULES:
         conversation_id: Optional[str] = None,
         plan_feedback_queue=None,
         on_thought=None,
+        web_search: bool = False,
     ) -> str:
         # Assign a unique conversation_id if none provided (isolates anonymous
         # concurrent requests so they never share OpenAI response state).
@@ -6699,6 +6715,24 @@ IMPORTANT RULES:
         _explicit_no_web = bool(re.search(
             r'\b(?:no web search|dont search the web|dont use web search|without web search|no internet search)\b',
             _uq
+        )) or not web_search or "[GROUNDED_SUMMARY_MODE]" in query
+
+        # Skip web search for archive and paper queries (as they query dedicated live databases, not the web)
+        _is_archive_or_paper = bool(re.search(
+            r'\b(?:observation|observations|data|archive|band\s*\d|'
+            r'search_by|search_cadc|member_ous|mous|project_code|fits)\b',
+            _uq,
+        )) or bool(re.search(
+            r'\b(?:find|search|show|get|list|query|look\s*up)\b.*'
+            r'\b(?:observation|observations|data|archive)\b',
+            _uq,
+        )) or bool(re.search(
+            r'\b(?:alma|vla|vlba|gbt|jwst|hst|gemini|jcmt|cfht|chandra|xmm)\b.*'
+            r'\b(?:observation|observations|data|of)\b',
+            _uq,
+        )) or bool(re.search(
+            r'\b(?:papers?|publications?|articles?|literature|studies)\b',
+            _uq,
         ))
 
         # Detect OpenAlex-targeted researcher query (copied from below for early execution)
@@ -6725,7 +6759,7 @@ IMPORTANT RULES:
             elif _is_researcher_query:
                 _web_search_query = _user_query
                 _web_search_reason = "researcher_supplement"
-            else:
+            elif not _is_archive_or_paper:
                 # Check standard year/cutoff/freshness matches
                 _cutoff_match = self._detect_beyond_cutoff(_user_query)
                 if _cutoff_match:
