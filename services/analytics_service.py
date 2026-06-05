@@ -11,16 +11,13 @@ import json
 import os
 from datetime import datetime
 from typing import Dict, List, Optional
+from services.admin_access import configured_admin_emails, is_admin_email
 from services.db import get_connection
 from pathlib import Path
 
 
 # Admin email(s) allowed to access the analytics export
-ADMIN_EMAILS = [
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "").split(",")
-    if e.strip()
-]
+ADMIN_EMAILS = sorted(configured_admin_emails())
 
 _LOCAL_DB = str(Path(__file__).resolve().parent.parent / "data" / "analytics.db")
 
@@ -293,9 +290,7 @@ class AnalyticsService:
     @staticmethod
     def is_admin(email: str) -> bool:
         """Check if the given email is an admin."""
-        if not email:
-            return False
-        return email.strip().lower() in ADMIN_EMAILS
+        return is_admin_email(email)
 
     # ── response feedback (like/dislike) ─────────────────────────
 

@@ -35,11 +35,13 @@ import json
 import os
 import uuid
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from core.retry import with_retry
 from core.langfuse_integration import get_langfuse, _safe_serialize
+from services.secret_redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,59 @@ logger = logging.getLogger(__name__)
 # made inside tool executors are automatically parented to the right trace.
 import threading as _threading
 _langfuse_tls = _threading.local()
+_request_tls = _threading.local()
+
+
+@dataclass
+class LLMRequestContext:
+    """Request-scoped provider key and usage accounting context."""
+
+    provider_api_keys: Dict[str, str] = field(default_factory=dict)
+    key_source_by_provider: Dict[str, str] = field(default_factory=dict)
+    user_id: str = "anonymous"
+    user_email: str = ""
+    usage_recorder: Optional[Callable[..., None]] = None
+    quota_checker: Optional[Callable[..., None]] = None
+    byok_token_limits: Dict[str, Optional[int]] = field(default_factory=dict)
+
+
+@contextmanager
+def llm_request_context(
+    *,
+    provider_api_keys: Optional[Dict[str, str]] = None,
+    key_source_by_provider: Optional[Dict[str, str]] = None,
+    user_id: str = "anonymous",
+    user_email: str = "",
+    usage_recorder: Optional[Callable[..., None]] = None,
+    quota_checker: Optional[Callable[..., None]] = None,
+    byok_token_limits: Optional[Dict[str, Optional[int]]] = None,
+):
+    """Install request-local LLM key routing and usage accounting."""
+    previous = getattr(_request_tls, "context", None)
+    _request_tls.context = LLMRequestContext(
+        provider_api_keys=dict(provider_api_keys or {}),
+        key_source_by_provider=dict(key_source_by_provider or {}),
+        user_id=user_id or "anonymous",
+        user_email=user_email or "",
+        usage_recorder=usage_recorder,
+        quota_checker=quota_checker,
+        byok_token_limits=dict(byok_token_limits or {}),
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_request_tls, "context")
+            except AttributeError:
+                pass
+        else:
+            _request_tls.context = previous
+
+
+def get_llm_request_context() -> Optional[LLMRequestContext]:
+    """Return current request-local LLM context, if any."""
+    return getattr(_request_tls, "context", None)
 
 def set_langfuse_parent(parent):
     """Set the current thread's Langfuse trace/span parent for LLM calls."""
@@ -246,6 +301,39 @@ class ResponsesShim:
         self._llm = llm_client
         self._history_cache = {}  # response_id -> list of chat messages
 
+    def _record_usage(self, provider: str, model: str, result: Any) -> None:
+        """Record provider-reported token usage, if a request recorder is installed."""
+        context = get_llm_request_context()
+        recorder = context.usage_recorder if context else None
+        if recorder is None:
+            return
+        usage = getattr(result, "usage", None)
+        if usage is None:
+            return
+        try:
+            recorder(
+                provider=provider,
+                model=model,
+                key_source=self._llm._resolve_key_source(provider),
+                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            )
+        except Exception as exc:
+            logger.warning("[usage] Failed to record LLM usage: %s", redact_secrets(exc))
+
+    def _wrap_usage_stream(self, stream: Any, provider: str, model: str):
+        """Wrap a stream and record usage from the completed response event."""
+        last_response = None
+        try:
+            for event in stream:
+                response = getattr(event, "response", None)
+                if response is not None and getattr(response, "usage", None):
+                    last_response = response
+                yield event
+        finally:
+            if last_response is not None:
+                self._record_usage(provider, model, last_response)
+
     def create(self, **kwargs) -> Any:
         """
         Drop-in replacement for OpenAI's `client.responses.create(...)`.
@@ -269,6 +357,13 @@ class ResponsesShim:
         attachments = kwargs.pop("attachments", None)
         user_id = kwargs.pop("user_id", None)
         session_id = kwargs.pop("session_id", None) or kwargs.pop("conversation_id", None)
+        context = get_llm_request_context()
+        if context and context.quota_checker:
+            context.quota_checker(
+                provider=provider,
+                model=model,
+                key_source=self._llm._resolve_key_source(provider),
+            )
 
         # ── Langfuse: create a generation span if a parent trace exists ──
         lf_gen = None
@@ -364,7 +459,7 @@ class ResponsesShim:
                                     pass
                         except Exception as e_stream:
                             try:
-                                gen_span.update(metadata={"error": str(e_stream)[:500]})
+                                gen_span.update(metadata={"error": redact_secrets(e_stream)[:500]})
                             except Exception:
                                 pass
                             raise e_stream
@@ -383,14 +478,19 @@ class ResponsesShim:
 
                     result = wrap_generator(result, lf_gen, t0)
 
+            if stream:
+                result = self._wrap_usage_stream(result, provider, model)
+            else:
+                self._record_usage(provider, model, result)
+
             return result
 
         except Exception as e:
             # ── Langfuse: record the error on the generation ──
             if lf_gen:
                 try:
-                    lf_gen.update(metadata={"error": str(e)[:500]})
-                    lf_gen.end(output=f"ERROR: {e}")
+                    lf_gen.update(metadata={"error": redact_secrets(e)[:500]})
+                    lf_gen.end(output=f"ERROR: {redact_secrets(e)}")
                 except Exception:
                     pass
             raise
@@ -1445,8 +1545,15 @@ class LLMClient:
         print(resp.output_text)
     """
 
-    def __init__(self, model: str = "gpt-4o"):
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        provider_api_keys: Optional[Dict[str, str]] = None,
+        key_source_by_provider: Optional[Dict[str, str]] = None,
+    ):
         self.default_model = model
+        self.provider_api_keys = dict(provider_api_keys or {})
+        self.key_source_by_provider = dict(key_source_by_provider or {})
         self._responses_shim = ResponsesShim(self)
 
         # Lazy-loaded provider clients
@@ -1455,6 +1562,42 @@ class LLMClient:
         self._anthropic_client = None
         self._google_client = None
         self._local_client = None
+
+    @staticmethod
+    def _normalize_provider_key(provider: str) -> str:
+        provider = (provider or "").strip().lower()
+        return "google" if provider == "gemini" else provider
+
+    def _resolve_context_api_key(self, provider: str) -> Optional[str]:
+        provider = self._normalize_provider_key(provider)
+        if provider in self.provider_api_keys and self.provider_api_keys[provider]:
+            return self.provider_api_keys[provider]
+        context = get_llm_request_context()
+        if context and provider in context.provider_api_keys and context.provider_api_keys[provider]:
+            return context.provider_api_keys[provider]
+        return None
+
+    def _resolve_key_source(self, provider: str) -> str:
+        provider = self._normalize_provider_key(provider)
+        if provider in self.key_source_by_provider:
+            return self.key_source_by_provider.get(provider) or "platform"
+        context = get_llm_request_context()
+        if context and provider in context.key_source_by_provider:
+            return context.key_source_by_provider.get(provider) or "platform"
+        return "platform"
+
+    def _resolve_api_key(self, provider: str, env_name: str) -> tuple[str, str]:
+        provider = self._normalize_provider_key(provider)
+        context_key = self._resolve_context_api_key(provider)
+        if context_key:
+            return context_key, "byok"
+        api_key = os.getenv(env_name, "")
+        if not api_key:
+            raise ValueError(
+                f"{env_name} is required for {provider} models. "
+                "Set it in .env or add your own provider API key in Quasar settings."
+            )
+        return api_key, "platform"
 
     @property
     def responses(self) -> ResponsesShim:
@@ -1470,16 +1613,16 @@ class LLMClient:
         automatic cost analytics, rate limiting, and request logging.
         Sign up free at https://helicone.ai (100k requests/month free).
         """
+        from openai import OpenAI
+        context_key = self._resolve_context_api_key("openai")
+        if context_key:
+            return OpenAI(api_key=context_key)
         if self._openai_client is None:
-            from openai import OpenAI
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            if not api_key:
-                raise ValueError(
-                    "OPENAI_API_KEY is required for OpenAI models. "
-                    "Set it in .env or use a local model (prefix with 'local/')."
-                )
+            api_key, key_source = self._resolve_api_key("openai", "OPENAI_API_KEY")
 
             helicone_key = os.getenv("HELICONE_API_KEY", "")
+            if key_source == "byok":
+                return OpenAI(api_key=api_key)
             if helicone_key:
                 self._openai_client = OpenAI(
                     api_key=api_key,
@@ -1498,33 +1641,33 @@ class LLMClient:
 
     def _get_anthropic_client(self):
         """Get or create Anthropic client."""
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError("Install 'anthropic' package: pip install anthropic")
+        context_key = self._resolve_context_api_key("anthropic")
+        if context_key:
+            return anthropic.Anthropic(api_key=context_key)
         if self._anthropic_client is None:
-            try:
-                import anthropic
-            except ImportError:
-                raise ImportError("Install 'anthropic' package: pip install anthropic")
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if not api_key:
-                raise ValueError(
-                    "ANTHROPIC_API_KEY is required for Claude models. "
-                    "Set it in .env or use a local model (prefix with 'local/')."
-                )
+            api_key, key_source = self._resolve_api_key("anthropic", "ANTHROPIC_API_KEY")
+            if key_source == "byok":
+                return anthropic.Anthropic(api_key=api_key)
             self._anthropic_client = anthropic.Anthropic(api_key=api_key)
         return self._anthropic_client
 
     def _get_google_client(self):
         """Get or create Google GenAI client."""
+        try:
+            from google import genai as ggenai
+        except ImportError:
+            raise ImportError("Install 'google-genai' package: pip install google-genai")
+        context_key = self._resolve_context_api_key("google")
+        if context_key:
+            return ggenai.Client(api_key=context_key)
         if self._google_client is None:
-            try:
-                from google import genai as ggenai
-            except ImportError:
-                raise ImportError("Install 'google-genai' package: pip install google-genai")
-            api_key = os.getenv("GEMINI_API_KEY", "")
-            if not api_key:
-                raise ValueError(
-                    "GEMINI_API_KEY is required for Gemini models. "
-                    "Set it in .env or use a local model (prefix with 'local/')."
-                )
+            api_key, key_source = self._resolve_api_key("google", "GEMINI_API_KEY")
+            if key_source == "byok":
+                return ggenai.Client(api_key=api_key)
             self._google_client = ggenai.Client(api_key=api_key)
         return self._google_client
 
@@ -1546,14 +1689,14 @@ class LLMClient:
 
     def _get_deepseek_client(self):
         """Get or create DeepSeek client."""
+        from openai import OpenAI
+        context_key = self._resolve_context_api_key("deepseek")
+        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        if context_key:
+            return OpenAI(api_key=context_key, base_url=base_url)
         if self._deepseek_client is None:
-            from openai import OpenAI
-            api_key = os.getenv("DEEPSEEK_API_KEY", "")
-            if not api_key:
-                raise ValueError(
-                    "DEEPSEEK_API_KEY is required for DeepSeek models. "
-                    "Set it in .env or provide it directly."
-                )
-            base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            api_key, key_source = self._resolve_api_key("deepseek", "DEEPSEEK_API_KEY")
+            if key_source == "byok":
+                return OpenAI(api_key=api_key, base_url=base_url)
             self._deepseek_client = OpenAI(api_key=api_key, base_url=base_url)
         return self._deepseek_client

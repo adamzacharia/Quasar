@@ -25,6 +25,38 @@ interface UserTool {
     api_key_name: string;
 }
 
+interface MCPServer {
+    name: string;
+    transport?: "stdio" | "http";
+    command?: string;
+    args?: string[];
+    url?: string;
+    env?: Record<string, string>;
+}
+
+interface ProviderKeyMeta {
+    provider: string;
+    key_last4: string;
+    token_limit?: number | null;
+    status: string;
+    created_at: string;
+    updated_at: string;
+    last_tested_at?: string | null;
+}
+
+interface QuotaBucket {
+    used_tokens: number;
+    limit_tokens?: number | null;
+    unlimited: boolean;
+    exhausted: boolean;
+}
+
+interface UsageQuota {
+    platform: Record<string, QuotaBucket>;
+    byok: Record<string, QuotaBucket>;
+    is_admin: boolean;
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────
 
 function formatBytes(bytes: number) {
@@ -35,6 +67,13 @@ function formatBytes(bytes: number) {
 
 function formatDate(iso: string) {
     return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatTokens(value?: number | null) {
+    const n = Number(value || 0);
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}K`;
+    return n.toLocaleString();
 }
 
 // ── Personalization Panel ─────────────────────────────────────────────────
@@ -474,7 +513,7 @@ function CustomToolsPanel() {
                 {activeTab === "templates" && (
                     <div className="space-y-6 max-w-2xl pb-8">
                         <div className="bg-indigo-500/10 border border-indigo-500/20 rounded-xl p-4 text-sm text-indigo-200">
-                            <strong>How tools work:</strong> Write a standard Python function. The AI sees your function's name, docstring, and parameter types to auto-generate the JSON schema. Must return a <code>dict</code> or <code>str</code>.
+                            <strong>How tools work:</strong> Write a standard Python function. The AI sees your function&apos;s name, docstring, and parameter types to auto-generate the JSON schema. Must return a <code>dict</code> or <code>str</code>.
                         </div>
 
                         <div>
@@ -504,7 +543,7 @@ function CustomToolsPanel() {
 function MCPServersPanel() {
     const { isAuthenticated, token } = useAuthStore();
     const [activeTab, setActiveTab] = useState<"installed" | "add">("installed");
-    const [servers, setServers] = useState<any[]>([]);
+    const [servers, setServers] = useState<MCPServer[]>([]);
     const [loading, setLoading] = useState(false);
     
     // Form state
@@ -779,7 +818,266 @@ function MCPServersPanel() {
 
 // ── Admin Analytics Panel ─────────────────────────────────────────────────
 
-const ADMIN_EMAILS = ["adamandspace@gmail.com"];
+// Provider Keys Panel
+
+const PROVIDER_OPTIONS = [
+    { id: "deepseek", label: "DeepSeek", quotaLabel: "1M included tokens" },
+    { id: "openai", label: "OpenAI", quotaLabel: "500K included tokens" },
+    { id: "anthropic", label: "Anthropic", quotaLabel: "BYOK only" },
+    { id: "google", label: "Google Gemini", quotaLabel: "BYOK only" },
+];
+
+function ProviderKeysPanel() {
+    const { isAuthenticated, token } = useAuthStore();
+    const [keys, setKeys] = useState<ProviderKeyMeta[]>([]);
+    const [quota, setQuota] = useState<UsageQuota | null>(null);
+    const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
+    const [limits, setLimits] = useState<Record<string, string>>({});
+    const [busy, setBusy] = useState<string | null>(null);
+    const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+    const getKey = (provider: string) => keys.find(k => k.provider === provider);
+
+    const fetchState = useCallback(async () => {
+        if (!token) return;
+        try {
+            const [keysRes, quotaRes] = await Promise.all([
+                fetch(`${API_BASE}/api/provider-keys`, { headers: { Authorization: `Bearer ${token}` } }),
+                fetch(`${API_BASE}/api/usage-quota`, { headers: { Authorization: `Bearer ${token}` } }),
+            ]);
+            if (keysRes.ok) {
+                const data = await keysRes.json();
+                setKeys(data.keys || []);
+                const nextLimits: Record<string, string> = {};
+                (data.keys || []).forEach((k: ProviderKeyMeta) => {
+                    nextLimits[k.provider] = k.token_limit ? String(k.token_limit) : "";
+                });
+                setLimits(nextLimits);
+            }
+            if (quotaRes.ok) setQuota(await quotaRes.json());
+        } catch {
+            setMessage({ type: "error", text: "Could not load provider key settings." });
+        }
+    }, [token]);
+
+    useEffect(() => { if (isAuthenticated) fetchState(); }, [isAuthenticated, fetchState]);
+
+    const saveKey = async (provider: string) => {
+        if (!token) return;
+        const rawKey = (apiKeys[provider] || "").trim();
+        if (!rawKey) {
+            setMessage({ type: "error", text: "Enter an API key before saving." });
+            return;
+        }
+        const limitText = (limits[provider] || "").trim();
+        setBusy(`${provider}:save`);
+        setMessage(null);
+        try {
+            const res = await fetch(`${API_BASE}/api/provider-keys`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({
+                    provider,
+                    api_key: rawKey,
+                    token_limit: limitText ? Number(limitText) : null,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || "Save failed.");
+            setApiKeys(prev => ({ ...prev, [provider]: "" }));
+            setMessage({ type: "success", text: `${provider} key saved.` });
+            fetchState();
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Save failed." });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const updateLimit = async (provider: string) => {
+        if (!token) return;
+        const limitText = (limits[provider] || "").trim();
+        setBusy(`${provider}:limit`);
+        setMessage(null);
+        try {
+            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/limit`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ token_limit: limitText ? Number(limitText) : null }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || "Limit update failed.");
+            setMessage({ type: "success", text: limitText ? "Token limit updated." : "Token limit cleared." });
+            fetchState();
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Limit update failed." });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const testKey = async (provider: string) => {
+        if (!token) return;
+        setBusy(`${provider}:test`);
+        setMessage(null);
+        try {
+            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/test`, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || "Test failed.");
+            setMessage({ type: "success", text: `${provider} key is valid.` });
+            fetchState();
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Test failed." });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const deleteKey = async (provider: string) => {
+        if (!token) return;
+        if (!confirm(`Delete your ${provider} API key?`)) return;
+        setBusy(`${provider}:delete`);
+        setMessage(null);
+        try {
+            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}`, {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || "Delete failed.");
+            setMessage({ type: "success", text: `${provider} key deleted.` });
+            fetchState();
+        } catch (e) {
+            setMessage({ type: "error", text: e instanceof Error ? e.message : "Delete failed." });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    if (!isAuthenticated) {
+        return (
+            <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
+                <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center">
+                    <Lock className="w-7 h-7 text-slate-500" />
+                </div>
+                <div>
+                    <p className="text-sm font-semibold text-slate-300">Sign in to manage provider keys</p>
+                    <p className="text-xs text-slate-500 mt-1.5 max-w-xs">Your keys are encrypted server-side and used before Quasar platform keys.</p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="p-6 space-y-5 overflow-y-auto h-full">
+            <div>
+                <h3 className="text-sm font-semibold text-white mb-1">Provider Keys</h3>
+                <p className="text-xs text-slate-400">BYOK traffic uses your key first. No limit is applied unless you set one.</p>
+            </div>
+
+            {message && (
+                <div className={`flex items-start gap-2 text-xs rounded-lg px-3 py-2 border ${message.type === "success" ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300" : "bg-red-500/10 border-red-500/30 text-red-300"}`}>
+                    {message.type === "success" ? <CheckCircle className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
+                    <span>{message.text}</span>
+                </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+                {["deepseek", "openai"].map(provider => {
+                    const bucket = quota?.platform?.[provider];
+                    const pct = bucket?.limit_tokens ? Math.min(100, Math.round((bucket.used_tokens / bucket.limit_tokens) * 100)) : 0;
+                    return (
+                        <div key={provider} className="bg-slate-800/50 border border-slate-700/50 rounded-xl px-4 py-3">
+                            <div className="flex items-center justify-between text-xs mb-2">
+                                <span className="font-semibold text-slate-300">{provider === "deepseek" ? "DeepSeek" : "OpenAI"} platform quota</span>
+                                <span className={bucket?.exhausted ? "text-red-300" : "text-slate-400"}>
+                                    {bucket?.unlimited ? "Unlimited" : `${formatTokens(bucket?.used_tokens)} / ${formatTokens(bucket?.limit_tokens)}`}
+                                </span>
+                            </div>
+                            {!bucket?.unlimited && (
+                                <div className="h-1.5 rounded-full bg-slate-700 overflow-hidden">
+                                    <div className={`h-full ${bucket?.exhausted ? "bg-red-400" : "bg-primary"}`} style={{ width: `${pct}%` }} />
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+
+            <div className="space-y-3">
+                {PROVIDER_OPTIONS.map(providerInfo => {
+                    const meta = getKey(providerInfo.id);
+                    const byokBucket = quota?.byok?.[providerInfo.id];
+                    const isBusy = busy?.startsWith(`${providerInfo.id}:`);
+                    return (
+                        <div key={providerInfo.id} className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-4 space-y-3">
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <div className="flex items-center gap-2">
+                                        <h4 className="text-sm font-semibold text-white">{providerInfo.label}</h4>
+                                        {meta ? (
+                                            <span className="text-[10px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded px-1.5 py-0.5">Connected</span>
+                                        ) : (
+                                            <span className="text-[10px] text-slate-400 bg-slate-700/50 border border-slate-600/50 rounded px-1.5 py-0.5">Not connected</span>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-slate-500 mt-1">
+                                        {meta ? `Key ending ${meta.key_last4} - ${meta.status}${meta.last_tested_at ? ` - tested ${formatDate(meta.last_tested_at)}` : ""}` : providerInfo.quotaLabel}
+                                    </p>
+                                </div>
+                                {meta && (
+                                    <div className="flex items-center gap-2">
+                                        <button onClick={() => testKey(providerInfo.id)} disabled={isBusy} className="text-xs px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50">
+                                            {busy === `${providerInfo.id}:test` ? "Testing..." : "Test"}
+                                        </button>
+                                        <button onClick={() => deleteKey(providerInfo.id)} disabled={isBusy} className="p-1.5 rounded-lg text-red-300 hover:bg-red-500/10 disabled:opacity-50" title="Delete key">
+                                            <Trash2 className="w-4 h-4" />
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="grid grid-cols-[1fr_150px_auto] gap-2">
+                                <input
+                                    type="password"
+                                    value={apiKeys[providerInfo.id] || ""}
+                                    onChange={e => setApiKeys(prev => ({ ...prev, [providerInfo.id]: e.target.value }))}
+                                    placeholder={meta ? "Rotate key" : "Paste API key"}
+                                    className="bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-primary"
+                                />
+                                <input
+                                    type="number"
+                                    min="1"
+                                    value={limits[providerInfo.id] || ""}
+                                    onChange={e => setLimits(prev => ({ ...prev, [providerInfo.id]: e.target.value }))}
+                                    placeholder="No limit"
+                                    className="bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-primary"
+                                />
+                                <button onClick={() => saveKey(providerInfo.id)} disabled={isBusy} className="px-3 py-2 rounded-lg bg-primary hover:bg-primary-600 text-white text-sm font-semibold disabled:opacity-50">
+                                    {busy === `${providerInfo.id}:save` ? "Saving..." : meta ? "Rotate" : "Save"}
+                                </button>
+                            </div>
+
+                            {meta && (
+                                <div className="flex items-center justify-between text-xs text-slate-500">
+                                    <span>BYOK used: {formatTokens(byokBucket?.used_tokens)}{byokBucket?.limit_tokens ? ` / ${formatTokens(byokBucket.limit_tokens)}` : " - no limit"}</span>
+                                    <button onClick={() => updateLimit(providerInfo.id)} disabled={isBusy} className="text-primary hover:text-white disabled:opacity-50">
+                                        {busy === `${providerInfo.id}:limit` ? "Updating..." : "Update limit"}
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+const ADMIN_EMAILS = ["adamandspace@gmail.com", "1@1"];
 
 interface AnalyticsSummary {
     total_chats: number;
@@ -976,7 +1274,7 @@ interface SettingsModalProps {
     onClose: () => void;
 }
 
-type TabType = 'personalization' | 'tools' | 'mcp' | 'analytics';
+type TabType = 'personalization' | 'providerKeys' | 'tools' | 'mcp' | 'analytics';
 
 export function SettingsModal({ open, onClose }: SettingsModalProps) {
     const backdropRef = useRef<HTMLDivElement>(null);
@@ -1020,6 +1318,14 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                         >
                             <FileText className="w-4 h-4" />
                             Personalization
+                        </button>
+
+                        <button
+                            onClick={() => setCurrentTab('providerKeys')}
+                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${currentTab === 'providerKeys' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
+                        >
+                            <Lock className="w-4 h-4" />
+                            Provider Keys
                         </button>
                         
                         <button 
@@ -1083,11 +1389,13 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 <div className="flex-1 overflow-hidden flex flex-col" style={{ background: 'var(--q-surface)' }}>
                     <div className="px-6 py-5 border-b border-slate-700/50 shrink-0">
                         <h2 className="text-base font-semibold text-white">
-                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'tools' ? "Custom Tools" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
+                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'providerKeys' ? "Provider Keys" : currentTab === 'tools' ? "Custom Tools" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
                         </h2>
                         <p className="text-xs text-slate-400 mt-0.5">
                             {currentTab === 'personalization' 
                                 ? "Your private knowledge base for smarter conversations" 
+                                : currentTab === 'providerKeys'
+                                ? "Bring your own provider API keys and view included quota"
                                 : currentTab === 'tools'
                                 ? "Extend Quasar with your own Python agent tools"
                                 : currentTab === 'analytics'
@@ -1098,6 +1406,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     
                     <div className="flex-1 overflow-hidden">
                         {currentTab === 'personalization' && <PersonalizationPanel />}
+                        {currentTab === 'providerKeys' && <ProviderKeysPanel />}
                         {currentTab === 'tools' && <CustomToolsPanel />}
                         {currentTab === 'mcp' && <MCPServersPanel />}
                         {currentTab === 'analytics' && <AnalyticsPanel />}
