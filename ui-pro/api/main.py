@@ -472,7 +472,7 @@ from services.provider_file_service import (
     ProviderFileService,
     UploadedChatFile,
 )
-from core.llm_client import detect_provider
+from core.llm_client import detect_provider, model_accepts_direct_image_input
 auth_service = AuthService()
 conversation_service = ConversationService()
 cube_workbench_service = CubeWorkbenchService()
@@ -942,6 +942,68 @@ def _extract_document_preview_text(filename: str, content_type: str, raw: bytes)
     return f"\n\n[Attached file: {filename} ({len(raw)/1024:.1f} KB)]"
 
 
+def _image_attachment_url_and_detail(image: Dict[str, Any]) -> tuple[str, str]:
+    payload = image.get("image_url") or image
+    if isinstance(payload, dict):
+        image_url = str(payload.get("url") or payload.get("image_url") or "")
+        detail = str(payload.get("detail") or "auto")
+        return image_url, detail
+    return str(payload or ""), str(image.get("detail") or "auto")
+
+
+def _analyze_uploaded_images_for_text(
+    images: List[Dict[str, Any]],
+    user_prompt: str,
+    *,
+    model: Optional[str] = None,
+) -> str:
+    """Summarize/OCR uploaded images for models that cannot accept image inputs."""
+    if not images:
+        return ""
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "Image analysis requires OPENAI_API_KEY because the selected model cannot accept images directly."
+        )
+
+    from openai import OpenAI
+
+    prepass_model = model or os.getenv("QUASAR_IMAGE_PREPASS_MODEL", "gpt-4o-mini")
+    instruction = (
+        "Analyze the uploaded image(s) so a text-only model can answer the user's request.\n"
+        "Return concise but complete context with these sections:\n"
+        "- Visual summary\n"
+        "- Visible/OCR text and UI labels\n"
+        "- Tables, charts, numbers, or screen state\n"
+        "- Uncertainties or unreadable regions\n\n"
+        "If a person's name or identity appears as visible on-screen text, transcribe it. "
+        "Do not infer a person's identity from their face alone.\n\n"
+        f"User request: {user_prompt or '(no text prompt provided)'}"
+    )
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": instruction}]
+    for image in images:
+        image_url, detail = _image_attachment_url_and_detail(image)
+        if not image_url:
+            continue
+        content.append({
+            "type": "input_image",
+            "image_url": image_url,
+            "detail": detail or "auto",
+        })
+
+    if len(content) == 1:
+        raise RuntimeError("No readable image payload was available for image analysis.")
+
+    client = OpenAI()
+    response = client.responses.create(
+        model=prepass_model,
+        input=[{"role": "user", "content": content}],
+        max_output_tokens=1200,
+    )
+    analysis = (getattr(response, "output_text", "") or "").strip()
+    if not analysis:
+        raise RuntimeError("The image analysis model returned no usable text.")
+    return analysis
+
 
 def _stream_chat_response(
     request: ChatRequest,
@@ -1043,6 +1105,37 @@ def _stream_chat_response(
         # Personal RAG retrieval for authenticated users only.
         # Searches ONLY the user's personal Qdrant collection (not the shared ALMA docs).
         enriched_message = request.message
+        image_prepass = attachment_context.get("image_prepass") or {}
+        image_prepass_images = image_prepass.get("images") or []
+        if image_prepass_images:
+            yield _sse_status("Analyzing uploaded image", "running")
+            try:
+                loop_img = asyncio.get_event_loop()
+                image_analysis = await loop_img.run_in_executor(
+                    _executor,
+                    lambda: _analyze_uploaded_images_for_text(
+                        image_prepass_images,
+                        request.message,
+                    ),
+                )
+            except Exception as e:
+                msg = (
+                    "I could not analyze the uploaded image before sending it to "
+                    f"{requested_model}. The selected model cannot accept raw image inputs. "
+                    f"Image analysis error: {e}"
+                )
+                yield f"data: {json.dumps({'type': 'error', 'content': msg})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            yield _sse_status("Analyzing uploaded image", "completed")
+            enriched_message = (
+                f"{enriched_message}\n\n"
+                "### Image analysis context\n"
+                "The selected model cannot receive the raw uploaded image directly, "
+                "so this context was generated from the image before the final answer:\n\n"
+                f"{image_analysis}"
+            )
+            yield _sse_status(f"Passing image context to {requested_model}", "completed")
         if request.grounded_summary:
             yield _sse_status("Grounded summary mode enabled", "completed")
         if current_user and not request.grounded_summary:
@@ -1115,7 +1208,7 @@ def _stream_chat_response(
                         context_block = "\n\n---\n".join(ctx_lines)
                         enriched_message = (
                             "The user has the following relevant documents in their personal "
-                            f"knowledge base:\n\n{context_block}\n\n---\nUser's question: {request.message}"
+                            f"knowledge base:\n\n{context_block}\n\n---\nUser's question: {enriched_message}"
                         )
                         yield _sse_status("Searching personal knowledge base", "completed")
                 except Exception as e:
@@ -2687,7 +2780,7 @@ async def chat_with_files(
             for preview in mixed_document_previews:
                 enriched_text += preview
 
-    if image_contents:
+    if image_contents and model_accepts_direct_image_input(selected_model):
         attachment_context = attachment_context or {
             "provider": provider,
             "attachments": [],
@@ -2699,6 +2792,13 @@ async def chat_with_files(
                 "type": "image_url",
                 "image_url": img["image_url"]
             })
+    elif image_contents:
+        attachment_context = attachment_context or {
+            "provider": provider,
+            "attachments": [],
+            "messages": []
+        }
+        attachment_context["image_prepass"] = {"images": image_contents}
 
     req = ChatRequest(
         message=enriched_text or message,

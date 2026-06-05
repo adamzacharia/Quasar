@@ -357,7 +357,7 @@ export function ChatArea() {
                         attachments: attachments?.map(a => a.file),
                         token: tokenRef.current || undefined,  // always reads current auth state
                         grounded_summary: Boolean(options?.groundedSummary),
-                        web_search: Boolean(options?.webSearch),
+                        web_search: options?.webSearch !== false,
                     },
                     {
                         onToken: (token: string) => {

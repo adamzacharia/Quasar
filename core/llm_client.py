@@ -76,6 +76,11 @@ def detect_provider(model: str) -> str:
     return "openai"
 
 
+def model_accepts_direct_image_input(model: str) -> bool:
+    """Return True when Quasar can pass uploaded images directly to the model."""
+    return detect_provider(model) == "openai"
+
+
 # ---------------------------------------------------------------------------
 # Response objects — mimic OpenAI Responses API output shapes
 # ---------------------------------------------------------------------------
@@ -433,9 +438,19 @@ class ResponsesShim:
 
         for attachment in attachments or []:
             if "image_url" in attachment or attachment.get("type") == "image_url":
+                image_payload = attachment.get("image_url") or attachment
+                if isinstance(image_payload, dict):
+                    image_url = image_payload.get("url") or image_payload.get("image_url")
+                    detail = image_payload.get("detail") or attachment.get("detail") or "auto"
+                else:
+                    image_url = str(image_payload)
+                    detail = attachment.get("detail") or "auto"
+                if not image_url:
+                    raise ValueError("OpenAI image attachment is missing image_url.")
                 content.append({
-                    "type": "image_url",
-                    "image_url": attachment.get("image_url")
+                    "type": "input_image",
+                    "image_url": image_url,
+                    "detail": detail,
                 })
                 continue
             if attachment.get("kind") != "openai_input_file":
@@ -1136,14 +1151,7 @@ class ResponsesShim:
         messages: list,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> list:
-        """Inject image attachments into the last user message for vision-capable models.
-
-        DeepSeek V4 supports the same multimodal content format as OpenAI:
-            content = [{"type": "text", "text": ...}, {"type": "image_url", "image_url": {...}}]
-
-        This method finds the last user message and converts its plain-text
-        ``content`` string into a multimodal content array.
-        """
+        """Inject image attachments into the last user message for compatible chat APIs."""
         if not attachments:
             return messages
 
@@ -1199,8 +1207,8 @@ class ResponsesShim:
         else:
             messages = self._build_chat_messages(instructions, input_data, json_mode)
 
-        # Inject image attachments for vision support
-        messages = self._inject_images_into_messages(messages, attachments)
+        if attachments and any(att.get("type") == "image_url" or "image_url" in att for att in attachments):
+            logger.warning("Dropping raw image attachments for DeepSeek; use the image prepass upstream.")
 
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
         tool_choice = kwargs.get("tool_choice", None)
@@ -1278,8 +1286,8 @@ class ResponsesShim:
         else:
             messages = self._build_chat_messages(instructions, input_data)
 
-        # Inject image attachments for vision support
-        messages = self._inject_images_into_messages(messages, attachments)
+        if attachments and any(att.get("type") == "image_url" or "image_url" in att for att in attachments):
+            logger.warning("Dropping raw image attachments for DeepSeek streaming; use the image prepass upstream.")
 
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
         tool_choice = kwargs.get("tool_choice", None)
