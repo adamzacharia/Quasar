@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 40    | 21    | 0           | 19      | 53%    |
-| **Total**              |**106**|**55** | **2**       | **49**  |**52%** |
+| Polish & Scale         | 41    | 22    | 0           | 19      | 54%    |
+| **Total**              |**107**|**56** | **2**       | **49**  |**52%** |
 
 
 ---
@@ -187,6 +187,7 @@ Without them, even great features feel broken.
 - [x] **PS38** Per-Query Observation-Paper Graph & Auto-Linking -- Moves the literature graph from a global bottom widget to an inline turn-scoped widget per data card, fixes space-insensitive target matching, removes false "Session literature" connections, and adds auto-linking in the system prompt to query papers for retrieved ALMA project codes (ui-pro/src/components/ChatArea.tsx + ui-pro/src/components/ChatMessage.tsx + ui-pro/src/lib/research-graph.js + core/agent.py)
 - [x] **PS39** Context-Aware Intent Routing & Web Search Control -- Fixed random web search triggers by passing recent conversation history to the LLM intent classifier to correctly distinguish domain terms like "Band 7" (ALMA bands) from general web terms. Added a manual Web Search Toggle to the frontend with complete override capability. (core/agent.py + ui-pro/api/main.py + ui-pro/src/components/PlusMenu.tsx)
 - [x] **PS40** Direct Personal RAG Search & Multimodal OCR Ingestion -- Bypassed combined RAG document mixing to route personal RAG queries directly to the user's specific collection, ensuring personal queries (e.g. travel dates) are retrieved. Added an automatic GPT-4o multimodal OCR vision transcription fallback for uploaded scanned/image-only PDFs while preserving original filenames in vector metadata. (services/rag_service.py + ui-pro/api/main.py)
+- [x] **PS41** Non-Native Model Image Prepass & Analysis Fallback -- Automatically detects when the selected LLM cannot accept direct image inputs (e.g., DeepSeek) and routes uploaded images to a GPT-4o-mini prepass analyzer, appending the detailed visual OCR transcript to the user prompt. (core/llm_client.py + ui-pro/api/main.py)
 
 ---
 
@@ -212,4 +213,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-06-03 -- Quasar v3.4.0 (Personal RAG Direct Search & Multimodal OCR Ingestion)*
+*Last updated: 2026-06-05 -- Quasar v3.4.1 (Non-Native Model Image Prepass & Analysis Fallback)*
