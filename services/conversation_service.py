@@ -93,13 +93,19 @@ class ConversationService:
                 provider_file_id TEXT,
                 provider_file_name TEXT,
                 provider_file_uri TEXT,
+                key_scope TEXT NOT NULL DEFAULT 'platform',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         ''')
+        try:
+            cursor.execute("ALTER TABLE conversation_file_refs ADD COLUMN key_scope TEXT NOT NULL DEFAULT 'platform'")
+        except Exception:
+            pass
+        cursor.execute('DROP INDEX IF EXISTS idx_conv_file_unique')
         cursor.execute('''
             CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_file_unique
-            ON conversation_file_refs(user_id, conversation_id, provider, content_hash)
+            ON conversation_file_refs(user_id, conversation_id, provider, key_scope, content_hash)
         ''')
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_conv_file_lookup
@@ -461,6 +467,7 @@ class ConversationService:
         provider_file_id: Optional[str] = None,
         provider_file_name: Optional[str] = None,
         provider_file_uri: Optional[str] = None,
+        key_scope: str = "platform",
     ) -> Dict:
         """Insert or update a provider file reference for a conversation."""
         now = datetime.now().isoformat()
@@ -470,9 +477,9 @@ class ConversationService:
         cursor.execute(
             '''
             SELECT id FROM conversation_file_refs
-            WHERE user_id = ? AND conversation_id = ? AND provider = ? AND content_hash = ?
+            WHERE user_id = ? AND conversation_id = ? AND provider = ? AND key_scope = ? AND content_hash = ?
             ''',
-            (user_id, conversation_id, provider, content_hash),
+            (user_id, conversation_id, provider, key_scope, content_hash),
         )
         row = cursor.fetchone()
 
@@ -482,7 +489,7 @@ class ConversationService:
                 '''
                 UPDATE conversation_file_refs
                 SET model_family = ?, filename = ?, mime_type = ?, provider_file_id = ?,
-                    provider_file_name = ?, provider_file_uri = ?, updated_at = ?
+                    provider_file_name = ?, provider_file_uri = ?, key_scope = ?, updated_at = ?
                 WHERE id = ?
                 ''',
                 (
@@ -492,6 +499,7 @@ class ConversationService:
                     provider_file_id,
                     provider_file_name,
                     provider_file_uri,
+                    key_scope,
                     now,
                     ref_id,
                 ),
@@ -502,9 +510,9 @@ class ConversationService:
                 INSERT INTO conversation_file_refs (
                     user_id, conversation_id, provider, model_family, filename, mime_type,
                     content_hash, provider_file_id, provider_file_name, provider_file_uri,
-                    created_at, updated_at
+                    key_scope, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     user_id,
@@ -517,6 +525,7 @@ class ConversationService:
                     provider_file_id,
                     provider_file_name,
                     provider_file_uri,
+                    key_scope,
                     now,
                     now,
                 ),
@@ -538,6 +547,7 @@ class ConversationService:
             "provider_file_id": provider_file_id,
             "provider_file_name": provider_file_name,
             "provider_file_uri": provider_file_uri,
+            "key_scope": key_scope,
             "updated_at": now,
         }
 
@@ -546,17 +556,30 @@ class ConversationService:
         user_id: str,
         conversation_id: str,
         provider: Optional[str] = None,
+        key_scope: Optional[str] = None,
     ) -> List[Dict]:
         """List stored provider file references for a user conversation."""
         conn = self._get_conn()
         cursor = conn.cursor()
 
-        if provider:
+        if provider and key_scope:
             cursor.execute(
                 '''
                 SELECT provider, model_family, filename, mime_type, content_hash,
                        provider_file_id, provider_file_name, provider_file_uri,
-                       created_at, updated_at
+                       created_at, updated_at, key_scope
+                FROM conversation_file_refs
+                WHERE user_id = ? AND conversation_id = ? AND provider = ? AND key_scope = ?
+                ORDER BY updated_at ASC, id ASC
+                ''',
+                (user_id, conversation_id, provider, key_scope),
+            )
+        elif provider:
+            cursor.execute(
+                '''
+                SELECT provider, model_family, filename, mime_type, content_hash,
+                       provider_file_id, provider_file_name, provider_file_uri,
+                       created_at, updated_at, key_scope
                 FROM conversation_file_refs
                 WHERE user_id = ? AND conversation_id = ? AND provider = ?
                 ORDER BY updated_at ASC, id ASC
@@ -568,7 +591,7 @@ class ConversationService:
                 '''
                 SELECT provider, model_family, filename, mime_type, content_hash,
                        provider_file_id, provider_file_name, provider_file_uri,
-                       created_at, updated_at
+                       created_at, updated_at, key_scope
                 FROM conversation_file_refs
                 WHERE user_id = ? AND conversation_id = ?
                 ORDER BY updated_at ASC, id ASC
@@ -592,6 +615,7 @@ class ConversationService:
                 "provider_file_uri": row[7],
                 "created_at": row[8],
                 "updated_at": row[9],
+                "key_scope": row[10],
             })
         return refs
 

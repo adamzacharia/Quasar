@@ -19,6 +19,7 @@ import httpx
 
 from core.llm_client import detect_provider
 from services.conversation_service import ConversationService
+from services.secret_redaction import redact_secrets
 
 
 OPENAI_EXTRA_MIME_TYPES = {
@@ -124,6 +125,8 @@ class ProviderFileService:
         files: List[UploadedChatFile],
         conversation_id: Optional[str],
         user_id: Optional[str],
+        provider_api_key: Optional[str] = None,
+        provider_key_scope: Optional[str] = None,
     ) -> Dict:
         provider = provider or detect_provider(model or "")
         if provider not in {"openai", "anthropic", "google"}:
@@ -131,11 +134,13 @@ class ProviderFileService:
                 f"Document uploads are not supported for provider '{provider}'."
             )
 
+        key_scope = provider_key_scope or self._key_scope(provider_api_key)
+
         if not files:
-            return self.get_active_files(provider, conversation_id, user_id)
+            return self.get_active_files(provider, conversation_id, user_id, key_scope=key_scope)
 
         normalized_files = [self._normalize_file(file) for file in files]
-        existing_refs = self._load_refs(conversation_id, provider, user_id)
+        existing_refs = self._load_refs(conversation_id, provider, user_id, key_scope=key_scope)
         existing_by_hash = {ref["content_hash"]: ref for ref in existing_refs}
 
         notes: List[str] = []
@@ -148,7 +153,7 @@ class ProviderFileService:
                 reused_count += 1
                 continue
 
-            uploaded_ref = self._upload_file(provider, upload)
+            uploaded_ref = self._upload_file(provider, upload, provider_api_key=provider_api_key)
             record = {
                 "provider": provider,
                 "model_family": self._model_family(model),
@@ -158,6 +163,7 @@ class ProviderFileService:
                 "provider_file_id": uploaded_ref.provider_file_id,
                 "provider_file_name": uploaded_ref.provider_file_name,
                 "provider_file_uri": uploaded_ref.provider_file_uri,
+                "key_scope": key_scope,
             }
             self._save_ref(conversation_id, user_id, record)
             existing_by_hash[upload.content_hash] = record
@@ -182,7 +188,7 @@ class ProviderFileService:
                 messages=notes,
             ).to_dict()
 
-        current_context = self.get_active_files(provider, conversation_id, user_id)
+            current_context = self.get_active_files(provider, conversation_id, user_id, key_scope=key_scope)
         current_context["messages"] = notes + current_context.get("messages", [])
         return current_context
 
@@ -191,12 +197,13 @@ class ProviderFileService:
         provider: str,
         conversation_id: Optional[str],
         user_id: Optional[str],
+        key_scope: str = "platform",
     ) -> Dict:
         provider = provider or "openai"
         if not conversation_id:
             return PreparedAttachmentContext(provider=provider).to_dict()
 
-        refs = self._load_refs(conversation_id, provider, user_id)
+        refs = self._load_refs(conversation_id, provider, user_id, key_scope=key_scope)
         other_refs = [
             ref for ref in self._load_refs(conversation_id, None, user_id)
             if ref.get("provider") != provider
@@ -300,17 +307,26 @@ class ProviderFileService:
 
         raise ProviderFileError(f"Unknown provider '{provider}'.")
 
-    def _upload_file(self, provider: str, file: UploadedChatFile) -> PreparedAttachmentRef:
+    def _upload_file(
+        self,
+        provider: str,
+        file: UploadedChatFile,
+        provider_api_key: Optional[str] = None,
+    ) -> PreparedAttachmentRef:
         if provider == "openai":
-            return self._upload_openai_file(file)
+            return self._upload_openai_file(file, provider_api_key=provider_api_key)
         if provider == "anthropic":
-            return self._upload_anthropic_file(file)
+            return self._upload_anthropic_file(file, provider_api_key=provider_api_key)
         if provider == "google":
-            return self._upload_google_file(file)
+            return self._upload_google_file(file, provider_api_key=provider_api_key)
         raise ProviderFileError(f"Unknown provider '{provider}'.")
 
-    def _upload_openai_file(self, file: UploadedChatFile) -> PreparedAttachmentRef:
-        api_key = os.getenv("OPENAI_API_KEY", "")
+    def _upload_openai_file(
+        self,
+        file: UploadedChatFile,
+        provider_api_key: Optional[str] = None,
+    ) -> PreparedAttachmentRef:
+        api_key = provider_api_key or os.getenv("OPENAI_API_KEY", "")
         if not api_key:
             raise ProviderFileError("OPENAI_API_KEY is not configured on the server.")
 
@@ -330,8 +346,12 @@ class ProviderFileService:
             provider_file_name=payload.get("filename") or payload.get("id"),
         )
 
-    def _upload_anthropic_file(self, file: UploadedChatFile) -> PreparedAttachmentRef:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    def _upload_anthropic_file(
+        self,
+        file: UploadedChatFile,
+        provider_api_key: Optional[str] = None,
+    ) -> PreparedAttachmentRef:
+        api_key = provider_api_key or os.getenv("ANTHROPIC_API_KEY", "")
         if not api_key:
             raise ProviderFileError("ANTHROPIC_API_KEY is not configured on the server.")
 
@@ -355,8 +375,12 @@ class ProviderFileService:
             provider_file_name=payload.get("filename") or payload.get("id"),
         )
 
-    def _upload_google_file(self, file: UploadedChatFile) -> PreparedAttachmentRef:
-        api_key = os.getenv("GEMINI_API_KEY", "")
+    def _upload_google_file(
+        self,
+        file: UploadedChatFile,
+        provider_api_key: Optional[str] = None,
+    ) -> PreparedAttachmentRef:
+        api_key = provider_api_key or os.getenv("GEMINI_API_KEY", "")
         if not api_key:
             raise ProviderFileError("GEMINI_API_KEY is not configured on the server.")
 
@@ -427,10 +451,10 @@ class ProviderFileService:
             if response.content:
                 return response.json()
             return {}
-        detail = response.text
+        detail = redact_secrets(response.text)
         try:
             payload = response.json()
-            detail = (
+            detail = redact_secrets(
                 payload.get("error", {}).get("message")
                 or payload.get("message")
                 or payload.get("detail")
@@ -471,6 +495,7 @@ class ProviderFileService:
         conversation_id: Optional[str],
         provider: Optional[str],
         user_id: Optional[str],
+        key_scope: Optional[str] = None,
     ) -> List[Dict]:
         if not conversation_id:
             return []
@@ -480,12 +505,16 @@ class ProviderFileService:
                 user_id=user_id,
                 conversation_id=conversation_id,
                 provider=provider,
+                key_scope=key_scope,
             )
 
         with self._lock:
             provider_map = self._anonymous_refs.get(conversation_id, {})
             if provider:
-                return [dict(ref) for ref in provider_map.get(provider, [])]
+                refs = [dict(ref) for ref in provider_map.get(provider, [])]
+                if key_scope:
+                    refs = [ref for ref in refs if ref.get("key_scope", "platform") == key_scope]
+                return refs
 
             refs: List[Dict] = []
             for provider_refs in provider_map.values():
@@ -508,6 +537,7 @@ class ProviderFileService:
                 provider_file_id=ref.get("provider_file_id"),
                 provider_file_name=ref.get("provider_file_name"),
                 provider_file_uri=ref.get("provider_file_uri"),
+                key_scope=ref.get("key_scope", "platform"),
             )
             return
 
@@ -515,7 +545,11 @@ class ProviderFileService:
             provider_map = self._anonymous_refs.setdefault(conversation_id, {})
             refs = provider_map.setdefault(ref["provider"], [])
             existing_index = next(
-                (index for index, item in enumerate(refs) if item["content_hash"] == ref["content_hash"]),
+                (
+                    index for index, item in enumerate(refs)
+                    if item["content_hash"] == ref["content_hash"]
+                    and item.get("key_scope", "platform") == ref.get("key_scope", "platform")
+                ),
                 None,
             )
             stored_ref = dict(ref)
@@ -523,6 +557,13 @@ class ProviderFileService:
                 refs.append(stored_ref)
             else:
                 refs[existing_index] = stored_ref
+
+    @staticmethod
+    def _key_scope(provider_api_key: Optional[str]) -> str:
+        if not provider_api_key:
+            return "platform"
+        digest = hashlib.sha256(provider_api_key.encode("utf-8")).hexdigest()[:16]
+        return f"byok:{digest}"
 
     def _content_hash(self, data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()

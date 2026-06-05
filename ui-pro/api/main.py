@@ -154,10 +154,10 @@ from starlette.responses import JSONResponse
 
 @app.exception_handler(Exception)
 async def _global_exception_handler(request, exc):
-    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {redact_secrets(exc)}")
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc)},
+        content={"detail": redact_secrets(exc)},
     )
 
 
@@ -459,6 +459,14 @@ class WorkbenchJobStartRequest(BaseModel):
     operation: str
     payload: Optional[Dict[str, Any]] = None
 
+class ProviderKeySaveRequest(BaseModel):
+    provider: str
+    api_key: str
+    token_limit: Optional[int] = None
+
+class ProviderKeyLimitRequest(BaseModel):
+    token_limit: Optional[int] = None
+
 # ── Auth Service Instance ──
 from services.auth import AuthService
 from services.conversation_service import ConversationService
@@ -472,11 +480,16 @@ from services.provider_file_service import (
     ProviderFileService,
     UploadedChatFile,
 )
-from core.llm_client import detect_provider, model_accepts_direct_image_input
+from services.provider_key_service import ProviderKeyError, ProviderKeyService
+from services.secret_redaction import redact_secrets
+from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
+from core.llm_client import LLMClient, detect_provider, llm_request_context, model_accepts_direct_image_input
 auth_service = AuthService()
 conversation_service = ConversationService()
 cube_workbench_service = CubeWorkbenchService()
 provider_file_service = ProviderFileService()
+provider_key_service = ProviderKeyService()
+usage_quota_service = UsageQuotaService()
 
 from services.analytics_service import AnalyticsService
 analytics_service = AnalyticsService()
@@ -489,6 +502,57 @@ def get_current_user(authorization: Optional[str] = Header(None)):
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
     return payload
+
+
+def _current_user_email(current_user: Optional[dict]) -> str:
+    if not current_user:
+        return ""
+    return str(current_user.get("email") or current_user.get("username") or "").strip().lower()
+
+
+def _build_llm_context_for_user(user_id: str) -> Dict[str, Any]:
+    metadata = provider_key_service.list_keys(user_id)
+    api_keys = provider_key_service.decrypt_all_keys(user_id)
+    providers = {"openai", "deepseek", "anthropic", "google"} | set(api_keys.keys())
+    key_sources = {provider: ("byok" if api_keys.get(provider) else "platform") for provider in providers}
+    byok_limits = {
+        item.get("provider"): item.get("token_limit")
+        for item in metadata
+        if item.get("provider")
+    }
+    return {
+        "provider_api_keys": api_keys,
+        "key_source_by_provider": key_sources,
+        "byok_token_limits": byok_limits,
+        "metadata": metadata,
+    }
+
+
+def _make_usage_recorder(user_id: str):
+    def _record_usage(provider: str, model: str, key_source: str, input_tokens: int, output_tokens: int):
+        usage_quota_service.record_usage(
+            UsageRecord(
+                user_id=user_id,
+                provider=provider,
+                model=model,
+                key_source=key_source,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        )
+    return _record_usage
+
+
+def _make_quota_checker(user_id: str, user_email: str, byok_token_limits: Dict[str, Optional[int]]):
+    def _check_quota(provider: str, model: str, key_source: str):
+        usage_quota_service.ensure_allowed(
+            user_id=user_id,
+            user_email=user_email,
+            provider=provider,
+            key_source=key_source,
+            byok_token_limit=byok_token_limits.get(provider),
+        )
+    return _check_quota
 
 
 class ConversationCreate(BaseModel):
@@ -896,7 +960,7 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
 
 def _sse_error_response(message: str) -> StreamingResponse:
     async def generate():
-        yield f"data: {json.dumps({'type': 'error', 'content': message})}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'content': redact_secrets(message)})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -960,12 +1024,6 @@ def _analyze_uploaded_images_for_text(
     """Summarize/OCR uploaded images for models that cannot accept image inputs."""
     if not images:
         return ""
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "Image analysis requires OPENAI_API_KEY because the selected model cannot accept images directly."
-        )
-
-    from openai import OpenAI
 
     prepass_model = model or os.getenv("QUASAR_IMAGE_PREPASS_MODEL", "gpt-4o-mini")
     instruction = (
@@ -993,7 +1051,7 @@ def _analyze_uploaded_images_for_text(
     if len(content) == 1:
         raise RuntimeError("No readable image payload was available for image analysis.")
 
-    client = OpenAI()
+    client = LLMClient(model=prepass_model)
     response = client.responses.create(
         model=prepass_model,
         input=[{"role": "user", "content": content}],
@@ -1003,6 +1061,26 @@ def _analyze_uploaded_images_for_text(
     if not analysis:
         raise RuntimeError("The image analysis model returned no usable text.")
     return analysis
+
+
+def _run_with_llm_context(
+    llm_context: Dict[str, Any],
+    user_id: str,
+    user_email: str,
+    usage_recorder,
+    quota_checker,
+    fn,
+):
+    with llm_request_context(
+        provider_api_keys=llm_context["provider_api_keys"],
+        key_source_by_provider=llm_context["key_source_by_provider"],
+        byok_token_limits=llm_context["byok_token_limits"],
+        user_id=user_id,
+        user_email=user_email,
+        usage_recorder=usage_recorder,
+        quota_checker=quota_checker,
+    ):
+        return fn()
 
 
 def _stream_chat_response(
@@ -1019,12 +1097,37 @@ def _stream_chat_response(
     requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or "gpt-4o"
     provider = detect_provider(requested_model)
     current_user_id = current_user.get("sub") if current_user else None
+    current_user_email = _current_user_email(current_user)
     
     if not current_user_id:
         raise HTTPException(
             status_code=401,
             detail="Authentication required. Please sign in to your Quasar account to access the system."
         )
+
+    try:
+        llm_context = _build_llm_context_for_user(current_user_id)
+        selected_key_source = llm_context["key_source_by_provider"].get(provider, "platform")
+        usage_quota_service.ensure_allowed(
+            user_id=current_user_id,
+            user_email=current_user_email,
+            provider=provider,
+            key_source=selected_key_source,
+            byok_token_limit=llm_context["byok_token_limits"].get(provider),
+        )
+    except QuotaExceededError as exc:
+        raise HTTPException(status_code=429, detail=redact_secrets(exc))
+    except ProviderKeyError as exc:
+        raise HTTPException(status_code=400, detail=redact_secrets(exc))
+
+    usage_recorder = _make_usage_recorder(current_user_id)
+    quota_checker = _make_quota_checker(
+        current_user_id,
+        current_user_email,
+        llm_context["byok_token_limits"],
+    )
+    selected_provider_api_key = llm_context["provider_api_keys"].get(provider)
+    selected_provider_key_scope = ProviderFileService._key_scope(selected_provider_api_key)
 
     # ── Conversation persistence: auto-create + save user message ──────
     conv_id = request.conversation_id
@@ -1055,6 +1158,7 @@ def _stream_chat_response(
             provider=provider,
             conversation_id=request.conversation_id,
             user_id=current_user_id,
+            key_scope=selected_provider_key_scope,
         )
     attachment_context = attachment_context or {}
     active_attachments = attachment_context.get("attachments") or []
@@ -1113,16 +1217,23 @@ def _stream_chat_response(
                 loop_img = asyncio.get_event_loop()
                 image_analysis = await loop_img.run_in_executor(
                     _executor,
-                    lambda: _analyze_uploaded_images_for_text(
-                        image_prepass_images,
-                        request.message,
+                    lambda: _run_with_llm_context(
+                        llm_context,
+                        current_user_id,
+                        current_user_email,
+                        usage_recorder,
+                        quota_checker,
+                        lambda: _analyze_uploaded_images_for_text(
+                            image_prepass_images,
+                            request.message,
+                        ),
                     ),
                 )
             except Exception as e:
                 msg = (
                     "I could not analyze the uploaded image before sending it to "
                     f"{requested_model}. The selected model cannot accept raw image inputs. "
-                    f"Image analysis error: {e}"
+                    f"Image analysis error: {redact_secrets(e)}"
                 )
                 yield f"data: {json.dumps({'type': 'error', 'content': msg})}\n\n"
                 yield "data: [DONE]\n\n"
@@ -1177,7 +1288,20 @@ def _stream_chat_response(
                         except Exception:
                             return []
 
-                        embeddings = OpenAIEmbeddings()
+                        openai_byok_key = llm_context["provider_api_keys"].get("openai")
+                        openai_key_source = "byok" if openai_byok_key else "platform"
+                        usage_quota_service.ensure_allowed(
+                            user_id=user_id,
+                            user_email=current_user_email,
+                            provider="openai",
+                            key_source=openai_key_source,
+                            byok_token_limit=llm_context["byok_token_limits"].get("openai"),
+                        )
+                        embeddings = (
+                            OpenAIEmbeddings(openai_api_key=openai_byok_key)
+                            if openai_byok_key
+                            else OpenAIEmbeddings()
+                        )
                         query_vector = embeddings.embed_query(request.message)
                         hits = search_vectors(collection_name, query_vector, limit=6)
                         print(f"[PERSONAL_RAG] User={user_id}, Query='{request.message[:60]}', Hits={len(hits)}")
@@ -1324,13 +1448,23 @@ def _stream_chat_response(
                         asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
                     except Exception as e:
                         print(f"Agent error: {e}")
-                        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+                        asyncio.run_coroutine_threadsafe(queue.put(("error", redact_secrets(e))), loop)
                 finally:
                     if lf_trace:
                         from core.llm_client import set_langfuse_parent
                         set_langfuse_parent(None)
 
-            loop.run_in_executor(_executor, _run_agent)
+            loop.run_in_executor(
+                _executor,
+                lambda: _run_with_llm_context(
+                    llm_context,
+                    current_user_id,
+                    current_user_email,
+                    usage_recorder,
+                    quota_checker,
+                    _run_agent,
+                ),
+            )
 
             first_token = True
             response_text = ""
@@ -1717,8 +1851,8 @@ def _stream_chat_response(
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            print(f"Chat route error: {e}")
-            error_data = json.dumps({"type": "error", "content": str(e)})
+            print(f"Chat route error: {redact_secrets(e)}")
+            error_data = json.dumps({"type": "error", "content": redact_secrets(e)})
             yield f"data: {error_data}\n\n"
             yield "data: [DONE]\n\n"
         finally:
@@ -1811,6 +1945,113 @@ async def list_models():
             logger.warning(f"[MODELS] Failed to discover local models: {e}")
 
     return {"models": cloud_models + local_models}
+
+
+# Provider Key / Quota Endpoints
+
+def _test_provider_key(provider: str, api_key: str) -> None:
+    """Make a tiny provider call to validate a stored BYOK key."""
+    provider = "google" if provider == "gemini" else provider
+    test_models = {
+        "openai": os.getenv("OPENAI_KEY_TEST_MODEL", "gpt-4o-mini"),
+        "deepseek": os.getenv("DEEPSEEK_KEY_TEST_MODEL", "deepseek-chat"),
+        "anthropic": os.getenv("ANTHROPIC_KEY_TEST_MODEL", "claude-3-5-haiku-latest"),
+        "google": os.getenv("GEMINI_KEY_TEST_MODEL", "gemini-1.5-flash"),
+    }
+    model = test_models.get(provider)
+    if not model:
+        raise ValueError(f"Unsupported provider '{provider}'.")
+
+    client = LLMClient(
+        model=model,
+        provider_api_keys={provider: api_key},
+        key_source_by_provider={provider: "byok"},
+    )
+    client.responses.create(
+        model=model,
+        input="Reply with ok.",
+        max_output_tokens=2,
+        temperature=0,
+    )
+
+
+@app.get("/api/provider-keys")
+async def list_provider_keys(current_user: dict = Depends(get_current_user)):
+    return {"keys": provider_key_service.list_keys(current_user["sub"])}
+
+
+@app.post("/api/provider-keys")
+async def save_provider_key(req: ProviderKeySaveRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        metadata = provider_key_service.save_key(
+            current_user["sub"],
+            req.provider,
+            req.api_key,
+            token_limit=req.token_limit,
+        )
+        return {"status": "success", "key": metadata}
+    except ProviderKeyError as exc:
+        raise HTTPException(status_code=400, detail=redact_secrets(exc))
+
+
+@app.post("/api/provider-keys/{provider}/test")
+async def test_provider_key(provider: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["sub"]
+    try:
+        api_key = provider_key_service.decrypt_key(user_id, provider)
+        if not api_key:
+            raise HTTPException(status_code=404, detail="Provider key not found")
+        try:
+            _test_provider_key(provider, api_key)
+        except Exception as exc:
+            provider_key_service.mark_test_result(user_id, provider, False)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Provider key test failed: {redact_secrets(exc)}",
+            )
+        metadata = provider_key_service.mark_test_result(user_id, provider, True)
+        return {"status": "success", "key": metadata}
+    except HTTPException:
+        raise
+    except ProviderKeyError as exc:
+        raise HTTPException(status_code=400, detail=redact_secrets(exc))
+
+
+@app.patch("/api/provider-keys/{provider}/limit")
+async def update_provider_key_limit(
+    provider: str,
+    req: ProviderKeyLimitRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        metadata = provider_key_service.set_token_limit(
+            current_user["sub"],
+            provider,
+            req.token_limit,
+        )
+        return {"status": "success", "key": metadata}
+    except ProviderKeyError as exc:
+        raise HTTPException(status_code=400, detail=redact_secrets(exc))
+
+
+@app.delete("/api/provider-keys/{provider}")
+async def delete_provider_key(provider: str, current_user: dict = Depends(get_current_user)):
+    try:
+        if provider_key_service.delete_key(current_user["sub"], provider):
+            return {"status": "success"}
+    except ProviderKeyError as exc:
+        raise HTTPException(status_code=400, detail=redact_secrets(exc))
+    raise HTTPException(status_code=404, detail="Provider key not found")
+
+
+@app.get("/api/usage-quota")
+async def get_usage_quota(current_user: dict = Depends(get_current_user)):
+    metadata = provider_key_service.list_keys(current_user["sub"])
+    return usage_quota_service.usage_summary(
+        user_id=current_user["sub"],
+        user_email=_current_user_email(current_user),
+        provider_key_metadata=metadata,
+    )
 
 # ── Custom Tool Models ────────────────────────────────────────
 
@@ -2695,8 +2936,29 @@ async def chat_with_files(
     auth_header = _safe_authorization_header(authorization)
     current_user = _resolve_optional_user(auth_header)
     user_id = current_user.get("sub") if current_user else None
+    if not user_id:
+        return _sse_error_response(
+            "Authentication required. Please sign in to your Quasar account to upload files."
+        )
     selected_model = model or "gpt-4o"
     provider = detect_provider(selected_model)
+    try:
+        upload_llm_context = _build_llm_context_for_user(user_id)
+        upload_user_email = _current_user_email(current_user)
+        upload_key_source = upload_llm_context["key_source_by_provider"].get(provider, "platform")
+        usage_quota_service.ensure_allowed(
+            user_id=user_id,
+            user_email=upload_user_email,
+            provider=provider,
+            key_source=upload_key_source,
+            byok_token_limit=upload_llm_context["byok_token_limits"].get(provider),
+        )
+    except QuotaExceededError as exc:
+        return _sse_error_response(redact_secrets(exc))
+    except ProviderKeyError as exc:
+        return _sse_error_response(redact_secrets(exc))
+    selected_provider_api_key = upload_llm_context["provider_api_keys"].get(provider)
+    selected_provider_key_scope = ProviderFileService._key_scope(selected_provider_api_key)
 
     import base64
 
@@ -2771,9 +3033,11 @@ async def chat_with_files(
                     files=document_uploads,
                     conversation_id=conversation_id,
                     user_id=user_id,
+                    provider_api_key=selected_provider_api_key,
+                    provider_key_scope=selected_provider_key_scope,
                 )
             except ProviderFileError as exc:
-                return _sse_error_response(str(exc))
+                return _sse_error_response(redact_secrets(exc))
         else:
             # Fallback for providers without native document upload support (e.g. DeepSeek)
             # Extract document text server-side and append it directly to the message prompt
