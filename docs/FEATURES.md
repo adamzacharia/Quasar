@@ -21,8 +21,8 @@ Last audited against the codebase: 2026-04-25
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
-| Polish & Scale         | 42    | 23    | 0           | 19      | 55%    |
-| **Total**              |**108**|**57** | **2**       | **49**  |**53%** |
+| Polish & Scale         | 42    | 23    | 1           | 18      | 55%    |
+| **Total**              |**108**|**57** | **3**       | **48**  |**53%** |
 
 
 ---
@@ -150,7 +150,7 @@ Without them, even great features feel broken.
 
 ### User Experience
 
-- [ ] **PS10** Mobile-Responsive UI -- Currently desktop-only
+- [/] **PS10** Mobile-Responsive UI -- (partial) Responsive empty state layout (ui-pro/src/components/EmptyState.tsx)
 - [x] **PS11** Onboarding Tutorial -- 5-step guided first-visit overlay with glassmorphism cards, step dots, localStorage persistence, and re-trigger from Settings (ui-pro/src/components/OnboardingOverlay.tsx)
 - [ ] **PS12** Example Query Gallery -- Show example queries on the empty state
 - [x] **PS13** Download Progress Indicator -- Streaming progress bar with filename, speed, percentage via SSE download_progress events; auto-dismiss after completion (services/download_utils.py + ui-pro/src/components/DownloadProgress.tsx)
@@ -214,4 +214,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-06-05 -- Quasar v3.4.2 (User Provider Key Storage & Platform Usage Quotas)*
+*Last updated: 2026-06-06 -- Quasar v3.4.3 (Responsive Empty State Layout)*
