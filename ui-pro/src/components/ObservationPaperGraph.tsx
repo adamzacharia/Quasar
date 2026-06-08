@@ -85,7 +85,8 @@ function nodeIcon(type: string) {
 }
 
 function truncateLabel(value: string, max = 38): string {
-    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+    const suffix = "...";
+    return value.length > max ? `${value.slice(0, Math.max(0, max - suffix.length))}${suffix}` : value;
 }
 
 export function ObservationPaperGraph({ graph }: ObservationPaperGraphProps) {
@@ -169,7 +170,7 @@ export function ObservationPaperGraph({ graph }: ObservationPaperGraphProps) {
                                         key={`${edge.from}-${edge.to}-${index}`}
                                         d={`M ${from.x} ${from.y} C ${(from.x + to.x) / 2} ${from.y}, ${(from.x + to.x) / 2} ${to.y}, ${to.x} ${to.y}`}
                                         fill="none"
-                                        stroke="rgba(148, 163, 184, 0.34)"
+                                        stroke="var(--q-observation-graph-edge)"
                                         strokeWidth={strokeWidth}
                                         vectorEffect="non-scaling-stroke"
                                     />
@@ -185,7 +186,7 @@ export function ObservationPaperGraph({ graph }: ObservationPaperGraphProps) {
                                 <div
                                     className="w-[128px] rounded-lg px-2.5 py-2 shadow-sm transition-all hover:scale-[1.02]"
                                     style={{
-                                        background: "rgba(15, 23, 42, 0.9)",
+                                        background: "var(--q-observation-graph-node-bg)",
                                         border: `1px solid ${color}66`,
                                         boxShadow: `0 0 0 1px ${color}18`,
                                     }}
@@ -195,11 +196,17 @@ export function ObservationPaperGraph({ graph }: ObservationPaperGraphProps) {
                                         {nodeIcon(node.type)}
                                         <span className="text-[10px] font-semibold uppercase truncate">{node.type}</span>
                                     </div>
-                                    <div className="text-xs font-semibold text-slate-100 leading-snug mt-1 line-clamp-2">
+                                    <div
+                                        className="text-xs font-semibold leading-snug mt-1 line-clamp-2"
+                                        style={{ color: "var(--q-observation-graph-node-text)" }}
+                                    >
                                         {truncateLabel(node.label)}
                                     </div>
                                     {node.detail && (
-                                        <div className="text-[10px] text-slate-400 truncate mt-1">
+                                        <div
+                                            className="text-[10px] truncate mt-1"
+                                            style={{ color: "var(--q-observation-graph-node-detail)" }}
+                                        >
                                             {node.detail}
                                         </div>
                                     )}

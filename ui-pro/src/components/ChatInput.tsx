@@ -208,29 +208,40 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                             <span>Upload documents</span>
                                         </button>
                                         <div className="my-1 h-px bg-slate-800" />
-                                        <button
-                                            type="button"
-                                            role="menuitemcheckbox"
-                                            aria-checked={groundedSummary}
-                                            onClick={() => setGroundedSummary(value => !value)}
-                                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
-                                        >
-                                            <span className="flex min-w-0 items-center gap-3">
-                                                <ShieldCheck className={`h-4 w-4 ${groundedSummary ? "text-emerald-300" : "text-slate-500"}`} />
-                                                <span>Grounded</span>
-                                            </span>
-                                            <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
-                                                groundedSummary
-                                                    ? "border-emerald-400/50 bg-emerald-500/25"
-                                                    : "border-slate-700 bg-slate-900"
-                                            }`}>
-                                                <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
+                                        <div className="group/grounded relative">
+                                            <button
+                                                type="button"
+                                                role="menuitemcheckbox"
+                                                aria-checked={groundedSummary}
+                                                aria-describedby="grounded-mode-tooltip"
+                                                onClick={() => setGroundedSummary(value => !value)}
+                                                className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80 focus-visible:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400/50"
+                                            >
+                                                <span className="flex min-w-0 items-center gap-3">
+                                                    <ShieldCheck className={`h-4 w-4 ${groundedSummary ? "text-emerald-300" : "text-slate-500"}`} />
+                                                    <span>Grounded</span>
+                                                </span>
+                                                <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
                                                     groundedSummary
-                                                        ? "translate-x-4 bg-emerald-300"
-                                                        : "translate-x-1 bg-slate-500"
-                                                }`} />
-                                            </span>
-                                        </button>
+                                                        ? "border-emerald-400/50 bg-emerald-500/25"
+                                                        : "border-slate-700 bg-slate-900"
+                                                }`}>
+                                                    <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
+                                                        groundedSummary
+                                                            ? "translate-x-4 bg-emerald-300"
+                                                            : "translate-x-1 bg-slate-500"
+                                                    }`} />
+                                                </span>
+                                            </button>
+                                            <div
+                                                id="grounded-mode-tooltip"
+                                                role="tooltip"
+                                                className="max-h-0 overflow-hidden px-3 text-[11px] leading-relaxed text-slate-400 opacity-0 transition-all duration-150 group-hover/grounded:mb-1 group-hover/grounded:max-h-28 group-hover/grounded:opacity-100 group-focus-within/grounded:mb-1 group-focus-within/grounded:max-h-28 group-focus-within/grounded:opacity-100"
+                                            >
+                                                <span className="block font-semibold text-emerald-200">Grounded mode</span>
+                                                Summarizes only rows, counts, identifiers, coordinates, links, and explicit errors returned by tools in this run. It avoids outside background knowledge, guesses, and unstated counts.
+                                            </div>
+                                        </div>
                                         <button
                                             type="button"
                                             role="menuitemcheckbox"

@@ -38,6 +38,10 @@ html {
   --q-input-bg: #0f1f38;
   --q-code-bg: #0a0a0f;
   --q-shadow-glow: rgba(244, 113, 181, 0.15);
+  --q-observation-graph-node-bg: rgba(15, 23, 42, 0.9);
+  --q-observation-graph-node-text: #f8fafc;
+  --q-observation-graph-node-detail: #94a3b8;
+  --q-observation-graph-edge: rgba(148, 163, 184, 0.34);
 }
 
 /* ── Light theme ───────────────────────────────────────────── */
@@ -59,6 +63,10 @@ html {
   --q-input-bg: #ffffff;
   --q-code-bg: #f1f5f9;
   --q-shadow-glow: rgba(244, 113, 181, 0.1);
+  --q-observation-graph-node-bg: rgba(15, 23, 42, 0.92);
+  --q-observation-graph-node-text: #f8fafc;
+  --q-observation-graph-node-detail: #cbd5e1;
+  --q-observation-graph-edge: rgba(100, 116, 139, 0.28);
 }
 
 /* ── Backwards-compatible Tailwind aliases ─────────────────── */
