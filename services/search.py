@@ -1,14 +1,19 @@
 # services/search.py
 """
-Search Service — Facade over ALminerClient for all ALMA archive searches.
+Search Service — Facade over the archive clients for all archive searches.
 
 CALLED BY: core/agent.py (tool execution: search_by_target, search_by_position, etc.)
-CALLS:     integrations/alminer_client.py (ALminerClient)
+CALLS:     integrations/alminer_client.py (ALminerClient)  — ALMA (default)
+           integrations/tap.py (NRAOTapClient)             — VLA/VLBA/GBT
 
 DATA FLOW:
     agent._search_by_target(name) → SearchService.search_by_target(name)
     → ALminerClient.search_by_target(name) → alminer.target(name)
     → Returns pd.DataFrame of matching observations
+
+    agent._search_by_target(name, facility="VLA")
+    → NRAOTapClient.search_vla_vlba(name, instruments=["VLA", "EVLA", "JVLA"])
+    → Returns pd.DataFrame of matching NRAO archive observations
 
 Also provides: plot generation, data download, line coverage checks,
 and catalog search — all delegated to ALminerClient.
@@ -19,16 +24,57 @@ import pandas as pd
 from datetime import datetime
 from integrations.alminer_client import ALminerClient
 
+# Facilities served by the NRAO TAP archive (data-query.nrao.edu)
+NRAO_FACILITIES = {"VLA", "VLBA", "EVLA", "JVLA", "GBT"}
+
+
 class SearchService:
     """High-level search operations for NRAO data"""
 
     def __init__(self):
         self.alminer_client = ALminerClient()
+        self._nrao_client = None
+
+    @property
+    def nrao_client(self):
+        """Lazily constructed NRAO TAP client for VLA/VLBA/GBT searches."""
+        if self._nrao_client is None:
+            try:
+                from integrations.tap import NRAOTapClient
+                self._nrao_client = NRAOTapClient()
+            except Exception as e:
+                print(f"[SearchService] NRAO TAP client unavailable: {e}")
+                self._nrao_client = False  # sentinel: do not retry every call
+        return self._nrao_client or None
+
+    @staticmethod
+    def is_nrao_facility(facility: Optional[str]) -> bool:
+        """True when the requested facility lives in the NRAO (non-ALMA) archive."""
+        return bool(facility) and facility.strip().upper() in NRAO_FACILITIES
+
+    def _nrao_instruments(self, facility: str) -> List[str]:
+        from integrations.tap import NRAOTapClient
+        return NRAOTapClient.instruments_for_facility(facility)
 
     def cone_search(self, ra: float, dec: float, radius: float,
                    facility: Optional[str] = None,
                    max_results: int = 100) -> pd.DataFrame:
-        """Perform cone search using ALminer"""
+        """Perform cone search. Routes to NRAO TAP for VLA/VLBA/GBT, else ALminer (ALMA)."""
+        if self.is_nrao_facility(facility):
+            client = self.nrao_client
+            if client is None:
+                print("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
+                return pd.DataFrame()
+            try:
+                return client.search_by_position(
+                    ra, dec, radius,
+                    instruments=self._nrao_instruments(facility),
+                    max_results=max_results,
+                )
+            except Exception as e:
+                print(f"NRAO TAP search failed: {e}")
+                return pd.DataFrame()
+
         try:
             return self.alminer_client.search_by_position(ra, dec, radius)
         except Exception as e:
@@ -39,7 +85,22 @@ class SearchService:
                         facility: Optional[str] = None,
                         date_range: Optional[str] = None,
                         max_results: int = 100) -> pd.DataFrame:
-        """Search by target name using ALminer"""
+        """Search by target name. Routes to NRAO TAP for VLA/VLBA/GBT, else ALminer (ALMA)."""
+        if self.is_nrao_facility(facility):
+            client = self.nrao_client
+            if client is None:
+                print("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
+                return pd.DataFrame()
+            try:
+                return client.search_vla_vlba(
+                    target_name,
+                    max_results=max_results,
+                    instruments=self._nrao_instruments(facility),
+                )
+            except Exception as e:
+                print(f"NRAO TAP search failed: {e}")
+                return pd.DataFrame()
+
         try:
             return self.alminer_client.search_by_target(target_name)
         except Exception as e:
@@ -49,7 +110,22 @@ class SearchService:
     def search_by_frequency(self, min_freq_ghz: float, max_freq_ghz: float,
                            facility: Optional[str] = None,
                            max_results: int = 100) -> pd.DataFrame:
-        """Search by frequency range"""
+        """Search by frequency range. Routes to NRAO TAP for VLA/VLBA/GBT, else ALminer (ALMA)."""
+        if self.is_nrao_facility(facility):
+            client = self.nrao_client
+            if client is None:
+                print("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
+                return pd.DataFrame()
+            try:
+                return client.search_by_frequency_range(
+                    min_freq_ghz, max_freq_ghz,
+                    instruments=self._nrao_instruments(facility),
+                    max_results=max_results,
+                )
+            except Exception as e:
+                print(f"NRAO TAP search failed: {e}")
+                return pd.DataFrame()
+
         return self.alminer_client.search_by_frequency(min_freq_ghz, max_freq_ghz)
 
     def get_observation_details(self, obs_id: str) -> Dict[str, Any]:

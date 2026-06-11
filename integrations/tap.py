@@ -6,6 +6,7 @@ Corrects the table name issue for VLA/VLBA queries
 import os
 from typing import Optional, Dict, Any, List
 import pandas as pd
+import requests
 from datetime import datetime
 import pyvo as vo
 from astropy import units as u
@@ -16,6 +17,23 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+class _TimeoutHTTPSession(requests.Session):
+    """requests.Session that enforces a default timeout on every request.
+
+    pyvo issues requests without a timeout, which can hang indefinitely on
+    slow or filtered networks. Injecting this session guarantees every TAP
+    HTTP call fails fast instead of blocking the agent.
+    """
+
+    def __init__(self, timeout: float = 30.0):
+        super().__init__()
+        self._default_timeout = timeout
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self._default_timeout)
+        return super().request(method, url, **kwargs)
+
+
 def _sanitize_adql(value: str) -> str:
     """Escape user input for safe ADQL interpolation."""
     # Remove/escape characters that could break ADQL string literals
@@ -23,53 +41,98 @@ def _sanitize_adql(value: str) -> str:
 
 
 class NRAOTapClient:
-    """Fixed client for interacting with NRAO's TAP service - Version 2"""
+    """Client for NRAO's TAP service covering VLA, VLBA, EVLA, and GBT.
 
-    # CORRECT NRAO TAP service endpoints
+    Connection is lazy: the first search triggers the TAP endpoint
+    connection and ObsCore table discovery, keeping construction free of
+    network calls (safe to instantiate at agent startup).
+    """
+
+    # NRAO TAP service endpoints
     TAP_URLS = {
-        "nrao": "https://data-query.nrao.edu/tap",  # VLA/VLBA data
+        "nrao": "https://data-query.nrao.edu/tap",  # VLA/VLBA/GBT data
         "alma": "https://almascience.nrao.edu/tap"   # ALMA data
     }
 
-    def __init__(self, service_url: Optional[str] = None, timeout: int = 60):
+    # Instrument name variants per facility in the NRAO ObsCore table
+    FACILITY_INSTRUMENTS = {
+        "VLA": ["VLA", "EVLA", "JVLA"],
+        "VLBA": ["VLBA"],
+        "GBT": ["GBT"],
+    }
+    DEFAULT_INSTRUMENTS = ["VLA", "VLBA", "EVLA", "JVLA"]
+
+    def __init__(self, service_url: Optional[str] = None, timeout: int = 60, lazy: bool = True):
         """
-        Initialize TAP client
+        Initialize TAP client. With lazy=True (default) no network calls
+        are made until the first search.
         """
-        self.nrao_url = self.TAP_URLS["nrao"]
+        self.nrao_url = service_url or self.TAP_URLS["nrao"]
         self.alma_url = self.TAP_URLS["alma"]
         self.timeout = timeout
-        
-        # Try to determine the correct table name
-        self.obscore_table = None
-        
-        # Connect to NRAO TAP and discover table name
+        self.obscore_table: Optional[str] = None
+        self.nrao_tap = None
+        self._connected = False
+        self._alma = None
+        if not lazy:
+            self._ensure_connected()
+
+    @property
+    def alma(self):
+        """Lazily constructed astroquery ALMA interface."""
+        if self._alma is None:
+            self._alma = Alma()
+        return self._alma
+
+    @classmethod
+    def instruments_for_facility(cls, facility: Optional[str]) -> List[str]:
+        """Map a facility name (VLA/VLBA/GBT) to ObsCore instrument_name values."""
+        if not facility:
+            return list(cls.DEFAULT_INSTRUMENTS)
+        return list(cls.FACILITY_INSTRUMENTS.get(facility.strip().upper(), cls.DEFAULT_INSTRUMENTS))
+
+    def _ensure_connected(self) -> bool:
+        """Connect to the NRAO TAP service and discover the ObsCore table name."""
+        if self._connected and self.nrao_tap is not None:
+            return True
+
         try:
-            self.nrao_tap = vo.dal.TAPService(self.nrao_url)
-            print(f"✅ Connected to NRAO TAP: {self.nrao_url}")
-            
+            # Fast reachability probe so unreachable networks fail in seconds,
+            # not minutes (pyvo's own requests carry no timeout).
+            probe = requests.get(f"{self.nrao_url}/capabilities", timeout=10)
+            probe.raise_for_status()
+
+            session = _TimeoutHTTPSession(timeout=self.timeout)
+            try:
+                self.nrao_tap = vo.dal.TAPService(self.nrao_url, session=session)
+            except TypeError:
+                # Older pyvo without session support
+                self.nrao_tap = vo.dal.TAPService(self.nrao_url)
+            print(f"[NRAO TAP] Connected: {self.nrao_url}")
+
             # Try different table names to find the correct one
             for table_name in ["obscore", "ivoa.obscore", "ObsCore", "tap_schema.obscore"]:
                 try:
                     test_query = f"SELECT TOP 1 obs_publisher_did FROM {table_name}"
                     self.nrao_tap.search(test_query)
                     self.obscore_table = table_name
-                    print(f"✅ Using table: {table_name}")
+                    print(f"[NRAO TAP] Using table: {table_name}")
                     break
-                except:
+                except Exception:
                     continue
-                    
+
             if not self.obscore_table:
-                print("⚠️ Could not determine ObsCore table name, using 'obscore' as default")
+                print("[NRAO TAP] Could not determine ObsCore table name, using 'obscore' as default")
                 self.obscore_table = "obscore"
-                
+
+            self._connected = True
         except Exception as e:
-            print(f"⚠️ Could not connect to NRAO TAP: {e}")
+            print(f"[NRAO TAP] Connection failed: {e}")
             self.nrao_tap = None
-            self.obscore_table = "obscore"
-            
-        # Initialize ALMA through astroquery (more reliable)
-        self.alma = Alma()
-        print(f"✅ ALMA interface ready")
+            self.obscore_table = self.obscore_table or "obscore"
+            self._connected = False
+
+        return self._connected
 
     def search_by_source_name(self, source_name: str, max_results: int = 100) -> pd.DataFrame:
         """
@@ -99,14 +162,190 @@ class NRAOTapClient:
             print(f"\n❌ No observations found for {source_name}")
             return pd.DataFrame()
 
-    def search_vla_vlba(self, source_name: str, max_results: int = 100) -> pd.DataFrame:
+    def _postprocess_obscore_df(self, df: pd.DataFrame,
+                                instruments: Optional[List[str]] = None) -> pd.DataFrame:
+        """Standardize an NRAO ObsCore result DataFrame (freq, dates, size, URLs)."""
+        if df.empty:
+            return df
+
+        # Convert wavelength to frequency if em_min/max present
+        if 'em_min' in df.columns and 'em_max' in df.columns:
+            c = 299792458.0  # speed of light in m/s
+            df['freq_max_ghz'] = (c / df['em_min']) / 1e9  # min wavelength = max frequency
+            df['freq_min_ghz'] = (c / df['em_max']) / 1e9  # max wavelength = min frequency
+
+        # Convert MJD to datetime
+        if 't_min' in df.columns:
+            try:
+                df['obs_date'] = pd.to_datetime(df['t_min'] - 40587, unit='D', origin='1970-01-01')
+            except Exception:
+                df['obs_date'] = df['t_min']
+
+        # Add size in GB
+        if 'access_estsize' in df.columns:
+            df['size_gb'] = df['access_estsize'] / 1e9
+
+        # Add archive URLs
+        if 'obs_publisher_did' in df.columns:
+            df['archive_url'] = df['obs_publisher_did'].apply(
+                lambda x: f"https://data.nrao.edu/portal/#/search/{x}" if pd.notna(x) else ""
+            )
+
+        # Filter to requested instruments if instrument_name exists
+        if instruments and 'instrument_name' in df.columns:
+            df = df[df['instrument_name'].isin(instruments)]
+
+        return df
+
+    def search_by_position(self, ra: float, dec: float, radius: float = 0.5,
+                           instruments: Optional[List[str]] = None,
+                           max_results: int = 100) -> pd.DataFrame:
         """
-        Search VLA/VLBA observations using correct TAP query
+        Cone search of the NRAO archive (VLA/VLBA/GBT) by sky position.
+
+        Args:
+            ra: Right ascension in degrees (ICRS)
+            dec: Declination in degrees (ICRS)
+            radius: Search radius in degrees
+            instruments: ObsCore instrument_name values to keep
+                         (default: VLA/VLBA/EVLA/JVLA)
+            max_results: Maximum rows to return
         """
-        if not self.nrao_tap:
-            print("⚠️ NRAO TAP service not available")
+        if not self._ensure_connected() or not self.nrao_tap:
+            print("[NRAO TAP] Service not available")
             return pd.DataFrame()
-            
+
+        instruments = instruments or list(self.DEFAULT_INSTRUMENTS)
+        inst_list = ", ".join(f"'{_sanitize_adql(i)}'" for i in instruments)
+
+        query = f"""
+        SELECT TOP {int(max_results)}
+            obs_publisher_did,
+            target_name,
+            s_ra, s_dec,
+            t_min, t_max,
+            t_exptime,
+            em_min, em_max,
+            instrument_name,
+            facility_name,
+            access_estsize
+        FROM {self.obscore_table}
+        WHERE 1=CONTAINS(POINT('ICRS', s_ra, s_dec),
+                       CIRCLE('ICRS', {float(ra)}, {float(dec)}, {float(radius)}))
+        AND instrument_name IN ({inst_list})
+        ORDER BY t_min DESC
+        """
+
+        try:
+            try:
+                results = self.nrao_tap.search(query)
+            except Exception:
+                # Fallback without frequency columns
+                query = f"""
+                SELECT TOP {int(max_results)}
+                    obs_publisher_did,
+                    target_name,
+                    s_ra, s_dec,
+                    t_min, t_max,
+                    t_exptime,
+                    instrument_name,
+                    facility_name,
+                    access_estsize
+                FROM {self.obscore_table}
+                WHERE 1=CONTAINS(POINT('ICRS', s_ra, s_dec),
+                               CIRCLE('ICRS', {float(ra)}, {float(dec)}, {float(radius)}))
+                AND instrument_name IN ({inst_list})
+                ORDER BY t_min DESC
+                """
+                results = self.nrao_tap.search(query)
+
+            if results and len(results) > 0:
+                df = results.to_table().to_pandas()
+                df = self._postprocess_obscore_df(df, instruments=None)
+                print(f"[NRAO TAP] Position search found {len(df)} observations")
+                return df
+
+            print("[NRAO TAP] No observations found at position")
+            return pd.DataFrame()
+        except Exception as e:
+            print(f"[NRAO TAP] Position search error: {e}")
+            return pd.DataFrame()
+
+    def search_by_frequency_range(self, min_freq_ghz: float, max_freq_ghz: float,
+                                  instruments: Optional[List[str]] = None,
+                                  max_results: int = 100) -> pd.DataFrame:
+        """
+        Search the NRAO archive for observations whose spectral coverage
+        overlaps [min_freq_ghz, max_freq_ghz].
+
+        ObsCore stores wavelength bounds (em_min/em_max in meters), so the
+        overlap condition in wavelength space is:
+            em_min <= c/min_freq  AND  em_max >= c/max_freq
+        """
+        if not self._ensure_connected() or not self.nrao_tap:
+            print("[NRAO TAP] Service not available")
+            return pd.DataFrame()
+
+        if min_freq_ghz <= 0 or max_freq_ghz <= 0 or max_freq_ghz < min_freq_ghz:
+            print(f"[NRAO TAP] Invalid frequency range: {min_freq_ghz}-{max_freq_ghz} GHz")
+            return pd.DataFrame()
+
+        c = 299792458.0
+        lam_max = c / (min_freq_ghz * 1e9)  # longest wavelength of the requested range
+        lam_min = c / (max_freq_ghz * 1e9)  # shortest wavelength of the requested range
+
+        instruments = instruments or list(self.DEFAULT_INSTRUMENTS)
+        inst_list = ", ".join(f"'{_sanitize_adql(i)}'" for i in instruments)
+
+        query = f"""
+        SELECT TOP {int(max_results)}
+            obs_publisher_did,
+            target_name,
+            s_ra, s_dec,
+            t_min, t_max,
+            t_exptime,
+            em_min, em_max,
+            instrument_name,
+            facility_name,
+            access_estsize
+        FROM {self.obscore_table}
+        WHERE em_min <= {lam_max}
+        AND em_max >= {lam_min}
+        AND instrument_name IN ({inst_list})
+        ORDER BY t_min DESC
+        """
+
+        try:
+            results = self.nrao_tap.search(query)
+            if results and len(results) > 0:
+                df = results.to_table().to_pandas()
+                df = self._postprocess_obscore_df(df, instruments=None)
+                print(f"[NRAO TAP] Frequency search found {len(df)} observations")
+                return df
+            print("[NRAO TAP] No observations found in frequency range")
+            return pd.DataFrame()
+        except Exception as e:
+            print(f"[NRAO TAP] Frequency search error: {e}")
+            return pd.DataFrame()
+
+    def search_vla_vlba(self, source_name: str, max_results: int = 100,
+                        instruments: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Search VLA/VLBA/GBT observations using a TAP query.
+
+        Args:
+            source_name: Target name (resolved to coordinates when possible)
+            max_results: Maximum rows to return
+            instruments: ObsCore instrument_name values to keep
+                         (default: VLA/VLBA/EVLA/JVLA)
+        """
+        if not self._ensure_connected() or not self.nrao_tap:
+            print("[NRAO TAP] Service not available")
+            return pd.DataFrame()
+
+        instruments = instruments or list(self.DEFAULT_INSTRUMENTS)
+        inst_filter = ", ".join(f"'{_sanitize_adql(i)}'" for i in instruments)
+
         try:
             # First try to resolve to coordinates
             try:
@@ -130,7 +369,7 @@ class NRAOTapClient:
                 FROM {self.obscore_table}
                 WHERE 1=CONTAINS(POINT('ICRS', s_ra, s_dec),
                                CIRCLE('ICRS', {ra}, {dec}, 0.1))
-                AND instrument_name IN ('VLA', 'VLBA', 'EVLA')
+                AND instrument_name IN ({inst_filter})
                 ORDER BY t_min DESC
                 """
                 
@@ -203,56 +442,26 @@ class NRAOTapClient:
             # Process results
             if results and len(results) > 0:
                 df = results.to_table().to_pandas()
-                
+
                 if not df.empty:
-                    # Process the dataframe
-                    # Convert wavelength to frequency if em_min/max present
-                    if 'em_min' in df.columns and 'em_max' in df.columns:
-                        # em is wavelength in meters, convert to frequency
-                        c = 299792458.0  # speed of light in m/s
-                        df['freq_max_ghz'] = (c / df['em_min']) / 1e9  # min wavelength = max frequency
-                        df['freq_min_ghz'] = (c / df['em_max']) / 1e9  # max wavelength = min frequency
-                    
-                    # Convert MJD to datetime
-                    if 't_min' in df.columns:
-                        try:
-                            df['obs_date'] = pd.to_datetime(df['t_min'] - 40587, unit='D', origin='1970-01-01')
-                        except:
-                            df['obs_date'] = df['t_min']  # Keep original if conversion fails
-                    
-                    # Add size in GB
-                    if 'access_estsize' in df.columns:
-                        df['size_gb'] = df['access_estsize'] / 1e9
-                    
-                    # Add archive URLs
-                    if 'obs_publisher_did' in df.columns:
-                        df['archive_url'] = df['obs_publisher_did'].apply(
-                            lambda x: f"https://data.nrao.edu/portal/#/search/{x}" if pd.notna(x) else ""
-                        )
-                    
-                    # Filter to only VLA/VLBA if instrument_name exists
-                    if 'instrument_name' in df.columns:
-                        vla_vlba_mask = df['instrument_name'].isin(['VLA', 'VLBA', 'EVLA', 'JVLA'])
-                        df = df[vla_vlba_mask]
-                    
+                    df = self._postprocess_obscore_df(df, instruments=instruments)
+
                     if not df.empty:
-                        print(f"✅ Found {len(df)} VLA/VLBA observations")
-                        
-                        # Show summary
+                        print(f"[NRAO TAP] Found {len(df)} observations ({'/'.join(instruments)})")
                         if 'instrument_name' in df.columns:
                             for inst in df['instrument_name'].unique():
                                 count = len(df[df['instrument_name'] == inst])
                                 print(f"   - {inst}: {count} observations")
                     else:
-                        print("❌ No VLA/VLBA observations found after filtering")
-                            
+                        print("[NRAO TAP] No observations found after instrument filtering")
+
                     return df
-            
-            print("❌ No VLA/VLBA observations found")
+
+            print("[NRAO TAP] No observations found")
             return pd.DataFrame()
-            
+
         except Exception as e:
-            print(f"❌ Error searching VLA/VLBA: {e}")
+            print(f"[NRAO TAP] Search error: {e}")
             # Return empty dataframe on error
             return pd.DataFrame()
 
@@ -361,6 +570,8 @@ class NRAOTapClient:
         """
         Test connections to all services
         """
+        self._ensure_connected()
+
         results = {
             "status": "disconnected",
             "nrao_tap": "disconnected",

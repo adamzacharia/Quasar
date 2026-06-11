@@ -40,7 +40,7 @@ from core.prompts import (
     RESPONSE_GENERATION_PROMPT,
     ALMA_TAP_SCHEMA
 )
-# from integrations.tap import NRAOTapClient
+# NRAO TAP (VLA/VLBA/GBT) routing lives in services/search.py (SearchService.nrao_client)
 from integrations.datalink import DataLinkClient
 from integrations.ads_client import ADSService
 from integrations.openalex_client import OpenAlexService
@@ -715,8 +715,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="search_by_target",
             description=(
-                "Search ALMA archive by target name. Supports multiple targets separated by "
-                "'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
+                "Search the ALMA archive (default) by target name. Supports multiple targets "
+                "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
+                "Pass facility='VLA', 'VLBA', or 'GBT' to search the NRAO archive instead — "
+                "ONLY when the user explicitly asks for those telescopes.\n"
                 "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency) "
                 "if the user EXPLICITLY mentions them. Do NOT invent default values. "
                 "If the user just says 'Find ALMA data of M87', pass ONLY target_name='M87' "
@@ -744,14 +746,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="search_by_frequency",
-            description="Search archives by frequency range",
+            description="Search archives by frequency range. Defaults to ALMA; pass facility='VLA'/'VLBA'/'GBT' for the NRAO archive.",
             function=self._search_by_frequency,
             parameters={
                 "type": "object",
                 "properties": {
                     "min_freq_ghz": {"type": "number", "description": "Minimum frequency in GHz"},
                     "max_freq_ghz": {"type": "number", "description": "Maximum frequency in GHz"},
-                    "facility": {"type": "string", "description": "Facility name"},
+                    "facility": {"type": "string", "enum": ["ALMA", "VLA", "VLBA", "GBT"], "description": "Observatory facility. Default ALMA."},
                     "max_results": {"type": "integer", "description": "Max results"}
                 },
                 "required": ["min_freq_ghz", "max_freq_ghz"]
@@ -3586,6 +3588,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         crashing, even though the underlying cone_search doesn't use them.
         Band filtering is applied as a post-filter on the results.
         """
+        facility_label = (facility or "ALMA").strip().upper()
+        if facility_label in ("EVLA", "JVLA"):
+            facility_label = "VLA"
+        if facility_label not in ("VLA", "VLBA", "GBT"):
+            facility_label = "ALMA"
+
         try:
             results = self.search_service.cone_search(
                 ra, dec, radius, facility, max_results
@@ -3610,7 +3618,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         print(f"[FILTER] Band {band}: {before} → {len(results)} rows")
 
             self.last_search_results = results
-            self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_position"}
+            self.last_run_result = {"type": "data", "data": results, "source": facility_label, "tool_name": "search_by_position"}
 
             # Include top MOUS UIDs + access URLs so Conductor subtasks
             # can use them for list_alma_files / render_fits_image.
@@ -3663,7 +3671,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                           max_freq_ghz: Optional[float] = None,
                           min_exp_s: Optional[float] = None,
                           public_only: bool = False) -> Dict[str, Any]:
-        """Search ALMA by target name, with optional native post-filters."""
+        """Search ALMA (default) or NRAO VLA/VLBA/GBT archives by target name,
+        with optional native post-filters."""
+        # ── Normalize facility for routing + result labeling ──
+        facility_label = (facility or "ALMA").strip().upper()
+        if facility_label in ("EVLA", "JVLA"):
+            facility_label = "VLA"
+        if facility_label not in ("VLA", "VLBA", "GBT"):
+            facility_label = "ALMA"
+
         # ── Normalize band to a list (multi-band support) ──
         band_list_input: List[int] = []
         if band is not None:
@@ -3826,7 +3842,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     print(f"[FALLBACK] Positional fallback failed: {_fb_err}")
 
             if results.empty:
-                self.last_run_result = {"type": "data", "data": results, "source": "ALMA", "tool_name": "search_by_target"}
+                self.last_run_result = {"type": "data", "data": results, "source": facility_label, "tool_name": "search_by_target"}
                 return {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
 
             # ── Tier 2: Pandas post-filters (non-band) ─────────────────
@@ -3881,17 +3897,17 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 if not combined.empty:
                     results = combined
                     band_label = ", ".join(f"Band {b}" for b in band_list_input)
-                    filter_label = f"ALMA › {target_name} [{band_label}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
+                    filter_label = f"{facility_label} › {target_name} [{band_label}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
                 else:
                     # None of the bands matched — show unfiltered
-                    filter_label = f"ALMA › {target_name}"
+                    filter_label = f"{facility_label} › {target_name}"
                     if filter_parts:
                         filter_label += " [" + ", ".join(filter_parts) + "]"
 
                 self.last_search_results = results
                 self.last_run_result = {
                     "type": "data", "data": results,
-                    "source": "ALMA", "filter_label": filter_label,
+                    "source": facility_label, "filter_label": filter_label,
                     "tool_name": "search_by_target"
                 }
             elif len(band_list_input) == 1 and band_col:
@@ -3904,24 +3920,24 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 filter_parts.append(f"Band {b}")
                 print(f"[FILTER] Band {b}: {before} → {len(results)} rows")
 
-                filter_label = f"ALMA › {target_name}"
+                filter_label = f"{facility_label} › {target_name}"
                 if filter_parts:
                     filter_label += " [" + ", ".join(filter_parts) + "]"
                 self.last_search_results = results
                 self.last_run_result = {
                     "type": "data", "data": results,
-                    "source": "ALMA", "filter_label": filter_label,
+                    "source": facility_label, "filter_label": filter_label,
                     "tool_name": "search_by_target"
                 }
             else:
                 # No band filter
-                filter_label = f"ALMA › {target_name}"
+                filter_label = f"{facility_label} › {target_name}"
                 if filter_parts:
                     filter_label += " [" + ", ".join(filter_parts) + "]"
                 self.last_search_results = results
                 self.last_run_result = {
                     "type": "data", "data": results,
-                    "source": "ALMA", "filter_label": filter_label,
+                    "source": facility_label, "filter_label": filter_label,
                     "tool_name": "search_by_target"
                 }
 
@@ -3971,14 +3987,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                             facility: Optional[str] = None,
                             max_results: int = 100) -> Dict[str, Any]:
         """Search archives by frequency range"""
+        facility_label = (facility or "ALMA").strip().upper()
+        if facility_label in ("EVLA", "JVLA"):
+            facility_label = "VLA"
+        if facility_label not in ("VLA", "VLBA", "GBT"):
+            facility_label = "ALMA"
+
         try:
             results = self.search_service.search_by_frequency(
                 min_freq_ghz, max_freq_ghz, facility, max_results
             )
             self.last_search_results = results
             self.last_run_result = {"type": "data", "data": results,
-                                    "source": "ALMA",
-                                    "filter_label": f"ALMA › {min_freq_ghz}–{max_freq_ghz} GHz",
+                                    "source": facility_label,
+                                    "filter_label": f"{facility_label} › {min_freq_ghz}–{max_freq_ghz} GHz",
                                     "tool_name": "search_by_frequency"}
             return {
                 "success": True,

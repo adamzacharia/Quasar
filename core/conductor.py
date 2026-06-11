@@ -90,7 +90,7 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
 - web_crawl_site: Crawl bounded documentation/site sections.
 - web_research: Comprehensive current web research reports with citations. NEVER for papers — use search_papers instead.
 
-**CRITICAL**: We do NOT have VLA, VLBA, or GBT archive search. Do NOT create tasks to search VLA or any non-ALMA radio archive.
+**VLA/VLBA/GBT**: search_by_target and search_by_position accept facility="VLA"/"VLBA"/"GBT" to query the NRAO archive. ONLY use these facilities when the user explicitly names those telescopes — the default facility is ALMA.
 
 ## Key Principles
 
@@ -120,14 +120,14 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
 
 **Line coverage check** (e.g. "Check CO(2-1) coverage for M87"):
   t1 (archive): search_by_target for M87 → t2 (analysis): check_co_lines or check_line_coverage → t3 (synthesis)
-  That's 3 tasks maximum. Do NOT search VLA. Do NOT add extra analysis.
+  That's 3 tasks maximum. Do NOT search VLA unless explicitly requested. Do NOT add extra analysis.
 
 **Multi-target search** (e.g. "ALMA data on M87 and NGC 1068"):
   t1 (archive): search_by_target("M87, NGC 1068") → t2 (synthesis)
   Both targets in ONE call, not separate tasks.
 
 ## Anti-Patterns (NEVER do these)
-- NEVER search VLA, VLBA, or GBT — we don't have those archives.
+- NEVER search VLA, VLBA, or GBT unless the user explicitly names those telescopes (then pass facility="VLA"/"VLBA"/"GBT" to search_by_target/search_by_position).
 - Never create a task that says "Based on your findings" — each task gets
   explicit dependency context injected automatically.
 - Never create "verify" or "check" tasks unless the user explicitly asked.
