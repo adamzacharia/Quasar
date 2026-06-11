@@ -10,6 +10,8 @@ Usage:
     python run_benchmark.py --model gpt-4.1             # Specify model
     python run_benchmark.py --judge-model gpt-4o        # Specify judge model
     python run_benchmark.py --output-dir ./results       # Custom output directory
+    python run_benchmark.py --auth-token <jwt>           # Authenticated deployments
+    python run_benchmark.py --self-test                  # Offline harness integrity check
 """
 
 import os
@@ -22,6 +24,23 @@ import datetime
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Bootstrap: make the repo root importable and load .env so the LLM judge
+# (core.llm_client) can run no matter where this script is invoked from.
+# Without this, every judge call fails with ImportError and all scores
+# silently collapse to 0 (the exact failure of the 2026-04-21 run).
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Benchmark question definitions
@@ -333,6 +352,12 @@ class QuestionResult:
     tool_usage: int = 0
     judge_reasoning: str = ""
     criteria_met: list = field(default_factory=list)
+    judge_error: Optional[str] = None
+
+    @property
+    def judged(self) -> bool:
+        """True when the LLM judge produced a valid score for this question."""
+        return self.judge_error is None
 
     @property
     def total_score(self) -> int:
@@ -363,18 +388,27 @@ class QuestionResult:
 # API interaction
 # ---------------------------------------------------------------------------
 
-def query_quasar_api(question: str, api_url: str, model: str, timeout: int = 300) -> tuple[str, float]:
+def query_quasar_api(
+    question: str,
+    api_url: str,
+    model: str,
+    timeout: int = 300,
+    auth_token: Optional[str] = None,
+) -> tuple[str, float]:
     """Send a question to the Quasar SSE endpoint, collect the full response."""
     import httpx
 
     url = f"{api_url.rstrip('/')}/api/chat"
     payload = {"message": question, "model": model}
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
 
     t0 = time.time()
     full_text = ""
 
     with httpx.Client(timeout=timeout) as client:
-        with client.stream("POST", url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+        with client.stream("POST", url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line.startswith("data: "):
@@ -425,8 +459,96 @@ For tool_usage, evaluate whether the system used appropriate tools (archive quer
 """
 
 
-def judge_response(question_data: dict, response: str, judge_model: str) -> dict:
-    """Use an LLM to judge the response quality."""
+def extract_json_object(text: str) -> dict:
+    """
+    Extract a JSON object from raw LLM output.
+
+    Handles markdown code fences, leading/trailing prose, and partial noise
+    around the outermost ``{ ... }`` block. Raises ValueError when no valid
+    JSON object can be recovered.
+    """
+    if not text or not text.strip():
+        raise ValueError("Judge returned empty output")
+
+    cleaned = text.strip()
+
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+
+    # Fast path: the whole thing is JSON
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: locate the outermost brace pair
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"No JSON object found in judge output: {cleaned[:200]!r}")
+
+    parsed = json.loads(cleaned[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Judge output JSON is not an object")
+    return parsed
+
+
+def _clamp_score(value, allow_none: bool = False) -> Optional[int]:
+    """Coerce a judge score to an int in [0, 5]. None passes through if allowed."""
+    if value is None and allow_none:
+        return None
+    try:
+        return max(0, min(5, int(round(float(value)))))
+    except (TypeError, ValueError):
+        if allow_none:
+            return None
+        raise ValueError(f"Judge returned non-numeric score: {value!r}")
+
+
+def validate_judge_scores(raw: dict) -> dict:
+    """
+    Validate and normalize a judge JSON payload.
+
+    Raises ValueError when required score fields are missing so the caller
+    records a judge failure instead of silently writing zeros.
+    """
+    required = ["correctness", "completeness", "presentation", "tool_usage"]
+    missing = [k for k in required if k not in raw]
+    if missing:
+        raise ValueError(f"Judge output missing required fields: {missing}")
+
+    criteria_met = raw.get("criteria_met", [])
+    if not isinstance(criteria_met, list):
+        criteria_met = []
+
+    return {
+        "correctness": _clamp_score(raw["correctness"]),
+        "completeness": _clamp_score(raw["completeness"]),
+        "code_quality": _clamp_score(raw.get("code_quality"), allow_none=True),
+        "presentation": _clamp_score(raw["presentation"]),
+        "tool_usage": _clamp_score(raw["tool_usage"]),
+        "criteria_met": [int(i) for i in criteria_met if isinstance(i, (int, float))],
+        "reasoning": str(raw.get("reasoning", "")).strip() or "(judge provided no reasoning)",
+    }
+
+
+def judge_response(
+    question_data: dict,
+    response: str,
+    judge_model: str,
+    max_attempts: int = 3,
+) -> dict:
+    """
+    Use an LLM to judge the response quality.
+
+    Retries transient failures up to ``max_attempts`` times and raises on
+    final failure so the caller can record an explicit judge_error instead
+    of silently scoring 0.
+    """
     from core.llm_client import LLMClient
 
     client = LLMClient(model=judge_model)
@@ -444,22 +566,27 @@ def judge_response(question_data: dict, response: str, judge_model: str) -> dict
 
 Please evaluate this response and return your JSON scoring."""
 
-    resp = client.responses.create(
-        model=judge_model,
-        instructions=JUDGE_SYSTEM_PROMPT,
-        input=user_prompt,
-        text={"format": {"type": "json_object"}},
-        temperature=0.1,
-    )
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = client.responses.create(
+                model=judge_model,
+                instructions=JUDGE_SYSTEM_PROMPT,
+                input=user_prompt,
+                text={"format": {"type": "json_object"}},
+                temperature=0.1,
+            )
+            output_text = getattr(resp, "output_text", None)
+            raw = extract_json_object(output_text or "")
+            return validate_judge_scores(raw)
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts:
+                wait = 2 ** attempt
+                print(f"\n    [WARN] Judge attempt {attempt}/{max_attempts} failed: {e} — retrying in {wait}s...", end=" ", flush=True)
+                time.sleep(wait)
 
-    try:
-        return json.loads(resp.output_text)
-    except (json.JSONDecodeError, AttributeError):
-        return {
-            "correctness": 0, "completeness": 0, "code_quality": None,
-            "presentation": 0, "tool_usage": 0, "criteria_met": [],
-            "reasoning": "Judge failed to return valid JSON",
-        }
+    raise RuntimeError(f"Judge failed after {max_attempts} attempts: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +774,10 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
     """Generate a markdown report with embedded charts."""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    total_weighted = sum(r.percentage * DIFFICULTY_WEIGHTS[r.difficulty] for r in results)
-    max_weighted = sum(100 * DIFFICULTY_WEIGHTS[r.difficulty] for r in results)
+    judged = [r for r in results if r.judged]
+    judge_failures = len(results) - len(judged)
+    total_weighted = sum(r.percentage * DIFFICULTY_WEIGHTS[r.difficulty] for r in judged)
+    max_weighted = sum(100 * DIFFICULTY_WEIGHTS[r.difficulty] for r in judged)
     overall_pct = total_weighted / max_weighted * 100 if max_weighted else 0
     overall_grade = "A" if overall_pct >= 90 else "B" if overall_pct >= 75 else "C" if overall_pct >= 60 else "D" if overall_pct >= 40 else "F"
 
@@ -669,10 +798,11 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
         f"",
         f"| Metric | Value |",
         f"|--------|-------|",
-        f"| **Weighted Score** | **{overall_pct:.1f}%** |",
-        f"| **Overall Grade** | **{overall_grade}** |",
+        f"| **Weighted Score** | **{overall_pct:.1f}%** (over {len(judged)}/{len(results)} judged) |",
+        f"| **Overall Grade** | **{overall_grade if judged else 'INVALID — judge failed on all questions'}** |",
         f"| Avg Response Time | {avg_time:.1f}s |",
-        f"| Errors | {errors}/{len(results)} |",
+        f"| API Errors | {errors}/{len(results)} |",
+        f"| Judge Failures | {judge_failures}/{len(results)} |",
         f"",
         f"---",
         f"",
@@ -719,7 +849,12 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
     ]
 
     for r in results:
-        status = "❌ ERROR" if r.error else f"{r.grade} ({r.percentage:.0f}%)"
+        if r.error:
+            status = "[ERROR]"
+        elif not r.judged:
+            status = "[JUDGE FAILED]"
+        else:
+            status = f"{r.grade} ({r.percentage:.0f}%)"
         lines += [
             f"### {r.id}: {r.title}",
             f"",
@@ -735,7 +870,8 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
             f"| Tool Usage | {r.tool_usage}/5 |",
             f"| **Total** | **{r.total_score}/{r.max_score}** |",
             f"",
-            f"**Judge Reasoning:** {r.judge_reasoning}",
+            f"**Judge Reasoning:** {r.judge_reasoning or '(none)'}",
+            *([f"", f"**Judge Error:** `{r.judge_error}`"] if r.judge_error else []),
             f"",
             f"<details><summary>Full Response</summary>",
             f"",
@@ -773,7 +909,17 @@ def main():
                         help="Specific question IDs to run (e.g., GK-E-01 AM-M-02). Default: all")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print questions without running them")
+    parser.add_argument("--auth-token", default=None,
+                        help="Bearer token for locked-down deployments "
+                             "(default: QUASAR_API_TOKEN env var, if set)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Run offline harness self-tests (no API calls) and exit")
     args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(run_self_test())
+
+    auth_token = args.auth_token or os.getenv("QUASAR_API_TOKEN") or None
 
     # Select questions
     if args.questions:
@@ -828,7 +974,10 @@ def main():
         # ── Step 1: Query Quasar ──
         try:
             print(f"    -> Querying Quasar API...", end=" ", flush=True)
-            response, elapsed = query_quasar_api(q["question"], args.api_url, args.model, args.timeout)
+            response, elapsed = query_quasar_api(
+                q["question"], args.api_url, args.model, args.timeout,
+                auth_token=auth_token,
+            )
             result.response = response
             result.response_time_s = round(elapsed, 2)
             print(f"[OK] ({elapsed:.1f}s, {len(response)} chars)")
@@ -841,15 +990,16 @@ def main():
         try:
             print(f"    -> Judging response...", end=" ", flush=True)
             scores = judge_response(q, result.response, args.judge_model)
-            result.correctness = scores.get("correctness", 0)
-            result.completeness = scores.get("completeness", 0)
-            result.code_quality = scores.get("code_quality")
-            result.presentation = scores.get("presentation", 0)
-            result.tool_usage = scores.get("tool_usage", 0)
-            result.criteria_met = scores.get("criteria_met", [])
-            result.judge_reasoning = scores.get("reasoning", "")
+            result.correctness = scores["correctness"]
+            result.completeness = scores["completeness"]
+            result.code_quality = scores["code_quality"]
+            result.presentation = scores["presentation"]
+            result.tool_usage = scores["tool_usage"]
+            result.criteria_met = scores["criteria_met"]
+            result.judge_reasoning = scores["reasoning"]
             print(f"[OK] Score: {result.total_score}/{result.max_score} ({result.percentage:.0f}%) [{result.grade}]")
         except Exception as e:
+            result.judge_error = str(e)
             print(f"[ERR] Judge error: {e}")
 
         results.append(result)
@@ -883,16 +1033,127 @@ def main():
     generate_report(results, output_dir, args.model, args.judge_model)
 
     # ── Summary ──
-    total_weighted = sum(r.percentage * DIFFICULTY_WEIGHTS[r.difficulty] for r in results)
-    max_weighted = sum(100 * DIFFICULTY_WEIGHTS[r.difficulty] for r in results)
+    judged = [r for r in results if r.judged]
+    judge_failures = len(results) - len(judged)
+    total_weighted = sum(r.percentage * DIFFICULTY_WEIGHTS[r.difficulty] for r in judged)
+    max_weighted = sum(100 * DIFFICULTY_WEIGHTS[r.difficulty] for r in judged)
     overall_pct = total_weighted / max_weighted * 100 if max_weighted else 0
 
     print(f"\n{'='*60}")
     print(f"  BENCHMARK COMPLETE")
     print(f"{'='*60}")
-    print(f"  Overall Weighted Score: {overall_pct:.1f}%")
+    if judged:
+        print(f"  Overall Weighted Score: {overall_pct:.1f}% (over {len(judged)}/{len(results)} judged questions)")
+    if judge_failures:
+        print(f"  [WARN] Judge failed on {judge_failures}/{len(results)} questions — "
+              f"scores for those are excluded from the aggregate.")
     print(f"  Results: {output_dir}")
     print(f"{'='*60}\n")
+
+    if results and not judged:
+        print("  [FATAL] The judge failed on every question. The benchmark run is invalid.")
+        print("          Check OPENAI_API_KEY in .env and judge model availability.\n")
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Offline self-test (no network) — verifies harness integrity for CI
+# ---------------------------------------------------------------------------
+
+def run_self_test() -> int:
+    """
+    Verify the scoring pipeline without any API calls.
+
+    Covers JSON extraction edge cases, score validation/clamping, weighted
+    aggregate math, and report generation. Returns a process exit code.
+    """
+    import tempfile
+
+    failures: list[str] = []
+
+    def check(name: str, condition: bool, detail: str = ""):
+        status = "PASS" if condition else "FAIL"
+        print(f"  [{status}] {name}{(' — ' + detail) if (detail and not condition) else ''}")
+        if not condition:
+            failures.append(name)
+
+    print("\n  QUASAR Benchmark Harness Self-Test\n  " + "-" * 40)
+
+    # 1. JSON extraction: plain object
+    parsed = extract_json_object('{"correctness": 4, "completeness": 3, "presentation": 5, "tool_usage": 2, "reasoning": "ok"}')
+    check("extract: plain JSON", parsed.get("correctness") == 4)
+
+    # 2. JSON extraction: markdown fenced
+    parsed = extract_json_object('Here you go:\n```json\n{"correctness": 5, "completeness": 5, "presentation": 4, "tool_usage": 4}\n```\nDone.')
+    check("extract: fenced JSON", parsed.get("correctness") == 5)
+
+    # 3. JSON extraction: surrounding prose
+    parsed = extract_json_object('The evaluation is {"correctness": 2, "completeness": 1, "presentation": 3, "tool_usage": 0} as requested.')
+    check("extract: embedded JSON", parsed.get("tool_usage") == 0)
+
+    # 4. JSON extraction: empty output raises
+    try:
+        extract_json_object("")
+        check("extract: empty raises", False)
+    except ValueError:
+        check("extract: empty raises", True)
+
+    # 5. JSON extraction: garbage raises
+    try:
+        extract_json_object("I cannot evaluate this response.")
+        check("extract: garbage raises", False)
+    except ValueError:
+        check("extract: garbage raises", True)
+
+    # 6. Validation: missing fields raise
+    try:
+        validate_judge_scores({"correctness": 3})
+        check("validate: missing fields raise", False)
+    except ValueError:
+        check("validate: missing fields raise", True)
+
+    # 7. Validation: clamping out-of-range and float scores
+    scores = validate_judge_scores({
+        "correctness": 7, "completeness": -1, "presentation": 4.6,
+        "tool_usage": "3", "code_quality": None, "criteria_met": [0, 2, "x"],
+        "reasoning": "fine",
+    })
+    check("validate: clamps to [0,5]", scores["correctness"] == 5 and scores["completeness"] == 0)
+    check("validate: rounds floats", scores["presentation"] == 5)
+    check("validate: coerces strings", scores["tool_usage"] == 3)
+    check("validate: code_quality None ok", scores["code_quality"] is None)
+    check("validate: criteria filtered", scores["criteria_met"] == [0, 2])
+
+    # 8. QuestionResult math: with and without code_quality
+    r = QuestionResult(id="T-1", category="Test", difficulty="Easy", title="t", question="q",
+                       correctness=5, completeness=5, presentation=5, tool_usage=5, code_quality=5)
+    check("scoring: max 25 with code", r.max_score == 25 and r.percentage == 100.0 and r.grade == "A")
+    r2 = QuestionResult(id="T-2", category="Test", difficulty="Hard", title="t", question="q",
+                        correctness=3, completeness=3, presentation=3, tool_usage=3, code_quality=None)
+    check("scoring: max 20 without code", r2.max_score == 20 and r2.percentage == 60.0 and r2.grade == "C")
+
+    # 9. judge_error excludes from judged
+    r3 = QuestionResult(id="T-3", category="Test", difficulty="Easy", title="t", question="q",
+                        judge_error="boom")
+    check("judged flag: error excluded", not r3.judged and r.judged)
+
+    # 10. Report generation does not crash and flags judge failures
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        try:
+            generate_report([r, r2, r3], out, model="test-model", judge_model="test-judge")
+            content = (out / "benchmark_report.md").read_text(encoding="utf-8")
+            check("report: generated", (out / "benchmark_report.md").exists())
+            check("report: marks judge failure", "JUDGE FAILED" in content)
+        except Exception as e:
+            check("report: generated", False, str(e))
+
+    print("  " + "-" * 40)
+    if failures:
+        print(f"  SELF-TEST FAILED: {len(failures)} failing check(s): {', '.join(failures)}\n")
+        return 1
+    print("  SELF-TEST PASSED: harness scoring pipeline is intact.\n")
+    return 0
 
 
 if __name__ == "__main__":
