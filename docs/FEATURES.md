@@ -13,16 +13,16 @@ Last audited against the codebase: 2026-04-25
 | Category               | Total | Built | In Progress | Planned | % Done |
 |------------------------|-------|-------|-------------|---------|--------|
 | Universal              | 10    | 6     | 1           | 3       | 60%    |
-| Radio                  | 10    | 6     | 0           | 4       | 60%    |
+| Radio                  | 10    | 7     | 0           | 3       | 70%    |
 | Gravitational Wave     | 7     | 2     | 0           | 5       | 29%    |
-| Infrared               | 6     | 2     | 0           | 4       | 33%    |
+| Infrared               | 6     | 3     | 0           | 3       | 50%    |
 | High-Energy            | 5     | 0     | 0           | 5       | 0%     |
-| Optical / UV           | 7     | 1     | 0           | 6       | 14%    |
+| Optical / UV           | 7     | 3     | 0           | 4       | 43%    |
 | Platform               | 6     | 5     | 0           | 1       | 83%    |
 | Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
 | Polish & Scale         | 42    | 23    | 1           | 18      | 55%    |
-| **Total**              |**108**|**57** | **3**       | **48**  |**53%** |
+| **Total**              |**108**|**61** | **3**       | **44**  |**56%** |
 
 
 ---
@@ -79,14 +79,14 @@ user audience.
 - [/] **U7** NED / Simbad Natural Language Search -- Basic SIMBAD/NED object lookups work via resolve_target and cross_match_source tools; NL criteria queries not yet built (services/multi_archive.py, partial)
 - [ ] **R5** ALMA Proposal Advisor -- RAG over Cycle call and proposer guide (extends rag_service.py)
 - [ ] **U4** Grant / Proposal Writer -- RAG over NSF/NASA calls, successful funded abstracts, reviewer guidelines
-- [ ] **R8** Channel Map Viewer -- Grid of velocity channel maps from 3D cubes (extends fits_service.py)
-- [ ] **O2** Target Visibility Planner -- Given site, date, target list, generate observability chart (astroplan)
+- [x] **R8** Channel Map Viewer -- Grid of velocity channel maps from 3D cubes (services/fits_service.py)
+- [x] **O2** Target Visibility Planner -- Given site, date, target list, generate observability chart (services/visibility_planner.py)
 - [ ] **O1** Transient Classifier -- Given ZTF/LSST alert, classify as SN Ia, AGN, CV, asteroid (LLM-powered)
-- [ ] **O3** Spectral Redshift Assistant -- Upload 1D spectrum, AI identifies lines and estimates redshift
+- [x] **O3** Spectral Redshift Assistant -- Upload 1D spectrum, AI identifies lines and estimates redshift (services/redshift_assistant.py)
 - [ ] **I2** JWST Pipeline Advisor -- Recommend CRDS context, pipeline stages, parameters for obs mode (RAG pattern)
 - [ ] **I3** JWST Proposal Advisor -- RAG over successful JWST proposals and Cycle call
 - [ ] **G3** Multi-messenger Sky Matcher -- Cross-match GW HEALPix sky map against telescope archives
-- [ ] **I4** Photometric SED Plotter -- Plot multi-band photometry with model SED overlay
+- [x] **I4** Photometric SED Plotter -- Plot multi-band photometry with model SED overlay (services/sed_plotter.py)
 
 ---
 
@@ -214,4 +214,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-06-06 -- Quasar v3.4.3 (Responsive Empty State Layout)*
+*Last updated: 2026-06-14 -- Quasar v3.4.3 (Implement O2, O3, I4, R8)*

@@ -34,7 +34,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
       <body className="bg-[var(--q-bg)] font-display text-[var(--q-text)] antialiased transition-colors duration-300" suppressHydrationWarning>
         <ThemeInitializer />
         <ErrorBoundary>
-          <div className="fixed inset-0 flex overflow-hidden">
+          <div className="fixed inset-0 flex overflow-hidden quasar-backdrop">
             {children}
           </div>
         </ErrorBoundary>

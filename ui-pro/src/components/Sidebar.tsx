@@ -34,7 +34,7 @@ function OverlayPanel({ open, onClose, title, icon: Icon, children }: {
 }) {
     if (!open) return null;
     return (
-        <div className="absolute inset-0 z-50 flex flex-col bg-sidebar-dark animate-in fade-in slide-in-from-left-2 duration-200">
+        <div className="absolute inset-0 z-50 flex flex-col glass-sidebar animate-in fade-in slide-in-from-left-2 duration-200">
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700/50">
                 <div className="flex items-center gap-2.5">
@@ -182,7 +182,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
     return (
         <div ref={ref} className="relative">
             <button onClick={() => setOpen(!open)}
-                className="flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors">
+                className="glass-control flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 rounded-lg transition-colors">
                 <div className="flex items-center justify-between w-full">
                     <div className="flex items-center gap-2"><ModelIcon model={selectedModel} className="w-4 h-4 shrink-0" /><span className="truncate">Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "[Local] ") : selectedModel}</span></div>
                     <ChevronDown className={`w-4 h-4 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
@@ -197,7 +197,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             </button>
 
             {open && (
-                <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-800 border border-slate-600/50 rounded-xl shadow-2xl shadow-black/40 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
+                <div className="glass-popover absolute bottom-full left-0 right-0 mb-1.5 rounded-xl overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
                     {renderGroup("OpenAI", openaiModels)}
                     {deepseekModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("DeepSeek", deepseekModels)}
@@ -231,7 +231,7 @@ function SettingsContent({ selectedModel, availableModels, onSelectModel }: {
                         <button key={m} onClick={() => onSelectModel(m)}
                             className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-sm transition-colors ${m === selectedModel
                                 ? "bg-primary/15 text-primary border border-primary/30"
-                                : "text-slate-300 bg-slate-800/50 hover:bg-slate-700/50"
+                                : "text-slate-300 glass-control"
                                 }`}>
                             <div className="flex items-center gap-2">
                                 <ModelIcon model={m} className="w-4 h-4 shrink-0" />
@@ -246,7 +246,7 @@ function SettingsContent({ selectedModel, availableModels, onSelectModel }: {
             {/* API Status */}
             <div>
                 <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 block">Connection</label>
-                <div className="bg-slate-800/50 rounded-lg p-3 flex items-center gap-3">
+                <div className="glass-control rounded-lg p-3 flex items-center gap-3">
                     <div className="w-2.5 h-2.5 rounded-full bg-emerald-accent animate-pulse" />
                     <div>
                         <p className="text-sm text-white font-medium">Backend Connected</p>
@@ -260,7 +260,7 @@ function SettingsContent({ selectedModel, availableModels, onSelectModel }: {
             {/* Version */}
             <div>
                 <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 block">About</label>
-                <div className="bg-slate-800/50 rounded-lg p-3 space-y-1.5">
+                <div className="glass-control rounded-lg p-3 space-y-1.5">
                     <div className="flex justify-between text-xs"><span className="text-slate-500">Version</span><span className="text-slate-300 font-mono">2.0.0</span></div>
                     <div className="flex justify-between text-xs"><span className="text-slate-500">Engine</span><span className="text-slate-300 font-mono">Responses API</span></div>
                     <div className="flex justify-between text-xs"><span className="text-slate-500">Env</span><span className="text-slate-300 font-mono">Development</span></div>
@@ -282,7 +282,7 @@ function SavedPapersContent() {
                 <p className="text-xs text-slate-500">Papers you bookmark during research sessions will appear here.</p>
 
                 <div className="flex flex-col items-center justify-center py-12 text-center">
-                    <div className="w-14 h-14 rounded-2xl bg-slate-800/80 flex items-center justify-center mb-4">
+                    <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center mb-4">
                         <Bookmark className="w-7 h-7 text-slate-600" />
                     </div>
                     <p className="text-sm text-slate-400 font-medium">No saved papers yet</p>
@@ -304,7 +304,7 @@ function SavedPapersContent() {
                     : paper.arxivId ? `https://arxiv.org/abs/${paper.arxivId}`
                     : null;
                 return (
-                    <div key={paper.id} className="bg-slate-800/50 rounded-xl p-3 space-y-1.5 group hover:bg-slate-800/80 transition-colors">
+                    <div key={paper.id} className="glass-control rounded-xl p-3 space-y-1.5 group">
                         <div className="flex items-start justify-between gap-2">
                             {adsUrl ? (
                                 <a href={adsUrl} target="_blank" rel="noopener noreferrer"
@@ -391,7 +391,7 @@ export function Sidebar() {
             : "U";
 
     return (
-        <aside className="relative w-[280px] bg-sidebar-dark border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
+        <aside className="relative w-[280px] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
             {/* Logo */}
             <div className="p-6 flex items-center gap-3">
                 <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
@@ -420,7 +420,7 @@ export function Sidebar() {
                             return (
                                 <div key={conv.id} className="relative group/item">
                                     <button onClick={() => handleSelectConversation(conv.id)}
-                                        className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-all text-left ${isActive ? "bg-slate-700/50 text-white border-l-2 border-primary" : "text-slate-300 hover:bg-slate-800/50 group"}`}>
+                                        className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-all text-left ${isActive ? "glass-active text-white" : "text-slate-300 hover:bg-white/10 group"}`}>
                                         {isActive ? <MessageSquare className="w-5 h-5 text-primary shrink-0" /> : <History className="w-5 h-5 text-slate-400 group-hover:text-primary transition-colors shrink-0" />}
                                         <div className="flex flex-col overflow-hidden flex-1">
                                             <span className="text-sm font-medium truncate">{conv.title}</span>
@@ -459,15 +459,15 @@ export function Sidebar() {
 
                 <div className="pt-2 border-t border-slate-700/50 space-y-1">
                     <button onClick={() => togglePanel("papers")}
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${activePanel === "papers" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-slate-800/50 hover:text-white"}`}>
+                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${activePanel === "papers" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                         <Bookmark className="w-4 h-4" />Saved Papers
                     </button>
                     <button onClick={() => setSettingsOpen(true)}
-                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm text-slate-400 hover:bg-slate-800/50 hover:text-white">
+                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm text-slate-400 hover:bg-white/10 hover:text-white">
                         <Settings className="w-4 h-4" />Settings
                     </button>
                     <Link href="/help"
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-slate-800/50 hover:text-white"}`}>
+                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                         <HelpCircle className="w-4 h-4" />Help & Docs
                     </Link>
                     {isAuthenticated && (

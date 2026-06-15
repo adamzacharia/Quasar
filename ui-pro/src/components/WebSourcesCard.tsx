@@ -80,21 +80,17 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                                     href={source.url}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="group flex items-start gap-2.5 p-2.5 rounded-lg
+                                    className="glass-control group flex items-start gap-2.5 p-2.5 rounded-lg
                                            transition-all duration-200 cursor-pointer
                                            overflow-hidden hover:scale-[1.02]"
-                                    style={{
-                                        background: 'var(--q-glass-bg)',
-                                        border: '1px solid var(--q-glass-border)',
-                                    }}
                                     title={quality?.reason || source.snippet}
                                     onMouseEnter={(e) => {
                                         e.currentTarget.style.borderColor = 'rgba(244, 113, 181, 0.4)';
-                                        e.currentTarget.style.background = 'var(--q-glass-hover)';
+                                        e.currentTarget.style.background = 'var(--q-glass-control-hover)';
                                     }}
                                     onMouseLeave={(e) => {
                                         e.currentTarget.style.borderColor = 'var(--q-glass-border)';
-                                        e.currentTarget.style.background = 'var(--q-glass-bg)';
+                                        e.currentTarget.style.background = 'var(--q-glass-control)';
                                     }}
                                 >
                                     <div className="shrink-0 mt-0.5 space-y-1">
@@ -166,13 +162,9 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                                     href={image.url}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="group relative aspect-square rounded-lg overflow-hidden
+                                    className="glass-control group relative aspect-square rounded-lg overflow-hidden
                                                hover:scale-[1.03]
                                                transition-all duration-200 cursor-pointer"
-                                    style={{
-                                        background: 'var(--q-glass-bg)',
-                                        border: '1px solid var(--q-glass-border)',
-                                    }}
                                     title={image.description || "View image"}
                                 >
                                     <img

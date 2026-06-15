@@ -629,7 +629,7 @@ export function ChatArea() {
         <main className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
             <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-1.5 md:py-2 border-b border-slate-800/80 glass-panel">
                 <div className="flex items-center gap-3">
-                    <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800/50 transition-all"><PanelLeft className="w-5 h-5" /></button>
+                    <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/10 transition-all"><PanelLeft className="w-5 h-5" /></button>
                     <h2 className="text-base font-semibold text-white tracking-tight">
                         {hasMessages ? messages[0].content.slice(0, 50) + (messages[0].content.length > 50 ? "…" : "") : conversationTitle}
                     </h2>
@@ -639,8 +639,8 @@ export function ChatArea() {
                         onClick={() => activeConversationId && toggleStar(activeConversationId)}
                         title="Star this chat"
                         className={`p-2 rounded-lg transition-all ${isStarred
-                            ? "text-yellow-500 hover:bg-slate-800/50 hover:text-yellow-400"
-                            : "text-slate-400 hover:text-yellow-500 hover:bg-slate-800/50"
+                            ? "text-yellow-500 hover:bg-white/10 hover:text-yellow-400"
+                            : "text-slate-400 hover:text-yellow-500 hover:bg-white/10"
                             }`}
                     >
                         <Star className="w-[18px] h-[18px]" fill={isStarred ? "currentColor" : "none"} />
@@ -711,10 +711,8 @@ export function ChatArea() {
                 <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20">
                     <button
                         onClick={scrollToBottom}
-                        className="w-9 h-9 flex items-center justify-center rounded-full shadow-lg transition-all duration-200 hover:scale-110 animate-in fade-in slide-in-from-bottom-2 duration-200"
+                        className="glass-control w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200 hover:scale-110 animate-in fade-in slide-in-from-bottom-2 duration-200"
                         style={{
-                            background: 'var(--q-card)',
-                            border: '1px solid var(--q-glass-border)',
                             color: 'var(--q-text-secondary)',
                             boxShadow: '0 4px 16px -2px rgba(0,0,0,0.25)',
                         }}

@@ -44,7 +44,7 @@ export function PaperCard({ paper }: PaperCardProps) {
     const linkedIdentifier = paper.observationLinks?.[0]?.identifier;
 
     return (
-        <div className="bg-sidebar-dark rounded-2xl border border-slate-700/50 hover:border-emerald-500/50 transition-colors group flex flex-col justify-between h-full">
+        <div className="glass-card rounded-2xl hover:border-emerald-500/50 transition-colors group flex flex-col justify-between h-full">
             {/* Clickable card header — opens ADS link */}
             <a
                 href={adsUrl || "#"}

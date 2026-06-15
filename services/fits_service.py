@@ -406,6 +406,167 @@ def compute_moment_map(
         gc.collect()
 
 
+def generate_channel_maps(
+    url: str,
+    n_channels: int = 12,
+    title: str = "",
+    colormap: str = "inferno",
+    freq_min_ghz: float = None,
+    freq_max_ghz: float = None,
+    vel_min_kms: float = None,
+    vel_max_kms: float = None,
+) -> Dict[str, Any]:
+    """
+    Download a FITS spectral cube and render a grid of velocity/frequency
+    channel maps (the classic "channel map" figure of radio astronomy).
+
+    Channels are selected evenly across the (optionally restricted)
+    spectral axis and share a common intensity normalization so emission
+    can be compared between panels.
+
+    Args:
+        url: FITS cube URL or local path
+        n_channels: Number of panels to render (4-24, default 12)
+        title: Figure title prefix
+        colormap: Matplotlib colormap for the panels
+        freq_min_ghz / freq_max_ghz: Optional frequency slab bounds
+        vel_min_kms / vel_max_kms: Optional velocity slab bounds (used if
+            the cube's spectral axis is in velocity, or convertible)
+
+    Returns:
+        {"success": True, "image_path": "/api/images/xxx.png", "caption": "..."}
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.visualization import ZScaleInterval, ImageNormalize, SqrtStretch
+    import astropy.units as u
+
+    fits_path = None
+    try:
+        n_channels = int(max(4, min(24, n_channels)))
+
+        fits_path = _download_fits(url, title or "channel maps")
+
+        try:
+            from spectral_cube import SpectralCube
+            cube = SpectralCube.read(fits_path, memmap=True)
+        except Exception as e:
+            logger.error(f"[FITS] spectral-cube can't read file: {e}")
+            return {"success": False, "error": f"Not a spectral cube: {e}"}
+
+        if cube.shape[0] < 2:
+            return {"success": False,
+                    "error": "Cube has fewer than 2 spectral channels — channel maps need a 3D cube"}
+
+        # ── Optional spectral slab ────────────────────────────────────
+        try:
+            if freq_min_ghz is not None or freq_max_ghz is not None:
+                lo = (freq_min_ghz * u.GHz) if freq_min_ghz else cube.spectral_axis.min()
+                hi = (freq_max_ghz * u.GHz) if freq_max_ghz else cube.spectral_axis.max()
+                cube = cube.spectral_slab(lo, hi)
+            elif vel_min_kms is not None or vel_max_kms is not None:
+                lo = (vel_min_kms * u.km / u.s) if vel_min_kms is not None else cube.spectral_axis.min()
+                hi = (vel_max_kms * u.km / u.s) if vel_max_kms is not None else cube.spectral_axis.max()
+                cube = cube.spectral_slab(lo, hi)
+        except Exception as e:
+            logger.warning(f"[FITS] spectral_slab failed (continuing with full cube): {e}")
+
+        n_spec = cube.shape[0]
+        n_channels = min(n_channels, n_spec)
+
+        # Evenly spaced channel indices across the spectral axis
+        idx = np.unique(np.linspace(0, n_spec - 1, n_channels).round().astype(int))
+
+        # ── Per-channel labels in natural units ──────────────────────
+        spec_axis = cube.spectral_axis
+        if spec_axis.unit.is_equivalent(u.m / u.s):
+            ch_vals = spec_axis.to(u.km / u.s).value
+            ch_fmt = "{:.1f} km/s"
+        elif spec_axis.unit.is_equivalent(u.Hz):
+            ch_vals = spec_axis.to(u.GHz).value
+            ch_fmt = "{:.4f} GHz"
+        else:
+            ch_vals = spec_axis.value
+            ch_fmt = "{:.4g} " + str(spec_axis.unit)
+
+        # ── Shared normalization across all selected channels ────────
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            sample = np.concatenate([
+                np.asarray(cube[i].value, dtype=float).ravel() for i in idx
+            ])
+        sample = sample[np.isfinite(sample)]
+        if sample.size == 0:
+            return {"success": False, "error": "All selected channels are empty (NaN)"}
+        norm = ImageNormalize(sample, interval=ZScaleInterval(), stretch=SqrtStretch())
+
+        # ── Grid layout ───────────────────────────────────────────────
+        ncols = 4 if len(idx) > 9 else 3
+        nrows = int(math.ceil(len(idx) / ncols))
+
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(3.2 * ncols, 3.2 * nrows),
+            facecolor="#0f172a",
+            squeeze=False,
+        )
+
+        im = None
+        for panel, ax in enumerate(axes.flat):
+            if panel >= len(idx):
+                ax.set_visible(False)
+                continue
+            ch = int(idx[panel])
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                data = np.asarray(cube[ch].value, dtype=float)
+            im = ax.imshow(data, origin="lower", cmap=colormap, norm=norm)
+            ax.text(
+                0.04, 0.94, ch_fmt.format(ch_vals[ch]),
+                transform=ax.transAxes, color="white", fontsize=9,
+                va="top", ha="left",
+                bbox=dict(facecolor="black", alpha=0.55, edgecolor="none", pad=2),
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_facecolor("black")
+
+        if im is not None:
+            cbar = fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
+            cbar.set_label(str(cube.unit), color="white", fontsize=10)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white", fontsize=8)
+
+        full_title = f"{title} — Channel Maps" if title else "Channel Maps"
+        fig.suptitle(full_title, color="white", fontsize=15, y=0.995)
+
+        img_name = f"chanmap_{uuid.uuid4().hex[:10]}.png"
+        img_path = os.path.join(RENDERED_DIR, img_name)
+        fig.savefig(img_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+        return {
+            "success": True,
+            "image_path": f"/api/images/{img_name}",
+            "caption": full_title,
+            "n_panels": int(len(idx)),
+            "spectral_range": f"{ch_vals[0]:.4g} to {ch_vals[-1]:.4g} ({ch_fmt.split(' ', 1)[-1].strip('{}')})"
+                              if len(ch_vals) else "",
+        }
+
+    except Exception as e:
+        logger.error(f"[FITS] generate_channel_maps failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    finally:
+        if fits_path and os.path.exists(fits_path):
+            os.unlink(fits_path)
+        gc.collect()
+
+
 def extract_spectrum(
     url: str,
     ra_deg: float = None,

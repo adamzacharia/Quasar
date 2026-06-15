@@ -115,13 +115,13 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
             <div className="max-w-3xl mx-auto relative">
                 <form onSubmit={handleSubmit} className="relative group">
                     <div className="absolute inset-0 bg-primary/20 rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-                    <div className="relative w-full bg-card-dark/90 backdrop-blur-xl border border-slate-600 rounded-2xl shadow-2xl ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all">
+                    <div className="relative w-full glass-surface rounded-2xl ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all">
 
                         {/* Attachment previews */}
                         {attachments.length > 0 && (
                             <div className="flex flex-wrap gap-2 px-3 pt-3">
                                 {attachments.map((att, i) => (
-                                    <div key={i} className="relative group/att flex items-center gap-2 bg-slate-800/80 border border-slate-700 rounded-xl px-3 py-2 max-w-[200px]">
+                                    <div key={i} className="relative group/att glass-control flex items-center gap-2 rounded-xl px-3 py-2 max-w-[200px]">
                                         {att.type === "image" && att.preview ? (
                                             <img src={att.preview} alt={att.file.name} className="w-8 h-8 rounded-lg object-cover shrink-0" />
                                         ) : (
@@ -131,7 +131,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                         <button
                                             type="button"
                                             onClick={() => removeAttachment(i)}
-                                            className="ml-1 p-0.5 rounded-full bg-slate-700 hover:bg-red-500/80 text-slate-400 hover:text-white transition-all opacity-0 group-hover/att:opacity-100"
+                                            className="ml-1 p-0.5 rounded-full glass-control hover:bg-red-500/80 text-slate-400 hover:text-white transition-all opacity-0 group-hover/att:opacity-100"
                                         >
                                             <X className="w-3 h-3" />
                                         </button>
@@ -166,7 +166,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                     disabled={isStreaming}
                                     aria-haspopup="menu"
                                     aria-expanded={menuOpen}
-                                    className="relative p-2.5 text-slate-400 hover:text-primary hover:bg-slate-700/50 rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                                    className="relative p-2.5 text-slate-400 hover:text-primary hover:bg-white/10 rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                                     title="Add files or modes"
                                 >
                                     <PlusCircle className="w-5 h-5" />
@@ -181,7 +181,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                 {menuOpen && (
                                     <div
                                         role="menu"
-                                        className="absolute bottom-full left-0 z-30 mb-2 w-56 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950/95 p-1.5 shadow-2xl shadow-black/30 backdrop-blur-xl"
+                                        className="glass-popover absolute bottom-full left-0 z-30 mb-2 w-56 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl p-1.5"
                                     >
                                         <button
                                             type="button"
@@ -190,7 +190,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                                 setMenuOpen(false);
                                                 imageInputRef.current?.click();
                                             }}
-                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
                                         >
                                             <ImageIcon className="h-4 w-4 text-primary" />
                                             <span>Upload images</span>
@@ -202,12 +202,12 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                                 setMenuOpen(false);
                                                 documentInputRef.current?.click();
                                             }}
-                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
                                         >
                                             <FileText className="h-4 w-4 text-primary" />
                                             <span>Upload documents</span>
                                         </button>
-                                        <div className="my-1 h-px bg-slate-800" />
+                                        <div className="my-1 h-px bg-white/10" />
                                         <div className="group/grounded relative">
                                             <button
                                                 type="button"
@@ -215,7 +215,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                                 aria-checked={groundedSummary}
                                                 aria-describedby="grounded-mode-tooltip"
                                                 onClick={() => setGroundedSummary(value => !value)}
-                                                className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80 focus-visible:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400/50"
+                                                className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10 focus-visible:bg-white/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400/50"
                                             >
                                                 <span className="flex min-w-0 items-center gap-3">
                                                     <ShieldCheck className={`h-4 w-4 ${groundedSummary ? "text-emerald-300" : "text-slate-500"}`} />
@@ -247,7 +247,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                             role="menuitemcheckbox"
                                             aria-checked={webSearch}
                                             onClick={() => setWebSearch(value => !value)}
-                                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-slate-800/80"
+                                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
                                         >
                                             <span className="flex min-w-0 items-center gap-3">
                                                 <Globe className={`h-4 w-4 ${webSearch ? "text-cyan-300" : "text-slate-500"}`} />

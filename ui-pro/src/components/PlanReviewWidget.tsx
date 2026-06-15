@@ -177,8 +177,7 @@ export function PlanReviewWidget({ plan, onApprove, onFeedback, isSubmitting }: 
 
     return (
         <div
-            className="rounded-2xl overflow-hidden max-w-2xl mx-auto my-3 backdrop-blur-sm animate-in fade-in slide-in-from-bottom-2 duration-300"
-            style={{ background: "var(--q-glass-bg)", border: "1px solid var(--q-glass-border)" }}
+            className="glass-surface rounded-2xl overflow-hidden max-w-2xl mx-auto my-3 animate-in fade-in slide-in-from-bottom-2 duration-300"
         >
             {/* ── Header ─────────────────────────────────────────────── */}
             <div

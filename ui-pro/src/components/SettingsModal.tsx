@@ -143,7 +143,7 @@ function PersonalizationPanel() {
     if (!isAuthenticated) {
         return (
             <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
-                <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center">
+                <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center">
                     <Lock className="w-7 h-7 text-slate-500" />
                 </div>
                 <div>
@@ -215,7 +215,7 @@ function PersonalizationPanel() {
                 ) : (
                     <div className="space-y-2">
                         {docs.map(doc => (
-                            <div key={doc.id} className="flex items-center gap-3 px-4 py-3 bg-slate-800/60 border border-slate-700/50 rounded-xl group">
+                            <div key={doc.id} className="glass-control flex items-center gap-3 px-4 py-3 rounded-xl group">
                                 <FileText className="w-4 h-4 text-primary shrink-0" />
                                 <div className="flex-1 min-w-0">
                                     <p className="text-sm text-slate-200 font-medium truncate">{doc.filename}</p>
@@ -354,7 +354,7 @@ function CustomToolsPanel() {
     if (!isAuthenticated) {
         return (
             <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
-                <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center">
+                <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center">
                     <Lock className="w-7 h-7 text-slate-500" />
                 </div>
                 <div>
@@ -409,7 +409,7 @@ function CustomToolsPanel() {
                         {!loading && tools.length > 0 && (
                             <div className="space-y-3">
                                 {tools.map(tool => (
-                                    <div key={tool.name} className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 group flex items-start justify-between">
+                                    <div key={tool.name} className="glass-control rounded-xl p-4 group flex items-start justify-between">
                                         <div className="min-w-0 flex-1 pr-4">
                                             <div className="flex items-center gap-2 mb-1">
                                                 <h4 className="text-sm font-semibold text-slate-200 truncate">{tool.name}</h4>
@@ -476,7 +476,7 @@ function CustomToolsPanel() {
                             />
                         </div>
 
-                        <div className="p-4 bg-slate-800/40 border border-slate-700/50 rounded-xl space-y-3">
+                        <div className="glass-control p-4 rounded-xl space-y-3">
                             <h4 className="text-xs font-semibold text-slate-300">API Key Storage (Optional)</h4>
                             <p className="text-[10px] text-slate-500 leading-snug">If your tool needs an API key, name it here. We will securely inject it into <code className="text-pink-400">os.environ</code> when the agent starts.</p>
                             <div className="flex gap-3">
@@ -647,7 +647,7 @@ function MCPServersPanel() {
     if (!isAuthenticated) {
         return (
             <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
-                <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center">
+                <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center">
                     <Lock className="w-7 h-7 text-slate-500" />
                 </div>
                 <div>
@@ -692,7 +692,7 @@ function MCPServersPanel() {
                         {!loading && servers.length > 0 && (
                             <div className="space-y-3">
                                 {servers.map(srv => (
-                                    <div key={srv.name} className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 group flex items-start justify-between">
+                                    <div key={srv.name} className="glass-control rounded-xl p-4 group flex items-start justify-between">
                                         <div className="min-w-0 flex-1 pr-4">
                                             <div className="flex items-center gap-2 mb-1">
                                                 <h4 className="text-sm font-semibold text-slate-200 truncate">{srv.name}</h4>
@@ -960,7 +960,7 @@ function ProviderKeysPanel() {
     if (!isAuthenticated) {
         return (
             <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
-                <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center">
+                <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center">
                     <Lock className="w-7 h-7 text-slate-500" />
                 </div>
                 <div>
@@ -990,7 +990,7 @@ function ProviderKeysPanel() {
                     const bucket = quota?.platform?.[provider];
                     const pct = bucket?.limit_tokens ? Math.min(100, Math.round((bucket.used_tokens / bucket.limit_tokens) * 100)) : 0;
                     return (
-                        <div key={provider} className="bg-slate-800/50 border border-slate-700/50 rounded-xl px-4 py-3">
+                        <div key={provider} className="glass-control rounded-xl px-4 py-3">
                             <div className="flex items-center justify-between text-xs mb-2">
                                 <span className="font-semibold text-slate-300">{provider === "deepseek" ? "DeepSeek" : "OpenAI"} platform quota</span>
                                 <span className={bucket?.exhausted ? "text-red-300" : "text-slate-400"}>
@@ -1013,7 +1013,7 @@ function ProviderKeysPanel() {
                     const byokBucket = quota?.byok?.[providerInfo.id];
                     const isBusy = busy?.startsWith(`${providerInfo.id}:`);
                     return (
-                        <div key={providerInfo.id} className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-4 space-y-3">
+                        <div key={providerInfo.id} className="glass-control rounded-xl p-4 space-y-3">
                             <div className="flex items-start justify-between gap-3">
                                 <div>
                                     <div className="flex items-center gap-2">
@@ -1153,7 +1153,7 @@ function AnalyticsPanel() {
             {/* Stat cards */}
             <div className="grid grid-cols-3 gap-3">
                 {statCards.map(s => (
-                    <div key={s.label} className="bg-slate-800/60 border border-slate-700/50 rounded-xl px-4 py-3">
+                    <div key={s.label} className="glass-control rounded-xl px-4 py-3">
                         <p className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">{s.label}</p>
                         <p className={`text-2xl font-bold ${s.color} mt-1`}>{s.value.toLocaleString()}</p>
                     </div>
@@ -1183,7 +1183,7 @@ function AnalyticsPanel() {
                     <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Top Models</h4>
                     <div className="space-y-1.5">
                         {data.top_models.map((m, i) => (
-                            <div key={m.model} className="flex items-center gap-3 bg-slate-800/40 rounded-lg px-3 py-2">
+                            <div key={m.model} className="glass-control flex items-center gap-3 rounded-lg px-3 py-2">
                                 <span className="text-xs font-bold text-slate-500 w-5">{i + 1}</span>
                                 <span className="text-sm text-slate-200 flex-1 font-mono">{m.model}</span>
                                 <span className="text-xs text-slate-400 font-semibold">{m.count} calls</span>
@@ -1199,7 +1199,7 @@ function AnalyticsPanel() {
                     <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Top Tools</h4>
                     <div className="space-y-1.5">
                         {data.top_tools.map((t, i) => (
-                            <div key={t.tool} className="flex items-center gap-3 bg-slate-800/40 rounded-lg px-3 py-2">
+                            <div key={t.tool} className="glass-control flex items-center gap-3 rounded-lg px-3 py-2">
                                 <span className="text-xs font-bold text-slate-500 w-5">{i + 1}</span>
                                 <span className="text-sm text-slate-200 flex-1 font-mono">{t.tool}</span>
                                 <span className="text-xs text-slate-400 font-semibold">{t.count}×</span>
@@ -1216,7 +1216,7 @@ function AnalyticsPanel() {
                     <button
                         onClick={() => downloadFile("/api/admin/analytics/export?format=csv", `quasar_analytics_${new Date().toISOString().slice(0,10)}.csv`, "csv")}
                         disabled={downloading === "csv"}
-                        className="flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium transition-colors disabled:opacity-50"
+                        className="glass-control flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium disabled:opacity-50"
                     >
                         {downloading === "csv" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                         Chat Analytics (CSV)
@@ -1224,7 +1224,7 @@ function AnalyticsPanel() {
                     <button
                         onClick={() => downloadFile("/api/admin/analytics/export?format=json", `quasar_analytics_${new Date().toISOString().slice(0,10)}.json`, "json")}
                         disabled={downloading === "json"}
-                        className="flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium transition-colors disabled:opacity-50"
+                        className="glass-control flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium disabled:opacity-50"
                     >
                         {downloading === "json" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                         Chat Analytics (JSON)
@@ -1232,7 +1232,7 @@ function AnalyticsPanel() {
                     <button
                         onClick={() => downloadFile("/api/admin/feedback/export", `quasar_feedback_${new Date().toISOString().slice(0,10)}.json`, "feedback")}
                         disabled={downloading === "feedback"}
-                        className="flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium transition-colors disabled:opacity-50"
+                        className="glass-control flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm text-slate-200 font-medium disabled:opacity-50"
                     >
                         {downloading === "feedback" ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                         Feedback Data (JSON)
@@ -1294,10 +1294,10 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     return (
         <div
             ref={backdropRef}
-            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-lg"
             onClick={(e) => { if (e.target === backdropRef.current) onClose(); }}
         >
-            <div className="relative w-[850px] max-w-[95vw] h-[650px] max-h-[90vh] border border-slate-700/60 rounded-2xl shadow-2xl shadow-black/60 flex overflow-hidden animate-in fade-in zoom-in-95 duration-200" style={{ background: 'var(--q-surface)' }}>
+            <div className="relative w-[850px] max-w-[95vw] h-[650px] max-h-[90vh] glass-surface rounded-2xl flex overflow-hidden animate-in fade-in zoom-in-95 duration-200">
 
                 {/* Close button */}
                 <button
@@ -1308,7 +1308,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 </button>
 
                 {/* Left nav */}
-                <div className="w-48 shrink-0 border-r border-slate-700/50 p-4" style={{ background: 'var(--q-bg)' }}>
+                <div className="w-48 shrink-0 border-r border-slate-700/50 p-4 glass-sidebar">
                     <p className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold px-2 mb-3">Settings</p>
                     
                     <div className="space-y-1">
@@ -1386,7 +1386,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 </div>
 
                 {/* Right content */}
-                <div className="flex-1 overflow-hidden flex flex-col" style={{ background: 'var(--q-surface)' }}>
+                <div className="flex-1 overflow-hidden flex flex-col">
                     <div className="px-6 py-5 border-b border-slate-700/50 shrink-0">
                         <h2 className="text-base font-semibold text-white">
                             {currentTab === 'personalization' ? "Personalization" : currentTab === 'providerKeys' ? "Provider Keys" : currentTab === 'tools' ? "Custom Tools" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}

@@ -28,7 +28,7 @@ export class ErrorBoundary extends Component<Props, State> {
     if (this.state.hasError) {
       return (
         <div className="flex flex-col items-center justify-center h-full w-full min-h-[400px] text-slate-300 bg-bg-dark z-50 relative p-6">
-          <div className="bg-slate-800/50 p-8 rounded-2xl border border-slate-700/50 max-w-md w-full text-center shadow-xl backdrop-blur-md">
+          <div className="glass-surface p-8 rounded-2xl max-w-md w-full text-center">
             <h2 className="text-xl font-semibold mb-3 text-white">Interface Recovered</h2>
             <p className="text-sm text-slate-400 mb-6">
               The layout engine experienced an unexpected glitch (likely due to resizing across monitors). The application has protected your data, but needs to refresh the view to continue.

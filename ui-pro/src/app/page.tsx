@@ -62,7 +62,7 @@ export default function Home() {
         <div className="relative z-10 w-full max-w-[850px] flex flex-col items-center text-center space-y-8 animate-in fade-in zoom-in-95 duration-500">
           
           {/* System Badge */}
-          <div className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-950/80 border border-slate-800 text-slate-300 text-xs font-semibold uppercase tracking-widest shadow-inner">
+          <div className="glass-control flex items-center gap-2 px-4 py-1.5 rounded-full text-slate-300 text-xs font-semibold uppercase tracking-widest">
             <Lock className="w-3.5 h-3.5 text-purple-400" />
             Strict Access Control
           </div>
@@ -94,7 +94,7 @@ export default function Home() {
           {/* Feature Grid */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full pt-10 border-t border-slate-900/60">
             {/* Card 1 */}
-            <div className="flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl bg-slate-950/40 border border-slate-900/50 backdrop-blur-sm">
+            <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
               <div className="p-3 rounded-xl bg-purple-500/10 text-purple-400 mb-4 border border-purple-500/10">
                 <Compass className="w-5 h-5" />
               </div>
@@ -105,7 +105,7 @@ export default function Home() {
             </div>
 
             {/* Card 2 */}
-            <div className="flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl bg-slate-950/40 border border-slate-900/50 backdrop-blur-sm">
+            <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
               <div className="p-3 rounded-xl bg-pink-500/10 text-pink-400 mb-4 border border-pink-500/10">
                 <FileText className="w-5 h-5" />
               </div>
@@ -116,7 +116,7 @@ export default function Home() {
             </div>
 
             {/* Card 3 */}
-            <div className="flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl bg-slate-950/40 border border-slate-900/50 backdrop-blur-sm">
+            <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
               <div className="p-3 rounded-xl bg-indigo-500/10 text-indigo-400 mb-4 border border-indigo-500/10">
                 <Activity className="w-5 h-5" />
               </div>
@@ -148,7 +148,7 @@ export default function Home() {
         <div className="fixed inset-0 z-40 flex">
           {/* Dark backdrop — click to close */}
           <div
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40"
+            className="fixed inset-0 bg-black/60 backdrop-blur-lg z-40"
             onClick={toggleSidebar}
           />
           {/* Sidebar panel */}
