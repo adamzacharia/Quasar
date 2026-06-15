@@ -161,7 +161,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
                 const cost = getModelCost(model);
                 return (
                     <button key={model} onClick={() => { onSelect(model); setOpen(false); }}
-                        className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/10 text-primary" : "text-slate-300 hover:bg-slate-700/50 hover:text-white"}`}>
+                        className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/15 text-primary border-l-2 border-primary" : "text-slate-300 hover:bg-slate-700/70 hover:text-white"}`}>
                         <div className="flex flex-col items-start truncate overflow-hidden pr-2">
                             <span className="font-medium truncate w-full text-left">{model.startsWith("local/") ? model.replace("local/", "") : model}</span>
                             {cost && (
@@ -182,7 +182,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
     return (
         <div ref={ref} className="relative">
             <button onClick={() => setOpen(!open)}
-                className="glass-control flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 rounded-lg transition-colors">
+                className="flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors border border-slate-700/50">
                 <div className="flex items-center justify-between w-full">
                     <div className="flex items-center gap-2"><ModelIcon model={selectedModel} className="w-4 h-4 shrink-0" /><span className="truncate">Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "[Local] ") : selectedModel}</span></div>
                     <ChevronDown className={`w-4 h-4 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
@@ -197,7 +197,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             </button>
 
             {open && (
-                <div className="glass-popover absolute bottom-full left-0 right-0 mb-1.5 rounded-xl overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
+                <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl shadow-black/50 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
                     {renderGroup("OpenAI", openaiModels)}
                     {deepseekModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("DeepSeek", deepseekModels)}
