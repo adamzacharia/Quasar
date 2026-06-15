@@ -97,16 +97,12 @@ html {
 .quasar-backdrop {
   background-color: var(--q-bg);
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px),
     linear-gradient(135deg, rgba(244, 113, 181, 0.08), transparent 34%, rgba(16, 185, 129, 0.045));
-  background-size: 46px 46px, 46px 46px, cover;
+  background-size: cover;
 }
 
 [data-theme="light"] .quasar-backdrop {
   background-image:
-    linear-gradient(rgba(15, 23, 42, 0.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(15, 23, 42, 0.035) 1px, transparent 1px),
     linear-gradient(135deg, rgba(244, 113, 181, 0.08), transparent 36%, rgba(14, 165, 233, 0.055));
 }
 

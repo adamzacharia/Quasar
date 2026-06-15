@@ -150,9 +150,9 @@ export function AuthModal() {
                                 }}
                                 className="sr-only peer"
                             />
-                            <div className="w-5 h-5 border border-slate-700 peer-checked:border-white peer-checked:bg-white rounded-md flex items-center justify-center transition-all duration-200">
+                            <div className="w-5 h-5 border border-slate-700 peer-checked:border-white peer-checked:bg-white peer-focus-visible:ring-2 peer-focus-visible:ring-primary/60 rounded-md flex items-center justify-center transition-all duration-200">
                                 <svg
-                                    className="w-3.5 h-3.5 text-black opacity-0 peer-checked:opacity-100 transition-opacity duration-200"
+                                    className={`w-3.5 h-3.5 text-black transition-opacity duration-200 ${isAgreed ? "opacity-100" : "opacity-0"}`}
                                     fill="none"
                                     viewBox="0 0 24 24"
                                     stroke="currentColor"
