@@ -116,12 +116,9 @@ export function ObservationPaperGraph({ graph }: ObservationPaperGraphProps) {
 
     return (
         <div className="pl-11">
-            <section
-                className="rounded-lg overflow-hidden"
-                style={{ background: "var(--q-card)", border: "1px solid var(--q-border)" }}
-            >
+            <section className="glass-surface rounded-lg overflow-hidden">
                 <div className="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-3"
-                     style={{ borderColor: "var(--q-border)", background: "var(--q-surface)" }}>
+                     style={{ borderColor: "var(--q-border)", background: "var(--q-glass-control)" }}>
                     <div className="flex items-center gap-2 min-w-0">
                         <Waypoints className="w-4 h-4 text-cyan-300 shrink-0" />
                         <div className="min-w-0">

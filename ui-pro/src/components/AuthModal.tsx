@@ -113,12 +113,12 @@ export function AuthModal() {
     };
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-in fade-in duration-300">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-lg animate-in fade-in duration-300">
             {/* Click outside to close */}
             <div className="absolute inset-0" onClick={isAuthenticated ? closeAuthModal : undefined} />
 
             {/* Modal Content */}
-            <div className="relative w-full max-w-[400px] bg-[#1c1c1c] border border-slate-800 rounded-3xl shadow-2xl p-8 animate-in zoom-in-95 duration-300">
+            <div className="relative w-full max-w-[400px] glass-surface rounded-3xl p-8 animate-in zoom-in-95 duration-300">
                 {isAuthenticated && (
                     <button
                         onClick={closeAuthModal}
@@ -138,7 +138,7 @@ export function AuthModal() {
                 </div>
 
                 {/* Terms and Conditions Checkbox */}
-                <div className="bg-[#242424]/40 border border-slate-800/80 rounded-2xl p-4 mb-5 transition-all duration-300 hover:border-slate-700/60 select-none">
+                <div className="glass-control rounded-2xl p-4 mb-5 duration-300 select-none">
                     <label className="flex items-start gap-3 cursor-pointer group text-left">
                         <div className="relative flex items-center mt-0.5 shrink-0">
                             <input
@@ -216,7 +216,7 @@ export function AuthModal() {
                         <>
                             <button
                                 onClick={() => setShowEmailForm(true)}
-                                className="w-full flex items-center justify-center gap-2 bg-[#2a2a2a] hover:bg-[#333] text-white border border-slate-700/50 py-2.5 px-4 rounded-lg transition-colors text-sm font-medium"
+                                className="glass-control w-full flex items-center justify-center gap-2 text-white py-2.5 px-4 rounded-lg text-sm font-medium"
                             >
                                 <Mail className="w-4 h-4" />
                                 Continue with Email
@@ -224,7 +224,7 @@ export function AuthModal() {
                         </>
                     ) : (
                         <div className="animate-in fade-in slide-in-from-top-2 duration-300">
-                            <div className="flex bg-slate-800/50 p-1 rounded-lg mb-6">
+                            <div className="glass-control flex p-1 rounded-lg mb-6">
                                 <button
                                     className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${isLogin ? 'bg-slate-700 text-white shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
                                     onClick={() => { setIsLogin(true); setError(null); }}
@@ -248,7 +248,7 @@ export function AuthModal() {
                                             required
                                             value={displayName}
                                             onChange={(e) => setDisplayName(e.target.value)}
-                                            className="w-full bg-[#111] border border-slate-800 text-white text-sm rounded-xl focus:ring-1 focus:ring-slate-600 focus:border-slate-600 pl-10 pr-4 py-3 outline-none transition-all placeholder:text-slate-600"
+                                            className="glass-control w-full text-white text-sm rounded-xl focus:ring-1 focus:ring-slate-600 focus:border-slate-600 pl-10 pr-4 py-3 outline-none placeholder:text-slate-600"
                                             placeholder="Your Name"
                                         />
                                     </div>
@@ -261,7 +261,7 @@ export function AuthModal() {
                                         required
                                         value={email}
                                         onChange={(e) => setEmail(e.target.value)}
-                                        className="w-full bg-[#111] border border-slate-800 text-white text-sm rounded-xl focus:ring-1 focus:ring-slate-600 focus:border-slate-600 pl-10 pr-4 py-3 outline-none transition-all placeholder:text-slate-600"
+                                        className="glass-control w-full text-white text-sm rounded-xl focus:ring-1 focus:ring-slate-600 focus:border-slate-600 pl-10 pr-4 py-3 outline-none placeholder:text-slate-600"
                                         placeholder="Email address"
                                     />
                                 </div>
@@ -273,7 +273,7 @@ export function AuthModal() {
                                         required
                                         value={password}
                                         onChange={(e) => setPassword(e.target.value)}
-                                        className="w-full bg-[#111] border border-slate-800 text-white text-sm rounded-xl focus:ring-1 focus:ring-slate-600 focus:border-slate-600 pl-10 pr-4 py-3 outline-none transition-all placeholder:text-slate-600"
+                                        className="glass-control w-full text-white text-sm rounded-xl focus:ring-1 focus:ring-slate-600 focus:border-slate-600 pl-10 pr-4 py-3 outline-none placeholder:text-slate-600"
                                         placeholder="Password"
                                     />
                                 </div>

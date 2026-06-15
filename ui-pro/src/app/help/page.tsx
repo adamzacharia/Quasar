@@ -89,7 +89,7 @@ export default function HelpPage() {
                     </div>
 
                     {/* Tab Navigation */}
-                    <div className="flex gap-2 p-1 bg-slate-800/50 rounded-xl border border-slate-700/50 w-fit">
+                    <div className="glass-control flex gap-2 p-1 rounded-xl w-fit">
                         {tabs.map((tab) => (
                             <button
                                 key={tab.id}
@@ -114,14 +114,14 @@ export default function HelpPage() {
 
 
                                 {/* Pro Tips Section */}
-                                <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">
+                                <section className="glass-surface rounded-2xl p-6">
                                     <h2 className="text-xl font-semibold text-white mb-6 flex items-center gap-2">
                                         <div className="p-1.5 bg-slate-700/50 rounded-md"><Zap className="w-5 h-5 text-yellow-400" /></div>
                                         Example Queries
                                     </h2>
                                     <ul className="space-y-3">
                                         {tips.map((tip, i) => (
-                                            <li key={i} className="flex items-start gap-3 bg-slate-800/50 p-3 rounded-lg border border-slate-700/30">
+                                            <li key={i} className="glass-control flex items-start gap-3 p-3 rounded-lg">
                                                 <span className="text-primary font-bold mt-0.5">•</span>
                                                 <span className="text-sm text-slate-300 font-medium">&quot;{tip}&quot;</span>
                                             </li>
@@ -133,7 +133,7 @@ export default function HelpPage() {
                             {/* Right Column */}
                             <div className="space-y-8">
                                 {/* Link Resources Section */}
-                                <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">
+                                <section className="glass-surface rounded-2xl p-6">
                                     <h2 className="text-xl font-semibold text-white mb-6 flex items-center gap-2">
                                         <div className="p-1.5 bg-slate-700/50 rounded-md"><ExternalLink className="w-5 h-5 text-blue-400" /></div>
                                         Official Resources
@@ -141,7 +141,7 @@ export default function HelpPage() {
                                     <div className="space-y-3">
                                         {/* TEMPORARILY HIDDEN FOR ANONYMOUS REVIEW
                                         <a href="https://github.com/adamzacharia/Quasar2" target="_blank" rel="noopener noreferrer"
-                                            className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
+                                            className="glass-control flex items-center gap-4 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-slate-700 rounded-lg group-hover:bg-slate-600 transition-colors"><Github className="w-5 h-5 text-white" /></div>
                                             <div className="flex-1">
                                                 <span className="text-sm font-semibold text-white">GitHub Repository</span>
@@ -151,7 +151,7 @@ export default function HelpPage() {
                                         </a>
                                         */}
                                         <a href="https://almascience.nrao.edu/aq/" target="_blank" rel="noopener noreferrer"
-                                            className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
+                                            className="glass-control flex items-center gap-4 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-blue-900/40 rounded-lg group-hover:bg-blue-800/50 transition-colors"><Telescope className="w-5 h-5 text-blue-400" /></div>
                                             <div className="flex-1">
                                                 <span className="text-sm font-semibold text-white">ALMA Archive</span>
@@ -160,7 +160,7 @@ export default function HelpPage() {
                                             <ExternalLink className="w-4 h-4 text-slate-500 group-hover:text-primary transition-colors" />
                                         </a>
                                         <a href="https://ui.adsabs.harvard.edu/" target="_blank" rel="noopener noreferrer"
-                                            className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
+                                            className="glass-control flex items-center gap-4 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-accent-purple/20 rounded-lg group-hover:bg-accent-purple/30 transition-colors"><Search className="w-5 h-5 text-accent-purple" /></div>
                                             <div className="flex-1">
                                                 <span className="text-sm font-semibold text-white">NASA ADS</span>
@@ -169,7 +169,7 @@ export default function HelpPage() {
                                             <ExternalLink className="w-4 h-4 text-slate-500 group-hover:text-primary transition-colors" />
                                         </a>
                                         <a href="https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/" target="_blank" rel="noopener noreferrer"
-                                            className="flex items-center gap-4 bg-slate-800/50 hover:bg-slate-700 border border-slate-700/50 rounded-xl p-4 transition-all hover:scale-[1.02] group">
+                                            className="glass-control flex items-center gap-4 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-teal-900/40 rounded-lg group-hover:bg-teal-800/50 transition-colors"><Database className="w-5 h-5 text-teal-400" /></div>
                                             <div className="flex-1">
                                                 <span className="text-sm font-semibold text-white">CADC Archive</span>
@@ -181,7 +181,7 @@ export default function HelpPage() {
                                 </section>
 
                                 {/* Available Tools Reference */}
-                                <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-6 backdrop-blur-sm">
+                                <section className="glass-surface rounded-2xl p-6">
                                     <h2 className="text-xl font-semibold text-white mb-6 flex items-center gap-2">
                                         <div className="p-1.5 bg-slate-700/50 rounded-md"><Bot className="w-5 h-5 text-emerald-accent" /></div>
                                         Agent Tools Arsenal
@@ -189,7 +189,7 @@ export default function HelpPage() {
                                     <p className="text-sm text-slate-400 mb-4">The QUASAR agent autonomously routes requests to these Python tools:</p>
                                     <div className="flex flex-wrap gap-2">
                                         {tools.map((t) => (
-                                            <div key={t} className="px-3 py-1.5 bg-[#111] border border-slate-700/50 rounded-md flex items-center gap-2">
+                                            <div key={t} className="glass-control px-3 py-1.5 rounded-md flex items-center gap-2">
                                                 <div className="w-1.5 h-1.5 rounded-full bg-emerald-accent/60 animate-pulse" />
                                                 <span className="text-xs font-mono text-slate-300">{t}</span>
                                             </div>
@@ -203,7 +203,7 @@ export default function HelpPage() {
                     {/* ═══════════════ TERMS & CONDITIONS TAB ═══════════════ */}
                     {activeTab === "terms" && (
                         <div className="max-w-3xl animate-in fade-in duration-300 space-y-8">
-                            <section className="bg-slate-800/30 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
+                            <section className="glass-surface rounded-2xl p-8">
                                 <div className="flex items-center gap-3 mb-6">
                                     <div className="p-2 bg-primary/10 rounded-lg"><Shield className="w-6 h-6 text-primary" /></div>
                                     <div>

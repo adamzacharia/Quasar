@@ -486,11 +486,11 @@ function SkyMapLightbox({
 
     return (
         <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-lg"
             onClick={onClose}
         >
             <div
-                className="relative bg-[#0a1220] border border-slate-600/60 rounded-2xl p-4 shadow-2xl max-w-[680px] w-full mx-4"
+                className="glass-surface relative rounded-2xl p-4 max-w-[680px] w-full mx-4"
                 onClick={e => e.stopPropagation()}
             >
                 <button
@@ -536,11 +536,11 @@ function PreviewLightbox({
 
     return (
         <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-lg"
             onClick={onClose}
         >
             <div
-                className="relative bg-surface-dark border border-slate-600/60 rounded-2xl p-3 shadow-2xl max-w-[480px]"
+                className="glass-surface relative rounded-2xl p-3 max-w-[480px]"
                 onClick={e => e.stopPropagation()}
             >
                 <button
@@ -688,11 +688,11 @@ function FitsPreviewLightbox({
 
     return (
         <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-lg"
             onClick={onClose}
         >
             <div
-                className="relative bg-[#0a1220] border border-slate-600/60 rounded-2xl shadow-2xl w-[min(1180px,calc(100vw-32px))] max-h-[calc(100vh-32px)] overflow-y-auto"
+                className="glass-surface relative rounded-2xl w-[min(1180px,calc(100vw-32px))] max-h-[calc(100vh-32px)] overflow-y-auto"
                 onClick={e => e.stopPropagation()}
             >
                 <button
@@ -1107,7 +1107,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 />
             )}
 
-            <div className="rounded-2xl overflow-hidden shadow-sm" style={{ background: 'var(--q-card)', border: '1px solid var(--q-border)' }}>
+            <div className="glass-surface rounded-2xl overflow-hidden">
 
                 {data.partial && (
                     <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2 text-xs text-amber-200 bg-amber-500/10" style={{ borderColor: 'var(--q-border)' }}>
@@ -1139,7 +1139,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
 
                 {/* ── Demographics Charts ── */}
                 {hasDemographics && (
-                    <div className="border-b px-4 py-3" style={{ borderColor: 'var(--q-border)', background: 'var(--q-glass-bg)' }}>
+                    <div className="border-b px-4 py-3" style={{ borderColor: 'var(--q-border)', background: 'var(--q-glass-control)' }}>
                         <div className="flex items-center gap-1.5 mb-2">
                             <BarChart3 className="w-3.5 h-3.5 text-slate-500" />
                             <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">

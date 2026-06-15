@@ -63,10 +63,9 @@ export function ThoughtProcessWidget({
     const displaySeconds = duration !== undefined ? duration : seconds;
 
     return (
-        <div className="max-w-2xl my-3 rounded-xl overflow-hidden transition-all duration-300"
+        <div className="glass-surface max-w-2xl my-3 rounded-xl overflow-hidden transition-all duration-300"
              style={{
-                 background: 'var(--q-glass-bg)',
-                 border: `1px solid ${isRunning ? 'rgba(244, 113, 181, 0.2)' : 'var(--q-glass-border)'}`,
+                 borderColor: isRunning ? 'rgba(244, 113, 181, 0.2)' : 'var(--q-glass-border)',
              }}>
             <details className="group" open={isOpen}>
                 <summary className="flex items-center justify-between px-4 py-3 cursor-pointer list-none select-none hover:bg-[var(--q-glass-hover)] transition-colors">

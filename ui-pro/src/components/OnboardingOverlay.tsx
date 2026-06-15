@@ -88,19 +88,13 @@ export function OnboardingOverlay({ onComplete }: OnboardingOverlayProps) {
                 ${visible && !exiting ? "opacity-100" : "opacity-0 pointer-events-none"}`}
         >
             {/* Backdrop */}
-            <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={finish} />
+            <div className="absolute inset-0 bg-black/60 backdrop-blur-lg" onClick={finish} />
 
             {/* Card */}
             <div
-                className={`relative z-10 w-full max-w-md mx-4 rounded-3xl overflow-hidden
-                    shadow-2xl shadow-primary/10
+                className={`glass-surface relative z-10 w-full max-w-md mx-4 rounded-3xl overflow-hidden
                     transition-all duration-300 ease-out
                     ${visible && !exiting ? "scale-100 translate-y-0" : "scale-95 translate-y-4"}`}
-                style={{
-                    background: 'var(--q-card)',
-                    border: '1px solid var(--q-glass-border)',
-                    backdropFilter: "blur(24px)",
-                }}
             >
                 {/* Skip button */}
                 <button

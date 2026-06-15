@@ -301,8 +301,7 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
     const hasErrors      = Array.from(state.tasks.values()).some(t => t.status === "error");
 
     return (
-        <div className="rounded-2xl overflow-hidden max-w-2xl my-3 backdrop-blur-sm"
-             style={{ background: 'var(--q-glass-bg)', border: '1px solid var(--q-glass-border)' }}>
+        <div className="glass-surface rounded-2xl overflow-hidden max-w-2xl my-3">
             {/* Header — clickable to expand/collapse when done */}
             <button
                 onClick={() => !state.isActive && setIsCollapsed(!isCollapsed)}
