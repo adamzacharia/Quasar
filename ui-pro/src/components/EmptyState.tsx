@@ -23,7 +23,7 @@ interface EmptyStateProps { onSuggestionClick: (prompt: string) => void; }
 export function EmptyState({ onSuggestionClick }: EmptyStateProps) {
     return (
         <div className="hide-scrollbar flex-1 w-full overflow-y-auto px-3 pt-8 pb-3 md:p-8 md:pb-6">
-            <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col items-center justify-start md:justify-center">
+            <div className="mx-auto flex min-h-full w-full max-w-[var(--q-empty-state-width)] flex-col items-center justify-start md:justify-center">
                 <div className="flex flex-col items-center justify-center text-center mb-4 md:mb-6">
                     <div className="relative mb-1">
                         <div className="absolute inset-0 bg-primary/20 rounded-full blur-3xl opacity-50" />
@@ -39,7 +39,7 @@ export function EmptyState({ onSuggestionClick }: EmptyStateProps) {
                     </p>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 md:gap-4 w-full max-w-3xl">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 md:gap-4 w-full max-w-[var(--q-suggestion-grid-width)]">
                     {SUGGESTIONS.map((s, i) => (
                         <button key={i} onClick={() => onSuggestionClick(s.prompt)}
                             className="glass-card min-h-[76px] p-3 md:p-5 rounded-2xl md:rounded-3xl text-left group flex items-start gap-3 md:gap-4">

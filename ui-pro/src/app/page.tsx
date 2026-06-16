@@ -152,7 +152,7 @@ export default function Home() {
             onClick={toggleSidebar}
           />
           {/* Sidebar panel */}
-          <div className="relative z-50 w-[280px] h-full animate-in slide-in-from-left duration-200">
+          <div className="relative z-50 w-[var(--q-sidebar-width)] h-full animate-in slide-in-from-left duration-200">
             <Sidebar />
           </div>
         </div>
@@ -160,7 +160,7 @@ export default function Home() {
 
       {/* ── DESKTOP: sidebar as a push panel ── */}
       {!isMobile && (
-        <div className={`${sidebarOpen ? "w-[280px]" : "w-0"} transition-all duration-300 shrink-0 overflow-hidden`}>
+        <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-0"} transition-all duration-300 shrink-0 overflow-hidden`}>
           <Sidebar />
         </div>
       )}

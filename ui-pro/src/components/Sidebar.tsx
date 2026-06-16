@@ -391,7 +391,7 @@ export function Sidebar() {
             : "U";
 
     return (
-        <aside className="relative w-[280px] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
+        <aside className="relative w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
             {/* Logo */}
             <div className="p-6 flex items-center gap-3">
                 <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
