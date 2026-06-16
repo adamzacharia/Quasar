@@ -91,7 +91,7 @@ TABLE: ivoa.obscore
 | pol_states            | VARCHAR | Polarization states (e.g., 'XX YY')      |
 | science_observation   | VARCHAR | Science observation flag                 |
 | scan_intent           | VARCHAR | Scan intent, e.g., TARGET or calibrators |
-| qa2_passed            | VARCHAR | QA2 pass flag ('T' for passed, 'F' fail) |
+| qa2_passed            | VARCHAR | QA2 matrix flag ('T' for PASS, 'F' for SEMIPASS) |
 
 Example Queries:
 - Find Band 6 data: SELECT * FROM ivoa.obscore WHERE band_list = '6'

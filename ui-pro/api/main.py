@@ -65,9 +65,14 @@ def _sanitize_assistant_text(text: str) -> str:
 
 
 def _normalize_qa2_value(value: Any) -> str:
-    """Normalize archive-table QA2 values for the existing UI badge."""
+    """Normalize archive-table QA2 values for the existing UI badge.
+
+    ALMA's matrix exposes science QA2 as PASS or SEMIPASS. The ObsCore
+    qa2_passed boolean uses T/F, where F corresponds to SEMIPASS in that
+    matrix rather than a third visible "Fail" state.
+    """
     if isinstance(value, bool):
-        return "Pass" if value else "Fail"
+        return "Pass" if value else "SemiPass"
     if value is None:
         return "Unknown"
 
@@ -79,13 +84,13 @@ def _normalize_qa2_value(value: Any) -> str:
     if compact in {"t", "true", "y", "yes", "1", "pass", "passed", "qa2pass", "qa2passed"}:
         return "Pass"
     if compact in {"f", "false", "n", "no", "0", "fail", "failed", "qa2fail", "qa2failed"}:
-        return "Fail"
+        return "SemiPass"
     if compact in {"semipass", "semipassed", "qa2semipass", "qa2semipassed"}:
         return "SemiPass"
     if "semipass" in compact:
         return "SemiPass"
     if "fail" in compact:
-        return "Fail"
+        return "SemiPass"
     if "pass" in compact:
         return "Pass"
     return text
