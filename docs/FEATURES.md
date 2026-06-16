@@ -13,7 +13,7 @@ Last audited against the codebase: 2026-04-25
 | Category               | Total | Built | In Progress | Planned | % Done |
 |------------------------|-------|-------|-------------|---------|--------|
 | Universal              | 10    | 6     | 1           | 3       | 60%    |
-| Radio                  | 10    | 7     | 0           | 3       | 70%    |
+| Radio                  | 11    | 8     | 0           | 3       | 73%    |
 | Gravitational Wave     | 7     | 2     | 0           | 5       | 29%    |
 | Infrared               | 6     | 3     | 0           | 3       | 50%    |
 | High-Energy            | 5     | 0     | 0           | 5       | 0%     |
@@ -22,7 +22,7 @@ Last audited against the codebase: 2026-04-25
 | Next-Gen               | 13    | 10    | 1           | 2       | 77%    |
 | Literature             | 2     | 2     | 0           | 0       | 100%   |
 | Polish & Scale         | 42    | 23    | 1           | 18      | 55%    |
-| **Total**              |**108**|**61** | **3**       | **44**  |**56%** |
+| **Total**              |**109**|**62** | **3**       | **44**  |**57%** |
 
 
 ---
@@ -66,6 +66,7 @@ hours and adds immediate user value.
 - [x] **R4** ALMA Sensitivity Calculator -- Radiometer equation per band with Tsys and PWV scaling (services/astro_calculators.py)
 - [x] **O6** Finding Chart Generator -- DSS/PanSTARRS chart with WCS, crosshair, N/E arrows, scale bar (integrations/skyview_client.py)
 - [x] **R3** Spectral Line Profile Plotter -- Extract spectrum from cube, fit Gaussian, report FWHM and integrated flux (services/fits_service.py)
+- [x] **R11** ALMA QA2 Status Lookup -- Automatic mapping and extraction of QA2 status (Pass/Fail/SemiPass) from Member OUS UID report PDFs (services/alma_qa2.py)
 - [x] **W13** Search Provider Router & RAG Filtration -- A premium multi-provider search router directing queries to Brave Search (primary LLM context), Tavily (fallback & image search), and Exa (specialist deep semantic/technical). Persistent calendar-month rate-limiting caps free API requests at 1,000/month. Fast zero-LLM pre-RAG domain relevancy gates out casual chitchat while a 0.35 semantic cosine score floor and time-sensitive keyword triggers filter search results (services/web_search_service.py + core/agent.py + ui-pro/api/main.py + services/rag_service.py)
 
 ---
@@ -214,4 +215,4 @@ Phase 6 -- Polish & Scale (Ongoing, continuous):
 
 ---
 
-*Last updated: 2026-06-14 -- Quasar v3.4.3 (Implement O2, O3, I4, R8)*
+*Last updated: 2026-06-15 -- Quasar v3.4.4 (Implement R11)*
