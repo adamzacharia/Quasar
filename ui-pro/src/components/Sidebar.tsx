@@ -8,9 +8,10 @@ import { useAuthStore } from "../lib/auth-store";
 import {
     Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2
+    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
+import { isTaccModel } from "../lib/models";
 
 function timeAgo(date: Date): string {
     const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -85,6 +86,7 @@ const MODEL_PRICING: Record<string, { in: number, out: number }> = {
 
 function getModelCost(model: string) {
     if (model.startsWith("local/")) return { in: 0, out: 0 };
+    if (isTaccModel(model)) return null;
     if (MODEL_PRICING[model]) return MODEL_PRICING[model];
     // Fallbacks
     if (model.includes("deepseek-v4-flash")) return MODEL_PRICING["deepseek-v4-flash"];
@@ -105,8 +107,13 @@ function getModelCost(model: string) {
    MODEL ICON COMPONENT
    ──────────────────────────────────────────── */
 function ModelIcon({ model, className = "w-4 h-4" }: { model: string; className?: string }) {
+    const isTacc = isTaccModel(model);
     const isDeepSeek = model.toLowerCase().includes("deepseek");
-    const isOpenAI = model.startsWith("gpt-") || model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4");
+    const isOpenAI = !isTacc && (model.startsWith("gpt-") || model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4"));
+
+    if (isTacc) {
+        return <Cpu className={`${className} text-cyan-300 shrink-0`} />;
+    }
 
     if (isDeepSeek) {
         return (
@@ -146,10 +153,11 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
         return () => document.removeEventListener("mousedown", handleClick);
     }, []);
 
-    const openaiModels = availableModels.filter(m => m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4"));
-    const deepseekModels = availableModels.filter(m => m.toLowerCase().includes("deepseek"));
-    const geminiModels = availableModels.filter(m => m.startsWith("gemini-") || m.startsWith("gemma-"));
-    const claudeModels = availableModels.filter(m => m.startsWith("claude-"));
+    const taccModels = availableModels.filter(isTaccModel);
+    const openaiModels = availableModels.filter(m => !isTaccModel(m) && (m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")));
+    const deepseekModels = availableModels.filter(m => !isTaccModel(m) && m.toLowerCase().includes("deepseek"));
+    const geminiModels = availableModels.filter(m => !isTaccModel(m) && (m.startsWith("gemini-") || m.startsWith("gemma-")));
+    const claudeModels = availableModels.filter(m => !isTaccModel(m) && m.startsWith("claude-"));
     const localModels = availableModels.filter(m => m.startsWith("local/"));
 
     const renderGroup = (label: string, models: string[]) => models.length === 0 ? null : (
@@ -201,9 +209,11 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
                     {renderGroup("OpenAI", openaiModels)}
                     {deepseekModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("DeepSeek", deepseekModels)}
+                    {taccModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
+                    {renderGroup("TACC Tejas", taccModels)}
                     {claudeModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Anthropic Claude", claudeModels)}
-                    {geminiModels.length > 0 && (openaiModels.length > 0 || deepseekModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
+                    {geminiModels.length > 0 && (openaiModels.length > 0 || deepseekModels.length > 0 || taccModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Google Gemini", geminiModels)}
                     {localModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
                     {renderGroup("Local LLM", localModels)}

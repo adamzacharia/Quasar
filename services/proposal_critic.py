@@ -20,9 +20,9 @@ class ProposalCriticService:
     """
     
     def __init__(self, api_key: Optional[str] = None, ads_service: Optional[ADSService] = None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.model = "gpt-4o"
-        self.client = LLMClient(model=self.model) if self.api_key else None
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("TACC_API_KEY")
+        self.model = os.getenv("QUASAR_PROPOSAL_CRITIC_MODEL") or os.getenv("QUASAR_REASONING_MODEL", "gpt-4o")
+        self.client = LLMClient(model=self.model)
         self.ads_client = ads_service or ADSService()
 
     def _run_fact_checker(self, proposal_text: str) -> str:

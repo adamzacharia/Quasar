@@ -137,7 +137,7 @@ class AgentConfig:
     """Configuration for QuasarAgent"""
     api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     ads_api_key: str = field(default_factory=lambda: os.getenv("NASA_ADS_API_KEY", ""))
-    model: str = "gpt-4o"  # Changed to gpt-4o for better reasoning
+    model: str = field(default_factory=lambda: os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b"))
     temperature: float = 0.7
     max_tokens: int = 2000
     max_memory_turns: int = 10
@@ -289,10 +289,15 @@ class QuasarAgent:
         self.model_router.health_monitor = self.health_monitor
         self.agent_pool = AgentPool()
         print("DEBUG: Init Conductor")
+        fast_model = os.getenv("QUASAR_FAST_MODEL", "deepseek-v4-flash")
+        reasoning_model = os.getenv("QUASAR_REASONING_MODEL", "deepseek-v4-pro")
+        conductor_model = os.getenv("QUASAR_CONDUCTOR_MODEL", reasoning_model)
+        synthesis_model = os.getenv("QUASAR_SYNTHESIS_MODEL", conductor_model)
         # Initialize complexity detector (gates Conductor activation)
         print("DEBUG: Init ComplexityDetector")
         self.complexity_detector = ComplexityDetector(
-            client=self.client, model="deepseek-v4-flash"
+            client=self.client,
+            model=os.getenv("QUASAR_COMPLEXITY_MODEL", fast_model),
         )
 
         # Initialize sandbox executor (for Conductor "compute" agent type)
@@ -307,7 +312,8 @@ class QuasarAgent:
         self.conductor = Conductor(
             client=self.client,
             model=self.config.model,
-            conductor_model="deepseek-v4-pro",  # DeepSeek model for planning/synthesis
+            conductor_model=conductor_model,
+            synthesis_model=synthesis_model,
             tool_executor=self._conductor_tool_executor,
             recovery_engine=self.recovery_engine,
             model_router=self.model_router,
@@ -3065,9 +3071,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         try:
             from core.llm_client import LLMClient
-            client = LLMClient(model="gpt-4.1-mini")
+            synthesis_model = os.getenv("QUASAR_WEB_SYNTHESIS_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4.1-mini")
+            client = LLMClient(model=synthesis_model)
             resp = client.responses.create(
-                model="gpt-4.1-mini",
+                model=synthesis_model,
                 instructions=system_prompt,
                 input=user_prompt,
                 max_output_tokens=200,
@@ -3129,9 +3136,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         try:
             from core.llm_client import LLMClient
-            client = LLMClient(model="gpt-4.1-mini")
+            synthesis_model = os.getenv("QUASAR_WEB_SYNTHESIS_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4.1-mini")
+            client = LLMClient(model=synthesis_model)
             resp = client.responses.create(
-                model="gpt-4.1-mini",
+                model=synthesis_model,
                 instructions=system_prompt,
                 input=user_prompt,
                 max_output_tokens=700,
@@ -6677,9 +6685,7 @@ IMPORTANT RULES:
         return None
 
     def _detect_web_search_needed_via_llm(self, query: str) -> bool:
-        """
-        Use deepseek-v4-flash to classify if a query requires web search.
-        """
+        """Use the configured fast model to classify if a query requires web search."""
         try:
             # 1. Direct keyword override for policy/time-sensitive queries
             query_lower = query.lower()
@@ -6693,8 +6699,8 @@ IMPORTANT RULES:
                 return True
 
             from core.llm_client import LLMClient
-            # Instantiate deepseek-v4-flash client
-            client = LLMClient(model="deepseek-v4-flash")
+            intent_model = os.getenv("QUASAR_WEB_INTENT_MODEL") or os.getenv("QUASAR_FAST_MODEL", "deepseek-v4-flash")
+            client = LLMClient(model=intent_model)
             
             # Get recent conversation history (e.g. last 2 turns / 4 messages) to provide context
             recent_turns = self.memory.get_last_n_turns(2)
@@ -6729,7 +6735,7 @@ IMPORTANT RULES:
             )
             
             resp = client.responses.create(
-                model="deepseek-v4-flash",
+                model=intent_model,
                 input=prompt,
                 temperature=0,
                 max_output_tokens=1024,
@@ -7054,12 +7060,13 @@ IMPORTANT RULES:
         # use a fast LLM call to verify before committing to search_papers.
         _is_paper_query = False
         if _has_paper_word and not _is_document_analysis:
-            # Fast LLM intent verification (~200ms with gpt-4o-mini)
+            # Fast LLM intent verification.
             try:
                 from core.llm_client import LLMClient
-                _mini = LLMClient(model="gpt-4o-mini")
+                _intent_model = os.getenv("QUASAR_PAPER_INTENT_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4o-mini")
+                _mini = LLMClient(model=_intent_model)
                 _intent_resp = _mini.responses.create(
-                    model="gpt-4o-mini",
+                    model=_intent_model,
                     input=(
                         f"Classify this astronomy query into exactly one category.\n\n"
                         f"Query: \"{_user_query}\"\n\n"
@@ -8294,7 +8301,7 @@ IMPORTANT RULES:
             """
             
             response = self.client.responses.create(
-                model="gpt-4o-mini",  # Use cheaper model for background tasks
+                model=os.getenv("QUASAR_PERSONAL_MEMORY_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4o-mini"),
                 input=prompt,
                 temperature=0.1,
                 max_output_tokens=50

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue as stdlib_queue
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -283,7 +284,7 @@ class Conductor:
         # Planning model: expensive, only used for DAG decomposition
         self.conductor_model = conductor_model or model
         # Synthesis model: cheaper, used for combining results into final answer
-        self.synthesis_model = synthesis_model or "deepseek-v4-pro"
+        self.synthesis_model = synthesis_model or os.getenv("QUASAR_SYNTHESIS_MODEL", "deepseek-v4-pro")
         self.tool_executor = tool_executor
         self.model_router = model_router
         self.recovery = recovery_engine

@@ -117,8 +117,27 @@ def get_langfuse_parent():
 # Provider detection
 # ---------------------------------------------------------------------------
 
+TACC_DEFAULT_BASE_URL = "https://ai.tejas.tacc.utexas.edu/v1"
+
+TACC_MODEL_IDS = [
+    "gpt-oss-120b",
+    "Llama-4-Maverick-17B-128E-Instruct",
+    "gemma-4-31B-it",
+    "MiniMax-M2.7",
+    "Qwen3-32B",
+    "Meta-Llama-3.2-1B-Instruct",
+    "Meta-Llama-3.1-8B-Instruct",
+    "Meta-Llama-3.3-70B-Instruct",
+    "Mistral-Large-3-675B-Instruct-2512",
+    "E5-Mistral-7B-Instruct",
+]
+
+TACC_MODEL_ID_SET = frozenset(TACC_MODEL_IDS)
+
 def detect_provider(model: str) -> str:
     """Detect the LLM provider from the model name."""
+    if model in TACC_MODEL_ID_SET or model.startswith("tacc/"):
+        return "tacc"
     if model.startswith("local/"):
         return "local"
     if model.startswith("claude-"):
@@ -393,6 +412,11 @@ class ResponsesShim:
         try:
             if provider == "openai":
                 result = self._call_openai(kwargs, attachments=attachments)
+            elif provider == "tacc":
+                if stream:
+                    result = self._stream_tacc(kwargs, attachments=attachments)
+                else:
+                    result = self._call_tacc(kwargs, attachments=attachments)
             elif provider == "deepseek":
                 if stream:
                     result = self._stream_deepseek(kwargs, attachments=attachments)
@@ -1150,6 +1174,190 @@ class ResponsesShim:
             )
         )
 
+    @with_retry(max_retries=3, backoff_base=1.0)
+    def _call_tacc(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> LLMResponse:
+        """Translate responses.create() to TACC's OpenAI-compatible Chat Completions API."""
+        client = self._llm._get_tacc_client()
+        model = self._llm._normalize_tacc_model(kwargs.get("model", self._llm.default_model))
+        instructions = kwargs.get("instructions", "")
+        input_data = kwargs.get("input", "")
+        temperature = kwargs.get("temperature", 0.7)
+        max_tokens = kwargs.get("max_output_tokens", 2000)
+        tools_raw = kwargs.get("tools", None)
+        prev_id = kwargs.get("previous_response_id", None)
+        json_mode = False
+        text_opt = kwargs.get("text", None)
+        if text_opt and isinstance(text_opt, dict):
+            fmt = text_opt.get("format", {})
+            if fmt.get("type") == "json_object":
+                json_mode = True
+
+        if prev_id and prev_id in self._history_cache:
+            messages = list(self._history_cache[prev_id])
+            self._append_chat_input(messages, input_data)
+        else:
+            messages = self._build_chat_messages(instructions, input_data, json_mode)
+
+        messages = self._inject_images_into_messages(messages, attachments)
+        openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
+        tool_choice = kwargs.get("tool_choice", None)
+
+        call_kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if openai_tools:
+            call_kwargs["tools"] = openai_tools
+            if tool_choice:
+                call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
+        if json_mode and os.getenv("TACC_ENABLE_RESPONSE_FORMAT", "").lower() in {"1", "true", "yes"}:
+            call_kwargs["response_format"] = {"type": "json_object"}
+
+        completions_engine = getattr(getattr(client, "chat"), "completions")
+        resp = completions_engine.create(**call_kwargs)
+        result = self._chat_completion_to_llm_response(resp)
+
+        new_messages = list(messages)
+        tool_calls = [out for out in result.output if getattr(out, "type", None) == "function_call"]
+        if tool_calls:
+            new_messages.append({
+                "role": "assistant",
+                "content": result.output_text or None,
+                "tool_calls": [
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+        else:
+            new_messages.append({"role": "assistant", "content": result.output_text})
+        self._history_cache[result.id] = new_messages
+        return result
+
+    def _stream_tacc(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
+        """Streaming TACC call via OpenAI-compatible Chat Completions."""
+        client = self._llm._get_tacc_client()
+        model = self._llm._normalize_tacc_model(kwargs.get("model", self._llm.default_model))
+        instructions = kwargs.get("instructions", "")
+        input_data = kwargs.get("input", "")
+        temperature = kwargs.get("temperature", 0.7)
+        max_tokens = kwargs.get("max_output_tokens", 2000)
+        tools_raw = kwargs.get("tools", None)
+        prev_id = kwargs.get("previous_response_id", None)
+
+        if prev_id and prev_id in self._history_cache:
+            messages = list(self._history_cache[prev_id])
+            self._append_chat_input(messages, input_data)
+        else:
+            messages = self._build_chat_messages(instructions, input_data)
+
+        messages = self._inject_images_into_messages(messages, attachments)
+        openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
+        tool_choice = kwargs.get("tool_choice", None)
+
+        call_kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if os.getenv("TACC_STREAM_INCLUDE_USAGE", "true").lower() in {"1", "true", "yes"}:
+            call_kwargs["stream_options"] = {"include_usage": True}
+        if openai_tools:
+            call_kwargs["tools"] = openai_tools
+            if tool_choice:
+                call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
+
+        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+        yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
+
+        function_calls = {}
+        output_text = ""
+        usage_obj = None
+
+        completions_engine = getattr(getattr(client, "chat"), "completions")
+        stream = completions_engine.create(**call_kwargs)
+        for chunk in stream:
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage_obj = LLMUsage(
+                    input_tokens=getattr(chunk.usage, "prompt_tokens", 0),
+                    output_tokens=getattr(chunk.usage, "completion_tokens", 0),
+                )
+
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+
+            delta = choice.delta
+            if delta.content:
+                output_text += delta.content
+                yield StreamEvent(type="response.output_text.delta", delta=delta.content)
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in function_calls:
+                        fc = FunctionCallItem(
+                            name=tc.function.name or "" if tc.function else "",
+                            call_id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
+                        )
+                        function_calls[idx] = fc
+                        yield StreamEvent(type="response.output_item.added", item=fc)
+
+                    fc = function_calls[idx]
+                    if tc.function and tc.function.name and not fc.name:
+                        fc.name = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        fc.arguments += tc.function.arguments
+                        yield StreamEvent(
+                            type="response.function_call_arguments.delta",
+                            delta=tc.function.arguments,
+                            item=fc,
+                        )
+
+        for fc in function_calls.values():
+            yield StreamEvent(type="response.output_item.done", item=fc)
+
+        completed_items = [fc for fc in function_calls.values()]
+        yield StreamEvent(
+            type="response.completed",
+            response=LLMResponse(
+                id=resp_id,
+                output=completed_items,
+                usage=usage_obj,
+            ),
+        )
+
+        new_messages = list(messages)
+        if completed_items:
+            new_messages.append({
+                "role": "assistant",
+                "content": output_text or None,
+                "tool_calls": [
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        },
+                    }
+                    for tc in completed_items
+                ],
+            })
+        else:
+            new_messages.append({"role": "assistant", "content": output_text})
+        self._history_cache[resp_id] = new_messages
+
     def _build_chat_messages(self, instructions: str, input_data, json_mode: bool = False) -> list:
         """Build Chat Completions messages from responses.create() args."""
         messages = []
@@ -1561,12 +1769,23 @@ class LLMClient:
         self._deepseek_client = None
         self._anthropic_client = None
         self._google_client = None
+        self._tacc_client = None
         self._local_client = None
 
     @staticmethod
     def _normalize_provider_key(provider: str) -> str:
         provider = (provider or "").strip().lower()
-        return "google" if provider == "gemini" else provider
+        aliases = {
+            "gemini": "google",
+            "tejas": "tacc",
+            "texas": "tacc",
+            "texas_ai": "tacc",
+        }
+        return aliases.get(provider, provider)
+
+    @staticmethod
+    def _normalize_tacc_model(model: str) -> str:
+        return (model or "").removeprefix("tacc/")
 
     def _resolve_context_api_key(self, provider: str) -> Optional[str]:
         provider = self._normalize_provider_key(provider)
@@ -1686,6 +1905,32 @@ class LLMClient:
                 api_key="not-needed",  # Local servers don't require API keys
             )
         return self._local_client
+
+    def _get_tacc_client(self):
+        """Get or create Texas Advanced Computing Center OpenAI-compatible client."""
+        from openai import OpenAI
+        context_key = self._resolve_context_api_key("tacc")
+        base_url = (
+            os.getenv("TACC_BASE_URL", "")
+            or os.getenv("TEJAS_BASE_URL", "")
+            or os.getenv("TEXAS_AI_BASE_URL", "")
+            or TACC_DEFAULT_BASE_URL
+        )
+        if context_key:
+            return OpenAI(api_key=context_key, base_url=base_url)
+        if self._tacc_client is None:
+            api_key = (
+                os.getenv("TACC_API_KEY", "")
+                or os.getenv("TEJAS_API_KEY", "")
+                or os.getenv("TEXAS_AI_API_KEY", "")
+            )
+            if not api_key:
+                raise ValueError(
+                    "TACC_API_KEY is required for TACC models. "
+                    "Set it in .env locally or in the Render service environment."
+                )
+            self._tacc_client = OpenAI(api_key=api_key, base_url=base_url)
+        return self._tacc_client
 
     def _get_deepseek_client(self):
         """Get or create DeepSeek client."""

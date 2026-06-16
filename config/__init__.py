@@ -33,16 +33,24 @@ class Config:
         return os.getenv("OPENAI_API_KEY", "")
 
     @property
+    def tacc_api_key(self):
+        return os.getenv("TACC_API_KEY", "")
+
+    @property
+    def tacc_base_url(self):
+        return os.getenv("TACC_BASE_URL", "https://ai.tejas.tacc.utexas.edu/v1")
+
+    @property
     def nasa_ads_api_key(self):
         return os.getenv("NASA_ADS_API_KEY", "")
 
     @property
     def default_model(self):
-        return os.getenv("DEFAULT_LLM_MODEL", "deepseek-v4-pro")
+        return os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b")
 
     @property
     def ads_query_model(self):
-        return os.getenv("ADS_QUERY_MODEL", "deepseek-v4-pro")
+        return os.getenv("ADS_QUERY_MODEL", os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b"))
 
     @property
     def verbose(self):
