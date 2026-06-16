@@ -4,12 +4,12 @@
 
 **Quasar** is an open-source AI research assistant that makes ALMA Science Archive search and data retrieval as simple as asking a question in natural language. It is a *domain-specialized agent framework* that wraps any general-purpose LLM with the tools, knowledge, and orchestration needed to perform real radio astronomy tasks.
 
-Quasar pairs a registry of **35+ domain-specific tools** covering archive data search, retrieval, and analysis with a **Conductor** orchestration engine that decomposes complex, multi-step research queries into Directed Acyclic task Graphs (DAGs). By externalizing task planning into the Conductor, Quasar enables even smaller or non-reasoning LLMs to reliably execute sophisticated archive workflows through structured tool composition.
+Quasar pairs a registry of **75+ domain-specific tools** covering archive data search, retrieval, and analysis with a **Conductor** orchestration engine that decomposes complex, multi-step research queries into Directed Acyclic task Graphs (DAGs). By externalizing task planning into the Conductor, Quasar enables even smaller or non-reasoning LLMs to reliably execute sophisticated archive workflows through structured tool composition.
 
 > **Key insight:** A general-purpose LLM becomes a capable scientific assistant not through model fine-tuning alone, but in combination with careful domain engineering.
 
 - **Live application:** [quasarassistant.com](https://www.quasarassistant.com/)
-- **Repository:** [Anonymous Repository Tracking Link](https://anonymous.4open.science/r/Quasar-B2B5) *(Link anonymized for double-blind review)*
+- **Repository:** [adamzacharia/Quasar](https://github.com/adamzacharia/Quasar)
 
 ## Current Capabilities
 
@@ -50,7 +50,7 @@ flowchart LR
     DIRECT["Agent Tool Loop<br/>(Simple Queries)"]
     COND["Conductor<br/>DAG Orchestration"]
     REPL["Sandboxed REPL<br/>numpy · astropy · pandas"]
-    SVC["35+ Domain Tools<br/>Search · ADS · DataLink · FITS · CASA"]
+    SVC["75+ Domain Tools<br/>Search · ADS · DataLink · FITS · CASA"]
     EXT["External Systems<br/>ALMA Archive · NASA ADS · CADC · SIMBAD"]
     SSE["SSE Events<br/>token · status · tool · task"]
 
@@ -116,7 +116,7 @@ Create a repository root `.env` file before starting the backend.
 ### 1. Clone the repository and install Python dependencies
 
 ```bash
-git clone <repository_url_provided_after_review>
+git clone https://github.com/adamzacharia/Quasar.git
 cd Quasar
 python -m venv .venv
 
