@@ -1,6 +1,5 @@
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -16,22 +15,15 @@ def load_api_main_module():
     return module
 
 
-def test_alma_observation_data_card_includes_qa2_column(monkeypatch):
+def test_alma_observation_data_card_includes_qa2_column():
     api_main = load_api_main_module()
-    lookup = SimpleNamespace(
-        statuses={"A001_X1_X1": "Pass"},
-        requested=1,
-        incomplete_count=0,
-        capped=False,
-        timed_out=False,
-        errors={},
-    )
-    monkeypatch.setattr(api_main, "fetch_qa2_statuses", lambda *args, **kwargs: lookup)
 
     df = pd.DataFrame([
         {
             "obs_publisher_did": "ADS/JAO.ALMA#2017.1.00001.S",
             "target_name": "Sz65",
+            "scan_intent": "TARGET",
+            "qa2_passed": "T",
             "member_ous_uid": "uid://A001/X1/X1",
             "obs_collection": "ALMA",
             "instrument_name": "ALMA",
@@ -47,21 +39,14 @@ def test_alma_observation_data_card_includes_qa2_column(monkeypatch):
     })
 
     assert "QA2" in rich["columns"]
+    assert "Scan Intent" in rich["columns"]
     assert rich["rows"][0]["QA2"] == "Pass"
+    assert rich["rows"][0]["Scan Intent"] == "TARGET"
     assert rich["partial"] is False
 
 
-def test_alma_product_data_card_includes_qa2_column(monkeypatch):
+def test_alma_product_data_card_includes_qa2_column():
     api_main = load_api_main_module()
-    lookup = SimpleNamespace(
-        statuses={"A001_X2_X1": "SemiPass"},
-        requested=1,
-        incomplete_count=0,
-        capped=False,
-        timed_out=False,
-        errors={},
-    )
-    monkeypatch.setattr(api_main, "fetch_qa2_statuses", lambda *args, **kwargs: lookup)
 
     df = pd.DataFrame([
         {
@@ -70,6 +55,8 @@ def test_alma_product_data_card_includes_qa2_column(monkeypatch):
             "size_mb": 22,
             "proposal_id": "2017.1.00001.S",
             "target_name": "Sz65",
+            "scan_intent": "TARGET",
+            "qa2_status": "SemiPass",
             "member_ous_uid": "uid://A001/X2/X1",
             "access_url": "https://almascience.nrao.edu/dataPortal/science.pbcor.fits",
         }
@@ -84,4 +71,6 @@ def test_alma_product_data_card_includes_qa2_column(monkeypatch):
     })
 
     assert "QA2" in rich["columns"]
+    assert "Scan Intent" in rich["columns"]
     assert rich["rows"][0]["QA2"] == "SemiPass"
+    assert rich["rows"][0]["Scan Intent"] == "TARGET"

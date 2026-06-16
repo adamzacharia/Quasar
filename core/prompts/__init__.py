@@ -90,12 +90,15 @@ TABLE: ivoa.obscore
 | velocity_resolution   | DOUBLE  | Velocity resolution (km/s)               |
 | pol_states            | VARCHAR | Polarization states (e.g., 'XX YY')      |
 | science_observation   | VARCHAR | Science observation flag                 |
+| scan_intent           | VARCHAR | Scan intent, e.g., TARGET or calibrators |
+| qa2_passed            | VARCHAR | QA2 pass flag ('T' for passed, 'F' fail) |
 
 Example Queries:
 - Find Band 6 data: SELECT * FROM ivoa.obscore WHERE band_list = '6'
 - Resolution < 0.1": SELECT * FROM ivoa.obscore WHERE s_resolution < 0.1
 - Frequency range: SELECT * FROM ivoa.obscore WHERE frequency BETWEEN 230 AND 240
 - Target search: SELECT * FROM ivoa.obscore WHERE target_name LIKE '%M31%'
+- Target scans only: SELECT * FROM ivoa.obscore WHERE scan_intent LIKE '%TARGET%'
 """
 
 

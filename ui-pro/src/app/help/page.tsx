@@ -140,7 +140,7 @@ export default function HelpPage() {
                                     </h2>
                                     <div className="space-y-3">
                                         {/* TEMPORARILY HIDDEN FOR ANONYMOUS REVIEW
-                                        <a href="https://github.com/adamzacharia/Quasar2" target="_blank" rel="noopener noreferrer"
+                                        <a href="https://github.com/adamzacharia/Quasar" target="_blank" rel="noopener noreferrer"
                                             className="glass-control flex items-center gap-4 rounded-xl p-4 transition-all hover:scale-[1.02] group">
                                             <div className="p-2 bg-slate-700 rounded-lg group-hover:bg-slate-600 transition-colors"><Github className="w-5 h-5 text-white" /></div>
                                             <div className="flex-1">
@@ -262,7 +262,7 @@ export default function HelpPage() {
                                     {/* TEMPORARILY HIDDEN FOR ANONYMOUS REVIEW
                                     <div>
                                         <h3 className="text-base font-semibold text-white mb-2">9. Contact</h3>
-                                        <p>For questions about these Terms, please reach out via the <a href="https://github.com/adamzacharia/Quasar2" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">GitHub repository</a>.</p>
+                                        <p>For questions about these Terms, please reach out via the <a href="https://github.com/adamzacharia/Quasar" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">GitHub repository</a>.</p>
                                     </div>
                                     */}
                                 </div>

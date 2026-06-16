@@ -263,6 +263,14 @@ function SettingsContent({ selectedModel, availableModels, onSelectModel }: {
                 <div className="glass-control rounded-lg p-3 space-y-1.5">
                     <div className="flex justify-between text-xs"><span className="text-slate-500">Version</span><span className="text-slate-300 font-mono">2.0.0</span></div>
                     <div className="flex justify-between text-xs"><span className="text-slate-500">Engine</span><span className="text-slate-300 font-mono">Responses API</span></div>
+                    <a href="https://github.com/adamzacharia/Quasar" target="_blank" rel="noopener noreferrer"
+                        className="flex items-center justify-between gap-3 text-xs text-slate-300 hover:text-primary transition-colors">
+                        <span className="text-slate-500">Repository</span>
+                        <span className="inline-flex items-center gap-1.5 font-mono truncate">
+                            <Github className="w-3.5 h-3.5 shrink-0" />
+                            adamzacharia/Quasar
+                        </span>
+                    </a>
                     <div className="flex justify-between text-xs"><span className="text-slate-500">Env</span><span className="text-slate-300 font-mono">Development</span></div>
                 </div>
             </div>
@@ -470,6 +478,10 @@ export function Sidebar() {
                         className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                         <HelpCircle className="w-4 h-4" />Help & Docs
                     </Link>
+                    <a href="https://github.com/adamzacharia/Quasar" target="_blank" rel="noopener noreferrer"
+                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm text-slate-400 hover:bg-white/10 hover:text-white">
+                        <Github className="w-4 h-4" />GitHub
+                    </a>
                     {isAuthenticated && (
                         <button onClick={logout}
                             className="w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm text-red-500/70 hover:bg-red-500/10 hover:text-red-500">

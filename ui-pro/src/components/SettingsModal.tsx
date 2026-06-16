@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, Copy, BarChart3, Download, Sparkles, Sun, Moon, ScrollText, ExternalLink } from "lucide-react";
+import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, Copy, BarChart3, Download, Sparkles, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
 import { useAuthStore } from "../lib/auth-store";
 import { resetOnboarding } from "./OnboardingOverlay";
 import { useThemeStore } from "../lib/theme-store";
@@ -1381,6 +1381,19 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                                 <span>Terms & Privacy</span>
                             </div>
                             <ExternalLink className="w-3 h-3 text-slate-600" />
+                        </a>
+
+                        <a
+                            href="https://github.com/adamzacharia/Quasar"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+                        >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                                <Github className="w-4 h-4 shrink-0" />
+                                <span className="truncate">GitHub Repository</span>
+                            </div>
+                            <ExternalLink className="w-3 h-3 text-slate-600 shrink-0" />
                         </a>
                     </div>
                 </div>
