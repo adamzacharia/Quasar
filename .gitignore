@@ -63,7 +63,57 @@ user_uploads/
 # ============================================
 tmp/
 tmp_*.py
+scratch_*.py
 *.log
+
+# ============================================
+# Generated/runtime artifacts
+# ============================================
+/Benchmark/results/
+/data/dag_cache.json
+/poster/
+/scripts/debug_output.txt
+/scripts/Understand-Anything/
+/tests/debug/
+/.agent/
+/scripts/check_*.py
+/scripts/debug_*.py
+/scripts/extract_mem0.py
+/scripts/extract_pdf.py
+/scripts/get_tap_schema.py
+/scripts/measure_memory*.py
+/scripts/render_logs.py
+/scripts/test_*.py
+/scripts/ua_graph_builder.py
+/ALMA_MCP/
+/JWST_MCP/
+/assets/HUDF_Overlay.png
+/assets/JWST_HUDF.png
+/assets/quasar_brand_sheet.png
+/assets/quasar_logo.png
+/assets/favicon.ico
+/assets/favicon.png
+/ui-pro/public/file.svg
+/ui-pro/public/globe.svg
+/ui-pro/public/next.svg
+/ui-pro/public/vercel.svg
+/ui-pro/public/window.svg
+
+# ============================================
+# Root-only research/review artifacts
+# ============================================
+/*.code-workspace
+/*.ipynb
+/*.pptx
+/PAI_Poster.*
+/Quasar__*.pdf
+/Recording*.gif
+/quasar.mp4
+/2.0.0
+/alma_physical_language_model.md
+/beat_lium_strategy.md
+/lium_paper_and_science_strategy.md
+/lium_research.md
 
 # ============================================
 # Test Artifacts (not test code)
