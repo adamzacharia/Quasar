@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 from utils.archive_links import build_archive_link, infer_archive_kind
+from services.alma_qa2 import fetch_qa2_statuses, normalize_mous_uid
 from services.evidence_quality import annotate_web_source_evidence, choose_better_evidence_quality, rank_web_sources
 
 # ── Observability: Loguru + Sentry ────────────────────────────────────────────
@@ -711,6 +712,32 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
 
     try:
         table_kind = str(_run_result.get("table_kind", "") or "")
+        _source = _run_result.get("source", "")
+        _filter_label = _run_result.get("filter_label", "")
+        archive_kind = infer_archive_kind(df, source_hint=_source, filter_label=_filter_label)
+        qa2_warning = ""
+
+        if archive_kind == "alma" and table_kind != "alma_project_picker" and "member_ous_uid" in df.columns:
+            try:
+                # Copy before adding UI-only enrichment so we do not mutate agent-owned results.
+                df = df.copy()
+                qa2_lookup = fetch_qa2_statuses(
+                    df["member_ous_uid"].dropna().astype(str).tolist(),
+                    max_lookup=40,
+                    per_request_timeout_s=6.0,
+                    overall_timeout_s=10.0,
+                    max_workers=8,
+                )
+                df["qa2_status"] = df["member_ous_uid"].map(
+                    lambda value: qa2_lookup.statuses.get(normalize_mous_uid(value), "Unknown")
+                )
+                if qa2_lookup.capped or qa2_lookup.timed_out or qa2_lookup.errors:
+                    qa2_warning = (
+                        f"QA2 lookup incomplete for {qa2_lookup.incomplete_count} of "
+                        f"{qa2_lookup.requested} MOUS IDs; unavailable entries show Unknown."
+                    )
+            except Exception as qa2_err:
+                print(f"[WARN] QA2 enrichment failed: {qa2_err}")
         product_display_cols = [
             ("filename", "File"),
             ("product_kind", "Product"),
@@ -718,6 +745,7 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             ("proposal_id", "Proposal ID"),
             ("target_name", "Target"),
             ("member_ous_uid", "MOUS ID"),
+            ("qa2_status", "QA2"),
             ("triage_status", "Triage"),
             ("readiness_score", "Readiness"),
             ("warnings", "Warnings"),
@@ -736,6 +764,7 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         alma_display_cols = [
             ("obs_publisher_did", "Project"),
             ("target_name", "Target"),
+            ("qa2_status", "QA2"),
             ("obs_collection", "Telescope"),
             ("instrument_name", "Instrument"),
             ("band_list", "Band"),
@@ -785,10 +814,6 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         _MAX_TABLE_ROWS = 10000
         sub = df[sel_cols].head(_MAX_TABLE_ROWS).copy()
         sub.columns = display_cols
-
-        _source = _run_result.get("source", "")
-        _filter_label = _run_result.get("filter_label", "")
-        archive_kind = infer_archive_kind(df, source_hint=_source, filter_label=_filter_label)
 
         per_row_links = []
         if table_kind == "alma_products" and "access_url" in df.columns:
@@ -934,14 +959,18 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             filter_label=_filter_label,
         )
 
+        warnings = list(_run_result.get("warnings") or [])
+        if qa2_warning:
+            warnings.append(qa2_warning)
+
         table_payload = {
             "type": "data",
             "metrics": metrics,
             "columns": list(sub.columns),
             "rows": rows,
             "sourceName": _detected_source,
-            "warnings": list(_run_result.get("warnings") or []),
-            "partial": bool(_run_result.get("partial") or _run_result.get("warnings")),
+            "warnings": warnings,
+            "partial": bool(_run_result.get("partial") or warnings),
             "archiveLink": archive_link,
             "hasRowLinks": any(bool(r.get("_link")) for r in rows),
             "hasPreview": has_preview,

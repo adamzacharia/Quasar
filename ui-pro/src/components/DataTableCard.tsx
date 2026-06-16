@@ -16,6 +16,29 @@ function optionalCellText(value: unknown): string | undefined {
     return text;
 }
 
+function QA2StatusBadge({ status }: { status: string }) {
+    const label = status && status !== "—" ? status : "Unknown";
+    const normalized = label.replace(/[\s_-]+/g, "").toLowerCase();
+
+    const styleByStatus: Record<string, { dot: string; text: string }> = {
+        pass: { dot: "bg-emerald-400 shadow-emerald-400/30", text: "text-emerald-200" },
+        semipass: { dot: "bg-amber-300 shadow-amber-300/30", text: "text-amber-200" },
+        unknown: { dot: "bg-slate-500 shadow-slate-500/20", text: "text-slate-400" },
+    };
+    const style = styleByStatus[normalized];
+
+    if (!style) {
+        return <span className="text-slate-300">{label}</span>;
+    }
+
+    return (
+        <span className={`inline-flex items-center gap-1.5 font-sans text-xs font-semibold ${style.text}`}>
+            <span className={`h-2 w-2 shrink-0 rounded-full shadow-[0_0_8px_currentColor] ${style.dot}`} aria-hidden="true" />
+            {label}
+        </span>
+    );
+}
+
 interface FitsPreviewResult {
     imageDataUrl: string;
     downloadUrl: string;
@@ -1186,7 +1209,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 )}
 
                 {columns.length > 0 && rows.length > 0 ? (
-                    <div className="overflow-x-auto overflow-y-auto max-h-[420px] custom-scrollbar">
+                    <div className="overflow-x-auto overflow-y-auto max-h-[var(--q-table-max-height)] custom-scrollbar">
                         <table className="w-full text-left border-collapse min-w-max">
                             <thead className="sticky top-0 z-10">
                                 <tr style={{ background: 'var(--q-surface)', borderBottom: '1px solid var(--q-border)' }}>
@@ -1302,15 +1325,16 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                             const display = val === null || val === undefined || val === "nan" || val === "None" || val === ""
                                                 ? "—"
                                                 : String(val);
+                                            const isQa2 = col === "QA2";
                                             return (
                                                 <td
                                                     key={ci}
                                                     title={display !== "—" ? display : undefined}
-                                                    className={`py-2 px-4 text-xs font-mono max-w-[220px] truncate ${
+                                                    className={`py-2 px-4 text-xs ${isQa2 ? "max-w-[140px]" : "font-mono max-w-[220px] truncate"} ${
                                                         isFirst ? "text-primary font-semibold" : "text-slate-300"
                                                     }`}
                                                 >
-                                                    {display}
+                                                    {isQa2 ? <QA2StatusBadge status={display} /> : display}
                                                 </td>
                                             );
                                         })}

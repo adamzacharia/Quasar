@@ -657,7 +657,7 @@ export function ChatArea() {
                     onTouchMove={markUserScrollIntent}
                     className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6"
                 >
-                    <div className="max-w-4xl mx-auto space-y-6">
+                    <div className="max-w-[var(--q-chat-content-width)] mx-auto space-y-6">
                         {(() => {
                             // Find the last text-type assistant message for attaching thinking/task state
                             const lastTextAssistantIdx = (() => {
@@ -725,7 +725,7 @@ export function ChatArea() {
 
             {/* Download progress bar — inline before input */}
             {downloadProgress && (
-                <div className="px-4 md:px-8 max-w-4xl mx-auto w-full">
+                <div className="px-4 md:px-8 max-w-[var(--q-chat-content-width)] mx-auto w-full">
                     <DownloadProgress data={downloadProgress} />
                 </div>
             )}
