@@ -14,6 +14,7 @@ fallback if a model starts failing.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -89,6 +90,25 @@ class ModelRouter:
     def __init__(self, default_model: str = "gpt-5.4-mini"):
         self.default_model = default_model
         self.health_monitor = None  # Injected by agent.py
+        fast_model = os.getenv("QUASAR_FAST_MODEL", "deepseek-v4-flash")
+        reasoning_model = os.getenv("QUASAR_REASONING_MODEL", "deepseek-v4-pro")
+        synthesis_model = os.getenv("QUASAR_SYNTHESIS_MODEL", reasoning_model)
+        self.routing_table = {
+            category: dict(entry)
+            for category, entry in self.ROUTING_TABLE.items()
+        }
+        for category in (
+            "archive_search",
+            "literature_review",
+            "code_generation",
+            "data_analysis",
+            "simple_qa",
+            "web_search",
+            "visualization",
+        ):
+            self.routing_table[category]["model"] = fast_model
+        self.routing_table["scientific_reasoning"]["model"] = reasoning_model
+        self.routing_table["synthesis"]["model"] = synthesis_model
 
     def route(self, task_description: str, agent_type: str = "general") -> str:
         """
@@ -108,7 +128,7 @@ class ModelRouter:
 
         if agent_type in type_to_category:
             category = type_to_category[agent_type]
-            entry = self.ROUTING_TABLE.get(category)
+            entry = self.routing_table.get(category)
             if entry:
                 logger.debug(
                     "Routed '%s' → %s (%s)",
@@ -118,7 +138,7 @@ class ModelRouter:
 
         # Fallback: classify from description
         category = self.classify_task_type(task_description)
-        entry = self.ROUTING_TABLE.get(category)
+        entry = self.routing_table.get(category)
         if entry:
             return self._apply_health_check(entry["model"])
 
@@ -142,7 +162,7 @@ class ModelRouter:
         """Get full routing info including model and reasoning."""
         model = self.route(task_description, agent_type)
         category = self.classify_task_type(task_description)
-        entry = self.ROUTING_TABLE.get(category, {})
+        entry = self.routing_table.get(category, {})
         return {
             "model": model,
             "category": category,

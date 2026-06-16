@@ -16,6 +16,7 @@ _LOCAL_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 PLATFORM_TOKEN_LIMITS = {
     "deepseek": 1_000_000,
     "openai": 500_000,
+    "tacc": None,
 }
 
 
@@ -78,6 +79,8 @@ class UsageQuotaService:
         value = (provider or "").strip().lower()
         if value == "gemini":
             return "google"
+        if value in {"tejas", "texas", "texas_ai"}:
+            return "tacc"
         return value
 
     @staticmethod
@@ -118,7 +121,11 @@ class UsageQuotaService:
                 return
             used = self.get_used_tokens(user_id, provider, "platform")
             if used >= limit:
-                provider_label = "DeepSeek" if provider == "deepseek" else "OpenAI"
+                provider_label = {
+                    "deepseek": "DeepSeek",
+                    "openai": "OpenAI",
+                    "tacc": "TACC",
+                }.get(provider, provider)
                 raise QuotaExceededError(
                     "You have exhausted your included Quasar token allowance. "
                     f"Your {provider_label} platform-key allowance is {limit:,} lifetime tokens. "

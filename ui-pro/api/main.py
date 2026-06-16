@@ -433,7 +433,7 @@ except ImportError as e:
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
-    model: Optional[str] = "gpt-4o"
+    model: Optional[str] = "gpt-oss-120b"
     grounded_summary: bool = False
     web_search: bool = True
 
@@ -525,7 +525,7 @@ from services.provider_file_service import (
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
 from services.secret_redaction import redact_secrets
 from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
-from core.llm_client import LLMClient, detect_provider, llm_request_context, model_accepts_direct_image_input
+from core.llm_client import LLMClient, TACC_MODEL_IDS, detect_provider, llm_request_context, model_accepts_direct_image_input
 auth_service = AuthService()
 conversation_service = ConversationService()
 cube_workbench_service = CubeWorkbenchService()
@@ -555,7 +555,7 @@ def _current_user_email(current_user: Optional[dict]) -> str:
 def _build_llm_context_for_user(user_id: str) -> Dict[str, Any]:
     metadata = provider_key_service.list_keys(user_id)
     api_keys = provider_key_service.decrypt_all_keys(user_id)
-    providers = {"openai", "deepseek", "anthropic", "google"} | set(api_keys.keys())
+    providers = {"openai", "deepseek", "anthropic", "google", "tacc"} | set(api_keys.keys())
     key_sources = {provider: ("byok" if api_keys.get(provider) else "platform") for provider in providers}
     byok_limits = {
         item.get("provider"): item.get("token_limit")
@@ -1148,7 +1148,7 @@ def _stream_chat_response(
     auth_header = _safe_authorization_header(authorization)
     current_user = _resolve_optional_user(auth_header)
 
-    requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or "gpt-4o"
+    requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b")
     provider = detect_provider(requested_model)
     current_user_id = current_user.get("sub") if current_user else None
     current_user_email = _current_user_email(current_user)
@@ -1980,6 +1980,7 @@ async def list_models():
             "gpt-4o-mini",             # GPT-4o Mini
             "deepseek-v4-pro",          # DeepSeek V4 Pro (thinking reasoning model)
             "deepseek-v4-flash",        # DeepSeek V4 Flash (fast thinking, lowest cost)
+            *TACC_MODEL_IDS,             # Texas Advanced Computing Center / Tejas models
     ]
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
@@ -2011,6 +2012,7 @@ def _test_provider_key(provider: str, api_key: str) -> None:
         "deepseek": os.getenv("DEEPSEEK_KEY_TEST_MODEL", "deepseek-chat"),
         "anthropic": os.getenv("ANTHROPIC_KEY_TEST_MODEL", "claude-3-5-haiku-latest"),
         "google": os.getenv("GEMINI_KEY_TEST_MODEL", "gemini-1.5-flash"),
+        "tacc": os.getenv("TACC_KEY_TEST_MODEL", "Meta-Llama-3.2-1B-Instruct"),
     }
     model = test_models.get(provider)
     if not model:
@@ -2980,7 +2982,7 @@ async def chat(request: ChatRequest, req: Request = None, authorization: Optiona
 async def chat_with_files(
     message: str = Form(""),
     conversation_id: Optional[str] = Form(None),
-    model: Optional[str] = Form("gpt-4o"),
+    model: Optional[str] = Form("gpt-oss-120b"),
     grounded_summary: bool = Form(False),
     web_search: bool = Form(True),
     files: PyList[UploadFile] = File(default=[]),
@@ -2994,7 +2996,7 @@ async def chat_with_files(
         return _sse_error_response(
             "Authentication required. Please sign in to your Quasar account to upload files."
         )
-    selected_model = model or "gpt-4o"
+    selected_model = model or os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b")
     provider = detect_provider(selected_model)
     try:
         upload_llm_context = _build_llm_context_for_user(user_id)

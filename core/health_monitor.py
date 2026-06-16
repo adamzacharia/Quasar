@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -32,6 +33,7 @@ FALLBACK_MODELS = {
     "openai": "claude-sonnet",       # OpenAI down → use Claude
     "anthropic": "gpt-4o",           # Anthropic down → use GPT-4o
     "google": "gpt-4o",              # Google down → use GPT-4o
+    "tacc": "gpt-4o-mini",           # TACC down → use cloud
     "local": "gpt-4o-mini",          # Local down → use cloud
 }
 
@@ -135,7 +137,10 @@ class HealthMonitor:
         if self.is_healthy(current_provider):
             return None
 
-        fallback = FALLBACK_MODELS.get(current_provider)
+        env_name = f"QUASAR_{current_provider.upper()}_FALLBACK_MODEL"
+        fallback = os.getenv(env_name, FALLBACK_MODELS.get(current_provider) or "")
+        if fallback.strip().lower() in {"", "none", "disabled", "false"}:
+            return None
         if fallback:
             logger.info(
                 "[health] Provider '%s' unhealthy — falling back from '%s' to '%s'",

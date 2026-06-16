@@ -82,7 +82,7 @@ flowchart LR
 
 - Python 3.9+
 - Node.js and npm
-- `OPENAI_API_KEY`
+- `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, or `TACC_API_KEY`
 
 Optional configuration:
 
@@ -93,7 +93,7 @@ Optional configuration:
 - `TURSO_AUTH_TOKEN`
 - `JWT_SECRET`
 - `NEXT_PUBLIC_API_URL`
-- `DEFAULT_LLM_MODEL` (defaults to `gpt-4.1`)
+- `DEFAULT_LLM_MODEL`
 
 ## Configuration
 
@@ -101,7 +101,10 @@ Create a repository root `.env` file before starting the backend.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | Primary model access for the agent runtime |
+| `OPENAI_API_KEY` | One model provider required | OpenAI model access for the agent runtime and optional embeddings |
+| `DEEPSEEK_API_KEY` | One model provider required | DeepSeek model access |
+| `TACC_API_KEY` | One model provider required | Texas Advanced Computing Center / Tejas model access |
+| `TACC_BASE_URL` | No | TACC OpenAI-compatible endpoint; defaults to `https://ai.tejas.tacc.utexas.edu/v1` |
 | `NASA_ADS_API_KEY` | No | Literature search via NASA ADS |
 | `QDRANT_URL` | No | Persistent vector storage for RAG and memory |
 | `QDRANT_API_KEY` | No | Authentication for Qdrant Cloud |
@@ -109,7 +112,55 @@ Create a repository root `.env` file before starting the backend.
 | `TURSO_AUTH_TOKEN` | No | Authentication for Turso |
 | `JWT_SECRET` | Production | JWT signing secret for authentication; must be a private random value when `QUASAR_ENV=production` |
 | `NEXT_PUBLIC_API_URL` | No | Frontend API base URL override |
-| `DEFAULT_LLM_MODEL` | No | Backbone LLM model (default: `gpt-4.1`) |
+| `DEFAULT_LLM_MODEL` | No | Backbone LLM model |
+| `QUASAR_FAST_MODEL` | No | Fast internal model for routing, memory, and classifiers |
+| `QUASAR_REASONING_MODEL` | No | Strong internal model for scientific reasoning subtasks |
+| `QUASAR_CONDUCTOR_MODEL` | No | Planning model used by Conductor |
+| `QUASAR_SYNTHESIS_MODEL` | No | Final synthesis model used by Conductor |
+
+### TACC / Tejas configuration
+
+Quasar supports these TACC model IDs:
+
+```text
+gpt-oss-120b
+Llama-4-Maverick-17B-128E-Instruct
+gemma-4-31B-it
+MiniMax-M2.7
+Qwen3-32B
+Meta-Llama-3.2-1B-Instruct
+Meta-Llama-3.1-8B-Instruct
+Meta-Llama-3.3-70B-Instruct
+Mistral-Large-3-675B-Instruct-2512
+E5-Mistral-7B-Instruct
+```
+
+For a TACC-first Render deployment, set these environment variables in the Render service dashboard:
+
+```bash
+TACC_API_KEY=your-tacc-key
+TACC_BASE_URL=https://ai.tejas.tacc.utexas.edu/v1
+DEFAULT_LLM_MODEL=gpt-oss-120b
+QUASAR_FAST_MODEL=gpt-oss-120b
+QUASAR_REASONING_MODEL=gpt-oss-120b
+QUASAR_CONDUCTOR_MODEL=gpt-oss-120b
+QUASAR_SYNTHESIS_MODEL=gpt-oss-120b
+QUASAR_COMPLEXITY_MODEL=gpt-oss-120b
+QUASAR_WEB_INTENT_MODEL=gpt-oss-120b
+QUASAR_PAPER_INTENT_MODEL=gpt-oss-120b
+QUASAR_WEB_SYNTHESIS_MODEL=gpt-oss-120b
+QUASAR_SUMMARY_MODEL=gpt-oss-120b
+QUASAR_MEMORY_EXTRACTION_MODEL=gpt-oss-120b
+QUASAR_PERSONAL_MEMORY_MODEL=gpt-oss-120b
+QUASAR_PDF_MODEL=gpt-oss-120b
+QUASAR_PROPOSAL_CRITIC_MODEL=gpt-oss-120b
+TACC_KEY_TEST_MODEL=Meta-Llama-3.2-1B-Instruct
+TACC_ENABLE_RESPONSE_FORMAT=false
+TACC_STREAM_INCLUDE_USAGE=true
+QUASAR_TACC_FALLBACK_MODEL=none
+```
+
+The TACC key is a platform key configured in Render, not an end-user BYOK key. Keep `OPENAI_API_KEY` only if you want OpenAI embeddings, image prepass, or OpenAI fallback behavior. For a strict TACC-only model path, leave OpenAI/DeepSeek keys unset and keep `QUASAR_TACC_FALLBACK_MODEL=none`.
 
 ## Local Development
 
@@ -210,7 +261,7 @@ python quasar.py query "Find ALMA observations of HL Tau in Band 6"
 ## Notes
 
 - The primary runtime surface is the Next.js frontend plus FastAPI backend under `ui-pro/`.
-- The default LLM model is `gpt-4.1`. Override via `DEFAULT_LLM_MODEL` in `.env`.
+- The default LLM model is `gpt-oss-120b`. Override via `DEFAULT_LLM_MODEL` in `.env` or the Render service environment.
 - CASA and CARTA integrations are disabled by default due to high RAM requirements. Enable via `ENABLE_CASA_PIPELINE=true` and `ENABLE_CARTA_INTEGRATION=true`.
 - CI runs automatically on pushes to `main`/`beta` and all PRs via GitHub Actions.
 - The repository contains broader astronomy modules, but the strongest supported workflow is ALMA archive search and analysis support.

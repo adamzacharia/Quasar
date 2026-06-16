@@ -18,9 +18,9 @@ class PDFProcessingService:
     """Service for downloading and processing PDF documents."""
     
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.model = "gpt-4o-mini" # Fast, cheap model for extraction tasks
-        self.client = LLMClient(model=self.model) if self.api_key else None
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("TACC_API_KEY")
+        self.model = os.getenv("QUASAR_PDF_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4o-mini")
+        self.client = LLMClient(model=self.model)
         
     def download_pdf(self, url: str) -> Optional[str]:
         """Download a PDF from a URL to a temporary file and return the path."""

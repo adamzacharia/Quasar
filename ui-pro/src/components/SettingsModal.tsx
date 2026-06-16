@@ -827,6 +827,12 @@ const PROVIDER_OPTIONS = [
     { id: "google", label: "Google Gemini", quotaLabel: "BYOK only" },
 ];
 
+const PLATFORM_PROVIDER_LABELS: Record<string, string> = {
+    deepseek: "DeepSeek",
+    openai: "OpenAI",
+    tacc: "TACC Tejas",
+};
+
 function ProviderKeysPanel() {
     const { isAuthenticated, token } = useAuthStore();
     const [keys, setKeys] = useState<ProviderKeyMeta[]>([]);
@@ -986,13 +992,13 @@ function ProviderKeysPanel() {
             )}
 
             <div className="grid grid-cols-2 gap-3">
-                {["deepseek", "openai"].map(provider => {
+                {["deepseek", "openai", "tacc"].map(provider => {
                     const bucket = quota?.platform?.[provider];
                     const pct = bucket?.limit_tokens ? Math.min(100, Math.round((bucket.used_tokens / bucket.limit_tokens) * 100)) : 0;
                     return (
                         <div key={provider} className="glass-control rounded-xl px-4 py-3">
                             <div className="flex items-center justify-between text-xs mb-2">
-                                <span className="font-semibold text-slate-300">{provider === "deepseek" ? "DeepSeek" : "OpenAI"} platform quota</span>
+                                <span className="font-semibold text-slate-300">{PLATFORM_PROVIDER_LABELS[provider] || provider} platform quota</span>
                                 <span className={bucket?.exhausted ? "text-red-300" : "text-slate-400"}>
                                     {bucket?.unlimited ? "Unlimited" : `${formatTokens(bucket?.used_tokens)} / ${formatTokens(bucket?.limit_tokens)}`}
                                 </span>

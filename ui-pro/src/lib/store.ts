@@ -18,6 +18,7 @@ import {
     updateLastAssistantThinking as updateAssistantThinking,
 } from "./chat-message-updaters";
 import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
+import { DEFAULT_AVAILABLE_MODELS } from "./models";
 
 interface ChatStore {
     conversations: Conversation[];
@@ -302,10 +303,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     messages: [],
     isStreaming: false,
     streamingContent: "",
-    selectedModel: "deepseek-v4-pro",
-    availableModels: [
-        "gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro", "deepseek-v4-flash",
-    ],
+    selectedModel: "gpt-oss-120b",
+    availableModels: DEFAULT_AVAILABLE_MODELS,
     sidebarOpen: true,
     thinkingSteps: [],
     thinkingStatus: "idle",
@@ -331,14 +330,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 conversations: updatedConversations,
                 activeConversationId: id,
                 messages: conv?.messages || [],
-                selectedModel: conv?.model || state.selectedModel || "deepseek-v4-pro",
+                selectedModel: conv?.model || state.selectedModel || "gpt-oss-120b",
             };
         }
         const conv = state.conversations.find((c) => c.id === id);
         return {
             activeConversationId: id,
             messages: conv?.messages || [],
-            selectedModel: conv?.model || state.selectedModel || "deepseek-v4-pro",
+            selectedModel: conv?.model || state.selectedModel || "gpt-oss-120b",
         };
     }),
 

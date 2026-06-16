@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -36,7 +37,7 @@ MIN_TOKENS_BETWEEN_UPDATES = 8_000
 MIN_TOOL_CALLS_BETWEEN_UPDATES = 4
 
 # Model used for extraction (cheap + fast)
-EXTRACTION_MODEL = "deepseek-v4-flash"
+EXTRACTION_MODEL = os.getenv("QUASAR_MEMORY_EXTRACTION_MODEL") or os.getenv("QUASAR_FAST_MODEL", "deepseek-v4-flash")
 
 # Maximum size of the running memory file
 MAX_MEMORY_CHARS = 4_000

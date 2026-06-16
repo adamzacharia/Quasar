@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,7 +67,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 MAX_SUMMARY_CHARS = 3000
 
 # Model used for summarization (cheap + fast)
-SUMMARY_MODEL = "gpt-4o-mini"
+SUMMARY_MODEL = os.getenv("QUASAR_SUMMARY_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4o-mini")
 
 # System prompt for the summarization agent
 COMPACTION_SYSTEM_PROMPT = """\

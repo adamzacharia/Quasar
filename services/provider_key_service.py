@@ -55,6 +55,8 @@ def _normalize_provider(provider: str) -> str:
     value = (provider or "").strip().lower()
     if value == "gemini":
         value = "google"
+    if value in {"tejas", "texas", "texas_ai"}:
+        value = "tacc"
     if value not in ALLOWED_PROVIDERS:
         raise ProviderKeyError(f"Unsupported provider '{provider}'.")
     return value
