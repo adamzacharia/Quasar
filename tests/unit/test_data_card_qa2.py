@@ -45,6 +45,32 @@ def test_alma_observation_data_card_includes_qa2_column():
     assert rich["partial"] is False
 
 
+def test_alma_observation_qa2_false_maps_to_semipass():
+    api_main = load_api_main_module()
+
+    df = pd.DataFrame([
+        {
+            "obs_publisher_did": "ADS/JAO.ALMA#2017.1.00569.S",
+            "target_name": "Sz65",
+            "scan_intent": "TARGET",
+            "qa2_passed": "F",
+            "member_ous_uid": "uid://A001/X12a3/X407",
+            "obs_collection": "ALMA",
+            "instrument_name": "ALMA",
+            "band_list": "6",
+        }
+    ])
+
+    _, rich = api_main._build_data_card_event({
+        "type": "data",
+        "data": df,
+        "source": "ALMA Archive",
+        "tool_name": "search_alma_archive",
+    })
+
+    assert rich["rows"][0]["QA2"] == "SemiPass"
+
+
 def test_alma_product_data_card_includes_qa2_column():
     api_main = load_api_main_module()
 
