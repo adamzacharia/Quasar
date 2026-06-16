@@ -1,6 +1,110 @@
 import threading
+import sys
+import types
 
 import pandas as pd
+
+
+_original_modules = {}
+_stubbed_names = []
+
+
+def _stub_module(name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    if name not in _original_modules:
+        _original_modules[name] = sys.modules.get(name)
+    _stubbed_names.append(name)
+    sys.modules[name] = module
+    return module
+
+
+class _Dummy:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _identity_decorator(fn):
+    return fn
+
+
+_dummy_logger = types.SimpleNamespace(
+    debug=lambda *args, **kwargs: None,
+    info=lambda *args, **kwargs: None,
+    warning=lambda *args, **kwargs: None,
+    error=lambda *args, **kwargs: None,
+    success=lambda *args, **kwargs: None,
+)
+
+_stub_module("core.logger", logger=_dummy_logger, log_tool=_identity_decorator)
+_stub_module("core.llm_client", LLMClient=_Dummy, detect_provider=lambda *args, **kwargs: "openai")
+_stub_module("core.memory", ConversationMemory=_Dummy)
+_stub_module("core.tools", ToolRegistry=_Dummy, Tool=_Dummy)
+_stub_module("core.complexity", ComplexityDetector=_Dummy)
+_stub_module("core.sandbox", SandboxExecutor=_Dummy)
+_stub_module("core.conductor", Conductor=_Dummy)
+_stub_module("core.model_router", ModelRouter=_Dummy)
+_stub_module("core.recovery", RecoveryEngine=_Dummy)
+_stub_module("core.observability", QueryTracer=_Dummy)
+_stub_module("core.agent_pool", AgentPool=_Dummy)
+_stub_module("core.context_manager", ContextManager=_Dummy)
+_stub_module("core.session_memory", SessionMemory=_Dummy)
+_stub_module("core.token_budget", TokenBudget=_Dummy, apply_tool_result_budget=lambda result, *args, **kwargs: result)
+_stub_module("core.health_monitor", HealthMonitor=_Dummy)
+_stub_module("core.prompts.lit_to_code", LIT_TO_CODE_PROMPT="")
+_stub_module("services.ads_auto_link", build_exact_project_paper_links=lambda *args, **kwargs: None)
+_stub_module("services.evidence_quality", annotate_web_source_evidence=lambda value: value, rank_web_sources=lambda value: value)
+_stub_module("services.search", SearchService=_Dummy)
+_stub_module("services.analysis", RadioAnalysisService=_Dummy)
+_stub_module("services.rag_service", RAGService=_Dummy)
+_stub_module("services.memory_service", MemoryService=_Dummy)
+_stub_module("services.browser", BrowserService=_Dummy)
+_stub_module("services.plotting", PlottingService=_Dummy)
+_stub_module("services.splatalogue", SplatalogueTool=_Dummy)
+_stub_module("services.multi_archive", MultiArchiveMatcher=_Dummy)
+_stub_module("services.casa_generator", CASAScriptGenerator=_Dummy)
+_stub_module("services.gcn_monitor", GCNAlertMonitor=_Dummy)
+_stub_module("services.notebook_gen", generate_analysis_notebook=lambda *args, **kwargs: {})
+_stub_module("services.pdf_processing", PDFProcessingService=_Dummy)
+_stub_module("services.fits_processing", FITSProcessingService=_Dummy)
+_stub_module(
+    "services.alma_science_queries",
+    LINE_REST_FREQ_GHZ={},
+    bandwidth_switching_candidates=lambda *args, **kwargs: pd.DataFrame(),
+    filter_band=lambda df, *args, **kwargs: df,
+    filter_resolution=lambda df, *args, **kwargs: df,
+    line_names_for_species=lambda *args, **kwargs: [],
+    normalize_target_alias=lambda value: value,
+    projects_covering_all_lines=lambda *args, **kwargs: pd.DataFrame(),
+    projects_with_array_combo=lambda *args, **kwargs: pd.DataFrame(),
+    project_prefix_where=lambda *args, **kwargs: "",
+    redshifted_line_projects=lambda *args, **kwargs: pd.DataFrame(),
+    select_obscore_query=lambda *args, **kwargs: "",
+    summarize_projects=lambda *args, **kwargs: pd.DataFrame(),
+)
+_stub_module(
+    "services.cross_archive_matcher",
+    PERSEUS_PROTOSTARS=[],
+    alma_bulk_cone_adql=lambda *args, **kwargs: "",
+    attach_nearest_source=lambda *args, **kwargs: pd.DataFrame(),
+    normalize_source_catalog=lambda *args, **kwargs: pd.DataFrame(),
+    summarize_cross_archive_matches=lambda *args, **kwargs: {},
+)
+_stub_module("integrations.datalink", DataLinkClient=_Dummy)
+_stub_module("integrations.ads_client", ADSService=_Dummy)
+_stub_module("integrations.openalex_client", OpenAlexService=_Dummy)
+_stub_module("integrations.mast_client", MASTClient=_Dummy)
+_stub_module("integrations.eso_tap_client", ESOTAPClient=_Dummy)
+_stub_module("integrations.irsa_client", IRSAClient=_Dummy)
+_stub_module("integrations.skyview_client", SkyViewClient=_Dummy)
+_stub_module(
+    "services.astro_calculators",
+    calculate_redshift=lambda *args, **kwargs: {},
+    convert_coordinates=lambda *args, **kwargs: {},
+    calculate_beam=lambda *args, **kwargs: {},
+    calculate_alma_sensitivity=lambda *args, **kwargs: {},
+)
 
 from core.agent import QuasarAgent
 from services.data_product_triage import (
@@ -8,6 +112,14 @@ from services.data_product_triage import (
     classify_alma_product_request,
     summarize_project_options,
 )
+
+# Clean up stubs from sys.modules so they don't pollute other tests during collection/execution
+for name in _stubbed_names:
+    orig = _original_modules[name]
+    if orig is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = orig
 
 
 def test_classifies_project_code_and_target_band():
@@ -33,6 +145,18 @@ def test_project_picker_groups_options():
     assert list(picker["proposal_id"]) == ["2019.1.00001.S", "2021.1.00002.S"]
     assert picker.iloc[0]["member_ous_count"] == 2
     assert picker.iloc[0]["observations"] == 2
+
+
+def test_scan_intent_filter_keeps_target_rows():
+    df = pd.DataFrame([
+        {"target_name": "M87", "scan_intent": "TARGET"},
+        {"target_name": "J1924-2914", "scan_intent": "BANDPASS FLUX WVR"},
+    ])
+
+    filtered, label = QuasarAgent._filter_by_scan_intent(df, "TARGET only")
+
+    assert label == "Scan Intent TARGET"
+    assert filtered["target_name"].tolist() == ["M87"]
 
 
 def test_project_picker_shows_all_projects_by_default():
@@ -154,6 +278,8 @@ def test_exact_project_code_triages_products_directly():
             "target_name": "AS 209",
             "band_list": "6",
             "member_ous_uid": "uid://A/X1/X1",
+            "scan_intent": "TARGET",
+            "qa2_passed": "T",
         }
     ])
     agent = make_agent(df)
@@ -167,6 +293,8 @@ def test_exact_project_code_triages_products_directly():
     assert agent.search_service.keyword_calls[0] == {"project_code": "2016.1.00484.L"}
     assert agent.last_run_result["table_kind"] == "alma_products"
     assert len(agent.last_run_result["data"]) == 2
+    assert set(agent.last_run_result["data"]["scan_intent"]) == {"TARGET"}
+    assert set(agent.last_run_result["data"]["qa2_passed"]) == {"T"}
 
 
 def test_generic_target_returns_project_picker():

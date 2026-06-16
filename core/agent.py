@@ -29,6 +29,7 @@ from openai import OpenAI
 from core.llm_client import LLMClient, detect_provider
 
 from core.logger import logger, log_tool
+from services.ads_auto_link import build_exact_project_paper_links
 from services.evidence_quality import annotate_web_source_evidence, rank_web_sources
 
 
@@ -601,7 +602,7 @@ GUIDELINES:
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
 - **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
-- **AUTO-LINKING LITERATURE**: Whenever you run `search_by_target` or `search_by_position` and find valid ALMA project/proposal codes in the `top_project_codes` of the results (e.g., "2021.1.00128.L"), you MUST automatically call `search_papers_by_observation_id` for each of these top project codes immediately. This automatically retrieves the literature citing those projects, allowing the UI to connect them in the Observation-Paper Graph.
+- **AUTO-LINKING LITERATURE**: The backend automatically exact-links top ALMA project/proposal codes from `search_by_target` or `search_by_position` to NASA ADS papers for the Observation-Paper Graph. Do NOT call `search_papers_by_observation_id` merely to auto-link normal archive search results. Only call it when the user explicitly asks for papers connected to a specific identifier.
 - **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer — "Who is X?", "Tell me about X", "Where does X work?" — call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
   1. **Header**: "## Profile: [Full Name]" with email and personal webpage (from web search if available)
   2. **Identity**: ORCID, alternative name forms, current institution(s)
@@ -628,7 +629,7 @@ GUIDELINES:
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
 - **DO NOT** output raw tool usage strings like `[TOOL: ...]` or JSON. Just use the Native Tool Calling feature.
 - **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
-- **MINIMAL PARAMETERS**: When calling search_by_target, ONLY include optional parameters (band, max_resolution, min_freq_ghz, etc.) if the user EXPLICITLY requested them. For example, if the user says "Find ALMA data of M87", call search_by_target(target_name="M87") with NO other parameters. Do NOT pass band=0, min_freq_ghz=0, max_resolution=100 etc. Leaving them out returns ALL data.
+- **MINIMAL PARAMETERS**: When calling search_by_target, ONLY include optional parameters (band, max_resolution, min_freq_ghz, scan_intent, etc.) if the user EXPLICITLY requested them. For example, if the user says "Find ALMA data of M87", call search_by_target(target_name="M87") with NO other parameters. Do NOT pass band=0, min_freq_ghz=0, max_resolution=100 etc. Leaving them out returns ALL data.
 - **MULTI-TARGET (SAME CONSTRAINTS)**: If the user mentions multiple targets with the SAME constraints (e.g. "M87 and Sz65", or "M87, Sz65, NGC23 and M83"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
 - **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
 - **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
@@ -706,6 +707,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "radius": {"type": "number", "description": "Search radius in degrees (default 0.5)"},
                     "facility": {"type": "string", "enum": ["VLA", "VLBA", "ALMA", "GBT"], "description": "Observatory facility. Default to ALMA."},
                     "band": {"type": "string", "description": "ALMA band number(s) to filter (3-10). Pass a single band like '6' or multiple like '6,7'."},
+                    "scan_intent": {"type": "string", "description": "ALMA scan intent to filter, such as TARGET, BANDPASS, PHASE, FLUX, or WVR. ONLY pass if user explicitly asks for a scan intent."},
                     "max_results": {"type": "integer", "description": "Maximum results to return"}
                 },
                 "required": ["ra", "dec"]
@@ -719,7 +721,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
                 "Pass facility='VLA', 'VLBA', or 'GBT' to search the NRAO archive instead — "
                 "ONLY when the user explicitly asks for those telescopes.\n"
-                "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency) "
+                "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency, scan_intent) "
                 "if the user EXPLICITLY mentions them. Do NOT invent default values. "
                 "If the user just says 'Find ALMA data of M87', pass ONLY target_name='M87' "
                 "with NO other parameters — this returns ALL observations across all bands.\n"
@@ -738,6 +740,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "min_freq_ghz":   {"type": "number",  "description": "Minimum frequency in GHz. ONLY pass if user specifies."},
                     "max_freq_ghz":   {"type": "number",  "description": "Maximum frequency in GHz. ONLY pass if user specifies."},
                     "min_exp_s":      {"type": "number",  "description": "Minimum integration time in seconds. ONLY pass if user specifies."},
+                    "scan_intent":    {"type": "string",  "description": "ALMA scan intent to filter, such as TARGET, BANDPASS, PHASE, FLUX, or WVR. ONLY pass if user explicitly asks for a scan intent."},
                     "public_only":    {"type": "boolean", "description": "Only return publicly available data."},
                 },
                 "required": ["target_name"]
@@ -2761,6 +2764,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             proposal_id = self._best_observation_value(observations, ["proposal_id", "project_code"]) or identifier
             target_name = self._best_observation_value(observations, ["target_name"]) or target
             mous_uids = unique_values(observations, ["member_ous_uid"], limit=max_mous)
+            observation_metadata_by_mous: Dict[str, Dict[str, Any]] = {}
+            if "member_ous_uid" in observations.columns:
+                for _, row in observations.iterrows():
+                    mous_uid = str(row.get("member_ous_uid") or "").strip()
+                    if not mous_uid or mous_uid in observation_metadata_by_mous:
+                        continue
+                    observation_metadata_by_mous[mous_uid] = {
+                        "scan_intent": row.get("scan_intent", ""),
+                        "qa2_passed": row.get("qa2_passed", ""),
+                    }
             if not mous_uids:
                 self.last_search_results = observations
                 self.last_run_result = {
@@ -2785,6 +2798,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 proposal_id=proposal_id,
                 target_name=target_name,
                 observation_count=len(observations),
+                observation_metadata_by_mous=observation_metadata_by_mous,
                 max_products=max_products,
                 max_header_checks=max_header_checks,
             )
@@ -2844,6 +2858,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         proposal_id: str = "",
         target_name: str = "",
         observation_count: int = 0,
+        observation_metadata_by_mous: Optional[Dict[str, Dict[str, Any]]] = None,
         max_products: int = 40,
         max_header_checks: int = 6,
     ) -> Dict[str, Any]:
@@ -2881,11 +2896,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "image_size": metadata.get("image_size") if isinstance(metadata, dict) else None,
                     "bunit": metadata.get("bunit") if isinstance(metadata, dict) else None,
                 })
+            observation_metadata = (observation_metadata_by_mous or {}).get(str(file_info.get("_mous_uid") or ""), {})
             product_rows.append(build_product_row(
                 file_info,
                 member_ous_uid=str(file_info.get("_mous_uid") or ""),
                 proposal_id=proposal_id,
                 target_name=target_name,
+                scan_intent=str(observation_metadata.get("scan_intent") or ""),
+                qa2_passed=observation_metadata.get("qa2_passed", ""),
                 metadata=metadata,
             ))
 
@@ -3577,10 +3595,37 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         """Fetch a Tavily Research task by request_id."""
         return self._web_search_service().get_tavily_research_status(request_id=request_id)
 
+    @staticmethod
+    def _filter_by_scan_intent(results: pd.DataFrame, scan_intent: Optional[Any]) -> Tuple[pd.DataFrame, str]:
+        """Filter ALMA rows by the archive scan_intent column when requested."""
+        raw = str(scan_intent or "").strip()
+        if not raw or results is None or results.empty:
+            return results, ""
+
+        intent_col = next((c for c in ["scan_intent", "Scan Intent", "intent"] if c in results.columns), None)
+        if not intent_col:
+            return results, ""
+
+        known_intents = re.findall(
+            r"\b(TARGET|BANDPASS|PHASE|FLUX|WVR|CHECK|POINTING|FOCUS|AMPLITUDE|ATMOSPHERE)\b",
+            raw.upper(),
+        )
+        requested = known_intents or [part.strip().upper() for part in re.split(r"[,;/]+|\s+and\s+", raw) if part.strip()]
+        requested = [part for part in requested if part and part not in {"ONLY", "EXCLUDE", "EXCLUDING", "CALIBRATORS"}]
+        if not requested:
+            return results, ""
+
+        mask = results[intent_col].astype(str).str.upper().apply(
+            lambda value: any(intent in value for intent in requested)
+        )
+        label = "Scan Intent " + ",".join(requested)
+        return results[mask].copy(), label
+
     @log_tool
     def _search_by_position(self, ra: float, dec: float, radius: float = 0.5,
                            facility: Optional[str] = None,
                            band: Optional[str] = None,
+                           scan_intent: Optional[str] = None,
                            max_results: int = 100, **kwargs) -> Dict[str, Any]:
         """Search archives by sky position.
         
@@ -3617,8 +3662,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         )]
                         print(f"[FILTER] Band {band}: {before} → {len(results)} rows")
 
+            scan_filter_label = ""
+            if facility_label == "ALMA" and scan_intent:
+                before = len(results)
+                results, scan_filter_label = self._filter_by_scan_intent(results, scan_intent)
+                if scan_filter_label:
+                    print(f"[FILTER] {scan_filter_label}: {before} â†’ {len(results)} rows")
+
             self.last_search_results = results
-            self.last_run_result = {"type": "data", "data": results, "source": facility_label, "tool_name": "search_by_position"}
+            self.last_run_result = {
+                "type": "data",
+                "data": results,
+                "source": facility_label,
+                "filter_label": f"{facility_label} â€º position" + (f" [{scan_filter_label}]" if scan_filter_label else ""),
+                "tool_name": "search_by_position",
+            }
 
             # Include top MOUS UIDs + access URLs so Conductor subtasks
             # can use them for list_alma_files / render_fits_image.
@@ -3656,6 +3714,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "top_mous_uids": top_mous,
                 "top_access_urls": top_urls,
                 "top_project_codes": top_projects,
+                "filters_applied": [scan_filter_label] if scan_filter_label else [],
                 "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             }
         except Exception as e:
@@ -3670,6 +3729,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                           min_freq_ghz: Optional[float] = None,
                           max_freq_ghz: Optional[float] = None,
                           min_exp_s: Optional[float] = None,
+                          scan_intent: Optional[str] = None,
                           public_only: bool = False) -> Dict[str, Any]:
         """Search ALMA (default) or NRAO VLA/VLBA/GBT archives by target name,
         with optional native post-filters."""
@@ -3880,6 +3940,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # ── Multi-band handling ────────────────────────────────────
             # When multiple bands are requested (e.g. [6, 7]), produce a
             # separate data card for each band via _accumulated_run_results.
+            if facility_label == "ALMA" and scan_intent:
+                before = len(results)
+                results, scan_filter_label = self._filter_by_scan_intent(results, scan_intent)
+                if scan_filter_label:
+                    filter_parts.append(scan_filter_label)
+                    print(f"[FILTER] {scan_filter_label}: {before} â†’ {len(results)} rows")
+
             band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
 
             if len(band_list_input) > 1 and band_col:
@@ -5659,6 +5726,22 @@ ORDER BY s_resolution
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _auto_link_project_papers_from_result(
+        self,
+        tool_name: str,
+        tool_result: Any,
+        max_project_codes: int = 3,
+        max_results: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """Build an exact project-code paper result for ALMA archive searches."""
+        return build_exact_project_paper_links(
+            self.ads_client,
+            tool_name,
+            tool_result,
+            max_project_codes=max_project_codes,
+            max_results=max_results,
+        )
 
     def _derive_archive_identifiers_for_paper_search(self, identifier: str) -> List[str]:
         """Resolve a MOUS/dataset identifier to proposal/project IDs when possible."""
@@ -7807,6 +7890,39 @@ IMPORTANT RULES:
                         try:
                             _acc_len_before = len(self._accumulated_run_results)
                             result = tool.execute(**args)
+                            _primary_run_result = (
+                                self.last_run_result.copy()
+                                if isinstance(self.last_run_result, dict)
+                                else self.last_run_result
+                            )
+                            _auto_paper_result = None
+                            if tool_name in {"search_by_target", "search_by_position"}:
+                                try:
+                                    if on_status:
+                                        on_status("Searching papers linked to observation", "running")
+                                    _auto_paper_result = self._auto_link_project_papers_from_result(tool_name, result)
+                                    if (
+                                        _auto_paper_result
+                                        and isinstance(_primary_run_result, dict)
+                                        and _primary_run_result.get("type") == "data"
+                                    ):
+                                        existing_warnings = list(_primary_run_result.get("warnings") or [])
+                                        for warning in _auto_paper_result.get("warnings") or []:
+                                            if warning and warning not in existing_warnings:
+                                                existing_warnings.append(warning)
+                                        if existing_warnings:
+                                            _primary_run_result["warnings"] = existing_warnings
+                                except Exception as _auto_link_err:
+                                    _auto_paper_result = None
+                                    if isinstance(_primary_run_result, dict) and _primary_run_result.get("type") == "data":
+                                        existing_warnings = list(_primary_run_result.get("warnings") or [])
+                                        warning = f"Exact ADS project-code paper lookup failed: {_auto_link_err}"
+                                        if warning not in existing_warnings:
+                                            existing_warnings.append(warning)
+                                        _primary_run_result["warnings"] = existing_warnings
+                                finally:
+                                    if on_status:
+                                        on_status("Searching papers linked to observation", "completed")
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
                             _acc_len_after = len(self._accumulated_run_results)
 
@@ -7825,15 +7941,28 @@ IMPORTANT RULES:
                                             on_status(f"__data_ready__{_payload}", "ready")
                                             # Stash inline data for the SSE handler to pick up
                                             on_status(f"__eager_data__{json.dumps(_new_rc, default=str)}", "data")
-                            elif self.last_run_result is not None:
+                            elif _primary_run_result is not None:
                                 # Tool didn't accumulate — add last_run_result ourselves
-                                _rc = self.last_run_result.copy()
-                                _rc["_result_id"] = id(self.last_run_result)
+                                _rc = (
+                                    _primary_run_result.copy()
+                                    if isinstance(_primary_run_result, dict)
+                                    else _primary_run_result
+                                )
+                                if isinstance(_rc, dict):
+                                    _rc["_result_id"] = id(_primary_run_result)
                                 self._accumulated_run_results.append(_rc)
-                                if on_status and _rc.get("type") in ("data", "papers"):
+                                if on_status and isinstance(_rc, dict) and _rc.get("type") in ("data", "papers"):
                                     _payload = json.dumps({"_eager_result": True, "_idx": len(self._accumulated_run_results) - 1, "_inline": True})
                                     on_status(f"__data_ready__{_payload}", "ready")
                                     on_status(f"__eager_data__{json.dumps(_rc, default=str)}", "data")
+                            if _auto_paper_result and _auto_paper_result.get("papers"):
+                                _paper_rc = _auto_paper_result.copy()
+                                _paper_rc["_result_id"] = id(_auto_paper_result)
+                                self._accumulated_run_results.append(_paper_rc)
+                                if on_status:
+                                    _payload = json.dumps({"_eager_result": True, "_idx": len(self._accumulated_run_results) - 1, "_inline": True})
+                                    on_status(f"__data_ready__{_payload}", "ready")
+                                    on_status(f"__eager_data__{json.dumps(_paper_rc, default=str)}", "data")
                             # Record tool calls for session memory
                             self.session_memory.record_tool_calls(1)
 

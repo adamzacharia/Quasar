@@ -48,7 +48,6 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 from utils.archive_links import build_archive_link, infer_archive_kind
-from services.alma_qa2 import fetch_qa2_statuses, normalize_mous_uid
 from services.evidence_quality import annotate_web_source_evidence, choose_better_evidence_quality, rank_web_sources
 
 # ── Observability: Loguru + Sentry ────────────────────────────────────────────
@@ -63,6 +62,43 @@ _LAB_SCIENCE_EMOJI_RE = re.compile(
 
 def _sanitize_assistant_text(text: str) -> str:
     return _LAB_SCIENCE_EMOJI_RE.sub("", text or "")
+
+
+def _normalize_qa2_value(value: Any) -> str:
+    """Normalize archive-table QA2 values for the existing UI badge."""
+    if isinstance(value, bool):
+        return "Pass" if value else "Fail"
+    if value is None:
+        return "Unknown"
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "<na>", "-", "--", "unknown"}:
+        return "Unknown"
+
+    compact = re.sub(r"[\s_-]+", "", text).lower()
+    if compact in {"t", "true", "y", "yes", "1", "pass", "passed", "qa2pass", "qa2passed"}:
+        return "Pass"
+    if compact in {"f", "false", "n", "no", "0", "fail", "failed", "qa2fail", "qa2failed"}:
+        return "Fail"
+    if compact in {"semipass", "semipassed", "qa2semipass", "qa2semipassed"}:
+        return "SemiPass"
+    if "semipass" in compact:
+        return "SemiPass"
+    if "fail" in compact:
+        return "Fail"
+    if "pass" in compact:
+        return "Pass"
+    return text
+
+
+def _qa2_status_from_table(df: Any) -> Optional[Any]:
+    """Return QA2 status from table columns; do not derive it from report PDFs."""
+    for column in ("qa2_status", "QA2", "qa2_passed", "qa2Passed", "qa2"):
+        if hasattr(df, "columns") and column in df.columns:
+            statuses = df[column].map(_normalize_qa2_value)
+            if statuses.astype(str).str.lower().ne("unknown").any():
+                return statuses
+    return None
 
 app = FastAPI(
     title="QUASAR API",
@@ -715,37 +751,22 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         _source = _run_result.get("source", "")
         _filter_label = _run_result.get("filter_label", "")
         archive_kind = infer_archive_kind(df, source_hint=_source, filter_label=_filter_label)
-        qa2_warning = ""
-
-        if archive_kind == "alma" and table_kind != "alma_project_picker" and "member_ous_uid" in df.columns:
-            try:
-                # Copy before adding UI-only enrichment so we do not mutate agent-owned results.
+        if archive_kind == "alma" and table_kind != "alma_project_picker":
+            qa2_status = _qa2_status_from_table(df)
+            if qa2_status is not None:
+                # Copy before adding UI-only normalization so we do not mutate agent-owned results.
                 df = df.copy()
-                qa2_lookup = fetch_qa2_statuses(
-                    df["member_ous_uid"].dropna().astype(str).tolist(),
-                    max_lookup=40,
-                    per_request_timeout_s=6.0,
-                    overall_timeout_s=10.0,
-                    max_workers=8,
-                )
-                df["qa2_status"] = df["member_ous_uid"].map(
-                    lambda value: qa2_lookup.statuses.get(normalize_mous_uid(value), "Unknown")
-                )
-                if qa2_lookup.capped or qa2_lookup.timed_out or qa2_lookup.errors:
-                    qa2_warning = (
-                        f"QA2 lookup incomplete for {qa2_lookup.incomplete_count} of "
-                        f"{qa2_lookup.requested} MOUS IDs; unavailable entries show Unknown."
-                    )
-            except Exception as qa2_err:
-                print(f"[WARN] QA2 enrichment failed: {qa2_err}")
+                df["qa2_status"] = qa2_status
         product_display_cols = [
             ("filename", "File"),
             ("product_kind", "Product"),
             ("size_mb", "Size (MB)"),
             ("proposal_id", "Proposal ID"),
             ("target_name", "Target"),
+            ("scan_intent", "Scan Intent"),
             ("member_ous_uid", "MOUS ID"),
             ("qa2_status", "QA2"),
+            ("qa2_passed", "QA2"),
             ("triage_status", "Triage"),
             ("readiness_score", "Readiness"),
             ("warnings", "Warnings"),
@@ -764,7 +785,9 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         alma_display_cols = [
             ("obs_publisher_did", "Project"),
             ("target_name", "Target"),
+            ("scan_intent", "Scan Intent"),
             ("qa2_status", "QA2"),
+            ("qa2_passed", "QA2"),
             ("obs_collection", "Telescope"),
             ("instrument_name", "Instrument"),
             ("band_list", "Band"),
@@ -960,9 +983,6 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         )
 
         warnings = list(_run_result.get("warnings") or [])
-        if qa2_warning:
-            warnings.append(qa2_warning)
-
         table_payload = {
             "type": "data",
             "metrics": metrics,

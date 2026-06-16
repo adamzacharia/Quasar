@@ -66,7 +66,7 @@ hours and adds immediate user value.
 - [x] **R4** ALMA Sensitivity Calculator -- Radiometer equation per band with Tsys and PWV scaling (services/astro_calculators.py)
 - [x] **O6** Finding Chart Generator -- DSS/PanSTARRS chart with WCS, crosshair, N/E arrows, scale bar (integrations/skyview_client.py)
 - [x] **R3** Spectral Line Profile Plotter -- Extract spectrum from cube, fit Gaussian, report FWHM and integrated flux (services/fits_service.py)
-- [x] **R11** ALMA QA2 Status Lookup -- Automatic mapping and extraction of QA2 status (Pass/Fail/SemiPass) from Member OUS UID report PDFs (services/alma_qa2.py)
+- [x] **R11** ALMA QA2 Status Display -- QA2 pass/fail is read from ALMA archive table data (`qa2_passed`) and displayed in result tables without parsing report PDFs.
 - [x] **W13** Search Provider Router & RAG Filtration -- A premium multi-provider search router directing queries to Brave Search (primary LLM context), Tavily (fallback & image search), and Exa (specialist deep semantic/technical). Persistent calendar-month rate-limiting caps free API requests at 1,000/month. Fast zero-LLM pre-RAG domain relevancy gates out casual chitchat while a 0.35 semantic cosine score floor and time-sensitive keyword triggers filter search results (services/web_search_service.py + core/agent.py + ui-pro/api/main.py + services/rag_service.py)
 
 ---

@@ -243,6 +243,8 @@ def build_product_row(
     member_ous_uid: str = "",
     proposal_id: str = "",
     target_name: str = "",
+    scan_intent: str = "",
+    qa2_passed: Any = "",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     kind = classify_product(file_info)
@@ -254,6 +256,8 @@ def build_product_row(
         "size_mb": file_info.get("size_mb") or 0,
         "proposal_id": proposal_id,
         "target_name": target_name,
+        "scan_intent": scan_intent,
+        "qa2_passed": qa2_passed,
         "member_ous_uid": member_ous_uid,
         "triage_status": "header checked" if metadata is not None else "listed only",
         "readiness_score": score,
