@@ -1375,7 +1375,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="search_lines_by_molecule",
-            description="Search Splatalogue for all known spectral line transitions of a specific molecule (e.g., 'CO', 'HCN', 'CH3OH', 'H2O').",
+            description="Search Splatalogue for spectral-line transitions of a molecule, with optional frequency, energy, intensity, transition, and catalog filters.",
             function=lambda **kw: self.splatalogue_tool.search_lines_by_molecule(**kw),
             parameters={
                 "type": "object",
@@ -1383,8 +1383,83 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "molecule_name": {"type": "string", "description": "Molecule name (e.g., 'CO', 'HCN', 'CH3OH', 'SiO')"},
                     "freq_min_ghz": {"type": "number", "description": "Minimum frequency filter (GHz)"},
                     "freq_max_ghz": {"type": "number", "description": "Maximum frequency filter (GHz)"},
+                    "top_n": {"type": "integer", "minimum": 1, "description": "Maximum number of normalized transitions to return"},
+                    "transition": {"type": "string", "description": "Optional quantum-number or transition filter, e.g. '2-1'"},
+                    "energy_min": {"type": "number", "description": "Optional lower energy bound"},
+                    "energy_max": {"type": "number", "description": "Optional upper energy bound"},
+                    "energy_type": {
+                        "type": "string",
+                        "enum": ["el_cm1", "eu_cm1", "el_k", "eu_k"],
+                        "description": "Energy field used for energy_min/energy_max",
+                    },
+                    "intensity_lower_limit": {"type": "number", "description": "Optional lower line-intensity threshold"},
+                    "intensity_type": {
+                        "type": "string",
+                        "enum": ["CDMS/JPL (log)", "Sij-mu2", "Aij (log)"],
+                        "description": "Intensity field used by intensity_lower_limit",
+                    },
+                    "line_lists": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["LovasNIST", "SLAIM", "JPL", "CDMS", "ToyaMA", "OSU", "TopModel", "Recombination", "RFI"],
+                        },
+                        "description": "Splatalogue source catalogs to include",
+                    },
+                    "only_astronomically_observed": {"type": "boolean", "description": "Only return transitions observed in space"},
+                    "only_nrao_recommended": {"type": "boolean", "description": "Only return NRAO-recommended frequencies"},
                 },
                 "required": ["molecule_name"]
+            }
+        ))
+
+        self.tool_registry.register(Tool(
+            name="search_spectral_lines",
+            description="Run an advanced Splatalogue frequency-range query. Use this for filtered line surveys, line-confusion checks, and catalog comparisons.",
+            function=lambda **kw: self.splatalogue_tool.search_spectral_lines(**kw),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "freq_min_ghz": {"type": "number", "description": "Minimum rest frequency in GHz"},
+                    "freq_max_ghz": {"type": "number", "description": "Maximum rest frequency in GHz"},
+                    "molecule_name": {"type": "string", "description": "Optional molecule/species name or formula"},
+                    "transition": {"type": "string", "description": "Optional quantum-number or transition filter"},
+                    "energy_min": {"type": "number", "description": "Optional lower energy bound"},
+                    "energy_max": {"type": "number", "description": "Optional upper energy bound"},
+                    "energy_type": {
+                        "type": "string",
+                        "enum": ["el_cm1", "eu_cm1", "el_k", "eu_k"],
+                        "description": "Energy field used for energy_min/energy_max",
+                    },
+                    "intensity_lower_limit": {"type": "number", "description": "Optional lower line-intensity threshold"},
+                    "intensity_type": {
+                        "type": "string",
+                        "enum": ["CDMS/JPL (log)", "Sij-mu2", "Aij (log)"],
+                        "description": "Intensity field used by intensity_lower_limit",
+                    },
+                    "version": {
+                        "type": "string",
+                        "enum": ["v1.0", "v2.0", "v3.0", "vall"],
+                        "description": "Splatalogue data version",
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["atmospheric", "potential", "probable", "known", "none"]},
+                        "description": "Species classifications to exclude",
+                    },
+                    "line_lists": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["LovasNIST", "SLAIM", "JPL", "CDMS", "ToyaMA", "OSU", "TopModel", "Recombination", "RFI"],
+                        },
+                        "description": "Splatalogue source catalogs to include",
+                    },
+                    "only_astronomically_observed": {"type": "boolean", "description": "Only return transitions observed in space"},
+                    "only_nrao_recommended": {"type": "boolean", "description": "Only return NRAO-recommended frequencies"},
+                    "top_n": {"type": "integer", "minimum": 1, "description": "Maximum number of normalized transitions to return"},
+                },
+                "required": ["freq_min_ghz", "freq_max_ghz"]
             }
         ))
 

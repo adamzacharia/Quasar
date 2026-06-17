@@ -740,6 +740,9 @@ class CubeWorkbenchService:
             "tolerance_ghz": float(tolerance_ghz or 0.01),
             "preset": preset,
             "lines": lines,
+            "backend": result.get("backend"),
+            "query_note": result.get("note"),
+            "query_error": result.get("error"),
         }
         state = session.setdefault("state", {})
         state["redshift"] = z
@@ -755,11 +758,22 @@ class CubeWorkbenchService:
             "presets": COMMON_LINE_PRESETS,
             "n_matches": len(lines),
             "lines": lines,
+            "backend": result.get("backend"),
+            "query_note": result.get("note"),
+            "query_error": result.get("error"),
             "evidence": {
-                "source": "Splatalogue",
+                "source": (
+                    "Splatalogue via IVOA SLAP"
+                    if result.get("backend") == "slap"
+                    else (
+                        "Splatalogue unavailable"
+                        if result.get("backend") == "unavailable"
+                        else "Splatalogue via Astroquery"
+                    )
+                ),
                 "assumptions": [
                     "Line search converts observed frequency to rest frequency using nu_rest = nu_obs * (1 + z).",
-                    "Candidate ranking is inherited from the Splatalogue query result order.",
+                    "Candidates are ranked by absolute frequency offset and duplicate catalog entries are merged.",
                 ],
                 "confidence": "medium" if lines else "low",
             },

@@ -272,6 +272,9 @@ export interface WorkbenchLineOverlays {
     presets?: WorkbenchLinePreset[];
     n_matches: number;
     lines: Record<string, unknown>[];
+    backend?: "astroquery" | "slap" | "unavailable";
+    query_note?: string | null;
+    query_error?: string | null;
     evidence: Record<string, unknown>;
 }
 
