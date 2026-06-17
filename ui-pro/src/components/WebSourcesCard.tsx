@@ -156,16 +156,20 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                     <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
                         {images.map((image, i) => {
                             if (failedImages.has(i)) return null;
+                            const clickUrl = image.sourceUrl || image.url;
+                            const clickTitle = image.sourceTitle
+                                ? `Open source: ${image.sourceTitle}`
+                                : image.description || "View image";
                             return (
                                 <a
                                     key={i}
-                                    href={image.url}
+                                    href={clickUrl}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="glass-control group relative aspect-square rounded-lg overflow-hidden
                                                hover:scale-[1.03]
                                                transition-all duration-200 cursor-pointer"
-                                    title={image.description || "View image"}
+                                    title={clickTitle}
                                 >
                                     <img
                                         src={image.url}

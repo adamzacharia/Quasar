@@ -55,6 +55,8 @@ interface UsageQuota {
     platform: Record<string, QuotaBucket>;
     byok: Record<string, QuotaBucket>;
     is_admin: boolean;
+    is_quota_exempt?: boolean;
+    platform_quota_window_days?: number;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────
@@ -821,8 +823,8 @@ function MCPServersPanel() {
 // Provider Keys Panel
 
 const PROVIDER_OPTIONS = [
-    { id: "deepseek", label: "DeepSeek", quotaLabel: "1M included tokens" },
-    { id: "openai", label: "OpenAI", quotaLabel: "500K included tokens" },
+    { id: "deepseek", label: "DeepSeek", quotaLabel: "500K/week included tokens" },
+    { id: "openai", label: "OpenAI", quotaLabel: "100K/week included tokens" },
     { id: "anthropic", label: "Anthropic", quotaLabel: "BYOK only" },
     { id: "google", label: "Google Gemini", quotaLabel: "BYOK only" },
 ];
@@ -998,7 +1000,7 @@ function ProviderKeysPanel() {
                     return (
                         <div key={provider} className="glass-control rounded-xl px-4 py-3">
                             <div className="flex items-center justify-between text-xs mb-2">
-                                <span className="font-semibold text-slate-300">{PLATFORM_PROVIDER_LABELS[provider] || provider} platform quota</span>
+                                <span className="font-semibold text-slate-300">{PLATFORM_PROVIDER_LABELS[provider] || provider} weekly quota</span>
                                 <span className={bucket?.exhausted ? "text-red-300" : "text-slate-400"}>
                                     {bucket?.unlimited ? "Unlimited" : `${formatTokens(bucket?.used_tokens)} / ${formatTokens(bucket?.limit_tokens)}`}
                                 </span>
@@ -1082,8 +1084,6 @@ function ProviderKeysPanel() {
         </div>
     );
 }
-
-const ADMIN_EMAILS = ["adamandspace@gmail.com", "1@1"];
 
 interface AnalyticsSummary {
     total_chats: number;
@@ -1286,7 +1286,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     const backdropRef = useRef<HTMLDivElement>(null);
     const [currentTab, setCurrentTab] = useState<TabType>('personalization');
     const { user } = useAuthStore();
-    const isAdmin = user?.username ? ADMIN_EMAILS.includes(user.username.toLowerCase()) : false;
+    const isAdmin = Boolean(user?.is_admin);
 
     // Close on Escape
     useEffect(() => {

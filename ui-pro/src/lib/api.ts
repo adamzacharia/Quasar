@@ -35,7 +35,7 @@ export interface StreamCallbacks {
     }) => void;
     onWebSources?: (data: {
         sources: { title: string; url: string; snippet: string; evidenceQuality?: Record<string, unknown>; evidence_quality?: Record<string, unknown> }[];
-        images: { url: string; description: string }[];
+        images: { url: string; description: string; sourceUrl?: string; sourceTitle?: string }[];
         query: string;
         provider?: string;
         image_provider?: string;

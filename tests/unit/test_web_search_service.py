@@ -276,6 +276,48 @@ def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
     assert calls["payload"]["include_image_descriptions"] is True
 
 
+def test_tavily_search_prefers_source_linked_result_images(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.delitem(sys.modules, "tavily", raising=False)
+
+    def fake_tavily_post(self, endpoint, payload, timeout=60):
+        return {
+            "answer": "Current answer",
+            "results": [
+                {
+                    "title": "Primary Source",
+                    "url": "https://example.com/source",
+                    "content": "Source snippet",
+                    "images": [
+                        {
+                            "url": "https://cdn.example.com/source-image.jpg",
+                            "description": "Source image",
+                        }
+                    ],
+                }
+            ],
+            "images": [
+                {
+                    "url": "https://cdn.example.com/generic-image.jpg",
+                    "description": "Generic image",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(WebSearchService, "_tavily_post", fake_tavily_post)
+
+    result = WebSearchService().search_tavily("current policy", max_results=3)
+
+    assert result["images"] == [
+        {
+            "url": "https://cdn.example.com/source-image.jpg",
+            "description": "Source image",
+            "sourceUrl": "https://example.com/source",
+            "sourceTitle": "Primary Source",
+        }
+    ]
+
+
 def test_route_enriches_brave_results_with_tavily_images(monkeypatch, isolated_usage_file):
     monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
@@ -301,6 +343,43 @@ def test_route_enriches_brave_results_with_tavily_images(monkeypatch, isolated_u
     assert result["provider"] == "Brave LLM Context"
     assert result["image_provider"] == "Tavily Images"
     assert result["images"][0]["url"] == "https://example.com/img.jpg"
+
+
+def test_brave_image_fallback_links_thumbnails_to_source_pages(monkeypatch, isolated_usage_file):
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return DummyResponse(
+            200,
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Brave Result",
+                            "url": "https://example.com/article",
+                            "snippet": "Article snippet",
+                            "thumbnail": {"src": "https://cdn.example.com/thumb.jpg"},
+                        }
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setattr(web_search_service.requests, "get", fake_get)
+
+    result = WebSearchService().search_images("historic image", max_results=3)
+
+    assert result["success"] is True
+    assert result["provider"] == "Brave Images (extrapolated)"
+    assert result["images"] == [
+        {
+            "url": "https://cdn.example.com/thumb.jpg",
+            "description": "Brave Result",
+            "sourceUrl": "https://example.com/article",
+            "sourceTitle": "Brave Result",
+        }
+    ]
 
 
 def test_tavily_extract_urls_uses_sdk_and_trims_content(monkeypatch):

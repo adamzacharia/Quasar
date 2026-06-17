@@ -119,14 +119,23 @@ function mergeWebImages(existing: WebImage[] = [], incoming: WebImage[] = []): W
     [...existing, ...incoming].forEach((image) => {
         const url = normalizeWebUrl(image.url) || String(image.url || "").trim();
         if (!url) return;
+        const sourceUrl = normalizeWebUrl(image.sourceUrl);
+        const sourceTitle = String(image.sourceTitle || "").trim();
         const key = url.toLowerCase().replace(/\/$/, "");
         if (byUrl.has(key)) {
             const current = merged[byUrl.get(key)!];
             if (!current.description && image.description) current.description = image.description;
+            if (!current.sourceUrl && sourceUrl) current.sourceUrl = sourceUrl;
+            if (!current.sourceTitle && sourceTitle) current.sourceTitle = sourceTitle;
             return;
         }
         byUrl.set(key, merged.length);
-        merged.push({ ...image, url });
+        merged.push({
+            ...image,
+            url,
+            ...(sourceUrl ? { sourceUrl } : {}),
+            ...(sourceTitle ? { sourceTitle } : {}),
+        });
     });
 
     return merged;

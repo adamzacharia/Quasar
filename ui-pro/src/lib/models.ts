@@ -4,12 +4,20 @@ export const TACC_MODELS = [
     "gemma-4-31B-it",
 ];
 
-export const DEFAULT_AVAILABLE_MODELS = [
+export const OPENAI_MODELS = [
     "gpt-5.4-mini",
     "gpt-4.1",
     "gpt-4o-mini",
+];
+
+export const DEEPSEEK_MODELS = [
     "deepseek-v4-pro",
     "deepseek-v4-flash",
+];
+
+export const DEFAULT_AVAILABLE_MODELS = [
+    ...OPENAI_MODELS,
+    ...DEEPSEEK_MODELS,
     ...TACC_MODELS,
 ];
 

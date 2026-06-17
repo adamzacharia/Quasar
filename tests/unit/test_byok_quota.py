@@ -44,14 +44,14 @@ def test_provider_key_metadata_never_returns_raw_key(provider_key_store):
     assert raw_key not in encrypted
 
 
-def test_platform_quota_is_lifetime_and_blocks_when_exhausted(quota_store):
+def test_platform_quota_is_weekly_and_blocks_when_exhausted(quota_store):
     quota_store.record_usage(
         UsageRecord(
             user_id="u1",
             provider="openai",
             model="gpt-4o-mini",
             key_source="platform",
-            input_tokens=499_999,
+            input_tokens=99_999,
             output_tokens=1,
         )
     )
@@ -59,27 +59,28 @@ def test_platform_quota_is_lifetime_and_blocks_when_exhausted(quota_store):
     with pytest.raises(QuotaExceededError):
         quota_store.ensure_allowed(
             user_id="u1",
-            user_email="person@example.com",
+            user_email="person@example.test",
             provider="openai",
             key_source="platform",
         )
 
 
-def test_admin_bypasses_platform_quota(quota_store):
+def test_quota_exempt_email_bypasses_platform_quota(monkeypatch, quota_store):
+    monkeypatch.setenv("QUASAR_TOKEN_LIMIT_EXEMPT_EMAILS", "quota-exempt@example.test")
     quota_store.record_usage(
         UsageRecord(
-            user_id="admin",
+            user_id="exempt-user",
             provider="deepseek",
             model="deepseek-v4-pro",
             key_source="platform",
-            input_tokens=2_000_000,
+            input_tokens=900_000,
             output_tokens=1,
         )
     )
 
     quota_store.ensure_allowed(
-        user_id="admin",
-        user_email="adamandspace@gmail.com",
+        user_id="exempt-user",
+        user_email="quota-exempt@example.test",
         provider="deepseek",
         key_source="platform",
     )
@@ -99,7 +100,7 @@ def test_byok_has_no_limit_unless_user_sets_one(quota_store):
 
     quota_store.ensure_allowed(
         user_id="u1",
-        user_email="person@example.com",
+        user_email="person@example.test",
         provider="deepseek",
         key_source="byok",
         byok_token_limit=None,
@@ -108,7 +109,7 @@ def test_byok_has_no_limit_unless_user_sets_one(quota_store):
     with pytest.raises(QuotaExceededError):
         quota_store.ensure_allowed(
             user_id="u1",
-            user_email="person@example.com",
+            user_email="person@example.test",
             provider="deepseek",
             key_source="byok",
             byok_token_limit=1_000,
