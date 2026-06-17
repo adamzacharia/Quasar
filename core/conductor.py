@@ -79,6 +79,7 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
 - check_co_lines: Check CO/13CO/C18O line coverage in the LAST search results. Requires a prior search_by_target call.
 - check_line_coverage: Check if a specific frequency falls in LAST search results. Requires a prior search_by_target call.
 - search_lines_by_molecule: Search Splatalogue for spectral lines by molecule name.
+- search_spectral_lines: Run an advanced Splatalogue frequency-range search with physical and catalog filters.
 - filter_results: Apply numeric filters to the LAST search results.
 
 **Literature tools (agent_type: "literature")**:
@@ -173,7 +174,7 @@ or modify sub-tasks. Keep the same JSON format. Ensure dependencies remain valid
 
 Available agent types: "archive", "literature", "analysis", "compute", "web", "synthesis".
 Available tools: search_by_target, search_by_position, search_cadc_archive, resolve_target,
-check_co_lines, check_line_coverage, search_lines_by_molecule, filter_results,
+check_co_lines, check_line_coverage, search_lines_by_molecule, search_spectral_lines, filter_results,
 search_papers, web_search, web_extract_url, web_map_site, web_crawl_site, web_research.
 
 Respond with ONLY valid JSON:
