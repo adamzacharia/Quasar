@@ -525,7 +525,7 @@ from services.provider_file_service import (
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
 from services.secret_redaction import redact_secrets
 from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
-from core.llm_client import LLMClient, TACC_MODEL_IDS, detect_provider, llm_request_context, model_accepts_direct_image_input
+from core.llm_client import LLMClient, TACC_VISIBLE_MODEL_IDS, detect_provider, llm_request_context, model_accepts_direct_image_input
 auth_service = AuthService()
 conversation_service = ConversationService()
 cube_workbench_service = CubeWorkbenchService()
@@ -1974,7 +1974,14 @@ async def root():
 
 @app.get("/api/models")
 async def list_models():
-    cloud_models = list(TACC_MODEL_IDS)
+    cloud_models = [
+        "gpt-5.4-mini",
+        "gpt-4.1",
+        "gpt-4o-mini",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        *TACC_VISIBLE_MODEL_IDS,
+    ]
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
     local_models = []

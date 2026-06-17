@@ -132,6 +132,12 @@ TACC_MODEL_IDS = [
     "E5-Mistral-7B-Instruct",
 ]
 
+TACC_VISIBLE_MODEL_IDS = [
+    "gpt-oss-120b",
+    "Qwen3-32B",
+    "gemma-4-31B-it",
+]
+
 TACC_MODEL_ID_SET = frozenset(TACC_MODEL_IDS)
 
 def detect_provider(model: str) -> str:
