@@ -7,13 +7,12 @@ from typing import Mapping, Optional
 
 
 DEFAULT_ADMIN_EMAILS = {
-    "adamandspace@gmail.com",
     "1@1",
 }
 
 
 def configured_admin_emails() -> set[str]:
-    """Return built-in and environment-configured admin emails."""
+    """Return local-dev and environment-configured admin emails."""
     env_emails = {
         email.strip().lower()
         for email in os.getenv("ADMIN_EMAILS", "").split(",")
@@ -22,11 +21,28 @@ def configured_admin_emails() -> set[str]:
     return DEFAULT_ADMIN_EMAILS | env_emails
 
 
+def configured_quota_exempt_emails() -> set[str]:
+    """Return emails allowed to bypass platform token quotas."""
+    env_emails = {
+        email.strip().lower()
+        for email in os.getenv("QUASAR_TOKEN_LIMIT_EXEMPT_EMAILS", "").split(",")
+        if email.strip()
+    }
+    return env_emails | configured_admin_emails()
+
+
 def is_admin_email(email: Optional[str]) -> bool:
-    """Return True when the email is allowed to bypass usage quotas/admin gates."""
+    """Return True when the email is allowed through admin gates."""
     if not email:
         return False
     return email.strip().lower() in configured_admin_emails()
+
+
+def is_quota_exempt_email(email: Optional[str]) -> bool:
+    """Return True when the email is allowed to bypass token quotas."""
+    if not email:
+        return False
+    return email.strip().lower() in configured_quota_exempt_emails()
 
 
 def is_admin_user(user: Optional[Mapping[str, object]]) -> bool:

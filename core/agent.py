@@ -3397,12 +3397,36 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             url = str(item.get("url") or item.get("src") or item.get("image_url") or "").strip()
             if not url:
                 return None
-            return {
+            image = {
                 "url": url,
                 "description": str(
                     item.get("description") or item.get("alt") or item.get("title") or ""
                 ).strip(),
             }
+            source_url = _normalize_web_url(
+                item.get("sourceUrl")
+                or item.get("source_url")
+                or item.get("sourcePageUrl")
+                or item.get("source_page_url")
+                or item.get("pageUrl")
+                or item.get("page_url")
+                or item.get("source")
+                or ""
+            )
+            if source_url:
+                image["sourceUrl"] = source_url
+            source_title = str(
+                item.get("sourceTitle")
+                or item.get("source_title")
+                or item.get("sourcePageTitle")
+                or item.get("source_page_title")
+                or item.get("pageTitle")
+                or item.get("page_title")
+                or ""
+            ).strip()
+            if source_title:
+                image["sourceTitle"] = source_title
+            return image
 
         def _source_items_from_text(text: Any) -> List[Dict[str, str]]:
             if not isinstance(text, str) or "." not in text:

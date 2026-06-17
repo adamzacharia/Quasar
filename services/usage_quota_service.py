@@ -1,23 +1,25 @@
-"""Lifetime LLM token usage accounting and quota enforcement."""
+"""Weekly LLM token usage accounting and quota enforcement."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-from services.admin_access import is_admin_email
+from services.admin_access import is_admin_email, is_quota_exempt_email
 from services.db import get_connection
 
 
 _LOCAL_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "usage_quota.db")
 
 PLATFORM_TOKEN_LIMITS = {
-    "deepseek": 1_000_000,
-    "openai": 500_000,
-    "tacc": None,
+    "deepseek": 500_000,
+    "openai": 100_000,
+    "tacc": 1_000_000,
 }
+
+PLATFORM_QUOTA_WINDOW_DAYS = 7
 
 
 class QuotaExceededError(RuntimeError):
@@ -39,7 +41,7 @@ class UsageRecord:
 
 
 class UsageQuotaService:
-    """Tracks usage and enforces lifetime platform-key quotas."""
+    """Tracks usage and enforces rolling weekly platform-key quotas."""
 
     def __init__(self):
         self._init_db()
@@ -71,6 +73,12 @@ class UsageQuotaService:
             ON llm_usage_events(user_id, provider, key_source)
             """
         )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_user_provider_source_created
+            ON llm_usage_events(user_id, provider, key_source, created_at)
+            """
+        )
         conn.commit()
         conn.close()
 
@@ -88,17 +96,33 @@ class UsageQuotaService:
         value = (key_source or "platform").strip().lower()
         return "byok" if value == "byok" else "platform"
 
-    def get_used_tokens(self, user_id: str, provider: str, key_source: str) -> int:
+    @staticmethod
+    def weekly_window_start() -> datetime:
+        return datetime.now(timezone.utc) - timedelta(days=PLATFORM_QUOTA_WINDOW_DAYS)
+
+    def get_used_tokens(
+        self,
+        user_id: str,
+        provider: str,
+        key_source: str,
+        *,
+        since: Optional[datetime] = None,
+    ) -> int:
         provider = self.normalize_provider(provider)
         key_source = self.normalize_key_source(key_source)
         conn = self._conn()
+        params = [user_id, provider, key_source]
+        since_clause = ""
+        if since is not None:
+            since_clause = " AND created_at >= ?"
+            params.append(since.astimezone(timezone.utc).isoformat())
         row = conn.execute(
-            """
+            f"""
             SELECT COALESCE(SUM(total_tokens), 0)
             FROM llm_usage_events
-            WHERE user_id = ? AND provider = ? AND key_source = ?
+            WHERE user_id = ? AND provider = ? AND key_source = ?{since_clause}
             """,
-            (user_id, provider, key_source),
+            tuple(params),
         ).fetchone()
         conn.close()
         return int(row[0] or 0) if row else 0
@@ -115,11 +139,19 @@ class UsageQuotaService:
         provider = self.normalize_provider(provider)
         key_source = self.normalize_key_source(key_source)
 
+        if is_quota_exempt_email(user_email):
+            return
+
         if key_source == "platform":
             limit = PLATFORM_TOKEN_LIMITS.get(provider)
-            if limit is None or is_admin_email(user_email):
+            if limit is None:
                 return
-            used = self.get_used_tokens(user_id, provider, "platform")
+            used = self.get_used_tokens(
+                user_id,
+                provider,
+                "platform",
+                since=self.weekly_window_start(),
+            )
             if used >= limit:
                 provider_label = {
                     "deepseek": "DeepSeek",
@@ -128,8 +160,8 @@ class UsageQuotaService:
                 }.get(provider, provider)
                 raise QuotaExceededError(
                     "You have exhausted your included Quasar token allowance. "
-                    f"Your {provider_label} platform-key allowance is {limit:,} lifetime tokens. "
-                    "Add your own API key to continue."
+                    f"Your {provider_label} platform-key allowance is {limit:,} tokens per week. "
+                    "Please try again after your weekly quota window resets."
                 )
             return
 
@@ -183,15 +215,17 @@ class UsageQuotaService:
         providers = sorted(set(PLATFORM_TOKEN_LIMITS) | set(byok_limits))
         platform: Dict[str, Dict] = {}
         byok: Dict[str, Dict] = {}
+        quota_exempt = is_quota_exempt_email(user_email)
         admin = is_admin_email(user_email)
+        window_start = self.weekly_window_start()
         for provider in providers:
             platform_limit = PLATFORM_TOKEN_LIMITS.get(provider)
-            platform_used = self.get_used_tokens(user_id, provider, "platform")
+            platform_used = self.get_used_tokens(user_id, provider, "platform", since=window_start)
             platform[provider] = {
                 "used_tokens": platform_used,
-                "limit_tokens": None if admin else platform_limit,
-                "unlimited": admin or platform_limit is None,
-                "exhausted": False if admin or platform_limit is None else platform_used >= platform_limit,
+                "limit_tokens": None if quota_exempt else platform_limit,
+                "unlimited": quota_exempt or platform_limit is None,
+                "exhausted": False if quota_exempt or platform_limit is None else platform_used >= platform_limit,
             }
             byok_limit = byok_limits.get(provider)
             byok_used = self.get_used_tokens(user_id, provider, "byok")
@@ -201,4 +235,10 @@ class UsageQuotaService:
                 "unlimited": byok_limit is None,
                 "exhausted": False if byok_limit is None else byok_used >= int(byok_limit),
             }
-        return {"platform": platform, "byok": byok, "is_admin": admin}
+        return {
+            "platform": platform,
+            "byok": byok,
+            "is_admin": admin,
+            "is_quota_exempt": quota_exempt,
+            "platform_quota_window_days": PLATFORM_QUOTA_WINDOW_DAYS,
+        }

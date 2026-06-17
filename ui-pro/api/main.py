@@ -525,6 +525,7 @@ from services.provider_file_service import (
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
 from services.secret_redaction import redact_secrets
 from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
+from services.admin_access import is_admin_email
 from core.llm_client import LLMClient, TACC_VISIBLE_MODEL_IDS, detect_provider, llm_request_context, model_accepts_direct_image_input
 auth_service = AuthService()
 conversation_service = ConversationService()
@@ -535,6 +536,38 @@ usage_quota_service = UsageQuotaService()
 
 from services.analytics_service import AnalyticsService
 analytics_service = AnalyticsService()
+
+
+def _visible_model_list(env_name: str, default_models: List[str]) -> List[str]:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return list(default_models)
+    models = [part.strip() for part in raw.split(",") if part.strip()]
+    return models or list(default_models)
+
+
+def _unique_models(models: List[str]) -> List[str]:
+    seen = set()
+    ordered = []
+    for model in models:
+        if model and model not in seen:
+            seen.add(model)
+            ordered.append(model)
+    return ordered
+
+
+OPENAI_VISIBLE_MODEL_IDS = _visible_model_list(
+    "QUASAR_OPENAI_MODELS",
+    ["gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini"],
+)
+DEEPSEEK_VISIBLE_MODEL_IDS = _visible_model_list(
+    "QUASAR_DEEPSEEK_MODELS",
+    ["deepseek-v4-pro", "deepseek-v4-flash"],
+)
+TACC_MENU_MODEL_IDS = _visible_model_list(
+    "QUASAR_TACC_MODELS",
+    list(TACC_VISIBLE_MODEL_IDS),
+)
 
 def get_current_user(authorization: Optional[str] = Header(None)):
     if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -675,15 +708,38 @@ def _merge_web_items(existing: List[Dict[str, Any]], incoming: List[Dict[str, An
     for item in [*(existing or []), *(incoming or [])]:
         if not isinstance(item, dict):
             continue
-        url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("source_url"))
+        url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("image_url") or item.get("src"))
         if not url:
             continue
         key = url.lower().rstrip("/")
         clean = dict(item)
         clean["url"] = url
+        source_url = _normalize_web_url(
+            item.get("sourceUrl")
+            or item.get("source_url")
+            or item.get("sourcePageUrl")
+            or item.get("source_page_url")
+            or item.get("pageUrl")
+            or item.get("page_url")
+            or item.get("source")
+            or ""
+        )
+        if source_url:
+            clean["sourceUrl"] = source_url
+        source_title = str(
+            item.get("sourceTitle")
+            or item.get("source_title")
+            or item.get("sourcePageTitle")
+            or item.get("source_page_title")
+            or item.get("pageTitle")
+            or item.get("page_title")
+            or ""
+        ).strip()
+        if source_title:
+            clean["sourceTitle"] = source_title
         if key in by_url:
             current = merged[by_url[key]]
-            for field in ("title", "snippet", "description"):
+            for field in ("title", "snippet", "description", "sourceUrl", "sourceTitle"):
                 if not current.get(field) and clean.get(field):
                     current[field] = clean[field]
             continue
@@ -1974,14 +2030,11 @@ async def root():
 
 @app.get("/api/models")
 async def list_models():
-    cloud_models = [
-        "gpt-5.4-mini",
-        "gpt-4.1",
-        "gpt-4o-mini",
-        "deepseek-v4-pro",
-        "deepseek-v4-flash",
-        *TACC_VISIBLE_MODEL_IDS,
-    ]
+    cloud_models = _unique_models([
+        *OPENAI_VISIBLE_MODEL_IDS,
+        *DEEPSEEK_VISIBLE_MODEL_IDS,
+        *TACC_MENU_MODEL_IDS,
+    ])
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
     local_models = []
@@ -1999,7 +2052,7 @@ async def list_models():
         except Exception as e:
             logger.warning(f"[MODELS] Failed to discover local models: {e}")
 
-    return {"models": cloud_models + local_models}
+    return {"models": _unique_models(cloud_models + local_models)}
 
 
 # Provider Key / Quota Endpoints
@@ -2216,7 +2269,8 @@ async def register(req: RegisterRequest):
             "id": payload["sub"],
             "username": payload.get("email") or req.username,
             "display_name": payload.get("name") or req.username,
-            "auth_provider": "local"
+            "auth_provider": "local",
+            "is_admin": is_admin_email(payload.get("email") or req.email or req.username),
         }
     }
 
@@ -2233,7 +2287,8 @@ async def login(req: LoginRequest):
             "id": user_id,
             "username": email or req.username,
             "display_name": display_name or req.username,
-            "auth_provider": "local"
+            "auth_provider": "local",
+            "is_admin": is_admin_email(email or req.username),
         }
     }
 
@@ -2269,6 +2324,7 @@ async def google_login(req: GoogleLoginRequest):
                 "display_name": name,
                 "auth_provider": "google",
                 "picture_url": picture,
+                "is_admin": is_admin_email(email),
             }
         }
     except ValueError as e:
@@ -2280,7 +2336,8 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "user": {
             "id": current_user["sub"],
             "username": current_user.get("email"),
-            "display_name": current_user.get("name")
+            "display_name": current_user.get("name"),
+            "is_admin": is_admin_email(current_user.get("email")),
         }
     }
 

@@ -62,7 +62,7 @@ export function ChatArea() {
     const scrollRef = useRef<HTMLDivElement>(null);
 
     const turnGraphs = useMemo(() => {
-        const graphs: Record<string, any> = {};
+        const graphs: Record<string, unknown> = {};
         let currentTurnMessages: Message[] = [];
         let currentTurnDataMessageIds: string[] = [];
         let currentTurnMessageIds: string[] = [];
@@ -230,10 +230,32 @@ export function ChatArea() {
             const item = image as Record<string, unknown>;
             const url = String(item.url || item.src || item.image_url || "").trim();
             if (!url) return null;
-            return {
+            const sourceUrl = normalizeUrl(
+                item.sourceUrl
+                || item.source_url
+                || item.sourcePageUrl
+                || item.source_page_url
+                || item.pageUrl
+                || item.page_url
+                || item.source
+                || ""
+            );
+            const sourceTitle = String(
+                item.sourceTitle
+                || item.source_title
+                || item.sourcePageTitle
+                || item.source_page_title
+                || item.pageTitle
+                || item.page_title
+                || ""
+            ).trim();
+            const normalized: WebImage = {
                 url,
                 description: String(item.description || item.alt || item.title || "").trim(),
             };
+            if (sourceUrl) normalized.sourceUrl = sourceUrl;
+            if (sourceTitle) normalized.sourceTitle = sourceTitle;
+            return normalized;
         };
 
         const rawSources = Array.isArray(data.sources)
@@ -340,8 +362,8 @@ export function ChatArea() {
             } else {
                 // Standard workflow
                 let accumulatedWebSources: {
-                    sources: any[];
-                    images: any[];
+                    sources: WebSource[];
+                    images: WebImage[];
                     provider?: string;
                     imageProvider?: string;
                     searchType?: string;

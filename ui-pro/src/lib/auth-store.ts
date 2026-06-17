@@ -9,6 +9,7 @@ export interface User {
     display_name: string;
     auth_provider: "local" | "google";
     picture_url?: string;
+    is_admin?: boolean;
 }
 
 interface AuthStore {

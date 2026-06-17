@@ -380,17 +380,41 @@ class WebSearchService:
         return results
 
     @staticmethod
-    def _normalize_image_items(items: Any) -> List[Dict[str, str]]:
+    def _normalize_source_url(value: Any) -> str:
+        """Return a web URL only when a provider supplied a real source page."""
+        url = str(value or "").strip().strip("<>")
+        url = url.rstrip(".,;:)]}'\"")
+        if not url:
+            return ""
+        if url.startswith(("http://", "https://")):
+            return url
+        if url.startswith("www."):
+            return f"https://{url}"
+        if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}/\S+$", url):
+            return f"https://{url}"
+        return ""
+
+    @classmethod
+    def _normalize_image_items(
+        cls,
+        items: Any,
+        source_url: str = "",
+        source_title: str = "",
+    ) -> List[Dict[str, str]]:
         """Normalize provider image payloads into Quasar's web image shape."""
         if not isinstance(items, list):
             return []
 
         images: List[Dict[str, str]] = []
         seen_urls = set()
+        parent_source_url = cls._normalize_source_url(source_url)
+        parent_source_title = str(source_title or "").strip()
         for item in items:
             if isinstance(item, str):
                 url = item.strip()
                 description = ""
+                item_source_url = parent_source_url
+                item_source_title = parent_source_title
             elif isinstance(item, dict):
                 url = str(item.get("url") or item.get("src") or item.get("image_url") or "").strip()
                 description = str(
@@ -399,15 +423,82 @@ class WebSearchService:
                     or item.get("alt")
                     or ""
                 ).strip()
+                item_source_url = cls._normalize_source_url(
+                    item.get("sourceUrl")
+                    or item.get("source_url")
+                    or item.get("sourcePageUrl")
+                    or item.get("source_page_url")
+                    or item.get("pageUrl")
+                    or item.get("page_url")
+                    or item.get("source")
+                    or parent_source_url
+                )
+                item_source_title = str(
+                    item.get("sourceTitle")
+                    or item.get("source_title")
+                    or item.get("sourcePageTitle")
+                    or item.get("source_page_title")
+                    or item.get("pageTitle")
+                    or item.get("page_title")
+                    or parent_source_title
+                    or ""
+                ).strip()
             else:
                 continue
 
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
-            images.append({"url": url, "description": description})
+            image = {"url": url, "description": description}
+            if item_source_url:
+                image["sourceUrl"] = item_source_url
+            if item_source_title:
+                image["sourceTitle"] = item_source_title
+            images.append(image)
 
         return images
+
+    @staticmethod
+    def _dedupe_image_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        images: List[Dict[str, str]] = []
+        by_url: Dict[str, int] = {}
+        for item in items:
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            key = url.lower().rstrip("/")
+            if key in by_url:
+                current = images[by_url[key]]
+                for field in ("description", "sourceUrl", "sourceTitle"):
+                    if not current.get(field) and item.get(field):
+                        current[field] = item[field]
+                continue
+            by_url[key] = len(images)
+            images.append(item)
+        return images
+
+    @classmethod
+    def _collect_tavily_images(cls, response: Any, max_images: int = 6) -> List[Dict[str, str]]:
+        """Prefer Tavily images attached to a source result, then generic images."""
+        if not isinstance(response, dict):
+            return []
+
+        linked_images: List[Dict[str, str]] = []
+        for result in response.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            linked_images.extend(
+                cls._normalize_image_items(
+                    result.get("images", []),
+                    source_url=str(result.get("url") or ""),
+                    source_title=str(result.get("title") or ""),
+                )
+            )
+        linked_images = cls._dedupe_image_items(linked_images)
+        if linked_images:
+            return linked_images[:max_images]
+
+        return cls._normalize_image_items(response.get("images", []))[:max_images]
 
     def _fetch_tavily_images(self, query: str, max_images: int = 6) -> List[Dict[str, str]]:
         """Fetch image tiles for a search result using Tavily's REST API."""
@@ -424,7 +515,7 @@ class WebSearchService:
         response = self._tavily_post("search", payload, timeout=30)
         if isinstance(response, dict) and response.get("success") is False:
             return []
-        return self._normalize_image_items(response.get("images", []))[:max_images]
+        return self._collect_tavily_images(response, max_images=max_images)
 
     def _enrich_with_tavily_images(
         self,
@@ -547,17 +638,15 @@ class WebSearchService:
             if isinstance(response, dict) and response.get("success") is False:
                 return response
 
+            response_results = response.get("results", []) if isinstance(response, dict) else []
             results = []
-            for r in response.get("results", []) if isinstance(response, dict) else []:
+            for r in response_results:
                 results.append({
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
                     "snippet": r.get("content", "")
                 })
-            images = self._normalize_image_items(response.get("images", [])) if isinstance(response, dict) else []
-            if not images and isinstance(response, dict):
-                for r in response.get("results", []):
-                    images.extend(self._normalize_image_items(r.get("images", [])))
+            images = self._collect_tavily_images(response, max_images=6)
             return {
                 "success": True,
                 "provider": "Tavily",
@@ -917,7 +1006,7 @@ class WebSearchService:
                 if isinstance(response, dict) and response.get("success") is False:
                     response = {}
 
-                images = self._normalize_image_items(response.get("images", []))
+                images = self._collect_tavily_images(response, max_images=max_results)
                 
                 # Also collect web references to go alongside images
                 results = []
@@ -958,10 +1047,17 @@ class WebSearchService:
                     for item in data.get("web", {}).get("results", []):
                         thumbnail = item.get("thumbnail", {})
                         if thumbnail and thumbnail.get("src"):
-                            images.append({
+                            image = {
                                 "url": thumbnail.get("src"),
                                 "description": item.get("title", "")
-                            })
+                            }
+                            source_url = self._normalize_source_url(item.get("url"))
+                            if source_url:
+                                image["sourceUrl"] = source_url
+                            source_title = str(item.get("title") or "").strip()
+                            if source_title:
+                                image["sourceTitle"] = source_title
+                            images.append(image)
                     
                     results = []
                     for item in data.get("web", {}).get("results", []):

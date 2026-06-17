@@ -60,6 +60,8 @@ export interface EvidenceQuality {
 export interface WebImage {
     url: string;
     description: string;
+    sourceUrl?: string;
+    sourceTitle?: string;
 }
 
 export interface Conversation {
