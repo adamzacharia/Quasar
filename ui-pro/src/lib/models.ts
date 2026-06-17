@@ -16,3 +16,17 @@ export const DEFAULT_AVAILABLE_MODELS = [
 export function isTaccModel(model: string): boolean {
     return TACC_MODELS.includes(model) || model.startsWith("tacc/");
 }
+
+export function mergeAvailableModels(models: unknown): string[] {
+    const merged = new Set(DEFAULT_AVAILABLE_MODELS);
+
+    if (Array.isArray(models)) {
+        for (const model of models) {
+            if (typeof model === "string" && model.trim()) {
+                merged.add(model);
+            }
+        }
+    }
+
+    return Array.from(merged);
+}

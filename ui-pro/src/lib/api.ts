@@ -1,3 +1,5 @@
+import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export interface ChatRequest {
@@ -198,8 +200,12 @@ export async function submitPlanFeedback(
 }
 
 export async function getModels(): Promise<string[]> {
-    try { const res = await fetch(`${API_BASE}/api/models`); const data = await res.json(); return data.models; }
-    catch { return ["gpt-5.4-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-v4-pro", "deepseek-v4-flash"]; }
+    try {
+        const res = await fetch(`${API_BASE}/api/models`);
+        const data = await res.json();
+        return mergeAvailableModels(data.models);
+    }
+    catch { return DEFAULT_AVAILABLE_MODELS; }
 }
 
 export interface WorkbenchSession {

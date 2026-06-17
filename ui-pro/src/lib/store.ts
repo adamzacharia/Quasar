@@ -18,7 +18,7 @@ import {
     updateLastAssistantThinking as updateAssistantThinking,
 } from "./chat-message-updaters";
 import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
-import { DEFAULT_AVAILABLE_MODELS } from "./models";
+import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
 
 interface ChatStore {
     conversations: Conversation[];
@@ -497,7 +497,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             const res = await fetch(`${API_BASE}/api/models`);
             if (res.ok) {
                 const data = await res.json();
-                if (data.models?.length) set({ availableModels: data.models });
+                set({ availableModels: mergeAvailableModels(data.models) });
             }
         } catch { /* keep defaults */ }
     },
