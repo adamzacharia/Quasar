@@ -103,6 +103,11 @@ function getModelCost(model: string) {
     return null;
 }
 
+function getModelTag(model: string) {
+    if (isTaccModel(model)) return "US hosted";
+    return null;
+}
+
 /* ────────────────────────────────────────────
    MODEL ICON COMPONENT
    ──────────────────────────────────────────── */
@@ -167,11 +172,17 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
             </div>
             {models.map((model) => {
                 const cost = getModelCost(model);
+                const tag = getModelTag(model);
                 return (
                     <button key={model} onClick={() => { onSelect(model); setOpen(false); }}
                         className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/15 text-primary border-l-2 border-primary" : "text-slate-300 hover:bg-slate-700/70 hover:text-white"}`}>
                         <div className="flex flex-col items-start truncate overflow-hidden pr-2">
                             <span className="font-medium truncate w-full text-left">{model.startsWith("local/") ? model.replace("local/", "") : model}</span>
+                            {tag && (
+                                <span className="mt-1 inline-flex items-center rounded border border-cyan-400/30 bg-cyan-400/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-cyan-200">
+                                    {tag}
+                                </span>
+                            )}
                             {cost && (
                                 <span className="text-[9px] text-slate-500 font-mono mt-0.5">
                                     In: ${cost.in}/M · Out: ${cost.out}/M
@@ -186,6 +197,7 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
     );
 
     const currentCost = getModelCost(selectedModel);
+    const currentTag = getModelTag(selectedModel);
 
     return (
         <div ref={ref} className="relative">
@@ -200,6 +212,13 @@ function ModelDropdown({ selectedModel, availableModels, onSelect }: {
                         <span>In: ${currentCost.in}/M</span>
                         <span className="text-slate-600">|</span>
                         <span>Out: ${currentCost.out}/M</span>
+                    </div>
+                )}
+                {currentTag && (
+                    <div className="mt-1 ml-6">
+                        <span className="inline-flex items-center rounded border border-cyan-400/30 bg-cyan-400/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-cyan-200">
+                            {currentTag}
+                        </span>
                     </div>
                 )}
             </button>

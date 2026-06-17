@@ -12,11 +12,6 @@ export const TACC_MODELS = [
 ];
 
 export const DEFAULT_AVAILABLE_MODELS = [
-    "gpt-5.4-mini",
-    "gpt-4.1",
-    "gpt-4o-mini",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
     ...TACC_MODELS,
 ];
 

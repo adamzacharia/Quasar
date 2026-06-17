@@ -1974,14 +1974,7 @@ async def root():
 
 @app.get("/api/models")
 async def list_models():
-    cloud_models = [
-            "gpt-5.4-mini",             # GPT-5.4 Mini (default — adaptive reasoning, cost-effective)
-            "gpt-4.1",                 # GPT-4.1
-            "gpt-4o-mini",             # GPT-4o Mini
-            "deepseek-v4-pro",          # DeepSeek V4 Pro (thinking reasoning model)
-            "deepseek-v4-flash",        # DeepSeek V4 Flash (fast thinking, lowest cost)
-            *TACC_MODEL_IDS,             # Texas Advanced Computing Center / Tejas models
-    ]
+    cloud_models = list(TACC_MODEL_IDS)
 
     # ── Auto-discover local models (Ollama / LM Studio) ──────────────
     local_models = []
