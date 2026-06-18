@@ -1096,6 +1096,170 @@ interface AnalyticsSummary {
     feedback?: { likes: number; dislikes: number; total: number };
 }
 
+interface AdminIssueReport {
+    id: string;
+    created_at: string;
+    status: "new" | "investigating" | "resolved" | "dismissed";
+    category: string;
+    description: string;
+    provider: string;
+    model: string;
+    trace_id?: string;
+    run_id: string;
+    admin_notes?: string;
+    technical_context?: {
+        run_status?: string;
+        duration_ms?: number;
+        tools_called?: string[];
+        first_token_ms?: number | null;
+        provider_chunk_count?: number;
+    };
+}
+
+function IssueReportsPanel({ token }: { token: string }) {
+    const [reports, setReports] = useState<AdminIssueReport[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [filters, setFilters] = useState({
+        status: "",
+        category: "",
+        provider: "",
+        model: "",
+        date_from: "",
+        date_to: "",
+    });
+    const [notes, setNotes] = useState<Record<string, string>>({});
+
+    const loadReports = useCallback(async () => {
+        setLoading(true);
+        const params = new URLSearchParams(
+            Object.entries(filters).filter(([, value]) => value) as [string, string][],
+        );
+        try {
+            const response = await fetch(`${API_BASE}/api/admin/issue-reports?${params}`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const payload = await response.json();
+            const rows = (payload.reports || []) as AdminIssueReport[];
+            setReports(rows);
+            setNotes(Object.fromEntries(rows.map((report) => [report.id, report.admin_notes || ""])));
+        } finally {
+            setLoading(false);
+        }
+    }, [filters, token]);
+
+    useEffect(() => {
+        loadReports().catch(() => setReports([]));
+    }, [loadReports]);
+
+    const updateReport = async (report: AdminIssueReport, status = report.status) => {
+        const response = await fetch(`${API_BASE}/api/admin/issue-reports/${report.id}`, {
+            method: "PATCH",
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ status, admin_notes: notes[report.id] || "" }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        await loadReports();
+    };
+
+    const exportReports = async (format: "csv" | "json") => {
+        const params = new URLSearchParams({
+            ...Object.fromEntries(Object.entries(filters).filter(([, value]) => value)),
+            format,
+        });
+        const response = await fetch(`${API_BASE}/api/admin/issue-reports/export?${params}`, {
+            headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        const anchor = document.createElement("a");
+        anchor.href = URL.createObjectURL(blob);
+        anchor.download = `quasar_issue_reports_${new Date().toISOString().slice(0, 10)}.${format}`;
+        anchor.click();
+        URL.revokeObjectURL(anchor.href);
+    };
+
+    const setFilter = (key: keyof typeof filters, value: string) => {
+        setFilters((current) => ({ ...current, [key]: value }));
+    };
+
+    return (
+        <div className="space-y-3">
+            <div className="flex items-center justify-between">
+                <div>
+                    <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Private Issue Reports</h4>
+                    <p className="mt-1 text-[10px] text-slate-500">Structured reports linked to model runs and traces.</p>
+                </div>
+                <div className="flex gap-2">
+                    <button onClick={() => exportReports("csv")} className="glass-control rounded-lg px-2.5 py-1.5 text-[10px] text-slate-300">CSV</button>
+                    <button onClick={() => exportReports("json")} className="glass-control rounded-lg px-2.5 py-1.5 text-[10px] text-slate-300">JSON</button>
+                </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
+                <select value={filters.status} onChange={(event) => setFilter("status", event.target.value)} className="glass-control rounded-lg px-2 py-2 text-xs">
+                    <option value="">All statuses</option>
+                    <option value="new">New</option>
+                    <option value="investigating">Investigating</option>
+                    <option value="resolved">Resolved</option>
+                    <option value="dismissed">Dismissed</option>
+                </select>
+                <select value={filters.category} onChange={(event) => setFilter("category", event.target.value)} className="glass-control rounded-lg px-2 py-2 text-xs">
+                    <option value="">All categories</option>
+                    <option value="stuck_slow">Stuck or slow</option>
+                    <option value="wrong_answer">Wrong answer</option>
+                    <option value="incorrect_data">Incorrect data</option>
+                    <option value="ui_problem">Interface problem</option>
+                    <option value="other">Other</option>
+                </select>
+                <input value={filters.provider} onChange={(event) => setFilter("provider", event.target.value)} placeholder="Provider" className="glass-control rounded-lg px-2 py-2 text-xs" />
+                <input value={filters.model} onChange={(event) => setFilter("model", event.target.value)} placeholder="Exact model" className="glass-control rounded-lg px-2 py-2 text-xs" />
+                <input type="date" value={filters.date_from} onChange={(event) => setFilter("date_from", event.target.value)} className="glass-control rounded-lg px-2 py-2 text-xs" />
+                <input type="date" value={filters.date_to} onChange={(event) => setFilter("date_to", event.target.value)} className="glass-control rounded-lg px-2 py-2 text-xs" />
+            </div>
+            {loading ? (
+                <div className="flex items-center gap-2 py-4 text-xs text-slate-500"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading reports...</div>
+            ) : reports.length === 0 ? (
+                <div className="rounded-xl border border-slate-800 p-4 text-xs text-slate-500">No reports match these filters.</div>
+            ) : (
+                <div className="space-y-2">
+                    {reports.map((report) => (
+                        <div key={report.id} className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                            <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
+                                <span className="rounded bg-red-500/10 px-2 py-0.5 text-red-300">{report.category.replace("_", " ")}</span>
+                                <span>{report.provider} / {report.model}</span>
+                                <span>{new Date(report.created_at).toLocaleString()}</span>
+                                <span>run {report.run_id.slice(0, 8)}</span>
+                            </div>
+                            <p className="mt-2 text-xs leading-5 text-slate-200">{report.description}</p>
+                            <div className="mt-2 text-[10px] text-slate-500">
+                                Run: {report.technical_context?.run_status || "unknown"}
+                                {" · "}First token: {report.technical_context?.first_token_ms ?? "—"} ms
+                                {" · "}Chunks: {report.technical_context?.provider_chunk_count ?? "—"}
+                                {" · "}Tools: {(report.technical_context?.tools_called || []).join(", ") || "none"}
+                            </div>
+                            <div className="mt-3 grid gap-2 md:grid-cols-[160px_1fr_auto]">
+                                <select value={report.status} onChange={(event) => updateReport(report, event.target.value as AdminIssueReport["status"])}
+                                    className="glass-control rounded-lg px-2 py-2 text-xs">
+                                    <option value="new">New</option>
+                                    <option value="investigating">Investigating</option>
+                                    <option value="resolved">Resolved</option>
+                                    <option value="dismissed">Dismissed</option>
+                                </select>
+                                <input value={notes[report.id] || ""} onChange={(event) => setNotes((current) => ({ ...current, [report.id]: event.target.value }))}
+                                    placeholder="Admin notes" className="glass-control rounded-lg px-2 py-2 text-xs" />
+                                <button onClick={() => updateReport(report)} className="glass-control rounded-lg px-3 py-2 text-xs text-slate-200">Save</button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
 function AnalyticsPanel() {
     const { token } = useAuthStore();
     const [data, setData] = useState<AnalyticsSummary | null>(null);
@@ -1214,6 +1378,8 @@ function AnalyticsPanel() {
                     </div>
                 </div>
             )}
+
+            {token && <IssueReportsPanel token={token} />}
 
             {/* Export / Download */}
             <div>

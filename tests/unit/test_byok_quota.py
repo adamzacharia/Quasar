@@ -118,7 +118,7 @@ def test_byok_has_no_limit_unless_user_sets_one(quota_store):
 
 def test_byok_openai_key_wins_over_cached_platform_client(monkeypatch):
     class FakeOpenAI:
-        def __init__(self, api_key=None, base_url=None, default_headers=None):
+        def __init__(self, api_key=None, base_url=None, default_headers=None, **kwargs):
             self.api_key = api_key
             self.base_url = base_url
             self.default_headers = default_headers

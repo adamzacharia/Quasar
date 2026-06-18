@@ -28,6 +28,7 @@ export interface Message {
     notebookData?: NotebookData;
     toolCall?: ToolCall;
     imageUrl?: string;
+    runMeta?: import("./api").ChatRunMeta;
     imageCaption?: string;
     thinkingSteps?: ThoughtStep[];
     thinking?: string;

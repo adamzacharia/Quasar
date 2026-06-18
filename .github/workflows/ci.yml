@@ -10,7 +10,7 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     env:
       # Dummy keys for import checks (tests don't call real APIs)
@@ -28,6 +28,13 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui-pro/package-lock.json
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -37,14 +44,28 @@ jobs:
       # ── Lint ───────────────────────────────────────────────
       - name: Lint with ruff
         run: |
-          ruff check --select E,F,W --ignore E501,E402,F401 \
-            core/ services/ integrations/ config/ agents/ \
-            --exit-zero
+          ruff check --select E,F,W --ignore E501,E402 \
+            services/issue_report_service.py \
+            tests/unit/test_issue_report_service.py \
+            tests/unit/test_request_scoped_model_state.py \
+            tests/unit/test_tacc_history.py \
+            tests/integration/test_live_provider_chat_protocol.py
 
       # ── Unit Tests ─────────────────────────────────────────
       - name: Run unit tests
         run: |
-          pytest tests/unit/ -v --tb=short -q 2>&1 || true
+          pytest tests/unit/ -v --tb=short -q
+
+      - name: Run opt-in live provider smoke tests
+        if: ${{ vars.RUN_LIVE_PROVIDER_TESTS == '1' }}
+        env:
+          RUN_LIVE_PROVIDER_TESTS: "1"
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TACC_API_KEY: ${{ secrets.TACC_API_KEY }}
+          TACC_BASE_URL: ${{ vars.TACC_BASE_URL }}
+        run: |
+          pytest tests/integration/test_live_provider_chat_protocol.py -v --tb=short
 
       # ── Import Smoke Test ──────────────────────────────────
       - name: Verify critical imports
@@ -75,4 +96,20 @@ jobs:
           import sys; sys.path.insert(0, '..')
           from api.main import app
           print('FastAPI app created successfully ✅')
-          " || true
+          "
+
+      - name: Install frontend dependencies
+        working-directory: ui-pro
+        run: npm ci
+
+      - name: Lint frontend
+        working-directory: ui-pro
+        run: npm run lint
+
+      - name: Run frontend regression tests
+        working-directory: ui-pro
+        run: npm test
+
+      - name: Build frontend
+        working-directory: ui-pro
+        run: npm run build

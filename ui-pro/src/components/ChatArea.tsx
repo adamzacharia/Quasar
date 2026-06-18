@@ -7,6 +7,7 @@ import { sendChatMessage, reviewProposal, submitPlanFeedback } from "../lib/api"
 import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
+import type { ResearchGraph } from "./ObservationPaperGraph";
 import { DownloadProgress } from "./DownloadProgress";
 import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
@@ -22,6 +23,7 @@ function generateId(): string { return Date.now().toString(36) + Math.random().t
 export function ChatArea() {
     const {
         messages, addMessage, mergeWebSourcesMessage, updateLastAssistantMessage, updateLastAssistantThinking,
+        updateLastAssistantRunMeta,
         isStreaming, setStreaming,
         toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -62,7 +64,7 @@ export function ChatArea() {
     const scrollRef = useRef<HTMLDivElement>(null);
 
     const turnGraphs = useMemo(() => {
-        const graphs: Record<string, unknown> = {};
+        const graphs: Record<string, ResearchGraph> = {};
         let currentTurnMessages: Message[] = [];
         let currentTurnDataMessageIds: string[] = [];
         let currentTurnMessageIds: string[] = [];
@@ -70,7 +72,7 @@ export function ChatArea() {
         for (const msg of messages) {
             if (msg.role === "user") {
                 if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
-                    const graph = buildObservationPaperGraph(currentTurnMessages);
+                    const graph = buildObservationPaperGraph(currentTurnMessages) as ResearchGraph | null;
                     if (graph) {
                         for (const id of currentTurnMessageIds) {
                             graphs[id] = graph;
@@ -89,7 +91,7 @@ export function ChatArea() {
         }
 
         if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
-            const graph = buildObservationPaperGraph(currentTurnMessages);
+            const graph = buildObservationPaperGraph(currentTurnMessages) as ResearchGraph | null;
             if (graph) {
                 for (const id of currentTurnMessageIds) {
                     graphs[id] = graph;
@@ -547,6 +549,9 @@ export function ChatArea() {
                                 conversationIdRef.current = meta.conversation_id;
                             }
                         },
+                        onRunMeta: (meta) => {
+                            updateLastAssistantRunMeta(meta);
+                        },
                         onComplete: () => {
                             attachThinkingToLastMessage();
                             
@@ -586,6 +591,7 @@ export function ChatArea() {
         mergeWebSourcesMessage,
         updateLastAssistantMessage,
         updateLastAssistantThinking,
+        updateLastAssistantRunMeta,
         setStreaming,
         isStreaming,
         activeConversationId,
@@ -701,6 +707,13 @@ export function ChatArea() {
                                     checklist: taskChecklist,
                                     isActive: taskExecutionActive && isStreaming,
                                 } : null;
+                                let reportPrompt = "";
+                                for (let j = i - 1; j >= 0; j--) {
+                                    if (messages[j].role === "user") {
+                                        reportPrompt = messages[j].content;
+                                        break;
+                                    }
+                                }
                                 return (
                                     <ChatMessage
                                         key={msg.id}
@@ -710,6 +723,7 @@ export function ChatArea() {
                                         thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
                                         taskExecutionState={execState}
                                         observationGraph={turnGraphs[msg.id]}
+                                        reportPrompt={reportPrompt}
                                     />
                                 );
                             });

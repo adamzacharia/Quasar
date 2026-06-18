@@ -290,6 +290,8 @@ export function TaskExecutionWidget({ state }: TaskExecutionWidgetProps) {
     // Auto-collapse when execution completes
     useEffect(() => {
         if (!state.isActive && state.tasks.size > 0) {
+            // Collapse once when an externally-driven execution reaches completion.
+            // eslint-disable-next-line react-hooks/set-state-in-effect
             setIsCollapsed(true);
         }
     }, [state.isActive, state.tasks.size]);

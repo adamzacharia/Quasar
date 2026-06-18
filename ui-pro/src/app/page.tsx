@@ -18,6 +18,8 @@ export default function Home() {
   const [showOnboarding, dismissOnboarding] = useShowOnboarding();
 
   useEffect(() => {
+    // Client hydration state is intentionally established after the first render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMounted(true);
 
     const mq = window.matchMedia("(max-width: 767px)");
