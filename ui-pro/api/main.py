@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import List as PyList
 from google.oauth2 import id_token
@@ -501,6 +501,16 @@ class WorkbenchJobStartRequest(BaseModel):
     operation: str
     payload: Optional[Dict[str, Any]] = None
 
+class SpectralTargetResolveRequest(BaseModel):
+    target_name: str
+    redshift: Optional[float] = None
+    ra_deg: Optional[float] = None
+    dec_deg: Optional[float] = None
+
+class SpectralLineJobRequest(BaseModel):
+    operation: str
+    payload: Optional[Dict[str, Any]] = None
+
 class ProviderKeySaveRequest(BaseModel):
     provider: str
     api_key: str
@@ -523,6 +533,7 @@ from services.provider_file_service import (
     UploadedChatFile,
 )
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
+from services.spectral_line_explorer import SpectralLineJobService
 from services.secret_redaction import redact_secrets
 from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
 from services.admin_access import is_admin_email
@@ -530,12 +541,18 @@ from core.llm_client import LLMClient, TACC_VISIBLE_MODEL_IDS, detect_provider, 
 auth_service = AuthService()
 conversation_service = ConversationService()
 cube_workbench_service = CubeWorkbenchService()
+spectral_line_job_service = SpectralLineJobService()
 provider_file_service = ProviderFileService()
 provider_key_service = ProviderKeyService()
 usage_quota_service = UsageQuotaService()
 
 from services.analytics_service import AnalyticsService
 analytics_service = AnalyticsService()
+
+
+@app.on_event("shutdown")
+def _shutdown_spectral_line_jobs():
+    spectral_line_job_service.shutdown()
 
 
 def _visible_model_list(env_name: str, default_models: List[str]) -> List[str]:
@@ -2746,6 +2763,146 @@ def _raise_workbench_error(exc: Exception):
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=400, detail=str(exc))
     raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _ensure_spectral_line_explorer_enabled():
+    enabled = os.getenv("ENABLE_SPECTRAL_LINE_EXPLORER", "false").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        raise HTTPException(status_code=404, detail="Spectral Line Explorer is disabled")
+
+
+def _raise_spectral_line_error(exc: Exception):
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, PermissionError):
+        raise HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc))
+    raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/spectral-lines/metadata")
+async def get_spectral_line_metadata(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return catalog, unit, ALMA-band, default, and limit metadata."""
+    _ensure_spectral_line_explorer_enabled()
+    return spectral_line_job_service.metadata()
+
+
+@app.get("/api/spectral-lines/species")
+async def search_spectral_line_species(
+    query: str = "",
+    limit: int = 25,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return cached Splatalogue species autocomplete records."""
+    _ensure_spectral_line_explorer_enabled()
+    try:
+        return {
+            "species": spectral_line_job_service.species.search(query, limit),
+            "query": query,
+        }
+    except Exception as exc:
+        _raise_spectral_line_error(exc)
+
+
+@app.post("/api/spectral-lines/resolve-target")
+async def resolve_spectral_line_target(
+    req: SpectralTargetResolveRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Resolve target coordinates and redshift with SIMBAD/NED provenance."""
+    _ensure_spectral_line_explorer_enabled()
+    try:
+        return spectral_line_job_service.resolver.resolve(
+            req.target_name,
+            explicit_redshift=req.redshift,
+            explicit_ra_deg=req.ra_deg,
+            explicit_dec_deg=req.dec_deg,
+        )
+    except Exception as exc:
+        _raise_spectral_line_error(exc)
+
+
+@app.post("/api/spectral-lines/jobs")
+async def start_spectral_line_job(
+    req: SpectralLineJobRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Start a catalog, exact ALMA coverage, or line-confusion job."""
+    _ensure_spectral_line_explorer_enabled()
+    try:
+        return spectral_line_job_service.create_job(
+            user_id=_workbench_user_id(current_user),
+            operation=req.operation,
+            payload=req.payload or {},
+        )
+    except Exception as exc:
+        _raise_spectral_line_error(exc)
+
+
+@app.get("/api/spectral-lines/jobs/{job_id}")
+async def get_spectral_line_job(
+    job_id: str,
+    page: int = 1,
+    page_size: int = 100,
+    dataset: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return job status, context, warnings, and one stable result page."""
+    _ensure_spectral_line_explorer_enabled()
+    try:
+        return spectral_line_job_service.get_job(
+            user_id=_workbench_user_id(current_user),
+            job_id=job_id,
+            page=page,
+            page_size=page_size,
+            dataset=dataset,
+        )
+    except Exception as exc:
+        _raise_spectral_line_error(exc)
+
+
+@app.delete("/api/spectral-lines/jobs/{job_id}")
+async def cancel_spectral_line_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Cancel queued/running spectral-line work and stop future query segments."""
+    _ensure_spectral_line_explorer_enabled()
+    try:
+        return spectral_line_job_service.cancel_job(
+            user_id=_workbench_user_id(current_user),
+            job_id=job_id,
+        )
+    except Exception as exc:
+        _raise_spectral_line_error(exc)
+
+
+@app.get("/api/spectral-lines/jobs/{job_id}/export")
+async def export_spectral_line_job(
+    job_id: str,
+    dataset: str = "lines",
+    format: str = "csv",
+    current_user: dict = Depends(get_current_user),
+):
+    """Export the complete job dataset rather than only the current page."""
+    _ensure_spectral_line_explorer_enabled()
+    try:
+        filename, media_type, content = spectral_line_job_service.export(
+            user_id=_workbench_user_id(current_user),
+            job_id=job_id,
+            dataset=dataset,
+            format_name=format,
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        _raise_spectral_line_error(exc)
 
 
 @app.post("/api/workbench/session")

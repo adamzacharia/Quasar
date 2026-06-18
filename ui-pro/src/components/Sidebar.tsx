@@ -8,7 +8,7 @@ import { useAuthStore } from "../lib/auth-store";
 import {
     Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu
+    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu, Waves
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
 import { isTaccModel } from "../lib/models";
@@ -445,6 +445,14 @@ export function Sidebar() {
                     <Plus className="w-5 h-5 transition-transform group-hover:rotate-90" />
                     <span>New Chat</span>
                 </button>
+            </div>
+
+            <div className="px-4 mb-4">
+                <Link href="/spectral-lines"
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors text-sm ${pathname === "/spectral-lines" ? "bg-cyan-500/10 text-cyan-200 border border-cyan-500/20" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                    <Waves className="w-4 h-4" />
+                    Spectral Line Explorer
+                </Link>
             </div>
 
             {/* Conversation History */}

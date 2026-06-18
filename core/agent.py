@@ -643,10 +643,7 @@ GUIDELINES:
 - **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
-- **LINE COVERAGE**: When the user asks about line coverage (e.g. "Check CO(2-1) line coverage for M87"), follow this exact 2-step workflow:
-  1. **Step 1**: Search the ALMA archive for the target using search_by_target(target_name="M87"). Do NOT search VLA or other archives unless the user explicitly asks.
-  2. **Step 2**: Check line coverage on the results using check_co_lines(z=<target_redshift>) for CO lines, or check_line_coverage(line_freq_ghz=<freq>, line_name="<name>") for a specific line.
-  That's it — just 2 tool calls. Do NOT add extra analysis tasks, do NOT search multiple archives unless asked, and do NOT search for papers. The check_line_coverage and check_co_lines tools automatically work on the LAST search results.
+- **LINE COVERAGE**: For one named transition and target (for example, "Check CO(2-1) line coverage for M87"), call `find_alma_line_coverage` once. It resolves the target/redshift, selects the exact Splatalogue transition, and locally verifies ALMA spectral-window coverage. Do NOT use broad `check_co_lines` for a named transition and do NOT report other CO ladder transitions as matches. Keep `check_co_lines` only for explicit requests to inspect the whole CO/13CO/C18O ladder in prior search results.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
 
 DUAL-SOURCE RESPONSE STRUCTURE (RAG + Web):
@@ -1028,6 +1025,46 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
 
         # NEW: Advanced ALminer Tools
+        self.tool_registry.register(Tool(
+            name="find_alma_line_coverage",
+            description=(
+                "Resolve one named spectral transition with Splatalogue and return only "
+                "ALMA projects whose exact spectral windows cover its observed frequency."
+            ),
+            function=self._find_alma_line_coverage,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {
+                        "type": "string",
+                        "description": "Astronomical target name, e.g. M87",
+                    },
+                    "species": {
+                        "type": "string",
+                        "description": "Molecular species/formula, e.g. CO",
+                    },
+                    "transition": {
+                        "type": "string",
+                        "description": "Exact transition text, e.g. 2-1",
+                    },
+                    "redshift": {
+                        "type": "number",
+                        "description": "Optional explicit redshift; overrides SIMBAD/NED",
+                    },
+                    "tolerance_mhz": {
+                        "type": "number",
+                        "description": "Optional additional frequency tolerance in MHz",
+                    },
+                    "velocity_width_kms": {
+                        "type": "number",
+                        "description": "Optional full velocity width in km/s",
+                    },
+                },
+                "required": ["target_name", "species", "transition"],
+            },
+            category="archive",
+        ))
+
         self.tool_registry.register(Tool(
             name="check_line_coverage",
             description="Check if specific lines are covered in the LAST search results.",
@@ -3372,6 +3409,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "advanced_search": "Running ALMA TAP query",
             "search_alma_with_keywords": "Searching ALMA project metadata",
             "search_alma_co_in_redshift_range": "Searching ALMA CO redshift coverage",
+            "find_alma_line_coverage": "Resolving line and checking exact ALMA coverage",
             "query_alma_science_archive": "Querying ALMA Science Archive",
             "triage_alma_data_products": "Inspecting ALMA data products",
             "list_alma_files": "Listing ALMA files",
@@ -6173,6 +6211,98 @@ IMPORTANT RULES:
             return {"success": True, "message": msg}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _find_alma_line_coverage(
+        self,
+        target_name: str,
+        species: str,
+        transition: str,
+        redshift: Optional[float] = None,
+        tolerance_mhz: float = 0.0,
+        velocity_width_kms: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Resolve one transition and verify exact ALMA SPW coverage."""
+        try:
+            from services.spectral_line_explorer import (
+                find_alma_line_coverage as run_alma_line_coverage,
+            )
+
+            result = run_alma_line_coverage(
+                target_name=target_name,
+                species=species,
+                transition=transition,
+                redshift=redshift,
+                tolerance_mhz=tolerance_mhz,
+                velocity_width_kms=velocity_width_kms,
+            )
+            if not result.get("success"):
+                return result
+            project_rows = []
+            for project in result.get("projects") or []:
+                project_rows.append(
+                    {
+                        "proposal_id": project.get("proposal_id"),
+                        "target_name": project.get("target_name"),
+                        "covered_line_count": project.get("covered_line_count"),
+                        "all_lines_full": project.get("all_lines_full"),
+                        "minimum_edge_margin_mhz": project.get(
+                            "minimum_edge_margin_mhz"
+                        ),
+                        "angular_separation_arcsec": project.get(
+                            "angular_separation_arcsec"
+                        ),
+                        "best_angular_resolution_arcsec": project.get(
+                            "best_angular_resolution_arcsec"
+                        ),
+                        "total_exposure_seconds": project.get(
+                            "total_exposure_seconds"
+                        ),
+                        "archive_url": project.get("archive_url"),
+                    }
+                )
+            frame = pd.DataFrame(project_rows)
+            self.last_search_results = frame
+            self.last_run_result = {
+                "type": "data",
+                "data": frame,
+                "source": (
+                    f"Exact ALMA coverage: {target_name} "
+                    f"{species}({transition})"
+                ),
+            }
+            selected = result.get("selected_line") or {}
+            target = result.get("target") or {}
+            return {
+                "success": True,
+                "target_name": target_name,
+                "species": species,
+                "transition": transition,
+                "rest_frequency_ghz": selected.get("frequency_ghz"),
+                "observed_frequency_ghz": selected.get(
+                    "observed_frequency_ghz"
+                ),
+                "redshift": target.get("redshift"),
+                "redshift_source": target.get("redshift_source"),
+                "coordinates": {
+                    "ra_deg": target.get("ra_deg"),
+                    "dec_deg": target.get("dec_deg"),
+                    "source": target.get("coordinate_source"),
+                },
+                "project_count": result.get("project_count", 0),
+                "projects": project_rows[:25],
+                "backend": result.get("backend"),
+                "degraded": result.get("degraded", False),
+                "warnings": result.get("warnings") or [],
+                "line_explorer_url": result.get("deep_link"),
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "target_name": target_name,
+                "species": species,
+                "transition": transition,
+            }
 
     def _check_line_coverage(self, line_freq_ghz: float, z: float = 0.0, line_name: str = "Line") -> Dict[str, Any]:
         """Check line coverage on cache"""
