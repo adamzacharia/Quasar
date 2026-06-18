@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { AuthModal } from "@/components/AuthModal";
 import { Sidebar } from "@/components/Sidebar";
+import { SpectralLineTable, lineSelectionKey } from "@/components/SpectralLineTable";
 import { useAuthStore } from "@/lib/auth-store";
 import { useChatStore } from "@/lib/store";
 import {
@@ -44,6 +45,7 @@ import {
     type WorkbenchPvSlicePlan,
     type WorkbenchRenderPlan,
     type WorkbenchSpectrumPlan,
+    type SpectralLineRecord,
 } from "@/lib/api";
 
 type RenderMode = "image" | "channel" | "moment" | "pv";
@@ -326,6 +328,7 @@ export default function WorkbenchPage() {
     const [activeJobId, setActiveJobId] = useState<string | null>(null);
     const [prepareResult, setPrepareResult] = useState<WorkbenchPrepareResult | null>(null);
     const [lineData, setLineData] = useState<WorkbenchLineOverlays | null>(null);
+    const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
     const [linePresets, setLinePresets] = useState<WorkbenchLinePreset[]>([]);
     const [renderPlan, setRenderPlan] = useState<WorkbenchRenderPlan | null>(null);
     const [spectrumPlan, setSpectrumPlan] = useState<WorkbenchSpectrumPlan | null>(null);
@@ -736,6 +739,27 @@ export default function WorkbenchPage() {
         } finally {
             setActionLoading(null);
         }
+    };
+
+    const toggleWorkbenchLine = (line: SpectralLineRecord) => {
+        const key = lineSelectionKey(line);
+        setSelectedLineIds((current) =>
+            current.includes(key)
+                ? current.filter((item) => item !== key)
+                : [...current, key]
+        );
+    };
+
+    const exportSelectedLines = () => {
+        const lines = (lineData?.lines || []) as SpectralLineRecord[];
+        const selected = lines.filter((line) => selectedLineIds.includes(lineSelectionKey(line)));
+        const payload = JSON.stringify(selected.length ? selected : lines, null, 2);
+        const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${metadata?.filename || "cube"}-spectral-lines.json`;
+        link.click();
+        URL.revokeObjectURL(url);
     };
 
     const cancelActiveJob = async () => {
@@ -1437,31 +1461,27 @@ export default function WorkbenchPage() {
                                                         </span>
                                                     )}
                                                     <span>{lineData.n_matches} matches</span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={exportSelectedLines}
+                                                        className="rounded border border-slate-800 bg-slate-900 px-2 py-1 text-[10px] text-cyan-200"
+                                                    >
+                                                        Export {selectedLineIds.length ? "selected" : "all"}
+                                                    </button>
                                                 </div>
                                             )}
                                         </div>
-                                        <div className="max-h-72 overflow-y-auto">
+                                        <div className="max-h-[420px] overflow-y-auto p-3">
                                             {lineData?.lines.length ? (
-                                                <table className="w-full text-left text-xs">
-                                                    <thead className="sticky top-0 bg-slate-950 text-slate-500">
-                                                        <tr>
-                                                            <th className="px-4 py-2 font-semibold">Line</th>
-                                                            <th className="px-4 py-2 font-semibold">Rest GHz</th>
-                                                            <th className="px-4 py-2 font-semibold">Obs GHz</th>
-                                                        </tr>
-                                                    </thead>
-                                                    <tbody>
-                                                        {lineData.lines.map((line, index) => (
-                                                            <tr key={`${asText(line.species || line.name, "line")}-${index}`} className="border-t border-slate-900">
-                                                                <td className="max-w-[220px] truncate px-4 py-2 text-slate-200" title={asText(line.species || line.name || line.transition)}>
-                                                                    {asText(line.species || line.name || line.transition, "Candidate")}
-                                                                </td>
-                                                                <td className="px-4 py-2 font-mono text-slate-400">{formatNumber(line.rest_frequency_ghz || line.frequency_ghz, 6)}</td>
-                                                                <td className="px-4 py-2 font-mono text-slate-400">{formatNumber(line.observed_frequency_ghz, 6)}</td>
-                                                            </tr>
-                                                        ))}
-                                                    </tbody>
-                                                </table>
+                                                <SpectralLineTable
+                                                    lines={(lineData.lines as SpectralLineRecord[]).map((line) => ({
+                                                        ...line,
+                                                        frequency_ghz: Number(line.frequency_ghz ?? line.rest_frequency_ghz),
+                                                    }))}
+                                                    selectedIds={selectedLineIds}
+                                                    onToggleSelect={toggleWorkbenchLine}
+                                                    compact
+                                                />
                                             ) : (
                                                 <div className="px-4 py-8 text-sm text-slate-500">No line overlays loaded.</div>
                                             )}

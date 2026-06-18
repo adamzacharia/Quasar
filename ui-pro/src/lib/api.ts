@@ -208,6 +208,219 @@ export async function getModels(): Promise<string[]> {
     catch { return DEFAULT_AVAILABLE_MODELS; }
 }
 
+export type SpectralLineJobStatus =
+    | "queued"
+    | "running"
+    | "needs_input"
+    | "succeeded"
+    | "partial"
+    | "failed"
+    | "canceled"
+    | "orphaned";
+
+export interface SpectralSpecies {
+    species_id: number;
+    tag: string;
+    formula: string;
+    chemical_name: string;
+    molecular_mass?: number | null;
+    status: "known" | "probable" | "potential" | "atmospheric" | "unknown";
+    label: string;
+}
+
+export interface SpectralLineRecord {
+    species_id?: string | number;
+    line_id?: string | number;
+    raw_line_ids?: Array<string | number>;
+    formula?: string;
+    species?: string;
+    chemical_name?: string;
+    species_status?: string;
+    transition?: string;
+    resolved_quantum_numbers?: string;
+    unresolved_quantum_numbers?: string;
+    catalogs?: string[];
+    frequency_ghz?: number;
+    predicted_frequency_ghz?: number | null;
+    predicted_frequency_uncertainty_mhz?: number | null;
+    measured_frequency_ghz?: number | null;
+    measured_frequency_uncertainty_mhz?: number | null;
+    observed_frequency_ghz?: number | null;
+    frequency_uncertainty_mhz?: number | null;
+    frequency_selection_reason?: string;
+    nrao_recommended?: boolean | null;
+    astronomically_observed?: boolean | null;
+    lower_energy_k?: number | null;
+    upper_energy_k?: number | null;
+    log_intensity?: number | null;
+    lovas_astronomical_intensity?: number | null;
+    sijmu2?: number | null;
+    sij?: number | null;
+    aij_log?: number | null;
+    alma_bands?: number[];
+    alma_preferred_band?: number | null;
+    alma_band_edge_warning?: string | null;
+    score?: number;
+    classification?: string;
+    velocity_offset_kms?: number | null;
+    score_components?: Record<string, number>;
+    [key: string]: unknown;
+}
+
+export interface SpectralCoverageProject {
+    proposal_id: string;
+    target_name?: string;
+    pi_name?: string;
+    obs_title?: string;
+    bands?: string[];
+    covers_all_lines: boolean;
+    all_lines_full: boolean;
+    covered_line_count: number;
+    requested_line_count: number;
+    minimum_edge_margin_mhz?: number | null;
+    angular_separation_arcsec?: number | null;
+    best_angular_resolution_arcsec?: number | null;
+    total_exposure_seconds?: number;
+    archive_url?: string;
+    observations: Array<Record<string, unknown>>;
+}
+
+export interface SpectralLineMetadata {
+    enabled: boolean;
+    band_registry: {
+        version: string;
+        source: string;
+        bands: Array<{ band: number; minimum_ghz: number; maximum_ghz: number }>;
+    };
+    units: string[];
+    catalogs: string[];
+    versions: string[];
+    defaults: Record<string, unknown>;
+    limits: Record<string, unknown>;
+}
+
+export interface SpectralLineJob {
+    job_id: string;
+    operation: "catalog_search" | "alma_coverage" | "confusion";
+    status: SpectralLineJobStatus;
+    phase: string;
+    progress: number;
+    payload: Record<string, unknown>;
+    created_at: string;
+    updated_at: string;
+    warnings: string[];
+    summary: Record<string, unknown>;
+    error?: string | null;
+    cancel_requested?: boolean;
+    rows?: Array<SpectralLineRecord | SpectralCoverageProject>;
+    pagination?: {
+        dataset: string;
+        page: number;
+        page_size: number;
+        total_rows: number;
+        total_pages: number;
+    };
+    result_context?: Record<string, unknown>;
+}
+
+function spectralAuthHeaders(token?: string | null, json = false): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (json) headers["Content-Type"] = "application/json";
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
+export async function getSpectralLineMetadata(token?: string | null): Promise<SpectralLineMetadata> {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/metadata`, {
+        headers: spectralAuthHeaders(token),
+    });
+    return parseJsonResponse<SpectralLineMetadata>(res);
+}
+
+export async function searchSpectralSpecies(
+    query: string,
+    limit = 25,
+    token?: string | null,
+): Promise<{ species: SpectralSpecies[]; query: string }> {
+    const params = new URLSearchParams({ query, limit: String(limit) });
+    const res = await fetch(`${API_BASE}/api/spectral-lines/species?${params}`, {
+        headers: spectralAuthHeaders(token),
+    });
+    return parseJsonResponse<{ species: SpectralSpecies[]; query: string }>(res);
+}
+
+export async function resolveSpectralTarget(
+    input: {
+        target_name: string;
+        redshift?: number;
+        ra_deg?: number;
+        dec_deg?: number;
+    },
+    token?: string | null,
+): Promise<Record<string, unknown>> {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/resolve-target`, {
+        method: "POST",
+        headers: spectralAuthHeaders(token, true),
+        body: JSON.stringify(input),
+    });
+    return parseJsonResponse<Record<string, unknown>>(res);
+}
+
+export async function startSpectralLineJob(
+    operation: SpectralLineJob["operation"],
+    payload: Record<string, unknown>,
+    token?: string | null,
+): Promise<SpectralLineJob> {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs`, {
+        method: "POST",
+        headers: spectralAuthHeaders(token, true),
+        body: JSON.stringify({ operation, payload }),
+    });
+    return parseJsonResponse<SpectralLineJob>(res);
+}
+
+export async function getSpectralLineJob(
+    jobId: string,
+    page = 1,
+    pageSize = 100,
+    token?: string | null,
+    dataset?: "lines" | "raw_lines" | "coverage" | "candidates",
+): Promise<SpectralLineJob> {
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+    if (dataset) params.set("dataset", dataset);
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}?${params}`, {
+        headers: spectralAuthHeaders(token),
+    });
+    return parseJsonResponse<SpectralLineJob>(res);
+}
+
+export async function cancelSpectralLineJob(
+    jobId: string,
+    token?: string | null,
+): Promise<SpectralLineJob> {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}`, {
+        method: "DELETE",
+        headers: spectralAuthHeaders(token),
+    });
+    return parseJsonResponse<SpectralLineJob>(res);
+}
+
+export async function downloadSpectralLineExport(
+    jobId: string,
+    dataset: "lines" | "raw_lines" | "coverage" | "candidates",
+    format: "csv" | "tsv" | "json" | "casa",
+    token?: string | null,
+): Promise<{ blob: Blob; filename: string }> {
+    const params = new URLSearchParams({ dataset, format });
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}/export?${params}`, {
+        headers: spectralAuthHeaders(token),
+    });
+    if (!res.ok) throw new Error(await getErrorMessage(res));
+    const disposition = res.headers.get("content-disposition") || "";
+    const filename = disposition.match(/filename="([^"]+)"/)?.[1] || `spectral-lines.${format}`;
+    return { blob: await res.blob(), filename };
+}
+
 export interface WorkbenchSession {
     session_id: string;
     source_url: string;
