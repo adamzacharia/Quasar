@@ -18,7 +18,7 @@ type GraphEdge = {
     strength?: number;
 };
 
-type ResearchGraph = {
+export type ResearchGraph = {
     nodes: GraphNode[];
     edges: GraphEdge[];
     summary: {

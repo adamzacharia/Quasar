@@ -217,6 +217,7 @@ class QuasarAgent:
         # Replaces the old singleton `self.last_response_id` which caused
         # cross-user state poisoning on the shared agent instance.
         self._conv_response_ids: Dict[str, str] = {}
+        self._conv_run_tokens: Dict[str, str] = {}
         self._conv_ids_lock = threading.Lock()
         self._alma_project_picker_by_conversation: Dict[str, Dict[str, Any]] = {}
         self._alma_project_picker_lock = threading.Lock()
@@ -524,26 +525,91 @@ class QuasarAgent:
 
     # ── Per-conversation response ID helpers ────────────────────────
 
-    def _get_response_id(self, conversation_id: str) -> Optional[str]:
-        """Get the OpenAI previous_response_id for a specific conversation."""
-        with self._conv_ids_lock:
-            return self._conv_response_ids.get(conversation_id)
+    def _response_state_key(self, conversation_id: str, model: Optional[str] = None) -> str:
+        selected_model = model or self.config.model
+        return f"{conversation_id}|{detect_provider(selected_model)}|{selected_model}"
 
-    def _set_response_id(self, conversation_id: str, response_id: Optional[str]):
-        """Set (or clear) the OpenAI response_id for a conversation."""
+    def _get_response_id(
+        self,
+        conversation_id: str,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
+        """Get provider response state for one conversation/model pair."""
         with self._conv_ids_lock:
+            return self._conv_response_ids.get(self._response_state_key(conversation_id, model))
+
+    def _begin_response_run(self, conversation_id: str, model: str, run_token: Optional[str]) -> None:
+        if not run_token:
+            return
+        with self._conv_ids_lock:
+            self._conv_run_tokens[self._response_state_key(conversation_id, model)] = run_token
+
+    def _response_run_active(self, conversation_id: str, model: str, run_token: Optional[str]) -> bool:
+        if not run_token:
+            return True
+        with self._conv_ids_lock:
+            return self._conv_run_tokens.get(
+                self._response_state_key(conversation_id, model)
+            ) == run_token
+
+    def _set_response_id(
+        self,
+        conversation_id: str,
+        response_id: Optional[str],
+        model: Optional[str] = None,
+        run_token: Optional[str] = None,
+    ):
+        """Set or clear provider response state for one conversation/model pair."""
+        key = self._response_state_key(conversation_id, model)
+        with self._conv_ids_lock:
+            if run_token and self._conv_run_tokens.get(key) != run_token:
+                return
             if response_id is None:
-                self._conv_response_ids.pop(conversation_id, None)
+                self._conv_response_ids.pop(key, None)
             else:
-                self._conv_response_ids[conversation_id] = response_id
+                self._conv_response_ids[key] = response_id
+
+    def clear_response_state(
+        self,
+        conversation_id: str,
+        model: Optional[str] = None,
+        run_token: Optional[str] = None,
+    ) -> None:
+        """Clear agent and compatibility-adapter history after interruption."""
+        if run_token and not self._response_run_active(
+            conversation_id, model or self.config.model, run_token
+        ):
+            return
+        response_id = self._get_response_id(conversation_id, model)
+        self._set_response_id(conversation_id, None, model, run_token)
+        if response_id:
+            try:
+                self.client.responses.clear_history(response_id)
+            except Exception:
+                pass
+
+    def cancel_response_run(self, conversation_id: str, model: str, run_token: str) -> None:
+        """Invalidate a timed-out run so its worker cannot restore stale state."""
+        key = self._response_state_key(conversation_id, model)
+        with self._conv_ids_lock:
+            if self._conv_run_tokens.get(key) != run_token:
+                return
+        self.clear_response_state(conversation_id, model, run_token)
+        with self._conv_ids_lock:
+            if self._conv_run_tokens.get(key) == run_token:
+                self._conv_run_tokens.pop(key, None)
 
     def _cleanup_conv_states(self, max_entries: int = 500):
         """Prevent memory leak — evict oldest conversation entries."""
         with self._conv_ids_lock:
-            if len(self._conv_response_ids) > max_entries:
-                keys = list(self._conv_response_ids.keys())
+            keys = list(dict.fromkeys([
+                *self._conv_response_ids.keys(),
+                *self._conv_run_tokens.keys(),
+            ]))
+            if len(keys) > max_entries:
                 for k in keys[:len(keys) // 2]:
-                    del self._conv_response_ids[k]
+                    self._conv_response_ids.pop(k, None)
+                    self._conv_run_tokens.pop(k, None)
 
     # Backward-compatible property so legacy code (e.g. reset_conversation_state)
     # still works.  In production, prefer _get/_set_response_id with a conv_id.
@@ -6991,11 +7057,16 @@ IMPORTANT RULES:
         plan_feedback_queue=None,
         on_thought=None,
         web_search: bool = False,
+        model: Optional[str] = None,
+        run_token: Optional[str] = None,
+        _history_recovery_attempted: bool = False,
     ) -> str:
         # Assign a unique conversation_id if none provided (isolates anonymous
         # concurrent requests so they never share OpenAI response state).
         if not conversation_id:
             conversation_id = f"anon_{uuid.uuid4().hex[:12]}"
+        selected_model = model or self.config.model
+        self._begin_response_run(conversation_id, selected_model, run_token)
 
         # Periodic cleanup to prevent unbounded memory growth
         self._cleanup_conv_states()
@@ -7562,8 +7633,8 @@ IMPORTANT RULES:
 
         # Emit model step
         if on_status:
-            on_status(f"Calling {self.config.model}", "running")
-            on_status(f"Calling {self.config.model}", "completed")
+            on_status(f"Calling {selected_model}", "running")
+            on_status(f"Calling {selected_model}", "completed")
         
         # 4. Build the full input
         citation_note = ""
@@ -7725,6 +7796,8 @@ IMPORTANT RULES:
             if complexity > Conductor.COMPLEXITY_THRESHOLD:
                 import asyncio, json as _json
                 trace_id = self.query_tracer.new_trace(_user_query, user_id=user_id)
+                if on_status:
+                    on_status("__run_mode__:conductor", "meta")
 
                 # Classify complexity tier → controls max subtasks
                 _tier_name, _tier_max = Conductor.classify_tier(complexity)
@@ -7871,7 +7944,7 @@ IMPORTANT RULES:
             
             # Smart token budget replaces hard MAX_TOOL_ROUNDS = 12
             _token_budget = TokenBudget(max_budget=100_000)
-            last_id = self._get_response_id(conversation_id)
+            last_id = self._get_response_id(conversation_id, selected_model)
             output_text = ""
             _had_tool_calls = False
             _web_tool_results: List[Dict[str, Any]] = []
@@ -7885,7 +7958,7 @@ IMPORTANT RULES:
                 )
                 _round_text_buffer = ""
                 request_kwargs = {
-                    "model": self.config.model,
+                    "model": selected_model,
                     "input": full_input if _round == 0 else tool_results,
                     "instructions": self.system_prompt,
                     "previous_response_id": last_id,
@@ -7947,7 +8020,7 @@ IMPORTANT RULES:
                         print(f"[WARNING] Recovering from hanging tool call state for conv={conversation_id}. Dropping previous_response_id.")
                         del request_kwargs["previous_response_id"]
                         last_id = None
-                        self._set_response_id(conversation_id, None)
+                        self.clear_response_state(conversation_id, selected_model, run_token)
                         response_stream = self.client.responses.create(**request_kwargs)
                     else:
                         raise e
@@ -7962,7 +8035,12 @@ IMPORTANT RULES:
                 for event in response_stream:
                     if event.type == "response.created":
                         last_id = event.response.id
-                        self._set_response_id(conversation_id, last_id)
+                        self._set_response_id(
+                            conversation_id,
+                            last_id,
+                            selected_model,
+                            run_token,
+                        )
                     elif event.type == "response.reasoning_summary_text.delta":
                         # Stream the model-provided reasoning summary to the Thinking box.
                         _reasoning_summary_text += event.delta
@@ -8334,7 +8412,35 @@ IMPORTANT RULES:
             )
             if _is_hanging_tool_err:
                 print(f"[WARNING] Clearing poisoned response_id for conv={conversation_id} to break error loop.")
-                self._set_response_id(conversation_id, None)
+                self.clear_response_state(conversation_id, selected_model, run_token)
+                if (
+                    detect_provider(selected_model) in {"tacc", "deepseek"}
+                    and not _history_recovery_attempted
+                    and not output_text
+                    and self._response_run_active(conversation_id, selected_model, run_token)
+                ):
+                    logger.warning(
+                        "Retrying interrupted %s tool history without cached state "
+                        "for conversation %s",
+                        detect_provider(selected_model),
+                        conversation_id,
+                    )
+                    return self.stream_response_api(
+                        query,
+                        message_placeholder=message_placeholder,
+                        user_id=user_id,
+                        on_token=on_token,
+                        on_status=on_status,
+                        attachments=attachments,
+                        raw_query=raw_query,
+                        conversation_id=conversation_id,
+                        plan_feedback_queue=plan_feedback_queue,
+                        on_thought=on_thought,
+                        web_search=web_search,
+                        model=selected_model,
+                        run_token=run_token,
+                        _history_recovery_attempted=True,
+                    )
             error_msg = f"Error with Responses API: {str(e)}"
             print(f"[ERROR] {error_msg}")
             return error_msg
@@ -8374,11 +8480,31 @@ IMPORTANT RULES:
     def reset_conversation_state(self, conversation_id: Optional[str] = None):
         """Reset conversation state for a specific or all chat sessions."""
         if conversation_id:
-            self._set_response_id(conversation_id, None)
+            prefix = f"{conversation_id}|"
+            with self._conv_ids_lock:
+                response_ids = [
+                    response_id
+                    for key, response_id in self._conv_response_ids.items()
+                    if key.startswith(prefix)
+                ]
+                for key in [key for key in self._conv_response_ids if key.startswith(prefix)]:
+                    self._conv_response_ids.pop(key, None)
+                for key in [key for key in self._conv_run_tokens if key.startswith(prefix)]:
+                    self._conv_run_tokens.pop(key, None)
+            for response_id in response_ids:
+                try:
+                    self.client.responses.clear_history(response_id)
+                except Exception:
+                    pass
         else:
             # Clear ALL conversation states (full reset)
             with self._conv_ids_lock:
                 self._conv_response_ids.clear()
+                self._conv_run_tokens.clear()
+            try:
+                self.client.responses.clear_history()
+            except Exception:
+                pass
         self.memory.clear()
         self.session_memory.clear()
         self._session_token_estimate = 0

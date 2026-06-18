@@ -179,7 +179,11 @@ export function useShowOnboarding(): [boolean, () => void] {
 
     useEffect(() => {
         const done = localStorage.getItem(STORAGE_KEY);
-        if (!done) setShow(true);
+        if (!done) {
+            // localStorage is only available after the component mounts.
+            // eslint-disable-next-line react-hooks/set-state-in-effect
+            setShow(true);
+        }
     }, []);
 
     const dismiss = useCallback(() => {

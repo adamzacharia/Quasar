@@ -119,7 +119,7 @@ export default function TermsPage() {
               </p>
               <ul className="list-disc pl-5 space-y-2">
                 <li>
-                  <strong className="text-slate-200">Your Chats:</strong> Prompt histories, research outlines, and responses so you don't lose your work.
+                  <strong className="text-slate-200">Your Chats:</strong> Prompt histories, research outlines, and responses so you don&apos;t lose your work.
                 </li>
                 <li>
                   <strong className="text-slate-200">Your Searches:</strong> Coordinate lookups and target names you search.
@@ -183,7 +183,7 @@ export default function TermsPage() {
             </div>
             <div className="bg-slate-950/30 border border-slate-900 rounded-2xl p-6 space-y-3 text-sm leading-relaxed text-slate-400">
               <p>
-                Your chat history stays saved so you don't lose your work. If you log out, your browser session is safely cleared.
+                Your chat history stays saved so you don&apos;t lose your work. If you log out, your browser session is safely cleared.
               </p>
             </div>
           </section>
@@ -201,7 +201,7 @@ export default function TermsPage() {
                 You have full control over your scientific search history and profile:
               </p>
               <p>
-                <strong>Wiping History:</strong> You can delete individual chat threads from the sidebar at any time, or request a complete wipe of your account and history in your Settings. Once deleted, it's permanently gone.
+                <strong>Wiping History:</strong> You can delete individual chat threads from the sidebar at any time, or request a complete wipe of your account and history in your Settings. Once deleted, it&apos;s permanently gone.
               </p>
             </div>
           </section>

@@ -54,6 +54,7 @@ interface ChatStore {
     }) => void;
     updateLastAssistantMessage: (content: string) => void;
     updateLastAssistantThinking: (thinking: string) => void;
+    updateLastAssistantRunMeta: (meta: import("./api").ChatRunMeta) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -185,6 +186,9 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     }
     if (meta.thinkingDuration || meta.thinking_duration) {
         base.thinkingDuration = Number(meta.thinkingDuration || meta.thinking_duration);
+    }
+    if (meta.runMeta && typeof meta.runMeta === "object") {
+        base.runMeta = meta.runMeta as Message["runMeta"];
     }
 
     const messages: Message[] = [base];
@@ -453,6 +457,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         return {
             messages: updateAssistantThinking(state.messages, thinking),
             thinkingStatus: "running",
+        };
+    }),
+
+    updateLastAssistantRunMeta: (meta) => set((state) => {
+        const messages = [...state.messages];
+        const index = findLastAssistantTextIndex(messages);
+        if (index < 0) return {};
+        messages[index] = { ...messages[index], runMeta: meta };
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
         };
     }),
 

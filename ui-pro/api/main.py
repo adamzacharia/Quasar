@@ -411,6 +411,10 @@ def _fetch_cadc_preview_urls(obs_publisher_dids: List[str], max_ids: int = 200) 
 
 # Thread pool for running synchronous agent calls
 _executor = ThreadPoolExecutor(max_workers=2)  # Keep low to avoid OOM on 2GB instances
+_chat_executor = ThreadPoolExecutor(
+    max_workers=max(2, int(os.getenv("CHAT_WORKER_THREADS", "4")))
+)
+_storage_executor = ThreadPoolExecutor(max_workers=2)
 
 # ── Channel Routers ──────────────────────────────────────────
 try:
@@ -519,6 +523,22 @@ class ProviderKeySaveRequest(BaseModel):
 class ProviderKeyLimitRequest(BaseModel):
     token_limit: Optional[int] = None
 
+
+class IssueReportCreateRequest(BaseModel):
+    run_id: str
+    message_id: str
+    category: str
+    description: str
+    include_context: bool = False
+    prompt_excerpt: Optional[str] = ""
+    response_excerpt: Optional[str] = ""
+    technical_context: Optional[Dict[str, Any]] = None
+
+
+class IssueReportUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    admin_notes: Optional[str] = None
+
 # ── Auth Service Instance ──
 from services.auth import AuthService
 from services.conversation_service import ConversationService
@@ -533,6 +553,7 @@ from services.provider_file_service import (
     UploadedChatFile,
 )
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
+from services.issue_report_service import ChatDeadline, IssueReportService
 from services.spectral_line_explorer import SpectralLineJobService
 from services.secret_redaction import redact_secrets
 from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
@@ -545,6 +566,7 @@ spectral_line_job_service = SpectralLineJobService()
 provider_file_service = ProviderFileService()
 provider_key_service = ProviderKeyService()
 usage_quota_service = UsageQuotaService()
+issue_report_service = IssueReportService()
 
 from services.analytics_service import AnalyticsService
 analytics_service = AnalyticsService()
@@ -1315,9 +1337,73 @@ def _stream_chat_response(
         except Exception as lf_err:
             logger.warning(f"[Langfuse] Failed to create parent trace: {lf_err}")
 
+    run_id = str(uuid.uuid4())
+    trace_id = str(getattr(lf_trace, "id", "") or "")
+    try:
+        issue_report_service.start_run(
+            run_id=run_id,
+            user_id=current_user_id,
+            conversation_id=conv_id or request.conversation_id or "",
+            trace_id=trace_id,
+            model=requested_model,
+            provider=provider,
+            key_source=selected_key_source,
+            client_ip=client_ip,
+        )
+    except Exception as run_err:
+        logger.warning(f"[RUN] Failed to create run record {run_id}: {run_err}")
+
     async def generate():
+        inactivity_timeout = int(os.getenv("CHAT_INACTIVITY_TIMEOUT_SECONDS", "90"))
+        standard_timeout = int(os.getenv("CHAT_STANDARD_TIMEOUT_SECONDS", "240"))
+        conductor_timeout = int(os.getenv("CHAT_CONDUCTOR_TIMEOUT_SECONDS", "360"))
+        run_started_at = _time.perf_counter()
+        run_status = "started"
+        run_error_code = ""
+        run_error_message = ""
+        run_last_status = ""
+        run_tools: List[str] = []
+        first_token_ms: Optional[int] = None
+        provider_chunk_count = 0
+        run_finalized = False
+
+        def finalize_run_record() -> None:
+            nonlocal run_finalized
+            if run_finalized:
+                return
+            try:
+                issue_report_service.finalize_run(
+                    run_id,
+                    status=run_status if run_status != "started" else "failed",
+                    duration_ms=int((_time.perf_counter() - run_started_at) * 1000),
+                    tools_called=run_tools,
+                    last_status=run_last_status,
+                    error_code=run_error_code,
+                    error_message=run_error_message,
+                    first_token_ms=first_token_ms,
+                    provider_chunk_count=provider_chunk_count,
+                )
+                run_finalized = True
+            except Exception as run_err:
+                logger.warning(f"[RUN] Failed to finalize run {run_id}: {run_err}")
+
+        run_meta = {
+            "type": "run_meta",
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "model": requested_model,
+            "provider": provider,
+            "conversation_id": conv_id or request.conversation_id or "",
+            "inactivity_timeout_seconds": inactivity_timeout,
+            "turn_timeout_seconds": standard_timeout,
+        }
+        yield f"data: {json.dumps(run_meta)}\n\n"
+
         if agent is None:
             err = get_agent_error() or "Unknown initialization error"
+            run_status = "failed"
+            run_error_code = "agent_unavailable"
+            run_error_message = err
             mock_response = (
                 "Backend initialization failed.\n\n"
                 "QuasarAgent could not be loaded. Python traceback:\n\n"
@@ -1328,6 +1414,7 @@ def _stream_chat_response(
                 yield f"data: {data}\n\n"
                 await asyncio.sleep(0.02)
             yield "data: [DONE]\n\n"
+            finalize_run_record()
             return
 
         for note in attachment_context.get("messages", []):
@@ -1362,8 +1449,12 @@ def _stream_chat_response(
                     f"{requested_model}. The selected model cannot accept raw image inputs. "
                     f"Image analysis error: {redact_secrets(e)}"
                 )
+                run_status = "failed"
+                run_error_code = "image_prepass_failed"
+                run_error_message = msg
                 yield f"data: {json.dumps({'type': 'error', 'content': msg})}\n\n"
                 yield "data: [DONE]\n\n"
+                finalize_run_record()
                 return
             yield _sse_status("Analyzing uploaded image", "completed")
             enriched_message = (
@@ -1485,9 +1576,6 @@ def _stream_chat_response(
             web_search=request.web_search,
         )
 
-        if requested_model != agent.config.model:
-            agent.set_model(requested_model)
-
         _chat_start_time = _time.perf_counter()
         try:
             loop = asyncio.get_event_loop()
@@ -1558,6 +1646,8 @@ def _stream_chat_response(
                                 plan_feedback_queue=_pfq,
                                 on_thought=on_thought,
                                 web_search=request.web_search,
+                                model=requested_model,
+                                run_token=run_id,
                             )
                         finally:
                             # Clean up the plan feedback queue
@@ -1581,8 +1671,8 @@ def _stream_chat_response(
                         from core.llm_client import set_langfuse_parent
                         set_langfuse_parent(None)
 
-            loop.run_in_executor(
-                _executor,
+            agent_future = loop.run_in_executor(
+                _chat_executor,
                 lambda: _run_with_llm_context(
                     llm_context,
                     current_user_id,
@@ -1611,19 +1701,54 @@ def _stream_chat_response(
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
+            deadline = ChatDeadline(
+                inactivity_seconds=inactivity_timeout,
+                standard_seconds=standard_timeout,
+                conductor_seconds=conductor_timeout,
+                started_at=run_started_at,
+            )
 
             while True:
                 # Use a timeout so we can send SSE keepalive comments.
                 # Render's reverse proxy kills idle connections after ~30s.
                 # Sending `:keepalive\n\n` (an SSE comment) every 15s prevents this.
                 try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    now = _time.perf_counter()
+                    wait_seconds = min(15.0, deadline.remaining(now))
+                    if wait_seconds <= 0:
+                        raise asyncio.TimeoutError
+                    msg = await asyncio.wait_for(queue.get(), timeout=wait_seconds)
                 except asyncio.TimeoutError:
+                    now = _time.perf_counter()
+                    timeout_code = deadline.timeout_code(now)
+                    if timeout_code:
+                        run_status = "timed_out"
+                        run_error_code = timeout_code
+                        run_error_message = (
+                            f"The {provider} model stopped producing progress. "
+                            "The run was ended so the chat would not remain stuck."
+                        )
+                        try:
+                            agent.cancel_response_run(
+                                conv_id or request.conversation_id or "",
+                                requested_model,
+                                run_id,
+                            )
+                        except Exception as clear_err:
+                            logger.warning(f"[RUN] Failed to clear response state: {clear_err}")
+                        agent_future.cancel()
+                        yield f"data: {json.dumps({'type': 'error', 'code': timeout_code, 'content': run_error_message, 'run_id': run_id})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
                     yield ": keepalive\n\n"
                     continue
+                deadline.mark_activity(_time.perf_counter())
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
                     if msg_type == "status":
+                        if step == "__run_mode__:conductor":
+                            deadline.enable_conductor()
+                            continue
                         if isinstance(step, str) and step.startswith("__eager_data__"):
                             # Agent sent inline result data — stash it for
                             # the next __data_ready__ to consume.
@@ -1717,6 +1842,7 @@ def _stream_chat_response(
                             yield _sse_status(step, state)
                             # Capture thinking steps for history
                             _rich_thinking.append({"step": step, "state": state})
+                            run_last_status = str(step)
                         continue
 
                 msg_type, payload = msg[0], msg[1]
@@ -1727,11 +1853,17 @@ def _stream_chat_response(
                     _snapshot_last = payload.get("last_result") if isinstance(payload, dict) else None
                     break
                 if msg_type == "error":
+                    run_status = "failed"
+                    run_error_code = "agent_error"
+                    run_error_message = str(payload)
                     response_text = f"An error occurred: {payload}"
                     _snapshot_all = []
                     _snapshot_last = None
                     break
                 if msg_type == "token":
+                    provider_chunk_count += 1
+                    if first_token_ms is None:
+                        first_token_ms = int((_time.perf_counter() - run_started_at) * 1000)
                     first_token = False
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
@@ -1814,6 +1946,8 @@ def _stream_chat_response(
                     "quasar_tool"
                 )
                 tool_display = tool_name_raw.replace("_", " ").title()
+                if tool_name_raw not in run_tools:
+                    run_tools.append(tool_name_raw)
                 tool_event = json.dumps({
                     "type": "tool_call",
                     "name": tool_name_raw,
@@ -1941,6 +2075,13 @@ def _stream_chat_response(
                         rich_meta["thinkingSteps"] = _rich_thinking
                     if _rich_thinking_text:
                         rich_meta["thinking"] = _rich_thinking_text
+                    rich_meta["runMeta"] = {
+                        "run_id": run_id,
+                        "trace_id": trace_id,
+                        "model": requested_model,
+                        "provider": provider,
+                        "conversation_id": conv_id or request.conversation_id or "",
+                    }
                     conversation_service.save_message(
                         conv_id, "assistant", response_text or "",
                         metadata=rich_meta if rich_meta else None,
@@ -1952,6 +2093,9 @@ def _stream_chat_response(
             try:
                 _elapsed_ms = int((_time.perf_counter() - _chat_start_time) * 1000)
                 _tool_names = [s.get("step", "").replace("Calling tool: ", "") for s in _rich_thinking if "Calling tool:" in s.get("step", "")]
+                for tool_name in _tool_names:
+                    if tool_name and tool_name not in run_tools:
+                        run_tools.append(tool_name)
                 _user_email = current_user.get("email", "") if current_user else ""
                 _user_name = current_user.get("name", "") if current_user else ""
                 analytics_service.log_chat(
@@ -1975,20 +2119,50 @@ def _stream_chat_response(
                 meta_event = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
                 yield f"data: {meta_event}\n\n"
 
+            if run_status == "started":
+                run_status = "completed"
             yield "data: [DONE]\n\n"
 
+        except asyncio.CancelledError:
+            run_status = "cancelled"
+            run_error_code = "client_cancelled"
+            run_error_message = "The client cancelled the chat run."
+            try:
+                if "agent_future" in locals():
+                    agent_future.cancel()
+                agent.cancel_response_run(
+                    conv_id or request.conversation_id or "",
+                    requested_model,
+                    run_id,
+                )
+            except Exception:
+                pass
+            raise
         except Exception as e:
+            run_status = "failed"
+            run_error_code = "chat_error"
+            run_error_message = redact_secrets(e)
             print(f"Chat route error: {redact_secrets(e)}")
-            error_data = json.dumps({"type": "error", "content": redact_secrets(e)})
+            error_data = json.dumps({
+                "type": "error",
+                "code": run_error_code,
+                "content": run_error_message,
+                "run_id": run_id,
+            })
             yield f"data: {error_data}\n\n"
             yield "data: [DONE]\n\n"
         finally:
+            finalize_run_record()
             if lf_trace:
                 try:
                     lf_trace.update(
                         metadata={
                             "response_length": len(response_text) if response_text else 0,
                             "response_preview": response_text[:200] if response_text else "",
+                            "run_id": run_id,
+                            "run_status": run_status,
+                            "first_token_ms": first_token_ms,
+                            "provider_chunk_count": provider_chunk_count,
                         }
                     )
                 except Exception:
@@ -3617,8 +3791,16 @@ async def submit_feedback(req: Request, authorization: Optional[str] = Header(No
     if lf_client:
         try:
             conv_id = body.get("conversation_id", "")
-            # Look up trace_id from latest traces, or fall back to _last_trace_id globally
-            trace_id = (_latest_traces.get(conv_id) if conv_id else None) or _last_trace_id
+            run_id = body.get("run_id", "")
+            trace_id = None
+            if run_id and current_user:
+                run = await loop.run_in_executor(
+                    _storage_executor,
+                    lambda: issue_report_service.get_run(run_id, user_id=user_id),
+                )
+                trace_id = run.get("trace_id") if run else None
+            if not trace_id and conv_id:
+                trace_id = _latest_traces.get(conv_id)
             
             # Score target: if trace_id is known, attach directly to the trace, else attach to session
             score_kwargs = {
@@ -3631,8 +3813,6 @@ async def submit_feedback(req: Request, authorization: Optional[str] = Header(No
                 score_kwargs["trace_id"] = trace_id
             elif conv_id:
                 score_kwargs["session_id"] = conv_id
-            else:
-                score_kwargs["trace_id"] = _last_trace_id
 
             if score_kwargs.get("trace_id") or score_kwargs.get("session_id"):
                 await loop.run_in_executor(
@@ -3644,6 +3824,115 @@ async def submit_feedback(req: Request, authorization: Optional[str] = Header(No
             print(f"[Langfuse] Failed to ingest feedback score: {lf_err}", flush=True)
 
     return {"success": True, "feedback": feedback}
+
+
+@app.post("/api/issue-reports")
+async def submit_issue_report(
+    req: IssueReportCreateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Store a private structured issue report linked to a chat run."""
+    user_id = current_user.get("sub", "")
+    try:
+        report = await asyncio.get_event_loop().run_in_executor(
+            _storage_executor,
+            lambda: issue_report_service.create_report(
+                user_id=user_id,
+                run_id=req.run_id,
+                message_id=req.message_id,
+                category=req.category,
+                description=req.description,
+                include_context=req.include_context,
+                prompt_excerpt=req.prompt_excerpt or "",
+                response_excerpt=req.response_excerpt or "",
+                technical_context=req.technical_context or {},
+            ),
+        )
+        return {"success": True, "report": report}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/admin/issue-reports")
+async def admin_issue_reports(
+    status: str = "",
+    provider: str = "",
+    model: str = "",
+    category: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 200,
+    current_user: dict = Depends(get_current_user),
+):
+    """List private issue reports with admin filters."""
+    if not is_admin_email(_current_user_email(current_user)):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return {
+        "reports": issue_report_service.list_reports(
+            status=status,
+            provider=provider,
+            model=model,
+            category=category,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+        )
+    }
+
+
+@app.patch("/api/admin/issue-reports/{report_id}")
+async def admin_update_issue_report(
+    report_id: str,
+    req: IssueReportUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update private report triage status or admin notes."""
+    if not is_admin_email(_current_user_email(current_user)):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    try:
+        return issue_report_service.update_report(
+            report_id,
+            status=req.status,
+            admin_notes=req.admin_notes,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/admin/issue-reports/export")
+async def admin_export_issue_reports(
+    format: str = "csv",
+    status: str = "",
+    provider: str = "",
+    model: str = "",
+    category: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    current_user: dict = Depends(get_current_user),
+):
+    """Export private issue reports as CSV or JSON."""
+    if not is_admin_email(_current_user_email(current_user)):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    filters = {
+        "status": status,
+        "provider": provider,
+        "model": model,
+        "category": category,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    if format.lower() == "json":
+        return issue_report_service.list_reports(limit=1000, **filters)
+    csv_data = issue_report_service.export_reports_csv(**filters)
+    return StreamingResponse(
+        iter([csv_data]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=quasar_issue_reports.csv"},
+    )
 
 
 @app.get("/api/admin/feedback/export")

@@ -325,6 +325,15 @@ class ResponsesShim:
     def __init__(self, llm_client: "LLMClient"):
         self._llm = llm_client
         self._history_cache = {}  # response_id -> list of chat messages
+        self._history_lock = _threading.Lock()
+
+    def clear_history(self, response_id: Optional[str] = None) -> None:
+        """Clear one compatibility-history chain or all cached chains."""
+        with self._history_lock:
+            if response_id:
+                self._history_cache.pop(response_id, None)
+            else:
+                self._history_cache.clear()
 
     def _record_usage(self, provider: str, model: str, result: Any) -> None:
         """Record provider-reported token usage, if a request recorder is installed."""
@@ -1198,8 +1207,10 @@ class ResponsesShim:
             if fmt.get("type") == "json_object":
                 json_mode = True
 
-        if prev_id and prev_id in self._history_cache:
-            messages = list(self._history_cache[prev_id])
+        with self._history_lock:
+            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
+        if cached_messages:
+            messages = cached_messages
             self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data, json_mode)
@@ -1245,7 +1256,8 @@ class ResponsesShim:
             })
         else:
             new_messages.append({"role": "assistant", "content": result.output_text})
-        self._history_cache[result.id] = new_messages
+        with self._history_lock:
+            self._history_cache[result.id] = new_messages
         return result
 
     def _stream_tacc(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
@@ -1259,8 +1271,10 @@ class ResponsesShim:
         tools_raw = kwargs.get("tools", None)
         prev_id = kwargs.get("previous_response_id", None)
 
-        if prev_id and prev_id in self._history_cache:
-            messages = list(self._history_cache[prev_id])
+        with self._history_lock:
+            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
+        if cached_messages:
+            messages = cached_messages
             self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data)
@@ -1362,7 +1376,8 @@ class ResponsesShim:
             })
         else:
             new_messages.append({"role": "assistant", "content": output_text})
-        self._history_cache[resp_id] = new_messages
+        with self._history_lock:
+            self._history_cache[resp_id] = new_messages
 
     def _build_chat_messages(self, instructions: str, input_data, json_mode: bool = False) -> list:
         """Build Chat Completions messages from responses.create() args."""
@@ -1515,8 +1530,10 @@ class ResponsesShim:
                 json_mode = True
 
         # Load from history cache if available to chain message history
-        if prev_id and prev_id in self._history_cache:
-            messages = list(self._history_cache[prev_id])
+        with self._history_lock:
+            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
+        if cached_messages:
+            messages = cached_messages
             self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data, json_mode)
@@ -1580,7 +1597,8 @@ class ResponsesShim:
                 "reasoning_content": reasoning_content or None,
             })
         
-        self._history_cache[result.id] = new_messages
+        with self._history_lock:
+            self._history_cache[result.id] = new_messages
         return result
 
     def _stream_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
@@ -1594,8 +1612,10 @@ class ResponsesShim:
         prev_id = kwargs.get("previous_response_id", None)
 
         # Load from history cache if available to chain message history
-        if prev_id and prev_id in self._history_cache:
-            messages = list(self._history_cache[prev_id])
+        with self._history_lock:
+            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
+        if cached_messages:
+            messages = cached_messages
             self._append_chat_input(messages, input_data)
         else:
             messages = self._build_chat_messages(instructions, input_data)
@@ -1737,7 +1757,8 @@ class ResponsesShim:
                 "reasoning_content": reasoning_content or None,
             })
         
-        self._history_cache[resp_id] = new_messages
+        with self._history_lock:
+            self._history_cache[resp_id] = new_messages
 
 
 
@@ -1777,6 +1798,18 @@ class LLMClient:
         self._google_client = None
         self._tacc_client = None
         self._local_client = None
+
+    @staticmethod
+    def _http_timeout():
+        """Shared bounded timeout policy for OpenAI-compatible providers."""
+        import httpx
+
+        return httpx.Timeout(
+            connect=float(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "15")),
+            read=float(os.getenv("LLM_READ_TIMEOUT_SECONDS", "90")),
+            write=float(os.getenv("LLM_WRITE_TIMEOUT_SECONDS", "30")),
+            pool=float(os.getenv("LLM_POOL_TIMEOUT_SECONDS", "15")),
+        )
 
     @staticmethod
     def _normalize_provider_key(provider: str) -> str:
@@ -1841,17 +1874,18 @@ class LLMClient:
         from openai import OpenAI
         context_key = self._resolve_context_api_key("openai")
         if context_key:
-            return OpenAI(api_key=context_key)
+            return OpenAI(api_key=context_key, timeout=self._http_timeout())
         if self._openai_client is None:
             api_key, key_source = self._resolve_api_key("openai", "OPENAI_API_KEY")
 
             helicone_key = os.getenv("HELICONE_API_KEY", "")
             if key_source == "byok":
-                return OpenAI(api_key=api_key)
+                return OpenAI(api_key=api_key, timeout=self._http_timeout())
             if helicone_key:
                 self._openai_client = OpenAI(
                     api_key=api_key,
                     base_url="https://oai.helicone.ai/v1",
+                    timeout=self._http_timeout(),
                     default_headers={
                         "Helicone-Auth": f"Bearer {helicone_key}",
                     },
@@ -1861,7 +1895,7 @@ class LLMClient:
                     "Dashboard: https://helicone.ai/dashboard"
                 )
             else:
-                self._openai_client = OpenAI(api_key=api_key)
+                self._openai_client = OpenAI(api_key=api_key, timeout=self._http_timeout())
         return self._openai_client
 
     def _get_anthropic_client(self):
@@ -1909,6 +1943,7 @@ class LLMClient:
             self._local_client = OpenAI(
                 base_url=base_url,
                 api_key="not-needed",  # Local servers don't require API keys
+                timeout=self._http_timeout(),
             )
         return self._local_client
 
@@ -1923,7 +1958,7 @@ class LLMClient:
             or TACC_DEFAULT_BASE_URL
         )
         if context_key:
-            return OpenAI(api_key=context_key, base_url=base_url)
+            return OpenAI(api_key=context_key, base_url=base_url, timeout=self._http_timeout())
         if self._tacc_client is None:
             api_key = (
                 os.getenv("TACC_API_KEY", "")
@@ -1935,7 +1970,11 @@ class LLMClient:
                     "TACC_API_KEY is required for TACC models. "
                     "Set it in .env locally or in the Render service environment."
                 )
-            self._tacc_client = OpenAI(api_key=api_key, base_url=base_url)
+            self._tacc_client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=self._http_timeout(),
+            )
         return self._tacc_client
 
     def _get_deepseek_client(self):
@@ -1944,10 +1983,14 @@ class LLMClient:
         context_key = self._resolve_context_api_key("deepseek")
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         if context_key:
-            return OpenAI(api_key=context_key, base_url=base_url)
+            return OpenAI(api_key=context_key, base_url=base_url, timeout=self._http_timeout())
         if self._deepseek_client is None:
             api_key, key_source = self._resolve_api_key("deepseek", "DEEPSEEK_API_KEY")
             if key_source == "byok":
-                return OpenAI(api_key=api_key, base_url=base_url)
-            self._deepseek_client = OpenAI(api_key=api_key, base_url=base_url)
+                return OpenAI(api_key=api_key, base_url=base_url, timeout=self._http_timeout())
+            self._deepseek_client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=self._http_timeout(),
+            )
         return self._deepseek_client

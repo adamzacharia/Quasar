@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, Send, X } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message } from "../lib/types";
@@ -15,7 +15,8 @@ import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 import { WebSourcesCard } from "./WebSourcesCard";
 import { useChatStore } from "../lib/store";
-import { ObservationPaperGraph } from "./ObservationPaperGraph";
+import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
+import { canSubmitIssueReport, shouldOpenIssueReport } from "../lib/feedback-report";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -37,9 +38,15 @@ function CodeBlock({ language, children }: { language: string; children: string 
     );
 }
 
-function MessageActions({ message }: { message: Message }) {
+function MessageActions({ message, reportPrompt = "" }: { message: Message; reportPrompt?: string }) {
     const [copied, setCopied] = useState(false);
     const [feedback, setFeedback] = useState<"like" | "dislike" | null>(null);
+    const [showReport, setShowReport] = useState(false);
+    const [category, setCategory] = useState("stuck_slow");
+    const [description, setDescription] = useState("");
+    const [includeContext, setIncludeContext] = useState(false);
+    const [reportState, setReportState] = useState<"idle" | "sending" | "sent">("idle");
+    const [reportError, setReportError] = useState("");
     const { activeConversationId, selectedModel } = useChatStore();
 
     const copyText = () => {
@@ -62,9 +69,11 @@ function MessageActions({ message }: { message: Message }) {
                 },
                 body: JSON.stringify({
                     message_id: message.id,
+                    run_id: message.runMeta?.run_id || "",
                     feedback: newFeedback,
                     conversation_id: activeConversationId || "",
-                    model: selectedModel || "",
+                    model: message.runMeta?.model || selectedModel || "",
+                    prompt_preview: reportPrompt.slice(0, 200),
                     response_preview: message.content?.slice(0, 500) || "",
                 }),
             });
@@ -73,20 +82,102 @@ function MessageActions({ message }: { message: Message }) {
         }
     };
 
+    const submitIssueReport = async () => {
+        if (!description.trim() || !message.runMeta?.run_id) return;
+        setReportState("sending");
+        setReportError("");
+        try {
+            const token = useAuthStore.getState().token;
+            const response = await fetch(`${API_BASE}/api/issue-reports`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                },
+                body: JSON.stringify({
+                    run_id: message.runMeta.run_id,
+                    message_id: message.id,
+                    category,
+                    description: description.trim(),
+                    include_context: includeContext,
+                    prompt_excerpt: includeContext ? reportPrompt : "",
+                    response_excerpt: includeContext ? message.content : "",
+                    technical_context: {
+                        user_agent: navigator.userAgent,
+                        page: window.location.pathname,
+                        viewport: `${window.innerWidth}x${window.innerHeight}`,
+                    },
+                }),
+            });
+            if (!response.ok) {
+                const payload = await response.json().catch(() => ({}));
+                throw new Error(payload.detail || `HTTP ${response.status}`);
+            }
+            setReportState("sent");
+        } catch (error) {
+            setReportState("idle");
+            setReportError(error instanceof Error ? error.message : "Could not submit report.");
+        }
+    };
+
     return (
-        <div className="flex items-center gap-1 mt-2 opacity-0 group-hover/msg:opacity-100 transition-opacity">
-            <button onClick={copyText} title="Copy response"
-                className="p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-700/50 rounded-lg transition-all">
-                {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-            </button>
-            <button onClick={() => sendFeedback("like")} title="Good response"
-                className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
-                <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
-            </button>
-            <button onClick={() => sendFeedback("dislike")} title="Bad response"
-                className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
-                <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
-            </button>
+        <div className={`mt-2 ${showReport ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100"} transition-opacity`}>
+            <div className="flex items-center gap-1">
+                <button onClick={copyText} title="Copy response"
+                    className="p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-700/50 rounded-lg transition-all">
+                    {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                </button>
+                <button onClick={() => sendFeedback("like")} title="Good response"
+                    className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                    <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
+                </button>
+                <button onClick={() => { sendFeedback("dislike"); setShowReport(shouldOpenIssueReport("dislike")); }} title="Report a problem"
+                    className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                    <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
+                </button>
+            </div>
+            {showReport && (
+                <div className="mt-2 max-w-xl rounded-xl border border-red-500/20 bg-slate-950/90 p-3 shadow-xl">
+                    <div className="flex items-center justify-between">
+                        <div className="text-xs font-semibold text-slate-200">Report a problem</div>
+                        <button type="button" onClick={() => setShowReport(false)} className="text-slate-500 hover:text-slate-200">
+                            <X className="h-3.5 w-3.5" />
+                        </button>
+                    </div>
+                    {reportState === "sent" ? (
+                        <div className="mt-3 text-xs text-emerald-300">Report saved. Thank you.</div>
+                    ) : (
+                        <>
+                            <select value={category} onChange={(event) => setCategory(event.target.value)}
+                                className="mt-3 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200">
+                                <option value="stuck_slow">Stuck or slow</option>
+                                <option value="wrong_answer">Wrong answer</option>
+                                <option value="incorrect_data">Incorrect data</option>
+                                <option value="ui_problem">Interface problem</option>
+                                <option value="other">Other</option>
+                            </select>
+                            <textarea value={description} onChange={(event) => setDescription(event.target.value)}
+                                placeholder="What happened, and what did you expect?" rows={3}
+                                className="mt-2 w-full resize-y rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 placeholder:text-slate-600" />
+                            <label className="mt-2 flex items-start gap-2 text-[11px] text-slate-400">
+                                <input type="checkbox" checked={includeContext}
+                                    onChange={(event) => setIncludeContext(event.target.checked)} className="mt-0.5" />
+                                Include this question and response. Technical diagnostics are included automatically.
+                            </label>
+                            {!message.runMeta?.run_id && (
+                                <div className="mt-2 text-[11px] text-amber-300">Diagnostics are unavailable for this older message.</div>
+                            )}
+                            {reportError && <div className="mt-2 text-[11px] text-red-300">{reportError}</div>}
+                            <button type="button" onClick={submitIssueReport}
+                                disabled={!canSubmitIssueReport(description, message.runMeta?.run_id) || reportState === "sending"}
+                                className="mt-3 flex items-center gap-2 rounded-lg bg-red-500/15 px-3 py-2 text-xs font-semibold text-red-200 disabled:opacity-40">
+                                {reportState === "sending" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                                Send report
+                            </button>
+                        </>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
@@ -236,10 +327,11 @@ interface ChatMessageProps {
     thinkingSteps?: ThoughtStep[];
     thinkingStatus?: "idle" | "running" | "completed";
     taskExecutionState?: TaskExecutionState | null;
-    observationGraph?: any;
+    observationGraph?: ResearchGraph;
+    reportPrompt?: string;
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt }: ChatMessageProps) {
     const isUser = message.role === "user";
     const hasContent = !!message.content;
     const hasThinkingSteps = !!thinkingSteps?.length;
@@ -572,7 +664,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     {showAnswerBuffer && <AnswerBuffer />}
 
                     {/* Action bar: copy, like, dislike — shown at bottom on hover */}
-                    {hasContent && !isStreaming && <MessageActions message={message} />}
+                    {hasContent && !isStreaming && <MessageActions message={message} reportPrompt={reportPrompt} />}
                 </div>
             </div>
         </div>

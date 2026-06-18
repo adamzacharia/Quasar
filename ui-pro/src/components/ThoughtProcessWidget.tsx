@@ -42,6 +42,8 @@ export function ThoughtProcessWidget({
         // Update immediately on mount/status change to align with startTime
         if (startTime) {
             const elapsed = Math.round((Date.now() - new Date(startTime).getTime()) / 1000);
+            // Synchronize the local timer with the server-provided start timestamp.
+            // eslint-disable-next-line react-hooks/set-state-in-effect
             setSeconds(Math.max(0, elapsed));
         }
 

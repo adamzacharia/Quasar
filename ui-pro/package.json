@@ -10,7 +10,9 @@
     "lint": "eslint",
     "test:thinking": "node --test tests/thinking-regression.test.mjs",
     "test:evidence": "node --test tests/evidence-quality.test.mjs",
-    "test:graph": "node --test tests/research-graph.test.mjs"
+    "test:graph": "node --test tests/research-graph.test.mjs",
+    "test:feedback": "node --test tests/feedback-report.test.mjs",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@vercel/speed-insights": "^2.0.0",

@@ -35,6 +35,8 @@ export function DownloadProgress({ data }: DownloadProgressProps) {
 
     useEffect(() => {
         if (isDone && !done) {
+            // This transition starts the one-time completion fade timer.
+            // eslint-disable-next-line react-hooks/set-state-in-effect
             setDone(true);
             // Auto-fade after 3 seconds
             const t = setTimeout(() => setFadeOut(true), 3000);

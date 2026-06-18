@@ -1,4 +1,5 @@
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
+import { splitProviderChunk } from "./feedback-report";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -10,6 +11,16 @@ export interface ChatRequest {
     token?: string;  // auth token for personal RAG
     grounded_summary?: boolean;
     web_search?: boolean;
+}
+
+export interface ChatRunMeta {
+    run_id: string;
+    trace_id: string;
+    model: string;
+    provider: string;
+    conversation_id: string;
+    inactivity_timeout_seconds?: number;
+    turn_timeout_seconds?: number;
 }
 
 export interface StreamCallbacks {
@@ -42,6 +53,7 @@ export interface StreamCallbacks {
         search_type?: string;
     }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
+    onRunMeta?: (meta: ChatRunMeta) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null }) => void;
     onComplete: (fullResponse: string) => void;
     onError: (error: string) => void;
@@ -105,24 +117,67 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
         const decoder = new TextDecoder();
         let fullText = "";
         let buffer = "";
+        let provider = "";
+        let lastMeaningfulEventAt = Date.now();
+        const streamStartedAt = Date.now();
+        let inactivityLimitMs = 110_000;
+        let totalLimitMs = 380_000;
+        let watchdogError = "";
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
+        const emitToken = async (content: string) => {
+            fullText += content;
+            if (provider === "tacc" && content.length > 80) {
+                const pieces = splitProviderChunk(provider, content);
+                for (const piece of pieces) {
+                    callbacks.onToken(piece);
+                    await new Promise(resolve => setTimeout(resolve, 8));
+                }
+                return;
+            }
+            callbacks.onToken(content);
+        };
 
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+        const watchdog = window.setInterval(() => {
+            const now = Date.now();
+            if (now - lastMeaningfulEventAt > inactivityLimitMs) {
+                watchdogError = "The model stopped sending progress. The request was ended so the chat would not remain stuck.";
+            } else if (now - streamStartedAt > totalLimitMs) {
+                watchdogError = "The model exceeded the maximum chat runtime.";
+            }
+            if (watchdogError) {
+                reader.cancel(watchdogError).catch(() => undefined);
+            }
+        }, 5_000);
 
-            for (const line of lines) {
-                if (line.startsWith("data: ")) {
-                    const data = line.slice(6);
-                    if (data === "[DONE]") { callbacks.onComplete(fullText); return; }
-                    try {
-                        const parsed = JSON.parse(data);
-                        if (parsed.type === "token") {
-                            fullText += parsed.content;
-                            callbacks.onToken(parsed.content);
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+
+                for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                        const data = line.slice(6);
+                        if (data === "[DONE]") { callbacks.onComplete(fullText); return; }
+                        try {
+                            const parsed = JSON.parse(data);
+                            lastMeaningfulEventAt = Date.now();
+                            if (parsed.type === "token") {
+                                await emitToken(parsed.content);
+                            } else if (parsed.type === "run_meta") {
+                                provider = parsed.provider || "";
+                                inactivityLimitMs = Math.max(
+                                    110_000,
+                                    Number(parsed.inactivity_timeout_seconds || 90) * 1000 + 20_000,
+                                );
+                                totalLimitMs = Math.max(
+                                    380_000,
+                                    Number(parsed.turn_timeout_seconds || 240) * 1000 + 20_000,
+                                );
+                                callbacks.onRunMeta?.(parsed);
                         } else if (parsed.type === "thought" && callbacks.onThought) {
                             callbacks.onThought(parsed.content);
                         } else if (parsed.type === "status" && callbacks.onStatus) {
@@ -158,13 +213,20 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onError(parsed.content);
                             return;
                         }
-                    } catch {
-                        // Non-JSON data, treat as token
-                        fullText += data;
-                        callbacks.onToken(data);
+                        } catch {
+                            // Non-JSON data, treat as token
+                            lastMeaningfulEventAt = Date.now();
+                            await emitToken(data);
+                        }
                     }
                 }
             }
+        } finally {
+            window.clearInterval(watchdog);
+        }
+        if (watchdogError) {
+            callbacks.onError(watchdogError);
+            return;
         }
         callbacks.onComplete(fullText);
     } catch (error) {
