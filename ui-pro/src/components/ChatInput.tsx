@@ -111,8 +111,8 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
     };
 
     return (
-        <div className="w-full px-4 pb-3 pt-2 z-20">
-            <div className="max-w-[var(--q-chat-input-width)] mx-auto relative">
+        <div className="w-full px-4 md:px-8 pb-3 pt-2 z-20">
+            <div className="w-full max-w-[var(--q-chat-input-width)] mx-auto relative">
                 <form onSubmit={handleSubmit} className="relative group">
                     <div className="absolute inset-0 bg-primary/20 rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
                     <div className="relative w-full glass-surface rounded-2xl ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all">
