@@ -65,6 +65,10 @@ def test_tacc_previous_response_appends_second_user_turn():
         "first literature question",
         "second literature question",
     ]
+    assert messages[0] == {
+        "role": "system",
+        "content": "Reasoning: high\n\nsystem prompt",
+    }
 
 
 def test_streaming_tacc_previous_response_appends_second_user_turn():
@@ -117,6 +121,48 @@ def test_clearing_tacc_history_starts_a_fresh_chain():
     )
 
     assert completions.calls[-1]["messages"] == [
-        {"role": "system", "content": "system prompt"},
+        {"role": "system", "content": "Reasoning: high\n\nsystem prompt"},
         {"role": "user", "content": "retry question"},
     ]
+
+
+def test_tacc_gpt_oss_reasoning_effort_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("QUASAR_GPT_OSS_REASONING", "low")
+    client, completions = _client_with_fake_tacc()
+
+    client.responses.create(
+        model="gpt-oss-120b",
+        instructions="system prompt",
+        input="question",
+    )
+
+    assert completions.calls[-1]["messages"][0]["content"] == (
+        "Reasoning: low\n\nsystem prompt"
+    )
+
+
+def test_tacc_non_gpt_oss_model_does_not_receive_reasoning_instruction():
+    client, completions = _client_with_fake_tacc()
+
+    client.responses.create(
+        model="Qwen3-32B",
+        instructions="system prompt",
+        input="question",
+    )
+
+    assert completions.calls[-1]["messages"][0]["content"] == "system prompt"
+
+
+def test_invalid_gpt_oss_reasoning_effort_defaults_to_high(monkeypatch):
+    monkeypatch.setenv("QUASAR_GPT_OSS_REASONING", "maximum")
+    client, completions = _client_with_fake_tacc()
+
+    client.responses.create(
+        model="gpt-oss-120b",
+        instructions="Reasoning: medium\n\nsystem prompt",
+        input="question",
+    )
+
+    assert completions.calls[-1]["messages"][0]["content"] == (
+        "Reasoning: high\n\nsystem prompt"
+    )
