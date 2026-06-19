@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 import logging
 from contextlib import contextmanager
@@ -1194,7 +1195,10 @@ class ResponsesShim:
         """Translate responses.create() to TACC's OpenAI-compatible Chat Completions API."""
         client = self._llm._get_tacc_client()
         model = self._llm._normalize_tacc_model(kwargs.get("model", self._llm.default_model))
-        instructions = kwargs.get("instructions", "")
+        instructions = self._configure_gpt_oss_instructions(
+            kwargs.get("instructions", ""),
+            model,
+        )
         input_data = kwargs.get("input", "")
         temperature = kwargs.get("temperature", 0.7)
         max_tokens = kwargs.get("max_output_tokens", 2000)
@@ -1264,7 +1268,10 @@ class ResponsesShim:
         """Streaming TACC call via OpenAI-compatible Chat Completions."""
         client = self._llm._get_tacc_client()
         model = self._llm._normalize_tacc_model(kwargs.get("model", self._llm.default_model))
-        instructions = kwargs.get("instructions", "")
+        instructions = self._configure_gpt_oss_instructions(
+            kwargs.get("instructions", ""),
+            model,
+        )
         input_data = kwargs.get("input", "")
         temperature = kwargs.get("temperature", 0.7)
         max_tokens = kwargs.get("max_output_tokens", 2000)
@@ -1405,6 +1412,30 @@ class ResponsesShim:
             messages.append({"role": "user", "content": str(input_data)})
 
         return messages
+
+    @staticmethod
+    def _configure_gpt_oss_instructions(instructions: str, model: str) -> str:
+        """Set GPT-OSS reasoning effort using its supported system-message format."""
+        if "gpt-oss" not in str(model or "").lower():
+            return instructions
+
+        effort = os.getenv("QUASAR_GPT_OSS_REASONING", "high").strip().lower()
+        if effort not in {"low", "medium", "high"}:
+            logger.warning(
+                "Invalid QUASAR_GPT_OSS_REASONING=%r; defaulting to high.",
+                effort,
+            )
+            effort = "high"
+
+        reasoning_instruction = f"Reasoning: {effort}"
+        existing_pattern = re.compile(
+            r"(?im)^[ \t]*Reasoning:[ \t]*(?:low|medium|high)[ \t]*$"
+        )
+        if existing_pattern.search(instructions):
+            return existing_pattern.sub(reasoning_instruction, instructions, count=1)
+        if instructions:
+            return f"{reasoning_instruction}\n\n{instructions}"
+        return reasoning_instruction
 
     def _append_chat_input(self, messages: list, input_data) -> None:
         """Append Responses-style input to an existing Chat Completions history."""
