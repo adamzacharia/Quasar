@@ -6,8 +6,13 @@
 html {
   font-size: 14px;
   --q-sidebar-width: 280px;
-  --q-chat-content-width: 56rem;
-  --q-chat-input-width: 48rem;
+  /*
+   * Keep the chat responsive to the available main-pane width. Fixed rem
+   * caps left very large empty margins on wide displays and made the
+   * composer appear disconnected from the conversation.
+   */
+  --q-chat-content-width: calc(100% - clamp(0rem, 4vw, 6rem));
+  --q-chat-input-width: calc(100% - clamp(0rem, 8vw, 12rem));
   --q-empty-state-width: 64rem;
   --q-suggestion-grid-width: 48rem;
   --q-table-max-height: 420px;
@@ -29,8 +34,6 @@ html {
   html {
     font-size: 18px;
     --q-sidebar-width: 320px;
-    --q-chat-content-width: 64rem;
-    --q-chat-input-width: 56rem;
     --q-empty-state-width: 72rem;
     --q-suggestion-grid-width: 56rem;
     --q-table-max-height: 520px;
@@ -41,8 +44,6 @@ html {
   html {
     font-size: 19px;
     --q-sidebar-width: 360px;
-    --q-chat-content-width: 72rem;
-    --q-chat-input-width: 64rem;
     --q-empty-state-width: 80rem;
     --q-suggestion-grid-width: 64rem;
     --q-table-max-height: 620px;
