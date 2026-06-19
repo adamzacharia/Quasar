@@ -1,5 +1,6 @@
 import threading
 import sys
+import time
 import types
 
 import pandas as pd
@@ -350,3 +351,30 @@ def test_project_picker_row_selection_triages_selected_project():
     assert result["project_code"] == "2021.1.00002.S"
     assert agent.search_service.keyword_calls[-1] == {"project_code": "2021.1.00002.S"}
     assert agent.last_run_result["table_kind"] == "alma_products"
+
+
+def test_long_running_tool_emits_progress_heartbeats_until_completion():
+    class SlowTool:
+        def execute(self, **kwargs):
+            time.sleep(0.055)
+            return {"success": True, **kwargs}
+
+    agent = QuasarAgent.__new__(QuasarAgent)
+    events = []
+
+    result = agent._execute_tool_with_progress(
+        SlowTool(),
+        {"project": "2018.1.00167.S"},
+        tool_name="triage_alma_data_products",
+        step_label="Inspecting ALMA data products",
+        on_status=lambda step, state: events.append((step, state)),
+        heartbeat_seconds=0.01,
+    )
+
+    heartbeat_count = len(events)
+    time.sleep(0.025)
+
+    assert result["success"] is True
+    assert heartbeat_count >= 2
+    assert len(events) == heartbeat_count
+    assert all(step.startswith("__tool_heartbeat__") for step, _ in events)

@@ -1112,9 +1112,31 @@ class CubeWorkbenchService:
 
         if operation == "prepare":
             last_update = {"at": 0.0}
+            transfer_started_at = time.monotonic()
+            prepare_session = self.get_session(session_id=session_id, user_id=user_id)
+            source_url = str(prepare_session.get("source_url") or "")
+            source_scheme = urlparse(source_url).scheme.lower()
+            transfer_kind = "download" if source_scheme in {"http", "https"} else "copy"
+            transfer_filename = str(
+                prepare_session.get("filename")
+                or Path(urlparse(source_url).path).name
+                or "FITS product"
+            )
 
             def copy_progress(done_bytes: int, total_bytes: Optional[int]) -> None:
-                now = time.time()
+                now = time.monotonic()
+                elapsed_seconds = max(0.001, now - transfer_started_at)
+                speed_bps = max(0.0, float(done_bytes) / elapsed_seconds)
+                transfer_percent = (
+                    min(100.0, (float(done_bytes) / max(1, total_bytes)) * 100.0)
+                    if total_bytes
+                    else None
+                )
+                eta_seconds = (
+                    max(0.0, (float(total_bytes) - float(done_bytes)) / speed_bps)
+                    if total_bytes and speed_bps > 0 and done_bytes < total_bytes
+                    else 0.0 if total_bytes and done_bytes >= total_bytes else None
+                )
                 if total_bytes and done_bytes >= total_bytes:
                     progress = 95
                 elif total_bytes:
@@ -1125,11 +1147,18 @@ class CubeWorkbenchService:
                     return
                 last_update["at"] = now
                 set_phase(
-                    "staging FITS product",
+                    f"{'downloading' if transfer_kind == 'download' else 'copying'} FITS product",
                     max(5, min(95, progress)),
                     {
+                        "filename": transfer_filename,
+                        "transfer_kind": transfer_kind,
                         "bytes_done": done_bytes,
                         "bytes_total": total_bytes,
+                        "speed_bps": round(speed_bps, 1),
+                        "speed_kbps": round(speed_bps / 1024.0, 1),
+                        "eta_seconds": round(eta_seconds, 1) if eta_seconds is not None else None,
+                        "transfer_percent": round(transfer_percent, 1) if transfer_percent is not None else None,
+                        "elapsed_seconds": round(elapsed_seconds, 1),
                     },
                 )
 

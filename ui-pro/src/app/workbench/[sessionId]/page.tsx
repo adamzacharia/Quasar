@@ -66,6 +66,11 @@ function asNumber(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
+function asOptionalNumber(value: unknown): number | null {
+    if (value === null || value === undefined || value === "") return null;
+    return asNumber(value);
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -102,6 +107,20 @@ function formatBytes(value: unknown): string {
     if (parsed >= 1024 * 1024) return `${(parsed / (1024 * 1024)).toFixed(1)} MB`;
     if (parsed >= 1024) return `${(parsed / 1024).toFixed(1)} KB`;
     return `${parsed} B`;
+}
+
+function formatTransferSpeed(value: unknown): string {
+    const bytesPerSecond = asNumber(value);
+    if (bytesPerSecond === null || bytesPerSecond <= 0) return "Estimating speed…";
+    return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatEta(value: unknown): string {
+    const seconds = asNumber(value);
+    if (seconds === null || seconds < 0) return "Estimating time…";
+    if (seconds < 60) return `${Math.ceil(seconds)}s remaining`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s remaining`;
+    return `${Math.floor(seconds / 3600)}h ${Math.ceil((seconds % 3600) / 60)}m remaining`;
 }
 
 function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
@@ -177,13 +196,19 @@ function WorkbenchJobPanel({ job, onCancel, canceling }: { job: WorkbenchJob | n
     if (!job) return null;
     const progress = Math.max(0, Math.min(100, Math.round(Number(job.progress) || 0)));
     const metrics = asRecord(job.metrics);
-    const bytesDone = asNumber(metrics.bytes_done);
-    const bytesTotal = asNumber(metrics.bytes_total);
+    const bytesDone = asOptionalNumber(metrics.bytes_done);
+    const bytesTotal = asOptionalNumber(metrics.bytes_total);
+    const speedBps = asOptionalNumber(metrics.speed_bps);
+    const etaSeconds = asOptionalNumber(metrics.eta_seconds);
+    const transferPercent = asOptionalNumber(metrics.transfer_percent);
+    const transferKind = asText(metrics.transfer_kind, "transfer");
+    const transferFilename = asText(metrics.filename, "");
     const byteLabel = bytesDone !== null
         ? bytesTotal
-            ? `${(bytesDone / (1024 * 1024)).toFixed(1)} / ${(bytesTotal / (1024 * 1024)).toFixed(1)} MB`
-            : `${(bytesDone / (1024 * 1024)).toFixed(1)} MB`
+            ? `${formatBytes(bytesDone)} / ${formatBytes(bytesTotal)}`
+            : `${formatBytes(bytesDone)} transferred · total size unknown`
         : "";
+    const displayedProgress = transferPercent !== null ? transferPercent : progress;
     const terminal = isTerminalJob(job);
 
     return (
@@ -198,15 +223,26 @@ function WorkbenchJobPanel({ job, onCancel, canceling }: { job: WorkbenchJob | n
             <div className="space-y-3 p-4">
                 <div className="flex items-center justify-between gap-3 text-xs">
                     <span className="truncate text-slate-400">{job.phase || "queued"}</span>
-                    <span className="font-mono text-slate-300">{progress}%</span>
+                    <span className="font-mono text-slate-300">{displayedProgress.toFixed(0)}%</span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-slate-900">
                     <div
                         className={`h-full rounded-full ${job.status === "failed" ? "bg-red-400" : job.status === "canceled" ? "bg-amber-400" : "bg-cyan-400"}`}
-                        style={{ width: `${progress}%` }}
+                        style={{ width: `${displayedProgress}%` }}
                     />
                 </div>
-                {byteLabel && <div className="font-mono text-[11px] text-slate-500">{byteLabel}</div>}
+                {byteLabel && (
+                    <div className="space-y-1 font-mono text-[11px] text-slate-500">
+                        {transferFilename && <div className="truncate text-slate-400" title={transferFilename}>{transferFilename}</div>}
+                        <div>{byteLabel}</div>
+                        {!terminal && (
+                            <div className="flex flex-wrap gap-x-3 gap-y-1">
+                                <span>{transferKind === "download" ? "Download" : "Copy"} speed: {formatTransferSpeed(speedBps)}</span>
+                                <span>{formatEta(etaSeconds)}</span>
+                            </div>
+                        )}
+                    </div>
+                )}
                 {job.error && <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-100">{job.error}</div>}
                 {!terminal && (
                     <button

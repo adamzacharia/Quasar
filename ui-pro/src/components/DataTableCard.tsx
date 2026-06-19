@@ -1241,7 +1241,15 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                 </tr>
                             </thead>
                             <tbody>
-                                {rows.map((row, ri) => (
+                                {rows.map((row, ri) => {
+                                    const productFilename = String(row.File || "").toLowerCase();
+                                    const productKind = String(row.Product || "").toLowerCase();
+                                    const canOpenInWorkbench = (
+                                        /\.fits(?:\.gz)?$/.test(productFilename)
+                                        || productKind.includes("fits")
+                                        || productKind.includes("spectral cube")
+                                    );
+                                    return (
                                     <tr
                                         key={ri}
                                         className="transition-colors"
@@ -1279,36 +1287,41 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                             <td className="py-2 px-3">
                                                 {row["_link"] ? (
                                                     <div className="flex items-center gap-1.5 whitespace-nowrap">
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => handlePreviewFits(row, ri)}
-                                                            disabled={previewLoadingRow === ri || workbenchLoadingRow === ri}
-                                                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/10 rounded-md transition-colors disabled:opacity-60"
-                                                        >
-                                                            {previewLoadingRow === ri ? (
-                                                                <Loader2 className="w-3 h-3 animate-spin" />
-                                                            ) : (
-                                                                <Eye className="w-3 h-3" />
-                                                            )}
-                                                            Preview
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => handleOpenWorkbench(row, ri)}
-                                                            disabled={workbenchLoadingRow === ri || previewLoadingRow === ri}
-                                                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/10 rounded-md transition-colors disabled:opacity-60"
-                                                        >
-                                                            {workbenchLoadingRow === ri ? (
-                                                                <Loader2 className="w-3 h-3 animate-spin" />
-                                                            ) : (
-                                                                <ExternalLink className="w-3 h-3" />
-                                                            )}
-                                                            Workbench
-                                                        </button>
+                                                        {canOpenInWorkbench && (
+                                                            <>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handlePreviewFits(row, ri)}
+                                                                    disabled={previewLoadingRow === ri || workbenchLoadingRow === ri}
+                                                                    className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/10 rounded-md transition-colors disabled:opacity-60"
+                                                                >
+                                                                    {previewLoadingRow === ri ? (
+                                                                        <Loader2 className="w-3 h-3 animate-spin" />
+                                                                    ) : (
+                                                                        <Eye className="w-3 h-3" />
+                                                                    )}
+                                                                    Preview
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleOpenWorkbench(row, ri)}
+                                                                    disabled={workbenchLoadingRow === ri || previewLoadingRow === ri}
+                                                                    className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/10 rounded-md transition-colors disabled:opacity-60"
+                                                                >
+                                                                    {workbenchLoadingRow === ri ? (
+                                                                        <Loader2 className="w-3 h-3 animate-spin" />
+                                                                    ) : (
+                                                                        <ExternalLink className="w-3 h-3" />
+                                                                    )}
+                                                                    Workbench
+                                                                </button>
+                                                            </>
+                                                        )}
                                                         <a
                                                             href={String(row["_link"])}
                                                             target="_blank"
                                                             rel="noopener noreferrer"
+                                                            title="Download directly in your browser. Progress is shown by your browser's download manager."
                                                             className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-slate-200 border border-slate-600/50 hover:bg-slate-700 rounded-md transition-colors"
                                                         >
                                                             <Download className="w-3 h-3" />Download
@@ -1357,7 +1370,8 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                             </td>
                                         )}
                                     </tr>
-                                ))}
+                                    );
+                                })}
                             </tbody>
                         </table>
                     </div>

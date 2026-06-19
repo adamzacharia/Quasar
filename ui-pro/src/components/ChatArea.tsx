@@ -49,6 +49,7 @@ export function ChatArea() {
     const [downloadProgress, setDownloadProgress] = useState<{
         filename: string; downloaded_bytes: number;
         total_bytes: number | null; speed_kbps: number; percent: number | null;
+        eta_seconds?: number | null; phase?: string;
     } | null>(null);
     // ── Plan Review (Human-in-the-Loop) ─────────────────────────
     const [pendingPlan, setPendingPlan] = useState<PlanReviewData | null>(null);

@@ -9,6 +9,8 @@ interface DownloadProgressData {
     total_bytes: number | null;
     speed_kbps: number;
     percent: number | null;
+    eta_seconds?: number | null;
+    phase?: string;
 }
 
 interface DownloadProgressProps {
@@ -26,12 +28,24 @@ function formatSpeed(kbps: number): string {
     return `${(kbps / 1024).toFixed(1)} MB/s`;
 }
 
+function formatDuration(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds < 0) return "Estimating…";
+    if (seconds < 60) return `${Math.ceil(seconds)}s remaining`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s remaining`;
+    return `${Math.floor(seconds / 3600)}h ${Math.ceil((seconds % 3600) / 60)}m remaining`;
+}
+
 export function DownloadProgress({ data }: DownloadProgressProps) {
     const [done, setDone] = useState(false);
     const [fadeOut, setFadeOut] = useState(false);
 
     const percent = data.percent ?? 0;
     const isDone = percent >= 100;
+    const calculatedEta = data.eta_seconds ?? (
+        data.total_bytes && data.speed_kbps > 0
+            ? Math.max(0, (data.total_bytes - data.downloaded_bytes) / (data.speed_kbps * 1024))
+            : null
+    );
 
     useEffect(() => {
         if (isDone && !done) {
@@ -75,19 +89,17 @@ export function DownloadProgress({ data }: DownloadProgressProps) {
                 {/* Info */}
                 <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between mb-1">
-                        <span
-                            className="text-xs font-medium truncate"
-                            style={{ color: "var(--q-text)" }}
-                        >
-                            {data.filename}
-                        </span>
+                        <div className="min-w-0">
+                            <div className="truncate text-xs font-medium" style={{ color: "var(--q-text)" }}>{data.filename}</div>
+                            <div className="text-[10px] text-slate-500">{data.phase || (isDone ? "Download complete" : "Downloading")}</div>
+                        </div>
                         <span
                             className="text-[10px] font-mono shrink-0 ml-2"
                             style={{ color: "var(--q-text-muted)" }}
                         >
                             {isDone
                                 ? "Complete"
-                                : `${formatSpeed(data.speed_kbps)}`}
+                                : formatSpeed(data.speed_kbps)}
                         </span>
                     </div>
 
@@ -123,7 +135,9 @@ export function DownloadProgress({ data }: DownloadProgressProps) {
                             className="text-[10px] font-mono"
                             style={{ color: "var(--q-text-muted)" }}
                         >
-                            {percent.toFixed(0)}%
+                            {data.percent === null
+                                ? calculatedEta !== null ? formatDuration(calculatedEta) : "Total size unknown"
+                                : `${percent.toFixed(0)}%${calculatedEta !== null && !isDone ? ` · ${formatDuration(calculatedEta)}` : ""}`}
                         </span>
                     </div>
                 </div>

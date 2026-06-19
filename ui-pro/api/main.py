@@ -1749,6 +1749,12 @@ def _stream_chat_response(
                         if step == "__run_mode__:conductor":
                             deadline.enable_conductor()
                             continue
+                        if isinstance(step, str) and step.startswith("__tool_heartbeat__"):
+                            heartbeat_detail = step[len("__tool_heartbeat__"):]
+                            heartbeat_tool, _, heartbeat_label = heartbeat_detail.partition("::")
+                            run_last_status = heartbeat_label or heartbeat_tool or run_last_status
+                            yield f"data: {json.dumps({'type': 'run_progress', 'phase': run_last_status, 'tool': heartbeat_tool})}\n\n"
+                            continue
                         if isinstance(step, str) and step.startswith("__eager_data__"):
                             # Agent sent inline result data — stash it for
                             # the next __data_ready__ to consume.

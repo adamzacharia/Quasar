@@ -36,6 +36,7 @@ def download_with_progress(
                 "total_bytes":      int | None,  (None if Content-Length missing)
                 "speed_kbps":       float,
                 "percent":          float | None,
+                "eta_seconds":      float | None,
             }
         chunk_size:        Bytes per read chunk.
         timeout:           Request timeout in seconds.
@@ -66,6 +67,11 @@ def download_with_progress(
                 if progress_callback and (now - last_report_time >= 0.5):
                     elapsed = max(now - start_time, 0.001)
                     speed = (downloaded / 1024) / elapsed  # KB/s
+                    eta_seconds = (
+                        max(0.0, (total - downloaded) / max(1.0, speed * 1024))
+                        if total
+                        else None
+                    )
 
                     progress_callback({
                         "filename": filename,
@@ -73,6 +79,7 @@ def download_with_progress(
                         "total_bytes": total,
                         "speed_kbps": round(speed, 1),
                         "percent": round((downloaded / total) * 100, 1) if total else None,
+                        "eta_seconds": round(eta_seconds, 1) if eta_seconds is not None else None,
                     })
                     last_report_time = now
 
@@ -85,6 +92,7 @@ def download_with_progress(
             "total_bytes": total or downloaded,
             "speed_kbps": round((downloaded / 1024) / elapsed, 1),
             "percent": 100.0,
+            "eta_seconds": 0.0,
         })
 
     return os.path.abspath(dest_path)

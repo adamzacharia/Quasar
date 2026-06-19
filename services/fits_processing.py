@@ -127,36 +127,49 @@ class FITSProcessingService:
     # ── Internal helpers for remote header reading ──────────────────────────
 
     @staticmethod
-    def _fetch_header_via_range(url: str):
+    def _fetch_header_via_range(url: str, max_bytes: int = 131072):
         """
         Fetch FITS header using HTTP Range request.
         Downloads only the first 64–128 KB — enough for any FITS primary header.
         """
         try:
-            # FITS headers are 2880-byte blocks. Most ALMA image headers fit in
-            # ~20 blocks (57 KB). We request 128 KB to be safe.
+            max_bytes = max(2880, int(max_bytes))
             resp = requests.get(
                 url,
-                headers={"Range": "bytes=0-131071"},
+                headers={"Range": f"bytes=0-{max_bytes - 1}"},
                 timeout=30,
                 stream=True,
             )
+            if resp.status_code == 416:
+                resp.close()
+                resp = requests.get(
+                    url,
+                    timeout=30,
+                    stream=True,
+                )
 
-            # Accept 200 (full) or 206 (partial) — both work
-            if resp.status_code not in (200, 206):
-                print(f"[FITS] Range request returned {resp.status_code}")
-                return None
-
-            header_bytes = resp.content
+            try:
+                if resp.status_code not in (200, 206):
+                    print(f"[FITS] Range request returned {resp.status_code}")
+                    return None
+                payload = bytearray()
+                for chunk in resp.iter_content(chunk_size=16384):
+                    if not chunk:
+                        continue
+                    remaining = max_bytes - len(payload)
+                    if remaining <= 0:
+                        break
+                    payload.extend(chunk[:remaining])
+                    if len(payload) >= max_bytes:
+                        break
+                header_bytes = bytes(payload)
+            finally:
+                resp.close()
             if len(header_bytes) < 2880:
                 print(f"[FITS] Response too small ({len(header_bytes)} bytes)")
                 return None
 
-            # Parse header from bytes
-            hdul = fits.open(io.BytesIO(header_bytes), ignore_missing_simple=True)
-            header = hdul[0].header
-            hdul.close()
-            return header
+            return FITSProcessingService._parse_bounded_header(header_bytes)
 
         except Exception as e:
             print(f"[FITS] Range request failed: {e}")
@@ -165,31 +178,29 @@ class FITSProcessingService:
     @staticmethod
     def _fetch_header_via_lazy_open(url: str):
         """
-        Fallback: use astropy's lazy HDU loading.
-        This may download more data but handles edge cases better.
+        Retry with a larger bounded header window.
+
+        This deliberately never opens or downloads the complete remote file.
         """
-        try:
-            # Try with fsspec if available (S3-style, HTTP, etc.)
-            try:
-                hdul = fits.open(url, lazy_load_hdus=True, memmap=False)
-                header = hdul[0].header
-                hdul.close()
-                return header
-            except Exception:
-                pass
+        return FITSProcessingService._fetch_header_via_range(url, max_bytes=1048576)
 
-            # Final fallback: download full file to memory
-            print("[FITS] Falling back to full download for header...")
-            resp = requests.get(url, timeout=120)
-            resp.raise_for_status()
-            hdul = fits.open(io.BytesIO(resp.content))
-            header = hdul[0].header
-            hdul.close()
-            return header
-
-        except Exception as e:
-            print(f"[FITS] Lazy open failed: {e}")
+    @staticmethod
+    def _parse_bounded_header(header_bytes: bytes):
+        """Parse a FITS header from a bounded byte prefix."""
+        end_offset = None
+        for offset in range(0, len(header_bytes) - 79, 80):
+            keyword = header_bytes[offset:offset + 8].decode(
+                "ascii",
+                errors="ignore",
+            ).strip()
+            if keyword == "END":
+                end_offset = offset + 80
+                break
+        if end_offset is None:
+            print(f"[FITS] END card not found in first {len(header_bytes)} bytes")
             return None
+        header_text = header_bytes[:end_offset].decode("ascii", errors="replace")
+        return fits.Header.fromstring(header_text, sep="")
 
     @staticmethod
     def _extract_science_metadata(header, url: str, filename: str) -> Dict[str, Any]:
