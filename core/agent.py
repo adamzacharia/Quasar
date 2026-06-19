@@ -3516,6 +3516,50 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             label += f' ("{", ".join(hint_parts)[:80]}")'
         return label
 
+    def _execute_tool_with_progress(
+        self,
+        tool,
+        args: Dict[str, Any],
+        *,
+        tool_name: str,
+        step_label: str,
+        on_status=None,
+        heartbeat_seconds: Optional[float] = None,
+    ):
+        """Execute a synchronous tool while emitting hidden liveness events."""
+        if on_status is None:
+            return tool.execute(**args)
+
+        interval = (
+            float(heartbeat_seconds)
+            if heartbeat_seconds is not None
+            else float(os.getenv("TOOL_PROGRESS_HEARTBEAT_SECONDS", "15"))
+        )
+        interval = max(1.0 if heartbeat_seconds is None else 0.001, interval)
+        stopped = threading.Event()
+
+        def emit_heartbeats():
+            while not stopped.wait(interval):
+                try:
+                    on_status(
+                        f"__tool_heartbeat__{tool_name}::{step_label}",
+                        "meta",
+                    )
+                except Exception:
+                    pass
+
+        heartbeat = threading.Thread(
+            target=emit_heartbeats,
+            name=f"quasar-tool-heartbeat-{tool_name[:32]}",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            return tool.execute(**args)
+        finally:
+            stopped.set()
+            heartbeat.join(timeout=min(1.0, interval))
+
     def _build_web_sources_event(self, web_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize web-tool outputs into the frontend source-card event."""
         if not isinstance(web_data, dict) or not web_data.get("success", True):
@@ -8203,7 +8247,13 @@ IMPORTANT RULES:
                     if tool:
                         try:
                             _acc_len_before = len(self._accumulated_run_results)
-                            result = tool.execute(**args)
+                            result = self._execute_tool_with_progress(
+                                tool,
+                                args,
+                                tool_name=tool_name,
+                                step_label=step_label,
+                                on_status=on_status,
+                            )
                             _primary_run_result = (
                                 self.last_run_result.copy()
                                 if isinstance(self.last_run_result, dict)

@@ -24,6 +24,7 @@ wheels/
 *.egg
 .venv/
 .pytest_cache/
+.pytest-tmp-full/
 
 # ============================================
 # Environment & Secrets
