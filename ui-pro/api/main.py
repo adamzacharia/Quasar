@@ -49,6 +49,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 from utils.archive_links import build_archive_link, infer_archive_kind
 from services.evidence_quality import annotate_web_source_evidence, choose_better_evidence_quality, rank_web_sources
+from services.content_safety import is_safe_web_image, is_safe_web_source
 
 # ── Observability: Loguru + Sentry ────────────────────────────────────────────
 from core.logger import logger, init_rollbar
@@ -747,6 +748,8 @@ def _merge_web_items(existing: List[Dict[str, Any]], incoming: List[Dict[str, An
     for item in [*(existing or []), *(incoming or [])]:
         if not isinstance(item, dict):
             continue
+        if not is_safe_web_image(item):
+            continue
         url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("image_url") or item.get("src"))
         if not url:
             continue
@@ -794,6 +797,8 @@ def _merge_web_sources(existing: List[Dict[str, Any]], incoming: List[Dict[str, 
 
     for item in [*(existing or []), *(incoming or [])]:
         if not isinstance(item, dict):
+            continue
+        if not is_safe_web_source(item):
             continue
         url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("source_url"))
         if not url:

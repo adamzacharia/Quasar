@@ -31,6 +31,14 @@ from core.llm_client import LLMClient, detect_provider
 from core.logger import logger, log_tool
 from services.ads_auto_link import build_exact_project_paper_links
 from services.evidence_quality import annotate_web_source_evidence, rank_web_sources
+from services.content_safety import (
+    FILTER_NOTICE,
+    is_explicit_query,
+    is_safe_web_image,
+    is_safe_web_source,
+    safe_assistant_text,
+    sanitize_web_payload,
+)
 
 
 from core.memory import ConversationMemory
@@ -696,6 +704,7 @@ GUIDELINES:
 - **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
 - **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
 - **WEB TOOL ROUTING**: Keyword query → `web_search`. Full URL(s) to read/summarize/quote → `web_extract_url`. Site root URL plus "find pages" → `web_map_site`. Site section plus "crawl/docs" → `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
+- **STRICT WEB SAFETY**: Never provide, summarize, cite, or link to pornographic, sexually explicit, nude, erotic, escort, or adult-entertainment content. Never emit general-web image URLs. If the web safety filter withholds results, state only that results were withheld by the safety filter and do not reconstruct the blocked content from memory.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
 - If the user says "yes/proceed" to a previous suggestion, ACT on it immediately.
@@ -3218,6 +3227,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         web search snippets.  This replaces the raw Tavily `answer` field which
         is often generic and unrelated to the user's actual question.
         """
+        web_data = sanitize_web_payload(web_data)
+        filter_meta = web_data.get("content_filter") if isinstance(web_data, dict) else {}
+        if (
+            isinstance(filter_meta, dict)
+            and filter_meta.get("filtered")
+            and not web_data.get("results")
+        ):
+            return str(filter_meta.get("notice") or FILTER_NOTICE)
+
         snippets = []
         for r in web_data.get("results", [])[:5]:
             title = r.get("title", "")
@@ -3260,15 +3278,29 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             summary = resp.output_text.strip()
             if summary:
-                return summary
+                return safe_assistant_text(summary)
         except Exception as e:
             print(f"[WEB SEARCH] Summary synthesis failed: {e}")
 
         # Fallback to raw Tavily answer
-        return web_data.get("answer", "").strip()
+        return safe_assistant_text(web_data.get("answer", "").strip())
 
     def _synthesize_web_tool_answer(self, query: str, web_results: List[Dict[str, Any]]) -> str:
         """Create a final answer when web tools returned sources but the model emitted no text."""
+        web_results = [
+            sanitize_web_payload(result)
+            for result in web_results
+            if isinstance(result, dict)
+        ]
+        if web_results and all(
+            isinstance(result.get("content_filter"), dict)
+            and result["content_filter"].get("filtered")
+            and not result.get("results")
+            and not result.get("sources")
+            for result in web_results
+        ):
+            return FILTER_NOTICE
+
         snippets = []
         for web_data in web_results[:4]:
             provider = web_data.get("provider", "Web")
@@ -3325,7 +3357,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             answer = resp.output_text.strip()
             if answer:
-                return answer
+                return safe_assistant_text(answer)
         except Exception as e:
             print(f"[WEB SEARCH] Tool-answer synthesis failed: {e}")
 
@@ -3397,7 +3429,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             except Exception:
                 pass
 
-        return ret_val
+        return sanitize_web_payload(ret_val)
 
     def _web_search_service(self):
         """Create the shared web provider service."""
@@ -3562,6 +3594,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     def _build_web_sources_event(self, web_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize web-tool outputs into the frontend source-card event."""
+        web_data = sanitize_web_payload(web_data)
         if not isinstance(web_data, dict) or not web_data.get("success", True):
             return None
 
@@ -3586,7 +3619,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         def _source_from_item(item: Any) -> Optional[Dict[str, Any]]:
             if isinstance(item, str):
                 url = _normalize_web_url(item)
-                return annotate_web_source_evidence({"title": _title_from_url(url), "url": url, "snippet": ""}) if url else None
+                candidate = {"title": _title_from_url(url), "url": url, "snippet": ""}
+                return annotate_web_source_evidence(candidate) if url and is_safe_web_source(candidate) else None
             if not isinstance(item, dict):
                 return None
             url = _normalize_web_url(
@@ -3598,7 +3632,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             if not url:
                 return None
-            return annotate_web_source_evidence({
+            candidate = {
                 "title": str(item.get("title") or item.get("name") or _title_from_url(url)).strip(),
                 "url": url,
                 "snippet": str(
@@ -3609,12 +3643,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     or ""
                 ).strip()[:500],
                 "evidenceQuality": item.get("evidenceQuality") or item.get("evidence_quality") or {},
-            })
+            }
+            return annotate_web_source_evidence(candidate) if is_safe_web_source(candidate) else None
 
         def _image_from_item(item: Any) -> Optional[Dict[str, str]]:
             if isinstance(item, str):
                 url = item.strip()
-                return {"url": url, "description": ""} if url else None
+                candidate = {"url": url, "description": ""}
+                return candidate if url and is_safe_web_image(candidate) else None
             if not isinstance(item, dict):
                 return None
             url = str(item.get("url") or item.get("src") or item.get("image_url") or "").strip()
@@ -3649,7 +3685,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             ).strip()
             if source_title:
                 image["sourceTitle"] = source_title
-            return image
+            return image if is_safe_web_image(image) else None
 
         def _source_items_from_text(text: Any) -> List[Dict[str, str]]:
             if not isinstance(text, str) or "." not in text:
@@ -7148,6 +7184,11 @@ IMPORTANT RULES:
             pattern = re.compile(re.escape(tag), re.IGNORECASE)
             query = pattern.sub("", query).strip()
 
+        if is_explicit_query(_user_query):
+            if on_token:
+                on_token(FILTER_NOTICE)
+            return FILTER_NOTICE
+
         # 0. Session Management -- smart context handling + session memory
         self._prune_session_if_needed(query, user_id)
 
@@ -7979,7 +8020,7 @@ IMPORTANT RULES:
 
                     # Companion notebook attachment has been disabled for Conductor tasks as per requirements.
 
-                    return conductor_answer
+                    return safe_assistant_text(conductor_answer)
                 # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:
             print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
@@ -8430,6 +8471,7 @@ IMPORTANT RULES:
             
 
             # 8. Update long-term memory — only for authenticated users
+            output_text = safe_assistant_text(output_text)
             if self.long_term_memory and not _is_anonymous:
                 try:
                     messages = [
@@ -8440,7 +8482,7 @@ IMPORTANT RULES:
                 except Exception as e:
                     print(f"[WARNING] mem0 memory add failed: {e}")
             
-            return output_text
+            return safe_assistant_text(output_text)
             
         except AttributeError as ae:
             # Responses API not available in this OpenAI version
