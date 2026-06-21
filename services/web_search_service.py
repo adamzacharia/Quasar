@@ -21,6 +21,13 @@ import time
 import requests
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+from services.content_safety import (
+    blocked_query_result,
+    is_blocked_url,
+    is_explicit_query,
+    sanitize_web_payload,
+    web_images_enabled,
+)
 
 # Constants
 USAGE_FILE = "./data/search_usage.json"
@@ -232,6 +239,9 @@ class WebSearchService:
         search_depth: str = "basic"
     ) -> Dict[str, Any]:
         """Classify search intent and route to the optimal provider with fallbacks."""
+        if is_explicit_query(query):
+            return blocked_query_result(query)
+
         q_lower = query.lower()
         try:
             max_results = max(1, min(int(max_results), 10))
@@ -241,7 +251,7 @@ class WebSearchService:
         # 1. Image or Plot intent -> route to Image Search
         if any(kw in q_lower for kw in ["image", "photo", "chart", "map", "plot", "spectrum"]):
             print(f"[SEARCH ROUTER] Routed to Image Search for: {query!r}")
-            return self.search_images(query, max_results=max_results)
+            return sanitize_web_payload(self.search_images(query, max_results=max_results))
             
         # 2. Advanced / deep technical / research intent -> route to Exa.
         # Normal advanced search uses Exa deep; only very hard synthesis uses
@@ -262,7 +272,7 @@ class WebSearchService:
                 exa_type = self._determine_exa_type(query)
                 res = self.search_exa(query, num_results=max_results, search_type=exa_type)
                 if res.get("success"):
-                    return self._enrich_with_tavily_images(query, res)
+                    return sanitize_web_payload(self._enrich_with_tavily_images(query, res))
                 print("[SEARCH ROUTER] Exa failed, falling back to Brave/Tavily")
             elif self.exa_key:
                 print("[SEARCH ROUTER] Exa monthly free limit (1000) reached. Falling back.")
@@ -273,7 +283,7 @@ class WebSearchService:
             print(f"[SEARCH ROUTER] Routed to Brave (Primary) for: {query!r}")
             res = self.search_brave(query, max_results=max_results)
             if res.get("success"):
-                return self._enrich_with_tavily_images(query, res)
+                return sanitize_web_payload(self._enrich_with_tavily_images(query, res))
             print("[SEARCH ROUTER] Brave failed, falling back to Tavily")
         elif self.brave_key:
             print("[SEARCH ROUTER] Brave monthly free limit (1000) reached. Falling back.")
@@ -283,7 +293,7 @@ class WebSearchService:
             print(f"[SEARCH ROUTER] Routing to Tavily for: {query!r}")
             res = self.search_tavily(query, max_results=max_results, search_depth=search_depth)
             if res.get("success"):
-                return res
+                return sanitize_web_payload(res)
                 
         # 5. Ultimate Fallback: Local Scraping / BrowserService
         if self.browser_service:
@@ -297,14 +307,14 @@ class WebSearchService:
                 )
                 if not isinstance(fallback_results, list):
                     fallback_results = []
-                return {
+                return sanitize_web_payload({
                     "success": True,
                     "provider": "BrowserService (fallback)",
                     "query": query,
                     "results": fallback_results,
                     "raw_text": fallback.get("raw_text", "") if isinstance(fallback, dict) else "",
                     "images": self._fetch_tavily_images(query) if self.tavily_key else []
-                }
+                })
             except Exception as e:
                 return {"success": False, "error": f"Scraping fallback failed: {e}"}
                 
@@ -402,7 +412,7 @@ class WebSearchService:
         source_title: str = "",
     ) -> List[Dict[str, str]]:
         """Normalize provider image payloads into Quasar's web image shape."""
-        if not isinstance(items, list):
+        if not web_images_enabled() or not isinstance(items, list):
             return []
 
         images: List[Dict[str, str]] = []
@@ -502,7 +512,7 @@ class WebSearchService:
 
     def _fetch_tavily_images(self, query: str, max_images: int = 6) -> List[Dict[str, str]]:
         """Fetch image tiles for a search result using Tavily's REST API."""
-        if not self.tavily_key:
+        if not web_images_enabled() or not self.tavily_key or is_explicit_query(query):
             return []
 
         payload = {
@@ -529,6 +539,7 @@ class WebSearchService:
             or not result.get("success")
             or result.get("images")
             or not self.tavily_key
+            or not web_images_enabled()
         ):
             return result
 
@@ -548,6 +559,8 @@ class WebSearchService:
 
     def search_brave(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> Dict[str, Any]:
         """Perform search using Brave LLM Context (primary RAG) or Web Search."""
+        if is_explicit_query(query):
+            return blocked_query_result(query)
         if not self.brave_key:
             return {"success": False, "error": "Brave API key missing"}
         max_results = max(1, min(int(max_results), 10))
@@ -570,20 +583,25 @@ class WebSearchService:
                 data = response.json()
                 results = self._parse_brave_llm_context(data, max_results=max_results)
                 if results:
-                    return {
+                    return sanitize_web_payload({
                         "success": True,
                         "provider": "Brave LLM Context",
                         "query": query,
                         "results": results,
                         "images": []
-                    }
+                    })
         except Exception as e:
             print(f"[SEARCH ROUTER] Brave LLM Context API call failed: {e}")
 
         # Fallback to standard Brave Web Search
         web_url = "https://api.search.brave.com/res/v1/web/search"
         try:
-            web_response = requests.get(web_url, headers=headers, params={"q": query, "count": min(max_results, 10)}, timeout=10)
+            web_response = requests.get(
+                web_url,
+                headers=headers,
+                params={"q": query, "count": min(max_results, 10), "safesearch": "strict"},
+                timeout=10,
+            )
             if web_response.status_code == 200:
                 self._increment_usage("brave")
                 data = web_response.json()
@@ -594,13 +612,13 @@ class WebSearchService:
                         "url": item.get("url", item.get("link", "")),
                         "snippet": item.get("snippet", "")
                     })
-                return {
+                return sanitize_web_payload({
                     "success": True,
                     "provider": "Brave Web Search",
                     "query": query,
                     "results": results[:max_results],
                     "images": []
-                }
+                })
         except Exception as e:
             print(f"[SEARCH ROUTER] Brave Web Search API call failed: {e}")
 
@@ -614,10 +632,13 @@ class WebSearchService:
         include_images: bool = True,
     ) -> Dict[str, Any]:
         """Perform Tavily search with source and optional image metadata."""
+        if is_explicit_query(query):
+            return blocked_query_result(query)
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
 
         max_results = max(1, min(int(max_results), 10))
+        include_images = bool(include_images and web_images_enabled())
         payload = {
             "query": query,
             "max_results": max_results,
@@ -647,14 +668,14 @@ class WebSearchService:
                     "snippet": r.get("content", "")
                 })
             images = self._collect_tavily_images(response, max_images=6)
-            return {
+            return sanitize_web_payload({
                 "success": True,
                 "provider": "Tavily",
                 "query": query,
                 "answer": response.get("answer", "") if isinstance(response, dict) else "",
                 "results": results,
                 "images": images[:6]
-            }
+            })
         except Exception as e:
             return {"success": False, "error": f"Tavily search failed: {e}"}
 
@@ -670,10 +691,17 @@ class WebSearchService:
     ) -> Dict[str, Any]:
         """Extract clean content from one or more URLs using Tavily Extract."""
         clean_urls = self._normalize_urls(urls)
+        original_url_count = len(clean_urls)
+        clean_urls = [url for url in clean_urls if not is_blocked_url(url)]
+        blocked_url_count = original_url_count - len(clean_urls)
         if not clean_urls:
             return {
                 "success": False,
-                "error": "web_extract_url requires at least one full http(s) URL. Use web_search for keyword queries.",
+                "error": (
+                    "The requested URL was blocked by the web safety filter."
+                    if blocked_url_count
+                    else "web_extract_url requires at least one full http(s) URL. Use web_search for keyword queries."
+                ),
             }
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
@@ -699,13 +727,13 @@ class WebSearchService:
             if isinstance(response, dict) and response.get("success") is False:
                 return response
             response = self._truncate_result_content(response, max_content_chars)
-            return {
+            return sanitize_web_payload({
                 "success": True,
                 "provider": "Tavily Extract",
                 "urls": clean_urls,
                 "response": response,
                 "results": response.get("results", []) if isinstance(response, dict) else response,
-            }
+            })
         except Exception as e:
             return {"success": False, "error": f"Tavily extract failed: {e}"}
 
@@ -725,6 +753,8 @@ class WebSearchService:
         """Discover URLs on a site using Tavily Map."""
         if not url:
             return {"success": False, "error": "A root URL is required"}
+        if is_blocked_url(url):
+            return {"success": False, "error": "The requested URL was blocked by the web safety filter."}
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
 
@@ -755,13 +785,13 @@ class WebSearchService:
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
-            return {
+            return sanitize_web_payload({
                 "success": True,
                 "provider": "Tavily Map",
                 "url": url,
                 "response": response,
                 "results": response.get("results", []) if isinstance(response, dict) else response,
-            }
+            })
         except Exception as e:
             return {"success": False, "error": f"Tavily map failed: {e}"}
 
@@ -786,6 +816,8 @@ class WebSearchService:
         """Crawl and extract content from a bounded site section using Tavily Crawl."""
         if not url:
             return {"success": False, "error": "A root URL is required"}
+        if is_blocked_url(url):
+            return {"success": False, "error": "The requested URL was blocked by the web safety filter."}
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
 
@@ -795,7 +827,7 @@ class WebSearchService:
             "limit": max(1, min(int(limit), 50)),
             "extract_depth": extract_depth,
             "format": content_format,
-            "include_images": include_images,
+            "include_images": bool(include_images and web_images_enabled()),
             "allow_external": allow_external,
         }
         if instructions:
@@ -821,13 +853,13 @@ class WebSearchService:
             if isinstance(response, dict) and response.get("success") is False:
                 return response
             response = self._truncate_result_content(response, max_content_chars)
-            return {
+            return sanitize_web_payload({
                 "success": True,
                 "provider": "Tavily Crawl",
                 "url": url,
                 "response": response,
                 "results": response.get("results", []) if isinstance(response, dict) else response,
-            }
+            })
         except Exception as e:
             return {"success": False, "error": f"Tavily crawl failed: {e}"}
 
@@ -844,6 +876,8 @@ class WebSearchService:
         """Create a Tavily Research task and optionally poll until it completes."""
         if not research_input:
             return {"success": False, "error": "A research input is required"}
+        if is_explicit_query(research_input):
+            return blocked_query_result(research_input, provider="Tavily Research")
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
 
@@ -868,13 +902,13 @@ class WebSearchService:
                 return response
 
             if not wait_for_completion or not isinstance(response, dict):
-                return {
+                return sanitize_web_payload({
                     "success": True,
                     "provider": "Tavily Research",
                     "status": response.get("status") if isinstance(response, dict) else None,
                     "request_id": response.get("request_id") if isinstance(response, dict) else None,
                     "response": response,
-                }
+                })
 
             request_id = response.get("request_id")
             status = response.get("status")
@@ -891,7 +925,7 @@ class WebSearchService:
                         break
 
             response = self._truncate_result_content(response, max_content_chars)
-            return {
+            return sanitize_web_payload({
                 "success": response.get("status") != "failed",
                 "provider": "Tavily Research",
                 "status": response.get("status"),
@@ -899,7 +933,7 @@ class WebSearchService:
                 "content": response.get("content"),
                 "sources": response.get("sources", []),
                 "response": response,
-            }
+            })
         except Exception as e:
             return {"success": False, "error": f"Tavily research failed: {e}"}
 
@@ -924,7 +958,7 @@ class WebSearchService:
             if isinstance(response, dict) and response.get("success") is False:
                 return response
             response = self._truncate_result_content(response, max_content_chars)
-            return {
+            return sanitize_web_payload({
                 "success": response.get("status") != "failed",
                 "provider": "Tavily Research",
                 "status": response.get("status"),
@@ -932,12 +966,14 @@ class WebSearchService:
                 "content": response.get("content"),
                 "sources": response.get("sources", []),
                 "response": response,
-            }
+            })
         except Exception as e:
             return {"success": False, "error": f"Tavily research status failed: {e}"}
 
     def search_exa(self, query: str, num_results: int = DEFAULT_MAX_RESULTS, search_type: str = "deep") -> Dict[str, Any]:
         """Perform semantic research search using Exa."""
+        if is_explicit_query(query):
+            return blocked_query_result(query)
         if not self.exa_key:
             return {"success": False, "error": "Exa API key missing"}
         num_results = max(1, min(int(num_results), 10))
@@ -972,20 +1008,41 @@ class WebSearchService:
                         "published_date": r.get("publishedDate", ""),
                         "author": r.get("author", "")
                     })
-                return {
+                return sanitize_web_payload({
                     "success": True,
                     "provider": "Exa",
                     "search_type": search_type,
                     "query": query,
                     "results": results,
                     "images": []
-                }
+                })
             return {"success": False, "error": f"Exa returned status code {response.status_code}"}
         except Exception as e:
             return {"success": False, "error": f"Exa search failed: {e}"}
 
     def search_images(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> Dict[str, Any]:
         """Specialized image-only search leveraging Tavily or Brave's visual index."""
+        if is_explicit_query(query):
+            return blocked_query_result(query)
+        if not web_images_enabled():
+            return {
+                "success": True,
+                "provider": "Safety filter",
+                "query": query,
+                "answer": "General web image tiles are disabled by the safety policy.",
+                "results": [],
+                "images": [],
+                "content_filter": {
+                    "enabled": True,
+                    "filtered": True,
+                    "blocked_query": False,
+                    "blocked_results": 0,
+                    "blocked_images": 0,
+                    "blocked_text_fields": 0,
+                    "notice": "General web image tiles are disabled by the safety policy.",
+                    "web_images_enabled": False,
+                },
+            }
         max_results = max(1, min(int(max_results), 10))
         # 1. Primary: Tavily Image Search (gives rich descriptions)
         if self.tavily_key:
@@ -1018,13 +1075,13 @@ class WebSearchService:
                     })
                     
                 if images:
-                    return {
+                    return sanitize_web_payload({
                         "success": True,
                         "provider": "Tavily Images",
                         "query": query,
                         "results": results,
                         "images": images[:6]
-                    }
+                    })
             except Exception as e:
                 print(f"[SEARCH ROUTER] Tavily image search failed: {e}")
 
@@ -1038,7 +1095,12 @@ class WebSearchService:
             }
             # We explicitly ask to return web search results
             try:
-                response = requests.get(url, headers=headers, params={"q": query, "count": 10}, timeout=10)
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={"q": query, "count": 10, "safesearch": "strict"},
+                    timeout=10,
+                )
                 if response.status_code == 200:
                     self._increment_usage("brave")
                     data = response.json()
@@ -1067,13 +1129,13 @@ class WebSearchService:
                             "snippet": item.get("snippet", "")
                         })
                         
-                    return {
+                    return sanitize_web_payload({
                         "success": True,
                         "provider": "Brave Images (extrapolated)",
                         "query": query,
                         "results": results[:max_results],
                         "images": images[:6]
-                    }
+                    })
             except Exception as e:
                 print(f"[SEARCH ROUTER] Brave image search failed: {e}")
 

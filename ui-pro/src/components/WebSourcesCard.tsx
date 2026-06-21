@@ -5,6 +5,7 @@ import { useState } from "react";
 import { ExternalLink, Globe, ChevronRight, ChevronUp, ShieldCheck } from "lucide-react";
 import type { WebSource, WebImage } from "../lib/types";
 import { rankWebSources } from "../lib/evidence-quality";
+import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
 
 interface WebSourcesCardProps {
     sources?: WebSource[];
@@ -49,9 +50,11 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
     const [showAllSources, setShowAllSources] = useState(false);
     const [failedImages, setFailedImages] = useState<Set<number>>(new Set());
 
-    const rankedSources = rankWebSources(sources) as WebSource[];
+    const rankedSources = rankWebSources(sources.filter(isSafeWebSource)) as WebSource[];
     const visibleSources = showAllSources ? rankedSources : rankedSources.slice(0, 4);
-    const validImages = images.filter((_, i) => !failedImages.has(i));
+    const validImages = images
+        .map((image, originalIndex) => ({ image, originalIndex }))
+        .filter(({ image, originalIndex }) => isSafeWebImage(image) && !failedImages.has(originalIndex));
 
     const handleImageError = (index: number) => {
         setFailedImages(prev => new Set(prev).add(index));
@@ -154,15 +157,14 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
             {validImages.length > 0 && (
                 <div className="space-y-2">
                     <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
-                        {images.map((image, i) => {
-                            if (failedImages.has(i)) return null;
+                        {validImages.map(({ image, originalIndex }) => {
                             const clickUrl = image.sourceUrl || image.url;
                             const clickTitle = image.sourceTitle
                                 ? `Open source: ${image.sourceTitle}`
                                 : image.description || "View image";
                             return (
                                 <a
-                                    key={i}
+                                    key={originalIndex}
                                     href={clickUrl}
                                     target="_blank"
                                     rel="noopener noreferrer"
@@ -176,7 +178,7 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                                         alt={image.description || "Web search result"}
                                         className="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition-opacity"
                                         loading="lazy"
-                                        onError={() => handleImageError(i)}
+                                        onError={() => handleImageError(originalIndex)}
                                     />
                                     {/* Hover overlay with description */}
                                     {image.description && (

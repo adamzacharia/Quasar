@@ -13,6 +13,7 @@ import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
 import { normalizeEvidenceQuality } from "../lib/evidence-quality";
+import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
 import { buildObservationPaperGraph } from "../lib/research-graph";
 import { useAuthStore } from "../lib/auth-store";
 
@@ -216,12 +217,13 @@ export function ChatArea() {
             const item = source as Record<string, unknown>;
             const url = normalizeUrl(item.url || item.link || item.href || item.source_url || "");
             if (!url) return null;
-            return {
+            const normalized = {
                 title: String(item.title || item.name || titleFromUrl(url)).trim(),
                 url,
                 snippet: String(item.snippet || item.content || item.text || item.description || "").trim(),
                 evidenceQuality: normalizeEvidenceQuality(item.evidenceQuality || item.evidence_quality),
             };
+            return isSafeWebSource(normalized) ? normalized : null;
         };
 
         const normalizeWebImage = (image: unknown): WebImage | null => {
@@ -258,7 +260,7 @@ export function ChatArea() {
             };
             if (sourceUrl) normalized.sourceUrl = sourceUrl;
             if (sourceTitle) normalized.sourceTitle = sourceTitle;
-            return normalized;
+            return isSafeWebImage(normalized) ? normalized : null;
         };
 
         const rawSources = Array.isArray(data.sources)

@@ -17,6 +17,7 @@ import { WebSourcesCard } from "./WebSourcesCard";
 import { useChatStore } from "../lib/store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
 import { canSubmitIssueReport, shouldOpenIssueReport } from "../lib/feedback-report";
+import { safeAssistantWebText } from "../lib/content-safety";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -333,7 +334,8 @@ interface ChatMessageProps {
 
 export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt }: ChatMessageProps) {
     const isUser = message.role === "user";
-    const hasContent = !!message.content;
+    const displayContent = isUser ? message.content : safeAssistantWebText(message.content);
+    const hasContent = !!displayContent;
     const hasThinkingSteps = !!thinkingSteps?.length;
     const hasThinking = hasThinkingSteps || !!message.thinking;
     const thinkingIsRunning = thinkingStatus === "running" && !hasContent;
@@ -657,14 +659,19 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                 img() {
                                     return null;
                                 },
-                            }}>{message.content.replace(/!\[([^\]]*)\]\([^)]+\)/g, '')}</ReactMarkdown>
+                            }}>{displayContent.replace(/!\[([^\]]*)\]\([^)]+\)/g, '')}</ReactMarkdown>
                         </div>
                     )}
 
                     {showAnswerBuffer && <AnswerBuffer />}
 
                     {/* Action bar: copy, like, dislike — shown at bottom on hover */}
-                    {hasContent && !isStreaming && <MessageActions message={message} reportPrompt={reportPrompt} />}
+                    {hasContent && !isStreaming && (
+                        <MessageActions
+                            message={{ ...message, content: displayContent }}
+                            reportPrompt={reportPrompt}
+                        />
+                    )}
                 </div>
             </div>
         </div>

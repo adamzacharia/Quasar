@@ -235,6 +235,7 @@ def test_exa_routes_deep_for_simple_documentation_searches(monkeypatch, isolated
 
 def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
     monkeypatch.delitem(sys.modules, "tavily", raising=False)
     calls = {}
 
@@ -278,6 +279,7 @@ def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
 
 def test_tavily_search_prefers_source_linked_result_images(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
     monkeypatch.delitem(sys.modules, "tavily", raising=False)
 
     def fake_tavily_post(self, endpoint, payload, timeout=60):
@@ -321,6 +323,7 @@ def test_tavily_search_prefers_source_linked_result_images(monkeypatch):
 def test_route_enriches_brave_results_with_tavily_images(monkeypatch, isolated_usage_file):
     monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
 
     def fake_search_brave(self, query, max_results=5):
         return {
@@ -348,6 +351,7 @@ def test_route_enriches_brave_results_with_tavily_images(monkeypatch, isolated_u
 def test_brave_image_fallback_links_thumbnails_to_source_pages(monkeypatch, isolated_usage_file):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
 
     def fake_get(url, headers=None, params=None, timeout=None):
         return DummyResponse(
