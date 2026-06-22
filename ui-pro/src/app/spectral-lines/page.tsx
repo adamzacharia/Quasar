@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
     AlertTriangle,
+    ArrowLeft,
     ChevronDown,
     ChevronRight,
     CircleStop,
@@ -30,6 +31,7 @@ import {
     downloadSpectralLineExport,
     getSpectralLineJob,
     getSpectralLineMetadata,
+    isUnauthorizedApiError,
     searchSpectralSpecies,
     startSpectralLineJob,
     type SpectralCoverageProject,
@@ -172,24 +174,36 @@ function SpectralLineExplorer() {
     const autorunHandled = useRef("");
     const [rawComparison, setRawComparison] = useState<{ line: SpectralLineRecord; rows: SpectralLineRecord[] } | null>(null);
 
+    const handleSpectralError = useCallback((reason: unknown) => {
+        if (isUnauthorizedApiError(reason)) {
+            setError("Your session expired — please sign in again.");
+            openAuthModal();
+            return;
+        }
+        setError(reason instanceof Error ? reason.message : String(reason));
+    }, [openAuthModal]);
+
     useEffect(() => {
         if (!isInitialized) return;
         if (!isAuthenticated) {
             openAuthModal();
             return;
         }
-        getSpectralLineMetadata(token).then(setMetadata).catch((reason) => setError(String(reason.message || reason)));
-    }, [isAuthenticated, isInitialized, openAuthModal, token]);
+        getSpectralLineMetadata(token).then(setMetadata).catch(handleSpectralError);
+    }, [handleSpectralError, isAuthenticated, isInitialized, openAuthModal, token]);
 
     useEffect(() => {
         if (!token || !speciesQuery.trim()) return;
         const timer = window.setTimeout(() => {
             searchSpectralSpecies(speciesQuery, 12, token)
                 .then((result) => setSpeciesMatches(result.species))
-                .catch(() => setSpeciesMatches([]));
+                .catch((reason) => {
+                    setSpeciesMatches([]);
+                    if (isUnauthorizedApiError(reason)) handleSpectralError(reason);
+                });
         }, 250);
         return () => window.clearTimeout(timer);
-    }, [speciesQuery, token]);
+    }, [handleSpectralError, speciesQuery, token]);
 
     useEffect(() => {
         const speciesId = searchParams.get("species");
@@ -200,8 +214,10 @@ function SpectralLineExplorer() {
                 setSelectedSpecies([selected]);
                 setSpeciesQuery(selected.formula);
             }
-        }).catch(() => undefined);
-    }, [searchParams, selectedSpecies.length, token]);
+        }).catch((reason) => {
+            if (isUnauthorizedApiError(reason)) handleSpectralError(reason);
+        });
+    }, [handleSpectralError, searchParams, selectedSpecies.length, token]);
 
     const buildQuery = useCallback(() => {
         const primaryWindows = windowMin && windowMax
@@ -311,10 +327,10 @@ function SpectralLineExplorer() {
         const timer = window.setInterval(() => {
             getSpectralLineJob(pollingJobId, page, 100, token)
                 .then((nextJob) => setJob((current) => current?.job_id === pollingJobId ? nextJob : current))
-                .catch((reason) => setError(String(reason.message || reason)));
+                .catch(handleSpectralError);
         }, 1500);
         return () => window.clearInterval(timer);
-    }, [job, page, token]);
+    }, [handleSpectralError, job, page, token]);
 
     const jobId = job?.job_id;
     const jobStatus = job?.status;
@@ -333,8 +349,10 @@ function SpectralLineExplorer() {
         if (!jobId || !jobStatus || !TERMINAL.has(jobStatus) || !token) return;
         getSpectralLineJob(jobId, page, 100, token, requestedDataset)
             .then((nextJob) => setJob((current) => current?.job_id === jobId ? nextJob : current))
-            .catch(() => undefined);
-    }, [jobId, jobStatus, page, requestedDataset, token]);
+            .catch((reason) => {
+                if (isUnauthorizedApiError(reason)) handleSpectralError(reason);
+            });
+    }, [handleSpectralError, jobId, jobStatus, page, requestedDataset, token]);
 
     useEffect(() => {
         const autorun = searchParams.get("autorun");
@@ -342,10 +360,10 @@ function SpectralLineExplorer() {
         if (!autorun || autorunHandled.current === autorunKey || !metadata || !token) return;
         autorunHandled.current = autorunKey;
         const timer = window.setTimeout(() => {
-            startJob(autorun === "coverage" ? "alma_coverage" : "catalog_search").catch((reason) => setError(String(reason.message || reason)));
+            startJob(autorun === "coverage" ? "alma_coverage" : "catalog_search").catch(handleSpectralError);
         }, 350);
         return () => window.clearTimeout(timer);
-    }, [metadata, searchParams, startJob, token]);
+    }, [handleSpectralError, metadata, searchParams, startJob, token]);
 
     const rows = (job?.rows || []) as SpectralLineRecord[];
     const projects = (job?.rows || []) as SpectralCoverageProject[];
@@ -364,13 +382,26 @@ function SpectralLineExplorer() {
 
     const download = async (dataset: "lines" | "raw_lines" | "coverage" | "candidates", format: "csv" | "tsv" | "json" | "casa") => {
         if (!job || !token) return;
-        const result = await downloadSpectralLineExport(job.job_id, dataset, format, token);
-        const url = URL.createObjectURL(result.blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = result.filename;
-        link.click();
-        URL.revokeObjectURL(url);
+        try {
+            const result = await downloadSpectralLineExport(job.job_id, dataset, format, token);
+            const url = URL.createObjectURL(result.blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = result.filename;
+            link.click();
+            URL.revokeObjectURL(url);
+        } catch (reason) {
+            handleSpectralError(reason);
+        }
+    };
+
+    const cancelJob = async () => {
+        if (!job || !token) return;
+        try {
+            setJob(await cancelSpectralLineJob(job.job_id, token));
+        } catch (reason) {
+            handleSpectralError(reason);
+        }
     };
 
     const compareRawEntries = async (line: SpectralLineRecord) => {
@@ -390,7 +421,7 @@ function SpectralLineExplorer() {
             }) as SpectralLineRecord[];
             setRawComparison({ line, rows: matches });
         } catch (reason) {
-            setError(String(reason instanceof Error ? reason.message : reason));
+            handleSpectralError(reason);
         }
     };
 
@@ -419,9 +450,19 @@ function SpectralLineExplorer() {
                         </div>
                         <p className="mt-1 text-xs text-slate-500">Splatalogue catalog evidence and exact ALMA spectral-window coverage</p>
                     </div>
-                    <div className="text-right text-[10px] text-slate-500">
-                        <div>{metadata?.band_registry.version || "ALMA band registry"}</div>
-                        <div>Results expire after one hour</div>
+                    <div className="flex items-center gap-4">
+                        <div className="text-right text-[10px] text-slate-500">
+                            <div>{metadata?.band_registry.version || "ALMA band registry"}</div>
+                            <div>Results expire after one hour</div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => router.push("/")}
+                            className="inline-flex items-center gap-2 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-500/50 hover:bg-slate-800 hover:text-cyan-200"
+                        >
+                            <ArrowLeft className="h-4 w-4" />
+                            Back to chat
+                        </button>
                     </div>
                 </header>
 
@@ -577,10 +618,10 @@ function SpectralLineExplorer() {
                                 </div>
                             )}
 
-                            <button type="button" onClick={() => startJob("catalog_search").catch((reason) => setError(String(reason.message || reason)))} className="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-cyan-400 text-xs font-bold text-slate-950 hover:bg-cyan-300">
+                            <button type="button" onClick={() => startJob("catalog_search").catch(handleSpectralError)} className="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-cyan-400 text-xs font-bold text-slate-950 hover:bg-cyan-300">
                                 <Search className="h-4 w-4" /> Search lines
                             </button>
-                            <button type="button" onClick={() => startJob("alma_coverage").catch((reason) => setError(String(reason.message || reason)))} className="flex h-10 w-full items-center justify-center gap-2 rounded-md border border-cyan-500/50 bg-cyan-500/10 text-xs font-bold text-cyan-200 hover:bg-cyan-500/15">
+                            <button type="button" onClick={() => startJob("alma_coverage").catch(handleSpectralError)} className="flex h-10 w-full items-center justify-center gap-2 rounded-md border border-cyan-500/50 bg-cyan-500/10 text-xs font-bold text-cyan-200 hover:bg-cyan-500/15">
                                 <Telescope className="h-4 w-4" /> Check exact ALMA coverage
                             </button>
                         </div>
@@ -598,7 +639,7 @@ function SpectralLineExplorer() {
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <span className="font-mono text-[10px] text-slate-500">{job.status} · {progress}%</span>
-                                        {!TERMINAL.has(job.status) && <button type="button" onClick={() => token && cancelSpectralLineJob(job.job_id, token).then(setJob)} className="rounded border border-amber-500/40 p-1.5 text-amber-300"><CircleStop className="h-3.5 w-3.5" /></button>}
+                                        {!TERMINAL.has(job.status) && <button type="button" onClick={cancelJob} className="rounded border border-amber-500/40 p-1.5 text-amber-300"><CircleStop className="h-3.5 w-3.5" /></button>}
                                     </div>
                                 </div>
                                 <div className="mt-3 h-1 overflow-hidden rounded bg-slate-900"><div className="h-full bg-cyan-400" style={{ width: `${progress}%` }} /></div>
@@ -628,7 +669,7 @@ function SpectralLineExplorer() {
                                     <span>{job?.pagination?.total_rows || 0} transitions · {selectedLineIds.length ? `${selectedLineIds.length} selection identifiers` : "select lines for coverage"}</span>
                                     <span>Page {job?.pagination?.page || 0} / {job?.pagination?.total_pages || 0}</span>
                                 </div>
-                                <SpectralLineTable lines={rows} selectedIds={selectedLineIds} onToggleSelect={toggleLine} onAnalyzeConfusion={(line) => startJob("confusion", line).catch((reason) => setError(String(reason.message || reason)))} onCompareRaw={compareRawEntries} />
+                                <SpectralLineTable lines={rows} selectedIds={selectedLineIds} onToggleSelect={toggleLine} onAnalyzeConfusion={(line) => startJob("confusion", line).catch(handleSpectralError)} onCompareRaw={compareRawEntries} />
                                 {(job?.pagination?.total_pages || 0) > 1 && (
                                     <div className="flex justify-end gap-2">
                                         <button type="button" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))} className="rounded border border-slate-700 px-3 py-2 text-xs text-slate-300 disabled:opacity-40">Previous</button>
