@@ -25,6 +25,10 @@ _DUMMY_KEYS = {
     "NASA_ADS_API_KEY": "test-dummy-ads-key",
     "DEFAULT_LLM_MODEL": "gpt-5.4-mini",
     "QUASAR_ENV": "testing",
+    # Keep the on-disk Splatalogue query cache off by default so unit tests are
+    # deterministic and never serve stale cross-run results. Cache-specific
+    # tests opt back in explicitly.
+    "SPLATALOGUE_QUERY_CACHE_ENABLED": "0",
 }
 for key, val in _DUMMY_KEYS.items():
     os.environ.setdefault(key, val)

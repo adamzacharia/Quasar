@@ -16,14 +16,20 @@ from __future__ import annotations
 import html
 import hashlib
 import json
+import logging
 import math
+import os
+import random
 import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 SPLATALOGUE_SLAP_URL = "https://splatalogue.online/splata-slap/slap"
@@ -59,6 +65,78 @@ _NUMBER_WITH_ERROR_RE = re.compile(
     r"(?P<frequency>[+-]?\d+(?:\.\d+)?)"
     r"(?:\s*\(\s*(?P<error>[+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s*\))?"
 )
+
+# --- Scientific species / transition matching --------------------------------
+# A quantum-number "group" is a (possibly half-integer) number optionally
+# followed by parenthetical sub-quantum-numbers, e.g. ``2`` or ``2(0,2)``.
+_QN_GROUP = r"\d+(?:/\d+)?(?:\([^)]*\))?"
+# An upper-lower transition pair such as ``2-1``, ``J=2-1`` (the J= is context,
+# not captured), ``2(0,2)-1(0,1)``, or ``5/2-3/2``. The lookarounds forbid only a
+# neighbouring digit/slash/dot, so a number isn't matched as part of a LARGER
+# number (``2-1`` is NOT found inside ``12-11``) while still allowing letters and
+# underscores as separators (e.g. CDMS ``2_1_2-1_0_1`` resolves to the 2-1 pair).
+_TRANSITION_PAIR_RE = re.compile(
+    r"(?<![\d/.])(" + _QN_GROUP + r")\s*(?:-->|->|→|–|—|-)\s*("
+    + _QN_GROUP + r")(?![\d/.])"
+)
+_LEADING_NUMBER_RE = re.compile(r"\d+(?:/\d+)?")
+_STATE_ANNOTATION_RE = re.compile(r"\bv\s*=\s*\d+|ν\s*=\s*\d+", re.IGNORECASE)
+
+
+def normalize_formula(value: Any) -> str:
+    """Normalize a molecular formula for case- and isotopologue-aware matching.
+
+    Strips HTML and vibrational/electronic state annotations (``v=0``/``ν=1``),
+    then keeps the leading whitespace/comma-delimited token. Element-symbol CASE
+    and isotope prefixes are preserved, so ``CO`` != ``Co`` (cobalt) and
+    ``CO`` != ``13CO`` != ``C18O``.
+    """
+    text = _HTML_TAG_RE.sub(" ", str(value or ""))
+    text = _STATE_ANNOTATION_RE.sub(" ", text)
+    parts = re.split(r"[\s,;]+", text.strip())
+    return parts[0].strip() if parts and parts[0] else ""
+
+
+def formula_matches(query: Any, candidate: Any) -> bool:
+    """True iff two molecular formulae are the same species (case-sensitive)."""
+    q = normalize_formula(query)
+    c = normalize_formula(candidate)
+    return bool(q) and bool(c) and q == c
+
+
+def _transition_pairs(text: str) -> set:
+    """Extract the set of upper-lower quantum-number pairs from a transition."""
+    pairs = set()
+    for match in _TRANSITION_PAIR_RE.finditer(text):
+        upper = _LEADING_NUMBER_RE.match(match.group(1))
+        lower = _LEADING_NUMBER_RE.match(match.group(2))
+        if upper and lower:
+            pairs.add((upper.group(0), lower.group(0)))
+    return pairs
+
+
+def transition_matches(query: Any, candidate: Any) -> bool:
+    """Structurally match a requested transition against a candidate's QNs.
+
+    ``2-1`` matches ``2-1``, ``J=2-1``, and ``2(0,2)-1(0,1)`` (the leading J pair),
+    and is found among the components of a hyperfine listing such as
+    ``N=2-1,J=5/2-3/2,F=3-2`` — but it does NOT match ``12-11`` or ``32-31``.
+    An empty query matches anything (no transition filter requested).
+    """
+    q = str(query or "").strip()
+    if not q:
+        return True
+    c = str(candidate or "").strip()
+    if not c:
+        return False
+    q_pairs = _transition_pairs(q)
+    if q_pairs:
+        return bool(q_pairs & _transition_pairs(c))
+    # No numeric upper-lower pair in the query (e.g. a named/letter transition):
+    # require a whole-string normalized match rather than a bare substring.
+    q_norm = re.sub(r"[^a-z0-9]+", "", q.lower())
+    c_norm = re.sub(r"[^a-z0-9]+", "", c.lower())
+    return bool(q_norm) and q_norm == c_norm
 
 
 @dataclass(frozen=True)
@@ -327,17 +405,154 @@ class SplatalogueQueryCancelled(RuntimeError):
     """Raised when a running threaded query is canceled."""
 
 
+def _slap_retryable_exceptions() -> tuple:
+    """Transient exception types worth retrying for the PyVO SLAP fallback."""
+    excs: List[type] = [
+        requests.ConnectionError,
+        requests.Timeout,
+        ConnectionError,
+        TimeoutError,
+    ]
+    try:  # pragma: no cover - depends on optional pyvo install
+        from pyvo.dal.exceptions import DALServiceError
+
+        excs.append(DALServiceError)
+    except Exception:
+        pass
+    return tuple(excs)
+
+
 class SplatalogueClient:
     """Network transport for current Splatalogue Advanced and SLAP services."""
+
+    #: HTTP status codes worth retrying (transient server/proxy/rate-limit errors).
+    RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
     def __init__(
         self,
         *,
         session: Optional[requests.Session] = None,
         timeout_seconds: float = 240.0,
+        max_retries: Optional[int] = None,
+        backoff_base_seconds: Optional[float] = None,
+        backoff_max_seconds: Optional[float] = None,
+        submit_timeout: float = 30.0,
+        poll_timeout: float = 30.0,
+        non_threaded_timeout: float = 60.0,
     ):
         self.session = session or requests.Session()
         self.timeout_seconds = timeout_seconds
+        self.max_retries = (
+            int(os.getenv("SPLATALOGUE_MAX_RETRIES", "3"))
+            if max_retries is None
+            else int(max_retries)
+        )
+        self.backoff_base_seconds = (
+            float(os.getenv("SPLATALOGUE_BACKOFF_BASE_SECONDS", "0.5"))
+            if backoff_base_seconds is None
+            else float(backoff_base_seconds)
+        )
+        self.backoff_max_seconds = (
+            float(os.getenv("SPLATALOGUE_BACKOFF_MAX_SECONDS", "8.0"))
+            if backoff_max_seconds is None
+            else float(backoff_max_seconds)
+        )
+        self.submit_timeout = submit_timeout
+        self.poll_timeout = poll_timeout
+        self.non_threaded_timeout = non_threaded_timeout
+
+    # -- transient-error resilience -------------------------------------------
+
+    def _interruptible_sleep(
+        self, seconds: float, cancel_event: Optional[threading.Event]
+    ) -> None:
+        """Sleep up to ``seconds`` while staying responsive to cancellation."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if cancel_event is not None and cancel_event.is_set():
+                raise SplatalogueQueryCancelled("Splatalogue query canceled")
+            time.sleep(min(0.25, remaining))
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff with full jitter for retry ``attempt`` (0-based)."""
+        ceiling = min(
+            self.backoff_max_seconds,
+            self.backoff_base_seconds * (2 ** attempt),
+        )
+        # Full jitter avoids synchronized retry storms across concurrent jobs.
+        return random.uniform(0.0, max(0.0, ceiling))
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Issue an HTTP request, retrying only transient failures.
+
+        Retries connection drops/timeouts (e.g. ``RemoteDisconnected``) and the
+        retryable 5xx/429 statuses with exponential backoff + jitter. Genuine
+        client errors (4xx other than 429) are returned to the caller unretried
+        so real query rejections are not masked. Splatalogue search requests are
+        effectively read-only, so retrying the POST submissions is safe.
+        """
+        for attempt in range(self.max_retries + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise SplatalogueQueryCancelled("Splatalogue query canceled")
+            try:
+                if method.upper() == "POST":
+                    response = self.session.post(url, **kwargs)
+                else:
+                    response = self.session.get(url, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt >= self.max_retries:
+                    raise
+                logger.warning(
+                    "Splatalogue %s %s transient error (attempt %d/%d): %s",
+                    method, url, attempt + 1, self.max_retries + 1, exc,
+                )
+                self._interruptible_sleep(self._backoff_delay(attempt), cancel_event)
+                continue
+            if (
+                response.status_code in self.RETRYABLE_STATUS
+                and attempt < self.max_retries
+            ):
+                logger.warning(
+                    "Splatalogue %s %s returned %d (attempt %d/%d); retrying",
+                    method, url, response.status_code, attempt + 1, self.max_retries + 1,
+                )
+                self._interruptible_sleep(self._backoff_delay(attempt), cancel_event)
+                continue
+            return response
+        raise RuntimeError("unreachable: retry loop exhausted without return")
+
+    def _call_with_retry(
+        self,
+        func,
+        *,
+        retryable: tuple,
+        cancel_event: Optional[threading.Event] = None,
+    ):
+        """Retry an opaque callable (e.g. the PyVO SLAP search) on transient errors."""
+        for attempt in range(self.max_retries + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise SplatalogueQueryCancelled("Splatalogue query canceled")
+            try:
+                return func()
+            except retryable as exc:
+                if attempt >= self.max_retries:
+                    raise
+                logger.warning(
+                    "Splatalogue SLAP transient error (attempt %d/%d): %s",
+                    attempt + 1, self.max_retries + 1, exc,
+                )
+                self._interruptible_sleep(self._backoff_delay(attempt), cancel_event)
+        raise RuntimeError("unreachable: retry loop exhausted without return")
 
     def query(
         self,
@@ -386,9 +601,13 @@ class SplatalogueClient:
                 + " | ".join(errors)
             )
         try:
-            rows = SplatalogueTool._query_slap(
-                query.windows[0].minimum_ghz,
-                query.windows[0].maximum_ghz,
+            rows = self._call_with_retry(
+                lambda: SplatalogueTool._query_slap(
+                    query.windows[0].minimum_ghz,
+                    query.windows[0].maximum_ghz,
+                ),
+                retryable=_slap_retryable_exceptions(),
+                cancel_event=cancel_event,
             )
             warnings.append(
                 "Results came from the IVOA SLAP fallback after the Advanced service "
@@ -402,6 +621,10 @@ class SplatalogueClient:
                 warnings=warnings,
                 errors=errors,
             )
+        except SplatalogueQueryCancelled:
+            # A user cancellation during the SLAP retry must surface as a
+            # cancellation, not be re-labeled as a hard query failure below.
+            raise
         except Exception as exc:
             errors.append(f"SLAP: {exc}")
             raise RuntimeError("Splatalogue query failed: " + " | ".join(errors)) from exc
@@ -413,10 +636,12 @@ class SplatalogueClient:
         cancel_event: Optional[threading.Event],
     ) -> List[Mapping[str, Any]]:
         payload = self._advanced_payload(query)
-        response = self.session.post(
+        response = self._request_with_retry(
+            "POST",
             SPLATALOGUE_THREADED_URL,
             json=payload,
-            timeout=30,
+            timeout=self.submit_timeout,
+            cancel_event=cancel_event,
         )
         response.raise_for_status()
         body = response.json()
@@ -434,11 +659,16 @@ class SplatalogueClient:
                 raise SplatalogueQueryCancelled("Splatalogue query canceled")
             elapsed = time.monotonic() - started
             if elapsed > self.timeout_seconds:
-                raise TimeoutError("Splatalogue threaded query exceeded 240 seconds")
+                raise TimeoutError(
+                    "Splatalogue threaded query exceeded "
+                    f"{self.timeout_seconds:g} seconds"
+                )
             time.sleep(delay)
-            response = self.session.get(
+            response = self._request_with_retry(
+                "GET",
                 SPLATALOGUE_POLL_URL.format(request_number=request_number),
-                timeout=30,
+                timeout=self.poll_timeout,
+                cancel_event=cancel_event,
             )
             response.raise_for_status()
             rows = response.json()
@@ -466,10 +696,11 @@ class SplatalogueClient:
     def _query_non_threaded(
         self, query: SpectralLineQuery
     ) -> List[Mapping[str, Any]]:
-        response = self.session.post(
+        response = self._request_with_retry(
+            "POST",
             SPLATALOGUE_ADVANCED_URL,
             json=self._advanced_payload(query),
-            timeout=60,
+            timeout=self.non_threaded_timeout,
         )
         response.raise_for_status()
         body = response.json()
@@ -635,31 +866,130 @@ class SplatalogueClient:
         }
 
 
+class SplatalogueQueryCache:
+    """TTL cache for full Splatalogue query results, keyed by the canonical query.
+
+    Only non-degraded Advanced results are cached, so a transient SLAP fallback
+    never pins a degraded result for the whole TTL after the Advanced service
+    recovers. Backed by diskcache (the same dependency used for species
+    metadata); degrades to a no-op if diskcache is unavailable.
+    """
+
+    def __init__(
+        self,
+        cache_dir: "Path | str" = Path("cache") / "spectral_line_queries",
+        *,
+        ttl_seconds: Optional[int] = None,
+        enabled: Optional[bool] = None,
+    ):
+        self.ttl_seconds = (
+            int(os.getenv("SPLATALOGUE_QUERY_CACHE_TTL_SECONDS", "3600"))
+            if ttl_seconds is None
+            else int(ttl_seconds)
+        )
+        if enabled is None:
+            flag = os.getenv("SPLATALOGUE_QUERY_CACHE_ENABLED", "true").strip().lower()
+            enabled = flag not in {"0", "false", "no", "off"}
+        self.enabled = bool(enabled)
+        self._cache = None
+        if self.enabled:
+            try:
+                from diskcache import Cache
+
+                self._cache = Cache(str(cache_dir))
+            except Exception:
+                logger.warning(
+                    "Splatalogue query cache unavailable; continuing without it",
+                    exc_info=True,
+                )
+                self.enabled = False
+
+    @staticmethod
+    def key_for(query: "SpectralLineQuery") -> str:
+        payload = json.dumps(query.to_dict(), sort_keys=True, default=str)
+        return "splat_query_v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def get(self, query: "SpectralLineQuery") -> Optional[Dict[str, Any]]:
+        if not self.enabled or self._cache is None:
+            return None
+        try:
+            value = self._cache.get(self.key_for(query))
+        except Exception:
+            return None
+        return dict(value) if isinstance(value, Mapping) else None
+
+    def set(self, query: "SpectralLineQuery", value: Mapping[str, Any]) -> None:
+        if not self.enabled or self._cache is None:
+            return
+        try:
+            self._cache.set(self.key_for(query), dict(value), expire=self.ttl_seconds)
+        except Exception:
+            logger.debug("Splatalogue query cache write failed", exc_info=True)
+
+
+_DEFAULT_QUERY_CACHE: Optional["SplatalogueQueryCache"] = None
+
+
+def _default_query_cache() -> "SplatalogueQueryCache":
+    global _DEFAULT_QUERY_CACHE
+    if _DEFAULT_QUERY_CACHE is None:
+        _DEFAULT_QUERY_CACHE = SplatalogueQueryCache()
+    return _DEFAULT_QUERY_CACHE
+
+
 class SplatalogueTool:
     """Query and normalize molecular spectral-line data from Splatalogue."""
 
-    def __init__(self, client: Optional[SplatalogueClient] = None):
+    def __init__(
+        self,
+        client: Optional[SplatalogueClient] = None,
+        *,
+        query_cache: Optional["SplatalogueQueryCache"] = None,
+    ):
         self.client = client or SplatalogueClient()
+        self.query_cache = (
+            query_cache if query_cache is not None else _default_query_cache()
+        )
 
     def query_catalog(
         self,
         query: SpectralLineQuery,
         *,
         cancel_event: Optional[threading.Event] = None,
+        use_cache: bool = True,
     ) -> Dict[str, Any]:
         """Run a canonical query and return raw or deterministically merged rows."""
+        if use_cache:
+            cached = self.query_cache.get(query)
+            if cached is not None:
+                cached["from_cache"] = True
+                return cached
         response = self.client.query(query, cancel_event=cancel_event)
         center = None
         if len(query.windows) == 1:
             center = (
                 query.windows[0].minimum_ghz + query.windows[0].maximum_ghz
             ) / 2
+        incoming_rows = list(response.pop("rows", []))
         lines = [
             line
-            for row in response.pop("rows", [])
+            for row in incoming_rows
             if (line := self._normalize_row(row, query_frequency_ghz=center))
             is not None
         ]
+        if incoming_rows and not lines:
+            drift_message = (
+                "Splatalogue returned rows but none could be normalized; the "
+                "response format may have changed (possible schema drift)."
+            )
+            logger.warning(
+                "%s backend=%s rows=%d",
+                drift_message,
+                response.get("backend"),
+                len(incoming_rows),
+            )
+            response.setdefault("warnings", []).append(drift_message)
+            response["schema_drift_suspected"] = True
         if response["backend"] == "slap":
             lines = self._filter_slap_results(
                 lines,
@@ -681,15 +1011,14 @@ class SplatalogueTool:
                 only_nrao_recommended=query.only_nrao_recommended,
             )
         if query.transition:
-            transition_token = self._search_token(query.transition)
             lines = [
                 line
                 for line in lines
-                if transition_token
-                in self._search_token(
+                if transition_matches(
+                    query.transition,
                     line.get("transition")
                     or line.get("resolved_quantum_numbers")
-                    or line.get("unresolved_quantum_numbers")
+                    or line.get("unresolved_quantum_numbers"),
                 )
             ]
         if query.maximum_frequency_uncertainty_mhz is not None:
@@ -724,6 +1053,16 @@ class SplatalogueTool:
                 "query": query.to_dict(),
             }
         )
+        response["from_cache"] = False
+        # Cache only authoritative results: skip degraded (SLAP) answers so a
+        # transient fallback never pins a degraded result for the whole TTL, and
+        # skip suspected schema drift so a broken normalizer can't cache emptiness.
+        if (
+            use_cache
+            and not response.get("degraded")
+            and not response.get("schema_drift_suspected")
+        ):
+            self.query_cache.set(query, response)
         return response
 
     def identify_spectral_line(
@@ -873,18 +1212,25 @@ class SplatalogueTool:
 
         errors: List[str] = []
         backend = "astroquery"
+        retryable = _slap_retryable_exceptions()
         try:
-            rows = self._query_astroquery(
-                low,
-                high,
-                export_stop=min(max(limit * 4, 250), 1000),
-                **query_options,
+            rows = self.client._call_with_retry(
+                lambda: self._query_astroquery(
+                    low,
+                    high,
+                    export_stop=min(max(limit * 4, 250), 1000),
+                    **query_options,
+                ),
+                retryable=retryable,
             )
         except Exception as exc:
             errors.append(f"astroquery: {exc}")
             backend = "slap"
             try:
-                rows = self._query_slap(low, high)
+                rows = self.client._call_with_retry(
+                    lambda: self._query_slap(low, high),
+                    retryable=retryable,
+                )
             except Exception as slap_exc:
                 errors.append(f"SLAP: {slap_exc}")
                 return {
@@ -1313,7 +1659,6 @@ class SplatalogueTool:
             if self._looks_like_formula(molecule_name)
             else None
         )
-        transition_query = self._search_token(transition)
         allowed_catalogs = {self._catalog_token(value) for value in line_lists}
         energy_field = {
             "el_k": "lower_energy_k",
@@ -1337,18 +1682,12 @@ class SplatalogueTool:
             )
             if molecule_query:
                 if formula_query:
-                    species = str(line.get("species") or "").strip()
-                    if re.match(
-                        rf"^{re.escape(formula_query)}(?![A-Za-z0-9+])",
-                        species,
-                        flags=re.IGNORECASE,
-                    ) is None:
+                    # Case- and isotopologue-aware: CO != Co, CO != 13CO/C18O.
+                    if not formula_matches(formula_query, line.get("species")):
                         continue
                 elif molecule_query not in searchable_name:
                     continue
-            if transition_query and transition_query not in self._search_token(
-                line.get("transition")
-            ):
+            if transition and not transition_matches(transition, line.get("transition")):
                 continue
             if allowed_catalogs and self._catalog_token(line.get("source")) not in allowed_catalogs:
                 continue
