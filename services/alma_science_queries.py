@@ -56,6 +56,15 @@ FREQUENCY_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# In ALMA frequency_support each SPW range is immediately followed by its
+# channel resolution, e.g. ``[86.24..88.11GHz, 976.56kHz, ...]``. This captures
+# that resolution token when it directly follows a parsed range.
+RESOLUTION_AFTER_RANGE_RE = re.compile(
+    r"\s*,\s*(?P<res>\d+(?:\.\d+)?)\s*(?P<unit>GHz|MHz|kHz|Hz)",
+    re.IGNORECASE,
+)
+_RES_UNIT_TO_KHZ = {"ghz": 1e6, "mhz": 1e3, "khz": 1.0, "hz": 1e-3}
+
 
 def as_text(value: Any) -> str:
     text = str(value if value is not None else "").strip()
@@ -215,18 +224,21 @@ def _value_to_ghz(value: float, unit: Optional[str]) -> float:
     return float(value)
 
 
-def parse_frequency_support_intervals(value: Any) -> List[Tuple[float, float]]:
-    """Parse ALMA frequency_support ranges into GHz intervals.
+def parse_frequency_support_windows(value: Any) -> List[Dict[str, Optional[float]]]:
+    """Parse ALMA frequency_support into per-SPW windows with channel resolution.
 
-    The archive commonly represents spectral windows as strings containing
-    ranges such as ``218.0..220.0GHz``.  This parser intentionally accepts only
-    explicit ranges, then callers fall back to ``frequency +/- bandwidth/2``.
+    The archive represents spectral windows as strings such as
+    ``[86.24..88.11GHz, 976.56kHz, ...] U [88.10..89.98GHz, 488.28kHz, ...]``.
+    Each returned dict carries ``low_ghz``/``high_ghz`` and, when present, the
+    SPW channel ``resolution_khz`` (the token immediately after the range).
+    Different separators (``..``/``-``/``to``) and units (GHz/MHz/kHz/Hz) are
+    accepted so the parser is robust across frequency_support formats.
     """
     text = as_text(value)
     if not text:
         return []
 
-    intervals: List[Tuple[float, float]] = []
+    windows: List[Dict[str, Optional[float]]] = []
     for match in FREQUENCY_RANGE_RE.finditer(text):
         lo_unit = match.group("lo_unit")
         hi_unit = match.group("hi_unit") or lo_unit
@@ -235,14 +247,45 @@ def parse_frequency_support_intervals(value: Any) -> List[Tuple[float, float]]:
         if lo != lo or hi != hi:
             continue
         low, high = sorted((lo, hi))
-        if high > low:
-            intervals.append((round(low, 9), round(high, 9)))
+        if high <= low:
+            continue
+        resolution_khz: Optional[float] = None
+        tail = RESOLUTION_AFTER_RANGE_RE.match(text, match.end())
+        if tail:
+            resolution_khz = round(
+                float(tail.group("res")) * _RES_UNIT_TO_KHZ[tail.group("unit").lower()],
+                6,
+            )
+        windows.append(
+            {
+                "low_ghz": round(low, 9),
+                "high_ghz": round(high, 9),
+                "resolution_khz": resolution_khz,
+            }
+        )
 
-    deduped: List[Tuple[float, float]] = []
-    for interval in sorted(intervals):
-        if interval not in deduped:
-            deduped.append(interval)
+    deduped: List[Dict[str, Optional[float]]] = []
+    seen: set = set()
+    for window in sorted(windows, key=lambda w: (w["low_ghz"], w["high_ghz"])):
+        key = (window["low_ghz"], window["high_ghz"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(window)
     return deduped
+
+
+def parse_frequency_support_intervals(value: Any) -> List[Tuple[float, float]]:
+    """Parse ALMA frequency_support ranges into GHz intervals (compat shim).
+
+    The archive commonly represents spectral windows as strings containing
+    ranges such as ``218.0..220.0GHz``.  This parser intentionally accepts only
+    explicit ranges, then callers fall back to ``frequency +/- bandwidth/2``.
+    """
+    return [
+        (window["low_ghz"], window["high_ghz"])
+        for window in parse_frequency_support_windows(value)
+    ]
 
 
 def observation_intervals_ghz(row: pd.Series) -> List[Tuple[float, float]]:
@@ -251,6 +294,19 @@ def observation_intervals_ghz(row: pd.Series) -> List[Tuple[float, float]]:
         return intervals
     fallback = observation_interval_ghz(row)
     return [fallback] if fallback else []
+
+
+def observation_windows_ghz(row: pd.Series) -> List[Dict[str, Optional[float]]]:
+    """Per-SPW windows (with resolution) for one ObsCore row, with fallback."""
+    windows = parse_frequency_support_windows(row.get("frequency_support"))
+    if windows:
+        return windows
+    fallback = observation_interval_ghz(row)
+    if fallback:
+        return [
+            {"low_ghz": fallback[0], "high_ghz": fallback[1], "resolution_khz": None}
+        ]
+    return []
 
 
 def line_names_for_input(lines: Sequence[str]) -> List[str]:

@@ -21,7 +21,10 @@ from urllib.parse import quote_plus, urlencode
 import pandas as pd
 from diskcache import Cache
 
-from services.alma_science_queries import observation_intervals_ghz
+from services.alma_science_queries import (
+    observation_intervals_ghz,
+    observation_windows_ghz,
+)
 from services.splatalogue import (
     ALMA_BAND_LIMITS_GHZ,
     SPLATALOGUE_SPECIES_URL,
@@ -29,6 +32,8 @@ from services.splatalogue import (
     SpectralWindow,
     SplatalogueQueryCancelled,
     SplatalogueTool,
+    formula_matches,
+    transition_matches,
 )
 
 
@@ -71,6 +76,18 @@ logger = logging.getLogger(__name__)
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def spectral_line_explorer_enabled() -> bool:
+    """Single source of truth for the Spectral Line Explorer feature flag.
+
+    Enabled by default; disabled only when ENABLE_SPECTRAL_LINE_EXPLORER is set
+    to an explicit falsy token. Both the API route gate (ui-pro/api/main.py) and
+    metadata() must use this so the reported ``enabled`` flag can never disagree
+    with the actual 404 gate.
+    """
+    value = os.getenv("ENABLE_SPECTRAL_LINE_EXPLORER", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def radial_velocity_to_redshift(
@@ -447,6 +464,13 @@ class ALMACoverageService:
         tolerance_mhz: float = 0.0,
         velocity_width_kms: Optional[float] = None,
         coverage_mode: str = "any",
+        frame_uncertainty_kms: float = 0.0,
+        min_calib_level: int = 2,
+        public_only: bool = False,
+        edge_channels: float = 0.0,
+        edge_margin_ghz: float = 0.0,
+        max_channel_width_khz: Optional[float] = None,
+        doppler_frame: str = "observed (source frame)",
     ) -> Dict[str, Any]:
         radius = float(radius_arcsec)
         if radius < 1 or radius > 600:
@@ -462,20 +486,47 @@ class ALMACoverageService:
                 line,
                 tolerance_mhz=tolerance_mhz,
                 velocity_width_kms=velocity_width_kms,
+                frame_uncertainty_kms=frame_uncertainty_kms,
             )
             for line in lines
         ]
         requested = [item for item in requested if item is not None]
         if not requested:
             raise ValueError("At least one line with an observed frequency is required")
+        now_iso = utc_now_iso()
         frame = self._query_obscore(
             ra_deg=ra,
             dec_deg=dec,
             radius_arcsec=radius,
             intervals=requested,
+            min_calib_level=min_calib_level,
+            public_only=public_only,
+            now_iso=now_iso,
         )
-        rows = self._classify_rows(frame, requested, ra, dec)
+        rows = self._classify_rows(
+            frame,
+            requested,
+            ra,
+            dec,
+            now_iso=now_iso,
+            edge_channels=float(edge_channels or 0.0),
+            edge_margin_ghz=float(edge_margin_ghz or 0.0),
+            max_channel_width_khz=(
+                float(max_channel_width_khz)
+                if max_channel_width_khz is not None
+                else None
+            ),
+        )
         projects = self._group_projects(rows, requested, coverage_mode)
+        warnings: List[str] = []
+        if frame_uncertainty_kms <= 0:
+            warnings.append(
+                "ALMA frequency_support is topocentric (TOPO) sky frequency while the "
+                "requested line is in the observed source frame; no Doppler-frame "
+                "margin was applied (frame_uncertainty_kms=0). Lines near a spectral "
+                "window edge may be mis-classified by the TOPO–LSRK offset "
+                "(up to a few tens of km/s)."
+            )
         return {
             "target": dict(target),
             "coverage_mode": coverage_mode,
@@ -484,8 +535,25 @@ class ALMACoverageService:
             "project_count": len(projects),
             "observation_count": sum(len(item["observations"]) for item in projects),
             "projects": projects,
-            "queried_at": utc_now_iso(),
+            "queried_at": now_iso,
             "archive": "ALMA ObsCore",
+            "coverage_filters": {
+                "min_calib_level": min_calib_level,
+                "public_only": bool(public_only),
+                "edge_channels": float(edge_channels or 0.0),
+                "edge_margin_ghz": float(edge_margin_ghz or 0.0),
+                "max_channel_width_khz": (
+                    float(max_channel_width_khz)
+                    if max_channel_width_khz is not None
+                    else None
+                ),
+            },
+            "doppler": {
+                "archive_frame": "TOPO",
+                "search_frame": doppler_frame,
+                "frame_uncertainty_kms": float(frame_uncertainty_kms or 0.0),
+            },
+            "warnings": warnings,
         }
 
     @staticmethod
@@ -494,6 +562,7 @@ class ALMACoverageService:
         *,
         tolerance_mhz: float,
         velocity_width_kms: Optional[float],
+        frame_uncertainty_kms: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         center = _finite_float(line.get("observed_frequency_ghz"))
         if center is None:
@@ -505,6 +574,14 @@ class ALMACoverageService:
         if velocity_width_kms is not None:
             half_width += (
                 center * max(0.0, float(velocity_width_kms)) / SPEED_OF_LIGHT_KMS / 2
+            )
+        # Absorb the topocentric-vs-source Doppler-frame offset of the archive
+        # frequencies by widening the search interval (does not shift the center).
+        if frame_uncertainty_kms:
+            half_width += (
+                center
+                * max(0.0, float(frame_uncertainty_kms))
+                / SPEED_OF_LIGHT_KMS
             )
         return {
             "line_id": str(line.get("line_id") or line.get("unique_line_id") or ""),
@@ -518,15 +595,22 @@ class ALMACoverageService:
         }
 
     @staticmethod
-    def _query_obscore(
+    def _build_obscore_adql(
         *,
         ra_deg: float,
         dec_deg: float,
         radius_arcsec: float,
         intervals: Sequence[Mapping[str, Any]],
-    ) -> pd.DataFrame:
-        import requests
+        min_calib_level: Optional[int] = 2,
+        public_only: bool = False,
+        now_iso: Optional[str] = None,
+    ) -> str:
+        """Build the ObsCore ADQL with spatial, spectral, and data-quality filters.
 
+        Pure/string-only so it can be unit-tested without the network. The
+        calib_level filter excludes raw (uncalibrated) products by default; the
+        public filter restricts to data past its proprietary period.
+        """
         radius_deg = radius_arcsec / 3600.0
         spectral_predicates = []
         for item in intervals:
@@ -537,7 +621,19 @@ class ALMACoverageService:
             spectral_predicates.append(
                 f"(em_min <= {lambda_max:.15g} AND em_max >= {lambda_min:.15g})"
             )
-        query = f"""
+        clauses = [
+            "CONTAINS("
+            "POINT('ICRS', s_ra, s_dec), "
+            f"CIRCLE('ICRS', {ra_deg:.10f}, {dec_deg:.10f}, {radius_deg:.10f})"
+            ") = 1",
+            "(" + " OR ".join(spectral_predicates) + ")",
+        ]
+        if min_calib_level is not None and int(min_calib_level) > 0:
+            clauses.append(f"calib_level >= {int(min_calib_level)}")
+        if public_only and now_iso:
+            clauses.append(f"obs_release_date <= '{now_iso[:19]}'")
+        where = "\n  AND ".join(clauses)
+        return f"""
 SELECT TOP 20000
        target_name, proposal_id, member_ous_uid, obs_publisher_did,
        frequency, bandwidth, frequency_support, band_list,
@@ -546,12 +642,31 @@ SELECT TOP 20000
        s_ra, s_dec, t_exptime, s_resolution, spatial_resolution,
        obs_release_date, em_min, em_max
 FROM ivoa.obscore
-WHERE CONTAINS(
-        POINT('ICRS', s_ra, s_dec),
-        CIRCLE('ICRS', {ra_deg:.10f}, {dec_deg:.10f}, {radius_deg:.10f})
-      ) = 1
-  AND ({' OR '.join(spectral_predicates)})
+WHERE {where}
 """
+
+    @staticmethod
+    def _query_obscore(
+        *,
+        ra_deg: float,
+        dec_deg: float,
+        radius_arcsec: float,
+        intervals: Sequence[Mapping[str, Any]],
+        min_calib_level: Optional[int] = 2,
+        public_only: bool = False,
+        now_iso: Optional[str] = None,
+    ) -> pd.DataFrame:
+        import requests
+
+        query = ALMACoverageService._build_obscore_adql(
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            radius_arcsec=radius_arcsec,
+            intervals=intervals,
+            min_calib_level=min_calib_level,
+            public_only=public_only,
+            now_iso=now_iso,
+        )
         configured = os.getenv("SPECTRAL_LINE_ALMA_TAP_URL", "").strip()
         endpoints = [
             configured.rstrip("/") + "/sync" if configured else "",
@@ -586,27 +701,38 @@ WHERE CONTAINS(
         requested: Sequence[Mapping[str, Any]],
         target_ra: float,
         target_dec: float,
+        *,
+        now_iso: Optional[str] = None,
+        edge_channels: float = 0.0,
+        edge_margin_ghz: float = 0.0,
+        max_channel_width_khz: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         if frame is None or frame.empty:
             return rows
+        rank = {"full": 0, "edge": 1, "center_only": 2, "partial": 3}
         for index, row in frame.iterrows():
-            spws = observation_intervals_ghz(row)
-            if not spws:
+            windows = observation_windows_ghz(row)
+            if not windows:
                 continue
             line_matches = []
             for line in requested:
-                matches = [
-                    self._classify_spw(spw, line)
-                    for spw in spws
-                    if self._classify_spw(spw, line)["classification"] != "none"
-                ]
+                matches = []
+                for window in windows:
+                    classified = self._classify_spw(
+                        window,
+                        line,
+                        edge_channels=edge_channels,
+                        edge_margin_ghz=edge_margin_ghz,
+                        max_channel_width_khz=max_channel_width_khz,
+                    )
+                    if classified["classification"] != "none":
+                        matches.append(classified)
                 if matches:
                     matches.sort(
                         key=lambda item: (
-                            {"full": 0, "center_only": 1, "partial": 2}.get(
-                                item["classification"], 3
-                            ),
+                            rank.get(item["classification"], 4),
+                            0 if item.get("resolution_ok", True) else 1,
                             -item["edge_margin_mhz"],
                         )
                     )
@@ -614,6 +740,7 @@ WHERE CONTAINS(
                         {
                             "line": dict(line),
                             "best_classification": matches[0]["classification"],
+                            "usable": bool(matches[0].get("usable")),
                             "spws": matches,
                         }
                     )
@@ -627,6 +754,9 @@ WHERE CONTAINS(
                 {
                     "observation_id": str(
                         row_dict.get("obs_publisher_did") or index
+                    ),
+                    "is_public": self._observation_is_public(
+                        row_dict.get("obs_release_date"), now_iso
                     ),
                     "matching_lines": line_matches,
                     "angular_separation_arcsec": _angular_separation_arcsec(
@@ -645,27 +775,69 @@ WHERE CONTAINS(
         return rows
 
     @staticmethod
+    def _observation_is_public(release: Any, now_iso: Optional[str]) -> Optional[bool]:
+        release_text = str(release if release is not None else "").strip()
+        if not release_text or release_text.lower() == "nan":
+            return None
+        reference = (now_iso or utc_now_iso())[:19]
+        return release_text[:19] <= reference
+
+    @staticmethod
     def _classify_spw(
-        spw: tuple[float, float], line: Mapping[str, Any]
+        window: Mapping[str, Any],
+        line: Mapping[str, Any],
+        *,
+        edge_channels: float = 0.0,
+        edge_margin_ghz: float = 0.0,
+        max_channel_width_khz: Optional[float] = None,
     ) -> Dict[str, Any]:
-        low, high = spw
+        low = float(window["low_ghz"])
+        high = float(window["high_ghz"])
+        resolution_khz = window.get("resolution_khz")
+        resolution_khz = (
+            float(resolution_khz) if resolution_khz is not None else None
+        )
         required_low = float(line["minimum_ghz"])
         required_high = float(line["maximum_ghz"])
         center = float(line["observed_frequency_ghz"])
+
+        # Effective edge-channel safety margin: the larger of an absolute GHz
+        # margin and N channels (when the channel width is known).
+        margin = max(0.0, float(edge_margin_ghz or 0.0))
+        if edge_channels and resolution_khz is not None:
+            margin = max(margin, float(edge_channels) * resolution_khz / 1e6)
+        usable_low = low + margin
+        usable_high = high - margin
+
         if low <= required_low and required_high <= high:
-            classification = "full"
+            # Fully inside the band; "edge" if within the safety margin of an edge.
+            if usable_low <= required_low and required_high <= usable_high:
+                classification = "full"
+            else:
+                classification = "edge"
         elif low <= center <= high:
             classification = "center_only"
         elif max(low, required_low) <= min(high, required_high):
             classification = "partial"
         else:
             classification = "none"
+
+        # Resolution requirement: if a max channel width is set we can only call a
+        # window resolution-OK when its (known) channel width is fine enough.
+        resolution_ok = max_channel_width_khz is None or (
+            resolution_khz is not None
+            and resolution_khz <= float(max_channel_width_khz)
+        )
+        usable = classification == "full" and resolution_ok
         edge_margin = min(center - low, high - center) * 1000
         return {
             "minimum_ghz": low,
             "maximum_ghz": high,
             "classification": classification,
             "edge_margin_mhz": round(edge_margin, 6),
+            "resolution_khz": resolution_khz,
+            "resolution_ok": resolution_ok,
+            "usable": usable,
         }
 
     @staticmethod
@@ -691,6 +863,7 @@ WHERE CONTAINS(
         for project_id, observations in grouped.items():
             covered_keys = set()
             full_keys = set()
+            usable_keys = set()
             margins = []
             for observation in observations:
                 for match in observation.get("matching_lines") or []:
@@ -704,6 +877,8 @@ WHERE CONTAINS(
                     covered_keys.add(key)
                     if match["best_classification"] == "full":
                         full_keys.add(key)
+                    if match.get("usable"):
+                        usable_keys.add(key)
                     for spw in match.get("spws") or []:
                         margins.append(float(spw.get("edge_margin_mhz") or 0))
             collective_all = requested_keys <= covered_keys
@@ -743,6 +918,7 @@ WHERE CONTAINS(
                     ),
                     "covers_all_lines": collective_all,
                     "all_lines_full": requested_keys <= full_keys,
+                    "all_lines_usable": requested_keys <= usable_keys,
                     "covered_line_count": len(covered_keys),
                     "requested_line_count": len(requested_keys),
                     "minimum_edge_margin_mhz": min(margins) if margins else None,
@@ -755,6 +931,7 @@ WHERE CONTAINS(
             )
         projects.sort(
             key=lambda item: (
+                0 if item["all_lines_usable"] else 1,
                 0 if item["all_lines_full"] else 1,
                 0 if item["covers_all_lines"] else 1,
                 -float(item["minimum_edge_margin_mhz"] or -1e12),
@@ -955,8 +1132,7 @@ class SpectralLineJobService:
 
     def metadata(self) -> Dict[str, Any]:
         return {
-            "enabled": os.getenv("ENABLE_SPECTRAL_LINE_EXPLORER", "true").lower()
-            not in {"0", "false", "no"},
+            "enabled": spectral_line_explorer_enabled(),
             "band_registry": {
                 "version": "ALMA Cycle 13",
                 "source": "https://almascience.nrao.edu/proposing/proposers-guide",
@@ -1360,6 +1536,12 @@ class SpectralLineJobService:
             tolerance_mhz=float(payload.get("tolerance_mhz") or 0),
             velocity_width_kms=_finite_float(payload.get("velocity_width_kms")),
             coverage_mode=str(payload.get("coverage_mode") or "any"),
+            frame_uncertainty_kms=float(payload.get("frame_uncertainty_kms") or 0),
+            min_calib_level=int(payload.get("min_calib_level", 2) or 0),
+            public_only=bool(payload.get("public_only", False)),
+            edge_channels=float(payload.get("edge_channels") or 0),
+            edge_margin_ghz=float(payload.get("edge_margin_ghz") or 0),
+            max_channel_width_khz=_finite_float(payload.get("max_channel_width_khz")),
         )
         coverage.update(
             {
@@ -1646,8 +1828,8 @@ def find_alma_line_coverage(
         exact = [
             item
             for item in metadata_matches
-            if SplatalogueTool._search_token(item.get("formula"))
-            == SplatalogueTool._search_token(species)
+            if formula_matches(species, item.get("formula"))
+            or formula_matches(species, item.get("base_formula"))
         ]
         preferred = next(
             (item for item in exact if item.get("status") == "known"),
@@ -1726,6 +1908,8 @@ def find_alma_line_coverage(
 
 
 def _transition_matches(value: Any, requested: str) -> bool:
-    normalized_value = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-    normalized_requested = re.sub(r"[^a-z0-9]+", "", str(requested or "").lower())
-    return bool(normalized_requested and normalized_requested in normalized_value)
+    """Structural quantum-number match (delegates to the shared matcher).
+
+    ``value`` is the candidate line's transition; ``requested`` is the query.
+    """
+    return transition_matches(requested, value)

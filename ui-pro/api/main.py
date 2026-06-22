@@ -555,7 +555,10 @@ from services.provider_file_service import (
 )
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
 from services.issue_report_service import ChatDeadline, IssueReportService
-from services.spectral_line_explorer import SpectralLineJobService
+from services.spectral_line_explorer import (
+    SpectralLineJobService,
+    spectral_line_explorer_enabled,
+)
 from services.secret_redaction import redact_secrets
 from services.usage_quota_service import QuotaExceededError, UsageQuotaService, UsageRecord
 from services.admin_access import is_admin_email
@@ -2951,8 +2954,7 @@ def _raise_workbench_error(exc: Exception):
 
 
 def _ensure_spectral_line_explorer_enabled():
-    enabled = os.getenv("ENABLE_SPECTRAL_LINE_EXPLORER", "false").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    if not spectral_line_explorer_enabled():
         raise HTTPException(status_code=404, detail="Spectral Line Explorer is disabled")
 
 
