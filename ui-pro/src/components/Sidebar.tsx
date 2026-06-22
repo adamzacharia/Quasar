@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useChatStore } from "../lib/store";
 import { useAuthStore } from "../lib/auth-store";
 import {
@@ -384,6 +384,7 @@ export function Sidebar() {
 
     const { user, logout, isAuthenticated, openAuthModal, token } = useAuthStore();
     const pathname = usePathname();
+    const router = useRouter();
 
     // Fetch model list from backend on mount
     useEffect(() => { fetchModels(); }, [fetchModels]);
@@ -420,6 +421,14 @@ export function Sidebar() {
         }
     };
 
+    const handleNewChat = () => {
+        createNewConversation();
+        setActivePanel(null);
+        if (pathname === "/spectral-lines") {
+            router.push("/");
+        }
+    };
+
     // Get user initials from display name, or fallback to username initials
     const initials = user?.display_name
         ? user.display_name.split(' ').filter(Boolean).map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
@@ -430,17 +439,17 @@ export function Sidebar() {
     return (
         <aside className="relative w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
             {/* Logo */}
-            <div className="p-6 flex items-center gap-3">
+            <Link href="/" className="p-6 flex items-center gap-3">
                 <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
                 <div className="flex flex-col">
                     <h1 className="text-lg font-bold tracking-tight text-white">QUASAR</h1>
                     <span className="text-xs text-slate-400 font-medium">Research Assistant</span>
                 </div>
-            </div>
+            </Link>
 
             {/* New Chat */}
             <div className="px-4 mb-6">
-                <button onClick={() => { createNewConversation(); setActivePanel(null); }}
+                <button onClick={handleNewChat}
                     className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-dark font-semibold py-3 px-4 rounded-full transition-colors shadow-lg shadow-primary/20 group">
                     <Plus className="w-5 h-5 transition-transform group-hover:rotate-90" />
                     <span>New Chat</span>

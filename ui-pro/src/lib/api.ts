@@ -75,6 +75,26 @@ async function getErrorMessage(response: Response): Promise<string> {
     }
 }
 
+export class ApiError extends Error {
+    status: number;
+
+    constructor(message: string, status: number) {
+        super(message);
+        this.name = "ApiError";
+        this.status = status;
+    }
+}
+
+async function createApiError(response: Response): Promise<ApiError> {
+    return new ApiError(await getErrorMessage(response), response.status);
+}
+
+export function isUnauthorizedApiError(error: unknown): boolean {
+    if (error instanceof ApiError && error.status === 401) return true;
+    const message = error instanceof Error ? error.message : String(error);
+    return /invalid token|unauthorized/i.test(message);
+}
+
 export async function sendChatMessage(request: ChatRequest, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
     try {
         let response: Response;
@@ -477,7 +497,7 @@ export async function downloadSpectralLineExport(
     const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}/export?${params}`, {
         headers: spectralAuthHeaders(token),
     });
-    if (!res.ok) throw new Error(await getErrorMessage(res));
+    if (!res.ok) throw await createApiError(res);
     const disposition = res.headers.get("content-disposition") || "";
     const filename = disposition.match(/filename="([^"]+)"/)?.[1] || `spectral-lines.${format}`;
     return { blob: await res.blob(), filename };
@@ -664,7 +684,7 @@ export interface WorkbenchExports {
 }
 
 async function parseJsonResponse<T>(res: Response): Promise<T> {
-    if (!res.ok) throw new Error(await getErrorMessage(res));
+    if (!res.ok) throw await createApiError(res);
     return res.json() as Promise<T>;
 }
 
