@@ -7175,14 +7175,8 @@ IMPORTANT RULES:
             detection, cutoff checks, and conductor routing).  If omitted,
             *query* is used for everything.
         """
-        # Derive the bare user question for routing / classification, and strip UI tags
+        # Derive the bare user question for routing / classification
         _user_query = raw_query or query
-        for tag in ["@archive", "@paper", "@search"]:
-            if _user_query.lower().strip().startswith(tag):
-                _user_query = _user_query.strip()[len(tag):].strip()
-            # Also strip from the enriched query so the LLM doesn't get confused
-            pattern = re.compile(re.escape(tag), re.IGNORECASE)
-            query = pattern.sub("", query).strip()
 
         if is_explicit_query(_user_query):
             if on_token:
