@@ -1,6 +1,7 @@
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
 @import url("https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap");
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
 /* ── Fluid responsive scaling ──────────────────────────────── */
 html {
@@ -138,7 +139,7 @@ html {
   --q-shadow-glow: rgba(168, 85, 247, 0.18);
   --q-text-faint: #837995;
   --q-mono-accent: #a855f7;
-  --q-content-scrim: rgba(255, 255, 255, 0.55);
+  --q-content-scrim: rgba(255, 255, 255, 0.62);
   --q-observation-graph-node-bg: rgba(28, 21, 48, 0.92);
   --q-observation-graph-node-text: #f3effb;
   --q-observation-graph-node-detail: #cabfe6;
@@ -513,55 +514,62 @@ html {
    token, so no light-mode override of .text-primary-dark is needed. */
 
 /* ══════════════════════════════════════════════════════════════
-   MARKDOWN TYPOGRAPHY (manual)
-   The @tailwindcss/typography plugin is intentionally NOT installed, so the
-   `prose`/`prose-invert`/`prose-sm` modifiers on markdown blocks are inert —
-   they don't add heading sizes, list markers, or link styles. Without that,
-   answers render as a flat wall of same-size lines with no bullets, which is
-   the core readability complaint. Style the structure manually here, driven by
-   theme tokens so it stays legible in BOTH themes. Body text color already
-   comes from the (theme-remapped) text-slate-* utility on each block, so we
-   only add structure + accents, not a blanket color override.
-   ══════════════════════════════════════════════════════════════ */
+   MARKDOWN TYPOGRAPHY
+   @tailwindcss/typography is registered (@plugin at the top of this file), so
+   it owns the base markdown structure: list markers + indent, link styling,
+   blockquotes, inline/fenced code, definition lists, paragraph rhythm. The
+   manual rules below are UNLAYERED (so they override the plugin's @layer rules)
+   and keep only what the plugin doesn't do well for this chat surface:
+   chat-appropriate (smaller) heading sizes, the bespoke gradient table, density
+   spacing, and the theme-token color wiring.
 
-/* Headings — restore a clear visual hierarchy (margins handled below).
-   Sized in `em` (not `rem`) so they scale with the block's own font-size —
-   the thinking widget renders markdown at text-xs, where rem headings would
-   jump to full answer size. */
+   COLOR WIRING: every markdown block uses `prose-invert`, so the plugin reads
+   ONLY the --tw-prose-invert-* variables in BOTH themes. We point those at the
+   --q-* tokens (which are themselves theme-scoped), so this single block stays
+   correct in dark AND light. Wiring the bare --tw-prose-* set instead would be
+   a no-op here and would reintroduce pale-on-white text in light mode. */
+.prose {
+  --tw-prose-invert-body: var(--q-text);
+  --tw-prose-invert-headings: var(--q-text);
+  --tw-prose-invert-lead: var(--q-text-secondary);
+  --tw-prose-invert-links: var(--color-primary);
+  --tw-prose-invert-bold: var(--q-text);
+  --tw-prose-invert-counters: var(--q-text-muted);
+  --tw-prose-invert-bullets: var(--q-text-muted);
+  --tw-prose-invert-hr: var(--q-border);
+  --tw-prose-invert-quotes: var(--q-text-secondary);
+  --tw-prose-invert-quote-borders: var(--color-primary);
+  --tw-prose-invert-captions: var(--q-text-muted);
+  --tw-prose-invert-kbd: var(--q-text);
+  --tw-prose-invert-kbd-shadows: 0 0 0; /* plugin wraps as rgb(... / a) — must be a bare RGB triplet */
+  --tw-prose-invert-code: var(--q-text);
+  --tw-prose-invert-pre-code: var(--q-text-secondary);
+  --tw-prose-invert-pre-bg: transparent; /* CodeBlock paints its own background */
+  --tw-prose-invert-th-borders: var(--q-border);
+  --tw-prose-invert-td-borders: var(--q-border);
+}
+
+/* Drop the plugin's literal-backtick pseudo-elements around inline code. */
+.prose :where(code)::before,
+.prose :where(code)::after { content: none; }
+
+/* Chat-appropriate heading sizes — the plugin's defaults are oversized for an
+   inline chat answer. `em` so they scale with the block (incl. the compact
+   thinking widget). Spacing/line-height handled in the section below; lists,
+   links, blockquotes, code, and bold are owned by the plugin (colored via the
+   invert vars above). */
 .prose h1 { font-size: 1.5em; font-weight: 700; }
 .prose h2 { font-size: 1.3em; font-weight: 700; }
 .prose h3 { font-size: 1.15em; font-weight: 600; }
 .prose h4 { font-size: 1.02em; font-weight: 600; }
 .prose h5, .prose h6 { font-size: 0.95em; font-weight: 600; }
 
-/* Lists — markers + indentation so steps read as a list, not run-on lines. */
-.prose ul { list-style: disc; padding-left: 1.5em; }
-.prose ol { list-style: decimal; padding-left: 1.5em; }
-.prose ul ul { list-style: circle; }
-.prose li { margin: 0.3em 0; padding-left: 0.2em; }
-.prose li::marker { color: var(--q-text-muted); }
-.prose li > p { margin: 0.2em 0; }
-
-/* Links — visible, accent-colored, underlined. */
-.prose a {
-  color: var(--color-primary);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  text-decoration-thickness: 1px;
+/* Long-form measure: cap text-flow lines in the assistant answer so they don't
+   run full-bleed on wide monitors. Tables and code blocks render inside div/pre
+   wrappers (not matched here), so they keep the full content width and scroll. */
+.prose-answer > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6, dl) {
+  max-width: 76ch;
 }
-.prose a:hover { filter: brightness(1.1); }
-
-/* Blockquotes — a calm token-driven callout. */
-.prose blockquote {
-  border-left: 3px solid var(--color-primary);
-  padding-left: 1em;
-  margin: 0.8em 0;
-  color: var(--q-text-secondary);
-  font-style: italic;
-}
-
-/* Bold inherits the block's body color but at full strength. */
-.prose strong { font-weight: 600; color: inherit; }
 
 /* ── Prose Heading Spacing ─────────────────────────────────── */
 /* Headings get double the spacing above them vs normal lines  */
@@ -582,24 +590,9 @@ html {
   margin-top: 0;
 }
 
-/* Paragraphs get tighter spacing */
-.prose p {
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
-}
-
-/* Lists get moderate spacing */
-.prose ul, .prose ol {
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
-}
-
-/* Horizontal rules (used as section dividers) */
-.prose hr {
-  margin-top: 1.5em;
-  margin-bottom: 1.5em;
-  border-color: rgba(148, 163, 184, 0.15);
-}
+/* Paragraph / list / hr rhythm is owned by the typography plugin (the polished
+   default the user asked for). The user-message bubble keeps tight paragraphs
+   via its own `prose-p:my-1` utility, which wins over the plugin. */
 
 /* ── Beautiful Markdown Tables ─────────────────────────────── */
 .prose table {
