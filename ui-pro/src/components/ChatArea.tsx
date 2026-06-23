@@ -37,7 +37,7 @@ export function ChatArea() {
         setActiveConversationId, loadConversations,
     } = useChatStore();
 
-    const { token, isAuthenticated } = useAuthStore();
+    const { token, isAuthenticated, openAuthModal } = useAuthStore();
 
     // Use a ref so handleSend always reads the CURRENT token (avoids stale closure)
     const tokenRef = useRef<string | null>(null);
@@ -569,9 +569,14 @@ export function ChatArea() {
                                 loadConversations(tokenRef.current);
                             }
                         },
-                        onError: (error: string) => {
+                        onError: (error: string, status?: number) => {
                             attachThinkingToLastMessage();
-                            updateLastAssistantMessage(`Error: ${error}`);
+                            if (status === 401) {
+                                openAuthModal();
+                                updateLastAssistantMessage("Your session expired — please sign in again.");
+                            } else {
+                                updateLastAssistantMessage(`Error: ${error}`);
+                            }
                             
                             // Merge web sources on error too if they were retrieved
                             if (accumulatedWebSources) {
@@ -611,6 +616,7 @@ export function ChatArea() {
         setActiveConversationId,
         loadConversations,
         isAuthenticated,
+        openAuthModal,
         normalizeWebSourcesPayload,
     ]);
 

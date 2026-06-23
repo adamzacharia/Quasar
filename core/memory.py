@@ -50,7 +50,7 @@ class ConversationMemory:
                     'why', 'when', 'where', 'who', 'which', 'this', 'that', 'it',
                     'for', 'to', 'of', 'in', 'on', 'at', 'with', 'by', 'from',
                     'can', 'you', 'i', 'me', 'my', 'please', 'tell', 'show', 'find',
-                    '@archive', '@search', '@paper', 'alma', 'data', 'search'}
+                    'alma', 'data', 'search'}
         
         # Extract words (alphanumeric)
         words = set(re.findall(r'\b[a-z]{3,}\b', text))

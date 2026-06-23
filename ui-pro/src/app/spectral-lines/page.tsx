@@ -172,12 +172,16 @@ function SpectralLineExplorer() {
     const [resultTab, setResultTab] = useState<ResultTab>("lines");
     const [error, setError] = useState("");
     const autorunHandled = useRef("");
+    const authModalOpened = useRef(false);
     const [rawComparison, setRawComparison] = useState<{ line: SpectralLineRecord; rows: SpectralLineRecord[] } | null>(null);
 
     const handleSpectralError = useCallback((reason: unknown) => {
         if (isUnauthorizedApiError(reason)) {
             setError("Your session expired — please sign in again.");
-            openAuthModal();
+            if (!authModalOpened.current) {
+                authModalOpened.current = true;
+                openAuthModal();
+            }
             return;
         }
         setError(reason instanceof Error ? reason.message : String(reason));
@@ -186,9 +190,13 @@ function SpectralLineExplorer() {
     useEffect(() => {
         if (!isInitialized) return;
         if (!isAuthenticated) {
-            openAuthModal();
+            if (!authModalOpened.current) {
+                authModalOpened.current = true;
+                openAuthModal();
+            }
             return;
         }
+        authModalOpened.current = false;
         getSpectralLineMetadata(token).then(setMetadata).catch(handleSpectralError);
     }, [handleSpectralError, isAuthenticated, isInitialized, openAuthModal, token]);
 

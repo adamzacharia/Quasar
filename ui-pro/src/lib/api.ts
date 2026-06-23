@@ -56,7 +56,7 @@ export interface StreamCallbacks {
     onRunMeta?: (meta: ChatRunMeta) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null; eta_seconds?: number | null; phase?: string }) => void;
     onComplete: (fullResponse: string) => void;
-    onError: (error: string) => void;
+    onError: (error: string, status?: number) => void;
 }
 
 async function getErrorMessage(response: Response): Promise<string> {
@@ -129,7 +129,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
         }
 
         if (!response.ok) {
-            callbacks.onError(await getErrorMessage(response));
+            callbacks.onError(await getErrorMessage(response), response.status);
             return;
         }
         const reader = response.body?.getReader();

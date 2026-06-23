@@ -386,11 +386,6 @@ class ConversationService:
         # Take first 40 chars, clean it up
         title = first_message[:40].strip()
         
-        # Remove command prefixes
-        for prefix in ["@archive", "@search", "@paper"]:
-            if title.lower().startswith(prefix):
-                title = title[len(prefix):].strip()
-        
         # Add ellipsis if truncated
         if len(first_message) > 40:
             title += "..."
