@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</helmet>
+<div style="min-width:100%; min-height:100vh; box-sizing:border-box; padding:48px; background:#e7e5df; width:max-content; font-family:'Inter',system-ui,sans-serif;">
+  <div style="margin-bottom:8px; font-size:22px; font-weight:700; color:#1c1917; letter-spacing:-0.02em;">QUASAR — accent palette options</div>
+  <div style="margin-bottom:32px; font-size:13.5px; color:#57534e; max-width:760px; line-height:1.5;">Same Safe-Ship layout, three accent treatments. Each shows the New Chat button, search input + send, the active recent item, and a starting-point card. Pick one and I'll apply it to frame 2.</div>
+
+  <div style="display:flex; gap:40px; align-items:flex-start;">
+
+    <!-- ============ OPTION A — RESTRAINED ============ -->
+    <div style="flex:none; width:420px;">
+      <div style="display:flex; align-items:baseline; gap:10px; margin-bottom:12px;">
+        <span style="font-size:14px; font-weight:700; color:#1c1917;">A · Restrained</span>
+        <span style="font-size:11px; color:#78716c;">one accent, unified icons</span>
+      </div>
+      <div style="border-radius:6px; overflow:hidden; box-shadow:0 8px 30px rgba(0,0,0,0.18); background:#0A1628;">
+        <div style="padding:22px; background-color:#0A1628; background-image:linear-gradient(135deg, rgba(168,85,247,0.07), transparent 45%);">
+
+          <!-- header -->
+          <div style="display:flex; align-items:center; gap:11px; margin-bottom:18px;">
+            <div style="width:38px; height:38px; border-radius:999px; background:radial-gradient(circle at 35% 30%, #c084fc, #7c3aed 70%); box-shadow:0 0 18px rgba(124,58,237,0.5);"></div>
+            <div><div style="font-size:15px; font-weight:700; color:#f1f5f9;">QUASAR</div><div style="font-size:11px; color:#94a3b8;">Research Assistant</div></div>
+          </div>
+
+          <!-- new chat -->
+          <div style="display:flex; align-items:center; justify-content:center; gap:8px; padding:11px; border-radius:11px; background:#7c3aed; color:#fff; font-weight:600; font-size:13.5px; box-shadow:0 8px 20px rgba(124,58,237,0.3); margin-bottom:14px;">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Chat
+          </div>
+
+          <!-- input -->
+          <div style="padding:12px 13px; border-radius:14px; background:rgba(13,28,50,0.9); border:1px solid rgba(168,85,247,0.4); box-shadow:0 0 0 3px rgba(168,85,247,0.07); margin-bottom:16px; display:flex; align-items:center; gap:10px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            <span style="flex:1; font-size:13px; color:#94a3b8;">Ask about an observation…</span>
+            <div style="width:34px; height:34px; border-radius:999px; background:#7c3aed; display:flex; align-items:center; justify-content:center; box-shadow:0 5px 14px rgba(124,58,237,0.4);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9z"/></svg></div>
+          </div>
+
+          <!-- recent active -->
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 11px; border-radius:10px; background:rgba(124,58,237,0.12); border-left:3px solid #a855f7; margin-bottom:16px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <div><div style="font-size:12.5px; color:#f1f5f9; font-weight:500;">Sz65 Band 6 observations</div><div style="font-size:10px; color:#64748b;">2m ago</div></div>
+          </div>
+
+          <!-- card -->
+          <div style="display:flex; align-items:flex-start; gap:14px; padding:18px; border-radius:18px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08);">
+            <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(168,85,247,0.12); color:#c084fc; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.9 19.1a10 10 0 0 1 0-14.2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M19.1 4.9a10 10 0 0 1 0 14.2"/></svg></div>
+            <div><div style="font-size:14px; font-weight:500; color:#f1f5f9; margin-bottom:3px;">Search the archive</div><div style="font-size:12.5px; color:#94a3b8; line-height:1.45;">Find Band 6 continuum data for protoplanetary disks.</div></div>
+          </div>
+
+        </div>
+      </div>
+      <div style="display:flex; gap:7px; margin-top:14px;">
+        <div style="width:26px; height:26px; border-radius:6px; background:#0A1628; border:1px solid #ffffff20;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#7c3aed;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#c084fc;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#1e293b;"></div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:#57534e; line-height:1.5; max-width:380px;">Keeps the familiar identity but drops the pink→purple gradient for a single violet. Card icons unified to one tint. Lowest risk — feels like a tidy-up, not a rebrand.</div>
+    </div>
+
+    <!-- ============ OPTION B — DEEP-SPACE / STARLIGHT ============ -->
+    <div style="flex:none; width:420px;">
+      <div style="display:flex; align-items:baseline; gap:10px; margin-bottom:12px;">
+        <span style="font-size:14px; font-weight:700; color:#1c1917;">B · Deep-space</span>
+        <span style="font-size:11px; color:#78716c;">amber-gold starlight</span>
+      </div>
+      <div style="border-radius:6px; overflow:hidden; box-shadow:0 8px 30px rgba(0,0,0,0.18); background:#0b1020;">
+        <div style="padding:22px; background-color:#0b1020; background-image:radial-gradient(120% 80% at 80% 0%, rgba(251,191,36,0.08), transparent 50%);">
+
+          <div style="display:flex; align-items:center; gap:11px; margin-bottom:18px;">
+            <div style="width:38px; height:38px; border-radius:999px; background:radial-gradient(circle at 35% 30%, #fcd34d, #f59e0b 72%); box-shadow:0 0 20px rgba(251,191,36,0.45);"></div>
+            <div><div style="font-size:15px; font-weight:700; color:#f8fafc;">QUASAR</div><div style="font-size:11px; color:#9aa6c2;">Research Assistant</div></div>
+          </div>
+
+          <div style="display:flex; align-items:center; justify-content:center; gap:8px; padding:11px; border-radius:11px; background:linear-gradient(135deg,#fbbf24,#f59e0b); color:#3a2406; font-weight:700; font-size:13.5px; box-shadow:0 8px 20px rgba(245,158,11,0.28); margin-bottom:14px;">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Chat
+          </div>
+
+          <div style="padding:12px 13px; border-radius:14px; background:rgba(15,21,40,0.9); border:1px solid rgba(251,191,36,0.4); box-shadow:0 0 0 3px rgba(251,191,36,0.06); margin-bottom:16px; display:flex; align-items:center; gap:10px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            <span style="flex:1; font-size:13px; color:#9aa6c2;">Ask about an observation…</span>
+            <div style="width:34px; height:34px; border-radius:999px; background:linear-gradient(135deg,#fbbf24,#f59e0b); display:flex; align-items:center; justify-content:center; box-shadow:0 5px 14px rgba(245,158,11,0.4);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#3a2406" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9z"/></svg></div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 11px; border-radius:10px; background:rgba(251,191,36,0.1); border-left:3px solid #fbbf24; margin-bottom:16px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <div><div style="font-size:12.5px; color:#f8fafc; font-weight:500;">Sz65 Band 6 observations</div><div style="font-size:10px; color:#6b7794;">2m ago</div></div>
+          </div>
+
+          <div style="display:flex; align-items:flex-start; gap:14px; padding:18px; border-radius:18px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08);">
+            <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(251,191,36,0.12); color:#fcd34d; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.9 19.1a10 10 0 0 1 0-14.2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M19.1 4.9a10 10 0 0 1 0 14.2"/></svg></div>
+            <div><div style="font-size:14px; font-weight:500; color:#f8fafc; margin-bottom:3px;">Search the archive</div><div style="font-size:12.5px; color:#9aa6c2; line-height:1.45;">Find Band 6 continuum data for protoplanetary disks.</div></div>
+          </div>
+
+        </div>
+      </div>
+      <div style="display:flex; gap:7px; margin-top:14px;">
+        <div style="width:26px; height:26px; border-radius:6px; background:#0b1020; border:1px solid #ffffff20;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#f59e0b;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#fcd34d;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#1a2238;"></div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:#57534e; line-height:1.5; max-width:380px;">Cooler indigo-black base + warm amber accent. Reads as starlight / spectral emission — distinctive and scientific, with the most warmth. My pick for character.</div>
+    </div>
+
+    <!-- ============ OPTION C — RADIO / SPECTRAL ============ -->
+    <div style="flex:none; width:420px;">
+      <div style="display:flex; align-items:baseline; gap:10px; margin-bottom:12px;">
+        <span style="font-size:14px; font-weight:700; color:#1c1917;">C · Spectral</span>
+        <span style="font-size:11px; color:#78716c;">cyan→violet signal</span>
+      </div>
+      <div style="border-radius:6px; overflow:hidden; box-shadow:0 8px 30px rgba(0,0,0,0.18); background:#091422;">
+        <div style="padding:22px; background-color:#091422; background-image:linear-gradient(120deg, rgba(34,211,238,0.07), transparent 40%, rgba(139,92,246,0.06));">
+
+          <div style="display:flex; align-items:center; gap:11px; margin-bottom:18px;">
+            <div style="width:38px; height:38px; border-radius:999px; background:linear-gradient(135deg,#22d3ee,#8b5cf6); box-shadow:0 0 18px rgba(34,211,238,0.4);"></div>
+            <div><div style="font-size:15px; font-weight:700; color:#f1f5f9;">QUASAR</div><div style="font-size:11px; color:#8da3bf;">Research Assistant</div></div>
+          </div>
+
+          <div style="display:flex; align-items:center; justify-content:center; gap:8px; padding:11px; border-radius:11px; background:linear-gradient(135deg,#22d3ee,#6366f1); color:#06121f; font-weight:700; font-size:13.5px; box-shadow:0 8px 20px rgba(34,211,238,0.25); margin-bottom:14px;">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Chat
+          </div>
+
+          <div style="padding:12px 13px; border-radius:14px; background:rgba(11,22,38,0.9); border:1px solid rgba(34,211,238,0.4); box-shadow:0 0 0 3px rgba(34,211,238,0.06); margin-bottom:16px; display:flex; align-items:center; gap:10px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            <span style="flex:1; font-size:13px; color:#8da3bf;">Ask about an observation…</span>
+            <div style="width:34px; height:34px; border-radius:999px; background:linear-gradient(135deg,#22d3ee,#6366f1); display:flex; align-items:center; justify-content:center; box-shadow:0 5px 14px rgba(34,211,238,0.4);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#06121f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9z"/></svg></div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 11px; border-radius:10px; background:rgba(34,211,238,0.1); border-left:3px solid #22d3ee; margin-bottom:16px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <div><div style="font-size:12.5px; color:#f1f5f9; font-weight:500;">Sz65 Band 6 observations</div><div style="font-size:10px; color:#5f7390;">2m ago</div></div>
+          </div>
+
+          <div style="display:flex; align-items:flex-start; gap:14px; padding:18px; border-radius:18px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08);">
+            <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(34,211,238,0.12); color:#67e8f9; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.9 19.1a10 10 0 0 1 0-14.2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M19.1 4.9a10 10 0 0 1 0 14.2"/></svg></div>
+            <div><div style="font-size:14px; font-weight:500; color:#f1f5f9; margin-bottom:3px;">Search the archive</div><div style="font-size:12.5px; color:#8da3bf; line-height:1.45;">Find Band 6 continuum data for protoplanetary disks.</div></div>
+          </div>
+
+        </div>
+      </div>
+      <div style="display:flex; gap:7px; margin-top:14px;">
+        <div style="width:26px; height:26px; border-radius:6px; background:#091422; border:1px solid #ffffff20;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#22d3ee;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#8b5cf6;"></div>
+        <div style="width:26px; height:26px; border-radius:6px; background:#152436;"></div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:#57534e; line-height:1.5; max-width:380px;">Cyan→violet spectral gradient — literally the visible spectrum. Cohesive with your existing cyan Spectral Line Explorer. Most "instrument" feel, coolest tone.</div>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

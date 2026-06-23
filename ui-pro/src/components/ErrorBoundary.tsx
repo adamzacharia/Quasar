@@ -34,7 +34,7 @@ export class ErrorBoundary extends Component<Props, State> {
               The layout engine experienced an unexpected glitch (likely due to resizing across monitors). The application has protected your data, but needs to refresh the view to continue.
             </p>
             <button
-              className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors font-medium w-full"
+              className="btn-accent px-5 py-2.5 rounded-lg font-medium w-full"
               onClick={() => {
                 this.setState({ hasError: false });
                 window.location.reload();

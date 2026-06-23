@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *{box-sizing:border-box;}
+    html,body{margin:0;height:100%;}
+    @keyframes qfade{from{opacity:0;filter:blur(5px);}to{opacity:1;filter:blur(0);}}
+    ::-webkit-scrollbar{height:9px;width:9px;}
+    ::-webkit-scrollbar-thumb{background:rgba(140,120,180,0.4);border-radius:8px;}
+    ::-webkit-scrollbar-track{background:transparent;}
+  </style>
+</helmet>
+
+<div style="position:relative; width:100vw; height:100vh; overflow:hidden; font-family:'Inter',sans-serif; -webkit-font-smoothing:antialiased;">
+
+  <!-- ===================================================================== -->
+  <!-- DARK (default)                                                         -->
+  <!-- ===================================================================== -->
+  <div style="position:absolute; inset:0; display:{{ darkDisplay }}; background-color:#070510; background-image:radial-gradient(54% 46% at 26% 66%, rgba(244,114,182,0.4), transparent 62%), radial-gradient(54% 54% at 76% 38%, rgba(167,139,250,0.46), transparent 62%), radial-gradient(46% 42% at 58% 86%, rgba(96,165,250,0.32), transparent 62%);">
+
+    <aside style="position:absolute; top:0; left:0; bottom:0; width:288px; display:flex; flex-direction:column; background:rgba(10,7,20,0.55); border-right:1px solid rgba(255,255,255,0.1); box-shadow:6px 0 30px rgba(0,0,0,0.38); backdrop-filter:blur(22px);">
+      <div style="padding:20px 18px 14px; display:flex; align-items:center; gap:12px;">
+        <img src="assets/quasar_logo.png" alt="Quasar" style="width:46px; height:46px; object-fit:contain;">
+        <div><h1 style="font-size:17px; font-weight:700; color:#f3effb; margin:0; letter-spacing:-0.01em;">QUASAR</h1><span style="font-size:11.5px; color:#b9a9e0;">Research Assistant</span></div>
+      </div>
+      <div style="padding:0 14px 12px;">
+        <div onClick="{{ newChat }}" style="cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; padding:12px; border-radius:13px; background:linear-gradient(135deg,#c77dff,#9333ea); color:#fff; font-weight:600; font-size:14.5px; box-shadow:0 10px 24px rgba(147,51,234,0.5);">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Chat
+        </div>
+      </div>
+      <div style="padding:0 14px 12px;">
+        <div style="display:flex; align-items:center; gap:9px; padding:9px 12px; border-radius:11px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1);">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9d92bd" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+          <span style="font-size:12.5px; color:#9d92bd;">Search research…</span>
+        </div>
+      </div>
+      <div style="padding:0 14px 14px;">
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 12px; border-radius:11px; background:rgba(129,140,248,0.16); border:1px solid rgba(129,140,248,0.3); color:#a5b4fc; font-size:13px; font-weight:500;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8c2 0 2-2 4-2s2 2 4 2 2-2 4-2 2 2 4 2 2-2 4-2"/><path d="M2 14c2 0 2-2 4-2s2 2 4 2 2-2 4-2 2 2 4 2 2-2 4-2"/></svg>Spectral Line Explorer
+        </div>
+      </div>
+      <div style="flex:1; overflow:hidden; padding:0 10px;">
+        <div style="padding:4px 8px 8px; font-size:10.5px; letter-spacing:0.1em; text-transform:uppercase; color:#9d92bd; font-weight:600;">Recent research</div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px; background:rgba(167,139,250,0.18); border-left:3px solid #a78bfa; margin-bottom:4px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#c4b5fd" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#f3effb; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Sz65 Band 6 observations</div><div style="font-size:10px; color:#9d92bd;">2m ago</div></div>
+        </div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px; margin-bottom:4px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#9d92bd" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 7v5l3 2"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#cabfe6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Protoplanetary disk papers</div><div style="font-size:10px; color:#9d92bd;">1h ago</div></div>
+        </div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px; margin-bottom:4px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#9d92bd" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 7v5l3 2"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#cabfe6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">CO(2-1) coverage for M87</div><div style="font-size:10px; color:#9d92bd;">3h ago</div></div>
+        </div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#9d92bd" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 7v5l3 2"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#cabfe6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">ALMA proprietary period</div><div style="font-size:10px; color:#9d92bd;">1d ago</div></div>
+        </div>
+      </div>
+      <div style="padding:12px 14px; border-top:1px solid rgba(255,255,255,0.08); display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:9px 12px; border-radius:11px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08);">
+          <span style="display:flex; align-items:center; gap:8px; font-size:12px; color:#cabfe6; font-weight:500;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#b9a9e0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="8.5" cy="16" r="1"/><circle cx="15.5" cy="16" r="1"/><path d="M12 7v4"/><circle cx="12" cy="5" r="1.6"/></svg>gpt-4o-mini</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9d92bd" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </div>
+        <div style="display:flex; gap:4px;">
+          <div style="flex:1; display:flex; align-items:center; justify-content:center; gap:7px; padding:8px; border-radius:9px; color:#9d92bd; font-size:12px;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>Saved</div>
+          <div style="flex:1; display:flex; align-items:center; justify-content:center; gap:7px; padding:8px; border-radius:9px; color:#9d92bd; font-size:12px;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.7-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H3a2 2 0 0 1 0-4h.1a1.6 1.6 0 0 0 1.1-2.7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1V3a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8z"/></svg>Settings</div>
+          <div style="flex:1; display:flex; align-items:center; justify-content:center; gap:7px; padding:8px; border-radius:9px; color:#9d92bd; font-size:12px;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.6 9a2.4 2.4 0 0 1 4.4 1.4c0 1.5-2 2-2 3"/><line x1="12" y1="17.5" x2="12.01" y2="17.5"/></svg>Help</div>
+        </div>
+        <div style="margin-top:2px; display:flex; align-items:center; justify-content:center; gap:8px; padding:11px; border-radius:12px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.12); color:#f3effb; font-size:13px; font-weight:500;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Sign In / Sign Up</div>
+      </div>
+    </aside>
+
+    <main style="position:absolute; top:0; left:288px; right:0; bottom:0; display:flex; flex-direction:column;">
+      <div style="flex:none; display:flex; align-items:center; justify-content:space-between; padding:13px 24px;">
+        <div style="display:flex; align-items:center; gap:13px;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#b9a9e0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+          <span style="font-size:15px; font-weight:600; color:#f3effb;">New Research Session</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div onClick="{{ toggleTheme }}" title="Switch to light" style="cursor:pointer; width:38px; height:38px; border-radius:999px; background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.14); display:flex; align-items:center; justify-content:center;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f3d27a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.5"/><line x1="12" y1="2.5" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="21.5"/><line x1="2.5" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="21.5" y2="12"/><line x1="5.2" y1="5.2" x2="7" y2="7"/><line x1="17" y1="17" x2="18.8" y2="18.8"/><line x1="18.8" y1="5.2" x2="17" y2="7"/><line x1="7" y1="17" x2="5.2" y2="18.8"/></svg></div>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7d72a0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+        </div>
+      </div>
+      <div style="flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px 56px;">
+        <div style="width:100%; max-width:780px;">
+          <div style="display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:26px;">
+            <div style="position:relative; margin-bottom:14px;">
+              <div style="position:absolute; inset:-22px; background:rgba(167,139,250,0.4); border-radius:999px; filter:blur(34px);"></div>
+              <img src="assets/quasar_logo.png" alt="Quasar" style="position:relative; width:78px; height:78px; object-fit:contain;">
+            </div>
+            <h1 style="font-size:31px; font-weight:600; color:#f3effb; margin:0; letter-spacing:-0.02em;">What are you researching today?</h1>
+            <p style="font-size:15px; color:#b9a9e0; margin:8px 0 0 0;">Observations, archives, literature — ask in plain language.</p>
+          </div>
+          <div style="display:flex; align-items:center; gap:13px; padding:15px 16px 15px 22px; border-radius:999px; background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.14); box-shadow:0 14px 38px rgba(0,0,0,0.4); backdrop-filter:blur(12px);">
+            <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#9d92bd" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            <span style="flex:1; font-size:15px; color:#9d92bd;">{{ qPlaceholder }}</span>
+            <div style="width:42px; height:42px; border-radius:999px; background:linear-gradient(135deg,#c77dff,#9333ea); display:flex; align-items:center; justify-content:center; box-shadow:0 8px 20px rgba(147,51,234,0.55);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9z"/></svg></div>
+          </div>
+          <div style="margin:26px 0 12px; font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:#9d92bd; font-weight:600;">Try a starting point</div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px;">
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(167,139,250,0.16); color:#c4b5fd; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.9 19.1a10 10 0 0 1 0-14.2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M19.1 4.9a10 10 0 0 1 0 14.2"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#f3effb; margin:0 0 4px 0;">Search the archive</h3><p style="font-size:13px; color:#b9a9e0; margin:0; line-height:1.5; min-height:39px;">{{ qArchive }}</p></div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(167,139,250,0.16); color:#c4b5fd; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#f3effb; margin:0 0 4px 0;">Search the literature</h3><p style="font-size:13px; color:#b9a9e0; margin:0; line-height:1.5; min-height:39px;">{{ qLit }}</p></div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(167,139,250,0.16); color:#c4b5fd; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.6 9a2.4 2.4 0 0 1 4.4 1.4c0 1.5-2 2-2 3"/><line x1="12" y1="17.5" x2="12.01" y2="17.5"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#f3effb; margin:0 0 4px 0;">Policy &amp; guidance</h3><p style="font-size:13px; color:#b9a9e0; margin:0; line-height:1.5; min-height:39px;">{{ qPolicy }}</p></div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(167,139,250,0.16); color:#c4b5fd; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="10" x2="4" y2="14"/><line x1="8" y1="6" x2="8" y2="18"/><line x1="12" y1="9" x2="12" y2="15"/><line x1="16" y1="4" x2="16" y2="20"/><line x1="20" y1="10" x2="20" y2="14"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#f3effb; margin:0 0 4px 0;">Spectral coverage</h3><p style="font-size:13px; color:#b9a9e0; margin:0; line-height:1.5; min-height:39px;">{{ qSpectral }}</p></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="flex:none; padding:0 56px 16px; text-align:center;">
+        <p style="font-size:10.5px; color:#7d72a0; margin:0;">QUASAR may produce inaccurate information. · Accepts images, PDFs, FITS, CSV · <span style="color:#c4b5fd; font-family:'JetBrains Mono',monospace;">12,847</span> visits</p>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- LIGHT                                                                  -->
+  <!-- ===================================================================== -->
+  <div style="position:absolute; inset:0; display:{{ lightDisplay }}; background-color:#fbfaff; background-image:radial-gradient(54% 48% at 26% 66%, rgba(249,168,212,0.55), transparent 60%), radial-gradient(54% 54% at 76% 38%, rgba(196,181,253,0.6), transparent 60%), radial-gradient(48% 44% at 58% 86%, rgba(165,180,252,0.5), transparent 62%);">
+
+    <aside style="position:absolute; top:0; left:0; bottom:0; width:288px; display:flex; flex-direction:column; background:rgba(255,255,255,0.74); border-right:1px solid rgba(120,90,160,0.2); box-shadow:6px 0 26px rgba(80,50,130,0.09); backdrop-filter:blur(22px);">
+      <div style="padding:20px 18px 14px; display:flex; align-items:center; gap:12px;">
+        <img src="assets/quasar_logo.png" alt="Quasar" style="width:46px; height:46px; object-fit:contain;">
+        <div><h1 style="font-size:17px; font-weight:700; color:#1c1530; margin:0; letter-spacing:-0.01em;">QUASAR</h1><span style="font-size:11.5px; color:#8b7fa8;">Research Assistant</span></div>
+      </div>
+      <div style="padding:0 14px 12px;">
+        <div onClick="{{ newChat }}" style="cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; padding:12px; border-radius:13px; background:linear-gradient(135deg,#c77dff,#9333ea); color:#fff; font-weight:600; font-size:14.5px; box-shadow:0 10px 24px rgba(147,51,234,0.32);">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Chat
+        </div>
+      </div>
+      <div style="padding:0 14px 12px;">
+        <div style="display:flex; align-items:center; gap:9px; padding:9px 12px; border-radius:11px; background:rgba(255,255,255,0.5); border:1px solid rgba(120,90,160,0.14);">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9a8fb0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+          <span style="font-size:12.5px; color:#9a8fb0;">Search research…</span>
+        </div>
+      </div>
+      <div style="padding:0 14px 14px;">
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 12px; border-radius:11px; background:rgba(129,140,248,0.12); border:1px solid rgba(129,140,248,0.28); color:#6366f1; font-size:13px; font-weight:500;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8c2 0 2-2 4-2s2 2 4 2 2-2 4-2 2 2 4 2 2-2 4-2"/><path d="M2 14c2 0 2-2 4-2s2 2 4 2 2-2 4-2 2 2 4 2 2-2 4-2"/></svg>Spectral Line Explorer
+        </div>
+      </div>
+      <div style="flex:1; overflow:hidden; padding:0 10px;">
+        <div style="padding:4px 8px 8px; font-size:10.5px; letter-spacing:0.1em; text-transform:uppercase; color:#9a8fb0; font-weight:600;">Recent research</div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px; background:rgba(192,132,252,0.16); border-left:3px solid #a855f7; margin-bottom:4px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#1c1530; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Sz65 Band 6 observations</div><div style="font-size:10px; color:#9a8fb0;">2m ago</div></div>
+        </div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px; margin-bottom:4px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#9a8fb0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 7v5l3 2"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#4a4360; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Protoplanetary disk papers</div><div style="font-size:10px; color:#9a8fb0;">1h ago</div></div>
+        </div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px; margin-bottom:4px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#9a8fb0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 7v5l3 2"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#4a4360; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">CO(2-1) coverage for M87</div><div style="font-size:10px; color:#9a8fb0;">3h ago</div></div>
+        </div>
+        <div style="display:flex; align-items:center; gap:11px; padding:10px 11px; border-radius:11px;">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#9a8fb0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 7v5l3 2"/></svg>
+          <div style="overflow:hidden;"><div style="font-size:13px; color:#4a4360; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">ALMA proprietary period</div><div style="font-size:10px; color:#9a8fb0;">1d ago</div></div>
+        </div>
+      </div>
+      <div style="padding:12px 14px; border-top:1px solid rgba(120,90,160,0.12); display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:9px 12px; border-radius:11px; background:rgba(255,255,255,0.55); border:1px solid rgba(120,90,160,0.12);">
+          <span style="display:flex; align-items:center; gap:8px; font-size:12px; color:#4a4360; font-weight:500;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8b7fa8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="8.5" cy="16" r="1"/><circle cx="15.5" cy="16" r="1"/><path d="M12 7v4"/><circle cx="12" cy="5" r="1.6"/></svg>gpt-4o-mini</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9a8fb0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </div>
+        <div style="display:flex; gap:4px;">
+          <div style="flex:1; display:flex; align-items:center; justify-content:center; gap:7px; padding:8px; border-radius:9px; color:#6b6480; font-size:12px;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>Saved</div>
+          <div style="flex:1; display:flex; align-items:center; justify-content:center; gap:7px; padding:8px; border-radius:9px; color:#6b6480; font-size:12px;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.7-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H3a2 2 0 0 1 0-4h.1a1.6 1.6 0 0 0 1.1-2.7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1V3a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8z"/></svg>Settings</div>
+          <div style="flex:1; display:flex; align-items:center; justify-content:center; gap:7px; padding:8px; border-radius:9px; color:#6b6480; font-size:12px;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.6 9a2.4 2.4 0 0 1 4.4 1.4c0 1.5-2 2-2 3"/><line x1="12" y1="17.5" x2="12.01" y2="17.5"/></svg>Help</div>
+        </div>
+        <div style="margin-top:2px; display:flex; align-items:center; justify-content:center; gap:8px; padding:11px; border-radius:12px; background:rgba(255,255,255,0.6); border:1px solid rgba(120,90,160,0.16); color:#1c1530; font-size:13px; font-weight:500;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Sign In / Sign Up</div>
+      </div>
+    </aside>
+
+    <main style="position:absolute; top:0; left:288px; right:0; bottom:0; display:flex; flex-direction:column;">
+      <div style="flex:none; display:flex; align-items:center; justify-content:space-between; padding:13px 24px;">
+        <div style="display:flex; align-items:center; gap:13px;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#8b7fa8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+          <span style="font-size:15px; font-weight:600; color:#1c1530;">New Research Session</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div onClick="{{ toggleTheme }}" title="Switch to dark" style="cursor:pointer; width:38px; height:38px; border-radius:999px; background:rgba(255,255,255,0.6); border:1px solid rgba(120,90,160,0.18); display:flex; align-items:center; justify-content:center;"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></div>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#a59bbd" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+        </div>
+      </div>
+      <div style="flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px 56px;">
+        <div style="width:100%; max-width:780px;">
+          <div style="display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:26px;">
+            <div style="position:relative; margin-bottom:14px;">
+              <div style="position:absolute; inset:-22px; background:rgba(168,85,247,0.28); border-radius:999px; filter:blur(34px);"></div>
+              <img src="assets/quasar_logo.png" alt="Quasar" style="position:relative; width:78px; height:78px; object-fit:contain;">
+            </div>
+            <h1 style="font-size:31px; font-weight:600; color:#1c1530; margin:0; letter-spacing:-0.02em;">What are you researching today?</h1>
+            <p style="font-size:15px; color:#6b6480; margin:8px 0 0 0;">Observations, archives, literature — ask in plain language.</p>
+          </div>
+          <div style="display:flex; align-items:center; gap:13px; padding:15px 16px 15px 22px; border-radius:999px; background:rgba(255,255,255,0.62); border:1px solid rgba(255,255,255,0.85); box-shadow:0 14px 38px rgba(120,90,160,0.18); backdrop-filter:blur(12px);">
+            <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#9a8fb0" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            <span style="flex:1; font-size:15px; color:#9a8fb0;">{{ qPlaceholder }}</span>
+            <div style="width:42px; height:42px; border-radius:999px; background:linear-gradient(135deg,#c77dff,#9333ea); display:flex; align-items:center; justify-content:center; box-shadow:0 8px 18px rgba(147,51,234,0.4);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9z"/></svg></div>
+          </div>
+          <div style="margin:26px 0 12px; font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:#9a8fb0; font-weight:600;">Try a starting point</div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px;">
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.5); border:1px solid rgba(255,255,255,0.8); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(168,85,247,0.14); color:#9333ea; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.9 19.1a10 10 0 0 1 0-14.2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4"/><path d="M19.1 4.9a10 10 0 0 1 0 14.2"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#1c1530; margin:0 0 4px 0;">Search the archive</h3><p style="font-size:13px; color:#6b6480; margin:0; line-height:1.5; min-height:39px;">{{ qArchive }}</p></div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.5); border:1px solid rgba(255,255,255,0.8); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(168,85,247,0.14); color:#9333ea; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#1c1530; margin:0 0 4px 0;">Search the literature</h3><p style="font-size:13px; color:#6b6480; margin:0; line-height:1.5; min-height:39px;">{{ qLit }}</p></div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.5); border:1px solid rgba(255,255,255,0.8); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(168,85,247,0.14); color:#9333ea; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.6 9a2.4 2.4 0 0 1 4.4 1.4c0 1.5-2 2-2 3"/><line x1="12" y1="17.5" x2="12.01" y2="17.5"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#1c1530; margin:0 0 4px 0;">Policy &amp; guidance</h3><p style="font-size:13px; color:#6b6480; margin:0; line-height:1.5; min-height:39px;">{{ qPolicy }}</p></div>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:15px; padding:18px; border-radius:20px; background:rgba(255,255,255,0.5); border:1px solid rgba(255,255,255,0.8); backdrop-filter:blur(8px);">
+              <div style="flex:none; width:40px; height:40px; border-radius:999px; background:rgba(168,85,247,0.14); color:#9333ea; display:flex; align-items:center; justify-content:center;"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="10" x2="4" y2="14"/><line x1="8" y1="6" x2="8" y2="18"/><line x1="12" y1="9" x2="12" y2="15"/><line x1="16" y1="4" x2="16" y2="20"/><line x1="20" y1="10" x2="20" y2="14"/></svg></div>
+              <div><h3 style="font-size:15px; font-weight:600; color:#1c1530; margin:0 0 4px 0;">Spectral coverage</h3><p style="font-size:13px; color:#6b6480; margin:0; line-height:1.5; min-height:39px;">{{ qSpectral }}</p></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="flex:none; padding:0 56px 16px; text-align:center;">
+        <p style="font-size:10.5px; color:#9a8fb0; margin:0;">QUASAR may produce inaccurate information. · Accepts images, PDFs, FITS, CSV · <span style="color:#a855f7; font-family:'JetBrains Mono',monospace;">12,847</span> visits</p>
+      </div>
+    </main>
+  </div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:&quot;100%&quot;,&quot;height&quot;:&quot;100%&quot;}}">
+class Component extends DCLogic {
+  state = { tick: 0, theme: "dark" };
+  componentDidMount() {
+    this._iv = setInterval(() => this.setState(s => ({ tick: s.tick + 1 })), 4400);
+  }
+  componentWillUnmount() {
+    if (this._iv) clearInterval(this._iv);
+  }
+  renderVals() {
+    const t = this.state.tick;
+    const theme = this.state.theme;
+    const archive = [
+      "Find ALMA observations of Sz65 in Band 6.",
+      "VLA archive data for the jet in 3C 273.",
+      "ALMA Cycle 9 observations of TW Hya.",
+      "Pull Band 7 continuum for HL Tau.",
+    ];
+    const lit = [
+      "Recent papers on protoplanetary disk substructure.",
+      "Papers citing the EHT M87* results.",
+      "2025 reviews of dust trapping in disks.",
+      "Latest work on disk wind signatures.",
+    ];
+    const policy = [
+      "What is the current ALMA proprietary period?",
+      "How do I apply for ALMA DDT time?",
+      "Band 6 sensitivity for a 1-hour track?",
+      "How is ALMA data weighted by default?",
+    ];
+    const spectral = [
+      "Check CO(2-1) line coverage for M87.",
+      "Does Band 7 cover HCO+ at z = 0.03?",
+      "Redshifted [CII] 158um at z = 6.1.",
+      "Which N2H+ lines fall in Band 3?",
+    ];
+    const placeholder = [
+      "Find ALMA observations of Sz65 in Band 6\u2026",
+      "Search for recent protoplanetary disk papers\u2026",
+      "What is the ALMA proprietary period?",
+      "Check CO(2-1) line coverage for M87\u2026",
+    ];
+    const pick = (arr) => arr[t % arr.length];
+    const node = (k, txt) => React.createElement(
+      "span",
+      { key: k + "-" + theme + "-" + t, style: { display: "inline-block", animation: "qfade 0.85s cubic-bezier(0.22,0.61,0.36,1)" } },
+      txt
+    );
+    return {
+      qArchive: node("ar", pick(archive)),
+      qLit: node("li", pick(lit)),
+      qPolicy: node("po", pick(policy)),
+      qSpectral: node("sp", pick(spectral)),
+      qPlaceholder: node("ph", pick(placeholder)),
+      darkDisplay: theme === "dark" ? "block" : "none",
+      lightDisplay: theme === "light" ? "block" : "none",
+      toggleTheme: () => this.setState(s => ({ theme: s.theme === "dark" ? "light" : "dark" })),
+      newChat: () => this.setState(s => ({ tick: s.tick + 1 })),
+    };
+  }
+}
+</script>
+</body>
+</html>

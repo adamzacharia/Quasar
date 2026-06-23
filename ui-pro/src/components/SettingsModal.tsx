@@ -480,7 +480,7 @@ function CustomToolsPanel() {
 
                         <div className="glass-control p-4 rounded-xl space-y-3">
                             <h4 className="text-xs font-semibold text-slate-300">API Key Storage (Optional)</h4>
-                            <p className="text-[10px] text-slate-500 leading-snug">If your tool needs an API key, name it here. We will securely inject it into <code className="text-pink-400">os.environ</code> when the agent starts.</p>
+                            <p className="text-[10px] text-slate-500 leading-snug">If your tool needs an API key, name it here. We will securely inject it into <code className="text-primary">os.environ</code> when the agent starts.</p>
                             <div className="flex gap-3">
                                 <div className="flex-1">
                                     <input 
@@ -503,7 +503,7 @@ function CustomToolsPanel() {
                             <button 
                                 onClick={handleSave}
                                 disabled={saving}
-                                className="bg-primary hover:bg-primary-600 disabled:opacity-50 text-white text-sm font-semibold py-2 px-6 rounded-lg transition-colors flex items-center gap-2"
+                                className="btn-accent disabled:opacity-50 text-sm font-semibold py-2 px-6 rounded-lg flex items-center gap-2"
                             >
                                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
                                 Save & Register Tool
@@ -805,7 +805,7 @@ function MCPServersPanel() {
                         <div className="pt-2 flex justify-end">
                             <button 
                                 onClick={handleSave} disabled={saving}
-                                className="bg-primary hover:bg-primary-600 disabled:opacity-50 text-white text-sm font-semibold py-2 px-6 rounded-lg transition-colors flex items-center gap-2"
+                                className="btn-accent disabled:opacity-50 text-sm font-semibold py-2 px-6 rounded-lg flex items-center gap-2"
                             >
                                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
                                 Save & Connect
@@ -1064,7 +1064,7 @@ function ProviderKeysPanel() {
                                     placeholder="No limit"
                                     className="bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-primary"
                                 />
-                                <button onClick={() => saveKey(providerInfo.id)} disabled={isBusy} className="px-3 py-2 rounded-lg bg-primary hover:bg-primary-600 text-white text-sm font-semibold disabled:opacity-50">
+                                <button onClick={() => saveKey(providerInfo.id)} disabled={isBusy} className="px-3 py-2 rounded-lg btn-accent text-sm font-semibold disabled:opacity-50">
                                     {busy === `${providerInfo.id}:save` ? "Saving..." : meta ? "Rotate" : "Save"}
                                 </button>
                             </div>

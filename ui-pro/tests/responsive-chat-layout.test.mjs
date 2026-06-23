@@ -18,7 +18,9 @@ test("chat content and composer use fluid viewport-aware widths", () => {
         "composer should expand with the available main pane",
     );
     assert.match(chatArea, /w-full max-w-\[var\(--q-chat-content-width\)\]/);
-    assert.match(chatInput, /w-full max-w-\[var\(--q-chat-input-width\)\]/);
+    // The docked composer still uses the fluid input width; it's now selected
+    // via the hero/docked variant ternary rather than a single literal class.
+    assert.match(chatInput, /max-w-\[var\(--q-chat-input-width\)\]/);
 });
 
 test("large-screen breakpoints do not replace fluid chat widths with fixed rem caps", () => {

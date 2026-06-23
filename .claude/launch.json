@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "quasar-frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "ui-pro", "run", "dev", "--", "-p", "3001"],
+      "port": 3001
+    },
+    {
+      "name": "quasar-backend",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["ui-pro/launch.py"],
+      "port": 8000
+    }
+  ]
+}

@@ -22,7 +22,7 @@ export default function TermsPage() {
   };
 
   return (
-    <div className="min-h-screen w-full overflow-y-auto bg-[#0d0d0e] text-slate-300 font-sans relative flex flex-col">
+    <div className="min-h-screen w-full overflow-y-auto bg-[var(--q-bg)] text-slate-300 font-sans relative flex flex-col">
       {/* Cosmic Background Gradients */}
       <div 
         className="absolute top-[-10%] right-[-10%] w-[600px] h-[600px] pointer-events-none opacity-20 select-none" 
@@ -34,7 +34,7 @@ export default function TermsPage() {
       />
       
       {/* Top Navigation Bar */}
-      <header className="sticky top-0 z-30 w-full bg-[#0d0d0e]/80 backdrop-blur-md border-b border-slate-900/60 px-6 py-4 flex items-center justify-between">
+      <header className="sticky top-0 z-30 w-full bg-[var(--q-bg)]/80 backdrop-blur-md border-b border-slate-900/60 px-6 py-4 flex items-center justify-between">
         <Link 
           href="/" 
           className="flex items-center gap-2 text-sm text-slate-400 hover:text-white transition-colors group"
@@ -108,7 +108,7 @@ export default function TermsPage() {
           {/* Section: Data Collection */}
           <section id="collection" className="space-y-4 scroll-mt-24">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-pink-500/10 text-pink-400 border border-pink-500/10">
+              <div className="p-2 rounded-lg bg-fuchsia-500/10 text-fuchsia-300 border border-fuchsia-500/10">
                 <Eye className="w-5 h-5" />
               </div>
               <h2 className="text-xl font-serif text-white font-[400]">2. What We Collect</h2>
@@ -155,7 +155,7 @@ export default function TermsPage() {
           {/* Section: Your Data & Discoveries */}
           <section id="fits-policy" className="space-y-4 scroll-mt-24">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-pink-500/10 text-pink-400 border border-pink-500/10">
+              <div className="p-2 rounded-lg bg-fuchsia-500/10 text-fuchsia-300 border border-fuchsia-500/10">
                 <FileText className="w-5 h-5" />
               </div>
               <h2 className="text-xl font-serif text-white font-[400]">4. Your Data & Discoveries</h2>
@@ -227,7 +227,7 @@ export default function TermsPage() {
       </div>
 
       {/* Footer */}
-      <footer className="w-full bg-[#0d0d0e] border-t border-slate-900/60 py-6 text-center text-xs text-slate-500 mt-auto">
+      <footer className="w-full bg-[var(--q-bg)] border-t border-slate-900/60 py-6 text-center text-xs text-slate-500 mt-auto">
         &copy; {new Date().getFullYear()} Quasar Observatory. All rights reserved.
       </footer>
     </div>

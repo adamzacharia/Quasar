@@ -158,7 +158,7 @@ export function OnboardingOverlay({ onComplete }: OnboardingOverlayProps) {
                         )}
                         <button
                             onClick={next}
-                            className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-semibold bg-primary hover:bg-primary/90 text-primary-dark transition-colors shadow-lg shadow-primary/20"
+                            className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-semibold btn-accent shadow-lg shadow-[#9333ea]/30"
                         >
                             {step === STEPS.length - 1 ? "Get Started" : "Next"}
                             {step < STEPS.length - 1 && <ChevronRight className="w-4 h-4" />}

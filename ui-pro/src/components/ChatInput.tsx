@@ -3,8 +3,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck, Globe } from "lucide-react";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
 interface AttachedFile {
     file: File;
     preview?: string; // base64 data URL for images
@@ -16,14 +14,24 @@ interface ChatInputProps {
     onStop?: () => void;
     isStreaming: boolean;
     initialValue?: string;
+    /** "hero" = centered pill on the empty landing; "docked" = pinned at the bottom during a chat. */
+    variant?: "hero" | "docked";
+    /* Composer options + analytics are owned by the parent so they survive the
+       hero→docked switch (and the visit counter is fetched only once). */
+    grounded: boolean;
+    onGroundedChange: (v: boolean) => void;
+    webSearch: boolean;
+    onWebSearchChange: (v: boolean) => void;
+    hitCount?: number | null;
 }
 
-export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: ChatInputProps) {
+export function ChatInput({
+    onSend, onStop, isStreaming, initialValue = "", variant = "docked",
+    grounded: groundedSummary, onGroundedChange, webSearch, onWebSearchChange, hitCount = null,
+}: ChatInputProps) {
+    const isHero = variant === "hero";
     const [value, setValue] = useState(initialValue);
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
-    const [hitCount, setHitCount] = useState<number | null>(null);
-    const [groundedSummary, setGroundedSummary] = useState(false);
-    const [webSearch, setWebSearch] = useState(true);
     const [menuOpen, setMenuOpen] = useState(false);
     const inputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
@@ -32,20 +40,6 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (initialValue) { setValue(initialValue); inputRef.current?.focus(); } }, [initialValue]);
-
-    // ── Fetch hit count on mount (with timeout to avoid slow renders) ──
-    useEffect(() => {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 4000);
-        fetch(`${API_BASE}/api/analytics/hit`, { signal: controller.signal })
-            .then(res => res.json())
-            .then(data => {
-                if (typeof data.hits === "number") setHitCount(data.hits);
-            })
-            .catch(() => {/* silent fail — timeout or network error */})
-            .finally(() => clearTimeout(timeout));
-        return () => { controller.abort(); clearTimeout(timeout); };
-    }, []);
 
     useEffect(() => {
         if (!menuOpen) return;
@@ -111,11 +105,11 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
     };
 
     return (
-        <div className="w-full px-4 md:px-8 pb-3 pt-2 z-20">
-            <div className="w-full max-w-[var(--q-chat-input-width)] mx-auto relative">
+        <div className={isHero ? "w-full z-20" : "w-full px-4 md:px-8 pb-3 pt-2 z-20"}>
+            <div className={`w-full mx-auto relative ${isHero ? "max-w-[var(--q-suggestion-grid-width)]" : "max-w-[var(--q-chat-input-width)]"}`}>
                 <form onSubmit={handleSubmit} className="relative group">
-                    <div className="absolute inset-0 bg-primary/20 rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-                    <div className="relative w-full glass-surface rounded-2xl ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all">
+                    <div className={`absolute inset-0 bg-primary/20 ${isHero ? "rounded-full" : "rounded-2xl"} blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500`} />
+                    <div className={`relative w-full glass-surface ${isHero ? "rounded-full" : "rounded-2xl"} ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all`}>
 
                         {/* Attachment previews */}
                         {attachments.length > 0 && (
@@ -141,7 +135,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                         )}
 
                         {/* Input row */}
-                        <div className="flex items-center gap-2 p-2">
+                        <div className={`flex items-center gap-2 ${isHero ? "p-2.5 pl-5" : "p-2"}`}>
                             {/* Hidden file inputs */}
                             <input
                                 ref={imageInputRef}
@@ -214,7 +208,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                                 role="menuitemcheckbox"
                                                 aria-checked={groundedSummary}
                                                 aria-describedby="grounded-mode-tooltip"
-                                                onClick={() => setGroundedSummary(value => !value)}
+                                                onClick={() => onGroundedChange(!groundedSummary)}
                                                 className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10 focus-visible:bg-white/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400/50"
                                             >
                                                 <span className="flex min-w-0 items-center gap-3">
@@ -246,7 +240,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                             type="button"
                                             role="menuitemcheckbox"
                                             aria-checked={webSearch}
-                                            onClick={() => setWebSearch(value => !value)}
+                                            onClick={() => onWebSearchChange(!webSearch)}
                                             className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
                                         >
                                             <span className="flex min-w-0 items-center gap-3">
@@ -286,7 +280,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                 <button
                                     type="button"
                                     onClick={onStop}
-                                    className="p-2.5 bg-red-500/80 hover:bg-red-500 text-white rounded-full transition-all shadow-lg shadow-red-500/20 flex items-center justify-center animate-pulse"
+                                    className="p-2.5 bg-red-500/80 hover:bg-red-500 text-on-accent rounded-full transition-all shadow-lg shadow-red-500/20 flex items-center justify-center animate-pulse"
                                     title="Stop generating"
                                 >
                                     <Square className="w-4 h-4 fill-current" />
@@ -295,7 +289,7 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                                 <button
                                     type="submit"
                                     disabled={!value.trim() && attachments.length === 0}
-                                    className="p-2.5 bg-primary hover:bg-primary/90 text-white rounded-full transition-all shadow-lg shadow-primary/20 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
+                                    className="btn-accent p-2.5 rounded-full shadow-lg shadow-[#9333ea]/40 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
                                 >
                                     <Send className="w-5 h-5" />
                                 </button>
@@ -303,13 +297,15 @@ export function ChatInput({ onSend, onStop, isStreaming, initialValue = "" }: Ch
                         </div>
                     </div>
                 </form>
-                <div className="text-center mt-2">
-                    <p className="text-[10px] text-slate-600">
-                        QUASAR may produce inaccurate information.
-                        <span className="text-slate-700 ml-2">· Accepts images, PDFs, FITS, CSV</span>
-                        <span className={`text-slate-700 ml-2 transition-opacity duration-500 ${hitCount !== null ? 'opacity-100' : 'opacity-0'}`}>· Visits: <span className="text-primary/50 font-mono tabular-nums">{hitCount !== null ? hitCount.toLocaleString() : '—'}</span></span>
-                    </p>
-                </div>
+                {!isHero && (
+                    <div className="text-center mt-2">
+                        <p className="text-[10px] text-slate-500">
+                            QUASAR may produce inaccurate information.
+                            <span className="text-slate-600 ml-2">· Accepts images, PDFs, FITS, CSV</span>
+                            <span className={`text-slate-600 ml-2 transition-opacity duration-500 ${hitCount !== null ? 'opacity-100' : 'opacity-0'}`}>· Visits: <span className="text-[var(--q-mono-accent)] font-mono tabular-nums">{hitCount !== null ? hitCount.toLocaleString() : '—'}</span></span>
+                        </p>
+                    </div>
+                )}
             </div>
         </div>
     );

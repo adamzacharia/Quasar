@@ -88,7 +88,7 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                                            overflow-hidden hover:scale-[1.02]"
                                     title={quality?.reason || source.snippet}
                                     onMouseEnter={(e) => {
-                                        e.currentTarget.style.borderColor = 'rgba(244, 113, 181, 0.4)';
+                                        e.currentTarget.style.borderColor = 'rgba(167, 139, 250, 0.45)';
                                         e.currentTarget.style.background = 'var(--q-glass-control-hover)';
                                     }}
                                     onMouseLeave={(e) => {
