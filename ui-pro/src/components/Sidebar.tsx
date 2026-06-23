@@ -450,7 +450,7 @@ export function Sidebar() {
             {/* New Chat */}
             <div className="px-4 mb-6">
                 <button onClick={handleNewChat}
-                    className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-dark font-semibold py-3 px-4 rounded-full transition-colors shadow-lg shadow-primary/20 group">
+                    className="btn-accent w-full flex items-center justify-center gap-2 font-semibold py-3 px-4 rounded-xl shadow-lg shadow-[#9333ea]/40 hover:shadow-[#9333ea]/60 group">
                     <Plus className="w-5 h-5 transition-transform group-hover:rotate-90" />
                     <span>New Chat</span>
                 </button>
@@ -458,7 +458,7 @@ export function Sidebar() {
 
             <div className="px-4 mb-4">
                 <Link href="/spectral-lines"
-                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors text-sm ${pathname === "/spectral-lines" ? "bg-cyan-500/10 text-cyan-200 border border-cyan-500/20" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors text-sm ${pathname === "/spectral-lines" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                     <Waves className="w-4 h-4" />
                     Spectral Line Explorer
                 </Link>
@@ -502,8 +502,8 @@ export function Sidebar() {
                 )}
             </div>
 
-            {/* Bottom Controls */}
-            <div className="p-4 border-t border-slate-700/50 space-y-3">
+            {/* Bottom Controls — compact, so Recent Research keeps its room */}
+            <div className="p-3 border-t border-slate-700/50 space-y-2.5">
                 {/* Model Dropdown */}
                 <ModelDropdown
                     selectedModel={selectedModel}
@@ -511,34 +511,33 @@ export function Sidebar() {
                     onSelect={setSelectedModel}
                 />
 
-                <div className="pt-2 border-t border-slate-700/50 space-y-1">
+                {/* Compact action row: Saved · Settings · Help */}
+                <div className="flex gap-1.5">
                     <button onClick={() => togglePanel("papers")}
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${activePanel === "papers" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                        <Bookmark className="w-4 h-4" />Saved Papers
+                        title="Saved Papers"
+                        className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${activePanel === "papers" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                        <Bookmark className="w-4 h-4 shrink-0" />Saved
                     </button>
                     <button onClick={() => setSettingsOpen(true)}
-                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm text-slate-400 hover:bg-white/10 hover:text-white">
-                        <Settings className="w-4 h-4" />Settings
+                        title="Settings"
+                        className="flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs text-slate-400 hover:bg-white/10 hover:text-white">
+                        <Settings className="w-4 h-4 shrink-0" />Settings
                     </button>
                     <Link href="/help"
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                        <HelpCircle className="w-4 h-4" />Help & Docs
+                        title="Help & Docs"
+                        className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                        <HelpCircle className="w-4 h-4 shrink-0" />Help
                     </Link>
-                    {isAuthenticated && (
-                        <button onClick={logout}
-                            className="w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm text-red-500/70 hover:bg-red-500/10 hover:text-red-500">
-                            <LogOut className="w-4 h-4" />Log Out
-                        </button>
-                    )}
                 </div>
 
-                <div className="pt-3 border-t border-slate-700/50 px-2 pb-2">
+                {/* User / Sign-in (Log Out folded into this row when signed in) */}
+                <div className="pt-2.5 border-t border-slate-700/50">
                     {isAuthenticated ? (
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-3 px-1">
                             {user?.picture_url ? (
                                 <img src={user.picture_url} alt={user.display_name || "User"} className="size-8 rounded-full object-cover shadow-md" referrerPolicy="no-referrer" />
                             ) : (
-                                <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 flex items-center justify-center text-white text-xs font-bold shadow-md">
+                                <div className="size-8 rounded-full bg-gradient-to-tr from-[#818cf8] to-[#c77dff] flex items-center justify-center text-on-accent text-xs font-bold shadow-md">
                                     {initials}
                                 </div>
                             )}
@@ -546,11 +545,15 @@ export function Sidebar() {
                                 <span className="text-sm font-semibold text-white truncate">{user?.display_name || user?.username || "User"}</span>
                                 <span className="text-[10px] text-slate-400 truncate">{user?.username || ""}</span>
                             </div>
+                            <button onClick={logout} title="Log out"
+                                className="shrink-0 p-1.5 rounded-lg text-red-500/70 hover:bg-red-500/10 hover:text-red-500 transition-colors">
+                                <LogOut className="w-4 h-4" />
+                            </button>
                         </div>
                     ) : (
                         <button
                             onClick={openAuthModal}
-                            className="w-full bg-[#2a2a2a] hover:bg-[#333] border border-slate-700 text-white font-medium text-sm py-2.5 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
+                            className="glass-control w-full text-[var(--q-text)] font-medium text-sm py-2.5 px-4 rounded-xl transition-all flex items-center justify-center gap-2"
                         >
                             <UserIcon className="w-4 h-4" />
                             Sign In / Sign Up

@@ -46,7 +46,7 @@ export default function Home() {
   // ── Authentication Lock Screen / Landing Gate ──
   if (!isAuthenticated) {
     return (
-      <div className="relative min-h-screen w-full flex flex-col items-center justify-center p-6 overflow-hidden bg-[#0d0d0e]">
+      <div className="relative min-h-screen w-full flex flex-col items-center justify-center p-6 overflow-hidden bg-[#070510]">
         {/* Cosmic Background Gradients */}
         <div 
           className="absolute top-[-20%] right-[-10%] w-[800px] h-[800px] pointer-events-none opacity-30 select-none animate-pulse duration-[10s]" 
@@ -108,7 +108,7 @@ export default function Home() {
 
             {/* Card 2 */}
             <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
-              <div className="p-3 rounded-xl bg-pink-500/10 text-pink-400 mb-4 border border-pink-500/10">
+              <div className="p-3 rounded-xl bg-fuchsia-500/10 text-fuchsia-300 mb-4 border border-fuchsia-500/10">
                 <FileText className="w-5 h-5" />
               </div>
               <h3 className="text-sm font-semibold text-slate-200 mb-2">FITS Processing</h3>

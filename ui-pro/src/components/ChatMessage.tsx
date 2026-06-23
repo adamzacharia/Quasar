@@ -399,7 +399,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     {user?.picture_url ? (
                         <img src={user.picture_url} alt={user.display_name || "You"} className="size-8 rounded-full object-cover shrink-0 mb-1 shadow-md" referrerPolicy="no-referrer" />
                     ) : (
-                        <div className="size-8 rounded-full bg-gradient-to-tr from-blue-500 to-cyan-400 shrink-0 mb-1 flex items-center justify-center text-white text-xs font-bold">
+                        <div className="size-8 rounded-full bg-gradient-to-tr from-[#818cf8] to-[#c77dff] shrink-0 mb-1 flex items-center justify-center text-on-accent text-xs font-bold">
                             {userInitials || <UserIcon className="w-4 h-4" />}
                         </div>
                     )}

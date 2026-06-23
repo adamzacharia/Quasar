@@ -46,6 +46,22 @@ export function ChatArea() {
     }, [token]);
 
     const [inputValue, setInputValue] = useState("");
+    // Composer options + visit counter live here (not in ChatInput) so they
+    // persist across the hero→docked switch and the hit endpoint fires once.
+    const [grounded, setGrounded] = useState(false);
+    const [webSearch, setWebSearch] = useState(true);
+    const [hitCount, setHitCount] = useState<number | null>(null);
+    useEffect(() => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 4000);
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        fetch(`${apiBase}/api/analytics/hit`, { signal: controller.signal })
+            .then((res) => res.json())
+            .then((data) => { if (typeof data.hits === "number") setHitCount(data.hits); })
+            .catch(() => {/* silent: timeout or network error */})
+            .finally(() => clearTimeout(timeout));
+        return () => { controller.abort(); clearTimeout(timeout); };
+    }, []);
     const abortControllerRef = useRef<AbortController | null>(null);
     const [downloadProgress, setDownloadProgress] = useState<{
         filename: string; downloaded_bytes: number;
@@ -686,13 +702,14 @@ export function ChatArea() {
             </header>
 
             {hasMessages ? (
+              <>
                 <div
                     ref={scrollRef}
                     onScroll={handleScroll}
                     onWheel={markUserScrollIntent}
                     onTouchStart={markUserScrollIntent}
                     onTouchMove={markUserScrollIntent}
-                    className="flex-1 overflow-y-auto px-4 md:px-8 py-6 space-y-6"
+                    className="flex-1 overflow-y-auto chat-scrim px-4 md:px-8 py-6 space-y-6"
                 >
                     <div className="w-full max-w-[var(--q-chat-content-width)] mx-auto space-y-6">
                         {(() => {
@@ -747,35 +764,50 @@ export function ChatArea() {
                         )}
                     </div>
                 </div>
+
+                {/* Scroll-to-bottom button */}
+                {showScrollBtn && (
+                    <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20">
+                        <button
+                            onClick={scrollToBottom}
+                            className="glass-control w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200 hover:scale-110 animate-in fade-in slide-in-from-bottom-2 duration-200"
+                            style={{
+                                color: 'var(--q-text-secondary)',
+                                boxShadow: '0 4px 16px -2px rgba(0,0,0,0.25)',
+                            }}
+                            title="Scroll to bottom"
+                        >
+                            <ArrowDown className="w-4 h-4" />
+                        </button>
+                    </div>
+                )}
+
+                {/* Download progress bar — inline before input */}
+                {downloadProgress && (
+                    <div className="px-4 md:px-8 max-w-[var(--q-chat-content-width)] mx-auto w-full">
+                        <DownloadProgress data={downloadProgress} />
+                    </div>
+                )}
+
+                <ChatInput
+                    onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
+                    grounded={grounded} onGroundedChange={setGrounded}
+                    webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
+                />
+              </>
             ) : (
-                <EmptyState onSuggestionClick={handleSuggestionClick} />
+                <EmptyState
+                    onSuggestionClick={handleSuggestionClick}
+                    hitCount={hitCount}
+                    composer={
+                        <ChatInput
+                            variant="hero" onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
+                            grounded={grounded} onGroundedChange={setGrounded}
+                            webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
+                        />
+                    }
+                />
             )}
-
-            {/* Scroll-to-bottom button */}
-            {hasMessages && showScrollBtn && (
-                <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20">
-                    <button
-                        onClick={scrollToBottom}
-                        className="glass-control w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200 hover:scale-110 animate-in fade-in slide-in-from-bottom-2 duration-200"
-                        style={{
-                            color: 'var(--q-text-secondary)',
-                            boxShadow: '0 4px 16px -2px rgba(0,0,0,0.25)',
-                        }}
-                        title="Scroll to bottom"
-                    >
-                        <ArrowDown className="w-4 h-4" />
-                    </button>
-                </div>
-            )}
-
-            {/* Download progress bar — inline before input */}
-            {downloadProgress && (
-                <div className="px-4 md:px-8 max-w-[var(--q-chat-content-width)] mx-auto w-full">
-                    <DownloadProgress data={downloadProgress} />
-                </div>
-            )}
-
-            <ChatInput onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue} />
         </main>
     );
 }
