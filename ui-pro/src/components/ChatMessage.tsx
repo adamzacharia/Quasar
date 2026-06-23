@@ -593,7 +593,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
                                 // When thinking is completed, display full markdown at normal 100% opacity
                                 return (
-                                    <div className="text-slate-300 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 prose prose-invert prose-xs">
+                                    <div className="text-slate-300 text-xs leading-relaxed max-w-none pt-2 border-t border-slate-800/40 prose prose-invert prose-sm">
                                         <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.thinking}</ReactMarkdown>
                                     </div>
                                 );
@@ -608,7 +608,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
                     {/* Content — rendered BELOW thinking */}
                     {hasContent && (
-                        <div className={`text-slate-200 prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent ${message.type === 'critique' ? 'border-l-4 border-red-500 pl-4 py-1 bg-red-950/10 rounded-r-xl' : ''}`}>
+                        <div className={`prose-answer text-slate-200 prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent ${message.type === 'critique' ? 'border-l-4 border-red-500 pl-4 py-1 bg-red-950/10 rounded-r-xl' : ''}`}>
                             {message.type === 'critique' && (
                                 <div className="text-red-400 font-bold mb-2 flex items-center gap-2">
                                     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
