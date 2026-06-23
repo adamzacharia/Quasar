@@ -104,16 +104,23 @@ export function ChatInput({
         }
     };
 
+    // The hero composer is a full pill only while empty. Once an attachment row
+    // stacks on top, the box grows tall — and rounded-full (radius = 50% of
+    // height) would warp it into a distorted stadium with the chips/input row
+    // pushed out of alignment. Switch to a fixed corner radius in that state.
+    const pillShape = isHero && attachments.length === 0;
+    const radius = pillShape ? "rounded-full" : isHero ? "rounded-3xl" : "rounded-2xl";
+
     return (
         <div className={isHero ? "w-full z-20" : "w-full px-4 md:px-8 pb-3 pt-2 z-20"}>
             <div className={`w-full mx-auto relative ${isHero ? "max-w-[var(--q-suggestion-grid-width)]" : "max-w-[var(--q-chat-input-width)]"}`}>
                 <form onSubmit={handleSubmit} className="relative group">
-                    <div className={`absolute inset-0 bg-primary/20 ${isHero ? "rounded-full" : "rounded-2xl"} blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500`} />
-                    <div className={`relative w-full glass-surface ${isHero ? "rounded-full" : "rounded-2xl"} ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all`}>
+                    <div className={`absolute inset-0 bg-primary/20 ${radius} blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500`} />
+                    <div className={`relative w-full glass-surface ${radius} ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all`}>
 
                         {/* Attachment previews */}
                         {attachments.length > 0 && (
-                            <div className="flex flex-wrap gap-2 px-3 pt-3">
+                            <div className={`flex flex-wrap gap-2 pt-3 ${isHero ? "px-5" : "px-3"}`}>
                                 {attachments.map((att, i) => (
                                     <div key={i} className="relative group/att glass-control flex items-center gap-2 rounded-xl px-3 py-2 max-w-[200px]">
                                         {att.type === "image" && att.preview ? (
