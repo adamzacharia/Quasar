@@ -22,12 +22,12 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" data-theme="dark" suppressHydrationWarning>
+    <html lang="en" data-theme="light" suppressHydrationWarning>
       <head>
         {/* Inline script to set theme BEFORE React hydration to prevent flash */}
         <script
           dangerouslySetInnerHTML={{
-            __html: `(function(){try{var t=localStorage.getItem("quasar_theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}})()`,
+            __html: `(function(){try{var t=localStorage.getItem("quasar_theme");document.documentElement.setAttribute("data-theme",t==="dark"||t==="light"?t:"light")}catch(e){document.documentElement.setAttribute("data-theme","light")}})()`,
           }}
         />
       </head>

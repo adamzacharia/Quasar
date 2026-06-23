@@ -6,7 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useChatStore } from "../lib/store";
 import { useAuthStore } from "../lib/auth-store";
 import {
-    Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
+    Plus, MessageSquare, History, Bookmark, Settings, HelpCircle, PanelLeft,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
     Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu, Waves
 } from "lucide-react";
@@ -374,7 +374,12 @@ function SavedPapersContent() {
 /* ────────────────────────────────────────────
    MAIN SIDEBAR
    ──────────────────────────────────────────── */
-export function Sidebar() {
+interface SidebarProps {
+    collapsed?: boolean;
+    onToggle?: () => void;
+}
+
+export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
     const {
         conversations, activeConversationId, setActiveConversation,
         createNewConversation, selectedModel, availableModels, setSelectedModel,
@@ -424,7 +429,7 @@ export function Sidebar() {
     const handleNewChat = () => {
         createNewConversation();
         setActivePanel(null);
-        if (pathname === "/spectral-lines") {
+        if (pathname !== "/") {
             router.push("/");
         }
     };
@@ -436,8 +441,85 @@ export function Sidebar() {
             ? user.username.substring(0, 2).toUpperCase()
             : "U";
 
+    if (collapsed) {
+        return (
+            <aside className="relative w-[var(--q-sidebar-rail-width)] glass-sidebar border-r border-slate-700/50 flex flex-col items-center h-full shrink-0 overflow-hidden py-3">
+                <button
+                    type="button"
+                    onClick={onToggle}
+                    className="mb-5 flex size-11 items-center justify-center rounded-xl transition-colors hover:bg-white/10"
+                    title="Expand sidebar"
+                    aria-label="Expand sidebar"
+                >
+                    <img src="/quasar_logo.png" alt="" className="size-8 object-contain" />
+                </button>
+
+                <div className="flex flex-col items-center gap-2">
+                    <button onClick={handleNewChat} className="sidebar-rail-button text-primary" title="New chat" aria-label="New chat">
+                        <Plus className="w-5 h-5" />
+                    </button>
+                    <button type="button" onClick={onToggle} className="sidebar-rail-button" title="Search and history" aria-label="Search and history">
+                        <Search className="w-5 h-5" />
+                    </button>
+                    <button type="button" onClick={onToggle} className="sidebar-rail-button" title="Recent chats" aria-label="Recent chats">
+                        <MessageSquare className="w-5 h-5" />
+                    </button>
+                    <Link
+                        href="/spectral-lines"
+                        className={`sidebar-rail-button ${pathname === "/spectral-lines" ? "text-primary bg-primary/10" : ""}`}
+                        title="Spectral Line Explorer"
+                        aria-label="Spectral Line Explorer"
+                    >
+                        <Waves className="w-5 h-5" />
+                    </Link>
+                </div>
+
+                <div className="mt-auto flex flex-col items-center gap-2">
+                    <Link
+                        href="/help"
+                        className={`sidebar-rail-button ${pathname === "/help" ? "text-primary bg-primary/10" : ""}`}
+                        title="Help and docs"
+                        aria-label="Help and docs"
+                    >
+                        <HelpCircle className="w-5 h-5" />
+                    </Link>
+                    <button type="button" onClick={() => setSettingsOpen(true)} className="sidebar-rail-button" title="Settings" aria-label="Settings">
+                        <Settings className="w-5 h-5" />
+                    </button>
+                    {isAuthenticated ? (
+                        <button type="button" onClick={onToggle} className="mt-2 rounded-full" title={user?.display_name || user?.username || "Account"} aria-label="Account">
+                            {user?.picture_url ? (
+                                <img src={user.picture_url} alt="" className="size-9 rounded-full object-cover shadow-md" referrerPolicy="no-referrer" />
+                            ) : (
+                                <span className="flex size-9 items-center justify-center rounded-full bg-gradient-to-tr from-[#818cf8] to-[#c77dff] text-on-accent text-xs font-bold shadow-md">
+                                    {initials}
+                                </span>
+                            )}
+                        </button>
+                    ) : (
+                        <button type="button" onClick={openAuthModal} className="sidebar-rail-button mt-2" title="Sign in" aria-label="Sign in">
+                            <UserIcon className="w-5 h-5" />
+                        </button>
+                    )}
+                </div>
+
+                <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+            </aside>
+        );
+    }
     return (
         <aside className="relative w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
+            {onToggle && (
+                <button
+                    type="button"
+                    onClick={onToggle}
+                    className="absolute right-3 top-3 z-10 rounded-lg p-2 text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+                    title="Collapse sidebar"
+                    aria-label="Collapse sidebar"
+                >
+                    <PanelLeft className="h-5 w-5" />
+                </button>
+            )}
             {/* Logo */}
             <Link href="/" className="p-6 flex items-center gap-3">
                 <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
@@ -450,7 +532,7 @@ export function Sidebar() {
             {/* New Chat */}
             <div className="px-4 mb-6">
                 <button onClick={handleNewChat}
-                    className="btn-accent w-full flex items-center justify-center gap-2 font-semibold py-3 px-4 rounded-xl shadow-lg shadow-[#9333ea]/40 hover:shadow-[#9333ea]/60 group">
+                    className="btn-new-chat w-full flex items-center justify-center gap-2 font-semibold py-3 px-4 rounded-xl group">
                     <Plus className="w-5 h-5 transition-transform group-hover:rotate-90" />
                     <span>New Chat</span>
                 </button>

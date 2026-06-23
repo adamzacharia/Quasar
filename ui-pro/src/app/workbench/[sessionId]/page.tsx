@@ -355,6 +355,7 @@ export default function WorkbenchPage() {
     const params = useParams<{ sessionId: string }>();
     const sessionId = String(params.sessionId || "");
     const sidebarOpen = useChatStore((s) => s.sidebarOpen);
+    const toggleSidebar = useChatStore((s) => s.toggleSidebar);
     const { token, isAuthenticated, isInitialized, openAuthModal } = useAuthStore();
 
     const [mounted, setMounted] = useState(false);
@@ -839,8 +840,8 @@ export default function WorkbenchPage() {
 
     return (
         <div className="flex h-screen w-full overflow-hidden bg-[#090d16] text-slate-200">
-            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-0"} shrink-0 overflow-hidden transition-all duration-300`}>
-                <Sidebar />
+            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} shrink-0 overflow-hidden transition-all duration-300`}>
+                <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
             </div>
 
             <main className="flex min-w-0 flex-1 flex-col overflow-hidden">

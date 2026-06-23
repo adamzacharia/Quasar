@@ -679,7 +679,7 @@ export function ChatArea() {
         : "New Research Session";
 
     return (
-        <main className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
+        <main className={`flex-1 flex flex-col h-full overflow-hidden relative z-10 ${hasMessages ? "chat-session-active" : ""}`}>
             <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-1.5 md:py-2 border-b border-slate-800/80 glass-panel">
                 <div className="flex items-center gap-3">
                     <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/10 transition-all"><PanelLeft className="w-5 h-5" /></button>

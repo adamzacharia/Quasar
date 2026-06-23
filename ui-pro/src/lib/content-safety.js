@@ -91,8 +91,30 @@ export function isSafeWebSource(source) {
         && !looksExplicitWebText(text);
 }
 
+function isDisplayableWebImageUrl(value) {
+    const raw = String(value || "").trim();
+    return /^https?:\/\//i.test(raw) || /^\/\//.test(raw);
+}
+
 export function isSafeWebImage(image) {
-    // General-web image pixels are not verifiable from URL metadata alone.
-    void image;
-    return false;
+    if (!image || typeof image !== "object") return false;
+    const url = image.url || image.src || image.image_url;
+    if (!isDisplayableWebImageUrl(url)) return false;
+
+    const text = [
+        image.description,
+        image.alt,
+        image.title,
+        image.sourceTitle,
+        image.source_title,
+        image.sourcePageTitle,
+        image.source_page_title,
+        url,
+        image.sourceUrl,
+        image.source_url,
+    ].map(value => String(value || "")).join(" ");
+
+    return !isBlockedWebUrl(url)
+        && !isBlockedWebUrl(image.sourceUrl || image.source_url || image.source || "")
+        && !looksExplicitWebText(text);
 }

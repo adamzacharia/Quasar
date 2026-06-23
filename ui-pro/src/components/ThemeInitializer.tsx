@@ -15,6 +15,8 @@ export function ThemeInitializer() {
         const saved = localStorage.getItem("quasar_theme");
         if (saved === "light" || saved === "dark") {
             setTheme(saved);
+        } else {
+            setTheme("light");
         }
     }, [setTheme]);
 
