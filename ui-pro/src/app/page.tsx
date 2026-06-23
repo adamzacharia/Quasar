@@ -155,15 +155,15 @@ export default function Home() {
           />
           {/* Sidebar panel */}
           <div className="relative z-50 w-[var(--q-sidebar-width)] h-full animate-in slide-in-from-left duration-200">
-            <Sidebar />
+            <Sidebar onToggle={toggleSidebar} />
           </div>
         </div>
       )}
 
       {/* ── DESKTOP: sidebar as a push panel ── */}
       {!isMobile && (
-        <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-0"} transition-all duration-300 shrink-0 overflow-hidden`}>
-          <Sidebar />
+        <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} transition-all duration-300 shrink-0 overflow-hidden`}>
+          <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
         </div>
       )}
 

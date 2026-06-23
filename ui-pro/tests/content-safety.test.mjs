@@ -34,9 +34,21 @@ test("blocks explicit source metadata", () => {
     assert.equal(looksExplicitWebText("ordinary astronomy article"), false);
 });
 
-test("general web images are rejected by the UI defense", () => {
+test("allows non-explicit http web images and blocks unsafe image metadata", () => {
     assert.equal(
         isSafeWebImage({ url: "https://example.com/image.jpg", description: "Portrait" }),
+        true,
+    );
+    assert.equal(
+        isSafeWebImage({ url: "https://www.xvideos.com/thumb.jpg", description: "Portrait" }),
+        false,
+    );
+    assert.equal(
+        isSafeWebImage({ url: "https://example.com/image.jpg", description: "Pornographic image" }),
+        false,
+    );
+    assert.equal(
+        isSafeWebImage({ url: "/relative/image.jpg", description: "Portrait" }),
         false,
     );
 });

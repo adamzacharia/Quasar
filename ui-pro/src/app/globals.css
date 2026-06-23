@@ -7,13 +7,14 @@
 html {
   font-size: 14px;
   --q-sidebar-width: 280px;
+  --q-sidebar-rail-width: 68px;
   /*
    * Keep the chat responsive to the available main-pane width. Fixed rem
    * caps left very large empty margins on wide displays and made the
    * composer appear disconnected from the conversation.
    */
-  --q-chat-content-width: calc(100% - clamp(0rem, 4vw, 6rem));
-  --q-chat-input-width: calc(100% - clamp(0rem, 8vw, 12rem));
+  --q-chat-content-width: min(calc(100% - clamp(0rem, 4vw, 6rem)), 92rem);
+  --q-chat-input-width: min(calc(100% - clamp(0rem, 8vw, 12rem)), 78rem);
   --q-empty-state-width: 64rem;
   --q-suggestion-grid-width: 48rem;
   --q-table-max-height: 420px;
@@ -241,10 +242,53 @@ html {
   filter: none;
 }
 
+.btn-new-chat {
+  background: linear-gradient(135deg, rgba(167, 139, 250, 0.22), rgba(147, 51, 234, 0.26));
+  color: var(--q-text) !important;
+  border: 1px solid rgba(167, 139, 250, 0.28);
+  box-shadow: 0 10px 26px rgba(75, 55, 130, 0.12), inset 0 1px 0 var(--q-glass-highlight);
+  transition: background-color 0.2s ease, border-color 0.2s ease, filter 0.2s ease;
+}
+.btn-new-chat:hover {
+  background: linear-gradient(135deg, rgba(167, 139, 250, 0.30), rgba(147, 51, 234, 0.34));
+  border-color: rgba(167, 139, 250, 0.42);
+}
+
 /* Subtle scrim behind the chat scroll area so messages/tables stay legible
    over the full-strength nebula. */
 .chat-scrim {
   background: var(--q-content-scrim);
+}
+
+.chat-session-active {
+  background: var(--q-content-scrim);
+}
+
+.chat-session-active .chat-scrim {
+  background: transparent;
+}
+
+[data-theme="dark"] .chat-session-active {
+  background: linear-gradient(180deg, rgba(3, 2, 8, 0.95), rgba(2, 2, 7, 0.98));
+}
+
+[data-theme="dark"] .chat-session-active .glass-panel {
+  background: rgba(5, 4, 10, 0.88);
+}
+
+.sidebar-rail-button {
+  display: inline-flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+  color: var(--q-text-secondary);
+  transition: background-color 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+.sidebar-rail-button:hover {
+  background: var(--q-glass-control-hover);
+  color: var(--q-text);
 }
 
 .glass-panel {
@@ -568,7 +612,7 @@ html {
    run full-bleed on wide monitors. Tables and code blocks render inside div/pre
    wrappers (not matched here), so they keep the full content width and scroll. */
 .prose-answer > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6, dl) {
-  max-width: 76ch;
+  max-width: 118ch;
 }
 
 /* ── Prose Heading Spacing ─────────────────────────────────── */

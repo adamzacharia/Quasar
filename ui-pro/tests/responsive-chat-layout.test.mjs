@@ -9,13 +9,13 @@ const chatInput = fs.readFileSync(new URL("../src/components/ChatInput.tsx", imp
 test("chat content and composer use fluid viewport-aware widths", () => {
     assert.match(
         globals,
-        /--q-chat-content-width:\s*calc\(100%\s*-\s*clamp\(/,
-        "chat content should expand with the available main pane",
+        /--q-chat-content-width:\s*min\(calc\(100%\s*-\s*clamp\(/,
+        "chat content should expand with the available main pane before the wide-screen cap",
     );
     assert.match(
         globals,
-        /--q-chat-input-width:\s*calc\(100%\s*-\s*clamp\(/,
-        "composer should expand with the available main pane",
+        /--q-chat-input-width:\s*min\(calc\(100%\s*-\s*clamp\(/,
+        "composer should expand with the available main pane before the wide-screen cap",
     );
     assert.match(chatArea, /w-full max-w-\[var\(--q-chat-content-width\)\]/);
     // The docked composer still uses the fluid input width; it's now selected
@@ -23,7 +23,7 @@ test("chat content and composer use fluid viewport-aware widths", () => {
     assert.match(chatInput, /max-w-\[var\(--q-chat-input-width\)\]/);
 });
 
-test("large-screen breakpoints do not replace fluid chat widths with fixed rem caps", () => {
+test("large-screen breakpoints keep a single fluid width token with a wide-screen cap", () => {
     assert.equal((globals.match(/--q-chat-content-width:/g) ?? []).length, 1);
     assert.equal((globals.match(/--q-chat-input-width:/g) ?? []).length, 1);
 });

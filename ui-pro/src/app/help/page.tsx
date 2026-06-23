@@ -10,6 +10,7 @@ import Link from "next/link";
 
 export default function HelpPage() {
     const sidebarOpen = useChatStore((s) => s.sidebarOpen);
+    const toggleSidebar = useChatStore((s) => s.toggleSidebar);
     const [mounted, setMounted] = useState(false);
     const [activeTab, setActiveTab] = useState<"docs" | "terms">("docs");
 
@@ -56,8 +57,8 @@ export default function HelpPage() {
     return (
         <div className="flex h-screen w-full bg-[#0a0f1c] text-slate-300 overflow-hidden font-sans selection:bg-primary/30">
             {/* Sidebar */}
-            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-0"} transition-all duration-300 shrink-0 overflow-hidden z-20 bg-sidebar-dark`}>
-                <Sidebar />
+            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} transition-all duration-300 shrink-0 overflow-hidden z-20 bg-sidebar-dark`}>
+                <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
             </div>
 
             {/* Main Content */}

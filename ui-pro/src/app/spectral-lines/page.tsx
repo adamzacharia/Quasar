@@ -133,6 +133,7 @@ function SpectralLineExplorer() {
     const router = useRouter();
     const searchParams = useSearchParams();
     const sidebarOpen = useChatStore((state) => state.sidebarOpen);
+    const toggleSidebar = useChatStore((state) => state.toggleSidebar);
     const token = useAuthStore((state) => state.token);
     const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
     const isInitialized = useAuthStore((state) => state.isInitialized);
@@ -448,7 +449,9 @@ function SpectralLineExplorer() {
 
     return (
         <div className="flex h-full w-full overflow-hidden">
-            {sidebarOpen && <Sidebar />}
+            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} shrink-0 overflow-hidden transition-all duration-300`}>
+                <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
+            </div>
             <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[#0b0d12]">
                 <header className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
                     <div>

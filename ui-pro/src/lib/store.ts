@@ -318,7 +318,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     streamingContent: "",
     selectedModel: "gpt-oss-120b",
     availableModels: DEFAULT_AVAILABLE_MODELS,
-    sidebarOpen: true,
+    sidebarOpen: false,
     thinkingSteps: [],
     thinkingStatus: "idle",
     // Task Execution initial state

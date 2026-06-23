@@ -42,15 +42,28 @@ LOG="$DIR/run.log"
 # windows.sandbox=unelevated: the "elevated" mode needs a logon-user setup that
 # isn't provisioned on this box (CreateProcessWithLogonW fails), so Codex can't
 # run verification commands; "unelevated" (restricted token + network) works.
-COMMON=(-m gpt-5.5 -c model_reasoning_effort="xhigh" -c windows.sandbox="unelevated" -s "$SANDBOX" -o "$LAST")
+# NOTE: `codex exec` (fresh) takes the sandbox via -s; `codex exec resume` REJECTS
+# -s and must receive it via `-c sandbox_mode=...`. Keep BASE sandbox-free.
+BASE=(-m gpt-5.5 -c model_reasoning_effort="xhigh" -c windows.sandbox="unelevated" -o "$LAST")
+SESSION_FILE="$DIR/session_id"
 
 if [ "$RESUME" -eq 1 ]; then
-  # Continue the most recent session so Codex remembers the discussion so far.
-  codex exec resume --last "${COMMON[@]}" "$@" - > "$LOG" 2>&1
+  # Resume the EXACT session id captured from the last fresh run. `--last` is
+  # cwd-filtered and can grab the wrong session after concurrent/manual Codex use.
+  SID="$(cat "$SESSION_FILE" 2>/dev/null || true)"
+  if [ -n "$SID" ]; then
+    codex exec resume "$SID" "${BASE[@]}" -c sandbox_mode="$SANDBOX" "$@" - > "$LOG" 2>&1
+  else
+    codex exec resume --last "${BASE[@]}" -c sandbox_mode="$SANDBOX" "$@" - > "$LOG" 2>&1
+  fi
 else
-  codex exec "${COMMON[@]}" "$@" - > "$LOG" 2>&1
+  codex exec "${BASE[@]}" -s "$SANDBOX" "$@" - > "$LOG" 2>&1
 fi
 RC=$?
+
+# Capture this run's session id so a later `--resume` can target it explicitly.
+SID_NEW="$(grep -m1 -oE 'session id: [0-9a-fA-F-]+' "$LOG" 2>/dev/null | awk '{print $3}')"
+[ -n "$SID_NEW" ] && printf '%s\n' "$SID_NEW" > "$SESSION_FILE"
 
 echo "codex_bridge: exit=$RC mode=$MODE sandbox=$SANDBOX resume=$RESUME"
 echo "===== CODEX FINAL MESSAGE ====="

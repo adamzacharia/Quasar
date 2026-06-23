@@ -13,12 +13,10 @@ interface ThemeStore {
 }
 
 function getInitialTheme(): Theme {
-    if (typeof window === "undefined") return "dark";
+    if (typeof window === "undefined") return "light";
     const saved = localStorage.getItem("quasar_theme");
     if (saved === "light" || saved === "dark") return saved;
-    // Respect system preference
-    if (window.matchMedia?.("(prefers-color-scheme: light)").matches) return "light";
-    return "dark";
+    return "light";
 }
 
 function applyTheme(theme: Theme) {

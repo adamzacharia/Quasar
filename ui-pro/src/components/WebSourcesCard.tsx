@@ -178,6 +178,7 @@ export function WebSourcesCard({ sources = [], images = [] }: WebSourcesCardProp
                                         alt={image.description || "Web search result"}
                                         className="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition-opacity"
                                         loading="lazy"
+                                        referrerPolicy="no-referrer"
                                         onError={() => handleImageError(originalIndex)}
                                     />
                                     {/* Hover overlay with description */}
