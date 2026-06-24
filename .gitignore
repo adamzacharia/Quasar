@@ -118,10 +118,9 @@ scratch_*.py
 /lium_research.md
 
 # ============================================
-# Test Code & Artifacts (not test code)
+# Test Artifacts (not test code)
 # ============================================
 test_results/
-tests/
 
 # ============================================
 # Logs
