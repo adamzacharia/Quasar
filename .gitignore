@@ -190,3 +190,9 @@ scripts/local/*
 # Test and preview data
 data/local_previews/
 data/rendered_images/
+
+# ============================================
+# Local Claude<->Codex bridge tooling (never commit — local build aid only)
+# ============================================
+codex-bridge/
+CLAUDE.md
