@@ -74,7 +74,7 @@ html {
 [data-theme="dark"] {
   /* Aurora — deep-space violet/black with pink·violet·blue nebula glow */
   --color-primary: #a78bfa;
-  --q-bg: #070510;
+  --q-bg: #0f0b1d;
   --q-sidebar: #0a0714;
   --q-card: #14101f;
   --q-surface: #0d0a1a;
@@ -612,7 +612,36 @@ html {
    run full-bleed on wide monitors. Tables and code blocks render inside div/pre
    wrappers (not matched here), so they keep the full content width and scroll. */
 .prose-answer > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6, dl) {
-  max-width: 118ch;
+  max-width: 72ch;
+}
+
+.prose-answer :where(p) {
+  margin-top: 0.8em;
+  margin-bottom: 0.8em;
+  line-height: 1.7;
+}
+
+.prose-answer :where(ul, ol, li) {
+  line-height: 1.7;
+}
+
+.prose-answer .citation-chip {
+  display: inline-block;
+  max-width: 18em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: baseline;
+  margin-left: 0.25em;
+  padding: 0 0.4em;
+  border-radius: 0.4em;
+  border: 1px solid var(--q-border);
+  background: var(--q-glass-control);
+  color: var(--q-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  font-style: normal;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 /* ── Prose Heading Spacing ─────────────────────────────────── */
@@ -634,9 +663,9 @@ html {
   margin-top: 0;
 }
 
-/* Paragraph / list / hr rhythm is owned by the typography plugin (the polished
-   default the user asked for). The user-message bubble keeps tight paragraphs
-   via its own `prose-p:my-1` utility, which wins over the plugin. */
+/* Paragraph / list rhythm for assistant answers is tuned above. The
+   user-message bubble keeps tight paragraphs via its own `prose-p:my-1`
+   utility, which wins over the plugin. */
 
 /* ── Beautiful Markdown Tables ─────────────────────────────── */
 .prose table {

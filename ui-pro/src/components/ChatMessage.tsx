@@ -263,6 +263,107 @@ function replaceEmojisInString(text: string, keyBase: number): ReactNode {
     return parts.length === 1 ? parts[0] : <>{parts}</>;
 }
 
+const CITATION_PATTERN = /(\u3010(?=[^\u3011]*\bSource\s*:)[^\u3011]*\u3011)/gi;
+
+function CitationChip({ citation }: { citation: string }) {
+    return (
+        <span className="citation-chip" title={citation} aria-label={citation}>
+            {getCitationLabel(citation)}
+        </span>
+    );
+}
+
+function replaceCitations(children: ReactNode): ReactNode {
+    if (!children) return children;
+
+    if (Array.isArray(children)) {
+        return children.flatMap((child, i) => {
+            if (typeof child !== "string") return [child];
+
+            const replaced = replaceCitationsInString(child, i);
+            return Array.isArray(replaced) ? replaced : [replaced];
+        });
+    }
+
+    if (typeof children === "string") {
+        return replaceCitationsInString(children, 0);
+    }
+
+    return children;
+}
+
+function renderAnswerText(children: ReactNode): ReactNode {
+    return replaceEmojisWithIcons(replaceCitations(children));
+}
+
+function replaceCitationsInString(text: string, keyBase: number): ReactNode {
+    if (!text.includes("\u3010") || !/\bSource\s*:/i.test(text)) {
+        return text;
+    }
+
+    const parts: ReactNode[] = [];
+    let lastIndex = 0;
+
+    for (const match of text.matchAll(CITATION_PATTERN)) {
+        const citation = match[0];
+        const index = match.index ?? 0;
+
+        if (index > lastIndex) {
+            parts.push(text.slice(lastIndex, index));
+        }
+
+        parts.push(<CitationChip key={`cite-${keyBase}-${index}`} citation={citation} />);
+        lastIndex = index + citation.length;
+    }
+
+    if (parts.length === 0) return text;
+
+    if (lastIndex < text.length) {
+        parts.push(text.slice(lastIndex));
+    }
+
+    return parts;
+}
+
+function getCitationLabel(citation: string): string {
+    const inner = citation.replace(/^\u3010|\u3011$/g, "");
+    const source = extractCitationSource(inner);
+
+    if (!source) return "Source";
+
+    const page = extractCitationPage(inner);
+    let label: string;
+
+    if (/^(?:https?:)?\/\//i.test(source)) {
+        // Explicit URL: keep the hostname (preserve the TLD), drop protocol/path.
+        // Detect URLs only by scheme so filenames like "guide.pdf" aren't mistaken
+        // for domains (their extension must not be stripped as if it were a TLD).
+        try {
+            const normalized = /^https?:\/\//i.test(source) ? source : `https:${source}`;
+            label = new URL(normalized).hostname.replace(/^www\./, "");
+        } catch {
+            label = source;
+        }
+    } else {
+        // File path / name: take the basename and strip a trailing extension.
+        const filename = source.split(/[\\/]/).pop()?.trim() || source;
+        label = filename.replace(/\.[^.\s\\/]+$/, "") || filename;
+    }
+
+    return page ? `${label} \u00b7 p.${page}` : label;
+}
+
+function extractCitationSource(text: string): string | null {
+    const match = text.match(/\bSource\s*:\s*([\s\S]*?)(?=,\s*(?:Page|Date|Relevance)\b\s*:?\s*|$)/i);
+    const source = match?.[1]?.trim();
+    return source || null;
+}
+
+function extractCitationPage(text: string): string | null {
+    const match = text.match(/\bPage\s*:?\s*([0-9]+(?:\s*[-\u2013]\s*[0-9]+)?)/i);
+    return match?.[1]?.replace(/\s+/g, "") || null;
+}
+
 function StreamingThinking({ text }: { text: string }) {
     const containerRef = useRef<HTMLDivElement>(null);
 
@@ -622,15 +723,41 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     if (match) return <CodeBlock language={match[1]}>{code}</CodeBlock>;
                                     return <code className="bg-slate-800 px-1.5 py-0.5 rounded text-primary text-sm font-mono" {...props}>{children}</code>;
                                 },
-                                // Replace 📚 and 🌐 emojis with custom SVG icons
+                                // Replace source citation blobs and book/globe emojis in text-bearing nodes.
                                 p({ children }) {
-                                    return <p>{replaceEmojisWithIcons(children)}</p>;
+                                    return <p>{renderAnswerText(children)}</p>;
                                 },
                                 em({ children }) {
-                                    return <em>{replaceEmojisWithIcons(children)}</em>;
+                                    return <em>{renderAnswerText(children)}</em>;
                                 },
                                 strong({ children }) {
-                                    return <strong>{replaceEmojisWithIcons(children)}</strong>;
+                                    return <strong>{renderAnswerText(children)}</strong>;
+                                },
+                                li({ children, className }) {
+                                    return <li className={className}>{renderAnswerText(children)}</li>;
+                                },
+                                h1({ children }) {
+                                    return <h1>{renderAnswerText(children)}</h1>;
+                                },
+                                h2({ children }) {
+                                    return <h2>{renderAnswerText(children)}</h2>;
+                                },
+                                h3({ children }) {
+                                    return <h3>{renderAnswerText(children)}</h3>;
+                                },
+                                h4({ children }) {
+                                    return <h4>{renderAnswerText(children)}</h4>;
+                                },
+                                h5({ children }) {
+                                    return <h5>{renderAnswerText(children)}</h5>;
+                                },
+                                h6({ children }) {
+                                    return <h6>{renderAnswerText(children)}</h6>;
+                                },
+                                a({ children, ...props }) {
+                                    // Spread remaining props so GFM footnote anchors keep their
+                                    // id / data-footnote-* / aria-* attributes (and href/title).
+                                    return <a {...props}>{renderAnswerText(children)}</a>;
                                 },
                                 table({ children }) {
                                     return (
@@ -649,10 +776,10 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     return <tr className="border-b border-slate-700/20 transition-colors hover:bg-white/[0.03]">{children}</tr>;
                                 },
                                 th({ children }) {
-                                    return <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-slate-200 whitespace-nowrap">{children}</th>;
+                                    return <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider text-slate-200 whitespace-nowrap">{renderAnswerText(children)}</th>;
                                 },
                                 td({ children }) {
-                                    return <td className="px-4 py-2 text-slate-300 text-xs leading-relaxed">{children}</td>;
+                                    return <td className="px-4 py-2 text-slate-300 text-xs leading-relaxed">{renderAnswerText(children)}</td>;
                                 },
                                 // Block LLM-hallucinated image URLs -- only system-provided images
                                 // (FITS, web search grid) should render via their own components.

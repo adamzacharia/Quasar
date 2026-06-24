@@ -5,8 +5,8 @@ The policy is intentionally conservative:
 - results with strong explicit-content signals are blocked;
 - when one result establishes an explicit search context, all source cards and
   web image tiles for that search are withheld;
-- general-web image tiles are disabled by default because metadata-only checks
-  cannot guarantee that image pixels are safe.
+- general-web image tiles are enabled by default, filtered by metadata, and can
+  be disabled with QUASAR_WEB_IMAGES_ENABLED=false.
 
 Archive images, uploaded images, and locally rendered scientific images do not
 pass through this module.
@@ -107,8 +107,8 @@ def strict_web_filter_enabled() -> bool:
 
 
 def web_images_enabled() -> bool:
-    """General-web image tiles are opt-in under the strict policy."""
-    return os.getenv("QUASAR_WEB_IMAGES_ENABLED", "false").strip().lower() not in _FALSE_VALUES
+    """General-web image tiles are on by default; false/0/no/off disables them."""
+    return os.getenv("QUASAR_WEB_IMAGES_ENABLED", "true").strip().lower() not in _FALSE_VALUES
 
 
 def _normalize_host(url: Any) -> str:
