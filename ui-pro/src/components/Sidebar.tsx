@@ -6,7 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useChatStore } from "../lib/store";
 import { useAuthStore } from "../lib/auth-store";
 import {
-    Plus, MessageSquare, History, Bookmark, Settings, HelpCircle, PanelLeft,
+    Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
     Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu, Waves
 } from "lucide-react";
@@ -509,17 +509,8 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
     }
     return (
         <aside className="relative w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
-            {onToggle && (
-                <button
-                    type="button"
-                    onClick={onToggle}
-                    className="absolute right-3 top-3 z-10 rounded-lg p-2 text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
-                    title="Collapse sidebar"
-                    aria-label="Collapse sidebar"
-                >
-                    <PanelLeft className="h-5 w-5" />
-                </button>
-            )}
+            {/* Collapse is handled by the single toggle in the chat header (ChatArea)
+                — no duplicate button here. */}
             {/* Logo */}
             <Link href="/" className="p-6 flex items-center gap-3">
                 <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
