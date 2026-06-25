@@ -616,7 +616,7 @@ html {
    run full-bleed on wide monitors. Tables and code blocks render inside div/pre
    wrappers (not matched here), so they keep the full content width and scroll. */
 .prose-answer > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6, dl) {
-  max-width: 90ch; /* ~1.25x the prior 72ch measure — wider answer text flow */
+  max-width: 90ch; /* ~1.25x the prior 72ch measure (wider answer text flow) */
 }
 
 .prose-answer :where(p) {
