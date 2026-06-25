@@ -3,7 +3,7 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, Send, X } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
@@ -15,6 +15,7 @@ import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 import { WebSourcesCard } from "./WebSourcesCard";
 import { useChatStore } from "../lib/store";
+import { useThemeStore } from "../lib/theme-store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
 import { canSubmitIssueReport, shouldOpenIssueReport } from "../lib/feedback-report";
 import { safeAssistantWebText } from "../lib/content-safety";
@@ -24,6 +25,10 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 function CodeBlock({ language, children }: { language: string; children: string }) {
     const [copied, setCopied] = useState(false);
+    // Match the syntax theme to the active app theme so token colors keep proper
+    // contrast in light mode (oneDark's dark-tuned pastels look washed out on a
+    // light background — see the light-mode pre/code rules in globals.css).
+    const theme = useThemeStore((s) => s.theme);
     const copy = () => { navigator.clipboard.writeText(children); setCopied(true); setTimeout(() => setCopied(false), 2000); };
     return (
         <div className="relative rounded-xl overflow-hidden my-3 group">
@@ -32,7 +37,7 @@ function CodeBlock({ language, children }: { language: string; children: string 
                     {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                 </button>
             </div>
-            <SyntaxHighlighter language={language} style={oneDark} customStyle={{ margin: 0, borderRadius: "0.75rem", fontSize: "0.8rem", padding: "1.25rem" }}>
+            <SyntaxHighlighter language={language} style={theme === "light" ? oneLight : oneDark} customStyle={{ margin: 0, borderRadius: "0.75rem", fontSize: "0.8rem", padding: "1.25rem" }}>
                 {children}
             </SyntaxHighlighter>
         </div>

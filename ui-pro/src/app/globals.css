@@ -506,10 +506,14 @@ html {
 }
 
 /* ── Code blocks ─────────────────────────────────────────── */
+/* The fenced-code highlighter (CodeBlock) now picks oneLight/oneDark to match
+   the active theme, so it owns its own token + base text colors in light mode.
+   We only normalize the surface background here; forcing a text color used to
+   leave oneDark's dark-tuned token pastels low-contrast (the "blurry" look).
+   Inline code stays legible via the prose code color token. */
 [data-theme="light"] pre,
 [data-theme="light"] code {
   background-color: var(--q-code-bg) !important;
-  color: #334155 !important;
 }
 [data-theme="light"] pre code {
   background-color: transparent !important;

@@ -196,3 +196,5 @@ data/rendered_images/
 # ============================================
 codex-bridge/
 CLAUDE.md
+CLAUDE.local.md
+.claude/
