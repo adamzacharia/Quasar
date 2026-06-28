@@ -30,6 +30,7 @@ from core.llm_client import LLMClient, detect_provider
 
 from core.logger import logger, log_tool
 from services.ads_auto_link import build_exact_project_paper_links
+from services.citation_verifier import append_citation_warning
 from services.evidence_quality import annotate_web_source_evidence, rank_web_sources
 from services.content_safety import (
     FILTER_NOTICE,
@@ -328,6 +329,7 @@ class QuasarAgent:
             model_router=self.model_router,
             agent_pool=self.agent_pool,
             sandbox_executor=self.sandbox_executor,
+            ads_client=self.ads_client,
             verbose=True,
         )
 
@@ -7576,7 +7578,7 @@ IMPORTANT RULES:
                     if _rag_min_year is None or _cycle_yr > _rag_min_year:
                         _rag_min_year = _cycle_yr
 
-                docs = self.rag_service.search(
+                docs, _rag_diag = self.rag_service.search_with_diagnostics(
                     _user_query,
                     min_year=_rag_min_year,
                     min_score=0.35,
@@ -7629,6 +7631,20 @@ IMPORTANT RULES:
                         "\n\n📚 DOCUMENTATION CONTEXT (from ALMA Technical Documentation):\n"
                         + "\n---\n".join(context_pieces)
                     )
+
+                    # Surface the freshness diagnostic computed during retrieval so
+                    # the model is told when retrieved ALMA docs span multiple cycles
+                    # (newer specs may supersede older ones).
+                    _year_conflict = (_rag_diag or {}).get("year_conflict")
+                    if _year_conflict and _year_conflict.get("message"):
+                        rag_context += (
+                            "\n\n⚠️ FRESHNESS NOTICE: "
+                            + _year_conflict["message"]
+                            + " Attribute each value to its specific cycle/year. If the "
+                            "user asked about a particular cycle or year, use that "
+                            "version's values; otherwise prefer the most recent and "
+                            "explicitly flag any version differences."
+                        )
 
                     # Launch a parallel web search to supplement RAG with fresh data.
                     # Only if a web thread isn't already running (from cutoff detection)
@@ -8465,6 +8481,12 @@ IMPORTANT RULES:
             
 
             # 8. Update long-term memory — only for authenticated users
+            output_text = safe_assistant_text(output_text)
+            output_text = append_citation_warning(
+                output_text,
+                self.ads_client,
+                on_token=on_token,
+            )
             output_text = safe_assistant_text(output_text)
             if self.long_term_memory and not _is_anonymous:
                 try:

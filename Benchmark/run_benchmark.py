@@ -21,6 +21,7 @@ import time
 import re
 import argparse
 import datetime
+import unicodedata
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -46,6 +47,9 @@ except ImportError:
 # Benchmark question definitions
 # ---------------------------------------------------------------------------
 
+# Golden facts below are intentionally conservative. Frequency/band assertions
+# mirror stable constants already used in services.splatalogue and the benchmark
+# question notes; dynamic archive counts are left to the live benchmark.
 QUESTIONS = [
     # ── General Knowledge — Easy ──
     {
@@ -108,6 +112,16 @@ QUESTIONS = [
             "Provides band frequency ranges for at least the most common bands",
             "Factually accurate",
         ],
+        "golden": {
+            "must_include_any": [
+                ["10 bands", "ten bands", "Band 1-10", "Band 1 through Band 10", "Band 1 to Band 10"],
+                ["Band 6", "Band six"],
+            ],
+            "numbers": [
+                {"value": 211.0, "unit": "GHz", "tol": 0.5, "why": "ALMA Band 6 lower edge"},
+                {"value": 275.0, "unit": "GHz", "tol": 0.5, "why": "ALMA Band 6 upper edge"},
+            ],
+        },
     },
     # ── General Knowledge — Hard ──
     {
@@ -169,6 +183,16 @@ QUESTIONS = [
             "Mentions possibility of combining data from multiple projects",
             "Discusses calibration or compatibility considerations",
         ],
+        "golden": {
+            "must_include_any": [
+                ["HH212", "HH 212"],
+                ["Band 7", "Band seven"],
+            ],
+            "numbers": [
+                {"value": 275.0, "unit": "GHz", "tol": 0.5, "why": "ALMA Band 7 lower edge"},
+                {"value": 373.0, "unit": "GHz", "tol": 0.5, "why": "ALMA Band 7 upper edge"},
+            ],
+        },
     },
     # ── Analysis & Methods — Easy ──
     {
@@ -228,6 +252,16 @@ QUESTIONS = [
             "Mentions Band 6 frequency range (~211-275 GHz) for context",
             "Code or method used is correct",
         ],
+        "golden": {
+            "must_include_any": [
+                ["M83", "M 83"],
+                ["Band 6", "Band six"],
+            ],
+            "numbers": [
+                {"value": 211.0, "unit": "GHz", "tol": 0.5, "why": "ALMA Band 6 lower edge"},
+                {"value": 275.0, "unit": "GHz", "tol": 0.5, "why": "ALMA Band 6 upper edge"},
+            ],
+        },
     },
     {
         "id": "AM-M-04",
@@ -308,6 +342,20 @@ QUESTIONS = [
             "Recognizes that the targets should be protostellar disks",
             "Returns a structured list of projects and targets",
         ],
+        "golden": {
+            "must_include_any": [
+                ["12CO", "12 CO", "CO(2-1)", "CO (2-1)"],
+                ["13CO", "13 CO"],
+                ["C18O", "C 18 O"],
+                ["Band 6", "Band six"],
+                ["same project", "single project", "one project"],
+            ],
+            "numbers": [
+                {"value": 230.538, "unit": "GHz", "tol": 0.01, "why": "12CO(2-1) rest frequency"},
+                {"value": 220.398684, "unit": "GHz", "tol": 0.01, "why": "13CO(2-1) rest frequency"},
+                {"value": 219.560354, "unit": "GHz", "tol": 0.01, "why": "C18O(2-1) rest frequency"},
+            ],
+        },
     },
     # ── Scientific Questions — Hard ──
     {
@@ -324,10 +372,185 @@ QUESTIONS = [
             "Returns a meaningful list of projects / sources",
             "Explains the methodology and which CO transitions are accessible at these redshifts",
         ],
+        "golden": {
+            "must_include_any": [
+                ["z=1", "z = 1", "redshift 1"],
+                ["z=2", "z = 2", "redshift 2"],
+                ["nu_obs", "f_obs", "observed frequency"],
+                ["nu_rest", "f_rest", "rest frequency"],
+                ["CO(2-1)", "CO (2-1)"],
+            ],
+            "numbers": [
+                {"value": 230.538, "unit": "GHz", "tol": 0.01, "why": "CO(2-1) rest frequency"},
+                {"value": 76.8, "unit": "GHz", "tol": 0.2, "why": "CO(2-1) observed at z=2"},
+                {"value": 115.3, "unit": "GHz", "tol": 0.2, "why": "CO(2-1) observed at z=1"},
+                {"value": 345.796, "unit": "GHz", "tol": 0.02, "why": "CO(3-2) rest frequency"},
+                {"value": 172.9, "unit": "GHz", "tol": 0.2, "why": "CO(3-2) observed at z=1"},
+            ],
+        },
     },
 ]
 
 DIFFICULTY_WEIGHTS = {"Easy": 1.0, "Medium": 1.5, "Hard": 2.0}
+
+
+# ---------------------------------------------------------------------------
+# Deterministic golden scoring
+# ---------------------------------------------------------------------------
+
+_NUMBER_UNIT_RE = re.compile(
+    r"(?P<first>[+-]?\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    r"(?:\s*(?:-|to|\u2013|\u2014)\s*"
+    r"(?P<second>[+-]?\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?))?"
+    r"\s*(?P<unit>GHz|MHz)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_for_text_match(value: str) -> str:
+    """Case-insensitive text matching with common Unicode compatibility folds."""
+    return unicodedata.normalize("NFKC", str(value)).casefold()
+
+
+def _term_present(response_text: str, term: str) -> bool:
+    return _normalize_for_text_match(term) in _normalize_for_text_match(response_text)
+
+
+def _number_from_token(token: str) -> Optional[float]:
+    cleaned = token.replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _to_ghz(value: float, unit: str) -> Optional[float]:
+    unit_norm = unit.strip().casefold()
+    if unit_norm == "ghz":
+        return value
+    if unit_norm == "mhz":
+        return value / 1000.0
+    return None
+
+
+def _numbers_with_units(response_text: str) -> list[dict]:
+    matches: list[dict] = []
+    for match in _NUMBER_UNIT_RE.finditer(response_text or ""):
+        unit = match.group("unit")
+        for group_name in ("first", "second"):
+            raw = match.group(group_name)
+            if raw is None:
+                continue
+            value = _number_from_token(raw)
+            if value is None:
+                continue
+            value_ghz = _to_ghz(value, unit)
+            if value_ghz is None:
+                continue
+            matches.append({
+                "raw": f"{raw} {unit}",
+                "value_ghz": value_ghz,
+                "unit": unit,
+            })
+    return matches
+
+
+def score_golden(response_text: str, golden: dict) -> dict:
+    """
+    Score deterministic facts without LLM calls or I/O.
+
+    ``total`` counts each required term, OR-group, regex, numeric fact, and
+    forbidden term. A forbidden term counts as a hit when it is absent.
+    """
+    response_text = response_text or ""
+    golden = golden or {}
+    failures: list[dict] = []
+    total = 0
+    hits = 0
+
+    for term in golden.get("must_include", []) or []:
+        total += 1
+        if _term_present(response_text, str(term)):
+            hits += 1
+        else:
+            failures.append({
+                "kind": "must_include",
+                "expected": term,
+                "detail": "Required term was not found.",
+            })
+
+    for group in golden.get("must_include_any", []) or []:
+        total += 1
+        group_terms = [str(term) for term in group]
+        matched = [term for term in group_terms if _term_present(response_text, term)]
+        if matched:
+            hits += 1
+        else:
+            failures.append({
+                "kind": "must_include_any",
+                "expected": group_terms,
+                "detail": "None of the acceptable terms in this OR-group were found.",
+            })
+
+    for pattern in golden.get("regex", []) or []:
+        total += 1
+        if re.search(str(pattern), response_text, flags=re.IGNORECASE | re.MULTILINE):
+            hits += 1
+        else:
+            failures.append({
+                "kind": "regex",
+                "expected": pattern,
+                "detail": "Required pattern did not match.",
+            })
+
+    numeric_matches = _numbers_with_units(response_text)
+    for expected_number in golden.get("numbers", []) or []:
+        total += 1
+        value = float(expected_number["value"])
+        unit = str(expected_number["unit"])
+        tol = float(expected_number.get("tol", 0.0))
+        target_ghz = _to_ghz(value, unit)
+        tol_ghz = _to_ghz(tol, unit)
+        if target_ghz is None or tol_ghz is None:
+            failures.append({
+                "kind": "number",
+                "expected": expected_number,
+                "detail": f"Unsupported expected unit: {unit}",
+            })
+            continue
+        matched = [
+            item for item in numeric_matches
+            if abs(item["value_ghz"] - target_ghz) <= tol_ghz
+        ]
+        if matched:
+            hits += 1
+        else:
+            failures.append({
+                "kind": "number",
+                "expected": expected_number,
+                "detail": (
+                    f"No {unit} value within +/- {tol:g} of {value:g}; "
+                    f"found {[item['raw'] for item in numeric_matches]}"
+                ),
+            })
+
+    for term in golden.get("forbid", []) or []:
+        total += 1
+        if _term_present(response_text, str(term)):
+            failures.append({
+                "kind": "forbid",
+                "expected": term,
+                "detail": "Forbidden term was present.",
+            })
+        else:
+            hits += 1
+
+    return {
+        "passed": not failures,
+        "total": total,
+        "hits": hits,
+        "failures": failures,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +576,10 @@ class QuestionResult:
     judge_reasoning: str = ""
     criteria_met: list = field(default_factory=list)
     judge_error: Optional[str] = None
+    golden_passed: Optional[bool] = None
+    golden_hits: int = 0
+    golden_total: int = 0
+    golden_failures: list = field(default_factory=list)
 
     @property
     def judged(self) -> bool:
@@ -783,6 +1010,11 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
 
     avg_time = sum(r.response_time_s for r in results) / len(results) if results else 0
     errors = sum(1 for r in results if r.error)
+    golden_results = [r for r in results if r.golden_passed is not None]
+    golden_failures = sum(1 for r in golden_results if not r.golden_passed)
+    golden_hits = sum(r.golden_hits for r in golden_results)
+    golden_total = sum(r.golden_total for r in golden_results)
+    golden_pct = (golden_hits / golden_total * 100) if golden_total else 0
 
     lines = [
         f"# QUASAR Benchmark Report",
@@ -803,6 +1035,7 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
         f"| Avg Response Time | {avg_time:.1f}s |",
         f"| API Errors | {errors}/{len(results)} |",
         f"| Judge Failures | {judge_failures}/{len(results)} |",
+        f"| Golden Checks | {golden_hits}/{golden_total} ({golden_pct:.1f}%) over {len(golden_results)} questions; {golden_failures} failed |",
         f"",
         f"---",
         f"",
@@ -830,14 +1063,20 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
         f"",
         f"## Detailed Results",
         f"",
-        f"| ID | Category | Difficulty | Score | Grade | Time |",
-        f"|----|----------|------------|-------|-------|------|",
+        f"| ID | Category | Difficulty | Score | Grade | Golden | Time |",
+        f"|----|----------|------------|-------|-------|--------|------|",
     ]
 
     for r in results:
+        if r.golden_passed is None:
+            golden_cell = "N/A"
+        elif r.golden_passed:
+            golden_cell = f"PASS {r.golden_hits}/{r.golden_total}"
+        else:
+            golden_cell = f"FAIL {r.golden_hits}/{r.golden_total}"
         lines.append(
             f"| {r.id} | {r.category} | {r.difficulty} | "
-            f"{r.total_score}/{r.max_score} ({r.percentage:.0f}%) | {r.grade} | {r.response_time_s:.1f}s |"
+            f"{r.total_score}/{r.max_score} ({r.percentage:.0f}%) | {r.grade} | {golden_cell} | {r.response_time_s:.1f}s |"
         )
 
     lines += [
@@ -870,6 +1109,18 @@ def generate_report(results: list[QuestionResult], output_dir: Path, model: str,
             f"| Tool Usage | {r.tool_usage}/5 |",
             f"| **Total** | **{r.total_score}/{r.max_score}** |",
             f"",
+            *(
+                [
+                    f"**Golden Assertions:** {'PASS' if r.golden_passed else 'FAIL'} "
+                    f"({r.golden_hits}/{r.golden_total})",
+                    *[
+                        f"- `{failure.get('kind')}`: {failure.get('detail')} Expected: `{failure.get('expected')}`"
+                        for failure in r.golden_failures
+                    ],
+                    f"",
+                ]
+                if r.golden_passed is not None else []
+            ),
             f"**Judge Reasoning:** {r.judge_reasoning or '(none)'}",
             *([f"", f"**Judge Error:** `{r.judge_error}`"] if r.judge_error else []),
             f"",
@@ -986,7 +1237,17 @@ def main():
             result.response_time_s = 0
             print(f"[ERR] Error: {e}")
 
-        # ── Step 2: Judge the response ──
+        # ── Step 2: Deterministic golden checks ──
+        if q.get("golden"):
+            golden_scores = score_golden(result.response, q["golden"])
+            result.golden_passed = golden_scores["passed"]
+            result.golden_hits = golden_scores["hits"]
+            result.golden_total = golden_scores["total"]
+            result.golden_failures = golden_scores["failures"]
+            status = "PASS" if result.golden_passed else "FAIL"
+            print(f"    -> Golden checks... [{status}] {result.golden_hits}/{result.golden_total}")
+
+        # ── Step 3: Judge the response ──
         try:
             print(f"    -> Judging response...", end=" ", flush=True)
             scores = judge_response(q, result.response, args.judge_model)
@@ -1038,6 +1299,10 @@ def main():
     total_weighted = sum(r.percentage * DIFFICULTY_WEIGHTS[r.difficulty] for r in judged)
     max_weighted = sum(100 * DIFFICULTY_WEIGHTS[r.difficulty] for r in judged)
     overall_pct = total_weighted / max_weighted * 100 if max_weighted else 0
+    golden_results = [r for r in results if r.golden_passed is not None]
+    golden_hits = sum(r.golden_hits for r in golden_results)
+    golden_total = sum(r.golden_total for r in golden_results)
+    golden_failures = sum(1 for r in golden_results if not r.golden_passed)
 
     print(f"\n{'='*60}")
     print(f"  BENCHMARK COMPLETE")
@@ -1047,6 +1312,9 @@ def main():
     if judge_failures:
         print(f"  [WARN] Judge failed on {judge_failures}/{len(results)} questions — "
               f"scores for those are excluded from the aggregate.")
+    if golden_results:
+        print(f"  Golden Checks: {golden_hits}/{golden_total} over {len(golden_results)} questions "
+              f"({golden_failures} question failures)")
     print(f"  Results: {output_dir}")
     print(f"{'='*60}\n")
 
@@ -1067,9 +1335,32 @@ def run_self_test() -> int:
     Covers JSON extraction edge cases, score validation/clamping, weighted
     aggregate math, and report generation. Returns a process exit code.
     """
-    import tempfile
-
     failures: list[str] = []
+
+    class _MemoryReportFile:
+        def __init__(self, sink: "_MemoryReportDir", name: str):
+            self.sink = sink
+            self.name = name
+
+        def write_text(self, content: str, encoding: str = "utf-8") -> int:
+            self.sink.files[self.name] = content
+            return len(content)
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            return self.sink.files[self.name]
+
+        def exists(self) -> bool:
+            return self.name in self.sink.files
+
+        def __str__(self) -> str:
+            return f"<memory>/{self.name}"
+
+    class _MemoryReportDir:
+        def __init__(self):
+            self.files: dict[str, str] = {}
+
+        def __truediv__(self, name: str) -> _MemoryReportFile:
+            return _MemoryReportFile(self, name)
 
     def check(name: str, condition: bool, detail: str = ""):
         status = "PASS" if condition else "FAIL"
@@ -1124,29 +1415,68 @@ def run_self_test() -> int:
     check("validate: code_quality None ok", scores["code_quality"] is None)
     check("validate: criteria filtered", scores["criteria_met"] == [0, 2])
 
-    # 8. QuestionResult math: with and without code_quality
+    # 8. Golden scoring: required terms, OR groups, regex, numbers, ranges, and forbids
+    golden = {
+        "must_include": ["Band 6"],
+        "must_include_any": [["M83", "M 83"]],
+        "regex": [r"\bproposal_id\b"],
+        "numbers": [
+            {"value": 230.538, "unit": "GHz", "tol": 0.001, "why": "CO(2-1) rest frequency"},
+            {"value": 230.538, "unit": "GHz", "tol": 0.001, "why": "MHz conversion check"},
+        ],
+        "forbid": ["Band 11"],
+    }
+    golden_scores = score_golden(
+        "M83 Band 6 result table includes proposal_id and CO at 230.538 GHz or 230538 MHz.",
+        golden,
+    )
+    check("golden: mixed checks pass", golden_scores["passed"] and golden_scores["hits"] == golden_scores["total"])
+
+    range_scores = score_golden(
+        "Band 6 spans 211-275 GHz.",
+        {"numbers": [
+            {"value": 211.0, "unit": "GHz", "tol": 0.0, "why": "Band 6 lower edge"},
+            {"value": 275.0, "unit": "GHz", "tol": 0.0, "why": "Band 6 upper edge"},
+        ]},
+    )
+    check("golden: range endpoints pass", range_scores["passed"])
+
+    bad_scores = score_golden(
+        "M83 Band 6 result table includes proposal_id and CO at 230.540 GHz plus Band 11.",
+        golden,
+    )
+    bad_kinds = {failure["kind"] for failure in bad_scores["failures"]}
+    check("golden: failures are explicit", not bad_scores["passed"] and {"number", "forbid"} <= bad_kinds)
+
+    empty_scores = score_golden("", {"must_include": ["Band 6"]})
+    check("golden: empty response fails", not empty_scores["passed"] and empty_scores["failures"][0]["kind"] == "must_include")
+
+    # 9. QuestionResult math: with and without code_quality
     r = QuestionResult(id="T-1", category="Test", difficulty="Easy", title="t", question="q",
-                       correctness=5, completeness=5, presentation=5, tool_usage=5, code_quality=5)
+                       correctness=5, completeness=5, presentation=5, tool_usage=5, code_quality=5,
+                       golden_passed=True, golden_hits=2, golden_total=2)
     check("scoring: max 25 with code", r.max_score == 25 and r.percentage == 100.0 and r.grade == "A")
     r2 = QuestionResult(id="T-2", category="Test", difficulty="Hard", title="t", question="q",
-                        correctness=3, completeness=3, presentation=3, tool_usage=3, code_quality=None)
+                        correctness=3, completeness=3, presentation=3, tool_usage=3, code_quality=None,
+                        golden_passed=False, golden_hits=1, golden_total=2,
+                        golden_failures=[{"kind": "number", "expected": "230.538 GHz", "detail": "missing"}])
     check("scoring: max 20 without code", r2.max_score == 20 and r2.percentage == 60.0 and r2.grade == "C")
 
-    # 9. judge_error excludes from judged
+    # 10. judge_error excludes from judged
     r3 = QuestionResult(id="T-3", category="Test", difficulty="Easy", title="t", question="q",
                         judge_error="boom")
     check("judged flag: error excluded", not r3.judged and r.judged)
 
-    # 10. Report generation does not crash and flags judge failures
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td)
-        try:
-            generate_report([r, r2, r3], out, model="test-model", judge_model="test-judge")
-            content = (out / "benchmark_report.md").read_text(encoding="utf-8")
-            check("report: generated", (out / "benchmark_report.md").exists())
-            check("report: marks judge failure", "JUDGE FAILED" in content)
-        except Exception as e:
-            check("report: generated", False, str(e))
+    # 11. Report generation does not crash and flags judge/golden failures
+    out = _MemoryReportDir()
+    try:
+        generate_report([r, r2, r3], out, model="test-model", judge_model="test-judge")
+        content = (out / "benchmark_report.md").read_text(encoding="utf-8")
+        check("report: generated", (out / "benchmark_report.md").exists())
+        check("report: marks judge failure", "JUDGE FAILED" in content)
+        check("report: marks golden failure", "Golden Assertions" in content and "FAIL 1/2" in content)
+    except Exception as e:
+        check("report: generated", False, str(e))
 
     print("  " + "-" * 40)
     if failures:

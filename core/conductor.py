@@ -36,6 +36,8 @@ from core.dag_cache import DAGCache
 from core.result_cache import ResultCache
 from core.observability import estimate_cost
 from core.langfuse_integration import get_langfuse, langfuse_trace, langfuse_generation
+from services.citation_verifier import append_citation_warning
+from services.provenance import build_sources_appendix
 from services.notebook_gen import generate_conductor_notebook
 
 logger = logging.getLogger(__name__)
@@ -276,6 +278,7 @@ class Conductor:
         recovery_engine: Optional[Any] = None,
         agent_pool: Optional[Any] = None,
         sandbox_executor: Optional[Any] = None,
+        ads_client: Optional[Any] = None,
         on_status: Optional[Callable[[str, str], None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         verbose: bool = False,
@@ -291,6 +294,7 @@ class Conductor:
         self.recovery = recovery_engine
         self.agent_pool = agent_pool
         self.sandbox_executor = sandbox_executor
+        self.ads_client = ads_client
         self.on_status = on_status
         self.on_event = on_event
         self.verbose = verbose
@@ -1113,8 +1117,8 @@ class Conductor:
                 )
                 if on_token:
                     on_token(fallback)
-                return fallback
-            return answer
+                return self._finalize_answer(fallback, results, on_token)
+            return self._finalize_answer(answer, results, on_token)
         except Exception as e:
             fallback = (
                 f"**Results for:** {query}\n\n"
@@ -1123,7 +1127,53 @@ class Conductor:
             )
             if on_token:
                 on_token(fallback)
-            return fallback
+            return self._finalize_answer(fallback, results, on_token)
+
+    def _finalize_answer(
+        self,
+        answer: str,
+        results: Dict[str, Any],
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Post-process the synthesized answer: citation check + source ledger."""
+        answer = self._append_citation_warning(answer, on_token)
+        answer = self._append_sources(answer, results, on_token)
+        return answer
+
+    def _append_citation_warning(
+        self,
+        answer: str,
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        return append_citation_warning(answer, self.ads_client, on_token=on_token)
+
+    def _append_sources(
+        self,
+        answer: str,
+        results: Dict[str, Any],
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Append a verified ## Sources appendix harvested from sub-agent results.
+
+        Additive and defensive: never alters the model's text beyond appending,
+        and never raises into the synthesis path.
+        """
+        if not answer or "## Sources" in answer:
+            return answer
+        try:
+            appendix = build_sources_appendix(results)
+        except Exception:
+            logger.debug("Provenance ledger failed; continuing", exc_info=True)
+            return answer
+        if not appendix:
+            return answer
+        block = "\n\n" + appendix
+        if on_token:
+            try:
+                on_token(block)
+            except Exception:
+                logger.debug("Sources appendix token callback failed", exc_info=True)
+        return answer + block
 
     def get_execution_summary(self) -> Dict[str, Any]:
         """Return DAG execution metrics for observability."""

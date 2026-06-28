@@ -452,6 +452,112 @@ def _first_numeric(
     return _finite_float(_first_value(row, names, candidates))
 
 
+# ALMA array centre (used as the EarthLocation fallback so we never depend on a
+# network site-registry lookup). Values per the IAU/ALMA reference position.
+_ALMA_LON_DEG = -67.7549
+_ALMA_LAT_DEG = -23.0229
+_ALMA_HEIGHT_M = 5058.7
+
+# Bounded safety margin (km/s) used to widen the ADQL spectral pre-filter when no
+# explicit Doppler margin was supplied, so the TOPO-vs-source frame mismatch can
+# never exclude a genuinely-covering observation before per-row correction.
+_FRAME_PREFILTER_CAP_KMS = 40.0
+
+
+def _resolve_target_frame_name(doppler_frame: Any) -> Optional[str]:
+    """Map a human Doppler-frame label to an astropy frame for correction.
+
+    Returns an astropy frame name suitable for
+    ``SpectralCoord.with_observer_stationary_relative_to`` ("lsrk" or "icrs"),
+    or ``None`` when no correction should be applied (already topocentric).
+    """
+    text = str(doppler_frame or "").strip().lower()
+    if "topo" in text:
+        return None
+    if any(token in text for token in ("bary", "icrs", "helio")):
+        # SpectralCoord treats an ICRS-stationary observer as barycentric;
+        # heliocentric differs by ~0.01 km/s (negligible here).
+        return "icrs"
+    # Default (incl. "observed (source frame)") → kinematic radio LSRK, which is
+    # the convention CASA/ALMA velocities are quoted in.
+    return "lsrk"
+
+
+def compute_topo_to_frame_offset_kms(
+    ra_deg: float,
+    dec_deg: float,
+    obs_mjd: float,
+    target_frame: str = "lsrk",
+) -> Optional[float]:
+    """Per-observation TOPO→target-frame radial-velocity offset, in km/s.
+
+    Returns ``v`` such that ``f_frame = f_topo * (1 + v/c)`` — i.e. the velocity
+    of the requested rest frame relative to the topocentric observer along the
+    line of sight at ``obs_mjd``. Computed with astropy's ``SpectralCoord`` frame
+    machinery (the authoritative implementation), so the sign/magnitude need no
+    hand-derivation. Returns ``None`` (caller falls back to no shift) when astropy
+    is unavailable, the epoch/coords are missing or non-finite, or the frame is
+    topocentric. Never raises.
+    """
+    if not target_frame:
+        return None
+    ra = _finite_float(ra_deg)
+    dec = _finite_float(dec_deg)
+    mjd = _finite_float(obs_mjd)
+    if ra is None or dec is None or mjd is None:
+        return None
+    try:
+        import warnings
+
+        import astropy.units as u
+        from astropy.coordinates import EarthLocation, SkyCoord, SpectralCoord
+        from astropy.time import Time
+
+        location = EarthLocation.from_geodetic(
+            lon=_ALMA_LON_DEG * u.deg,
+            lat=_ALMA_LAT_DEG * u.deg,
+            height=_ALMA_HEIGHT_M * u.m,
+        )
+        obstime = Time(float(mjd), format="mjd")
+        target = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
+        ref_ghz = 100.0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            spec = SpectralCoord(
+                ref_ghz * u.GHz,
+                observer=location.get_itrs(obstime=obstime),
+                target=target,
+            )
+            shifted = spec.with_observer_stationary_relative_to(target_frame)
+            f_frame = float(shifted.quantity.to_value(u.GHz))
+        return (f_frame / ref_ghz - 1.0) * SPEED_OF_LIGHT_KMS
+    except Exception:  # pragma: no cover - defensive: astropy edge cases
+        logger.debug("Frame offset computation failed", exc_info=True)
+        return None
+
+
+def _widen_intervals(
+    intervals: Sequence[Mapping[str, Any]], extra_kms: float
+) -> List[Dict[str, Any]]:
+    """Return copies of intervals widened symmetrically by ``extra_kms``.
+
+    Used only for the ADQL spectral pre-filter, never for classification, so a
+    frame-shifted line is not excluded before its exact per-row correction.
+    """
+    if extra_kms <= 0:
+        return [dict(item) for item in intervals]
+    widened: List[Dict[str, Any]] = []
+    for item in intervals:
+        center = _finite_float(item.get("observed_frequency_ghz"))
+        copy = dict(item)
+        if center is not None:
+            delta = center * float(extra_kms) / SPEED_OF_LIGHT_KMS
+            copy["minimum_ghz"] = float(item["minimum_ghz"]) - delta
+            copy["maximum_ghz"] = float(item["maximum_ghz"]) + delta
+        widened.append(copy)
+    return widened
+
+
 class ALMACoverageService:
     """Exact local SPW coverage classification over ALMA ObsCore results."""
 
@@ -494,11 +600,23 @@ class ALMACoverageService:
         if not requested:
             raise ValueError("At least one line with an observed frequency is required")
         now_iso = utc_now_iso()
+        target_frame_name = _resolve_target_frame_name(doppler_frame)
+        # Pre-filter widening: ensure the ADQL spectral predicate is at least as
+        # wide as the bounded frame cap so no covering observation is excluded
+        # before per-row correction. The precise `requested` intervals are kept
+        # for classification; only the pre-filter copy is widened.
+        if target_frame_name is None:
+            prefilter_extra_kms = 0.0  # caller wants TOPO; no frame margin needed
+        else:
+            prefilter_extra_kms = max(
+                0.0, _FRAME_PREFILTER_CAP_KMS - float(frame_uncertainty_kms or 0.0)
+            )
+        prefilter_intervals = _widen_intervals(requested, prefilter_extra_kms)
         frame = self._query_obscore(
             ra_deg=ra,
             dec_deg=dec,
             radius_arcsec=radius,
-            intervals=requested,
+            intervals=prefilter_intervals,
             min_calib_level=min_calib_level,
             public_only=public_only,
             now_iso=now_iso,
@@ -516,15 +634,27 @@ class ALMACoverageService:
                 if max_channel_width_khz is not None
                 else None
             ),
+            target_frame=target_frame_name,
         )
         projects = self._group_projects(rows, requested, coverage_mode)
+        # Summarise the per-observation frame corrections that were actually
+        # applied so nothing is shifted silently.
+        applied_offsets = [
+            row["frame_offset_kms"]
+            for row in rows
+            if row.get("frame_offset_kms") is not None
+        ]
+        any_corrected = bool(applied_offsets)
         warnings: List[str] = []
-        if frame_uncertainty_kms <= 0:
+        if target_frame_name is None:
+            pass  # caller explicitly requested the topocentric frame; no correction
+        elif not any_corrected and frame_uncertainty_kms <= 0:
             warnings.append(
                 "ALMA frequency_support is topocentric (TOPO) sky frequency while the "
-                "requested line is in the observed source frame; no Doppler-frame "
-                "margin was applied (frame_uncertainty_kms=0). Lines near a spectral "
-                "window edge may be mis-classified by the TOPO–LSRK offset "
+                "requested line is in the observed source frame; per-observation "
+                "Doppler-frame correction could not be applied (no observation epoch "
+                "or astropy unavailable) and frame_uncertainty_kms=0. Lines near a "
+                "spectral window edge may be mis-classified by the TOPO–LSRK offset "
                 "(up to a few tens of km/s)."
             )
         return {
@@ -551,7 +681,21 @@ class ALMACoverageService:
             "doppler": {
                 "archive_frame": "TOPO",
                 "search_frame": doppler_frame,
+                "target_frame": target_frame_name,
                 "frame_uncertainty_kms": float(frame_uncertainty_kms or 0.0),
+                "prefilter_margin_kms": float(_FRAME_PREFILTER_CAP_KMS)
+                if target_frame_name is not None
+                else 0.0,
+                "offset_kms_range": (
+                    [min(applied_offsets), max(applied_offsets)]
+                    if applied_offsets
+                    else None
+                ),
+                "method": (
+                    "astropy SpectralCoord (per-observation TOPO→%s)" % target_frame_name.upper()
+                    if any_corrected
+                    else "fallback: symmetric widening (no per-observation correction applied)"
+                ),
             },
             "warnings": warnings,
         }
@@ -640,7 +784,7 @@ SELECT TOP 20000
        antenna_arrays, dataproduct_type, calib_level,
        scientific_category, science_keyword, obs_title, pi_name,
        s_ra, s_dec, t_exptime, s_resolution, spatial_resolution,
-       obs_release_date, em_min, em_max
+       obs_release_date, em_min, em_max, t_min, t_max
 FROM ivoa.obscore
 WHERE {where}
 """
@@ -706,15 +850,50 @@ WHERE {where}
         edge_channels: float = 0.0,
         edge_margin_ghz: float = 0.0,
         max_channel_width_khz: Optional[float] = None,
+        target_frame: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         if frame is None or frame.empty:
             return rows
         rank = {"full": 0, "edge": 1, "center_only": 2, "partial": 3}
+        # Per-observation TOPO→frame offset, memoised by epoch (target is fixed
+        # for the whole query, so the offset depends only on the observation date).
+        offset_cache: Dict[Any, Optional[float]] = {}
+
+        def _offset_for_epoch(mid_mjd: Optional[float]) -> Optional[float]:
+            if target_frame is None or mid_mjd is None:
+                return None
+            key = round(float(mid_mjd), 3)
+            if key not in offset_cache:
+                offset_cache[key] = compute_topo_to_frame_offset_kms(
+                    target_ra, target_dec, mid_mjd, target_frame
+                )
+            return offset_cache[key]
+
         for index, row in frame.iterrows():
             windows = observation_windows_ghz(row)
             if not windows:
                 continue
+            # Convert this observation's topocentric SPW edges into the requested
+            # rest frame using its own epoch, so coverage is judged in a single
+            # consistent frame. f_frame = f_topo * (1 + v/c).
+            t_lo = _finite_float(row.get("t_min") if hasattr(row, "get") else None)
+            t_hi = _finite_float(row.get("t_max") if hasattr(row, "get") else None)
+            if t_lo is not None and t_hi is not None:
+                mid_mjd: Optional[float] = (t_lo + t_hi) / 2.0
+            else:
+                mid_mjd = t_lo if t_lo is not None else t_hi
+            frame_offset_kms = _offset_for_epoch(mid_mjd)
+            if frame_offset_kms is not None:
+                factor = 1.0 + frame_offset_kms / SPEED_OF_LIGHT_KMS
+                windows = [
+                    {
+                        **window,
+                        "low_ghz": float(window["low_ghz"]) * factor,
+                        "high_ghz": float(window["high_ghz"]) * factor,
+                    }
+                    for window in windows
+                ]
             line_matches = []
             for line in requested:
                 matches = []
@@ -759,6 +938,12 @@ WHERE {where}
                         row_dict.get("obs_release_date"), now_iso
                     ),
                     "matching_lines": line_matches,
+                    "frame_offset_kms": (
+                        round(frame_offset_kms, 4)
+                        if frame_offset_kms is not None
+                        else None
+                    ),
+                    "frame_corrected": frame_offset_kms is not None,
                     "angular_separation_arcsec": _angular_separation_arcsec(
                         target_ra,
                         target_dec,

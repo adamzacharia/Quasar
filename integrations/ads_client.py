@@ -463,24 +463,33 @@ class ADSService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _perform_get(self, endpoint: str, params: Dict[str, Union[str, int, List[str]]]) -> Dict[str, Any]:
+    def _perform_get(
+        self,
+        endpoint: str,
+        params: Dict[str, Union[str, int, List[str]]],
+        *,
+        timeout: Optional[float] = None,
+        retry_attempts: Optional[int] = None,
+    ) -> Dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}{endpoint}"
         headers = self._build_headers()
         delay = 1.0
+        eff_timeout = self.timeout if timeout is None else timeout
+        eff_attempts = self.retry_attempts if retry_attempts is None else max(1, int(retry_attempts))
 
-        for attempt in range(self.retry_attempts):
+        for attempt in range(eff_attempts):
             try:
                 response = self.session.get(
-                    url, headers=headers, params=params, timeout=self.timeout
+                    url, headers=headers, params=params, timeout=eff_timeout
                 )
             except requests.Timeout as exc:
-                if attempt == self.retry_attempts - 1:
+                if attempt == eff_attempts - 1:
                     raise ADSServiceError("ADS request timed out") from exc
                 time.sleep(delay)
                 delay *= 2
                 continue
             except requests.RequestException as exc:
-                if attempt == self.retry_attempts - 1:
+                if attempt == eff_attempts - 1:
                     raise ADSServiceError(f"ADS request error: {exc}") from exc
                 time.sleep(delay)
                 delay *= 2

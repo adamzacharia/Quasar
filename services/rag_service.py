@@ -37,7 +37,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Callable, Union
+from typing import List, Dict, Any, Optional, Callable, Union, Tuple
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_community.document_loaders.text import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -158,6 +158,161 @@ CYCLE_YEAR_MAP = {
     "6": 2018, "7": 2019, "8": 2020, "9": 2021, "10": 2022,
     "11": 2023, "12": 2024, "13": 2025, "14": 2026,
 }
+
+_SEMANTIC_TIE_TOLERANCE = 0.005
+
+
+def _coerce_doc_year(value: Any) -> Optional[int]:
+    """Return a usable doc_year int, or None for missing/invalid values."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r'\b(20[1-3]\d)\b', value)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _cycle_label_for_year(year: int, docs: List[Document]) -> str:
+    """Format a year as an ALMA cycle label when possible."""
+    for doc in docs:
+        metadata = doc.metadata or {}
+        if _coerce_doc_year(metadata.get("doc_year")) == year:
+            alma_cycle = str(metadata.get("alma_cycle") or "").strip()
+            if alma_cycle:
+                return f"{alma_cycle} ({year})"
+
+    for cycle, mapped_year in CYCLE_YEAR_MAP.items():
+        if mapped_year == year:
+            return f"Cycle {cycle} ({year})"
+    return str(year)
+
+
+def detect_year_conflicts(
+    docs: List[Document],
+    span_threshold: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """Detect stale/current ALMA documentation mixed in returned chunks."""
+    years = sorted({
+        year
+        for doc in docs
+        for year in [_coerce_doc_year((doc.metadata or {}).get("doc_year"))]
+        if year is not None
+    })
+    if not years:
+        return None
+
+    min_year = years[0]
+    max_year = years[-1]
+    span = max_year - min_year
+    if span < span_threshold:
+        return None
+
+    min_label = _cycle_label_for_year(min_year, docs)
+    max_label = _cycle_label_for_year(max_year, docs)
+    return {
+        "min_year": min_year,
+        "max_year": max_year,
+        "span": span,
+        "years": years,
+        "message": (
+            f"Retrieved ALMA docs span {min_label} to {max_label}; "
+            "newer specs may supersede older ones."
+        ),
+    }
+
+
+def _build_filter_conditions(
+    *,
+    year: Optional[int] = None,
+    min_year: Optional[int] = None,
+    max_year: Optional[int] = None,
+    category: Optional[str] = None,
+    source_file: Optional[str] = None,
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, int]]]:
+    """Build exact-match and range condition dicts for vector search."""
+    filter_conditions: Dict[str, str] = {}
+    range_conditions: Dict[str, Dict[str, int]] = {}
+
+    if category:
+        filter_conditions["doc_category"] = category
+    if source_file:
+        filter_conditions["source_file"] = source_file
+
+    if year is not None:
+        range_conditions["doc_year"] = {"gte": year, "lte": year}
+    elif min_year is not None or max_year is not None:
+        year_range: Dict[str, int] = {}
+        if min_year is not None:
+            year_range["gte"] = min_year
+        if max_year is not None:
+            year_range["lte"] = max_year
+        range_conditions["doc_year"] = year_range
+
+    return filter_conditions, range_conditions
+
+
+def _rank_scores(
+    scores: List[float],
+    *,
+    reverse: bool = True,
+    tolerance: float = 0.0,
+) -> Dict[int, int]:
+    """Return RRF-compatible ranks, preserving ties within tolerance.
+
+    Ties are measured against the first score in the current tie group (the
+    group "leader"), not the immediately preceding score. Comparing to the
+    previous score makes ties transitive — a run of small adjacent steps
+    (e.g. 0.900, 0.896, 0.892) could collapse into one rank even though the
+    endpoints differ by more than ``tolerance``. Leader-relative grouping
+    prevents that chaining.
+    """
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=reverse)
+    ranks: Dict[int, int] = {}
+    leader_score: Optional[float] = None
+    current_rank = 0
+
+    for position, idx in enumerate(ranked):
+        score = float(scores[idx])
+        if leader_score is None or abs(score - leader_score) > tolerance:
+            current_rank = position
+            leader_score = score
+        ranks[idx] = current_rank
+
+    return ranks
+
+
+def _build_recency_rank(
+    candidates: List[Document],
+    current_year: Optional[int] = None,
+) -> Dict[int, int]:
+    """Rank candidates by doc_year recency, with missing years last."""
+    years_by_index = {
+        idx: year
+        for idx, doc in enumerate(candidates)
+        for year in [_coerce_doc_year((doc.metadata or {}).get("doc_year"))]
+        if year is not None
+    }
+    if not years_by_index:
+        return {idx: 0 for idx in range(len(candidates))}
+
+    if current_year is None:
+        current_year = max(years_by_index.values())
+
+    unique_years = sorted(
+        set(years_by_index.values()),
+        key=lambda year: (max(current_year - year, 0), -year),
+    )
+    ranks_by_year = {year: rank for rank, year in enumerate(unique_years)}
+    missing_rank = len(unique_years)
+    return {
+        idx: ranks_by_year.get(years_by_index.get(idx), missing_rank)
+        for idx in range(len(candidates))
+    }
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -739,32 +894,45 @@ class RAGService:
         Returns:
             Combined list of relevant documents with metadata
         """
+        docs, _diagnostics = self.search_with_diagnostics(
+            query,
+            k=k,
+            include_personal=include_personal,
+            year=year,
+            min_year=min_year,
+            max_year=max_year,
+            category=category,
+            source_file=source_file,
+            min_score=min_score,
+        )
+        return docs
+
+    def search_with_diagnostics(
+        self,
+        query: str,
+        k: int = 5,
+        include_personal: bool = True,
+        year: Optional[int] = None,
+        min_year: Optional[int] = None,
+        max_year: Optional[int] = None,
+        category: Optional[str] = None,
+        source_file: Optional[str] = None,
+        min_score: float = 0.0,
+    ) -> Tuple[List[Document], Dict[str, Any]]:
+        """Hybrid search with structured diagnostics for freshness warnings."""
         # Over-fetch factor: retrieve more candidates for BM25 reranking
         fetch_k = k * 4
 
         results = []
         query_vector = self.embeddings.embed_query(query)
 
-        # Build filter conditions
-        filter_conditions = {}
-        range_conditions = {}
-
-        if category:
-            filter_conditions["doc_category"] = category
-        if source_file:
-            filter_conditions["source_file"] = source_file
-
-        if year:
-            # Exact year match via range (gte=year, lte=year)
-            range_conditions["doc_year"] = {"gte": year, "lte": year}
-        else:
-            if min_year or max_year:
-                year_range = {}
-                if min_year:
-                    year_range["gte"] = min_year
-                if max_year:
-                    year_range["lte"] = max_year
-                range_conditions["doc_year"] = year_range
+        filter_conditions, range_conditions = _build_filter_conditions(
+            year=year,
+            min_year=min_year,
+            max_year=max_year,
+            category=category,
+            source_file=source_file,
+        )
 
         # Search general collection (over-fetch for reranking)
         try:
@@ -817,7 +985,15 @@ class RAGService:
         if min_score > 0.0:
             results = [d for d in results if d.metadata.get("_semantic_score", 0.0) >= min_score]
 
-        return results
+        year_conflict = detect_year_conflicts(results)
+        if year_conflict:
+            for doc in results:
+                doc.metadata["_year_conflict"] = year_conflict
+        else:
+            for doc in results:
+                doc.metadata.pop("_year_conflict", None)
+
+        return results, {"year_conflict": year_conflict}
 
     @staticmethod
     def _hybrid_rerank(
@@ -827,8 +1003,11 @@ class RAGService:
         semantic_weight: float = 0.7,
         bm25_weight: float = 0.3,
         rrf_k: int = 60,
+        *,
+        recency_weight: float = 0.1,
+        current_year: Optional[int] = None,
     ) -> List[Document]:
-        """Rerank candidates using Reciprocal Rank Fusion (semantic + BM25).
+        """Rerank candidates using Reciprocal Rank Fusion (semantic + BM25 + recency).
 
         Combines semantic similarity rank (from Qdrant) with BM25 keyword
         relevance rank. Uses RRF: score = Σ (weight / (rrf_k + rank)).
@@ -840,59 +1019,81 @@ class RAGService:
             semantic_weight: Weight for the semantic (embedding) signal.
             bm25_weight:     Weight for the BM25 (keyword) signal.
             rrf_k:           RRF smoothing constant (standard is 60).
+            recency_weight:  Small supplemental weight for doc_year recency.
+            current_year:    Optional current ALMA doc year; defaults to the
+                             maximum candidate doc_year.
 
         Returns:
             Top-k documents sorted by combined RRF score.
         """
-        try:
-            from rank_bm25 import BM25Okapi
-        except ImportError:
-            # Fallback: if rank_bm25 not installed, return top-k by semantic only
-            candidates.sort(
-                key=lambda d: d.metadata.get("_semantic_score", 0), reverse=True
-            )
-            for doc in candidates[:k]:
-                doc.metadata["_score"] = doc.metadata.get("_semantic_score", 0.0)
-            return candidates[:k]
-
         if not candidates:
             return []
 
-        # Tokenize for BM25 (simple whitespace + lowercase)
-        tokenized_corpus = [
-            doc.page_content.lower().split() for doc in candidates
+        semantic_scores = [
+            float(doc.metadata.get("_semantic_score", 0) or 0)
+            for doc in candidates
         ]
-        tokenized_query = query.lower().split()
-
-        # Build BM25 index over the candidate set
-        bm25 = BM25Okapi(tokenized_corpus)
-        bm25_scores = bm25.get_scores(tokenized_query)
-
-        # Build semantic rank (already sorted by Qdrant score)
-        semantic_ranked = sorted(
-            range(len(candidates)),
-            key=lambda i: candidates[i].metadata.get("_semantic_score", 0),
+        semantic_rank = _rank_scores(
+            semantic_scores,
             reverse=True,
+            tolerance=_SEMANTIC_TIE_TOLERANCE,
         )
-        semantic_rank = {idx: rank for rank, idx in enumerate(semantic_ranked)}
 
-        # Build BM25 rank
-        bm25_ranked = sorted(
-            range(len(candidates)),
-            key=lambda i: bm25_scores[i],
-            reverse=True,
+        bm25_available = False
+        bm25_scores = [0.0 for _ in candidates]
+        bm25_rank = {idx: 0 for idx in range(len(candidates))}
+
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            # Optional dependency: keep search working with semantic + recency.
+            pass
+        else:
+            bm25_available = True
+            # Tokenize for BM25 (simple whitespace + lowercase)
+            tokenized_corpus = [
+                doc.page_content.lower().split() for doc in candidates
+            ]
+            tokenized_query = query.lower().split()
+
+            # Build BM25 index over the candidate set
+            bm25 = BM25Okapi(tokenized_corpus)
+            bm25_scores = [float(score) for score in bm25.get_scores(tokenized_query)]
+            bm25_rank = _rank_scores(bm25_scores, reverse=True, tolerance=1e-12)
+
+        recency_rank = _build_recency_rank(candidates, current_year=current_year)
+
+        # Relevance = semantic + BM25 RRF. Recency is deliberately NOT a free
+        # additive RRF term: as one, a newer-but-less-relevant chunk could
+        # outscore a stronger semantic match (recency's range can exceed the gap
+        # between adjacent relevance ranks). Instead, bound the recency bonus to
+        # be strictly smaller than the smallest gap between *distinct* relevance
+        # scores, so recency can only reorder candidates whose relevance is
+        # (near-)identical — never override a real relevance difference.
+        relevance = [
+            semantic_weight / (rrf_k + semantic_rank[i])
+            + bm25_weight / (rrf_k + bm25_rank[i])
+            for i in range(len(candidates))
+        ]
+        distinct_relevance = sorted(set(relevance))
+        min_gap = min(
+            (hi - lo for lo, hi in zip(distinct_relevance, distinct_relevance[1:])),
+            default=0.0,
         )
-        bm25_rank = {idx: rank for rank, idx in enumerate(bm25_ranked)}
+        # recency_weight is the fraction of the minimum relevance gap the recency
+        # tiebreaker may use (default 0.1). When all relevance scores are equal
+        # (min_gap == 0) there are no groups to cross, so a tiny absolute span is
+        # enough to order ties.
+        recency_span = (min_gap * recency_weight) if min_gap > 0 else 1e-6
+        max_recency_rank = max(recency_rank.values(), default=0) or 1
 
-        # Reciprocal Rank Fusion
         rrf_scores = []
         for i in range(len(candidates)):
-            sem_rrf = semantic_weight / (rrf_k + semantic_rank[i])
-            bm25_rrf = bm25_weight / (rrf_k + bm25_rank[i])
-            combined = sem_rrf + bm25_rrf
-            rrf_scores.append((i, combined))
+            # newer (recency_rank 0) → full recency_span; oldest → ~0.
+            recency_bonus = recency_span * (1 - recency_rank[i] / max_recency_rank)
+            rrf_scores.append((i, relevance[i] + recency_bonus))
 
-        # Sort by combined RRF score
+        # Sort by combined score (relevance dominates; recency only breaks ties).
         rrf_scores.sort(key=lambda x: x[1], reverse=True)
 
         # Return top-k with combined score
@@ -900,7 +1101,10 @@ class RAGService:
         for idx, score in rrf_scores[:k]:
             doc = candidates[idx]
             doc.metadata["_score"] = round(score, 6)
-            doc.metadata["_bm25_score"] = round(float(bm25_scores[idx]), 4)
+            if bm25_available:
+                doc.metadata["_bm25_score"] = round(float(bm25_scores[idx]), 4)
+            else:
+                doc.metadata.pop("_bm25_score", None)
             doc.metadata["_reranked"] = True
             reranked.append(doc)
 
