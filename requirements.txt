@@ -19,6 +19,11 @@ reproject
 spectral-cube
 pyvo
 alminer
+# NOIRLab Astro Data Lab: the connector (integrations/datalab_client.py) talks to
+# the query-manager REST API directly via `requests` (already a dependency), so it
+# runs on Python 3.13. The official `astro-datalab` client is OPTIONAL and only
+# installs on Python <3.12 — uncomment if you prefer dl.queryClient on a 3.11 env.
+# astro-datalab; python_version < "3.12"
 altair==4.2.2
 legacy-cgi>=2.6; python_version >= "3.13"
 

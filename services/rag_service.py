@@ -140,16 +140,36 @@ _DOMAIN_KEYWORDS = {
     "atacama", "eso", "nasa", "esa",
 }
 
+# Broad/ambiguous keywords that also appear in everyday non-astronomy text
+# ("rock band", "submit a proposal", "phase margin", "radio buttons"). These count
+# as domain-relevant ONLY when the query is not a smalltalk/off-domain stem.
+_AMBIGUOUS_KEYWORDS = {
+    "band", "proposal", "phase", "radio", "star", "survey", "catalog", "beam",
+    "flux", "planet", "cycle", "mosaic", "archive", "scheduling", "pipeline",
+    "imaging", "sensitivity", "continuum", "observation", "bandwidth",
+}
+
 def is_domain_relevant(query: str) -> bool:
-    """Fast, zero-LLM-call domain relevance check."""
-    # 1. Fast reject: known off-domain patterns
+    """Fast, zero-LLM-call domain relevance check.
+
+    Tiered to satisfy both failure modes: a real science question that opens with a
+    conversational stem ("what can you tell me about ALMA Band 6") must pass, while a
+    non-astronomy prompt that merely contains a broad word ("my rock band", "phase
+    margin") must not.
+    """
+    q_lower = query.lower()
+    strong = _DOMAIN_KEYWORDS - _AMBIGUOUS_KEYWORDS
+    # 1. Strong, unambiguous astronomy keyword → accept even after a conversational stem.
+    if any(kw in q_lower for kw in strong):
+        return True
+    # 2. Off-domain / smalltalk stem → reject. Runs BEFORE the broad-keyword check so
+    #    ambiguous words (band/phase/radio/...) can't rescue a clearly off-domain prompt.
     if _OFFDOMAIN_PATTERNS.match(query):
         return False
-    # 2. Fast accept: any astronomy/ALMA keyword present
-    q_lower = query.lower()
-    if any(kw in q_lower for kw in _DOMAIN_KEYWORDS):
+    # 3. Broad/ambiguous keyword with no off-domain stem → accept.
+    if any(kw in q_lower for kw in _AMBIGUOUS_KEYWORDS):
         return True
-    # 3. Ambiguous — default to False (conservative)
+    # 4. Ambiguous — default to False (conservative).
     return False
 
 # ALMA cycle → approximate year mapping

@@ -51,6 +51,91 @@ except ImportError:
 # mirror stable constants already used in services.splatalogue and the benchmark
 # question notes; dynamic archive counts are left to the live benchmark.
 QUESTIONS = [
+    # ── Intent-routing eval slice (Bug-B: conversational-stem science queries) ──
+    # These open with a smalltalk/filler stem ("what can you", "ok", "great")
+    # that the start-anchored off-domain reject in services/rag_service.py
+    # is_domain_relevant() used to classify as off-domain, silently disabling
+    # documentation RAG. The Bug-B fix (accept-before-reject) keeps RAG on.
+    # CTRL-01 is phrased plainly (no stem) so it is domain-relevant either way
+    # and acts as a no-regression control.
+    {
+        "id": "BUGB-01",
+        "category": "Intent Routing",
+        "difficulty": "Easy",
+        "title": "Conversational-stem: ALMA Band 6 sensitivity",
+        "question": "what can you tell me about ALMA Band 6 sensitivity?",
+        "criteria": [
+            "Identifies the ALMA Band 6 frequency range (~211-275 GHz)",
+            "Discusses sensitivity drivers (bandwidth, integration time, number of antennas, precipitable water vapor/weather)",
+            "References the ALMA sensitivity calculator or Technical Handbook",
+            "Factually accurate",
+        ],
+        "golden": {
+            "must_include_any": [
+                ["Band 6", "Band six"],
+                ["sensitivity"],
+            ],
+            "numbers": [
+                {"value": 211.0, "unit": "GHz", "tol": 1.0, "why": "ALMA Band 6 lower edge"},
+                {"value": 275.0, "unit": "GHz", "tol": 1.0, "why": "ALMA Band 6 upper edge"},
+            ],
+        },
+    },
+    {
+        "id": "BUGB-02",
+        "category": "Intent Routing",
+        "difficulty": "Easy",
+        "title": "Conversational-stem: ALMA correlator",
+        "question": "ok, explain the ALMA correlator",
+        "criteria": [
+            "Explains the correlator cross-correlates antenna signals to produce visibilities",
+            "Mentions the Baseline Correlator and/or the ACA correlator",
+            "Discusses spectral windows / channels / bandwidth (spectral) modes",
+            "Factually accurate",
+        ],
+        "golden": {
+            "must_include_any": [
+                ["correlator"],
+                ["spectral window", "spectral windows", "baseline", "visibilit"],
+            ],
+        },
+    },
+    {
+        "id": "BUGB-03",
+        "category": "Intent Routing",
+        "difficulty": "Medium",
+        "title": "Conversational-stem: ALMA proprietary period policy",
+        "question": "great question - what is the ALMA proprietary period policy?",
+        "criteria": [
+            "States the standard proprietary period (typically 12 months from delivery for most programs)",
+            "Notes the PI has exclusive access during the proprietary period",
+            "Mentions exceptions (e.g. DDT / Target-of-Opportunity may differ)",
+            "Factually accurate",
+        ],
+        "golden": {
+            "must_include_any": [
+                ["12 month", "twelve month", "12-month", "one year", "one-year"],
+                ["proprietary"],
+            ],
+        },
+    },
+    {
+        "id": "CTRL-01",
+        "category": "Intent Routing",
+        "difficulty": "Easy",
+        "title": "Control (plain phrasing): ALMA observing bands",
+        "question": "How many observing bands does ALMA have, and what are their approximate frequency ranges?",
+        "criteria": [
+            "States ALMA has 10 receiver bands (Band 1-10)",
+            "Provides approximate frequency ranges for at least a few bands",
+            "Factually accurate",
+        ],
+        "golden": {
+            "must_include_any": [
+                ["10 bands", "ten bands", "Band 1-10", "Band 1 through Band 10", "Band 1 to Band 10"],
+            ],
+        },
+    },
     # ── General Knowledge — Easy ──
     {
         "id": "GK-E-01",
@@ -390,6 +475,15 @@ QUESTIONS = [
         },
     },
 ]
+
+# Optional external dataset override (for reproducible custom eval sets).
+# If QUASAR_BENCH_DATASET points to a JSON file, it REPLACES the question set
+# above. Leaves the built-in set untouched when the env var is absent.
+import json as _json
+_ds = os.environ.get("QUASAR_BENCH_DATASET")
+if _ds and os.path.exists(_ds):
+    QUESTIONS = _json.load(open(_ds, encoding="utf-8"))
+    print(f"[dataset] loaded {len(QUESTIONS)} questions from {_ds}")
 
 DIFFICULTY_WEIGHTS = {"Easy": 1.0, "Medium": 1.5, "Hard": 2.0}
 

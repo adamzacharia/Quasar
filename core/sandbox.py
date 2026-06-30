@@ -45,6 +45,7 @@ _ALLOWED_MODULES = {
     # --- Astronomy-specific ---
     "astropy", "astropy.units", "astropy.constants", "astropy.coordinates",
     "astropy.cosmology", "astropy.io", "astropy.io.fits",
+    "astropy.timeseries", "astropy.visualization", "astropy.table",
 }
 
 # Builtins that are blocked

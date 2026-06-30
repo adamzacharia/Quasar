@@ -79,8 +79,77 @@ def generate_analysis_notebook(title: str, steps: list) -> dict:
             nb.add_markdown_cell(step.get("content", ""))
         elif step.get("type") == "code":
             nb.add_code_cell(step.get("content", ""))
-            
+
     return nb.generate_dict()
+
+
+def datalab_notebook_steps(
+    *,
+    sql=None,
+    catalog=None,
+    table=None,
+    sia=None,
+    svo_filters=None,
+    citation=None,
+):
+    """Build reproducible NOIRLab Astro Data Lab notebook steps.
+
+    Returns a list of {'type','content'} step dicts (the format generate_analysis_notebook
+    consumes) covering a TAP query (native SQL via queryClient), an optional SIA cutout,
+    an optional SVO filter-wavelength lookup, and a data-citation cell.
+
+    sia: optional dict {'ra','dec','fov_deg','endpoint'}.
+    svo_filters: optional list of SVO filterIDs (e.g. ['CTIO/DECam.g','WISE/WISE.W1']).
+    citation: optional dict {'text','url','doi'} (e.g. datalab_registry.citation(catalog)).
+    """
+    steps = [{
+        "type": "markdown",
+        "content": "## NOIRLab Astro Data Lab — reproducible recipe\n"
+                   "Run in an environment with the `astro-datalab` client (or use the REST API).",
+    }, {
+        "type": "code",
+        "content": (
+            "from dl import queryClient as qc\n"
+            "from pyvo.dal import sia\n"
+            "from astropy.io import fits\n"
+            "from astropy.utils.data import download_file\n"
+            "import numpy as np"
+        ),
+    }]
+    if sql:
+        steps.append({"type": "markdown", "content": f"### TAP query — {catalog or ''}.{table or ''}".rstrip(".")})
+        steps.append({"type": "code", "content": "q = '''" + str(sql).replace("'''", "\\'\\'\\'") + "'''\n"
+                                                 "df = qc.query(sql=q, fmt='pandas')\ndf.head()"})
+    if isinstance(sia, dict) and sia.get("ra") is not None and sia.get("dec") is not None:
+        endpoint = sia.get("endpoint") or "https://datalab.noirlab.edu/sia/coadd_all"
+        fov = sia.get("fov_deg", 0.1)
+        steps.append({"type": "markdown", "content": "### SIA image cutout (dec-corrected size; deepest Stack)"})
+        steps.append({"type": "code", "content": (
+            f"svc = sia.SIAService('{endpoint}')\n"
+            f"ra, dec, fov = {float(sia['ra'])}, {float(sia['dec'])}, {float(fov)}\n"
+            "imgs = svc.search((ra, dec), (fov/np.cos(np.radians(dec)), fov), verbosity=2).to_table()\n"
+            "sel = (imgs['proctype']=='Stack') & (imgs['prodtype']=='image')\n"
+            "row = imgs[sel][np.argmax(imgs[sel]['exptime'])]  # deepest stack\n"
+            "img = fits.getdata(download_file(row['access_url'], cache=True, timeout=180))"
+        )})
+    if svo_filters:
+        steps.append({"type": "markdown", "content": "### Filter effective wavelengths (SVO FPS — not hardcoded)"})
+        steps.append({"type": "code", "content": (
+            "from astroquery.svo_fps import SvoFps\n"
+            f"filter_ids = {list(svo_filters)}\n"
+            "# WavelengthEff / WavelengthPivot (Angstrom) come from the SVO service per filterID.\n"
+            "waves = {fid: SvoFps.get_filter_list(filterID=fid) for fid in filter_ids}\n"
+            "waves"
+        )})
+    if citation:
+        if isinstance(citation, dict):
+            text = citation.get("text") or ""
+            url = citation.get("url") or citation.get("doi")
+        else:
+            text, url = str(citation), None
+        body = f"### Data citation\n\n{text}" + (f"\n\n{url}" if url else "")
+        steps.append({"type": "markdown", "content": body})
+    return steps
 
 
 def generate_conductor_notebook(

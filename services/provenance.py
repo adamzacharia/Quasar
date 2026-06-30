@@ -23,6 +23,7 @@ _KIND_ORDER: Tuple[Tuple[str, str], ...] = (
     ("project_code", "ALMA projects"),
     ("ads_bibcode", "Literature (ADS)"),
     ("splatalogue", "Spectral lines (Splatalogue)"),
+    ("datalab_catalog", "Data Lab catalogs"),
     ("rag_chunk", "Documentation"),
     ("web", "Web sources"),
     ("notebook_cell", "Computation"),
@@ -161,6 +162,34 @@ class ProvenanceLedger:
                     extra={"doc_year": year} if year not in (None, "") else {},
                 )
             )
+
+        # Data Lab catalog: a result/provenance dict naming a registered catalog.table.
+        dl_catalog = node.get("catalog")
+        dl_table = node.get("table")
+        if isinstance(dl_catalog, str) and isinstance(dl_table, str):
+            try:
+                from services import datalab_registry as _dlreg
+            except Exception:
+                _dlreg = None
+            if _dlreg is not None and dl_catalog in _dlreg.DATALAB_CATALOGS:
+                try:
+                    cite = _dlreg.citation(dl_catalog)
+                except Exception:
+                    cite = {}
+                rowcount = node.get("rowcount")
+                label = f"{dl_catalog}.{dl_table}"
+                if isinstance(rowcount, (int, float)) and not isinstance(rowcount, bool):
+                    label += f" ({int(rowcount)} rows)"
+                if cite.get("text"):
+                    label += f" — {cite['text']}"
+                self.add(
+                    SourceRecord(
+                        kind="datalab_catalog",
+                        id=f"{dl_catalog}.{dl_table}",
+                        label=label,
+                        ref=(cite.get("url") or cite.get("doi")),
+                    )
+                )
 
         # Splatalogue line row: a species/formula plus a frequency.
         species = node.get("species") or node.get("formula")

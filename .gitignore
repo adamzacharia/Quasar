@@ -73,6 +73,7 @@ scratch_*.py
 # ============================================
 /Benchmark/results/
 /data/dag_cache.json
+/data/search_usage.json
 /poster/
 /scripts/debug_output.txt
 /scripts/Understand-Anything/

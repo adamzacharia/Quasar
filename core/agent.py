@@ -108,6 +108,11 @@ from services.astro_calculators import (
     calculate_redshift, convert_coordinates, calculate_beam,
     calculate_alma_sensitivity,
 )
+from integrations.datalab_client import DatalabClient
+from services import datalab_query_builders, datalab_registry, datalab_sql_policy
+from services import datalab_orchestration
+from services.datalab_result_store import default_result_store
+from services.datalab_job_service import default_job_service
 
 # Phase 1-4: Multi-Agent Workforce modules
 from core.conductor import Conductor
@@ -1704,6 +1709,461 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
 
         # ── Sky Survey Image Tools ────────────────────────────────
+
+        # Data Lab P0 catalog-TAP tools
+        self.tool_registry.register(Tool(
+            name="datalab_list_catalogs",
+            description="List supported NOIRLab Astro Data Lab P0 catalogs and registered tables.",
+            function=self._datalab_list_catalogs,
+            parameters={"type": "object", "properties": {}, "required": []},
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_describe_table",
+            description="Describe a registered Data Lab catalog table, columns, region strategy, morphology hints, and citation.",
+            function=self._datalab_describe_table,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string", "description": "Registered catalog, e.g. gaia_dr3 or nsc_dr2."},
+                    "table": {"type": "string", "description": "Registered table within the catalog, e.g. gaia_source or object."},
+                },
+                "required": ["catalog", "table"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_cone_count",
+            description="Count rows in a Data Lab catalog cone using a governed q3c_radial_query builder.",
+            function=self._datalab_cone_count,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "ra": {"type": "number", "description": "ICRS right ascension in degrees."},
+                    "dec": {"type": "number", "description": "ICRS declination in degrees."},
+                    "radius_deg": {"type": "number", "description": "Cone radius in degrees."},
+                },
+                "required": ["catalog", "table", "ra", "dec", "radius_deg"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_select_catalog_rows",
+            description="Select capped rows from a Data Lab catalog cone using governed structured SQL; returns result_id, not the full table.",
+            function=self._datalab_select_catalog_rows,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "radius_deg": {"type": "number"},
+                    "columns": {"type": "array", "items": {"type": "string"}},
+                    "limit": {"type": "integer", "default": 500},
+                },
+                "required": ["catalog", "table", "ra", "dec", "radius_deg"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_density_aggregate",
+            description="Aggregate Data Lab source density by RA/Dec grid or registered HEALPix column over a cone region; returns a stable result_id. Requires a cone (ra/dec/radius_deg) unless all_sky=true is set explicitly.",
+            function=self._datalab_density_aggregate,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["grid", "healpix"], "default": "grid"},
+                    "step_deg": {"type": "number", "default": 0.1},
+                    "healpix_column": {"type": "string"},
+                    "ra": {"type": "number", "description": "Cone center RA (deg); with dec+radius_deg bounds the aggregate."},
+                    "dec": {"type": "number", "description": "Cone center Dec (deg)."},
+                    "radius_deg": {"type": "number", "description": "Cone radius (deg) bounding the aggregate."},
+                    "all_sky": {"type": "boolean", "default": False, "description": "Explicitly run an unbounded whole-catalog aggregate (slow/expensive)."},
+                    "color_cut": {"type": "object", "description": "e.g. {'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
+                    "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'gmag','op':'>','value':19.5}]"},
+                    "morphology": {"type": "object", "description": "e.g. {'column':'class_star','op':'>','value':0.5}"},
+                    "limit": {"type": "integer", "default": 5000},
+                },
+                "required": ["catalog", "table"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_q3c_crossmatch",
+            description="Planner-safe Data Lab q3c crossmatch: materializes the small Gaia-like side first and joins the large indexed catalog second.",
+            function=self._datalab_q3c_crossmatch,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "small_catalog": {"type": "string", "default": "gaia_dr3"},
+                    "small_table": {"type": "string", "default": "gaia_source"},
+                    "big_catalog": {"type": "string", "default": "nsc_dr2"},
+                    "big_table": {"type": "string", "default": "object"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "radius_deg": {"type": "number"},
+                    "match_radius_arcsec": {"type": "number", "default": 1.0},
+                    "small_columns": {"type": "array", "items": {"type": "string"}},
+                    "big_columns": {"type": "array", "items": {"type": "string"}},
+                    "small_limit": {"type": "integer", "default": 10000},
+                    "limit": {"type": "integer", "default": 500},
+                },
+                "required": ["ra", "dec", "radius_deg"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_sql_query",
+            description=(
+                "EXPERT/DEBUG ONLY: run governed raw native SQL against Data Lab. "
+                "Requires expert_ack=true and a reason; q3c_join remains blocked outside the structured crossmatch builder. "
+                "Returns result_id only, not the full table."
+            ),
+            function=self._datalab_sql_query,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "Read-only native SQL SELECT/WITH query."},
+                    "expert_ack": {"type": "boolean", "description": "Must be true to acknowledge expert/debug raw SQL mode."},
+                    "reason": {"type": "string", "description": "Brief justification for not using structured builders."},
+                },
+                "required": ["sql", "expert_ack", "reason"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_get_result",
+            description="Fetch the rows of a stored Data Lab result_id (from a prior datalab_* tool), capped at max_rows (<=5000).",
+            function=self._datalab_get_result,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string", "description": "result_id returned by a datalab_* tool."},
+                    "max_rows": {"type": "integer", "default": 200, "description": "Maximum rows to return (capped at 5000)."},
+                },
+                "required": ["result_id"],
+            },
+            category="datalab",
+        ))
+
+        # Data Lab P1 SIA image, SVO, and catalog-analysis tools
+        self.tool_registry.register(Tool(
+            name="datalab_image_cutout",
+            description="Render a single-band NOIRLab Astro Data Lab SIA cutout at RA/Dec or a resolvable target name.",
+            function=self._datalab_image_cutout,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ra": {"type": "number", "description": "ICRS right ascension in degrees."},
+                    "dec": {"type": "number", "description": "ICRS declination in degrees."},
+                    "target_name": {"type": "string", "description": "Optional target name to resolve if ra/dec are not supplied."},
+                    "fov_deg": {"type": "number", "default": 0.05, "description": "Cutout field of view in degrees."},
+                    "band": {"type": "string", "default": "g", "description": "Band prefix, e.g. g, r, or i."},
+                    "catalog": {"type": "string", "default": "ls_dr9", "description": "Registered Data Lab catalog used to choose SIA endpoint."},
+                    "endpoint": {"type": "string", "description": "Optional explicit SIA endpoint override."},
+                    "title": {"type": "string"},
+                },
+                "required": ["fov_deg"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_color_image",
+            description="Render a Data Lab color image from deepest SIA stack images, reprojected to a common WCS before Lupton RGB composition. Auto-selects RGB bands (red=i or z, green=r, blue=g) unless 'bands' is given.",
+            function=self._datalab_color_image,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "target_name": {"type": "string"},
+                    "fov_deg": {"type": "number", "default": 0.05},
+                    "catalog": {"type": "string", "default": "ls_dr9"},
+                    "endpoint": {"type": "string"},
+                    "bands": {"type": "array", "items": {"type": "string"}, "description": "Optional (red, green, blue) band override, e.g. ['z','r','g']. Defaults to auto-selection."},
+                    "q": {"type": "number", "default": 8.0},
+                    "stretch": {"type": "number", "default": 0.5},
+                    "title": {"type": "string"},
+                },
+                "required": ["fov_deg"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_cutout_grid",
+            description="Render a multi-panel Data Lab SIA cutout grid for peak coordinates; panels without coverage are labeled instead of failing the grid.",
+            function=self._datalab_cutout_grid,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "peaks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "ra": {"type": "number"},
+                                "dec": {"type": "number"},
+                                "label": {"type": "string"},
+                            },
+                            "required": ["ra", "dec"],
+                        },
+                    },
+                    "fov_deg": {"type": "number", "default": 0.05},
+                    "band": {"type": "string", "default": "g"},
+                    "catalog": {"type": "string", "default": "ls_dr9"},
+                    "endpoint": {"type": "string"},
+                    "title": {"type": "string"},
+                },
+                "required": ["peaks", "fov_deg"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="svo_filter_wavelength",
+            description="Look up effective and pivot wavelengths for SVO FPS filter IDs, including LS DR9 shorthand g/r/z/w1/w2.",
+            function=self._svo_filter_wavelength,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "filter_id": {"type": "string", "description": "Single filter ID or shorthand."},
+                    "filter_ids": {"type": "array", "items": {"type": "string"}, "description": "Multiple filter IDs or shorthands."},
+                },
+                "required": [],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_catalog_scatter",
+            description="Render a Data Lab result_id as a CMD/CCD/HR-style scatter plot using safe column expressions.",
+            function=self._datalab_catalog_scatter,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string"},
+                    "x_expr": {"type": "string"},
+                    "y_expr": {"type": "string"},
+                    "color_by": {"type": "string"},
+                    "invert_y": {"type": "boolean", "default": False},
+                    "invert_x": {"type": "boolean", "default": False},
+                    "title": {"type": "string"},
+                    "x_label": {"type": "string"},
+                    "y_label": {"type": "string"},
+                    "overlay_locus": {"type": "string"},
+                },
+                "required": ["result_id", "x_expr", "y_expr"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_sky_density_map",
+            description="Render a Data Lab result_id as a RA/Dec density map or sparse HEALPix density map, with optional matched-filter peak detection.",
+            function=self._datalab_sky_density_map,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["hist2d", "healpix"], "default": "hist2d"},
+                    "ra_col": {"type": "string"},
+                    "dec_col": {"type": "string"},
+                    "count_col": {"type": "string", "default": "source_count"},
+                    "bins": {"type": "integer", "default": 80},
+                    "healpix_col": {"type": "string", "default": "healpix"},
+                    "nside": {"type": "integer"},
+                    "order": {"type": "string", "default": "nested"},
+                    "matched_filter": {"type": "boolean", "default": False},
+                    "sigma_small": {"type": "number", "default": 1.0},
+                    "sigma_large": {"type": "number", "default": 3.0},
+                    "peak_threshold": {"type": "number", "default": 3.0},
+                    "max_peaks": {"type": "integer", "default": 10},
+                    "title": {"type": "string"},
+                },
+                "required": ["result_id"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_period_fold",
+            description="Run Lomb-Scargle period search on a stored Data Lab light curve and render the folded light curve.",
+            function=self._datalab_period_fold,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string"},
+                    "time_col": {"type": "string", "default": "mjd"},
+                    "mag_col": {"type": "string", "default": "cmag"},
+                    "error_col": {"type": "string", "default": "cerr"},
+                    "min_frequency": {"type": "number", "default": 1.0},
+                    "max_frequency": {"type": "number", "default": 10.0},
+                    "title": {"type": "string"},
+                },
+                "required": ["result_id"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_sed_plot",
+            description="Render an LS DR9-style SED from a stored Data Lab result_id using SVO FPS wavelengths.",
+            function=self._datalab_sed_plot,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string"},
+                    "row_index": {"type": "integer", "default": 0},
+                    "filter_columns": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "title": {"type": "string"},
+                },
+                "required": ["result_id"],
+            },
+            category="datalab",
+        ))
+
+        self.tool_registry.register(Tool(
+            name="datalab_lss_wedge",
+            description="Render a stored spectroscopic Data Lab result_id as a comoving large-scale-structure wedge or 3D scatter plot.",
+            function=self._datalab_lss_wedge,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string"},
+                    "ra_col": {"type": "string"},
+                    "dec_col": {"type": "string"},
+                    "z_col": {"type": "string", "default": "z"},
+                    "class_col": {"type": "string"},
+                    "pie_slice": {"type": "boolean", "default": False},
+                    "title": {"type": "string"},
+                },
+                "required": ["result_id"],
+            },
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_density_vetting",
+            description="P12: find the densest catalog cells within a cone (with optional color/magnitude/morphology cuts) and pull a SIA cutout grid of the top-N densest locations to eyeball.",
+            function=self._datalab_density_vetting,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "radius_deg": {"type": "number"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "target_name": {"type": "string"},
+                    "step_deg": {"type": "number", "default": 0.05},
+                    "color_cut": {"type": "object", "description": "e.g. {'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
+                    "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'gmag','op':'<','value':25}]"},
+                    "morphology": {"type": "object", "description": "e.g. {'column':'class_star','op':'>','value':0.5} or {'column':'ext_coadd','between':[0,1]}"},
+                    "top_n": {"type": "integer", "default": 5},
+                    "fov_deg": {"type": "number", "default": 0.05},
+                    "band": {"type": "string", "default": "g"},
+                },
+                "required": ["catalog", "table", "radius_deg"],
+            },
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_tiled_search",
+            description="P15: tiled region-bounded overdensity search over a footprint. Runs a server-side density aggregate per q3c cone tile, finds matched-filter peaks, and ranks candidates. Executes as a background job; for a large area it returns needs_confirmation first — re-call with confirm=true after confirming the sky area with the user.",
+            function=self._datalab_tiled_search,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "ra_min": {"type": "number"},
+                    "ra_max": {"type": "number"},
+                    "dec_min": {"type": "number"},
+                    "dec_max": {"type": "number"},
+                    "tile_radius_deg": {"type": "number", "default": 2.0},
+                    "step_deg": {"type": "number", "default": 0.05},
+                    "color_cut": {"type": "object"},
+                    "value_cuts": {"type": "array", "items": {"type": "object"}},
+                    "morphology": {"type": "object"},
+                    "peak_threshold": {"type": "number", "default": 3.0},
+                    "max_tiles": {"type": "integer", "default": 64},
+                    "candidate_budget": {"type": "integer", "default": 50},
+                    "confirm": {"type": "boolean", "default": False},
+                },
+                "required": ["catalog", "table", "ra_min", "ra_max", "dec_min", "dec_max"],
+            },
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_confirm_sky_area",
+            description="Estimate the sky area and tile count for a tiled search before fanning out (guardrail: confirm wide scans with the user first).",
+            function=self._datalab_confirm_sky_area,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ra_min": {"type": "number"}, "ra_max": {"type": "number"},
+                    "dec_min": {"type": "number"}, "dec_max": {"type": "number"},
+                    "tile_radius_deg": {"type": "number", "default": 2.0},
+                },
+                "required": ["ra_min", "ra_max", "dec_min", "dec_max"],
+            },
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_job_status",
+            description="Poll the status of a Data Lab background job (e.g. a tiled search).",
+            function=self._datalab_job_status,
+            parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_job_results",
+            description="Fetch the result of a Data Lab background job (ranked candidates for a tiled search).",
+            function=self._datalab_job_results,
+            parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_job_cancel",
+            description="Cancel a running Data Lab background job.",
+            function=self._datalab_job_cancel,
+            parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_export_notebook",
+            description="Export a reproducible Jupyter notebook for a Data Lab analysis: the governed TAP SQL (qc.query(sql=...)), an optional SIA cutout recipe, an optional SVO filter-wavelength lookup, and a data-citation cell.",
+            function=self._datalab_export_notebook,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "default": "NOIRLab Data Lab analysis"},
+                    "sql": {"type": "string", "description": "The governed native SQL to reproduce (e.g. a datalab tool's query_summary)."},
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "sia_ra": {"type": "number"},
+                    "sia_dec": {"type": "number"},
+                    "sia_fov_deg": {"type": "number", "default": 0.1},
+                    "sia_endpoint": {"type": "string"},
+                    "svo_filters": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [],
+            },
+            category="datalab",
+        ))
         self.tool_registry.register(Tool(
             name="get_sky_image",
             description=(
@@ -4780,6 +5240,683 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     # ── Sky Survey Image Handler ───────────────────────────────────────
 
+
+    # Data Lab P0 handlers
+
+    def _get_datalab_client(self) -> DatalabClient:
+        if not hasattr(self, "_datalab_client_instance"):
+            self._datalab_client_instance = DatalabClient()
+        return self._datalab_client_instance
+
+    def _get_datalab_result_store(self):
+        if not hasattr(self, "_datalab_result_store_instance"):
+            self._datalab_result_store_instance = default_result_store()
+        return self._datalab_result_store_instance
+
+    def _datalab_list_catalogs(self) -> Dict[str, Any]:
+        self.last_run_result = None  # Data Lab tools emit summaries, not stale data cards
+        try:
+            catalogs = datalab_registry.list_catalogs()
+            return {"success": True, "catalogs": catalogs, "count": len(catalogs)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _datalab_describe_table(self, catalog: str, table: str) -> Dict[str, Any]:
+        self.last_run_result = None  # Data Lab tools emit summaries, not stale data cards
+        try:
+            return {"success": True, "table": datalab_registry.describe_table(catalog, table)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _datalab_cone_count(self, catalog: str, table: str, ra: float, dec: float, radius_deg: float) -> Dict[str, Any]:
+        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
+        try:
+            sql, meta = datalab_query_builders.build_cone_count(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg)
+            return self._execute_datalab_sql(sql, meta, tool_name="datalab_cone_count")
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_select_catalog_rows(
+        self,
+        catalog: str,
+        table: str,
+        ra: float,
+        dec: float,
+        radius_deg: float,
+        columns: Optional[List[str]] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
+        try:
+            sql, meta = datalab_query_builders.build_cone_select(
+                catalog, table, ra=ra, dec=dec, radius_deg=radius_deg, columns=columns, limit=limit
+            )
+            return self._execute_datalab_sql(sql, meta, tool_name="datalab_select_catalog_rows")
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_density_aggregate(
+        self,
+        catalog: str,
+        table: str,
+        mode: str = "grid",
+        step_deg: float = 0.1,
+        healpix_column: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_deg: Optional[float] = None,
+        all_sky: bool = False,
+        color_cut: Optional[Dict[str, Any]] = None,
+        value_cuts: Optional[List[Dict[str, Any]]] = None,
+        morphology: Optional[Dict[str, Any]] = None,
+        limit: int = 5000,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
+        try:
+            predicates = datalab_query_builders.build_catalog_predicates(
+                catalog, table, color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
+            )
+            sql, meta = datalab_query_builders.build_density_aggregate(
+                catalog, table, mode=mode, step_deg=step_deg, healpix_column=healpix_column,
+                ra=ra, dec=dec, radius_deg=radius_deg, all_sky=all_sky, predicates=predicates, limit=limit,
+            )
+            return self._execute_datalab_sql(sql, meta, tool_name="datalab_density_aggregate")
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_q3c_crossmatch(
+        self,
+        ra: float,
+        dec: float,
+        radius_deg: float,
+        small_catalog: str = "gaia_dr3",
+        small_table: str = "gaia_source",
+        big_catalog: str = "nsc_dr2",
+        big_table: str = "object",
+        match_radius_arcsec: float = 1.0,
+        small_columns: Optional[List[str]] = None,
+        big_columns: Optional[List[str]] = None,
+        small_limit: int = 10000,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
+        try:
+            sql, meta = datalab_query_builders.build_q3c_crossmatch(
+                small_catalog=small_catalog,
+                small_table=small_table,
+                big_catalog=big_catalog,
+                big_table=big_table,
+                ra=ra,
+                dec=dec,
+                radius_deg=radius_deg,
+                match_radius_arcsec=match_radius_arcsec,
+                small_columns=small_columns,
+                big_columns=big_columns,
+                small_limit=small_limit,
+                limit=limit,
+            )
+            return self._execute_datalab_sql(sql, meta, tool_name="datalab_q3c_crossmatch")
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_sql_query(self, sql: str, expert_ack: bool = False, reason: str = "") -> Dict[str, Any]:
+        self.last_run_result = None  # clear before the early expert-ack rejection path too
+        try:
+            if expert_ack is not True or not str(reason or "").strip():
+                return {
+                    "success": False,
+                    "error": "datalab_sql_query is restricted expert/debug mode and requires expert_ack=true plus a reason.",
+                }
+            meta = {"source": "expert", "builder": "raw_sql", "expert_reason": str(reason).strip()}
+            return self._execute_datalab_sql(sql, meta, tool_name="datalab_sql_query", source="expert")
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _execute_datalab_sql(
+        self,
+        sql: str,
+        meta: Dict[str, Any],
+        *,
+        tool_name: str,
+        source: str = "builder",
+    ) -> Dict[str, Any]:
+        # Data Lab tools return summaries/result_ids, not data cards; clear any prior
+        # tool's last_run_result so the streaming loop can't re-emit a stale card.
+        self.last_run_result = None
+        try:
+            validated = datalab_sql_policy.validate(sql, source=source, meta=meta)
+            result = self._get_datalab_client().query(sql=validated.sql, fmt="pandas")
+            store_meta = {
+                **validated.meta,
+                "tool_name": tool_name,
+                "validated_sql": validated.sql,
+                "warnings": validated.warnings,
+                "provenance": {
+                    **result.provenance,
+                    "query": validated.sql,
+                    "tool_name": tool_name,
+                    "policy_source": source,
+                },
+            }
+            result_id = self._get_datalab_result_store().put(result.dataframe, store_meta)
+            preview_rows, preview_more = self._datalab_fit_rows(result.dataframe, 10, char_budget=4000)
+            summary: Dict[str, Any] = {
+                "success": True,
+                "tool_name": tool_name,
+                "result_id": result_id,
+                "rowcount": int(len(result.dataframe)),
+                "columns": result.columns[:30],
+                "warnings": validated.warnings,
+                "catalog": validated.meta.get("catalog") or result.provenance.get("catalog"),
+                "table": validated.meta.get("table") or result.provenance.get("table"),
+                "query_summary": self._datalab_query_summary(validated.sql),
+                "preview": preview_rows,
+                "preview_truncated": preview_more,
+                "note": "Preview shows the first rows; fetch up to 5000 rows with datalab_get_result(result_id).",
+            }
+            if "row_count" in result.dataframe.columns and not result.dataframe.empty:
+                summary["reported_count"] = int(result.dataframe.iloc[0]["row_count"])
+            return summary
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_error(self, error: Exception) -> Dict[str, Any]:
+        payload = {"success": False, "error": str(error)}
+        if isinstance(error, datalab_sql_policy.DatalabPolicyError):
+            payload["fix_hint"] = error.fix_hint
+        return payload
+
+    @staticmethod
+    def _datalab_query_summary(sql: str) -> str:
+        compact = " ".join(str(sql or "").split())
+        return compact[:700] + ("..." if len(compact) > 700 else "")
+
+    @staticmethod
+    def _datalab_fit_rows(frame, max_rows: int, *, char_budget: int = 6000):
+        """Return (rows, truncated) trimmed so the JSON stays under char_budget.
+
+        Tool outputs are sliced at 8000 chars downstream; an unbounded row dump
+        would be cut mid-structure into invalid JSON. Trimming the row count here
+        keeps the payload valid and self-describing via the truncated flag.
+        """
+        total = int(len(frame))
+        if total == 0:
+            return [], False
+        n = max(1, min(int(max_rows or 1), total))
+        rows = frame.head(n).to_dict(orient="records")
+        truncated = total > len(rows)
+        blob = json.dumps(rows, default=str)
+        if len(blob) > char_budget:
+            # Estimate how many rows fit (one dump), then trim in small steps —
+            # avoids an O(n^2) pop-one-at-a-time loop on large results.
+            avg = max(1, len(blob) // max(1, len(rows)))
+            rows = rows[: max(1, char_budget // avg)]
+            truncated = True
+            while len(rows) > 1 and len(json.dumps(rows, default=str)) > char_budget:
+                rows = rows[: max(1, len(rows) - 5)]
+        # A single very wide row can still exceed the budget (e.g. a long text/description
+        # column); clip long string cells so the payload stays valid after the 8000-char slice.
+        if rows and len(json.dumps(rows, default=str)) > char_budget:
+            ncols = max(1, len(rows[0]))
+            per_cell = max(40, char_budget // (len(rows) * ncols))
+            rows = [
+                {k: (v[:per_cell] + "…" if isinstance(v, str) and len(v) > per_cell else v) for k, v in r.items()}
+                for r in rows
+            ]
+            truncated = True
+        return rows, truncated
+
+    def _datalab_get_result(self, result_id: str, max_rows: int = 200) -> Dict[str, Any]:
+        """Fetch stored Data Lab rows (size-bounded) for a result_id from a prior tool."""
+        self.last_run_result = None
+        try:
+            res = self._get_datalab_result_store().get(result_id)
+            cap = max(1, min(int(max_rows or 200), 5000))
+            rows, truncated = self._datalab_fit_rows(res.dataframe, cap)
+            return {
+                "success": True,
+                "result_id": result_id,
+                "rowcount": int(len(res.dataframe)),
+                "returned_rows": len(rows),
+                "columns": res.columns,
+                "rows": rows,
+                "provenance": res.provenance,
+                "truncated": truncated,
+            }
+        except Exception as e:
+            return self._datalab_error(e)
+
+    # Data Lab P1 handlers
+
+    def _get_datalab_image_service(self):
+        if not hasattr(self, "_datalab_image_service_instance"):
+            from services.datalab_image_service import DatalabImageService
+
+            self._datalab_image_service_instance = DatalabImageService()
+        return self._datalab_image_service_instance
+
+    def _get_svo_fps_client(self):
+        if not hasattr(self, "_svo_fps_client_instance"):
+            from integrations.svo_fps_client import SvoFpsClient
+
+            self._svo_fps_client_instance = SvoFpsClient()
+        return self._svo_fps_client_instance
+
+    def _datalab_coordinates(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+    ) -> Tuple[float, float, str]:
+        if ra is not None and dec is not None:
+            ra_f, dec_f = float(ra), float(dec)
+            if not 0.0 <= ra_f < 360.0 or not -90.0 <= dec_f <= 90.0:
+                raise ValueError("ra/dec must be valid ICRS degrees")
+            return ra_f, dec_f, f"RA={ra_f:.5f}, Dec={dec_f:.5f}"
+        if target_name:
+            resolved = self._resolve_target(str(target_name))
+            if not resolved.get("success"):
+                raise ValueError(resolved.get("error") or f"Could not resolve target {target_name!r}")
+            return float(resolved["ra_deg"]), float(resolved["dec_deg"]), str(target_name)
+        raise ValueError("Provide either ra+dec or target_name")
+
+    # ── P2 orchestration handlers (Tier 6-7) ───────────────────────────────
+    def _datalab_confirm_sky_area(self, ra_min: float, ra_max: float, dec_min: float, dec_max: float, tile_radius_deg: float = 2.0) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            fp = {"ra_min": ra_min, "ra_max": ra_max, "dec_min": dec_min, "dec_max": dec_max}
+            return {"success": True, **datalab_orchestration.confirm_sky_area(fp, float(tile_radius_deg))}
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_density_vetting(
+        self,
+        catalog: str,
+        table: str,
+        radius_deg: float,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        target_name: Optional[str] = None,
+        step_deg: float = 0.05,
+        color_cut: Optional[Dict[str, Any]] = None,
+        value_cuts: Optional[List[Dict[str, Any]]] = None,
+        morphology: Optional[Dict[str, Any]] = None,
+        top_n: int = 5,
+        fov_deg: float = 0.05,
+        band: str = "g",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
+            out = datalab_orchestration.density_then_cutouts(
+                catalog, table, ra_f, dec_f, float(radius_deg), step_deg=float(step_deg),
+                color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
+                top_n=int(top_n), fov_deg=float(fov_deg), band=band,
+            )
+            out["target"] = label
+            return out
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_tiled_search(
+        self,
+        catalog: str,
+        table: str,
+        ra_min: float,
+        ra_max: float,
+        dec_min: float,
+        dec_max: float,
+        tile_radius_deg: float = 2.0,
+        step_deg: float = 0.05,
+        color_cut: Optional[Dict[str, Any]] = None,
+        value_cuts: Optional[List[Dict[str, Any]]] = None,
+        morphology: Optional[Dict[str, Any]] = None,
+        peak_threshold: float = 3.0,
+        max_tiles: int = 64,
+        candidate_budget: int = 50,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            fp = {"ra_min": ra_min, "ra_max": ra_max, "dec_min": dec_min, "dec_max": dec_max}
+            decision = datalab_orchestration.confirm_sky_area(fp, float(tile_radius_deg), max_tiles=int(max_tiles))
+            # HITL gate: don't start a wide scan until the user confirms the area.
+            if decision["needs_confirmation"] and not confirm:
+                return {"success": False, "needs_confirmation": True, **decision,
+                        "hint": "Re-call datalab_tiled_search with confirm=true to run the scan over this area."}
+
+            def _job(cancel_check):
+                return datalab_orchestration.tiled_sky_scan(
+                    catalog, table, fp, tile_radius_deg=float(tile_radius_deg), step_deg=float(step_deg),
+                    color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
+                    peak_threshold=float(peak_threshold), max_tiles=int(max_tiles),
+                    candidate_budget=int(candidate_budget), confirm=True, cancel_check=cancel_check,
+                )
+
+            job_id = default_job_service().start("tiled_sky_scan", _job, params={"catalog": catalog, "table": table, **fp})
+            return {"success": True, "job_id": job_id, "status": "queued", **decision,
+                    "note": "Tiled scan started; poll with datalab_job_status / datalab_job_results."}
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_job_status(self, job_id: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            return {"success": True, **default_job_service().status(job_id)}
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_job_results(self, job_id: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            return {"success": True, **default_job_service().results(job_id)}
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_job_cancel(self, job_id: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            return {"success": True, **default_job_service().cancel(job_id)}
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_export_notebook(
+        self,
+        title: str = "NOIRLab Data Lab analysis",
+        sql: Optional[str] = None,
+        catalog: Optional[str] = None,
+        table: Optional[str] = None,
+        sia_ra: Optional[float] = None,
+        sia_dec: Optional[float] = None,
+        sia_fov_deg: float = 0.1,
+        sia_endpoint: Optional[str] = None,
+        svo_filters: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        # NB: _generate_notebook sets last_run_result to the notebook card (the deliverable),
+        # so we intentionally do NOT clear last_run_result here.
+        try:
+            from services.notebook_gen import datalab_notebook_steps
+            citation = None
+            if catalog:
+                try:
+                    citation = datalab_registry.citation(catalog)
+                except Exception:
+                    citation = None
+            sia = None
+            if sia_ra is not None and sia_dec is not None:
+                sia = {"ra": sia_ra, "dec": sia_dec, "fov_deg": sia_fov_deg, "endpoint": sia_endpoint}
+            steps = datalab_notebook_steps(
+                sql=sql, catalog=catalog, table=table, sia=sia, svo_filters=svo_filters, citation=citation,
+            )
+            return self._generate_notebook(title, steps)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_attach_image_result(self, result: Dict[str, Any], caption: str) -> Dict[str, Any]:
+        if result.get("success") and result.get("path") and not result.get("coverage_gap"):
+            self.last_run_result = {
+                "type": "image",
+                "image_url": result["path"],
+                "caption": caption,
+            }
+        return result
+
+    def _datalab_image_cutout(
+        self,
+        fov_deg: float,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        target_name: Optional[str] = None,
+        band: str = "g",
+        catalog: str = "ls_dr9",
+        endpoint: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
+            caption = title or f"Data Lab {band}-band cutout: {label}"
+            result = self._get_datalab_image_service().cutout(
+                ra_f,
+                dec_f,
+                float(fov_deg),
+                band=band,
+                catalog=catalog,
+                endpoint=endpoint,
+                title=caption,
+            )
+            return self._datalab_attach_image_result(result, caption)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_color_image(
+        self,
+        fov_deg: float,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        target_name: Optional[str] = None,
+        catalog: str = "ls_dr9",
+        endpoint: Optional[str] = None,
+        bands: Optional[List[str]] = None,
+        q: float = 8.0,
+        stretch: float = 0.5,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
+            caption = title or f"Data Lab color image: {label}"
+            result = self._get_datalab_image_service().color_image(
+                ra_f,
+                dec_f,
+                float(fov_deg),
+                catalog=catalog,
+                endpoint=endpoint,
+                bands=bands,
+                q=float(q),
+                stretch=float(stretch),
+                title=caption,
+            )
+            return self._datalab_attach_image_result(result, caption)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_cutout_grid(
+        self,
+        peaks: List[Dict[str, Any]],
+        fov_deg: float,
+        band: str = "g",
+        catalog: str = "ls_dr9",
+        endpoint: Optional[str] = None,
+        title: str = "Data Lab cutout grid",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_datalab_image_service().cutout_grid(
+                peaks,
+                float(fov_deg),
+                band=band,
+                catalog=catalog,
+                endpoint=endpoint,
+                title=title,
+            )
+            return self._datalab_attach_image_result(result, title)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _svo_filter_wavelength(
+        self,
+        filter_id: Optional[str] = None,
+        filter_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            client = self._get_svo_fps_client()
+            if filter_ids:
+                return {"success": True, "wavelengths": client.wavelengths(filter_ids)}
+            if filter_id:
+                return client.wavelength(filter_id)
+            return {"success": False, "error": "Provide filter_id or filter_ids"}
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_catalog_scatter(
+        self,
+        result_id: str,
+        x_expr: str,
+        y_expr: str,
+        color_by: Optional[str] = None,
+        invert_y: bool = False,
+        invert_x: bool = False,
+        title: str = "Data Lab catalog scatter",
+        x_label: Optional[str] = None,
+        y_label: Optional[str] = None,
+        overlay_locus: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            from services import datalab_analysis
+
+            result = datalab_analysis.catalog_scatter(
+                result_id,
+                x_expr,
+                y_expr,
+                color_by=color_by,
+                invert_y=invert_y,
+                invert_x=invert_x,
+                title=title,
+                x_label=x_label,
+                y_label=y_label,
+                overlay_locus=overlay_locus,
+                result_store=self._get_datalab_result_store(),
+            )
+            return self._datalab_attach_image_result(result, title)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_sky_density_map(
+        self,
+        result_id: str,
+        mode: str = "hist2d",
+        ra_col: Optional[str] = None,
+        dec_col: Optional[str] = None,
+        count_col: str = "source_count",
+        bins: int = 80,
+        healpix_col: str = "healpix",
+        nside: Optional[int] = None,
+        order: str = "nested",
+        matched_filter: bool = False,
+        sigma_small: float = 1.0,
+        sigma_large: float = 3.0,
+        peak_threshold: float = 3.0,
+        max_peaks: int = 10,
+        title: str = "Data Lab sky density map",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            from services import datalab_analysis
+
+            result = datalab_analysis.sky_density_map(
+                result_id,
+                mode=mode,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                count_col=count_col,
+                bins=bins,
+                healpix_col=healpix_col,
+                nside=nside,
+                order=order,
+                matched_filter=matched_filter,
+                sigma_small=sigma_small,
+                sigma_large=sigma_large,
+                peak_threshold=peak_threshold,
+                max_peaks=max_peaks,
+                title=title,
+                result_store=self._get_datalab_result_store(),
+            )
+            return self._datalab_attach_image_result(result, title)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_period_fold(
+        self,
+        result_id: str,
+        time_col: str = "mjd",
+        mag_col: str = "cmag",
+        error_col: Optional[str] = "cerr",
+        min_frequency: float = 1.0,
+        max_frequency: float = 10.0,
+        title: str = "Data Lab period-folded light curve",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            from services import datalab_analysis
+
+            result = datalab_analysis.period_fold(
+                result_id,
+                time_col=time_col,
+                mag_col=mag_col,
+                error_col=error_col,
+                min_frequency=min_frequency,
+                max_frequency=max_frequency,
+                title=title,
+                result_store=self._get_datalab_result_store(),
+            )
+            return self._datalab_attach_image_result(result, title)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_sed_plot(
+        self,
+        result_id: str,
+        row_index: int = 0,
+        filter_columns: Optional[Dict[str, str]] = None,
+        title: str = "Data Lab SED",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            from services import datalab_analysis
+
+            result = datalab_analysis.sed_plot(
+                result_id,
+                row_index=row_index,
+                filter_columns=filter_columns,
+                title=title,
+                result_store=self._get_datalab_result_store(),
+                svo_client=self._get_svo_fps_client(),
+            )
+            return self._datalab_attach_image_result(result, title)
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_lss_wedge(
+        self,
+        result_id: str,
+        ra_col: Optional[str] = None,
+        dec_col: Optional[str] = None,
+        z_col: str = "z",
+        class_col: Optional[str] = None,
+        pie_slice: bool = False,
+        title: str = "Data Lab large-scale structure wedge",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            from services import datalab_analysis
+
+            result = datalab_analysis.lss_wedge(
+                result_id,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                z_col=z_col,
+                class_col=class_col,
+                pie_slice=pie_slice,
+                title=title,
+                result_store=self._get_datalab_result_store(),
+            )
+            return self._datalab_attach_image_result(result, title)
+        except Exception as e:
+            return self._datalab_error(e)
+
     def _get_sky_image(self, target_name: Optional[str] = None,
                        survey: str = "dss2",
                        radius_arcmin: float = 5.0,
@@ -7406,12 +8543,12 @@ IMPORTANT RULES:
             re.search(r"\bperseus\b", _query_lower)
             and re.search(r"\bprotostar", _query_lower)
             and re.search(r"\balma\b", _query_lower)
-            and re.search(r"\bjwst|mast\b", _query_lower)
+            and re.search(r"\b(?:jwst|mast)\b", _query_lower)
         )
         _is_archive_overlay_query = bool(
-            re.search(r"\boverlay|contours?\b", _query_lower)
+            re.search(r"\b(?:overlay|contours?)\b", _query_lower)
             and re.search(r"\balma\b", _query_lower)
-            and re.search(r"\bjwst|mast\b", _query_lower)
+            and re.search(r"\b(?:jwst|mast)\b", _query_lower)
         )
         if _is_cross_archive_source_match_query or _is_archive_overlay_query:
             _should_rag = False
