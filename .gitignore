@@ -101,6 +101,8 @@ scratch_*.py
 /ui-pro/public/next.svg
 /ui-pro/public/vercel.svg
 /ui-pro/public/window.svg
+/ui-pro/public/plots/
+
 
 # ============================================
 # Root-only research/review artifacts

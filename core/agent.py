@@ -5432,6 +5432,38 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         return compact[:700] + ("..." if len(compact) > 700 else "")
 
     @staticmethod
+    def _summarize_tool_outcomes(tool_results) -> str:
+        """When the model called tools but emitted no final text, summarize what the tools
+        did (and surface any errors) so the user gets a useful reply — and so a silent failure
+        becomes self-explaining — instead of the dead-end 'didn't generate a text response'."""
+        produced, errors, queried = [], [], []
+        for tr in (tool_results or []):
+            try:
+                out = json.loads(tr.get("output") or "{}")
+            except Exception:
+                continue
+            if not isinstance(out, dict):
+                continue
+            if out.get("error"):
+                errors.append(str(out["error"]))
+            elif out.get("success"):
+                if out.get("image_attached") or out.get("path") or out.get("image_base64"):
+                    produced.append("a plot/image")
+                elif out.get("coverage_gap"):
+                    produced.append("a coverage-gap result (no image at this position)")
+                elif out.get("result_id") is not None:
+                    cat, tab, rc = out.get("catalog") or "", out.get("table") or "", out.get("rowcount")
+                    queried.append((f"{cat}.{tab}".strip(".") or "a Data Lab table") + (f" ({rc} rows)" if rc is not None else ""))
+        parts = []
+        if queried:
+            parts.append("Queried Data Lab: " + "; ".join(dict.fromkeys(queried)) + ".")
+        if produced:
+            parts.append("Produced " + "; ".join(dict.fromkeys(produced)) + " (shown above).")
+        if errors:
+            parts.append("Some steps failed: " + "; ".join(dict.fromkeys(errors))[:500])
+        return " ".join(parts)
+
+    @staticmethod
     def _datalab_fit_rows(frame, max_rows: int, *, char_budget: int = 6000):
         """Return (rows, truncated) trimmed so the JSON stays under char_budget.
 
@@ -9572,6 +9604,14 @@ IMPORTANT RULES:
                 output_text = self._synthesize_web_tool_answer(_user_query, _web_tool_results)
                 if output_text and on_token:
                     on_token(output_text)
+            # Safety net: the model called tools but produced no final text. Summarize what
+            # the tools did (incl. errors) so the user gets a useful, self-explaining reply.
+            if not output_text and _had_tool_calls:
+                _tool_summary = self._summarize_tool_outcomes(locals().get("tool_results"))
+                if _tool_summary:
+                    output_text = _tool_summary
+                    if on_token:
+                        on_token(output_text)
             if not output_text and (not _had_tool_calls or not _has_rich_tool_output):
                 output_text = "I processed your query but didn't generate a text response. Please try rephrasing."
                 if on_token:
