@@ -311,13 +311,24 @@ class DatalabImageService:
     def _gap_result(search: Mapping[str, Any], *, bands: Sequence[str], provenance_extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         provenance = dict(search.get("provenance") or {})
         provenance.update(dict(provenance_extra or {}))
+        missing = list((provenance_extra or {}).get("missing_bands") or [])
+        note = (
+            "No image produced (coverage gap): insufficient DECam coverage at this position"
+            + (f" — missing band(s) {missing}; only {list(bands)} available." if missing
+               else f" — only {list(bands)} band(s) available." if bands
+               else " — the SIA search returned 0 rows.")
+            + " NOIRLab Astro Data Lab / DECam Legacy Surveys coverage is limited here. Report the"
+            " coverage gap to the user; do NOT describe an image, and do NOT claim any bands were rendered."
+        )
         return {
             "success": True,
             "image_base64": None,
             "path": None,
             "used_endpoint": search.get("used_endpoint"),
-            "bands_used": list(bands),
+            "bands_used": [],            # no image was rendered, so no bands were used
+            "available_bands": list(bands),
             "coverage_gap": True,
+            "note": note,
             "provenance": provenance,
         }
 

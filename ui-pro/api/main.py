@@ -180,6 +180,17 @@ _RENDERED_IMAGES_DIR = _os.path.join(_os.path.dirname(__file__), "..", "..", "da
 _os.makedirs(_RENDERED_IMAGES_DIR, exist_ok=True)
 app.mount("/api/images", StaticFiles(directory=_RENDERED_IMAGES_DIR), name="rendered_images")
 
+# ── Static file serving for matplotlib-rendered plots ─────────────
+# PlottingService writes PNGs here and returns web_url "/plots/<file>.png" (CMDs, sky maps,
+# Data Lab analysis plots). Mount it so those URLs resolve — previously only /api/images was
+# served, so every /plots image 404'd and never displayed in chat.
+try:
+    from services.plotting import PLOT_OUTPUT_DIR as _PLOT_OUTPUT_DIR
+    _os.makedirs(_PLOT_OUTPUT_DIR, exist_ok=True)
+    app.mount("/plots", StaticFiles(directory=_PLOT_OUTPUT_DIR), name="plots")
+except Exception as _plots_mount_err:  # pragma: no cover - best-effort mount
+    print(f"[startup] Could not mount /plots static dir: {_plots_mount_err}")
+
 # ── Plan Feedback Registry (Human-in-the-Loop) ────────────────────────────────
 # Maps conversation_id → stdlib_queue.Queue for plan review blocking.
 # When the Conductor emits a plan_review event, it blocks on the queue.

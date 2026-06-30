@@ -5653,12 +5653,23 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             return self._datalab_error(e)
 
     def _datalab_attach_image_result(self, result: Dict[str, Any], caption: str) -> Dict[str, Any]:
-        if result.get("success") and result.get("path") and not result.get("coverage_gap"):
-            self.last_run_result = {
-                "type": "image",
-                "image_url": result["path"],
-                "caption": caption,
-            }
+        # Surface a displayable image card. Prefer the served path ("/plots/...", now mounted by
+        # the API); fall back to a base64 data URI so the image still renders if no path is set.
+        if result.get("success") and not result.get("coverage_gap"):
+            b64 = result.get("image_base64")
+            image_url = result.get("path") or (f"data:image/png;base64,{b64}" if b64 else None)
+            if image_url:
+                self.last_run_result = {
+                    "type": "image",
+                    "image_url": image_url,
+                    "caption": caption,
+                }
+        # Keep the heavy base64 OUT of the LLM-facing tool result: it bloats context and, worse,
+        # gets truncated mid-string by the 8000-char tool-output slice → malformed JSON → the model
+        # emits an empty response ("didn't generate a text response"). The image goes to the UI card above.
+        if result.get("image_base64"):
+            result = {k: v for k, v in result.items() if k != "image_base64"}
+            result["image_attached"] = True
         return result
 
     def _datalab_image_cutout(

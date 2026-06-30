@@ -275,6 +275,38 @@ def test_rag_gate_tiered_accept_reject():
     assert is_domain_relevant("show the proposal deadlines for cycle 12") is True              # broad keyword, no off-domain stem
 
 
+# ── Image display wiring (why Data Lab images render in chat) ──────────────────
+def test_attach_image_result_strips_base64_and_sets_card():
+    from tests.unit.test_datalab_p0 import _make_agent
+    agent = _make_agent()
+    agent.last_run_result = None
+    result = {"success": True, "path": "/plots/x.png", "image_base64": "AAAA" * 5000}
+    out = agent._datalab_attach_image_result(result, "cap")
+    # Heavy base64 is stripped from the LLM-facing result (prevents 8000-char truncation → empty reply).
+    assert "image_base64" not in out and out["image_attached"] is True
+    # UI image card is set with the servable /plots path.
+    assert agent.last_run_result == {"type": "image", "image_url": "/plots/x.png", "caption": "cap"}
+
+
+def test_attach_image_result_falls_back_to_data_uri():
+    from tests.unit.test_datalab_p0 import _make_agent
+    agent = _make_agent()
+    out = agent._datalab_attach_image_result({"success": True, "path": None, "image_base64": "QUJD"}, "c")
+    assert agent.last_run_result["image_url"].startswith("data:image/png;base64,QUJD")
+    assert "image_base64" not in out
+
+
+def test_attach_image_result_no_card_on_coverage_gap():
+    from tests.unit.test_datalab_p0 import _make_agent
+    agent = _make_agent()
+    agent.last_run_result = "PRIOR"
+    out = agent._datalab_attach_image_result(
+        {"success": True, "coverage_gap": True, "image_base64": None, "path": None, "bands_used": []}, "c"
+    )
+    assert agent.last_run_result == "PRIOR"  # coverage gap → no image card forced
+    assert out["coverage_gap"] is True
+
+
 
 
 
