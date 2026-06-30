@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from services import datalab_registry as registry
+
+# A safe SQL column identifier. The registry's column lists are NOT exhaustive (catalogs have
+# hundreds of columns), so we accept any safe identifier and let Data Lab validate it server-side
+# rather than hard-failing a whole task on an unlisted-but-real column.
+_SAFE_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 DEFAULT_ROW_LIMIT = 500
@@ -412,15 +418,14 @@ def _meta(builder: str, info: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
 
 
 def _column_list(info: Dict[str, Any], columns: Optional[Sequence[str]], *, required: Optional[Sequence[str]] = None) -> List[str]:
-    allowed = set(info.get("columns") or [])
     requested = list(columns or list(info.get("columns") or []))
     for col in required or []:
         if col not in requested:
             requested.insert(0, col)
     result = []
     for col in requested:
-        clean = _column(info, col)
-        if clean in allowed and clean not in result:
+        clean = _column(info, col)  # permissive: keeps any safe identifier, not only registered ones
+        if clean not in result:
             result.append(clean)
     if not result:
         raise ValueError("No valid columns selected")
@@ -438,9 +443,13 @@ def _prefixed_columns(prefix: str, columns: Iterable[str]) -> str:
 def _column(info: Dict[str, Any], column: str) -> str:
     text = str(column or "").strip().lower()
     allowed = set(info.get("columns") or [])
-    if text not in allowed:
-        raise ValueError(f"Column {column!r} is not registered for {info['qualified_name']}")
-    return text
+    if text in allowed:
+        return text
+    # Not in the seed registry — accept any safe identifier and let Data Lab validate it,
+    # instead of hard-failing the task (the registry can't list every column of a catalog).
+    if _SAFE_IDENT_RE.match(text):
+        return text
+    raise ValueError(f"Invalid column identifier {column!r} for {info['qualified_name']}")
 
 
 def _healpix_column(info: Dict[str, Any], column: Optional[str]) -> str:

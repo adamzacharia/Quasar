@@ -78,12 +78,17 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "region_strategy": "q3c",
         "tables": {
             "main": {
+                # DES DR1 columns are PER-BAND (verified against the live service): there is no bare
+                # `spread_model` or `class_star` — use spread_model_r / class_star_r, etc.
                 "columns": [
                     "coadd_object_id", "ra", "dec",
                     "mag_auto_g", "mag_auto_r", "mag_auto_i", "mag_auto_z",
-                    "magerr_auto_g", "magerr_auto_r", "magerr_auto_i",
-                    "fluxerr_auto_g", "fluxerr_auto_r", "fluxerr_auto_i",
-                    "spread_model_r", "flags_g", "flags_r", "flags_i",
+                    "mag_auto_g_dered", "mag_auto_r_dered", "mag_auto_i_dered", "mag_auto_z_dered",
+                    "magerr_auto_g", "magerr_auto_r", "magerr_auto_i", "magerr_auto_z",
+                    "flags_g", "flags_r", "flags_i", "flags_z",
+                    "spread_model_g", "spread_model_r", "spread_model_i", "spread_model_z",
+                    "spreaderr_model_r",
+                    "class_star_g", "class_star_r", "class_star_i", "class_star_z",
                 ],
                 "ra_column": "ra",
                 "dec_column": "dec",
@@ -91,7 +96,10 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
             }
         },
         "healpix_columns": [],
-        "morphology": {"spread_model_r": "spread_model_r > 0.003 => galaxy, else star"},
+        "morphology": {
+            "spread_model_r": "DES star/galaxy via spread_model_r > 0.005 => galaxy, ~0 => star. PER-BAND column — use spread_model_r (not 'spread_model'); also spread_model_g/i/z.",
+            "class_star_r": "class_star_r near 1 = star-like (per-band: class_star_g/i/z).",
+        },
         "bitmasks": {},
         "sia_endpoints": [],
         "citation": {"text": "Dark Energy Survey Data Release 1", "doi": "10.3847/1538-4365/ab4f2b", "url": "https://des.ncsa.illinois.edu/releases/dr1"},
@@ -274,7 +282,14 @@ def describe_table(catalog: str, table: str) -> Dict[str, Any]:
         raise ValueError(f"Unknown Data Lab catalog: {catalog}")
     tables = DATALAB_CATALOGS[catalog_key].get("tables", {})
     if table_key not in tables:
-        raise ValueError(f"Unknown Data Lab table: {catalog_key}.{table_key}")
+        if len(tables) == 1:
+            # Tolerate a wrong table name when the catalog has exactly one table — the agent
+            # commonly guesses 'object'/'main'; resolve to the catalog's canonical table.
+            table_key = next(iter(tables))
+        else:
+            raise ValueError(
+                f"Unknown Data Lab table: {catalog_key}.{table_key}. Available tables: {sorted(tables)}"
+            )
     entry = DATALAB_CATALOGS[catalog_key]
     table_entry = dict(tables[table_key])
     return {
@@ -291,6 +306,34 @@ def describe_table(catalog: str, table: str) -> Dict[str, Any]:
         "aggregate_safe": bool(table_entry.get("aggregate_safe")),
         "citation": dict(entry.get("citation", {})),
     }
+
+
+# Per-table magnitude column naming (band -> column). Used by the one-shot diagram tools so
+# the agent need not know each catalog's column convention.
+_MAG_TEMPLATES = {
+    "des_dr1.main": "mag_auto_{band}",
+    "nsc_dr2.object": "{band}mag",
+    "smash_dr1.object": "{band}mag",
+    "smash_dr2.object": "{band}mag",
+    "delve_dr3.coadd_objects": "mag_auto_{band}",
+    "ls_dr9.tractor": "dered_mag_{band}",
+}
+
+
+def mag_column(catalog: str, table: str, band: str) -> str:
+    """Resolve a band ('g','r','i','z',...) to its magnitude column for a catalog."""
+    info = describe_table(catalog, table)
+    template = _MAG_TEMPLATES.get(info["qualified_name"], "{band}mag")
+    return template.format(band=str(band).strip().lower())
+
+
+def morphology_split_column(catalog: str, table: str) -> Optional[str]:
+    """Best star/galaxy separation column for a catalog (spread_model_* preferred), or None."""
+    morph = dict(describe_table(catalog, table).get("morphology", {}))
+    for key in morph:
+        if "spread_model" in key or key == "ext_coadd":
+            return key
+    return None
 
 
 def region_strategy(catalog: str, table: str) -> str:

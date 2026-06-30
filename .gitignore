@@ -67,6 +67,8 @@ tmp/
 tmp_*.py
 scratch_*.py
 *.log
+*.log.mark
+
 
 # ============================================
 # Generated/runtime artifacts

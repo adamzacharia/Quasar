@@ -2081,6 +2081,51 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="datalab",
         ))
         self.tool_registry.register(Tool(
+            name="datalab_color_color_diagram",
+            description="ONE-SHOT color-color diagram (e.g. g-r vs r-i) for a catalog cone. Queries + plots in a single call; auto-splits into stars vs galaxies (2 panels) using the catalog's morphology column (e.g. DES spread_model_r) unless split_col is given. Use this for 'show me a color-color diagram'/'separate stars from galaxies' requests — do NOT chain separate query+plot tools.",
+            function=self._datalab_color_color_diagram,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "radius_deg": {"type": "number", "default": 0.5},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "target_name": {"type": "string"},
+                    "x_bands": {"type": "array", "items": {"type": "string"}, "description": "Two bands for the x color, e.g. ['g','r']."},
+                    "y_bands": {"type": "array", "items": {"type": "string"}, "description": "Two bands for the y color, e.g. ['r','i']."},
+                    "split_col": {"type": "string", "description": "Morphology column to split stars/galaxies (auto from registry if omitted, e.g. spread_model_r)."},
+                    "split_threshold": {"type": "number", "default": 0.005},
+                    "limit": {"type": "integer", "default": 3000},
+                },
+                "required": ["catalog", "table"],
+            },
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
+            name="datalab_color_magnitude_diagram",
+            description="ONE-SHOT color-magnitude diagram (CMD): mag_band vs (blue-red) color for a catalog cone. Queries + plots in a single call (magnitude axis inverted). Use this for 'plot a CMD'/'g vs g-r' requests instead of chaining query+plot tools.",
+            function=self._datalab_color_magnitude_diagram,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog": {"type": "string"},
+                    "table": {"type": "string"},
+                    "radius_deg": {"type": "number", "default": 0.4},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "target_name": {"type": "string"},
+                    "blue_band": {"type": "string", "default": "g"},
+                    "red_band": {"type": "string", "default": "r"},
+                    "mag_band": {"type": "string", "description": "Magnitude (y) band; defaults to blue_band."},
+                    "limit": {"type": "integer", "default": 5000},
+                },
+                "required": ["catalog", "table"],
+            },
+            category="datalab",
+        ))
+        self.tool_registry.register(Tool(
             name="datalab_tiled_search",
             description="P15: tiled region-bounded overdensity search over a footprint. Runs a server-side density aggregate per q3c cone tile, finds matched-filter peaks, and ranks candidates. Executes as a background job; for a large area it returns needs_confirmation first — re-call with confirm=true after confirming the sky area with the user.",
             function=self._datalab_tiled_search,
@@ -5587,6 +5632,69 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             out["target"] = label
             return out
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_color_color_diagram(
+        self,
+        catalog: str,
+        table: str,
+        radius_deg: float = 0.5,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        target_name: Optional[str] = None,
+        x_bands: Optional[List[str]] = None,
+        y_bands: Optional[List[str]] = None,
+        split_col: Optional[str] = None,
+        split_threshold: float = 0.005,
+        limit: int = 3000,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            # Coerce null/omitted optional args (models often pass null) to sane defaults.
+            radius_deg = float(radius_deg) if radius_deg is not None else 0.5
+            split_threshold = float(split_threshold) if split_threshold is not None else 0.005
+            limit = int(limit) if limit is not None else 3000
+            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
+            out = datalab_orchestration.color_color_diagram(
+                catalog, table, ra_f, dec_f, radius_deg,
+                x_bands=tuple(x_bands) if x_bands else ("g", "r"),
+                y_bands=tuple(y_bands) if y_bands else ("r", "i"),
+                split_col=split_col, split_threshold=split_threshold, limit=limit,
+                title=title or f"{catalog} color-color: {label}",
+            )
+            return self._datalab_attach_image_result(out, title or f"Color-color diagram: {label}")
+        except Exception as e:
+            return self._datalab_error(e)
+
+    def _datalab_color_magnitude_diagram(
+        self,
+        catalog: str,
+        table: str,
+        radius_deg: float = 0.4,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        target_name: Optional[str] = None,
+        blue_band: str = "g",
+        red_band: str = "r",
+        mag_band: Optional[str] = None,
+        limit: int = 5000,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            radius_deg = float(radius_deg) if radius_deg is not None else 0.4
+            limit = int(limit) if limit is not None else 5000
+            blue_band = blue_band or "g"
+            red_band = red_band or "r"
+            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
+            out = datalab_orchestration.color_magnitude_diagram(
+                catalog, table, ra_f, dec_f, radius_deg,
+                blue_band=blue_band, red_band=red_band, mag_band=mag_band, limit=limit,
+                title=title or f"{catalog} CMD: {label}",
+            )
+            return self._datalab_attach_image_result(out, title or f"Color-magnitude diagram: {label}")
         except Exception as e:
             return self._datalab_error(e)
 
@@ -9223,7 +9331,8 @@ IMPORTANT RULES:
             output_text = ""
             _had_tool_calls = False
             _web_tool_results: List[Dict[str, Any]] = []
-            
+            _all_tool_results: List[Dict[str, Any]] = []  # every round's tool outputs (for the no-text safety net)
+
             # 5. Call Responses API with manual streaming loop
             for _round in range(_token_budget.HARD_MAX_ITERATIONS if hasattr(_token_budget, 'HARD_MAX_ITERATIONS') else 25):
                 _buffer_round_text = _round == 0 and (
@@ -9591,7 +9700,8 @@ IMPORTANT RULES:
 
                 # Apply tool result budget — truncate oversized old results
                 tool_results = apply_tool_result_budget(tool_results)
-            
+                _all_tool_results.extend(tool_results)
+
             # Emit final step
             if on_status:
                 on_status("Generating response", "running")
@@ -9607,7 +9717,7 @@ IMPORTANT RULES:
             # Safety net: the model called tools but produced no final text. Summarize what
             # the tools did (incl. errors) so the user gets a useful, self-explaining reply.
             if not output_text and _had_tool_calls:
-                _tool_summary = self._summarize_tool_outcomes(locals().get("tool_results"))
+                _tool_summary = self._summarize_tool_outcomes(_all_tool_results)
                 if _tool_summary:
                     output_text = _tool_summary
                     if on_token:

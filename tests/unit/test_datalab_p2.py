@@ -73,9 +73,13 @@ def test_build_catalog_predicates_and_density_with_cuts():
     assert any("gmag - rmag" in p for p in preds)
     sql, meta = B.build_density_aggregate("nsc_dr2", "object", mode="grid", ra=10, dec=0, radius_deg=1.0, predicates=preds)
     assert "q3c_radial_query" in sql and "class_star" in sql and "GROUP BY ra_bin, dec_bin" in sql
-    with pytest.raises(ValueError):  # unregistered column rejected
-        B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "not_a_col", "op": "<", "value": 1}])
-    with pytest.raises(ValueError):  # bad operator rejected
+    # Unknown-but-safe column identifiers are PERMITTED now (the seed registry is not exhaustive;
+    # Data Lab validates them server-side). This is the brittleness fix.
+    preds2 = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "some_unlisted_col", "op": "<", "value": 1}])
+    assert any("some_unlisted_col" in p for p in preds2)
+    with pytest.raises(ValueError):  # unsafe identifier (injection) still rejected
+        B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "x) OR 1=1; --", "op": "<", "value": 1}])
+    with pytest.raises(ValueError):  # bad operator still rejected
         B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "gmag", "op": "DROP", "value": 1}])
 
 
@@ -219,3 +223,52 @@ def test_datalab_notebook_steps_recipe():
     assert all(s.get("type") in ("markdown", "code") and "content" in s for s in steps)
     blob = "\n".join(s["content"] for s in steps)
     assert "qc.query(sql=q" in blob and "sia.SIAService" in blob and "SvoFps" in blob and "Gaia DR3" in blob
+
+
+# ── One-shot diagram tools (the reliable P3/P5 path: query + plot in a single call) ────
+class _FakeDiagramClient:
+    def query(self, *, sql=None, adql=None, fmt="pandas", **kwargs):
+        rng = np.random.default_rng(1)
+        n = 300
+        df = pd.DataFrame({
+            "ra": rng.uniform(29.5, 30.5, n), "dec": rng.uniform(-50.5, -49.5, n),
+            "mag_auto_g": rng.uniform(18, 23, n), "mag_auto_r": rng.uniform(17, 22, n),
+            "mag_auto_i": rng.uniform(16.5, 21.5, n),
+            # bimodal spread_model_r → stars (~0) and galaxies (>0.005)
+            "spread_model_r": np.concatenate([rng.normal(0.0, 0.001, n // 2), rng.normal(0.02, 0.004, n - n // 2)]),
+        })
+        return DatalabResult.from_dataframe(df, {"catalog": "des_dr1", "table": "main", "query": sql})
+
+
+def test_color_color_diagram_one_shot_auto_splits():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    out = orch.color_color_diagram(
+        "des_dr1", "main", 30.0, -50.0, 0.5,
+        client=_FakeDiagramClient(), result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and out["image_base64"]
+    assert out["split_col"] == "spread_model_r"  # auto-detected from the registry
+    assert {p["population"] for p in out["populations"]} == {"stars", "galaxies"}
+
+
+def test_color_magnitude_diagram_one_shot():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    out = orch.color_magnitude_diagram(
+        "des_dr1", "main", 30.0, -50.0, 0.4, blue_band="g", red_band="r",
+        client=_FakeDiagramClient(), result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and out["image_base64"] and out["points"] > 0
+
+
+def test_agent_registers_diagram_tools():
+    from tests.unit.test_datalab_p0 import _make_agent
+    agent = _make_agent()
+    agent._register_tools()
+    assert agent.tool_registry.get_tool("datalab_color_color_diagram") is not None
+    assert agent.tool_registry.get_tool("datalab_color_magnitude_diagram") is not None
