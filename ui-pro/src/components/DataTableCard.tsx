@@ -5,6 +5,7 @@ import { Download, Eye, ExternalLink, Link2, Loader2, X, Telescope, BarChart3, M
 import type { DataTableResult } from "../lib/types";
 import { createWorkbenchSession } from "../lib/api";
 import { useAuthStore } from "../lib/auth-store";
+import { AladinSkyView } from "./AladinSkyView";
 
 interface DataTableCardProps { data: DataTableResult; }
 
@@ -484,13 +485,30 @@ function MiniSkyMap({
 }
 
 /* ── Sky map lightbox (expanded) ── */
+type SkyMapTab = "interactive" | "allSky";
+
+function finiteSkyRange(coords: { ra: number; dec: number }[]) {
+    const valid = coords.filter((coord) => Number.isFinite(coord.ra) && Number.isFinite(coord.dec));
+    if (valid.length === 0) return null;
+    return {
+        raMin: Math.min(...valid.map((coord) => coord.ra)),
+        raMax: Math.max(...valid.map((coord) => coord.ra)),
+        decMin: Math.min(...valid.map((coord) => coord.dec)),
+        decMax: Math.max(...valid.map((coord) => coord.dec)),
+    };
+}
+
 function SkyMapLightbox({
     coords, sourceName, onClose,
 }: { coords: { ra: number; dec: number }[]; sourceName?: string; onClose: () => void }) {
+    const [activeTab, setActiveTab] = useState<SkyMapTab>("interactive");
+    const [interactiveFallbackReason, setInteractiveFallbackReason] = useState<string | null>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const animRef = useRef<number>(0);
 
     useEffect(() => {
+        if (activeTab !== "allSky") return;
+
         let running = true;
         const animate = (time: number) => {
             if (!running || !canvasRef.current) return;
@@ -499,13 +517,13 @@ function SkyMapLightbox({
         };
         animRef.current = requestAnimationFrame(animate);
         return () => { running = false; cancelAnimationFrame(animRef.current); };
-    }, [coords]);
+    }, [activeTab, coords]);
 
-    // Compute RA/Dec range for footer
-    const raMin = Math.min(...coords.map(c => c.ra));
-    const raMax = Math.max(...coords.map(c => c.ra));
-    const decMin = Math.min(...coords.map(c => c.dec));
-    const decMax = Math.max(...coords.map(c => c.dec));
+    const range = finiteSkyRange(coords);
+    const tabs: { id: SkyMapTab; label: string }[] = [
+        { id: "interactive", label: "Interactive" },
+        { id: "allSky", label: "All-sky" },
+    ];
 
     return (
         <div
@@ -513,34 +531,74 @@ function SkyMapLightbox({
             onClick={onClose}
         >
             <div
-                className="glass-surface relative rounded-2xl p-4 max-w-[680px] w-full mx-4"
+                className="glass-surface relative rounded-2xl p-4 w-[min(720px,calc(100vw-32px))] max-h-[calc(100vh-32px)]"
                 onClick={e => e.stopPropagation()}
             >
                 <button
                     onClick={onClose}
                     className="absolute -top-2 -right-2 p-1 bg-slate-800 border border-slate-600 rounded-full hover:bg-red-500/20 transition-colors z-10"
+                    aria-label="Close sky map"
                 >
                     <X className="w-4 h-4 text-slate-300" />
                 </button>
 
-                <canvas
-                    ref={canvasRef}
-                    width={1200}
-                    height={600}
-                    className="w-full rounded-xl"
-                    style={{ maxHeight: 400 }}
-                />
-
-                <div className="mt-3 text-center space-y-1">
-                    <p className="text-sm font-semibold text-slate-200 flex items-center justify-center gap-2">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3 pr-6">
+                    <p className="text-sm font-semibold text-slate-200 flex items-center gap-2">
                         <Map className="w-4 h-4 text-cyan-400" />
                         {sourceName ? `${sourceName} — Sky Distribution` : "Sky Distribution"}
                     </p>
+                    <div className="inline-flex rounded-lg border border-slate-700/70 bg-slate-950/50 p-1">
+                        {tabs.map((tab) => {
+                            const disabled = tab.id === "interactive" && Boolean(interactiveFallbackReason);
+                            return (
+                                <button
+                                    key={tab.id}
+                                    type="button"
+                                    disabled={disabled}
+                                    title={disabled ? interactiveFallbackReason || undefined : undefined}
+                                    onClick={() => setActiveTab(tab.id)}
+                                    className={`rounded-md px-3 py-1 text-[11px] font-semibold transition-colors ${activeTab === tab.id
+                                        ? "bg-cyan-500/15 text-cyan-200"
+                                        : "text-slate-400 hover:bg-slate-800/80 hover:text-slate-200"} ${disabled ? "cursor-not-allowed opacity-40 hover:bg-transparent hover:text-slate-400" : ""}`}
+                                >
+                                    {tab.label}
+                                </button>
+                            );
+                        })}
+                    </div>
+                </div>
+
+                {activeTab === "interactive" ? (
+                    <div className="h-[60vh] min-h-[300px] max-h-[420px] rounded-xl overflow-hidden border border-slate-700/50 bg-slate-950/80">
+                        <AladinSkyView
+                            coords={coords}
+                            sourceName={sourceName}
+                            onFallback={(reason) => {
+                                setInteractiveFallbackReason(reason);
+                                setActiveTab("allSky");
+                            }}
+                        />
+                    </div>
+                ) : (
+                    <canvas
+                        ref={canvasRef}
+                        width={1200}
+                        height={600}
+                        className="w-full rounded-xl"
+                        style={{ maxHeight: 400 }}
+                    />
+                )}
+
+                <div className="mt-3 text-center space-y-1">
                     <p className="text-[10px] text-slate-500 font-mono">
-                        {coords.length} observations · RA {raMin.toFixed(2)}°–{raMax.toFixed(2)}° · Dec {decMin.toFixed(2)}°–{decMax.toFixed(2)}°
+                        {coords.length} observations {range
+                            ? `· RA ${range.raMin.toFixed(2)}°–${range.raMax.toFixed(2)}° · Dec ${range.decMin.toFixed(2)}°–${range.decMax.toFixed(2)}°`
+                            : "· RA/Dec range unavailable"}
                     </p>
                     <p className="text-[9px] text-slate-600">
-                        Aitoff equal-area projection · Equatorial J2000
+                        {activeTab === "interactive"
+                            ? "Aladin Lite · CDS Strasbourg"
+                            : "Aitoff equal-area projection · Equatorial J2000"}
                     </p>
                 </div>
             </div>

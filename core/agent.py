@@ -538,6 +538,20 @@ class QuasarAgent:
         self._tls.accumulated_run_results = value
 
     @property
+    def _accumulated_tool_trace(self):
+        # Request-scoped like _accumulated_run_results: concurrent chats must
+        # never mix tool traces. Conductor subtask threads get their own
+        # (discarded) list — their calls are not traced into the parent
+        # request until a collector can be passed through explicitly.
+        if not hasattr(self._tls, 'accumulated_tool_trace'):
+            self._tls.accumulated_tool_trace = []
+        return self._tls.accumulated_tool_trace
+
+    @_accumulated_tool_trace.setter
+    def _accumulated_tool_trace(self, value):
+        self._tls.accumulated_tool_trace = value
+
+    @property
     def last_search_results(self):
         return getattr(self._tls, 'last_search_results', None)
 
@@ -8842,6 +8856,52 @@ IMPORTANT RULES:
             self._accumulated_run_results = []
             import gc; gc.collect()
 
+    def _record_tool_trace(self, tool_name: str, args, result_str: str,
+                           result_obj=None) -> None:
+        """Append a compact record of one executed tool call to the per-request
+        trace (surfaced as the SSE ``tool_trace`` event; consumed by the UI's
+        debug view and by Benchmark/datalabbench). Never raises.
+
+        ``result_obj`` is the untruncated result dict when the caller has it —
+        structured fields are read from it so an 8000-char ``result_str``
+        slice can never cost the trace its SQL/rowcount."""
+        try:
+            trace = self._accumulated_tool_trace
+            if len(trace) >= 200:
+                return
+            ok = True
+            sql = ""
+            rowcount = None
+            try:
+                parsed = result_obj
+                if not isinstance(parsed, dict):
+                    parsed = json.loads(result_str) if result_str else {}
+                if isinstance(parsed, dict):
+                    if parsed.get("error") or parsed.get("success") is False:
+                        ok = False
+                    # Structured fields survive even when the raw output below
+                    # is truncated mid-JSON (the trace consumers rely on them).
+                    sql = str(parsed.get("query_summary")
+                              or parsed.get("validated_sql") or "")
+                    rowcount = parsed.get("reported_count", parsed.get("rowcount"))
+            except Exception:
+                pass
+            if not sql and isinstance(args, dict) and isinstance(args.get("sql"), str):
+                sql = args["sql"]
+            record = {
+                "name": str(tool_name or ""),
+                "arguments": args if isinstance(args, dict) else {},
+                "output": (result_str or "")[:2000],
+                "ok": ok,
+            }
+            if sql:
+                record["sql"] = sql[:1500]
+            if isinstance(rowcount, (int, float)):
+                record["rowcount"] = int(rowcount)
+            trace.append(record)
+        except Exception:
+            pass
+
     def _dispatch_tool_call(self, tool_name: str, arguments_json: str) -> str:
         """
         Dispatch a tool call by name using the tool registry.
@@ -8865,14 +8925,18 @@ IMPORTANT RULES:
             args = {}
 
         tool = self.tool_registry.get_tool(tool_name)
+        result_obj = None
         if tool:
             try:
                 result = tool.execute(**args)
-                return _json.dumps(result, default=str)[:8000]
+                result_obj = result if isinstance(result, dict) else None
+                result_str = _json.dumps(result, default=str)[:8000]
             except Exception as e:
-                return _json.dumps({"error": str(e)})
+                result_str = _json.dumps({"error": str(e)})
         else:
-            return _json.dumps({"error": f"Unknown tool: {tool_name}"})
+            result_str = _json.dumps({"error": f"Unknown tool: {tool_name}"})
+        self._record_tool_trace(tool_name, args, result_str, result_obj=result_obj)
+        return result_str
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # RESPONSES API METHOD (New Architecture)
@@ -9068,6 +9132,7 @@ IMPORTANT RULES:
 
         # Reset per-request thread-local state
         self._accumulated_run_results = []
+        self._accumulated_tool_trace = []
         self.last_run_result = None
         self.last_search_results = None
         self._tls.current_conversation_id = conversation_id
@@ -10208,6 +10273,7 @@ IMPORTANT RULES:
                     if on_status:
                         on_status(step_label, "running")
 
+                    _trace_result_obj = None
                     tool = self.tool_registry.get_tool(tool_name)
                     if tool:
                         try:
@@ -10252,6 +10318,7 @@ IMPORTANT RULES:
                                 finally:
                                     if on_status:
                                         on_status("Searching papers linked to observation", "completed")
+                            _trace_result_obj = result if isinstance(result, dict) else None
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
                             _acc_len_after = len(self._accumulated_run_results)
 
@@ -10316,7 +10383,9 @@ IMPORTANT RULES:
 
                     if on_status:
                         on_status(step_label, "completed")
-                    
+
+                    self._record_tool_trace(tool_name, args, result_str,
+                                            result_obj=_trace_result_obj)
                     tool_results.append({
                         "type": "function_call_output",
                         "call_id": fc["call_id"],

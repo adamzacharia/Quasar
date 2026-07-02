@@ -32,6 +32,14 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
+# Windows consoles default to cp1252 which cannot print the Unicode minus
+# signs that appear verbatim in the benchmark prompts — force UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -60,15 +68,23 @@ class ToolCall:
     arguments: Dict[str, Any] = field(default_factory=dict)
     output: str = ""
     ok: bool = True
+    sql: str = ""      # structured SQL field recorded by the agent trace
 
 
 @dataclass
 class Evidence:
-    """Everything the scorer can look at for one benchmark question."""
+    """Everything the scorer can look at for one benchmark question.
+
+    ``sql_texts`` holds EXECUTED SQL only (arguments/outputs of successful
+    tool calls). SQL that merely appears in the final answer text lives in
+    ``response_sql_texts`` and never earns auto credit — otherwise a model
+    could paste the reference query in prose without running it.
+    """
     response_text: str = ""
     calls: List[ToolCall] = field(default_factory=list)
     images: List[str] = field(default_factory=list)
-    sql_texts: List[str] = field(default_factory=list)
+    sql_texts: List[str] = field(default_factory=list)            # executed
+    response_sql_texts: List[str] = field(default_factory=list)   # prose only
     errors: List[str] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
     trace_source: str = "none"     # tool_trace | fallback | none
@@ -76,52 +92,138 @@ class Evidence:
 
     # -- derived text blobs (cached) --
     _args_blob: Optional[str] = None
+    _ok_args_blob: Optional[str] = None
     _sql_blob: Optional[str] = None
 
     def args_blob(self) -> str:
+        """Arguments of ALL calls (incl. failed) — for intent checks."""
         if self._args_blob is None:
-            parts = []
-            for c in self.calls:
-                try:
-                    parts.append(json.dumps({c.name: c.arguments}, sort_keys=True, default=str))
-                except Exception:
-                    parts.append(str(c.arguments))
-            self._args_blob = "\n".join(parts)
+            self._args_blob = self._serialize_calls(self.calls)
         return self._args_blob
+
+    def ok_args_blob(self) -> str:
+        """Arguments of successful calls only — for execution-credit checks.
+
+        Narrative fields (``reason``, plot ``title``, ...) are scrubbed:
+        mentioning a cut in ``datalab_sql_query.reason`` must never count as
+        having executed it."""
+        if self._ok_args_blob is None:
+            self._ok_args_blob = self._serialize_calls(
+                [c for c in self.calls if c.ok], scrub_narrative=True)
+        return self._ok_args_blob
+
+    @staticmethod
+    def _serialize_calls(calls: List["ToolCall"], scrub_narrative: bool = False) -> str:
+        parts = []
+        for c in calls:
+            arguments = _scrub_narrative_args(c.arguments) if scrub_narrative else c.arguments
+            try:
+                parts.append(json.dumps({c.name: arguments}, sort_keys=True, default=str))
+            except Exception:
+                parts.append(str(arguments))
+            # Structured cuts (value_cuts / morphology / color_cut) are also
+            # rendered in SQL-like form so rubric patterns written against the
+            # reference SQL ("pm > 100", "g - r BETWEEN ...") match tool args.
+            parts.extend(_flatten_structured_cuts(arguments))
+        return "\n".join(parts)
 
     def sql_blob(self) -> str:
         if self._sql_blob is None:
             self._sql_blob = "\n---\n".join(self.sql_texts)
         return self._sql_blob
 
+    def trace_blob(self) -> str:
+        """Executed evidence only: successful-call args + executed SQL."""
+        return "\n".join([self.sql_blob(), self.ok_args_blob()])
+
     def any_blob(self) -> str:
         return "\n".join([self.sql_blob(), self.args_blob(), self.response_text])
+
+
+# Argument keys that carry narrative text rather than executed parameters
+# (e.g. datalab_sql_query.reason — a required free-text justification — or a
+# plot title). Execution-credit blobs (trace_regex) must not match rubric
+# patterns against them; intent-tier blobs (args_regex/any_regex) keep them.
+_NARRATIVE_ARG_KEYS = frozenset({
+    "reason", "title", "subtitle", "caption", "label", "labels",
+    "description", "notes", "comment", "comments", "explanation",
+    "summary", "rationale", "justification", "message",
+})
+
+
+def _scrub_narrative_args(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {k: _scrub_narrative_args(x) for k, x in v.items()
+                if k not in _NARRATIVE_ARG_KEYS}
+    if isinstance(v, (list, tuple)):
+        return [_scrub_narrative_args(x) for x in v]
+    return v
+
+
+def _flatten_structured_cuts(args: Any) -> List[str]:
+    """Render structured cut dicts as SQL-like strings for pattern matching."""
+    out: List[str] = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            if "column" in v:
+                between = v.get("between")
+                if isinstance(between, (list, tuple)) and len(between) == 2:
+                    out.append(f"{v['column']} BETWEEN {between[0]} AND {between[1]}")
+                elif "op" in v or "value" in v:
+                    out.append(f"{v['column']} {v.get('op', '=')} {v.get('value', '')}")
+            bands = v.get("bands")
+            if isinstance(bands, (list, tuple)) and len(bands) == 2:
+                out.append(f"{bands[0]} - {bands[1]} BETWEEN {v.get('min', '')} AND {v.get('max', '')}")
+            for vv in v.values():
+                walk(vv)
+        elif isinstance(v, (list, tuple)):
+            for vv in v:
+                walk(vv)
+
+    walk(args)
+    return out
 
 
 _SQL_FENCE_RE = re.compile(r"```(?:sql|postgres(?:ql)?)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _QUERY_SUMMARY_RE = re.compile(r'"(?:query_summary|validated_sql|query)"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
-def extract_sql_texts(calls: List[ToolCall], response_text: str) -> List[str]:
-    """Pull every piece of SQL we can see: tool args, tool outputs, ``` blocks."""
+def _clean_sql(sql: str) -> str:
+    sql = (sql or "").strip()
+    try:
+        # tool outputs are JSON-escaped ("\\n" etc.) — unescape best-effort
+        if "\\n" in sql or '\\"' in sql:
+            sql = json.loads(f'"{sql}"')
+    except Exception:
+        pass
+    return sql
+
+
+# Only Data Lab tools EXECUTE their sql/query/adql arguments (and echo
+# query_summary/validated_sql in their outputs) against TAP. A free-text
+# `query` argument on any other successful tool (web_search, ADS, ...) is a
+# search string, not run SQL, and must earn no sql_regex/position credit.
+_SQL_CAPABLE_TOOL_RE = re.compile(r"^datalab_", re.IGNORECASE)
+
+
+def extract_executed_sql(calls: List[ToolCall]) -> List[str]:
+    """SQL that actually ran: args/outputs/structured field of SUCCESSFUL
+    calls to SQL-capable (Data Lab) tools."""
     seen, out = set(), []
 
     def add(sql: Optional[str]):
-        if not sql:
-            return
-        sql = sql.strip()
-        try:
-            # tool outputs are JSON-escaped ("\\n" etc.) — unescape best-effort
-            if "\\n" in sql or '\\"' in sql:
-                sql = json.loads(f'"{sql}"')
-        except Exception:
-            pass
+        sql = _clean_sql(sql or "")
         key = " ".join(sql.split())[:400]
         if key and key not in seen:
             seen.add(key)
             out.append(sql)
 
     for c in calls:
+        if not c.ok or not _SQL_CAPABLE_TOOL_RE.match(c.name or ""):
+            continue
+        if c.sql:
+            add(c.sql)
         for k in ("sql", "query", "adql"):
             v = c.arguments.get(k)
             if isinstance(v, str):
@@ -129,9 +231,13 @@ def extract_sql_texts(calls: List[ToolCall], response_text: str) -> List[str]:
         if c.output:
             for m in _QUERY_SUMMARY_RE.finditer(c.output):
                 add(m.group(1))
-    for m in _SQL_FENCE_RE.finditer(response_text or ""):
-        add(m.group(1))
     return out
+
+
+def extract_response_sql(response_text: str) -> List[str]:
+    """SQL the model merely wrote in its answer (report/judge context only)."""
+    return [_clean_sql(m.group(1)) for m in _SQL_FENCE_RE.finditer(response_text or "")
+            if m.group(1).strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +285,12 @@ def _as_float(v) -> Optional[float]:
         return None
 
 
-def candidate_positions(ev: Evidence) -> List[Dict[str, float]]:
-    """(ra, dec[, radius]) candidates from tool args and captured SQL."""
+def candidate_positions(ev: Evidence, include_failed: bool = False) -> List[Dict[str, float]]:
+    """(ra, dec[, radius]) candidates from SUCCESSFUL tool calls + executed SQL."""
     pos = []
     for c in ev.calls:
+        if not c.ok and not include_failed:
+            continue
         a = c.arguments or {}
         ra, dec = _as_float(a.get("ra")), _as_float(a.get("dec"))
         if ra is not None and dec is not None:
@@ -203,13 +311,23 @@ def candidate_positions(ev: Evidence) -> List[Dict[str, float]]:
     return pos
 
 
+# radius-bearing args with a conversion factor to degrees
+_RADIUS_ARGS = {
+    "radius_deg": 1.0, "fov_deg": 1.0, "tile_radius_deg": 1.0,
+    "sia_fov_deg": 1.0, "width_deg": 1.0, "height_deg": 1.0,
+    "radius_arcmin": 1.0 / 60.0, "radius_arcsec": 1.0 / 3600.0,
+}
+
+
 def candidate_radii(ev: Evidence) -> List[float]:
     radii = []
     for c in ev.calls:
-        for k in ("radius_deg", "fov_deg", "tile_radius_deg"):
+        if not c.ok:
+            continue
+        for k, factor in _RADIUS_ARGS.items():
             v = _as_float((c.arguments or {}).get(k))
             if v is not None:
-                radii.append(v)
+                radii.append(v * factor)
     for cone in q3c_cones_from_sql(ev.sql_blob()):
         if cone.get("radius") is not None:
             radii.append(cone["radius"])
@@ -267,16 +385,23 @@ def _sql_is_rowlevel(sql: str) -> bool:
     s = sql.upper()
     if "GROUP BY" in s or re.search(r"\bCOUNT\s*\(", s):
         return False
+    if "TAP_SCHEMA." in s:
+        return False  # metadata browsing, not a catalog scan
     return bool(_ROWSCAN_FROM_RE.search(sql))
 
 
 def _sql_unbounded_rowscan(sql: str) -> bool:
+    """Row-level catalog pull with no q3c bound and no key equality.
+
+    Per guardrail #1 a LIMIT alone does NOT make it safe — with selective
+    WHERE cuts Postgres may scan a large fraction of the catalog before
+    filling the LIMIT. LIMIT discipline is scored as a positive criterion
+    in the rubrics instead.
+    """
     if not _sql_is_rowlevel(sql):
         return False
     s = sql.upper()
     if "Q3C_" in s:
-        return False
-    if re.search(r"\bLIMIT\s+\d+", s):
         return False
     if re.search(r"\b(ID|OBJID|SPECOBJID|FIELDID|TARGETID)\s*=", s):
         return False
@@ -290,6 +415,14 @@ def _sql_between_rowscan(sql: str) -> bool:
     if "Q3C_" in s:
         return False
     return bool(re.search(r"\b(RA|DEC)\s+BETWEEN\b", s))
+
+
+def _sql_flat_q3c_join(sql: str) -> bool:
+    """The PDF anti-example: a q3c_join in a statement that does not
+    MATERIALIZE the reduced small side. Evaluated PER STATEMENT so a good
+    CTE elsewhere cannot mask a bad flat join."""
+    s = sql.upper()
+    return "Q3C_JOIN" in s and "MATERIALIZED" not in s
 
 
 def eval_check(check: Dict[str, Any], ev: Evidence) -> CheckResult:
@@ -322,16 +455,23 @@ def eval_check(check: Dict[str, Any], ev: Evidence) -> CheckResult:
                            f"no successful call among {check.get('tools')}")
 
     if kind == "tool_arg":
+        # Execution checkpoints must not be satisfiable by FAILED calls; a
+        # decision checkpoint (tool may legitimately fail, e.g. an SIA
+        # coverage gap) opts in with include_failed: true.
+        include_failed = bool(check.get("include_failed"))
         for c in _match_tools(ev, check.get("tools", [])):
+            if not c.ok and not include_failed:
+                continue
             if check["arg"] in (c.arguments or {}) and _arg_matches(check, c.arguments[check["arg"]]):
                 return CheckResult(True, f"{c.name}.{check['arg']}={c.arguments[check['arg']]!r}")
-        return CheckResult(False, f"no call with matching arg {check['arg']!r}")
+        return CheckResult(False, f"no {'call' if include_failed else 'successful call'} "
+                                  f"with matching arg {check['arg']!r}")
 
     if kind == "position_near":
         tol = float(check.get("tol_deg", 0.1))
         want_ra, want_dec = float(check["ra"]), float(check["dec"])
         import math
-        for p in candidate_positions(ev):
+        for p in candidate_positions(ev, include_failed=bool(check.get("include_failed"))):
             dra = abs(p["ra"] - want_ra) * math.cos(math.radians(want_dec))
             ddec = abs(p["dec"] - want_dec)
             if dra <= tol and ddec <= tol:
@@ -346,9 +486,10 @@ def eval_check(check: Dict[str, Any], ev: Evidence) -> CheckResult:
                 return CheckResult(True, f"radius {r:.6g} ~ {want:.6g}")
         return CheckResult(False, f"no radius within {tol} of {want}")
 
-    if kind in ("sql_regex", "args_regex", "text_regex", "any_regex"):
+    if kind in ("sql_regex", "args_regex", "text_regex", "any_regex", "trace_regex"):
         blob = {"sql_regex": ev.sql_blob(), "args_regex": ev.args_blob(),
-                "text_regex": ev.response_text, "any_regex": ev.any_blob()}[kind]
+                "text_regex": ev.response_text, "any_regex": ev.any_blob(),
+                "trace_regex": ev.trace_blob()}[kind]
         m = re.search(check["pattern"], blob or "", re.IGNORECASE)
         return CheckResult(bool(m), f"matched {m.group(0)[:60]!r}" if m else
                            f"pattern {check['pattern']!r} not found in {kind[:-6]}")
@@ -373,6 +514,12 @@ def eval_check(check: Dict[str, Any], ev: Evidence) -> CheckResult:
             if _sql_between_rowscan(sql):
                 return CheckResult(True, f"BETWEEN-box row scan: {' '.join(sql.split())[:100]!r}")
         return CheckResult(False, "no BETWEEN-box row scan found")
+
+    if kind == "sql_flat_q3c_join":
+        for sql in ev.sql_texts:
+            if _sql_flat_q3c_join(sql):
+                return CheckResult(True, f"flat q3c_join: {' '.join(sql.split())[:100]!r}")
+        return CheckResult(False, "no flat q3c_join found")
 
     return CheckResult(False, f"unknown check kind {kind!r}")
 
@@ -694,6 +841,7 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
                             arguments=call.get("arguments") or {},
                             output=str(call.get("output", ""))[:4000],
                             ok=bool(call.get("ok", True)),
+                            sql=str(call.get("sql", "")),
                         ))
                     ev.trace_source = "tool_trace"
                 elif etype == "image":
@@ -738,7 +886,8 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
             if m:
                 ev.images.append(m.group(1))
 
-    ev.sql_texts = extract_sql_texts(ev.calls, ev.response_text)
+    ev.sql_texts = extract_executed_sql(ev.calls)
+    ev.response_sql_texts = extract_response_sql(ev.response_text)
     return ev, raw_events, elapsed
 
 
@@ -815,8 +964,13 @@ def run_question(q: Dict[str, Any], args, auth_token: Optional[str],
 
 def overall_rollup(results: List[QuestionResult]) -> Dict[str, Any]:
     judged = [r for r in results if r.judged and r.percentage is not None]
-    w_full = sum(TIER_WEIGHTS[r.tier] for r in judged)
-    full = (sum(r.percentage * TIER_WEIGHTS[r.tier] for r in judged) / w_full) if w_full else None
+    # The headline score is only valid when EVERY selected question was
+    # judged — a partial judge outage would otherwise silently bias it.
+    if judged and len(judged) == len(results):
+        w_full = sum(TIER_WEIGHTS[r.tier] for r in judged)
+        full = sum(r.percentage * TIER_WEIGHTS[r.tier] for r in judged) / w_full
+    else:
+        full = None
     w_auto = sum(TIER_WEIGHTS[r.tier] for r in results)
     auto = (sum(r.auto_percentage * TIER_WEIGHTS[r.tier] for r in results) / w_auto) if w_auto else 0.0
     per_tier = {}
@@ -959,12 +1113,15 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
         fp = f"{info['full_pct']:.1f}%" if info["full_pct"] is not None else "—"
         lines.append(f"| T{t} | {info['label']} | {info['n']} | {fp} | {info['auto_pct']:.1f}% |")
 
-    # Improvement targets: weighted lost points, worst first
+    # Improvement targets: weighted lost points, worst first.
+    # Unjudged judge checkpoints (credit None, e.g. --skip-judge) are NOT
+    # losses — they are simply unmeasured this run.
     losses = []
     for r in results:
         for c in r.checkpoints:
-            credit = c.credit if c.credit is not None else 0.0
-            lost = c.points * (1 - credit) * TIER_WEIGHTS[r.tier]
+            if c.credit is None:
+                continue
+            lost = c.points * (1 - c.credit) * TIER_WEIGHTS[r.tier]
             if lost > 0.5:
                 losses.append((lost, r.id, c))
         for p in r.penalties:
@@ -1093,7 +1250,8 @@ def emit_rubric_md(path: Path):
 def _mk_ev(calls=None, text="", images=None, sqls=None) -> Evidence:
     ev = Evidence(response_text=text, calls=calls or [], images=images or [])
     ev.trace_source = "tool_trace" if ev.calls else "none"
-    ev.sql_texts = (sqls or []) + extract_sql_texts(ev.calls, text)
+    ev.sql_texts = (sqls or []) + extract_executed_sql(ev.calls)
+    ev.response_sql_texts = extract_response_sql(text)
     return ev
 
 
@@ -1188,18 +1346,124 @@ def run_self_test() -> int:
     check("DLB-09 C1 crossmatch route", c1.credit == 1.0, c1.detail[0] if c1.detail else "")
     check("DLB-09 C2 join orientation", c2.credit == 1.0, c2.detail[0] if c2.detail else "")
 
-    # 7. GP-01 unbounded row scan
+    # 7. GP-01 unbounded row scan (a LIMIT alone does NOT exempt — guardrail #1)
     check("GP-01 detects unbounded scan",
           _sql_unbounded_rowscan("SELECT ra, dec FROM nsc_dr2.object WHERE gmag < 20"))
-    check("GP-01 spares LIMIT", not _sql_unbounded_rowscan(
-        "SELECT ra FROM nsc_dr2.object WHERE gmag < 20 LIMIT 100"))
+    check("GP-01 fires despite LIMIT", _sql_unbounded_rowscan(
+        "SELECT ra FROM nsc_dr2.object WHERE gmag < 20 LIMIT 1000000"))
+    check("GP-01 spares q3c cone", not _sql_unbounded_rowscan(
+        "SELECT ra FROM nsc_dr2.object WHERE q3c_radial_query(ra, dec, 1, 2, 0.5)"))
     check("GP-01 spares aggregates", not _sql_unbounded_rowscan(
         "SELECT ring256, COUNT(*) FROM nsc_dr2.object GROUP BY ring256"))
+    check("GP-01 spares tap_schema", not _sql_unbounded_rowscan(
+        "SELECT table_name, description FROM tap_schema.tables WHERE schema_name='vhs_dr5'"))
     check("GP-03 detects BETWEEN row box", _sql_between_rowscan(
         "SELECT ra FROM nsc_dr2.object WHERE ra BETWEEN 70 AND 90 AND dec BETWEEN -70 AND -50"))
     check("GP-03 spares q3c", not _sql_between_rowscan(
         "SELECT ra FROM nsc_dr2.object WHERE q3c_radial_query(ra, dec, 1, 2, 0.5) "
         "AND gmag BETWEEN 9 AND 25"))
+
+    # 7b. GP-02 is per-statement: a good MATERIALIZED crossmatch elsewhere must
+    # not mask a separate flat q3c_join statement.
+    check("flat join detected per-statement", _sql_flat_q3c_join(
+        "SELECT n.ra FROM nsc_dr2.object n, gaia_dr3.gaia_source g "
+        "WHERE q3c_join(n.ra, n.dec, g.ra, g.dec, 1.0/3600.0)"))
+    check("materialized join spared", not _sql_flat_q3c_join(
+        "WITH g AS MATERIALIZED (SELECT ra, dec FROM gaia_dr3.gaia_source) "
+        "SELECT n.ra FROM g, nsc_dr2.object n WHERE q3c_join(g.ra, g.dec, n.ra, n.dec, 1.0/3600.0)"))
+    ev_mixed = _mk_ev(calls=[
+        ToolCall(name="datalab_q3c_crossmatch", arguments={},
+                 output=json.dumps({"success": True, "query_summary":
+                                    "WITH g AS MATERIALIZED (SELECT ra FROM gaia_dr3.gaia_source) "
+                                    "SELECT n.ra FROM g, nsc_dr2.object n "
+                                    "WHERE q3c_join(g.ra, g.dec, n.ra, n.dec, 1.0/3600.0)"})),
+        ToolCall(name="datalab_sql_query",
+                 arguments={"sql": "SELECT n.ra FROM nsc_dr2.object n, gaia_dr3.gaia_source g "
+                                   "WHERE q3c_join(n.ra, n.dec, g.ra, g.dec, 1.0/3600.0)",
+                            "expert_ack": True, "reason": "test"},
+                 output='{"success": true}'),
+    ], text="done")
+    pens_mixed = apply_penalties(q09, ev_mixed)
+    check("GP-02 fires on mixed statements", any(p.id == "GP-02" for p in pens_mixed),
+          str([p.id for p in pens_mixed]))
+
+    # 7c. Prose SQL earns nothing: reference SQL pasted in the answer with only
+    # a schema-listing call must score 0 auto points on DLB-02 (no GP-00 —
+    # a Data Lab tool DID succeed, the model just never ran the query).
+    ev_prose = _mk_ev(
+        calls=[ToolCall(name="datalab_list_catalogs", arguments={},
+                        output='{"success": true, "count": 10}')],
+        text="Run this:\n```sql\nSELECT COUNT(*) FROM gaia_dr3.gaia_source "
+             "WHERE q3c_radial_query(ra, dec, 229.022, -0.112, 10.0/60.0)\n```\n"
+             "That returns about 2415 sources.")
+    cps_prose = score_auto_checkpoints(q02, ev_prose)
+    earned_prose = sum(c.earned or 0 for c in cps_prose if c.type == "auto")
+    check("prose-only SQL earns 0 auto", earned_prose == 0.0, f"earned={earned_prose}")
+    check("prose SQL captured for report only", len(ev_prose.response_sql_texts) == 1
+          and not ev_prose.sql_texts)
+
+    # 7d. Failed calls contribute no positions/radii.
+    ev_failed = _mk_ev(calls=[ToolCall(
+        name="datalab_cone_count",
+        arguments={"catalog": "gaia_dr3", "ra": 229.022, "dec": -0.112, "radius_deg": 0.1667},
+        output='{"success": false, "error": "boom"}', ok=False)])
+    check("failed call yields no position", not eval_check(
+        {"kind": "position_near", "ra": 229.022, "dec": -0.112, "tol_deg": 0.05}, ev_failed).passed)
+    check("failed call yields no tool_arg", not eval_check(
+        {"kind": "tool_arg", "tools": [], "arg": "catalog", "equals": "gaia_dr3"}, ev_failed).passed)
+    check("include_failed opts back in", eval_check(
+        {"kind": "tool_arg", "tools": [], "arg": "catalog", "equals": "gaia_dr3",
+         "include_failed": True}, ev_failed).passed)
+    check("include_failed position opts in", eval_check(
+        {"kind": "position_near", "ra": 229.022, "dec": -0.112, "tol_deg": 0.05,
+         "include_failed": True}, ev_failed).passed)
+    check("radius alias arcmin converts", any(
+        abs(r - 0.1667) < 1e-3 for r in candidate_radii(_mk_ev(calls=[ToolCall(
+            name="x", arguments={"radius_arcmin": 10.0}, output='{"success": true}')]))))
+
+    # 7e. Structured cuts flatten into SQL-like strings so reference-style
+    # rubric patterns match tool arguments too.
+    ev_cuts = _mk_ev(calls=[ToolCall(
+        name="datalab_density_aggregate",
+        arguments={"catalog": "delve_dr3", "table": "coadd_objects",
+                   "value_cuts": [{"column": "pm", "op": ">", "value": 100},
+                                  {"column": "zwarn", "op": "=", "value": 0}],
+                   "morphology": {"column": "ext_coadd", "between": [0, 1]},
+                   "color_cut": {"bands": ["g", "r"], "min": -0.5, "max": 0.5}},
+        output='{"success": true}')])
+    for label, pat in [("value cut", r"pm\s*>\s*\d+"), ("zwarn cut", r"zwarn\s*=\s*0"),
+                       ("between cut", r"ext_coadd BETWEEN 0 AND 1"),
+                       ("color cut", r"g\s*-\s*r"), ("color bound", r"-\s*0\.5")]:
+        check(f"structured {label} matches trace_regex",
+              eval_check({"kind": "trace_regex", "pattern": pat}, ev_cuts).passed)
+
+    # 7f. SQL smuggled through a non-SQL tool's `query` argument is NOT
+    # executed SQL: no sql_regex credit, no position/radius from it.
+    ev_smuggle = _mk_ev(
+        calls=[ToolCall(name="web_search",
+                        arguments={"query": "SELECT COUNT(*) FROM gaia_dr3.gaia_source "
+                                            "WHERE q3c_radial_query(ra, dec, 229.022, -0.112, 0.16667)"},
+                        output='{"success": true, "results": 5}')],
+        text="There are about 2415 sources.")
+    check("non-SQL tool query yields no executed SQL", not ev_smuggle.sql_texts)
+    check("smuggled SQL fails sql_regex", not eval_check(
+        {"kind": "sql_regex", "pattern": r"gaia_dr3\.gaia_source"}, ev_smuggle).passed)
+
+    # 7g. Narrative fields (reason/title) of successful calls earn no
+    # execution credit — but still count for intent-tier args_regex.
+    ev_reason = _mk_ev(calls=[ToolCall(
+        name="datalab_sql_query",
+        arguments={"sql": "SELECT ra, dec FROM nsc_dr2.object "
+                          "WHERE q3c_radial_query(ra, dec, 229.022, -0.112, 0.1)",
+                   "expert_ack": True,
+                   "reason": "will try a class_star morphology cut next"},
+        output='{"success": true, "rowcount": 42}')])
+    check("narrative reason earns no trace credit", not eval_check(
+        {"kind": "trace_regex", "pattern": r"class_star"}, ev_reason).passed)
+    check("narrative reason still visible to args_regex", eval_check(
+        {"kind": "args_regex", "pattern": r"class_star"}, ev_reason).passed)
+    check("executed SQL from same call keeps trace credit", eval_check(
+        {"kind": "trace_regex", "pattern": r"q3c_radial_query"}, ev_reason).passed)
 
     # 8. image_count + position from peaks
     ev_img = _mk_ev(calls=[ToolCall(name="datalab_cutout_grid",

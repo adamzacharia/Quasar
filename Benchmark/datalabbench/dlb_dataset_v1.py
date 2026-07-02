@@ -27,10 +27,19 @@ Check DSL (kind → semantics)
                                                     is within tol of the target
 - radius_near   {value, tol}                        radius_deg / fov_deg / tile_radius_deg arg,
                                                     or the q3c_radial_query radius, near value
-- sql_regex     {pattern}                           case-insensitive regex over captured SQL
+- sql_regex     {pattern}                           case-insensitive regex over EXECUTED SQL
+                                                    (successful DATA LAB tool calls only —
+                                                    SQL pasted into the answer text or into a
+                                                    non-SQL tool's `query` arg never counts)
 - args_regex    {pattern}                           regex over JSON-serialized tool arguments
+                                                    of ALL calls (intent, incl. failed calls)
+- trace_regex   {pattern}                           regex over executed evidence only:
+                                                    successful-call args + executed SQL, with
+                                                    narrative fields (reason/title/...) scrubbed.
+                                                    Use for "the cut was actually APPLIED".
 - text_regex    {pattern}                           regex over the final response text
 - any_regex     {pattern}                           regex over SQL + args + text combined
+                                                    (gameable by prose — avoid for credit)
 - image_emitted {}                                  at least one image/plot was produced
 - image_count   {min}                               at least ``min`` images were produced
 - any / all     {of:[subchecks]}                    boolean composition
@@ -95,24 +104,21 @@ GLOBAL_PENALTIES = [
     },
     {
         "id": "GP-01",
-        "desc": "Unbounded row-level scan: raw SQL selects rows from a catalog "
-                "with no q3c spatial bound, no GROUP BY aggregate, no LIMIT and "
-                "no key-equality filter (seq-scan risk per guardrail #1/#4).",
+        "desc": "Unbounded row-level scan: executed SQL selects rows from a "
+                "catalog with no q3c spatial bound and no key-equality filter "
+                "(guardrail #1 — a LIMIT alone does not make the scan cheap; "
+                "row-cap discipline is scored separately as positive criteria).",
         "points": 10,
         "detect": {"kind": "sql_unbounded_rowscan"},
     },
     {
         "id": "GP-02",
-        "desc": "q3c_join anti-pattern: a flat q3c_join without a MATERIALIZED "
-                "CTE reduction of the small side (guardrail #2 — the exact "
-                "anti-example the PDF says never to run).",
+        "desc": "q3c_join anti-pattern: a statement with a flat q3c_join and no "
+                "MATERIALIZED CTE reduction of the small side (guardrail #2 — "
+                "the exact anti-example the PDF says never to run). Evaluated "
+                "per executed statement.",
         "points": 15,
-        "detect": {
-            "kind": "all", "of": [
-                {"kind": "sql_regex", "pattern": r"q3c_join\s*\("},
-                {"kind": "not", "of": {"kind": "sql_regex", "pattern": r"MATERIALIZED"}},
-            ],
-        },
+        "detect": {"kind": "sql_flat_q3c_join"},
     },
     {
         "id": "GP-03",
@@ -284,8 +290,8 @@ QUESTIONS = [
             },
             {
                 "id": "C3", "type": "auto", "points": 15,
-                "desc": "Point-source (morphology) cut applied",
-                "checks": [{"kind": "any_regex", "pattern": r"class_star"}],
+                "desc": "Point-source (morphology) cut actually applied in the executed query",
+                "checks": [{"kind": "trace_regex", "pattern": r"class_star"}],
             },
             {
                 "id": "C4", "type": "auto", "points": 20,
@@ -339,20 +345,23 @@ QUESTIONS = [
             },
             {
                 "id": "C2", "type": "auto", "points": 15,
-                "desc": "Pointed at M31 (10.6847, +41.2687) or resolved it by name",
+                "desc": "Pointed at M31 (10.6847, +41.2687) or resolved it by name "
+                        "(decision check: a coverage-gap failure must not zero it)",
                 "checks": [
                     {"kind": "any", "of": [
-                        {"kind": "position_near", "ra": 10.6847, "dec": 41.2687, "tol_deg": 0.3},
+                        {"kind": "position_near", "ra": 10.6847, "dec": 41.2687, "tol_deg": 0.3,
+                         "include_failed": True},
                         {"kind": "args_regex", "pattern": r"m\s?31|andromeda"},
                     ]},
                 ],
             },
             {
                 "id": "C3", "type": "auto", "points": 15,
-                "desc": "FOV chosen for the CENTER (modest, ~0.05-0.5 deg; not the whole 3-deg disk)",
+                "desc": "FOV chosen for the CENTER (modest, ~0.05-0.5 deg; not the whole 3-deg disk; "
+                        "decision check: counts even if the SIA search finds no coverage)",
                 "checks": [
                     {"kind": "tool_arg", "tools": ["datalab_color_image", "datalab_image_cutout"],
-                     "arg": "fov_deg", "min": 0.02, "max": 0.5},
+                     "arg": "fov_deg", "min": 0.02, "max": 0.5, "include_failed": True},
                 ],
             },
             {
@@ -417,10 +426,10 @@ QUESTIONS = [
             },
             {
                 "id": "C3", "type": "auto", "points": 20,
-                "desc": "Morphological star/galaxy split via spread_model",
+                "desc": "Morphological star/galaxy split via spread_model (in the executed query/tool args)",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"spread_model"},
-                    {"kind": "any_regex", "pattern": r"0\.00[2-9]"},
+                    {"kind": "trace_regex", "pattern": r"spread_model"},
+                    {"kind": "trace_regex", "pattern": r"0\.00[2-9]"},
                 ],
             },
             {
@@ -491,18 +500,18 @@ QUESTIONS = [
             },
             {
                 "id": "C2", "type": "auto", "points": 20,
-                "desc": "Real astrometric-quality + kinematic cuts (parallax significance, ruwe, pm)",
+                "desc": "Real astrometric-quality + kinematic cuts applied in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"parallax_over_error"},
-                    {"kind": "any_regex", "pattern": r"ruwe"},
-                    {"kind": "any_regex", "pattern": r"\bpm\b.{0,12}(>|&gt;).{0,6}\d|pm\s*>\s*\d+"},
+                    {"kind": "trace_regex", "pattern": r"parallax_over_error"},
+                    {"kind": "trace_regex", "pattern": r"ruwe"},
+                    {"kind": "trace_regex", "pattern": r"\bpm\b.{0,12}(>|&gt;).{0,6}\d|pm\s*>\s*\d+"},
                 ],
             },
             {
                 "id": "C3", "type": "auto", "points": 15,
-                "desc": "Absolute magnitude derived from parallax (M = G + 5 log10(parallax) - 10)",
+                "desc": "Absolute magnitude derived from parallax in the executed query/plot expression",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"5\s*\*?\s*log10\s*\(\s*parallax|abs_g|absolute magnitude"},
+                    {"kind": "trace_regex", "pattern": r"5\s*\*?\s*log10\s*\(\s*parallax|abs_g"},
                 ],
             },
             {
@@ -560,17 +569,17 @@ QUESTIONS = [
                         {"kind": "sql_regex", "pattern": r"smash_dr1\.object"},
                     ]},
                     {"kind": "any", "of": [
-                        {"kind": "any_regex", "pattern": r"fieldid.{0,12}169|\b169\b"},
+                        {"kind": "trace_regex", "pattern": r"fieldid.{0,12}169"},
                         {"kind": "position_near", "ra": 185.43, "dec": -31.99, "tol_deg": 0.5},
                     ]},
                 ],
             },
             {
                 "id": "C2", "type": "auto", "points": 15,
-                "desc": "Stellar morphology + blue main-sequence color box",
+                "desc": "Stellar morphology + blue main-sequence color box in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"sharp|class_star"},
-                    {"kind": "any_regex", "pattern": r"-\s*0\.5"},
+                    {"kind": "trace_regex", "pattern": r"sharp|class_star"},
+                    {"kind": "trace_regex", "pattern": r"-\s*0\.5"},
                 ],
             },
             {
@@ -585,11 +594,11 @@ QUESTIONS = [
             },
             {
                 "id": "C4", "type": "auto", "points": 10,
-                "desc": "Matched-filter / peak detection step present",
+                "desc": "Matched-filter / peak detection actually executed",
                 "checks": [
                     {"kind": "any", "of": [
                         {"kind": "tool_arg", "tools": ["datalab_sky_density_map"], "arg": "matched_filter", "equals": True},
-                        {"kind": "any_regex", "pattern": r"matched.?filter|difference.?of.?gaussians|mexican.?hat"},
+                        {"kind": "trace_regex", "pattern": r"matched_filter|peak_threshold|sigma_(small|large)"},
                     ]},
                 ],
             },
@@ -646,9 +655,9 @@ QUESTIONS = [
             },
             {
                 "id": "C2", "type": "auto", "points": 20,
-                "desc": "HEALPix binning via a precomputed column (ring256 / nest4096)",
+                "desc": "HEALPix binning via a precomputed column, in the executed aggregate",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"ring256|nest4096|healpix"},
+                    {"kind": "trace_regex", "pattern": r"ring256|nest4096|healpix"},
                 ],
             },
             {
@@ -748,13 +757,13 @@ QUESTIONS = [
             },
             {
                 "id": "C4", "type": "auto", "points": 10,
-                "desc": "Proper-motion selection applied (Pal 5 is a LOW-PM system)",
-                "checks": [{"kind": "any_regex", "pattern": r"\bpm\b\s*(<|&lt;)\s*\d|pmra|pmdec"}],
+                "desc": "Proper-motion selection applied in the executed crossmatch (Pal 5 is LOW-PM)",
+                "checks": [{"kind": "trace_regex", "pattern": r"\bpm\b\s*(<|&lt;)\s*\d|pmra|pmdec"}],
             },
             {
                 "id": "C5", "type": "auto", "points": 10,
-                "desc": "CMD/photometric mask on the NSC side",
-                "checks": [{"kind": "any_regex", "pattern": r"gmag|g\s*-\s*r|cmd|isochrone|main.?sequence"}],
+                "desc": "CMD/photometric selection on the NSC side (executed query/plot expressions)",
+                "checks": [{"kind": "trace_regex", "pattern": r"gmag|g\s*-\s*r"}],
             },
             {
                 "id": "C6", "type": "judge", "points": 20,
@@ -812,7 +821,7 @@ QUESTIONS = [
                         {"kind": "tool_arg", "tools": [], "arg": "catalog", "equals": "ls_dr9"},
                         {"kind": "sql_regex", "pattern": r"ls_dr9\.tractor"},
                     ]},
-                    {"kind": "any_regex", "pattern": r"dered_mag_w1|w1"},
+                    {"kind": "trace_regex", "pattern": r"dered_mag_w1|\bw1\b"},
                 ],
             },
             {
@@ -825,11 +834,11 @@ QUESTIONS = [
             },
             {
                 "id": "C3", "type": "auto", "points": 15,
-                "desc": "Red, extended-source selection with S/N floor",
+                "desc": "Red, extended-source selection with S/N floor in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"type\s*(!=|<>)\s*'?PSF|extended"},
-                    {"kind": "any_regex", "pattern": r"snr_|signal.?to.?noise"},
-                    {"kind": "any_regex", "pattern": r"(dered_mag_)?g\s*-\s*(dered_mag_)?r\s*(>|&gt;)|red"},
+                    {"kind": "trace_regex", "pattern": r"type\s*(!=|<>)\s*'?PSF"},
+                    {"kind": "trace_regex", "pattern": r"snr_"},
+                    {"kind": "trace_regex", "pattern": r"(dered_mag_)?g\s*-\s*(dered_mag_)?r\s*(>|&gt;)"},
                 ],
             },
             {
@@ -844,10 +853,10 @@ QUESTIONS = [
             },
             {
                 "id": "C5", "type": "auto", "points": 20,
-                "desc": "Wavelengths resolved from the SVO Filter Profile Service (not hardcoded)",
+                "desc": "Wavelengths resolved from the SVO Filter Profile Service, not hardcoded "
+                        "(datalab_sed_plot is SVO-backed internally, so either tool qualifies)",
                 "checks": [
                     {"kind": "tool_ok", "tools": ["svo_filter_wavelength", "datalab_sed_plot"]},
-                    {"kind": "any_regex", "pattern": r"svo|filter profile"},
                 ],
             },
             {
@@ -897,20 +906,20 @@ QUESTIONS = [
             },
             {
                 "id": "C2", "type": "auto", "points": 20,
-                "desc": "LRG bitmask + spectroscopic quality cuts",
+                "desc": "LRG bitmask + spectroscopic quality cuts in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"desi_target\s*&\s*1|desi_mask|LRG"},
-                    {"kind": "any_regex", "pattern": r"zwarn\s*=\s*0"},
-                    {"kind": "any_regex", "pattern": r"spectype\s*=\s*'?GALAXY"},
-                    {"kind": "any_regex", "pattern": r"survey\s*=\s*'?main|main_primary"},
+                    {"kind": "trace_regex", "pattern": r"desi_target\s*&\s*1|desi_mask"},
+                    {"kind": "trace_regex", "pattern": r"zwarn\s*=\s*0"},
+                    {"kind": "trace_regex", "pattern": r"spectype\s*=\s*'?GALAXY"},
+                    {"kind": "trace_regex", "pattern": r"survey\s*=\s*'?main|main_primary"},
                 ],
             },
             {
                 "id": "C3", "type": "auto", "points": 10,
-                "desc": "Redshift window 0.4 <= z <= 0.8",
+                "desc": "Redshift window 0.4 <= z <= 0.8 in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"0\.4"},
-                    {"kind": "any_regex", "pattern": r"0\.8"},
+                    {"kind": "trace_regex", "pattern": r"0\.4"},
+                    {"kind": "trace_regex", "pattern": r"0\.8"},
                 ],
             },
             {
@@ -987,10 +996,10 @@ QUESTIONS = [
             },
             {
                 "id": "C3", "type": "auto", "points": 10,
-                "desc": "Stellar + blue color cuts in the density query",
+                "desc": "Stellar + blue color cuts in the executed density query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"class_star|sharp"},
-                    {"kind": "any_regex", "pattern": r"-\s*0\.5"},
+                    {"kind": "trace_regex", "pattern": r"class_star|sharp"},
+                    {"kind": "trace_regex", "pattern": r"-\s*0\.5"},
                 ],
             },
             {
@@ -1044,9 +1053,12 @@ QUESTIONS = [
             "SELECT ra, dec, z FROM sdss_dr17.specobj WHERE class = 'GALAXY' AND zwarning = 0 "
             "AND ra BETWEEN 190 AND 240 AND dec BETWEEN 0 AND 5 AND z BETWEEN 0.0 AND 0.10"
         ),
-        # The reference query itself is a BETWEEN box (small spectroscopic table
-        # — the notebook idiom); do not penalize.
-        "disable_penalties": ["GP-03"],
+        # Explicit guardrail exception: the PDF's own reference query is a
+        # row-level RA/Dec BETWEEN box over sdss_dr17.specobj — a compact
+        # spectroscopic table where the notebook idiom is a plain box and a
+        # seq scan is affordable. GP-01/GP-03 are therefore waived HERE ONLY;
+        # bounding is still scored positively via C7.
+        "disable_penalties": ["GP-01", "GP-03"],
         "checkpoints": [
             {
                 "id": "C1", "type": "auto", "points": 15,
@@ -1060,11 +1072,11 @@ QUESTIONS = [
             },
             {
                 "id": "C2", "type": "auto", "points": 15,
-                "desc": "Galaxy + quality + thin-z selection",
+                "desc": "Galaxy + quality + thin-z selection in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"class\s*=\s*'?GALAXY"},
-                    {"kind": "any_regex", "pattern": r"zwarning\s*=\s*0"},
-                    {"kind": "any_regex", "pattern": r"z\s+BETWEEN\s+0(\.0)?\s+AND\s+0\.1|z\s*(<|&lt;)=?\s*0\.1"},
+                    {"kind": "trace_regex", "pattern": r"class\s*=\s*'?GALAXY"},
+                    {"kind": "trace_regex", "pattern": r"zwarning\s*=\s*0"},
+                    {"kind": "trace_regex", "pattern": r"z\s+BETWEEN\s+0(\.0)?\s+AND\s+0\.1|z\s*(<|&lt;)=?\s*0\.1"},
                 ],
             },
             {
@@ -1152,16 +1164,16 @@ QUESTIONS = [
                             {"kind": "position_near", "ra": 185.4311, "dec": -31.9953, "tol_deg": 0.01},
                             {"kind": "radius_near", "value": 0.000278, "tol": 0.001},
                         ]},
-                        {"kind": "any_regex", "pattern": r"169\.429960"},
+                        {"kind": "trace_regex", "pattern": r"169\.429960"},
                     ]},
                 ],
             },
             {
                 "id": "C3", "type": "auto", "points": 10,
-                "desc": "Valid-epoch filtering (cmag < 99) and a single band",
+                "desc": "Valid-epoch filtering (cmag < 99) and a single band, in the executed query",
                 "checks": [
-                    {"kind": "any_regex", "pattern": r"cmag\s*(<|&lt;)\s*99"},
-                    {"kind": "any_regex", "pattern": r"filter\s*=\s*'?g|\"filter\""},
+                    {"kind": "trace_regex", "pattern": r"cmag\s*(<|&lt;)\s*99"},
+                    {"kind": "trace_regex", "pattern": r"filter\s*=\s*'?g|\"filter\""},
                 ],
             },
             {
@@ -1169,7 +1181,7 @@ QUESTIONS = [
                 "desc": "Lomb-Scargle period search + phase fold executed",
                 "checks": [
                     {"kind": "tool_ok", "tools": ["datalab_period_fold"]},
-                    {"kind": "any_regex", "pattern": r"lomb|scargle|phase.?fold"},
+                    {"kind": "trace_regex", "pattern": r"lomb|scargle|phase.?fold|period_fold"},
                 ],
             },
             {
@@ -1250,8 +1262,8 @@ QUESTIONS = [
                         {"kind": "tool_ok", "tools": ["datalab_tiled_search"]},
                         {"kind": "tool_ok", "tools": ["datalab_density_aggregate"]},
                     ]},
-                    {"kind": "any_regex", "pattern": r"ext_coadd|class_star|sharp"},
-                    {"kind": "any_regex", "pattern": r"color_cut|mag_auto_g\s*-\s*mag_auto_r|g\s*-\s*r"},
+                    {"kind": "trace_regex", "pattern": r"ext_coadd|class_star|sharp"},
+                    {"kind": "trace_regex", "pattern": r"color_cut|mag_auto_g\s*-\s*mag_auto_r|g\s*-\s*r"},
                 ],
             },
             {
@@ -1303,9 +1315,9 @@ def validate_dataset():
     seen = set()
     known_kinds = {
         "tool_called", "tool_ok", "tool_arg", "position_near", "radius_near",
-        "sql_regex", "args_regex", "text_regex", "any_regex", "image_emitted",
-        "image_count", "any", "all", "not", "sql_unbounded_rowscan",
-        "sql_between_rowscan",
+        "sql_regex", "args_regex", "text_regex", "any_regex", "trace_regex",
+        "image_emitted", "image_count", "any", "all", "not",
+        "sql_unbounded_rowscan", "sql_between_rowscan", "sql_flat_q3c_join",
     }
 
     def walk(check, path):

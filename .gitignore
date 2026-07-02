@@ -76,6 +76,7 @@ scratch_*.py
 # Generated/runtime artifacts
 # ============================================
 /Benchmark/results/
+/Benchmark/datalabbench/results/
 /data/dag_cache.json
 /data/search_usage.json
 /poster/

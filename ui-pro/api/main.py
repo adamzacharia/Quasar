@@ -1739,6 +1739,7 @@ def _stream_chat_response(
                             "text": res,
                             "all_results": list(getattr(agent, '_accumulated_run_results', []) or []),
                             "last_result": agent.last_run_result,
+                            "tool_trace": list(getattr(agent, '_accumulated_tool_trace', []) or []),
                         }
                         asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
                     except Exception as e:
@@ -1935,6 +1936,7 @@ def _stream_chat_response(
                     response_text = _sanitize_assistant_text(payload["text"] if isinstance(payload, dict) else payload)
                     _snapshot_all = payload.get("all_results", []) if isinstance(payload, dict) else []
                     _snapshot_last = payload.get("last_result") if isinstance(payload, dict) else None
+                    _snapshot_tool_trace = payload.get("tool_trace", []) if isinstance(payload, dict) else []
                     break
                 if msg_type == "error":
                     run_status = "failed"
@@ -1961,6 +1963,7 @@ def _stream_chat_response(
             # the agent) so they survive thread-local cleanup.
             _all_results = _snapshot_all if '_snapshot_all' in dir() else []
             _last_result = _snapshot_last if '_snapshot_last' in dir() else None
+            _tool_trace = _snapshot_tool_trace if '_snapshot_tool_trace' in dir() else []
             # Deduplicate: if last_run_result isn't already in the list, add it
             if _last_result and not _all_results:
                 _all_results = [_last_result]
@@ -2202,6 +2205,44 @@ def _stream_chat_response(
             if conv_id:
                 meta_event = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
                 yield f"data: {meta_event}\n\n"
+
+            # Full tool-call trace (names, arguments, truncated outputs) —
+            # consumed by debug tooling and Benchmark/datalabbench scoring.
+            if _tool_trace:
+                try:
+                    _TRACE_CAP = 131072  # hard cap for one SSE event
+                    trace_event = json.dumps(
+                        {"type": "tool_trace", "calls": _tool_trace}, default=str
+                    )
+                    if len(trace_event) > _TRACE_CAP:
+                        # Degrade in stages until it fits: (1) drop raw outputs,
+                        # (2) replace oversized argument dicts, (3) drop tail
+                        # calls — always recording how much was omitted.
+                        slim_calls = [
+                            {k: v for k, v in c.items() if k != "output"}
+                            for c in _tool_trace if isinstance(c, dict)
+                        ]
+                        for c in slim_calls:
+                            try:
+                                if len(json.dumps(c.get("arguments", {}), default=str)) > 4000:
+                                    c["arguments"] = {"_truncated": True}
+                            except Exception:
+                                c["arguments"] = {"_truncated": True}
+                        omitted = 0
+                        trace_event = json.dumps(
+                            {"type": "tool_trace", "calls": slim_calls,
+                             "truncated": True, "omitted_calls": omitted}, default=str
+                        )
+                        while len(trace_event) > _TRACE_CAP and slim_calls:
+                            slim_calls.pop()
+                            omitted += 1
+                            trace_event = json.dumps(
+                                {"type": "tool_trace", "calls": slim_calls,
+                                 "truncated": True, "omitted_calls": omitted}, default=str
+                            )
+                    yield f"data: {trace_event}\n\n"
+                except Exception as _tt_err:
+                    logger.warning(f"[CHAT] Failed to emit tool_trace event: {_tt_err}")
 
             _tokens_total = usage_totals["input"] + usage_totals["output"]
             if _tokens_total > 0:
