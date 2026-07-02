@@ -937,10 +937,36 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             ("group_ous_uid", "Group OUS ID"),
             ("asdm_uid", "ASDM UID"),
         ]
+        mmu_display_cols = [
+            ("source_id", "Source ID"), ("object_id", "Object ID"), ("targetid", "Target ID"),
+            ("ticid", "TIC ID"), ("name", "Name"), ("obsid", "ObsID"),
+            ("ra", "RA (deg)"), ("dec", "Dec (deg)"),
+            ("parallax", "Parallax (mas)"), ("parallax_error", "Parallax err"),
+            ("pmra", "PM RA (mas/yr)"), ("pmdec", "PM Dec (mas/yr)"),
+            ("phot_g_mean_mag", "G (mag)"), ("phot_bp_mean_mag", "BP (mag)"), ("phot_rp_mean_mag", "RP (mag)"),
+            ("radial_velocity", "Radial Vel."), ("ruwe", "RUWE"),
+            ("redshift", "Redshift"), ("z", "Redshift"), ("Z", "Redshift"),
+            ("zerr", "z err"), ("ZERR", "z err"), ("Z_ERR", "z err"),
+            ("ZWARN", "Z warn"), ("ZWARNING", "Z warn"), ("EBV", "E(B-V)"),
+            ("FLUX_G", "Flux g"), ("FLUX_R", "Flux r"), ("FLUX_Z", "Flux z"),
+            ("VDISP", "V disp (km/s)"),
+            ("SPECTROFLUX_G", "Spec flux g"), ("SPECTROFLUX_R", "Spec flux r"), ("SPECTROFLUX_I", "Spec flux i"),
+            ("flux_aper_b", "Flux (b)"), ("flux_significance_b", "Flux signif."),
+            ("hard_hm", "HR hm"), ("hard_hs", "HR hs"), ("hard_ms", "HR ms"),
+            ("var_index_b", "Var index"), ("var_prob_b", "Var prob"),
+            ("mag", "Mag"), ("flux", "Flux"), ("tessmag", "TESS (mag)"),
+            ("teff", "Teff"), ("logg", "log g"), ("radius", "Radius"),
+            ("class", "Class"), ("classification", "Class"), ("spectype", "Spec Type"), ("subtype", "Subtype"), ("subclass", "Subclass"),
+            ("plate", "Plate"), ("mjd", "MJD"), ("fiberid", "Fiber ID"), ("exposure", "Exposure"),
+            ("survey", "Survey"), ("catalog", "Catalog"),
+        ]
         if table_kind == "alma_products":
             alma_display_cols = product_display_cols
         elif table_kind == "alma_project_picker":
             alma_display_cols = project_picker_cols
+        elif table_kind == "mmu_hats":
+            known_mmu_cols = {raw for raw, _ in mmu_display_cols}
+            alma_display_cols = list(mmu_display_cols) + [(col, str(col)) for col in df.columns if col not in known_mmu_cols]
         seen_display = set()
         sel_cols, display_cols = [], []
         for raw, nice in alma_display_cols:
@@ -1065,6 +1091,8 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             else:
                 fits_estimate = len(df)
         elif table_kind == "alma_project_picker":
+            fits_estimate = 0
+        elif table_kind == "mmu_hats":
             fits_estimate = 0
 
         # ── Detect archive source dynamically ─────────

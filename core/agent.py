@@ -112,6 +112,13 @@ from integrations.datalab_client import DatalabClient
 from services import datalab_query_builders, datalab_registry, datalab_sql_policy
 from services import datalab_orchestration
 from services.datalab_result_store import default_result_store
+from services.mmu_hats import (
+    MMU_HATS_CATALOGS,
+    MMUHatsError,
+    MMUHatsUnavailableError,
+    compact_preview_frame,
+    default_mmu_hats_service,
+)
 from services.datalab_job_service import default_job_service
 
 # Phase 1-4: Multi-Agent Workforce modules
@@ -723,6 +730,7 @@ GUIDELINES:
 - **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
 - **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` — they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
 - **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
+- **MMU/HATS CATALOG RULE**: Use `search_mmu_hats_catalog` when the user asks for source/catalog properties from large surveys -- Gaia astrometry/proper motions/parallaxes, DESI/SDSS redshifts and classifications, TESS source metadata, Chandra spectra metadata, what sources are near this position, source tables for ML, or cross-survey enrichment. Use the archive tools (search_by_target, search_by_position, search_mast, search_cadc_archive, search_eso_archive, triage_alma_data_products) when the user asks for observation availability, project/proposal IDs, FITS/data products, or telescope archive records. For combined requests (find ALMA data for M87 and Gaia sources in the field), call the archive tool FIRST to get observations/positions, THEN search_mmu_hats_catalog to enrich the field. For catalog-to-catalog matching use crossmatch_mmu_hats_catalogs within a bounded cone; if it fails, run two bounded cone searches and say so. Examples: Find ALMA data for M87 -> search_by_target. What Gaia sources are near M87? -> search_mmu_hats_catalog(catalog_key='gaia', target_name='M87'). Download ALMA FITS files -> ALMA/DataLink tools, never MMU/HATS.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **LINE COVERAGE**: For one named transition and target (for example, "Check CO(2-1) line coverage for M87"), call `find_alma_line_coverage` once. It resolves the target/redshift, selects the exact Splatalogue transition, and locally verifies ALMA spectral-window coverage. Do NOT use broad `check_co_lines` for a named transition and do NOT report other CO ladder transitions as matches. Keep `check_co_lines` only for explicit requests to inspect the whole CO/13CO/C18O ladder in prior search results.
@@ -2209,6 +2217,66 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             },
             category="datalab",
         ))
+        # -- Multimodal Universe HATS catalogs (LSDB / Hugging Face) --
+        self.tool_registry.register(Tool(
+            name="list_mmu_hats_catalogs",
+            description="List available Multimodal Universe HATS catalogs (Gaia, DESI, SDSS, TESS, Chandra) that Quasar can cone-search from Hugging Face via LSDB. These provide catalog/source properties, not archive observations.",
+            function=self._list_mmu_hats_catalogs,
+            parameters={"type": "object", "properties": {}, "required": []},
+            category="mmu_hats",
+        ))
+        self.tool_registry.register(Tool(
+            name="search_mmu_hats_catalog",
+            description=(
+                "Cone-search a Multimodal Universe HATS catalog using LSDB/Hugging Face. "
+                "Use this for catalog/source properties such as Gaia astrometry, DESI/SDSS redshifts, "
+                "TESS source metadata, Chandra spectra metadata, or cross-survey source enrichment "
+                "around a sky position. Do NOT use this for finding archive observations, project/proposal IDs, "
+                "or FITS/data products -- use the archive tools for those."
+            ),
+            function=self._search_mmu_hats_catalog,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "catalog_key": {"type": "string", "enum": sorted(MMU_HATS_CATALOGS)},
+                    "ra": {"type": "number", "description": "ICRS right ascension in degrees."},
+                    "dec": {"type": "number", "description": "ICRS declination in degrees."},
+                    "radius_arcsec": {"type": "number", "default": 120, "description": "Cone radius in arcseconds; capped by MMU_HATS_MAX_RADIUS_ARCSEC."},
+                    "columns": {"type": "array", "items": {"type": "string"}},
+                    "max_rows": {"type": "integer", "default": 500, "description": "Maximum rows returned to the UI; capped by MMU_HATS_MAX_ROWS."},
+                    "target_name": {"type": "string", "description": "Resolve this name to RA/Dec instead of passing ra/dec."},
+                },
+                "required": [],
+            },
+            category="mmu_hats",
+        ))
+        self.tool_registry.register(Tool(
+            name="crossmatch_mmu_hats_catalogs",
+            description=(
+                "Crossmatch two Multimodal Universe HATS catalogs (e.g. gaia x desi_edr_sv3) "
+                "within a bounded cone region using LSDB margin caches. Requires ra/dec/radius -- "
+                "all-sky crossmatches are not allowed. If this fails, run two bounded "
+                "search_mmu_hats_catalog cone searches instead."
+            ),
+            function=self._crossmatch_mmu_hats_catalogs,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "left_catalog_key": {"type": "string", "enum": sorted(MMU_HATS_CATALOGS)},
+                    "right_catalog_key": {"type": "string", "enum": sorted(MMU_HATS_CATALOGS)},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "radius_arcsec": {"type": "number", "default": 120},
+                    "match_radius_arcsec": {"type": "number", "default": 1.0},
+                    "columns_left": {"type": "array", "items": {"type": "string"}},
+                    "columns_right": {"type": "array", "items": {"type": "string"}},
+                    "max_rows": {"type": "integer", "default": 500},
+                },
+                "required": ["left_catalog_key", "right_catalog_key", "ra", "dec"],
+            },
+            category="mmu_hats",
+        ))
+
         self.tool_registry.register(Tool(
             name="get_sky_image",
             description=(
@@ -4039,6 +4107,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "search_papers": "Searching astronomy literature",
             "search_papers_by_observation_id": "Searching papers linked to observation",
             "lookup_researcher": "Looking up researcher profile",
+            "list_mmu_hats_catalogs": "Listing Multimodal Universe catalogs",
+            "search_mmu_hats_catalog": f"Searching Multimodal Universe {args.get('catalog_key', 'catalog')}",
+            "crossmatch_mmu_hats_catalogs": "Crossmatching Multimodal Universe catalogs",
         }
         label = tool_labels.get(tool_name, f"Running {tool_name.replace('_', ' ')}")
 
@@ -5298,6 +5369,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             self._datalab_result_store_instance = default_result_store()
         return self._datalab_result_store_instance
 
+    def _get_mmu_hats_service(self):
+        if not hasattr(self, "_mmu_hats_service_instance"):
+            self._mmu_hats_service_instance = default_mmu_hats_service()
+        return self._mmu_hats_service_instance
+
     def _datalab_list_catalogs(self) -> Dict[str, Any]:
         self.last_run_result = None  # Data Lab tools emit summaries, not stale data cards
         try:
@@ -5499,9 +5575,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 elif out.get("result_id") is not None:
                     cat, tab, rc = out.get("catalog") or "", out.get("table") or "", out.get("rowcount")
                     queried.append((f"{cat}.{tab}".strip(".") or "a Data Lab table") + (f" ({rc} rows)" if rc is not None else ""))
+                elif str(out.get("source") or "").startswith("Multimodal Universe"):
+                    rc = out.get("rowcount")
+                    queried.append(str(out.get("source")) + (f" ({rc} rows)" if rc is not None else ""))
         parts = []
         if queried:
-            parts.append("Queried Data Lab: " + "; ".join(dict.fromkeys(queried)) + ".")
+            query_label = "Queried catalogs" if any(str(q).startswith("Multimodal Universe") for q in queried) else "Queried Data Lab"
+            parts.append(query_label + ": " + "; ".join(dict.fromkeys(queried)) + ".")
         if produced:
             parts.append("Produced " + "; ".join(dict.fromkeys(produced)) + " (shown above).")
         if errors:
@@ -5562,6 +5642,159 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         except Exception as e:
             return self._datalab_error(e)
+
+    # MMU/HATS catalog handlers
+
+    def _list_mmu_hats_catalogs(self) -> Dict[str, Any]:
+        self.last_run_result = None  # MMU catalog listing emits summaries, not stale data cards
+        service = self._get_mmu_hats_service()
+        catalogs = service.list_catalogs()
+        available, reason = service.is_available()
+        return {
+            "success": True,
+            "enabled": bool(getattr(service, "enabled", True)),
+            "available": available,
+            "reason": reason or None,
+            "catalogs": catalogs,
+            "count": len(catalogs),
+        }
+
+    def _search_mmu_hats_catalog(
+        self,
+        catalog_key: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_arcsec: Optional[float] = None,
+        columns: Optional[List[str]] = None,
+        max_rows: Optional[int] = None,
+        target_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        service = self._get_mmu_hats_service()
+        if not catalog_key:
+            return {"success": False, "error": f"catalog_key is required. Valid catalogs: {sorted(MMU_HATS_CATALOGS)}"}
+        if (ra is None or dec is None) and target_name:
+            resolved = self._resolve_target(str(target_name))
+            if not resolved.get("success"):
+                return {"success": False, "error": resolved.get("error") or f"Could not resolve target {target_name!r}"}
+            ra = resolved.get("ra_deg")
+            dec = resolved.get("dec_deg")
+        try:
+            result = service.cone_search(
+                catalog_key,
+                ra=ra,
+                dec=dec,
+                radius_arcsec=radius_arcsec,
+                columns=columns,
+                max_rows=max_rows,
+            )
+        except MMUHatsUnavailableError as e:
+            return {"success": False, "unavailable": True, "error": str(e)}
+        except MMUHatsError as e:
+            return {"success": False, "error": str(e)}
+
+        df = result["dataframe"]
+        provenance = result.get("provenance", {})
+        cone = provenance.get("cone", {})
+        eff_ra = float(cone.get("ra_deg", ra))
+        eff_dec = float(cone.get("dec_deg", dec))
+        eff_radius = float(cone.get("radius_arcsec", radius_arcsec or 0))
+        catalog_label = provenance.get("catalog_label") or str(catalog_key)
+        source = f"Multimodal Universe / {catalog_label}"
+        self.last_run_result = {
+            "type": "data",
+            "data": df,
+            "source": source,
+            "filter_label": f"{catalog_label} › cone RA={eff_ra:.5f}, Dec={eff_dec:.5f}, r={eff_radius:g} arcsec",
+            "tool_name": "search_mmu_hats_catalog",
+            "table_kind": "mmu_hats",
+            "warnings": result.get("warnings", []),
+            "partial": bool(result.get("warnings")),
+        }
+        # Compact nested/oversized cells first: a single embedded spectrum could
+        # otherwise push the tool JSON past the 8000-char dispatch slice.
+        preview_rows, _ = self._datalab_fit_rows(compact_preview_frame(df), 10, char_budget=4000)
+        preview_more = int(len(df)) > len(preview_rows)
+        return {
+            "success": True,
+            "catalog_key": catalog_key,
+            "source": source,
+            "rowcount": result.get("rowcount", int(len(df))),
+            "returned_rows": result.get("returned_rows", int(len(df))),
+            "columns": result.get("columns", list(df.columns)),
+            "results_preview": preview_rows,
+            "preview_truncated": preview_more,
+            "warnings": result.get("warnings", []),
+            "provenance": provenance,
+            "note": "Full table is rendered as a data card in the UI; do not repeat the rows in text.",
+        }
+
+    def _crossmatch_mmu_hats_catalogs(
+        self,
+        left_catalog_key: str,
+        right_catalog_key: str,
+        ra: float,
+        dec: float,
+        radius_arcsec: Optional[float] = None,
+        match_radius_arcsec: float = 1.0,
+        columns_left: Optional[List[str]] = None,
+        columns_right: Optional[List[str]] = None,
+        max_rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        service = self._get_mmu_hats_service()
+        try:
+            result = service.crossmatch_catalogs(
+                left_catalog_key,
+                right_catalog_key,
+                ra=ra,
+                dec=dec,
+                radius_arcsec=radius_arcsec,
+                match_radius_arcsec=match_radius_arcsec,
+                columns_left=columns_left,
+                columns_right=columns_right,
+                max_rows=max_rows,
+            )
+        except MMUHatsUnavailableError as e:
+            return {"success": False, "unavailable": True, "error": str(e)}
+        except MMUHatsError as e:
+            return {"success": False, "error": str(e)}
+
+        df = result["dataframe"]
+        provenance = result.get("provenance", {})
+        cone = provenance.get("cone", {})
+        eff_ra = float(cone.get("ra_deg", ra))
+        eff_dec = float(cone.get("dec_deg", dec))
+        eff_radius = float(cone.get("radius_arcsec", radius_arcsec or 0))
+        left_label = provenance.get("left_catalog_label") or str(left_catalog_key)
+        right_label = provenance.get("right_catalog_label") or str(right_catalog_key)
+        source = f"Multimodal Universe / {left_label} x {right_label}"
+        self.last_run_result = {
+            "type": "data",
+            "data": df,
+            "source": source,
+            "filter_label": f"{left_label} × {right_label} › crossmatch RA={eff_ra:.5f}, Dec={eff_dec:.5f}, r={eff_radius:g} arcsec",
+            "tool_name": "crossmatch_mmu_hats_catalogs",
+            "table_kind": "mmu_hats",
+            "warnings": result.get("warnings", []),
+            "partial": bool(result.get("warnings")),
+        }
+        preview_rows, _ = self._datalab_fit_rows(compact_preview_frame(df), 10, char_budget=4000)
+        preview_more = int(len(df)) > len(preview_rows)
+        return {
+            "success": True,
+            "left_catalog_key": left_catalog_key,
+            "right_catalog_key": right_catalog_key,
+            "source": source,
+            "rowcount": result.get("rowcount", int(len(df))),
+            "returned_rows": result.get("returned_rows", int(len(df))),
+            "columns": result.get("columns", list(df.columns)),
+            "results_preview": preview_rows,
+            "preview_truncated": preview_more,
+            "warnings": result.get("warnings", []),
+            "provenance": provenance,
+            "note": "Full table is rendered as a data card in the UI; do not repeat the rows in text.",
+        }
 
     # Data Lab P1 handlers
 
@@ -7821,12 +8054,16 @@ IMPORTANT RULES:
                     "error": f"SIMBAD could not resolve '{target_name}'. Check spelling or try alternate designation."
                 }
             
-            # Get coordinates from first match
-            ra_str = result['RA'][0]   # Format: "HH MM SS.ss"
-            dec_str = result['DEC'][0]  # Format: "+DD MM SS.s"
-            
-            # Convert to decimal degrees
-            coord = SkyCoord(ra_str, dec_str, unit=(u.hourangle, u.deg))
+            # Get coordinates from first match. astroquery <0.4.8 returns
+            # 'RA'/'DEC' sexagesimal strings; newer versions return lowercase
+            # 'ra'/'dec' already in degrees.
+            cols = {c.lower(): c for c in result.colnames}
+            ra_val = result[cols['ra']][0]
+            dec_val = result[cols['dec']][0]
+            try:
+                coord = SkyCoord(ra=float(ra_val) * u.deg, dec=float(dec_val) * u.deg)
+            except (TypeError, ValueError):
+                coord = SkyCoord(str(ra_val), str(dec_val), unit=(u.hourangle, u.deg))
             
             return {
                 "success": True,

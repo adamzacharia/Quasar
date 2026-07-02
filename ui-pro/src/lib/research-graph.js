@@ -65,7 +65,7 @@ function collectGraphInputs(messages) {
     const papers = [];
 
     for (const message of messages || []) {
-        if (message?.dataTable && !["alma_products", "alma_project_picker"].includes(message.dataTable.tableKind || "")) {
+        if (message?.dataTable && !["alma_products", "alma_project_picker", "mmu_hats"].includes(message.dataTable.tableKind || "")) {
             dataTables.push(message.dataTable);
         }
         if (Array.isArray(message?.papers)) papers.push(...message.papers);

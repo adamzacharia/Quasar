@@ -74,3 +74,9 @@ diskcache
 h5py
 imageio
 networkx
+
+# Multimodal Universe / LSDB (HATS catalogs on Hugging Face). Lazy-imported by
+# services/mmu_hats.py; Quasar boots fine without them, and the MMU tools then
+# report "unavailable" instead of crashing.
+lsdb==0.9.2
+huggingface_hub
