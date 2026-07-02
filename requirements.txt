@@ -80,3 +80,6 @@ networkx
 # report "unavailable" instead of crashing.
 lsdb==0.9.2
 huggingface_hub
+
+# NOIRLab SparCL spectra; lazy-imported by services/sparcl_spectra.py.
+sparclclient

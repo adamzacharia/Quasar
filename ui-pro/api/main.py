@@ -960,6 +960,16 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             ("plate", "Plate"), ("mjd", "MJD"), ("fiberid", "Fiber ID"), ("exposure", "Exposure"),
             ("survey", "Survey"), ("catalog", "Catalog"),
         ]
+        external_display_cols = [
+            ("oid", "OID"), ("ndet", "Detections"),
+            ("meanra", "RA (deg)"), ("meandec", "Dec (deg)"),
+            ("firstmjd", "First MJD"), ("lastmjd", "Last MJD"),
+            ("classalerce", "Class"), ("classification", "Class"), ("class", "Class"),
+            ("probability", "Probability"), ("prob", "Probability"), ("classifier", "Classifier"),
+            ("sparcl_id", "SparCL ID"), ("ra", "RA (deg)"), ("dec", "Dec (deg)"),
+            ("distance_arcsec", "Distance (arcsec)"), ("redshift", "Redshift"),
+            ("spectype", "Spec Type"), ("data_release", "Data Release"),
+        ]
         if table_kind == "alma_products":
             alma_display_cols = product_display_cols
         elif table_kind == "alma_project_picker":
@@ -967,6 +977,9 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         elif table_kind == "mmu_hats":
             known_mmu_cols = {raw for raw, _ in mmu_display_cols}
             alma_display_cols = list(mmu_display_cols) + [(col, str(col)) for col in df.columns if col not in known_mmu_cols]
+        elif table_kind == "external_catalog":
+            known_external_cols = {raw for raw, _ in external_display_cols}
+            alma_display_cols = list(external_display_cols) + [(col, str(col)) for col in df.columns if col not in known_external_cols]
         seen_display = set()
         sel_cols, display_cols = [], []
         for raw, nice in alma_display_cols:
@@ -1093,6 +1106,8 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         elif table_kind == "alma_project_picker":
             fits_estimate = 0
         elif table_kind == "mmu_hats":
+            fits_estimate = 0
+        elif table_kind == "external_catalog":
             fits_estimate = 0
 
         # ── Detect archive source dynamically ─────────

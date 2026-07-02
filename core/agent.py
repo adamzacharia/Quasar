@@ -731,6 +731,7 @@ GUIDELINES:
 - **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` — they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
 - **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
 - **MMU/HATS CATALOG RULE**: Use `search_mmu_hats_catalog` when the user asks for source/catalog properties from large surveys -- Gaia astrometry/proper motions/parallaxes, DESI/SDSS redshifts and classifications, TESS source metadata, Chandra spectra metadata, what sources are near this position, source tables for ML, or cross-survey enrichment. Use the archive tools (search_by_target, search_by_position, search_mast, search_cadc_archive, search_eso_archive, triage_alma_data_products) when the user asks for observation availability, project/proposal IDs, FITS/data products, or telescope archive records. For combined requests (find ALMA data for M87 and Gaia sources in the field), call the archive tool FIRST to get observations/positions, THEN search_mmu_hats_catalog to enrich the field. For catalog-to-catalog matching use crossmatch_mmu_hats_catalogs within a bounded cone; if it fails, run two bounded cone searches and say so. Examples: Find ALMA data for M87 -> search_by_target. What Gaia sources are near M87? -> search_mmu_hats_catalog(catalog_key='gaia', target_name='M87'). Download ALMA FITS files -> ALMA/DataLink tools, never MMU/HATS.
+- **LIVE IMAGERY RULE**: Use `hips_cutout` or `hips_multiband_panel` for "show me", appearance, and multiwavelength postage-stamp questions; they are deeper and broader than `get_sky_image`. Use `vlass_cutout` for 3 GHz radio continuum imagery (Dec > -40 only). Use `search_ztf_alerts`, `ztf_light_curve`, and `ztf_stamps` for transients and variability. Use `ned_sed_plot` for literature SEDs. Use `sparcl_find_spectra` and `sparcl_plot_spectrum` for real DESI/SDSS optical spectra. MMU/Data Lab remain authoritative for catalog tables.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **LINE COVERAGE**: For one named transition and target (for example, "Check CO(2-1) line coverage for M87"), call `find_alma_line_coverage` once. It resolves the target/redshift, selects the exact Splatalogue transition, and locally verifies ALMA spectral-window coverage. Do NOT use broad `check_co_lines` for a named transition and do NOT report other CO ladder transitions as matches. Keep `check_co_lines` only for explicit requests to inspect the whole CO/13CO/C18O ladder in prior search results.
@@ -2277,6 +2278,141 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="mmu_hats",
         ))
 
+        # -- Live imagery and external spectra (hips2fits, ZTF, NED, SparCL) --
+        self.tool_registry.register(Tool(
+            name="hips_cutout",
+            description=(
+                "Fetch a live CDS hips2fits PNG cutout for 'show me X', 'what does X look like', "
+                "or multiwavelength postage-stamp requests. Supports aliases optical/dss/dss2, sdss, "
+                "2mass/nir, wise/mir, galex/uv, rosat/xray, fermi/gamma, vlass/radio, or raw HiPS IDs. "
+                "Use this for broad survey imagery; hips2fits exposes roughly 1000 HiPS surveys."
+            ),
+            function=self._hips_cutout,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Resolve this target name to RA/Dec if ra/dec are not supplied."},
+                    "ra": {"type": "number", "description": "ICRS right ascension in degrees."},
+                    "dec": {"type": "number", "description": "ICRS declination in degrees."},
+                    "survey": {"type": "string", "default": "optical", "description": "Survey alias or raw HiPS ID. Aliases: optical/dss/dss2, dss2_red, sdss, 2mass/nir, wise/mir, galex/uv, rosat/xray, fermi/gamma, vlass/radio."},
+                    "fov_deg": {"type": "number", "default": 0.25},
+                    "width": {"type": "integer", "default": 512},
+                },
+                "required": [],
+            },
+            category="archive",
+        ))
+        self.tool_registry.register(Tool(
+            name="hips_multiband_panel",
+            description=(
+                "Render a multi-panel CDS hips2fits survey view for appearance or multiwavelength "
+                "postage-stamp requests. Defaults to optical, 2MASS, and WISE; failed panels are labeled."
+            ),
+            function=self._hips_multiband_panel,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "surveys": {"type": "array", "items": {"type": "string"}, "default": ["optical", "2mass", "wise"]},
+                    "fov_deg": {"type": "number", "default": 0.25},
+                },
+                "required": [],
+            },
+            category="archive",
+        ))
+        self.tool_registry.register(Tool(
+            name="vlass_cutout",
+            description="Fetch a VLASS 3 GHz radio-continuum cutout via hips2fits. Use for radio appearance; VLASS covers Dec > -40 deg only.",
+            function=self._vlass_cutout,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "fov_deg": {"type": "number", "default": 0.1},
+                },
+                "required": [],
+            },
+            category="archive",
+        ))
+        self.tool_registry.register(Tool(
+            name="search_ztf_alerts",
+            description="Search ALeRCE/ZTF alert objects near a target or sky position for transients and variability; returns a UI table of object IDs and detection metadata.",
+            function=self._search_ztf_alerts,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "radius_arcsec": {"type": "number", "default": 120},
+                    "max_rows": {"type": "integer", "default": 25},
+                },
+                "required": [],
+            },
+            category="archive",
+        ))
+        self.tool_registry.register(Tool(
+            name="ztf_light_curve",
+            description="Plot an ALeRCE/ZTF light curve for an alert object oid, including detections and non-detection limits.",
+            function=self._ztf_light_curve,
+            parameters={"type": "object", "properties": {"oid": {"type": "string"}}, "required": ["oid"]},
+            category="analysis",
+        ))
+        self.tool_registry.register(Tool(
+            name="ztf_stamps",
+            description="Render ALeRCE/ZTF science, template, and difference stamp PNG panels for an alert object oid and optional candid.",
+            function=self._ztf_stamps,
+            parameters={
+                "type": "object",
+                "properties": {"oid": {"type": "string"}, "candid": {"type": "string"}},
+                "required": ["oid"],
+            },
+            category="analysis",
+        ))
+        self.tool_registry.register(Tool(
+            name="ned_sed_plot",
+            description="Plot a literature SED from NED photometry for a named target.",
+            function=self._ned_sed_plot,
+            parameters={"type": "object", "properties": {"target_name": {"type": "string"}}, "required": ["target_name"]},
+            category="analysis",
+        ))
+        self.tool_registry.register(Tool(
+            name="sparcl_find_spectra",
+            description="Search NOIRLab SparCL for actual DESI/SDSS optical spectra near a target or position, not just redshift catalog values.",
+            function=self._sparcl_find_spectra,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string"},
+                    "ra": {"type": "number"},
+                    "dec": {"type": "number"},
+                    "radius_arcsec": {"type": "number", "default": 60},
+                    "data_release": {"type": "array", "items": {"type": "string"}},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": [],
+            },
+            category="archive",
+        ))
+        self.tool_registry.register(Tool(
+            name="sparcl_plot_spectrum",
+            description="Plot an actual SparCL optical spectrum by sparcl_id with optional model overlay and redshifted line markers.",
+            function=self._sparcl_plot_spectrum,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "sparcl_id": {"type": "string"},
+                    "mark_lines": {"type": "boolean", "default": True},
+                    "smooth": {"type": "integer", "default": 0},
+                },
+                "required": ["sparcl_id"],
+            },
+            category="analysis",
+        ))
         self.tool_registry.register(Tool(
             name="get_sky_image",
             description=(
@@ -4110,6 +4246,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "list_mmu_hats_catalogs": "Listing Multimodal Universe catalogs",
             "search_mmu_hats_catalog": f"Searching Multimodal Universe {args.get('catalog_key', 'catalog')}",
             "crossmatch_mmu_hats_catalogs": "Crossmatching Multimodal Universe catalogs",
+            "hips_cutout": f"Fetching {args.get('survey', 'optical')} cutout",
+            "hips_multiband_panel": "Fetching multiband HiPS panel",
+            "vlass_cutout": "Fetching VLASS 3 GHz cutout",
+            "search_ztf_alerts": "Searching ALeRCE/ZTF alerts",
+            "ztf_light_curve": f"Plotting ZTF light curve {args.get('oid', '')}",
+            "ztf_stamps": f"Fetching ZTF stamps {args.get('oid', '')}",
+            "ned_sed_plot": f"Plotting NED SED {args.get('target_name', '')}",
+            "sparcl_find_spectra": "Searching SparCL spectra",
+            "sparcl_plot_spectrum": f"Plotting SparCL spectrum {args.get('sparcl_id', '')}",
         }
         label = tool_labels.get(tool_name, f"Running {tool_name.replace('_', ' ')}")
 
@@ -5374,6 +5519,34 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             self._mmu_hats_service_instance = default_mmu_hats_service()
         return self._mmu_hats_service_instance
 
+    def _get_hips_image_service(self):
+        if not hasattr(self, "_hips_image_service_instance"):
+            from services.hips_images import HipsImageService
+
+            self._hips_image_service_instance = HipsImageService()
+        return self._hips_image_service_instance
+
+    def _get_alerce_client(self):
+        if not hasattr(self, "_alerce_client_instance"):
+            from services.alerce_client import AlerceClient
+
+            self._alerce_client_instance = AlerceClient()
+        return self._alerce_client_instance
+
+    def _get_ned_photometry_service(self):
+        if not hasattr(self, "_ned_photometry_service_instance"):
+            from services.ned_photometry import NedPhotometryService
+
+            self._ned_photometry_service_instance = NedPhotometryService()
+        return self._ned_photometry_service_instance
+
+    def _get_sparcl_spectra_service(self):
+        if not hasattr(self, "_sparcl_spectra_service_instance"):
+            from services.sparcl_spectra import SparclSpectraService
+
+            self._sparcl_spectra_service_instance = SparclSpectraService()
+        return self._sparcl_spectra_service_instance
+
     def _datalab_list_catalogs(self) -> Dict[str, Any]:
         self.last_run_result = None  # Data Lab tools emit summaries, not stale data cards
         try:
@@ -5831,6 +6004,221 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         raise ValueError("Provide either ra+dec or target_name")
 
     # ── P2 orchestration handlers (Tier 6-7) ───────────────────────────────
+    # Live imagery / external catalog handlers
+    def _live_imagery_coordinates(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+    ) -> Tuple[float, float, str]:
+        import math
+
+        if (ra is None or dec is None) and target_name:
+            resolved = self._resolve_target(str(target_name))
+            if not resolved.get("success"):
+                raise ValueError(resolved.get("error") or f"Could not resolve target {target_name!r}")
+            ra = resolved.get("ra_deg")
+            dec = resolved.get("dec_deg")
+            label = str(target_name)
+        else:
+            label = f"RA={float(ra):.5f}, Dec={float(dec):.5f}" if ra is not None and dec is not None else "sky position"
+        if ra is None or dec is None:
+            raise ValueError("Provide either target_name or both ra and dec.")
+        ra_f = float(ra)
+        dec_f = float(dec)
+        if not math.isfinite(ra_f) or not math.isfinite(dec_f) or not 0.0 <= ra_f < 360.0 or not -90.0 <= dec_f <= 90.0:
+            raise ValueError("ra/dec must be finite ICRS degrees with 0 <= ra < 360 and -90 <= dec <= 90.")
+        return ra_f, dec_f, label
+
+    def _external_catalog_table_result(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        columns: List[str],
+        source: str,
+        filter_label: str,
+        tool_name: str,
+        warnings: Optional[List[str]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        df = pd.DataFrame(rows, columns=columns)
+        warnings_list = list(warnings or [])
+        self.last_run_result = {
+            "type": "data",
+            "data": df,
+            "source": source,
+            "filter_label": filter_label,
+            "tool_name": tool_name,
+            "table_kind": "external_catalog",
+            "warnings": warnings_list,
+            "partial": bool(warnings_list),
+        }
+        preview_rows, _ = self._datalab_fit_rows(compact_preview_frame(df), 10, char_budget=4000)
+        return {
+            "success": True,
+            "source": source,
+            "rowcount": int(len(df)),
+            "returned_rows": int(len(df)),
+            "columns": list(df.columns),
+            "results_preview": preview_rows,
+            "preview_truncated": int(len(df)) > len(preview_rows),
+            "warnings": warnings_list,
+            "provenance": provenance or {},
+            "note": "Full table is rendered as a data card in the UI; do not repeat the rows in text.",
+        }
+
+    def _hips_cutout(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        survey: str = "optical",
+        fov_deg: float = 0.25,
+        width: int = 512,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_hips_image_service().cutout(ra_f, dec_f, fov_deg=fov_deg, survey=survey, width=width)
+            caption = f"HiPS {survey} cutout: {label}"
+            return self._datalab_attach_image_result(result, caption)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _hips_multiband_panel(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        surveys: Optional[List[str]] = None,
+        fov_deg: float = 0.25,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            survey_list = surveys or ["optical", "2mass", "wise"]
+            result = self._get_hips_image_service().multiband_panel(
+                ra_f,
+                dec_f,
+                fov_deg=fov_deg,
+                surveys=survey_list,
+                title=f"HiPS multiband panel: {label}",
+            )
+            return self._datalab_attach_image_result(result, f"HiPS multiband panel: {label}")
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _vlass_cutout(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        fov_deg: float = 0.1,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_hips_image_service().vlass_cutout(ra_f, dec_f, fov_deg=fov_deg)
+            return self._datalab_attach_image_result(result, f"VLASS 3 GHz cutout: {label}")
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _search_ztf_alerts(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_arcsec: float = 120,
+        max_rows: int = 25,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_alerce_client().cone_objects(ra_f, dec_f, radius_arcsec=radius_arcsec, max_rows=max_rows)
+            if not result.get("success"):
+                return result
+            columns = ["oid", "ndet", "meanra", "meandec", "firstmjd", "lastmjd", "classalerce", "probability", "classifier", "class", "classification", "prob"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns[:6]
+            return self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="ALeRCE ZTF alerts",
+                filter_label=f"ALeRCE/ZTF cone {label}, r={float(result.get('provenance', {}).get('radius_arcsec', radius_arcsec)):g} arcsec",
+                tool_name="search_ztf_alerts",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _ztf_light_curve(self, oid: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_alerce_client().plot_light_curve(oid)
+            return self._datalab_attach_image_result(result, f"ZTF light curve: {oid}")
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _ztf_stamps(self, oid: str, candid: Optional[str] = None) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_alerce_client().stamp_triplet(oid, candid=candid)
+            caption = f"ZTF stamps: {oid}" + (f" / {candid}" if candid else "")
+            return self._datalab_attach_image_result(result, caption)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _ned_sed_plot(self, target_name: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_ned_photometry_service().sed_plot(target_name)
+            return self._datalab_attach_image_result(result, f"NED SED: {target_name}")
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _sparcl_find_spectra(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_arcsec: float = 60,
+        data_release: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_sparcl_spectra_service().find_spectra(
+                ra_f,
+                dec_f,
+                radius_arcsec=radius_arcsec,
+                data_release=data_release,
+                limit=limit,
+            )
+            if not result.get("success"):
+                return result
+            columns = ["sparcl_id", "ra", "dec", "distance_arcsec", "redshift", "spectype", "data_release"]
+            return self._external_catalog_table_result(
+                result.get("rows") or [],
+                columns=columns,
+                source="NOIRLab SparCL spectra",
+                filter_label=f"SparCL cone {label}, r={float(result.get('provenance', {}).get('radius_arcsec', radius_arcsec)):g} arcsec",
+                tool_name="sparcl_find_spectra",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _sparcl_plot_spectrum(self, sparcl_id: str, mark_lines: bool = True, smooth: int = 0) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_sparcl_spectra_service().plot_spectrum(sparcl_id, mark_lines=mark_lines, smooth=smooth)
+            return self._datalab_attach_image_result(result, f"SparCL spectrum: {sparcl_id}")
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def _datalab_confirm_sky_area(self, ra_min: float, ra_max: float, dec_min: float, dec_max: float, tile_radius_deg: float = 2.0) -> Dict[str, Any]:
         self.last_run_result = None
         try:

@@ -26,6 +26,8 @@ wheels/
 .pytest_cache/
 .pytest-tmp-full*/
 .pytest-tmp-*/
+.pytest-tmp/
+
 
 # ============================================
 # Environment & Secrets
