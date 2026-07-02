@@ -158,6 +158,11 @@ class MMUHatsService:
         # Keep HF downloads under the configured MMU cache dir unless the
         # deployment already pinned HF_HOME elsewhere.
         os.environ.setdefault("HF_HOME", str(self.cache_dir / "huggingface"))
+        # Deployments (Render) set the token as `HF_token`; env names are
+        # case-sensitive on Linux and huggingface_hub only reads HF_TOKEN.
+        alias_token = os.environ.get("HF_token")
+        if alias_token and not os.environ.get("HF_TOKEN"):
+            os.environ["HF_TOKEN"] = alias_token
         importlib.import_module("huggingface_hub")
         self._lsdb_module = importlib.import_module("lsdb")
         return self._lsdb_module

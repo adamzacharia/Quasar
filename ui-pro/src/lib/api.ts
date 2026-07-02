@@ -54,6 +54,7 @@ export interface StreamCallbacks {
     }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
     onRunMeta?: (meta: ChatRunMeta) => void;
+    onUsage?: (usage: { inputTokens: number; outputTokens: number; totalTokens: number }) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null; eta_seconds?: number | null; phase?: string }) => void;
     onComplete: (fullResponse: string) => void;
     onError: (error: string, status?: number) => void;
@@ -225,6 +226,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onPlanReview(parsed);
                         } else if (parsed.type === "conversation_meta" && callbacks.onConversationMeta) {
                             callbacks.onConversationMeta(parsed);
+                        } else if (parsed.type === "usage" && callbacks.onUsage) {
+                            callbacks.onUsage(parsed);
                         } else if (parsed.type === "web_sources" && callbacks.onWebSources) {
                             callbacks.onWebSources(parsed);
                         } else if (parsed.type === "download_progress" && callbacks.onDownloadProgress) {

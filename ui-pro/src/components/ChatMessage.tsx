@@ -44,6 +44,19 @@ function CodeBlock({ language, children }: { language: string; children: string 
     );
 }
 
+function formatTokenCount(n: number): string {
+    if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+    return String(n);
+}
+
+/* Provider-reported tokens when the backend sent a usage event; otherwise a
+   ~chars/4 estimate so older / still-streaming messages get a figure too. */
+function tokenLabelFor(content: string, usageTokens?: number): string {
+    if (usageTokens && usageTokens > 0) return `${formatTokenCount(usageTokens)} tokens`;
+    const estimate = Math.ceil((content || "").length / 4);
+    return estimate > 0 ? `~${formatTokenCount(estimate)} tokens` : "";
+}
+
 function MessageActions({ message, reportPrompt = "" }: { message: Message; reportPrompt?: string }) {
     const [copied, setCopied] = useState(false);
     const [feedback, setFeedback] = useState<"like" | "dislike" | null>(null);
@@ -126,21 +139,30 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
         }
     };
 
+    const tokenLabel = tokenLabelFor(message.content, message.usageTokens);
+
     return (
-        <div className={`mt-2 ${showReport ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100"} transition-opacity`}>
+        <div className="mt-2">
             <div className="flex items-center gap-1">
-                <button onClick={copyText} title="Copy response"
-                    className="p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-700/50 rounded-lg transition-all">
-                    {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-                </button>
-                <button onClick={() => sendFeedback("like")} title="Good response"
-                    className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
-                    <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
-                </button>
-                <button onClick={() => { sendFeedback("dislike"); setShowReport(shouldOpenIssueReport("dislike")); }} title="Report a problem"
-                    className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
-                    <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
-                </button>
+                <div className={`flex items-center gap-1 ${showReport ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100"} transition-opacity`}>
+                    <button onClick={copyText} title="Copy response"
+                        className="p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-700/50 rounded-lg transition-all">
+                        {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                    </button>
+                    <button onClick={() => sendFeedback("like")} title="Good response"
+                        className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                        <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
+                    </button>
+                    <button onClick={() => { sendFeedback("dislike"); setShowReport(shouldOpenIssueReport("dislike")); }} title="Report a problem"
+                        className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                        <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
+                    </button>
+                </div>
+                {tokenLabel && (
+                    <span className="ml-1 text-[11px] text-slate-500 tabular-nums select-none" title={message.usageTokens ? "Tokens used for this response (provider-reported)" : "Estimated from response length"}>
+                        {tokenLabel}
+                    </span>
+                )}
             </div>
             {showReport && (
                 <div className="mt-2 max-w-xl rounded-xl border border-red-500/20 bg-slate-950/90 p-3 shadow-xl">
@@ -796,6 +818,13 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     )}
 
                     {showAnswerBuffer && <AnswerBuffer />}
+
+                    {/* Live token estimate while the answer is still streaming */}
+                    {hasContent && isStreaming && (
+                        <div className="mt-2 text-[11px] text-slate-500 tabular-nums select-none">
+                            {tokenLabelFor(displayContent)}
+                        </div>
+                    )}
 
                     {/* Action bar: copy, like, dislike — shown at bottom on hover */}
                     {hasContent && !isStreaming && (

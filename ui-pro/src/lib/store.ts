@@ -55,6 +55,7 @@ interface ChatStore {
     updateLastAssistantMessage: (content: string) => void;
     updateLastAssistantThinking: (thinking: string) => void;
     updateLastAssistantRunMeta: (meta: import("./api").ChatRunMeta) => void;
+    updateLastAssistantUsage: (totalTokens: number) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -465,6 +466,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const index = findLastAssistantTextIndex(messages);
         if (index < 0) return {};
         messages[index] = { ...messages[index], runMeta: meta };
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
+        };
+    }),
+
+    updateLastAssistantUsage: (totalTokens) => set((state) => {
+        const messages = [...state.messages];
+        const index = findLastAssistantTextIndex(messages);
+        if (index < 0) return {};
+        messages[index] = { ...messages[index], usageTokens: totalTokens };
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),

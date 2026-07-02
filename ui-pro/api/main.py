@@ -1316,7 +1316,23 @@ def _stream_chat_response(
     except ProviderKeyError as exc:
         raise HTTPException(status_code=400, detail=redact_secrets(exc))
 
-    usage_recorder = _make_usage_recorder(current_user_id)
+    _quota_usage_recorder = _make_usage_recorder(current_user_id)
+    # Per-turn token accumulator: every LLM call in this request (main loop +
+    # auxiliary calls) reports here, and the total is emitted as a final SSE
+    # "usage" event so the UI can show tokens used per response.
+    usage_totals = {"input": 0, "output": 0}
+
+    def usage_recorder(provider: str, model: str, key_source: str, input_tokens: int, output_tokens: int):
+        usage_totals["input"] += int(input_tokens or 0)
+        usage_totals["output"] += int(output_tokens or 0)
+        _quota_usage_recorder(
+            provider=provider,
+            model=model,
+            key_source=key_source,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
     quota_checker = _make_quota_checker(
         current_user_id,
         current_user_email,
@@ -2171,6 +2187,16 @@ def _stream_chat_response(
             if conv_id:
                 meta_event = json.dumps({"type": "conversation_meta", "conversation_id": conv_id})
                 yield f"data: {meta_event}\n\n"
+
+            _tokens_total = usage_totals["input"] + usage_totals["output"]
+            if _tokens_total > 0:
+                usage_event = json.dumps({
+                    "type": "usage",
+                    "inputTokens": usage_totals["input"],
+                    "outputTokens": usage_totals["output"],
+                    "totalTokens": _tokens_total,
+                })
+                yield f"data: {usage_event}\n\n"
 
             if run_status == "started":
                 run_status = "completed"

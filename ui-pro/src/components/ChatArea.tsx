@@ -24,7 +24,7 @@ function generateId(): string { return Date.now().toString(36) + Math.random().t
 export function ChatArea() {
     const {
         messages, addMessage, mergeWebSourcesMessage, updateLastAssistantMessage, updateLastAssistantThinking,
-        updateLastAssistantRunMeta,
+        updateLastAssistantRunMeta, updateLastAssistantUsage,
         isStreaming, setStreaming,
         toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -570,6 +570,9 @@ export function ChatArea() {
                         },
                         onRunMeta: (meta) => {
                             updateLastAssistantRunMeta(meta);
+                        },
+                        onUsage: (usage) => {
+                            if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens);
                         },
                         onComplete: () => {
                             attachThinkingToLastMessage();

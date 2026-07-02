@@ -41,6 +41,7 @@ export interface Message {
     webImageProvider?: string;      // provider used for image enrichment
     webSearchType?: string;         // provider-specific search mode, e.g. Exa deep
     webQuery?: string;              // original web query or URL
+    usageTokens?: number;           // provider-reported tokens used for this response
 }
 
 export interface WebSource {

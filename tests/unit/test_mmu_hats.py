@@ -246,6 +246,29 @@ def test_hf_home_defaults_under_configured_cache_dir(monkeypatch, tmp_path):
     assert os.environ["HF_HOME"] == str(tmp_path / "mmu" / "huggingface")
 
 
+def test_hf_token_lowercase_alias_maps_to_hf_token(monkeypatch):
+    _install_fake_lsdb(monkeypatch)
+    # setenv-then-delenv so monkeypatch restores pre-test state even though
+    # the service writes HF_TOKEN directly (same trick as the HF_HOME test).
+    monkeypatch.setenv("HF_TOKEN", "sentinel")
+    monkeypatch.delenv("HF_TOKEN")
+    monkeypatch.setenv("HF_token", "hf_dummy")
+    assert _service().is_available()[0] is True
+    assert os.environ["HF_TOKEN"] == "hf_dummy"
+
+
+def test_hf_token_alias_does_not_override_existing_hf_token(monkeypatch):
+    _install_fake_lsdb(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", "canonical")
+    monkeypatch.setenv("HF_token", "alias")
+    assert _service().is_available()[0] is True
+    # On Windows os.environ is case-insensitive so both names collapse to one
+    # entry; on Linux the canonical spelling must win.
+    assert os.environ["HF_TOKEN"] in {"canonical", "alias"}
+    if os.name != "nt":
+        assert os.environ["HF_TOKEN"] == "canonical"
+
+
 def test_no_coverage_returns_empty_result_not_error(monkeypatch):
     _install_fake_lsdb(monkeypatch, open_raises=ValueError("The selected sky region has no coverage"))
     out = _service().cone_search("gaia", 10, 0)
