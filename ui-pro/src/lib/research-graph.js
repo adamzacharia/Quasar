@@ -65,7 +65,10 @@ function collectGraphInputs(messages) {
     const papers = [];
 
     for (const message of messages || []) {
-        if (message?.dataTable && !["alma_products", "alma_project_picker", "mmu_hats"].includes(message.dataTable.tableKind || "")) {
+        // external_catalog covers alert/catalog lookups (ALeRCE/ZTF, NED, ...)
+        // whose rows carry no observing-program provenance — a graph built
+        // from them is just "archive → unlabeled project → unlabeled target".
+        if (message?.dataTable && !["alma_products", "alma_project_picker", "mmu_hats", "external_catalog"].includes(message.dataTable.tableKind || "")) {
             dataTables.push(message.dataTable);
         }
         if (Array.isArray(message?.papers)) papers.push(...message.papers);
@@ -313,6 +316,13 @@ export function buildObservationPaperGraph(messages, options = {}) {
             }
         }
     }
+
+    // Without real project codes, linked papers, or explicit identifiers the
+    // graph is a hub-and-spoke restatement of the data card — don't render it.
+    const hasLabeledProject = [...projects.values()].some(
+        (project) => project.label !== "Unlabeled project"
+    );
+    if (!hasLabeledProject && linkedPapers === 0 && explicitIdentifiers.size === 0) return null;
 
     const graphNodes = [...nodes.values()];
     const graphEdges = [...edges.values()].filter((edge) =>

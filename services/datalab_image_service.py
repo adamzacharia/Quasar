@@ -35,24 +35,75 @@ class DatalabImageService:
         return self.sia_client.search(ra, dec, fov_deg, catalog=catalog, endpoint=endpoint)
 
     def deepest_by_band(self, rows: Sequence[Mapping[str, Any]], bands: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+        candidates = self.candidates_by_band(rows, bands)
+        return {band: items[0] for band, items in candidates.items() if items}
+
+    def candidates_by_band(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        bands: Iterable[str],
+        *,
+        max_candidates: int = 4,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Per band, ALL matching Stack/image rows sorted deepest-first (capped).
+
+        coadd_all is cross-survey and some rows carry broken cutout refs (observed: Local Group
+        Survey tiles with an empty ``col=`` in access_url that 500 server-side). Callers should
+        try candidates in order and fall through on download failure rather than dying on the
+        single deepest row.
+        """
         wanted = [str(b).strip().lower() for b in bands]
-        best: Dict[str, Dict[str, Any]] = {}
+        found: Dict[str, List[Dict[str, Any]]] = {b: [] for b in wanted}
         for row in rows:
             if str(_row_get(row, "proctype") or "").strip().lower() != "stack":
                 continue
             if str(_row_get(row, "prodtype") or "").strip().lower() != "image":
                 continue
-            exptime = _to_positive_float(_row_get(row, "exptime"))
-            if exptime is None:
-                continue
+            # Missing exptime does NOT exclude a row: Legacy Surveys coadd rows often carry
+            # no exptime, and dropping them left only broken LGS/Mosaic refs at e.g. M31.
+            # Treat missing depth as 0 so these rank last but remain usable fallbacks.
+            exptime = _to_positive_float(_row_get(row, "exptime")) or 0.0
             bandpass = str(_row_get(row, "obs_bandpass") or "").strip().lower()
             for band in wanted:
-                if not bandpass.startswith(band):
-                    continue
-                current = best.get(band)
-                if current is None or exptime > float(current["exptime"]):
-                    best[band] = {"row": dict(row), "exptime": exptime}
-        return best
+                if bandpass.startswith(band):
+                    found[band].append({"row": dict(row), "exptime": exptime})
+        def _rank(item: Dict[str, Any]):
+            # Deprioritize rows whose cutout URL has an empty col= (known-broken pattern),
+            # then prefer greater depth.
+            url = str(_row_get(item["row"], "access_url") or "")
+            broken_hint = 1 if "col=&" in url or url.endswith("col=") else 0
+            return (broken_hint, -float(item["exptime"]))
+        return {b: sorted(items, key=_rank)[: max_candidates] for b, items in found.items() if items}
+
+    def _bands_with_healthy_refs(self, rows: Sequence[Mapping[str, Any]], *, exclude: str = "") -> List[str]:
+        """Bands (g/r/i/z/u/y) that have at least one candidate with a non-broken cutout ref."""
+        out: List[str] = []
+        common = [b for b in ("g", "r", "i", "z", "u", "y") if b != str(exclude).lower()]
+        for band, cands in self.candidates_by_band(rows, common).items():
+            for cand in cands:
+                url = str(_row_get(cand["row"], "access_url") or "")
+                if "col=&" not in url and not url.endswith("col="):
+                    out.append(band)
+                    break
+        return sorted(out)
+
+    def _load_first_working(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        ra: float,
+        dec: float,
+        fov_deg: float,
+    ):
+        """Try candidate rows deepest-first; return (row, FitsImage, errors). All-fail -> (None, None, errors)."""
+        errors: List[str] = []
+        for cand in candidates:
+            row = cand["row"]
+            try:
+                return row, self._load_image(row, ra=ra, dec=dec, fov_deg=fov_deg), errors
+            except Exception as exc:  # noqa: BLE001 - fall through to the next candidate tile
+                errors.append(f"{str(_row_get(row, 'access_url'))[:120]} -> {exc}")
+        return None, None, errors
 
     def cutout(
         self,
@@ -68,21 +119,55 @@ class DatalabImageService:
         search = self.search(ra, dec, fov_deg, catalog=catalog, endpoint=endpoint)
         if search.get("coverage_gap"):
             return self._gap_result(search, bands=[band], provenance_extra={"ra": ra, "dec": dec, "fov_deg": fov_deg})
-        chosen = self.deepest_by_band(search.get("rows") or [], [band])
-        if str(band).lower() not in chosen:
-            return self._gap_result(search, bands=[], provenance_extra={"missing_band": band})
+        band_key = str(band).lower()
+        candidates = self.candidates_by_band(search.get("rows") or [], [band_key]).get(band_key) or []
+        if not candidates:
+            # Tell the model which bands DO have healthy tiles so it can retry instead of
+            # giving up (e.g. M31 has no g/r/i but a working MzLS z tile).
+            suggested = self._bands_with_healthy_refs(search.get("rows") or [], exclude=band_key)
+            gap = self._gap_result(search, bands=suggested, provenance_extra={"missing_band": band})
+            gap["suggested_bands"] = suggested
+            if suggested:
+                gap["note"] = (
+                    f"No {band_key}-band coverage at this position, but band(s) {suggested} have usable "
+                    f"tiles here — RETRY datalab_image_cutout with band='{suggested[0]}' instead of "
+                    "reporting failure. Do not describe an image that was not rendered."
+                )
+            return gap
 
-        row = chosen[str(band).lower()]["row"]
-        image = self._load_image(row, ra=ra, dec=dec, fov_deg=fov_deg)
+        # Try candidates deepest-first: individual coadd_all tiles can 500 on the on-demand
+        # cutout service (observed for Local Group Survey refs at M31) — fall through instead
+        # of failing the whole tool on one broken tile.
+        row, image, dl_errors = self._load_first_working(candidates, ra=ra, dec=dec, fov_deg=fov_deg)
+        if image is None:
+            suggested = self._bands_with_healthy_refs(search.get("rows") or [], exclude=band_key)
+            hint = (
+                f" Bands with healthy-looking tiles at this position: {suggested} — retry with one of those."
+                if suggested else " No other band shows healthy tile refs here — suggest a different survey (e.g. get_sky_image)."
+            )
+            return {
+                "success": False,
+                "coverage_gap": False,
+                "image_base64": None,
+                "path": None,
+                "bands_used": [],
+                "error": (
+                    f"All {len(candidates)} matching {band_key}-band tiles failed to download from the "
+                    "Data Lab cutout service (server-side errors on those tile refs). This is a service/"
+                    "tile issue, not missing coverage." + hint
+                ),
+                "suggested_bands": suggested,
+                "download_errors": dl_errors,
+                "used_endpoint": search.get("used_endpoint"),
+                "provenance": dict(search.get("provenance") or {}),
+            }
         cut = self._cutout_image(image, ra=ra, dec=dec, fov_deg=fov_deg)
         render = self._render_single_band(cut.data, cut.wcs, title or f"Data Lab {band}-band cutout")
         self._cleanup_paths([image.path])
-        return self._image_result(
-            render,
-            search,
-            bands=[str(band).lower()],
-            provenance_extra={"selected_rows": {str(band).lower(): self._row_provenance(row)}, "source_url": image.source_url},
-        )
+        extra = {"selected_rows": {band_key: self._row_provenance(row)}, "source_url": image.source_url}
+        if dl_errors:
+            extra["skipped_broken_tiles"] = dl_errors
+        return self._image_result(render, search, bands=[band_key], provenance_extra=extra)
 
     def color_image(
         self,
@@ -113,14 +198,32 @@ class DatalabImageService:
             red = "i" if "i" in avail else ("z" if "z" in avail else "i")
             rgb_bands = [red, "r", "g"]
         red_b, green_b, blue_b = rgb_bands
-        chosen = self.deepest_by_band(rows, rgb_bands)
-        missing = [band for band in rgb_bands if band not in chosen]
+        band_candidates = self.candidates_by_band(rows, rgb_bands)
+        missing = [band for band in rgb_bands if not band_candidates.get(band)]
         if missing:
-            return self._gap_result(search, bands=sorted(chosen), provenance_extra={"missing_bands": missing, "requested_bands": rgb_bands})
+            return self._gap_result(search, bands=sorted(band_candidates), provenance_extra={"missing_bands": missing, "requested_bands": rgb_bands})
 
         cutouts: Dict[str, FitsImage] = {}
+        chosen: Dict[str, Dict[str, Any]] = {}
         for band in rgb_bands:
-            image = self._load_image(chosen[band]["row"], ra=ra, dec=dec, fov_deg=fov_deg)
+            # Fall through broken tile refs per band (see cutout()).
+            row, image, dl_errors = self._load_first_working(band_candidates[band], ra=ra, dec=dec, fov_deg=fov_deg)
+            if image is None:
+                return {
+                    "success": False,
+                    "coverage_gap": False,
+                    "image_base64": None,
+                    "path": None,
+                    "bands_used": [],
+                    "error": (
+                        f"All matching {band}-band tiles failed to download from the Data Lab cutout "
+                        "service (server-side tile errors) — cannot build the color composite."
+                    ),
+                    "download_errors": dl_errors,
+                    "used_endpoint": search.get("used_endpoint"),
+                    "provenance": dict(search.get("provenance") or {}),
+                }
+            chosen[band] = {"row": row}
             cutouts[band] = self._cutout_image(image, ra=ra, dec=dec, fov_deg=fov_deg)
 
         try:

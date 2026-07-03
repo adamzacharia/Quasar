@@ -3985,7 +3985,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "write a SHORT (2-4 sentence) summary that DIRECTLY answers the "
             "user's question using ONLY information from the snippets. "
             "Include specific facts, numbers, or dates when available. "
-            "If the snippets don't contain relevant information, say so briefly. "
+            "If the snippets do not contain information that helps answer the "
+            "question, reply with exactly NO_RELEVANT_INFO and nothing else. "
             "Do NOT repeat background context the user already knows. "
             "Do NOT include generic descriptions of organizations or telescopes."
         )
@@ -4008,6 +4009,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 temperature=0.2,
             )
             summary = resp.output_text.strip()
+            if "NO_RELEVANT_INFO" in summary.upper():
+                # Web results don't answer the question — suppress the
+                # "From the Web" section entirely rather than appending a
+                # "the snippets do not provide..." non-answer.
+                print("[WEB SEARCH] Synthesis judged web snippets irrelevant; omitting web section")
+                return ""
             if summary:
                 return safe_assistant_text(summary)
         except Exception as e:
@@ -6485,8 +6492,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.last_run_result = None
         try:
             ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
+            service = self._get_datalab_image_service()
             caption = title or f"Data Lab {band}-band cutout: {label}"
-            result = self._get_datalab_image_service().cutout(
+            result = service.cutout(
                 ra_f,
                 dec_f,
                 float(fov_deg),
@@ -6495,6 +6503,25 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 endpoint=endpoint,
                 title=caption,
             )
+            # Auto-substitute a working band: models often stop instead of retrying, so if the
+            # requested band has no usable tiles but another does (e.g. M31: no g/r/i, working
+            # MzLS z), render that band deterministically and label the substitution clearly.
+            no_image = not (result.get("image_base64") or result.get("path"))
+            suggested = list(result.get("suggested_bands") or [])
+            if no_image and suggested:
+                sub_band = suggested[0]
+                sub_caption = title or f"Data Lab {sub_band}-band cutout: {label} (requested {band}, not available here)"
+                retry = service.cutout(
+                    ra_f, dec_f, float(fov_deg), band=sub_band,
+                    catalog=catalog, endpoint=endpoint, title=sub_caption,
+                )
+                if retry.get("image_base64") or retry.get("path"):
+                    retry["band_substituted"] = {"requested": str(band), "used": sub_band}
+                    retry["note"] = (
+                        f"No usable {band}-band tiles at this position; rendered the {sub_band}-band "
+                        f"cutout instead. State the substitution to the user."
+                    )
+                    return self._datalab_attach_image_result(retry, sub_caption)
             return self._datalab_attach_image_result(result, caption)
         except Exception as e:
             return self._datalab_error(e)
@@ -6743,14 +6770,35 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             if not result.get("success"):
                 return result
 
-            # If we have a preview PNG, set it as the run result for UI display
-            if "preview_path" in result:
-                self.last_run_result = {
-                    "type": "image",
-                    "image_path": result["preview_path"],
-                    "source": f"SkyView ({result.get('survey', 'DSS2')})",
-                    "tool_name": "get_sky_image"
-                }
+            # If we have a preview PNG, set it as the run result for UI display.
+            # NB: the SSE layer emits image cards from the `image_url` key ONLY, and the
+            # preview lives in ~/quasar_data (not web-served) — so copy it into the served
+            # /plots dir and reference that URL (base64 data-URI as a fallback). The old
+            # `image_path` key was silently ignored and SkyView images never displayed.
+            if result.get("preview_path"):
+                image_url = None
+                try:
+                    import shutil
+                    from services.plotting import PLOT_OUTPUT_DIR
+                    os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+                    dest_name = f"skyview_{uuid.uuid4().hex[:10]}.png"
+                    shutil.copyfile(result["preview_path"], os.path.join(PLOT_OUTPUT_DIR, dest_name))
+                    image_url = f"/plots/{dest_name}"
+                except Exception:
+                    try:
+                        import base64 as _b64
+                        with open(result["preview_path"], "rb") as _f:
+                            image_url = "data:image/png;base64," + _b64.b64encode(_f.read()).decode()
+                    except Exception:
+                        image_url = None
+                if image_url:
+                    self.last_run_result = {
+                        "type": "image",
+                        "image_url": image_url,
+                        "caption": f"SkyView {result.get('survey', 'DSS2')}: {target_name or f'RA={ra}, Dec={dec}'}",
+                        "source": f"SkyView ({result.get('survey', 'DSS2')})",
+                        "tool_name": "get_sky_image"
+                    }
 
             label = target_name or f"RA={ra:.3f}, Dec={dec:.3f}"
             return {
@@ -8978,6 +9026,57 @@ IMPORTANT RULES:
     _LLM_CUTOFF_YEAR = 2024
     _LLM_CUTOFF_MONTH = 10   # October 2024
 
+    # ── Live-data query detection ───────────────────────────────────────
+    # Queries served by QUASAR's built-in live-data tools — observation
+    # archives (ALMA/CADC/...), ADS/arXiv papers, ALeRCE/ZTF alerts,
+    # Data Lab catalogs, SparCL spectra, NED photometry, SIMBAD/VizieR
+    # lookups, HiPS imagery/cutouts, cone searches, crossmatches.
+    # These hit live databases directly; web search adds nothing and just
+    # clutters the response with an irrelevant "From the Web" section.
+    _LIVE_DATA_KEYWORDS_RE = re.compile(
+        r'\b(?:observations?|data|archives?|band\s*\d|'
+        r'search_by|search_cadc|member_ous|mous|project_code|fits|'
+        r'alerts?|light\s*curves?|lightcurves?|cutouts?|cone\s*search(?:es)?|'
+        r'cross-?match(?:es|ing|ed)?|photometry|spectra|spectrum|'
+        r'catalogs?|catalogues?|sky\s*map|skymap|'
+        r'ztf|alerce|sparcl|data\s*lab|vlass|hips|aladin|'
+        r'simbad|vizier|gaia|sdss|desi|pan-?starrs|2mass)\b'
+    )
+    _LIVE_DATA_VERBS_RE = re.compile(
+        r'\b(?:find|search|show|get|list|query|look\s*up|plot|display)\b.*'
+        r'\b(?:observations?|data|archives?|images?|spectra|spectrum|alerts?)\b'
+    )
+    _LIVE_DATA_FACILITY_RE = re.compile(
+        r'\b(?:alma|vla|vlba|gbt|ngvla|jwst|hst|gemini|jcmt|cfht|chandra|xmm|'
+        r'ztf|desi|sdss|gaia|vlass|euclid|rubin|lsst)\b.*'
+        r'\b(?:observations?|data|of)\b'
+    )
+    # Cone-search-shaped queries: "within 2 arcminutes of M87", "sources
+    # around NGC 1275 within a 30 arcsec radius", ...
+    _LIVE_DATA_CONE_RE = re.compile(
+        r'\b(?:within|around|near)\b.*?\b\d+(?:\.\d+)?\s*'
+        r'(?:arc\s*sec(?:onds?)?|arc\s*min(?:utes?)?|deg(?:rees?)?)\b'
+    )
+    # Papers come from NASA ADS (search_papers tool), not web search.
+    # "recent papers on X" should NOT trigger web search just because
+    # of the word "recent".
+    _PAPER_QUERY_RE = re.compile(
+        r'\b(?:papers?|publications?|articles?|literature|studies)\b'
+    )
+
+    def _is_live_data_query(self, query: str) -> bool:
+        """True when the query is answered by QUASAR's built-in live-data
+        tools (archives, papers, alerts, catalogs, imagery, spectra,
+        photometry, cone searches) — web search adds nothing for these."""
+        _q = query.lower()
+        return bool(
+            self._LIVE_DATA_KEYWORDS_RE.search(_q)
+            or self._LIVE_DATA_VERBS_RE.search(_q)
+            or self._LIVE_DATA_FACILITY_RE.search(_q)
+            or self._LIVE_DATA_CONE_RE.search(_q)
+            or self._PAPER_QUERY_RE.search(_q)
+        )
+
     def _detect_beyond_cutoff(self, query: str) -> Optional[str]:
         """
         Check if a query references dates or time periods beyond the LLM's
@@ -8994,37 +9093,12 @@ IMPORTANT RULES:
         """
         _q = query.lower()
 
-        # ── Skip web search for archive queries ────────────────────────
-        # Archive searches already query live databases — web search adds
-        # nothing and just wastes time / clutters the response.
-        _archive_keywords = re.search(
-            r'\b(?:observation|observations|data|archive|band\s*\d|'
-            r'search_by|search_cadc|member_ous|mous|project_code|fits)\b',
-            _q,
-        )
-        _archive_verbs = re.search(
-            r'\b(?:find|search|show|get|list|query|look\s*up)\b.*'
-            r'\b(?:observation|observations|data|archive)\b',
-            _q,
-        )
-        _telescope_query = re.search(
-            r'\b(?:alma|vla|vlba|gbt|jwst|hst|gemini|jcmt|cfht|chandra|xmm)\b.*'
-            r'\b(?:observation|observations|data|of)\b',
-            _q,
-        )
-        if _archive_verbs or _telescope_query:
-            return None  # skip web search for archive queries
-
-        # ── Skip web search for paper/literature queries ───────────────
-        # Papers come from NASA ADS (search_papers tool), not web search.
-        # "recent papers on X" should NOT trigger web search just because
-        # of the word "recent".
-        _paper_query = re.search(
-            r'\b(?:papers?|publications?|articles?|literature|studies)\b',
-            _q,
-        )
-        if _paper_query:
-            return None  # skip web search for paper queries
+        # ── Skip web search for live-data / paper queries ───────────────
+        # These are served by dedicated live databases (ALMA archive, ADS,
+        # ALeRCE alerts, Data Lab, SparCL, NED, HiPS imagery, ...) — web
+        # search adds nothing and just wastes time / clutters the response.
+        if self._is_live_data_query(_q):
+            return None
 
         # 1. Explicit year mentions beyond cutoff
         year_matches = re.findall(r'\b(20[2-9]\d)\b', query)
@@ -9114,7 +9188,8 @@ IMPORTANT RULES:
                 "2. Is purely conversational or a follow-up (e.g., 'hello', 'thank you', 'can you explain more?', 'now show me the band 7 of the same' when preceding messages refer to telescope observations).\n"
                 "3. Asks you to write code, scripts, or format something (e.g., 'write a python script to plot a fits file').\n"
                 "4. Asks for scientific papers or publications (these are searched via NASA ADS/arXiv tool, not general web search).\n"
-                "5. Is a follow-up query related to astronomical data, observations, or archives discussed in the recent conversation (e.g. asking for another band, project code, or target details of an observation already found).\n\n"
+                "5. Is a follow-up query related to astronomical data, observations, or archives discussed in the recent conversation (e.g. asking for another band, project code, or target details of an observation already found).\n"
+                "6. Asks for astronomical data served by the assistant's built-in live tools: observation archives, transient/ZTF alerts, catalog cone-searches or crossmatches, photometry, spectra, light curves, or sky images/cutouts (e.g., 'any ZTF alerts near M87?', 'DESI spectra of this target', 'SDSS photometry of NGC 1275'). These query live astronomical databases directly — even though the data is real-time, general web search adds nothing.\n\n"
                 "Reply with ONLY one word: YES or NO"
             )
             
@@ -9228,23 +9303,10 @@ IMPORTANT RULES:
             _uq
         )) or not web_search or "[GROUNDED_SUMMARY_MODE]" in query
 
-        # Skip web search for archive and paper queries (as they query dedicated live databases, not the web)
-        _is_archive_or_paper = bool(re.search(
-            r'\b(?:observation|observations|data|archive|band\s*\d|'
-            r'search_by|search_cadc|member_ous|mous|project_code|fits)\b',
-            _uq,
-        )) or bool(re.search(
-            r'\b(?:find|search|show|get|list|query|look\s*up)\b.*'
-            r'\b(?:observation|observations|data|archive)\b',
-            _uq,
-        )) or bool(re.search(
-            r'\b(?:alma|vla|vlba|gbt|jwst|hst|gemini|jcmt|cfht|chandra|xmm)\b.*'
-            r'\b(?:observation|observations|data|of)\b',
-            _uq,
-        )) or bool(re.search(
-            r'\b(?:papers?|publications?|articles?|literature|studies)\b',
-            _uq,
-        ))
+        # Skip web search for live-data and paper queries — archives, alerts,
+        # catalogs, imagery, spectra, photometry all hit dedicated live
+        # databases (ALMA/CADC, ALeRCE, Data Lab, SparCL, NED, ...), not the web.
+        _is_archive_or_paper = self._is_live_data_query(_uq)
 
         # Detect OpenAlex-targeted researcher query (copied from below for early execution)
         _bare_lower = _user_query.lower()
@@ -9259,7 +9321,7 @@ IMPORTANT RULES:
         )) and not bool(re.search(
             r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b',
             _bare_lower,
-        ))
+        )) and not self._LIVE_DATA_KEYWORDS_RE.search(_bare_lower)
 
         _web_search_query = None
 
@@ -9499,7 +9561,7 @@ IMPORTANT RULES:
             # Exclude ALMA instrument/process questions (only in the BARE query)
             r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b',
             _bare_lower,
-        ))
+        )) and not self._LIVE_DATA_KEYWORDS_RE.search(_bare_lower)
         _is_trend_query = bool(re.search(
             r'\b(?:interest in .+ growing|publication trend|research trend|'
             r'how much research|how many papers on|papers per year|'

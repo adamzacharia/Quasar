@@ -296,6 +296,55 @@ def test_attach_image_result_falls_back_to_data_uri():
     assert "image_base64" not in out
 
 
+def test_cutout_falls_through_broken_tiles(monkeypatch):
+    """A tile whose download 500s must NOT kill the cutout — the next-deepest candidate is used.
+    (Observed live: Local Group Survey refs in coadd_all at M31 500 on /svc/cutout.)"""
+    rows = [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 900, "access_url": "https://x/cutout?col=lgs&siaRef=broken.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 500, "access_url": "https://x/cutout?col=ls_dr9&siaRef=good.fits"},
+    ]
+    service = DatalabImageService(sia_client=_FakeSia(rows))
+
+    def fake_load(row, **kwargs):
+        if "broken" in row["access_url"]:
+            raise RuntimeError("500 Server Error")
+        return FitsImage(data=np.ones((4, 4)), wcs=object(), header={}, path="good.fits", source_url=row["access_url"])
+
+    monkeypatch.setattr(service, "_load_image", fake_load)
+    monkeypatch.setattr(service, "_cutout_image", lambda image, **kw: image)
+    monkeypatch.setattr(service, "_render_single_band", lambda data, wcs, title: {"base64_png": "abc", "web_url": "/p.png"})
+
+    out = service.cutout(10.0, 41.0, 0.05, band="r")
+    assert out["success"] is True and out.get("coverage_gap") is not True
+    assert out["provenance"]["selected_rows"]["r"]  # a row was used
+    assert "good.fits" in str(out["provenance"].get("source_url"))
+    assert out["provenance"].get("skipped_broken_tiles")  # the broken one is reported
+
+
+def test_cutout_reports_structured_error_when_all_tiles_fail(monkeypatch):
+    rows = [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 900, "access_url": "https://x/cutout?col=&siaRef=b1.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 500, "access_url": "https://x/cutout?col=&siaRef=b2.fits"},
+    ]
+    service = DatalabImageService(sia_client=_FakeSia(rows))
+    monkeypatch.setattr(service, "_load_image", lambda row, **kw: (_ for _ in ()).throw(RuntimeError("500")))
+    out = service.cutout(10.0, 41.0, 0.05, band="r")
+    # Structured failure, NOT a raised exception; distinguishes service errors from coverage gaps.
+    assert out["success"] is False and out["coverage_gap"] is False
+    assert "failed to download" in out["error"] and len(out["download_errors"]) == 2
+
+
+def test_candidates_deprioritize_empty_col_urls():
+    rows = [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "g", "exptime": 900, "access_url": "https://x/cutout?col=&siaRef=lgs.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "g", "exptime": 100, "access_url": "https://x/cutout?col=ls_dr9&siaRef=ok.fits"},
+    ]
+    service = DatalabImageService(sia_client=_FakeSia(rows))
+    cands = service.candidates_by_band(rows, ["g"])["g"]
+    # Known-broken empty-col URL ranks BELOW the shallower but healthy ref.
+    assert "ok.fits" in cands[0]["row"]["access_url"]
+
+
 def test_attach_image_result_no_card_on_coverage_gap():
     from tests.unit.test_datalab_p0 import _make_agent
     agent = _make_agent()
