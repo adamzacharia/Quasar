@@ -153,6 +153,11 @@ else:
 
 
 
+def _run_result_is_new(before_result: Any, current_result: Any) -> bool:
+    """Return True only when this tool assigned a fresh UI run result."""
+    return current_result is not None and current_result is not before_result
+
+
 @dataclass
 class AgentConfig:
     """Configuration for QuasarAgent"""
@@ -732,6 +737,7 @@ GUIDELINES:
 - **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
 - **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
 - **WEB TOOL ROUTING**: Keyword query → `web_search`. Full URL(s) to read/summarize/quote → `web_extract_url`. Site root URL plus "find pages" → `web_map_site`. Site section plus "crawl/docs" → `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
+- **IMAGERY ROUTING**: when the user asks to SEE something (show me X / what does X look like / image of X), call an imaging tool (hips_cutout / hips_multiband_panel / vlass_cutout / stamps) in THIS turn - even if a similar image was produced earlier in the conversation. Prior images are not re-displayed with a new answer; an answer about appearance without a fresh tool-produced image is incomplete.
 - **STRICT WEB SAFETY**: Never provide, summarize, cite, or link to pornographic, sexually explicit, nude, erotic, escort, or adult-entertainment content. Never emit general-web image URLs. If the web safety filter withholds results, state only that results were withheld by the safety filter and do not reconstruct the blocked content from memory.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
@@ -6095,7 +6101,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
             result = self._get_hips_image_service().cutout(ra_f, dec_f, fov_deg=fov_deg, survey=survey, width=width)
             caption = f"HiPS {survey} cutout: {label}"
-            return self._datalab_attach_image_result(result, caption)
+            meta = {
+                "kind": "hips",
+                "ra": ra_f,
+                "dec": dec_f,
+                "fov_deg": result.get("fov_deg", fov_deg),
+                "survey": result.get("survey_id") or result.get("survey") or survey,
+            }
+            return self._datalab_attach_image_result(result, caption, meta=meta)
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -6118,7 +6131,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 surveys=survey_list,
                 title=f"HiPS multiband panel: {label}",
             )
-            return self._datalab_attach_image_result(result, f"HiPS multiband panel: {label}")
+            meta = {"kind": "hips_panel", "ra": ra_f, "dec": dec_f, "fov_deg": result.get("fov_deg", fov_deg)}
+            return self._datalab_attach_image_result(result, f"HiPS multiband panel: {label}", meta=meta)
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -6133,7 +6147,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         try:
             ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
             result = self._get_hips_image_service().vlass_cutout(ra_f, dec_f, fov_deg=fov_deg)
-            return self._datalab_attach_image_result(result, f"VLASS 3 GHz cutout: {label}")
+            meta = {
+                "kind": "hips",
+                "ra": ra_f,
+                "dec": dec_f,
+                "fov_deg": result.get("fov_deg", fov_deg),
+                "survey": result.get("survey_id") or result.get("survey") or "NRAO/P/VLASS-Quicklook-MedianStack",
+            }
+            return self._datalab_attach_image_result(result, f"VLASS 3 GHz cutout: {label}", meta=meta)
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -6427,18 +6448,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return self._datalab_error(e)
 
-    def _datalab_attach_image_result(self, result: Dict[str, Any], caption: str) -> Dict[str, Any]:
+    def _datalab_attach_image_result(self, result: Dict[str, Any], caption: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         # Surface a displayable image card. Prefer the served path ("/plots/...", now mounted by
         # the API); fall back to a base64 data URI so the image still renders if no path is set.
         if result.get("success") and not result.get("coverage_gap"):
             b64 = result.get("image_base64")
             image_url = result.get("path") or (f"data:image/png;base64,{b64}" if b64 else None)
             if image_url:
-                self.last_run_result = {
+                image_result = {
                     "type": "image",
                     "image_url": image_url,
                     "caption": caption,
                 }
+                if meta is not None:
+                    image_result["meta"] = dict(meta)
+                self.last_run_result = image_result
         # Keep the heavy base64 OUT of the LLM-facing tool result: it bloats context and, worse,
         # gets truncated mid-string by the 8000-char tool-output slice → malformed JSON → the model
         # emits an empty response ("didn't generate a text response"). The image goes to the UI card above.
@@ -8793,21 +8817,27 @@ IMPORTANT RULES:
                     _status_label = self._tool_status_label(fn_name, _status_args)
                     if on_status := getattr(self, "_last_on_status", None):
                         on_status(_status_label, "running")
+                    _rr_before = self.last_run_result
                     result = self._dispatch_tool_call(fn_name, fn_args)
                     if on_status:
                         on_status(_status_label, "completed")
 
                     # ── Capture image results IMMEDIATELY after each tool call ──
-                    if self.last_run_result and self.last_run_result.get("type") == "image":
+                    _conductor_image_result = (
+                        self.last_run_result
+                        if _run_result_is_new(_rr_before, self.last_run_result)
+                        else None
+                    )
+                    if isinstance(_conductor_image_result, dict) and _conductor_image_result.get("type") == "image":
                         if hasattr(self, '_conductor_images'):
                             lock = getattr(self, '_conductor_images_lock', None)
                             if lock:
                                 with lock:
-                                    self._conductor_images.append(self.last_run_result.copy())
+                                    self._conductor_images.append(_conductor_image_result.copy())
                             else:
-                                self._conductor_images.append(self.last_run_result.copy())
-                        img_url = self.last_run_result.get("image_url", "")
-                        caption = self.last_run_result.get("caption", "")
+                                self._conductor_images.append(_conductor_image_result.copy())
+                        img_url = _conductor_image_result.get("image_url", "")
+                        caption = _conductor_image_result.get("caption", "")
                         tool_summaries.append(
                             f"✅ Image rendered via {fn_name}: {caption} "
                             f"[image_url: {img_url}]"
@@ -9701,8 +9731,16 @@ IMPORTANT RULES:
         
         # 3. Build tools list
         tools = self._build_tools_for_responses_api()
+        disabled_web_note = ""
         if not web_search:
             tools = [t for t in tools if not (t.get("name", "").startswith("web_") or t.get("name", "") == "web_search")]
+            disabled_web_note = (
+                "\n\nNOTE: Web search is DISABLED for this request by the user. You have no web tools. "
+                "Do not include an 'Updated Information from the Web' section or any web-sourced "
+                "claims/links, and do not imply web verification. Answer from internal tools, "
+                "documentation context, and prior knowledge only, and if freshness matters, say web "
+                "search was disabled."
+            )
 
         # Emit model step
         if on_status:
@@ -9728,7 +9766,7 @@ IMPORTANT RULES:
                 "'🌐 Updated Information from the Web:' with a detailed paragraph. NEVER say 'No additional updates were found'. "
                 "Always extract and present the actual content from the web results, even if it overlaps with the documentation."
             )
-        full_input = f"{memory_context}{rag_context}{citation_note}\n\nUser: {query}"
+        full_input = f"{memory_context}{rag_context}{citation_note}{disabled_web_note}\n\nUser: {query}"
 
         # 4b. Paper query safety net — even if RAG context leaked in above,
         #     force the LLM to call search_papers (ADS) for paper queries.
@@ -10278,6 +10316,7 @@ IMPORTANT RULES:
                     if tool:
                         try:
                             _acc_len_before = len(self._accumulated_run_results)
+                            _rr_before = self.last_run_result
                             result = self._execute_tool_with_progress(
                                 tool,
                                 args,
@@ -10285,11 +10324,14 @@ IMPORTANT RULES:
                                 step_label=step_label,
                                 on_status=on_status,
                             )
-                            _primary_run_result = (
-                                self.last_run_result.copy()
-                                if isinstance(self.last_run_result, dict)
-                                else self.last_run_result
-                            )
+                            if _run_result_is_new(_rr_before, self.last_run_result):
+                                _primary_run_result = (
+                                    self.last_run_result.copy()
+                                    if isinstance(self.last_run_result, dict)
+                                    else self.last_run_result
+                                )
+                            else:
+                                _primary_run_result = None
                             _auto_paper_result = None
                             if tool_name in {"search_by_target", "search_by_position"}:
                                 try:

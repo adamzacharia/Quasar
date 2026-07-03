@@ -30,7 +30,7 @@ export interface StreamCallbacks {
     onData?: (data: Record<string, unknown>) => void;
     onPapers?: (papers: Record<string, unknown>[]) => void;
     onNotebook?: (notebook: Record<string, unknown>) => void;
-    onImage?: (image: { url: string; caption: string }) => void;
+    onImage?: (image: { url: string; caption: string; meta?: unknown }) => void;
     onStatus?: (step: string, state: string) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;

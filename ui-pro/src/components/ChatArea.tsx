@@ -13,6 +13,7 @@ import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
 import { normalizeEvidenceQuality } from "../lib/evidence-quality";
+import { normalizeHipsImageMeta } from "../lib/hips-imagery";
 import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
 import { buildObservationPaperGraph } from "../lib/research-graph";
 import { useAuthStore } from "../lib/auth-store";
@@ -497,7 +498,7 @@ export function ChatArea() {
                         onImage: (img) => {
                             // Resolve relative URL to absolute backend URL
                             const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-                            const imageUrl = img.url.startsWith("http") ? img.url : `${apiBase}${img.url}`;
+                            const imageUrl = img.url.startsWith("http") || img.url.startsWith("data:") ? img.url : `${apiBase}${img.url}`;
                             addMessage({
                                 id: generateId(),
                                 role: "assistant",
@@ -506,6 +507,7 @@ export function ChatArea() {
                                 timestamp: new Date(),
                                 imageUrl: imageUrl,
                                 imageCaption: img.caption || "",
+                                imageMeta: normalizeHipsImageMeta(img.meta),
                             });
                         },
                         onTaskGroup: (group) => handleTaskGroup(group),
@@ -619,6 +621,7 @@ export function ChatArea() {
         updateLastAssistantMessage,
         updateLastAssistantThinking,
         updateLastAssistantRunMeta,
+        updateLastAssistantUsage,
         setStreaming,
         isStreaming,
         activeConversationId,

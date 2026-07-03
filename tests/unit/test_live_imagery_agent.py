@@ -85,7 +85,24 @@ def test_hips_handler_attaches_image_and_strips_base64():
     assert out["success"] is True
     assert "image_base64" not in out
     assert out["image_attached"] is True
-    assert agent.last_run_result == {"type": "image", "image_url": "/plots/hips_test.png", "caption": "HiPS optical cutout: RA=10.00000, Dec=-2.00000"}
+    assert agent.last_run_result == {
+        "type": "image",
+        "image_url": "/plots/hips_test.png",
+        "caption": "HiPS optical cutout: RA=10.00000, Dec=-2.00000",
+        "meta": {"kind": "hips", "ra": 10.0, "dec": -2.0, "fov_deg": 0.25, "survey": "CDS/P/DSS2/color"},
+    }
+
+
+def test_run_result_identity_helper_rejects_stale_result_objects():
+    module = _load_agent_module()
+    prior = {"type": "image", "image_url": "/plots/a.png"}
+
+    assert module._run_result_is_new(None, prior) is True
+    assert module._run_result_is_new(prior, prior) is False
+    assert module._run_result_is_new(prior, None) is False
+    prior["caption"] = "mutated in place"
+    assert module._run_result_is_new(prior, prior) is False
+    assert module._run_result_is_new(prior, {"type": "image", "image_url": "/plots/a.png"}) is True
 
 
 def test_search_ztf_alerts_sets_external_catalog_table():

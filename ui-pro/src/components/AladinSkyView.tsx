@@ -25,8 +25,8 @@ type AladinCatalog = {
     addSources?: (sources: unknown[]) => void;
 };
 
-const DEFAULT_SURVEY = "P/DSS2/color";
-const SURVEYS = [
+export const DEFAULT_SURVEY = "P/DSS2/color";
+export const SURVEYS = [
     { label: "DSS2 color", id: DEFAULT_SURVEY },
     { label: "SDSS9", id: "P/SDSS9/color" },
     { label: "AllWISE", id: "P/allWISE/color" },

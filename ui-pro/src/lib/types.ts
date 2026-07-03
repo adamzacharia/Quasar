@@ -17,6 +17,14 @@ export interface CommandTag {
     color: string;
 }
 
+export interface HipsImageMeta {
+    kind?: string;
+    ra?: number;
+    dec?: number;
+    fovDeg?: number;
+    survey?: string;
+}
+
 export interface Message {
     id: string;
     role: MessageRole;
@@ -30,6 +38,7 @@ export interface Message {
     imageUrl?: string;
     runMeta?: import("./api").ChatRunMeta;
     imageCaption?: string;
+    imageMeta?: HipsImageMeta;
     thinkingSteps?: ThoughtStep[];
     thinking?: string;
     thinkingDuration?: number;

@@ -1,3 +1,4 @@
+/* eslint-disable @next/next/no-img-element */
 "use client";
 
 import ReactMarkdown from "react-markdown";
@@ -14,6 +15,7 @@ import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 import { WebSourcesCard } from "./WebSourcesCard";
+import { HipsImageCard } from "./HipsImageCard";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
@@ -646,30 +648,12 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     // ── Rendered FITS Image ──────────────────────────────────────
     if (message.type === "image" && message.imageUrl) {
         return (
-            <div className="pl-11">
-                <div className="mt-4 rounded-xl border border-cyan-500/30 bg-slate-900/60 overflow-hidden shadow-xl shadow-cyan-500/5">
-                    <img
-                        src={message.imageUrl}
-                        alt={message.imageCaption || "Rendered FITS image"}
-                        className="w-full max-h-[600px] object-contain bg-black"
-                        loading="lazy"
-                    />
-                    {message.imageCaption && (
-                        <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between">
-                            <span className="text-xs text-slate-400">{message.imageCaption}</span>
-                            <a
-                                href={message.imageUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1"
-                            >
-                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                                Full size
-                            </a>
-                        </div>
-                    )}
-                </div>
-            </div>
+            <HipsImageCard
+                key={message.imageUrl}
+                imageUrl={message.imageUrl}
+                caption={message.imageCaption || ""}
+                imageMeta={message.imageMeta}
+            />
         );
     }
 

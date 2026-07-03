@@ -19,6 +19,7 @@ import {
 } from "./chat-message-updaters";
 import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
+import { normalizeHipsImageMeta } from "./hips-imagery";
 
 interface ChatStore {
     conversations: Conversation[];
@@ -261,22 +262,36 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             notebookData: nb as unknown as Message["notebookData"],
         });
     }
-    // Restore rendered image as a separate "image" message
-    if (meta.image) {
-        const img = meta.image as { url: string; caption: string };
+    // Restore rendered images as separate "image" messages.
+    const storedImages = Array.isArray(meta.images) && meta.images.length > 0
+        ? meta.images
+        : meta.image
+            ? [meta.image]
+            : [];
+    if (storedImages.length > 0) {
         const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        const imageUrl = img.url.startsWith("http") ? img.url : `${apiBase}${img.url}`;
-        messages.push({
-            id: `srv-${index}-img-${Date.now().toString(36)}`,
-            role: "assistant",
-            content: img.caption || "",
-            type: "image",
-            timestamp: new Date(),
-            imageUrl: imageUrl,
-            imageCaption: img.caption || "",
+        const seenImageUrls = new Set<string>();
+        storedImages.forEach((rawImage, imageIndex) => {
+            if (rawImage === null || rawImage === undefined) return;
+            if (typeof rawImage === "object") {
+                const img = rawImage as { url?: string; caption?: string; meta?: unknown };
+                const rawUrl = String(img.url || "").trim();
+                if (rawUrl === "" || seenImageUrls.has(rawUrl)) return;
+                seenImageUrls.add(rawUrl);
+                const imageUrl = rawUrl.startsWith("http") || rawUrl.startsWith("data:") ? rawUrl : apiBase + rawUrl;
+                messages.push({
+                    id: "srv-" + index + "-img-" + imageIndex + "-" + Date.now().toString(36),
+                    role: "assistant",
+                    content: img.caption || "",
+                    type: "image",
+                    timestamp: new Date(),
+                    imageUrl,
+                    imageCaption: img.caption || "",
+                    imageMeta: normalizeHipsImageMeta(img.meta),
+                });
+            }
         });
     }
-
     // Restore web source cards from metadata (same as live SSE)
     if (
         (meta.webSources && Array.isArray(meta.webSources) && meta.webSources.length > 0) ||

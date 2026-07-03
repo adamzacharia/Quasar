@@ -1771,6 +1771,9 @@ def _stream_chat_response(
             _rich_papers = None
             _rich_notebook = None
             _rich_image = None
+            _rich_images = []
+            _rich_image_urls = set()
+            _emitted_image_urls = set()
             _rich_web_sources = []
             _rich_web_images = []
             _rich_web_provider = ""
@@ -1780,6 +1783,19 @@ def _stream_chat_response(
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
+
+            def _record_rich_image(img_url, caption, meta=None):
+                nonlocal _rich_image
+                if not img_url or img_url in _rich_image_urls:
+                    return None
+                entry = {"url": img_url, "caption": caption}
+                if meta is not None:
+                    entry["meta"] = meta
+                _rich_image_urls.add(img_url)
+                _rich_images.append(entry)
+                _rich_image = entry
+                return entry
+
             deadline = ChatDeadline(
                 inactivity_seconds=inactivity_timeout,
                 standard_seconds=standard_timeout,
@@ -2016,12 +2032,16 @@ def _stream_chat_response(
                 # Skip results already emitted eagerly during streaming
                 if _result_idx in _eagerly_emitted:
                     continue
-                # Deduplicate by (type, tool_name, data-id) to avoid emitting same result twice
-                _dedup_key = (
-                    _run_result.get("type", ""),
-                    _run_result.get("tool_name", ""),
-                    id(_run_result.get("data")) if _run_result.get("data") is not None else id(_run_result),
-                )
+                # Deduplicate by stable payload identity; images use URL so copied stale dicts collapse.
+                _image_url_for_dedup = str(_run_result.get("image_url") or "").strip()
+                if _run_result.get("type") == "image" and _image_url_for_dedup:
+                    _dedup_key = ("image", _image_url_for_dedup)
+                else:
+                    _dedup_key = (
+                        _run_result.get("type", ""),
+                        _run_result.get("tool_name", ""),
+                        id(_run_result.get("data")) if _run_result.get("data") is not None else id(_run_result),
+                    )
                 if _dedup_key in _seen_result_ids:
                     continue
                 _seen_result_ids.add(_dedup_key)
@@ -2079,30 +2099,32 @@ def _stream_chat_response(
                 elif result_type == "image":
                     img_url = _run_result.get("image_url", "")
                     caption = _run_result.get("caption", "")
-                    if img_url:
+                    meta = _run_result.get("meta")
+                    if img_url and img_url not in _emitted_image_urls:
+                        _emitted_image_urls.add(img_url)
                         image_event = json.dumps({
-                            "type": "image", "url": img_url, "caption": caption,
+                            "type": "image", "url": img_url, "caption": caption, "meta": meta,
                         })
                         yield f"data: {image_event}\n\n"
-                        _rich_image = {"url": img_url, "caption": caption}
+                        _record_rich_image(img_url, caption, meta)
                         await asyncio.sleep(0.05)
 
                 elif result_type == "conductor_result":
                     # Multiple images accumulated during Conductor orchestration
                     images = _run_result.get("images", [])
-                    _local_seen_img = set()
                     for img in images:
                         img_url = img.get("image_url", "")
                         caption = img.get("caption", "")
+                        meta = img.get("meta")
                         if img_url:
-                            if img_url in _local_seen_img:
+                            if img_url in _emitted_image_urls:
                                 continue
-                            _local_seen_img.add(img_url)
+                            _emitted_image_urls.add(img_url)
                             image_event = json.dumps({
-                                "type": "image", "url": img_url, "caption": caption,
+                                "type": "image", "url": img_url, "caption": caption, "meta": meta,
                             })
                             yield f"data: {image_event}\n\n"
-                            _rich_image = {"url": img_url, "caption": caption}
+                            _record_rich_image(img_url, caption, meta)
                             await asyncio.sleep(0.05)
                             
                     # Companion notebook
@@ -2125,7 +2147,7 @@ def _stream_chat_response(
             # ── Persist assistant response + rich UI data to DB ─────
             if current_user_id and conv_id and (
                 response_text or _rich_data_tables or _rich_data_table or
-                _rich_papers or _rich_notebook or _rich_image or
+                _rich_papers or _rich_notebook or _rich_images or _rich_image or
                 _rich_web_sources or _rich_web_images or
                 _rich_thinking or _rich_thinking_text
             ):
@@ -2144,7 +2166,10 @@ def _stream_chat_response(
                         rich_meta["papers"] = _rich_papers
                     if _rich_notebook:
                         rich_meta["notebook"] = _rich_notebook
-                    if _rich_image:
+                    if _rich_images:
+                        rich_meta["images"] = _rich_images
+                        rich_meta["image"] = _rich_images[-1]
+                    elif _rich_image:
                         rich_meta["image"] = _rich_image
                     if _rich_web_sources:
                         rich_meta["webSources"] = _rich_web_sources
