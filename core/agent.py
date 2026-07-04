@@ -6831,6 +6831,115 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _radio_sed(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_arcsec: float = 30.0,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            service = self._get_radio_sed_service()
+            compile_out = service.compile_sed(ra_f, dec_f, radius_arcsec=radius_arcsec)
+            if not compile_out.get("success"):
+                return compile_out
+
+            points = list(compile_out.get("points") or [])
+            warnings = list(compile_out.get("warnings") or [])
+            provenance = {"compile": compile_out.get("provenance", {})}
+            if not points:
+                statuses = compile_out.get("provenance", {}).get("survey_status", [])
+                all_failed = bool(statuses) and all(row.get("status") == "failed" for row in statuses)
+                note = "No usable radio catalog responses; this is not evidence of a radio nondetection." if all_failed else "No radio catalog detections within radius."
+                return {
+                    "success": True,
+                    "note": note,
+                    "target": label,
+                    "points": [],
+                    "count": 0,
+                    "warnings": warnings,
+                    "provenance": compile_out.get("provenance", {}),
+                }
+
+            fit = None
+            fit_flags: List[str] = []
+            if len(points) >= 2:
+                fit_out = service.fit_spectral_index(points)
+                if fit_out.get("success"):
+                    fit = fit_out
+                    fit_flags = list(fit_out.get("flags") or [])
+                    warnings.extend(fit_out.get("warnings") or [])
+                    provenance["fit"] = fit_out.get("provenance", {})
+                else:
+                    warnings.extend(fit_out.get("warnings") or [])
+                    warnings.append(f"Spectral-index fit skipped: {fit_out.get('error', 'fit failed')}.")
+                    provenance["fit"] = fit_out.get("provenance", {})
+            else:
+                warnings.append("Only one radio catalog detection; spectral index was not fitted.")
+
+            plot_result = service.plot_sed(points, fit=fit, title=f"Radio SED: {label}")
+            warnings.extend(plot_result.get("warnings") or [])
+            provenance["plot"] = plot_result.get("provenance", {})
+            if not plot_result.get("success"):
+                plot_result["points"] = points
+                plot_result["warnings"] = warnings
+                plot_result["flags"] = fit_flags
+                plot_result["provenance"] = provenance
+                return plot_result
+
+            n_points = len(points)
+            if fit:
+                alpha = float(fit["alpha"])
+                alpha_err = None
+                try:
+                    alpha_err_candidate = float(fit.get("alpha_err"))
+                    if alpha_err_candidate == alpha_err_candidate and alpha_err_candidate not in (float("inf"), float("-inf")) and alpha_err_candidate >= 0:
+                        alpha_err = alpha_err_candidate
+                except (TypeError, ValueError):
+                    alpha_err = None
+                if alpha_err is None:
+                    caption = f"Radio SED: {label} - alpha = {alpha:.2f} ({n_points} surveys)"
+                else:
+                    caption = f"Radio SED: {label} - alpha = {alpha:.2f} +/- {alpha_err:.2f} ({n_points} surveys)"
+            else:
+                caption = f"Radio SED: {label} ({n_points} survey point{'s' if n_points != 1 else ''}; spectral index not fitted)"
+
+            meta = {
+                "kind": "radio_sed",
+                "ra": ra_f,
+                "dec": dec_f,
+                "radius_arcsec": compile_out.get("provenance", {}).get("radius_arcsec", radius_arcsec),
+                "flags": fit_flags,
+            }
+            attached = self._datalab_attach_image_result(plot_result, caption, meta=meta)
+            attached.update(
+                {
+                    "points": points,
+                    "count": n_points,
+                    "flags": fit_flags,
+                    "warnings": warnings,
+                    "provenance": provenance,
+                    "target": label,
+                }
+            )
+            if fit:
+                attached.update(
+                    {
+                        "alpha": fit.get("alpha"),
+                        "alpha_err": fit.get("alpha_err"),
+                        "chi2_red": fit.get("chi2_red"),
+                        "n_points": fit.get("n_points"),
+                        "s_1400_mjy_predicted": fit.get("s_1400_mjy_predicted"),
+                    }
+                )
+            else:
+                attached["note"] = "Radio SED plotted, but spectral index was not fitted."
+            return attached
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 
     def _search_space_lightcurves(
         self,
@@ -11776,6 +11885,8 @@ IMPORTANT RULES:
                 return pd.DataFrame(papers)
         
         return None
+
+
 
 
 
