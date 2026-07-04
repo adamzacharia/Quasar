@@ -2,7 +2,7 @@
 
 ![Quasar UI](assets/UI.png)
 
-**Quasar** is an open-source AI research assistant that makes ALMA Science Archive search and data retrieval as simple as asking a question in natural language. It is a *domain-specialized agent framework* that wraps any general-purpose LLM with the tools, knowledge, and orchestration needed to perform real radio astronomy tasks.
+**Quasar** is a free, source-available AI research assistant that makes ALMA Science Archive search and data retrieval as simple as asking a question in natural language. It is a *domain-specialized agent framework* that wraps any general-purpose LLM with the tools, knowledge, and orchestration needed to perform real radio astronomy tasks.
 
 Quasar pairs a registry of **75+ domain-specific tools** covering archive data search, retrieval, and analysis with a **Conductor** orchestration engine that decomposes complex, multi-step research queries into Directed Acyclic task Graphs (DAGs). By externalizing task planning into the Conductor, Quasar enables even smaller or non-reasoning LLMs to reliably execute sophisticated archive workflows through structured tool composition.
 
@@ -269,4 +269,6 @@ python quasar.py query "Find ALMA observations of HL Tau in Band 6"
 
 ## License
 
-MIT License. See `LICENSE` for details.
+Quasar is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0). See `LICENSE` for the full terms.
+
+**In short:** anyone may freely use, modify, and share Quasar for any **noncommercial** purpose — including personal use, research, education, and use by nonprofits, public research organizations, and government institutions. **Commercial use of any kind is strictly prohibited**, including selling Quasar or any modified version of it, or offering it as part of a paid product or service. For commercial licensing inquiries, contact the maintainers.

@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from core.llm_client import LLMClient
+from core.llm_client import LLMClient, ResponsesShim
+
+_TOOL_JSON_RULE = ResponsesShim._GPT_OSS_TOOL_JSON_RULE
 
 
 class _FakeTaccCompletions:
@@ -67,7 +69,7 @@ def test_tacc_previous_response_appends_second_user_turn():
     ]
     assert messages[0] == {
         "role": "system",
-        "content": "Reasoning: high\n\nsystem prompt",
+        "content": f"Reasoning: high\n\nsystem prompt\n\n{_TOOL_JSON_RULE}",
     }
 
 
@@ -121,7 +123,7 @@ def test_clearing_tacc_history_starts_a_fresh_chain():
     )
 
     assert completions.calls[-1]["messages"] == [
-        {"role": "system", "content": "Reasoning: high\n\nsystem prompt"},
+        {"role": "system", "content": f"Reasoning: high\n\nsystem prompt\n\n{_TOOL_JSON_RULE}"},
         {"role": "user", "content": "retry question"},
     ]
 
@@ -137,7 +139,7 @@ def test_tacc_gpt_oss_reasoning_effort_can_be_overridden(monkeypatch):
     )
 
     assert completions.calls[-1]["messages"][0]["content"] == (
-        "Reasoning: low\n\nsystem prompt"
+        f"Reasoning: low\n\nsystem prompt\n\n{_TOOL_JSON_RULE}"
     )
 
 
@@ -164,5 +166,5 @@ def test_invalid_gpt_oss_reasoning_effort_defaults_to_high(monkeypatch):
     )
 
     assert completions.calls[-1]["messages"][0]["content"] == (
-        "Reasoning: high\n\nsystem prompt"
+        f"Reasoning: high\n\nsystem prompt\n\n{_TOOL_JSON_RULE}"
     )

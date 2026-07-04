@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import difflib
 import math
 import os
 import re
@@ -15,8 +17,38 @@ from services.datalab_result_store import default_result_store
 from services.plotting import PlottingService
 
 
-_EXPR_RE = re.compile(r"^[A-Za-z_]\w*(?:\s*[-+*/()]\s*(?:[A-Za-z_]\w*|\d+(?:\.\d*)?|\.\d+))*$")
-_NAME_RE = re.compile(r"\b[A-Za-z_]\w*\b")
+# Whitelisted math functions usable inside plot expressions (evaluated on
+# pandas Series / numpy arrays). Needed for derived quantities like absolute
+# magnitude: phot_g_mean_mag + 5*log10(parallax/100).
+_EXPR_FUNCS: Dict[str, Any] = {
+    "log10": np.log10,
+    "log": np.log,
+    "log2": np.log2,
+    "sqrt": np.sqrt,
+    "abs": np.abs,
+    "exp": np.exp,
+    "power": np.power,
+    "arcsinh": np.arcsinh,
+    "sin": np.sin,
+    "cos": np.cos,
+    "tan": np.tan,
+    "arcsin": np.arcsin,
+    "arccos": np.arccos,
+    "arctan": np.arctan,
+    "arctan2": np.arctan2,
+    "deg2rad": np.deg2rad,
+    "rad2deg": np.rad2deg,
+    "minimum": np.minimum,
+    "maximum": np.maximum,
+}
+
+_EXPR_GRAMMAR_NOTE = (
+    "Expressions may combine result columns with + - * / ** %, parentheses, numeric "
+    "literals, and the functions: " + ", ".join(sorted(_EXPR_FUNCS)) + "."
+)
+
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)
+_ALLOWED_UNARYOPS = (ast.USub, ast.UAdd)
 
 
 def catalog_scatter(
@@ -351,20 +383,71 @@ def _get_result(result_id: str, result_store: Any = None):
     return store.get(result_id)
 
 
+def _resolve_expr_column(frame: pd.DataFrame, name: str, expr: str) -> pd.Series:
+    if name in frame.columns:
+        return pd.to_numeric(frame[name], errors="coerce")
+    # Postgres folds unquoted SELECT aliases to lowercase (M_G -> m_g), so a
+    # case-insensitive fallback lets the model reference the alias it wrote.
+    lowered = {str(col).lower(): col for col in frame.columns}
+    match = lowered.get(name.lower())
+    if match is not None:
+        return pd.to_numeric(frame[match], errors="coerce")
+    available = [str(col) for col in frame.columns][:40]
+    close = difflib.get_close_matches(name, [str(col) for col in frame.columns], n=3, cutoff=0.6)
+    hint = f" Did you mean {', '.join(repr(c) for c in close)}?" if close else ""
+    raise ValueError(
+        f"Column {name!r} not found for expression {expr!r}.{hint} "
+        f"Available columns: {', '.join(available)}. {_EXPR_GRAMMAR_NOTE}"
+    )
+
+
+def _validate_expr_node(node: ast.AST, expr: str) -> None:
+    if isinstance(node, ast.Expression):
+        _validate_expr_node(node.body, expr)
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINOPS):
+        _validate_expr_node(node.left, expr)
+        _validate_expr_node(node.right, expr)
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, _ALLOWED_UNARYOPS):
+        _validate_expr_node(node.operand, expr)
+    elif isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _EXPR_FUNCS or node.keywords:
+            raise ValueError(f"Unsafe or unsupported expression: {expr!r}. {_EXPR_GRAMMAR_NOTE}")
+        for arg in node.args:
+            _validate_expr_node(arg, expr)
+    elif isinstance(node, ast.Name):
+        pass
+    elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        pass
+    else:
+        raise ValueError(f"Unsafe or unsupported expression: {expr!r}. {_EXPR_GRAMMAR_NOTE}")
+
+
 def _eval_expression(frame: pd.DataFrame, expr: str) -> pd.Series:
     text = str(expr or "").strip()
     if not text:
         raise ValueError("expression is required")
     if text in frame.columns:
         return pd.to_numeric(frame[text], errors="coerce")
-    if not _EXPR_RE.match(text) or "__" in text:
-        raise ValueError(f"Unsafe or unsupported expression: {expr!r}")
-    local_dict = {}
-    for name in set(_NAME_RE.findall(text)):
-        if name not in frame.columns:
-            raise ValueError(f"Column {name!r} not found for expression {expr!r}")
-        local_dict[name] = pd.to_numeric(frame[name], errors="coerce")
-    value = pd.eval(text, local_dict=local_dict, engine="python", parser="pandas")
+    if "__" in text:
+        raise ValueError(f"Unsafe or unsupported expression: {expr!r}. {_EXPR_GRAMMAR_NOTE}")
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        raise ValueError(f"Unsafe or unsupported expression: {expr!r}. {_EXPR_GRAMMAR_NOTE}") from None
+    _validate_expr_node(tree, expr)
+    local_dict: Dict[str, Any] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id not in _EXPR_FUNCS and node.id not in local_dict:
+            local_dict[node.id] = _resolve_expr_column(frame, node.id, expr)
+    if not local_dict:
+        raise ValueError(f"Expression {expr!r} must reference at least one result column. {_EXPR_GRAMMAR_NOTE}")
+    env = {"__builtins__": {}}
+    env.update(_EXPR_FUNCS)
+    try:
+        with np.errstate(all="ignore"):
+            value = eval(compile(tree, "<datalab_expr>", "eval"), env, local_dict)  # noqa: S307 - AST-validated above
+    except Exception as exc:
+        raise ValueError(f"Failed to evaluate expression {expr!r}: {exc}. {_EXPR_GRAMMAR_NOTE}") from None
     return pd.Series(value, index=frame.index)
 
 

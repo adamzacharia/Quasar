@@ -1,5 +1,5 @@
-"""
-QuasarAgent — Central orchestrator for Quasar AI.
+﻿"""
+QuasarAgent â€” Central orchestrator for Quasar AI.
 
 CALLED BY: ui/app.py (Streamlit), ui-pro/api/main.py (FastAPI SSE),
            core/cli.py (terminal REPL), telegram.py (webhook)
@@ -8,7 +8,7 @@ CALLS:     All services/* modules, integrations/*, core/complexity.py,
 
 This is the heart of Quasar. The QuasarAgent class:
   1. Registers 27+ tools as OpenAI function-calling schemas
-  2. Routes user queries through complexity detection → Conductor DAG
+  2. Routes user queries through complexity detection â†’ Conductor DAG
   3. Manages RAG context, conversation memory, and long-term memory
   4. Streams responses via Chat Completions API or Responses API
   5. Caches search results (DataFrames) for follow-up operations
@@ -135,9 +135,9 @@ from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
 from core.health_monitor import HealthMonitor
 
-# mem0 DISABLED — it pulls in sentence-transformers + PyTorch (~1–1.5GB RAM),
+# mem0 DISABLED â€” it pulls in sentence-transformers + PyTorch (~1â€“1.5GB RAM),
 # which causes OOM on 2GB Render instances. The app already uses Qdrant + RAG
-# for knowledge persistence. Set ENABLE_MEM0=1 to re-enable if you have ≥4GB.
+# for knowledge persistence. Set ENABLE_MEM0=1 to re-enable if you have â‰¥4GB.
 import os as _os_mem0
 if _os_mem0.getenv("ENABLE_MEM0", "").strip() in ("1", "true", "yes"):
     try:
@@ -172,7 +172,7 @@ class AgentConfig:
     use_responses_api: bool = False  # Toggle for Responses API vs Chat Completions
     mcp_server_url: str = "http://localhost:8000/sse"  # MCP server SSE endpoint
     enable_mcp: bool = False  # Enable MCP tool connection
-    # User context — needed to load custom tools on startup
+    # User context â€” needed to load custom tools on startup
     user_id: str = ""
 
 class QuasarAgent:
@@ -183,7 +183,7 @@ class QuasarAgent:
         print("DEBUG: Agent init start - VERSION 2")
         self.config = config or AgentConfig()
 
-        # API key validation — only required for cloud providers
+        # API key validation â€” only required for cloud providers
         provider = detect_provider(self.config.model)
         if provider == "openai" and not self.config.api_key:
             raise ValueError(
@@ -231,15 +231,15 @@ class QuasarAgent:
         if self.config.verbose:
             print("[green]QuasarAgent initialized successfully[/green]")
         
-        # ── Per-request thread-local storage ─────────────────────────
+        # â”€â”€ Per-request thread-local storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # These attributes are accessed via @property so each concurrent
         # request (running in its own ThreadPoolExecutor thread) gets
         # isolated state.  Tools still write `self.last_run_result = {...}`
-        # — the property setter transparently redirects to thread-local.
+        # â€” the property setter transparently redirects to thread-local.
         self._tls = threading.local()
 
-        # ── Per-conversation OpenAI response-ID tracking ──────────────
-        # Maps conversation_id → last OpenAI response_id.  Thread-safe.
+        # â”€â”€ Per-conversation OpenAI response-ID tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Maps conversation_id â†’ last OpenAI response_id.  Thread-safe.
         # Replaces the old singleton `self.last_response_id` which caused
         # cross-user state poisoning on the shared agent instance.
         self._conv_response_ids: Dict[str, str] = {}
@@ -248,7 +248,7 @@ class QuasarAgent:
         self._alma_project_picker_by_conversation: Dict[str, Dict[str, Any]] = {}
         self._alma_project_picker_lock = threading.Lock()
 
-        self._session_token_estimate = 0  # Running token count estimate (legacy — kept for compat)
+        self._session_token_estimate = 0  # Running token count estimate (legacy â€” kept for compat)
         self._session_token_limit = 90000  # Legacy threshold (superseded by ContextManager)
         
         # Initialize mem0 long-term memory (if available)
@@ -359,7 +359,7 @@ class QuasarAgent:
         
         print("DEBUG: Agent init done")
 
-    # ── Custom User Tools ──────────────────────────────────────────────────
+    # â”€â”€ Custom User Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _load_user_tools(self, user_id: str):
         """
@@ -514,13 +514,13 @@ class QuasarAgent:
         except Exception as e:
             print(f"[MCPServers] Failed to set up MCP clients: {e}")
 
-    # ── Token helpers ──────────────────────────────────────────────────────
+    # â”€â”€ Token helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _estimate_tokens(self, text: str) -> int:
         """Rough token estimate: ~4 chars per token for English text."""
         return len(text) // 4
 
-    # ── Thread-local properties ───────────────────────────────────────
+    # â”€â”€ Thread-local properties â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # These let 40+ tool methods keep writing `self.last_run_result = {}`
     # while each concurrent request thread sees its own isolated value.
 
@@ -546,7 +546,7 @@ class QuasarAgent:
     def _accumulated_tool_trace(self):
         # Request-scoped like _accumulated_run_results: concurrent chats must
         # never mix tool traces. Conductor subtask threads get their own
-        # (discarded) list — their calls are not traced into the parent
+        # (discarded) list â€” their calls are not traced into the parent
         # request until a collector can be passed through explicitly.
         if not hasattr(self._tls, 'accumulated_tool_trace'):
             self._tls.accumulated_tool_trace = []
@@ -564,7 +564,7 @@ class QuasarAgent:
     def last_search_results(self, value):
         self._tls.last_search_results = value
 
-    # ── Per-conversation response ID helpers ────────────────────────
+    # â”€â”€ Per-conversation response ID helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _response_state_key(self, conversation_id: str, model: Optional[str] = None) -> str:
         selected_model = model or self.config.model
@@ -641,7 +641,7 @@ class QuasarAgent:
                 self._conv_run_tokens.pop(key, None)
 
     def _cleanup_conv_states(self, max_entries: int = 500):
-        """Prevent memory leak — evict oldest conversation entries."""
+        """Prevent memory leak â€” evict oldest conversation entries."""
         with self._conv_ids_lock:
             keys = list(dict.fromkeys([
                 *self._conv_response_ids.keys(),
@@ -664,7 +664,7 @@ class QuasarAgent:
 
     def _prune_session_if_needed(self, query: str, user_id: str):
         """
-        Smart context management — replaces the old session nuke with
+        Smart context management â€” replaces the old session nuke with
         LLM-powered summarization via ContextManager.
 
         Legacy: used to reset last_response_id and lose ALL context.
@@ -696,30 +696,31 @@ and the IRSA infrared catalog services (WISE, 2MASS, Spitzer catalogs) via `sear
 Your goal is to help users find, visualize, and analyze astronomical data.
 
 GUIDELINES:
-- **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool.
-- **FRESH DATA ALWAYS**: NEVER answer archive/data queries from conversation memory or prior tool results. ALWAYS make a fresh tool call, even if you already called the same tool earlier in this conversation. Every data request MUST trigger a new search_by_target, search_by_position, search_cadc_archive, or search_papers call. The user expects live data with a data card in the UI — text-only answers without a tool call are UNACCEPTABLE for data queries.
-- **KNOWLEDGE vs DATA**: For factual/conceptual/how-to questions, answer directly from the documentation context (RAG) and your knowledge. Do NOT call search_papers or any data tool — these are NOT data queries, they are knowledge queries. Only call search_papers when the user EXPLICITLY asks for papers, articles, publications, or literature (e.g. "find papers about...", "show me recent publications on...").
+- **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool. Answering a data, catalog, imagery, or plotting request with generic how-to instructions, an SQL sketch, or a description of what one COULD do â€” instead of actually calling the tools â€” is UNACCEPTABLE.
+- **RECOVER FROM TOOL ERRORS**: When a tool returns an error with a hint (wrong column name, unsupported expression, bad table), fix the call using the hint (e.g. consult datalab_describe_table for valid columns) and retry. Never end the turn on a tool error without at least one corrected retry, and always finish with a plain-text answer for the user summarizing what worked.
+- **FRESH DATA ALWAYS**: NEVER answer archive/data queries from conversation memory or prior tool results. ALWAYS make a fresh tool call, even if you already called the same tool earlier in this conversation. Every data request MUST trigger a new search_by_target, search_by_position, search_cadc_archive, or search_papers call. The user expects live data with a data card in the UI â€” text-only answers without a tool call are UNACCEPTABLE for data queries.
+- **KNOWLEDGE vs DATA**: For factual/conceptual/how-to questions, answer directly from the documentation context (RAG) and your knowledge. Do NOT call search_papers or any data tool â€” these are NOT data queries, they are knowledge queries. Only call search_papers when the user EXPLICITLY asks for papers, articles, publications, or literature (e.g. "find papers about...", "show me recent publications on...").
   KNOWLEDGE QUERY EXAMPLES (answer from RAG, NEVER call search_papers):
-  - "What is the ALMA proprietary period?" → RAG answer
-  - "What are the Cycle 13 proposal submission deadlines?" → RAG answer (the word "proposal" does NOT mean "find papers")
-  - "How do I access archival ALMA data?" → RAG answer (the word "archival" means ALMA archive, NOT research articles)
-  - "How does the ALMA proposal review process work?" → RAG answer
-  - "How do I calibrate ALMA Band 6 data?" → RAG answer
-  - "What receiver bands are available on ALMA?" → RAG answer
-  - "What file formats does ALMA deliver?" → RAG answer
+  - "What is the ALMA proprietary period?" â†’ RAG answer
+  - "What are the Cycle 13 proposal submission deadlines?" â†’ RAG answer (the word "proposal" does NOT mean "find papers")
+  - "How do I access archival ALMA data?" â†’ RAG answer (the word "archival" means ALMA archive, NOT research articles)
+  - "How does the ALMA proposal review process work?" â†’ RAG answer
+  - "How do I calibrate ALMA Band 6 data?" â†’ RAG answer
+  - "What receiver bands are available on ALMA?" â†’ RAG answer
+  - "What file formats does ALMA deliver?" â†’ RAG answer
   PAPER QUERY EXAMPLES (call search_papers):
-  - "Find recent papers on protoplanetary disks" → search_papers
-  - "Show me publications about ALMA observations of M87" → search_papers
-  - "What are the latest studies on galaxy mergers?" → search_papers
-  If the query is asking HOW something works, WHAT something is, or about ALMA procedures/policies/deadlines — it is a KNOWLEDGE query. NEVER call search_papers for these.
+  - "Find recent papers on protoplanetary disks" â†’ search_papers
+  - "Show me publications about ALMA observations of M87" â†’ search_papers
+  - "What are the latest studies on galaxy mergers?" â†’ search_papers
+  If the query is asking HOW something works, WHAT something is, or about ALMA procedures/policies/deadlines â€” it is a KNOWLEDGE query. NEVER call search_papers for these.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
-- **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
-- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
+- **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step â€” do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." â€” instead CALL search_by_target(). NEVER write "Use Splatalogue to..." â€” instead CALL search_lines_by_molecule().
+- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies â€” you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers â€” output NOTHING. The UI renders the papers as interactive cards automatically.
 - **AUTO-LINKING LITERATURE**: The backend automatically exact-links top ALMA project/proposal codes from `search_by_target` or `search_by_position` to NASA ADS papers for the Observation-Paper Graph. Do NOT call `search_papers_by_observation_id` merely to auto-link normal archive search results. Only call it when the user explicitly asks for papers connected to a specific identifier.
-- **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer — "Who is X?", "Tell me about X", "Where does X work?" — call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
+- **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer â€” "Who is X?", "Tell me about X", "Where does X work?" â€” call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
   1. **Header**: "## Profile: [Full Name]" with email and personal webpage (from web search if available)
   2. **Identity**: ORCID, alternative name forms, current institution(s)
-  3. **Academic Metrics** — ALWAYS as a markdown table:
+  3. **Academic Metrics** â€” ALWAYS as a markdown table:
      | Metric | Value |
      |--------|-------|
      | Publications | N |
@@ -729,14 +730,14 @@ GUIDELINES:
      | 2yr Mean Citedness | N |
   4. **Research Focus**: Bulleted list of top topics
   5. **Affiliation History**: Chronological list of past institutions with year ranges
-  6. **Recent Research Activity** — ALWAYS as a markdown table with Year / Works / Citations columns (last 5–10 years)
+  6. **Recent Research Activity** â€” ALWAYS as a markdown table with Year / Works / Citations columns (last 5â€“10 years)
   7. **Summary**: A brief narrative paragraph about the researcher
   If web search results are also available, extract and include their email address, personal webpage, and recent news/awards at the top.
 - **ALMA DATA PRODUCT TRIAGE**: When the user asks to fetch, inspect, list, or triage ALMA FITS/data products, call `triage_alma_data_products`. If they provide a project/proposal code, MOUS UID, ASDM UID, or dataset ID, triage that exact identifier directly. If they provide only a target name such as "M87", first use `triage_alma_data_products` to show available project codes and ask the user which project to triage; do NOT guess. If the previous turn showed a project-code picker and the user replies with a row number like "#4", "number 4", or "use the fourth one", call `triage_alma_data_products` with that reply exactly. If they provide a band preference, pass it so the picker is filtered first. Never auto-download huge products; remote header inspection and product listing are safe.
-- **RESEARCH TRENDS**: When the user asks about publication volume, field growth, or funding landscape — "How much research on FRBs?", "Is interest in X growing?", "Who funds research on Y?" — call `get_research_trends`. Returns papers-per-year breakdown and top funders.
+- **RESEARCH TRENDS**: When the user asks about publication volume, field growth, or funding landscape â€” "How much research on FRBs?", "Is interest in X growing?", "Who funds research on Y?" â€” call `get_research_trends`. Returns papers-per-year breakdown and top funders.
 - **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
-- **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
-- **WEB TOOL ROUTING**: Keyword query → `web_search`. Full URL(s) to read/summarize/quote → `web_extract_url`. Site root URL plus "find pages" → `web_map_site`. Site section plus "crawl/docs" → `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
+- **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications â€” use `search_papers` instead.
+- **WEB TOOL ROUTING**: Keyword query â†’ `web_search`. Full URL(s) to read/summarize/quote â†’ `web_extract_url`. Site root URL plus "find pages" â†’ `web_map_site`. Site section plus "crawl/docs" â†’ `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
 - **IMAGERY ROUTING**: when the user asks to SEE something (show me X / what does X look like / image of X), call an imaging tool (hips_cutout / hips_multiband_panel / vlass_cutout / stamps) in THIS turn - even if a similar image was produced earlier in the conversation. Prior images are not re-displayed with a new answer; an answer about appearance without a fresh tool-produced image is incomplete.
 - **STRICT WEB SAFETY**: Never provide, summarize, cite, or link to pornographic, sexually explicit, nude, erotic, escort, or adult-entertainment content. Never emit general-web image URLs. If the web safety filter withholds results, state only that results were withheld by the safety filter and do not reconstruct the blocked content from memory.
 - After a tool runs (except search_papers), summarize the output concisely.
@@ -746,37 +747,45 @@ GUIDELINES:
 - **NAME RESOLUTION**: If search_by_target returns empty for a valid target, use the resolve_target tool to get RA/Dec, then use search_by_position.
 - **MINIMAL PARAMETERS**: When calling search_by_target, ONLY include optional parameters (band, max_resolution, min_freq_ghz, scan_intent, etc.) if the user EXPLICITLY requested them. For example, if the user says "Find ALMA data of M87", call search_by_target(target_name="M87") with NO other parameters. Do NOT pass band=0, min_freq_ghz=0, max_resolution=100 etc. Leaving them out returns ALL data.
 - **MULTI-TARGET (SAME CONSTRAINTS)**: If the user mentions multiple targets with the SAME constraints (e.g. "M87 and Sz65", or "M87, Sz65, NGC23 and M83"), pass them as a single comma-separated string: search_by_target(target_name="M87, Sz65"). The tool handles splitting and searching each target.
-- **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band — use comma-separated bands in ONE call.
-- **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") — the tool can parse per-target bands.
-- **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` — they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
+- **MULTI-BAND**: If the user mentions multiple bands (e.g. "Band 6 and Band 7"), pass them as comma-separated: search_by_target(target_name="M87", band="6,7"). The tool handles searching each band separately and shows a data card for each. NEVER make separate tool calls for each band â€” use comma-separated bands in ONE call.
+- **PER-TARGET CONSTRAINTS**: If different targets have DIFFERENT band/constraint requirements (e.g. "M87 in Band 6 and Sz65 in Band 7"), make SEPARATE tool calls for each target-constraint pair: first search_by_target(target_name="M87", band="6"), then search_by_target(target_name="Sz65", band="7"). Each call produces its own data card. You MAY also pass them in one call as search_by_target(target_name="M87 in band 6, Sz65 in band 7") â€” the tool can parse per-target bands.
+- **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` â€” they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
 - **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
 - **MMU/HATS CATALOG RULE**: Use `search_mmu_hats_catalog` when the user asks for source/catalog properties from large surveys -- Gaia astrometry/proper motions/parallaxes, DESI/SDSS redshifts and classifications, TESS source metadata, Chandra spectra metadata, what sources are near this position, source tables for ML, or cross-survey enrichment. Use the archive tools (search_by_target, search_by_position, search_mast, search_cadc_archive, search_eso_archive, triage_alma_data_products) when the user asks for observation availability, project/proposal IDs, FITS/data products, or telescope archive records. For combined requests (find ALMA data for M87 and Gaia sources in the field), call the archive tool FIRST to get observations/positions, THEN search_mmu_hats_catalog to enrich the field. For catalog-to-catalog matching use crossmatch_mmu_hats_catalogs within a bounded cone; if it fails, run two bounded cone searches and say so. Examples: Find ALMA data for M87 -> search_by_target. What Gaia sources are near M87? -> search_mmu_hats_catalog(catalog_key='gaia', target_name='M87'). Download ALMA FITS files -> ALMA/DataLink tools, never MMU/HATS.
 - **LIVE IMAGERY RULE**: Use `hips_cutout` or `hips_multiband_panel` for "show me", appearance, and multiwavelength postage-stamp questions; they are deeper and broader than `get_sky_image`. Use `vlass_cutout` for 3 GHz radio continuum imagery (Dec > -40 only). Use `search_ztf_alerts`, `ztf_light_curve`, and `ztf_stamps` for transients and variability. Use `ned_sed_plot` for literature SEDs. Use `sparcl_find_spectra` and `sparcl_plot_spectrum` for real DESI/SDSS optical spectra. MMU/Data Lab remain authoritative for catalog tables.
+- **RADIO SED RULE**: Use `radio_sed` for compact-source radio continuum SED or radio spectral-index questions; always repeat its flags and state that v1 uses TGSS/GLEAM/SUMSS/NVSS/FIRST catalog fluxes without resolution matching, flux-scale corrections, or image-plane photometry.
+- **VARIABILITY RULE**: For variability, use `search_space_lightcurves` / `plot_space_lightcurve` for TESS/Kepler availability and plots, and `period_search` for TESS/Kepler targets or ZTF oids; always report the FAP with any period.
+- **PULSAR CATALOG RULE**: Use `search_pulsars` / `pulsar_lookup` for pulsar catalogue or parameter questions (periods, DMs, S1400 fluxes, associations, name lookups, cone searches) instead of web search.
+- **SOLAR SYSTEM RULE**: Use `moving_object_check` when a transient could be a known asteroid/comet, and `solar_system_ephemeris` for planet/asteroid/comet positions, distances, magnitude, and visibility over a date range.
+- **DISTANCE RULE**: For distances: `gaia_distance` (stars, parallax), `ned_distance` (galaxies, redshift-independent), and `velocity_frame_distance` (flow-corrected Hubble distances) -- do not compute 1/parallax by hand.
+- **MOC COVERAGE RULE**: Use `survey_coverage` / `survey_covers_position` before broad archive availability searches to check which surveys actually cover a position, especially for "is there data" or "which surveys observed X" questions; for exact archive IDs, product downloads, or if MOCServer fails, continue with the requested archive tool and report the preflight issue.
+- **GALACTIC EXTINCTION RULE**: Use `galactic_extinction` for E(B-V)/A_lambda whenever photometry, colors, or distance moduli need dereddening.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
 - **FILTERING**: If the user asks for constraints like "resolution < 0.05", use the filter_results tool AFTER a search.
 - **LINE COVERAGE**: For one named transition and target (for example, "Check CO(2-1) line coverage for M87"), call `find_alma_line_coverage` once. It resolves the target/redshift, selects the exact Splatalogue transition, and locally verifies ALMA spectral-window coverage. Do NOT use broad `check_co_lines` for a named transition and do NOT report other CO ladder transitions as matches. Keep `check_co_lines` only for explicit requests to inspect the whole CO/13CO/C18O ladder in prior search results.
 - **TAP QUERIES**: When generating SQL/ADQL queries, use the column names in the schema below.
+- **DATA LAB COLUMNS**: If you are not certain of a Data Lab table's column names, call `datalab_describe_table` BEFORE writing SQL â€” never guess column names (e.g. NSC DR2 uses gmag/rmag, not gmagmag). If a query fails with 'column ... does not exist', correct the name from the HINT or describe-table output and re-run.
 
 DUAL-SOURCE RESPONSE STRUCTURE (RAG + Web):
 When your answer draws on BOTH the documentation context provided below AND web search results, you MUST structure your response in this EXACT order:
 
-**SECTION 1 — Documentation Answer** (from ALMA docs/tutorials):
-Present the main answer using the documentation context. Citations MUST be placed INLINE right after the sentence that uses the information — NEVER collect citations into a "References" or "Sources" section at the bottom. Each documentation chunk has a CITE_AS tag — copy that EXACT string verbatim as your citation. Do NOT modify, rephrase, or invent any fields in the citation.
-- CORRECT inline citation: "The proprietary period is 12 months. [Source: alma-proposers-guide-cycle13.pdf, Page 36, Date: February 2026, Relevance: 0.88]" — copied from the CITE_AS tag.
-- WRONG (bottom-grouped): Putting a "References:" section at the end listing all sources — NEVER do this.
-- WRONG (missing fields): "[Source: alma-proposers-guide.pdf]" — NEVER omit Page, Date, or Relevance.
-- WRONG (unknown): "[Source: file.pdf, Page unknown, Date: unknown]" — the CITE_AS tag always has the correct values. Copy them. NEVER write "unknown" or invent scores.
+**SECTION 1 â€” Documentation Answer** (from ALMA docs/tutorials):
+Present the main answer using the documentation context. Citations MUST be placed INLINE right after the sentence that uses the information â€” NEVER collect citations into a "References" or "Sources" section at the bottom. Each documentation chunk has a CITE_AS tag â€” copy that EXACT string verbatim as your citation. Do NOT modify, rephrase, or invent any fields in the citation.
+- CORRECT inline citation: "The proprietary period is 12 months. [Source: alma-proposers-guide-cycle13.pdf, Page 36, Date: February 2026, Relevance: 0.88]" â€” copied from the CITE_AS tag.
+- WRONG (bottom-grouped): Putting a "References:" section at the end listing all sources â€” NEVER do this.
+- WRONG (missing fields): "[Source: alma-proposers-guide.pdf]" â€” NEVER omit Page, Date, or Relevance.
+- WRONG (unknown): "[Source: file.pdf, Page unknown, Date: unknown]" â€” the CITE_AS tag always has the correct values. Copy them. NEVER write "unknown" or invent scores.
 
-**SECTION 2 — Documentation Disclaimer** (immediately after Section 1, BEFORE any web content):
+**SECTION 2 â€” Documentation Disclaimer** (immediately after Section 1, BEFORE any web content):
 Add this line right after your documentation answer, before the web section:
-"*📚 The above information is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies or changes.*"
+"*ðŸ“š The above information is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies or changes.*"
 
-**SECTION 3 — Web Search Updates** (after the disclaimer):
-Start with the heading "🌐 Updated Information from the Web:" and then present a DETAILED summary of what the web search results contain. This section MUST:
+**SECTION 3 â€” Web Search Updates** (after the disclaimer):
+Start with the heading "ðŸŒ Updated Information from the Web:" and then present a DETAILED summary of what the web search results contain. This section MUST:
 - Be at least one full paragraph (3-5 sentences minimum) with specific facts extracted from the web results
 - Include clickable Markdown links to the source URLs
-- Present the web findings as-is, regardless of whether they overlap with the documentation above — the user wants to see what the web says independently
-- NEVER write "No additional web updates were found" or similar dismissals. If web results are provided to you, there IS content to present — extract and summarize it.
+- Present the web findings as-is, regardless of whether they overlap with the documentation above â€” the user wants to see what the web says independently
+- NEVER write "No additional web updates were found" or similar dismissals. If web results are provided to you, there IS content to present â€” extract and summarize it.
 
 IMPORTANT: The disclaimer (Section 2) MUST appear BETWEEN the documentation content and the web content. Never place the disclaimer after the web section.
 
@@ -789,7 +798,7 @@ FORMATTING RULES:
   | Type | Description | Format |
   | --- | --- | --- |
   | Science data | Final calibrated data | FITS |
-  Never use space-aligned plain text for tabular data — it will not render correctly.
+  Never use space-aligned plain text for tabular data â€” it will not render correctly.
 - **HEADINGS**: Use ## and ### for sections, not numbered lists for top-level categories.
 - **BOLD** key values, observatory names, and important findings.
 - **BULLET LISTS**: Use - for lists of items or key points.
@@ -833,12 +842,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             description=(
                 "Search the ALMA archive (default) by target name. Supports multiple targets "
                 "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
-                "Pass facility='VLA', 'VLBA', or 'GBT' to search the NRAO archive instead — "
+                "Pass facility='VLA', 'VLBA', or 'GBT' to search the NRAO archive instead â€” "
                 "ONLY when the user explicitly asks for those telescopes.\n"
                 "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency, scan_intent) "
                 "if the user EXPLICITLY mentions them. Do NOT invent default values. "
                 "If the user just says 'Find ALMA data of M87', pass ONLY target_name='M87' "
-                "with NO other parameters — this returns ALL observations across all bands.\n"
+                "with NO other parameters â€” this returns ALL observations across all bands.\n"
                 "Only pass band=6 if the user says 'Band 6'. Only pass max_resolution if "
                 "the user specifies a resolution constraint. Omitting a filter means 'no filter'."
             ),
@@ -877,7 +886,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── CADC Multi-wavelength Archive Search ──────────────────
+        # â”€â”€ CADC Multi-wavelength Archive Search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="search_cadc_archive",
             description=(
@@ -983,7 +992,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             name="search_alma_co_in_redshift_range",
             description=(
                 "Search the ALMA archive for observations that cover CO emission lines "
-                "for galaxies at a given redshift range. Handles the CO rest-frequency → "
+                "for galaxies at a given redshift range. Handles the CO rest-frequency â†’ "
                 "observed-frequency conversion and TAP frequency-containment query automatically. "
                 "Use this for any query like 'galaxies at z=1-2 with CO coverage' or "
                 "'ALMA CO detections at high redshift'.\n"
@@ -1259,15 +1268,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── Browser Control Tools ──────────────────────────────────
+        # â”€â”€ Browser Control Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="web_search",
             description=(
                 "Search the web for real-time information: astronomy news, telescope schedules, "
                 "observatory announcements, instrument specs, call-for-proposals, or operational status updates. "
-                "NEVER use this for finding papers or publications — use search_papers (NASA ADS) instead. "
+                "NEVER use this for finding papers or publications â€” use search_papers (NASA ADS) instead. "
                 "Uses Brave, Tavily, and Exa through Quasar's web search router for grounded, source-cited results. "
-                "Use the user's query as-is — do NOT add years or dates unless the user explicitly mentioned them. "
+                "Use the user's query as-is â€” do NOT add years or dates unless the user explicitly mentioned them. "
                 "For keyword queries, use this tool directly and answer from its returned sources. "
                 "Do NOT call navigate_to_url after web_search unless the user explicitly asks to open a specific result URL "
                 "or the search result is insufficient and you need one full page from a known http(s) URL. "
@@ -1445,7 +1454,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── Publication Plotting Tools ─────────────────────────────
+        # â”€â”€ Publication Plotting Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="plot_alma_results",
             description=(
@@ -1505,7 +1514,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── Splatalogue Line ID Tools ───────────────────────────────
+        # â”€â”€ Splatalogue Line ID Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="identify_spectral_line",
             description="Identify molecular spectral lines near a given rest frequency using the Splatalogue database. Essential for ALMA/VLA spectral line identification.",
@@ -1514,7 +1523,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "type": "object",
                 "properties": {
                     "frequency_ghz": {"type": "number", "description": "Rest frequency to search around (GHz), e.g. 230.538"},
-                    "tolerance_ghz": {"type": "number", "description": "Search window ± around the frequency in GHz (default: 0.01 = 10 MHz)"},
+                    "tolerance_ghz": {"type": "number", "description": "Search window Â± around the frequency in GHz (default: 0.01 = 10 MHz)"},
                     "top_n": {"type": "integer", "description": "Max candidate lines to return (default: 5)"},
                 },
                 "required": ["frequency_ghz"]
@@ -1611,7 +1620,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── Multi-archive Cross-matcher Tools ─────────────────────
+        # â”€â”€ Multi-archive Cross-matcher Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="cross_match_source",
             description="Query multiple astronomical archives (Simbad, NED, MAST, VizieR, Fermi 4FGL) in parallel for a source. Returns a unified multi-wavelength summary.",
@@ -1625,7 +1634,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "required": ["target_name"]
             }
         ))
-        # ── MAST Archive Tools (JWST, HST, TESS, Kepler) ──────────
+        # â”€â”€ MAST Archive Tools (JWST, HST, TESS, Kepler) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="search_mast",
             description=(
@@ -1692,7 +1701,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── ESO Science Archive Tools (VLT instruments) ───────────
+        # â”€â”€ ESO Science Archive Tools (VLT instruments) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="search_eso_archive",
             description=(
@@ -1715,7 +1724,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── IRSA Infrared Archive Tools (WISE, 2MASS, Spitzer) ────
+        # â”€â”€ IRSA Infrared Archive Tools (WISE, 2MASS, Spitzer) â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="search_irsa",
             description=(
@@ -1737,7 +1746,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── Sky Survey Image Tools ────────────────────────────────
+        # â”€â”€ Sky Survey Image Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         # Data Lab P0 catalog-TAP tools
         self.tool_registry.register(Tool(
@@ -1979,14 +1988,27 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="datalab_catalog_scatter",
-            description="Render a Data Lab result_id as a CMD/CCD/HR-style scatter plot using safe column expressions.",
+            description=(
+                "Render a Data Lab result_id as a CMD/CCD/HR-style scatter plot using safe column expressions. "
+                "x_expr/y_expr combine columns of the stored result with + - * / ** %, parentheses, numeric literals, "
+                "and functions log10/log/sqrt/abs/exp/power (e.g. absolute magnitude: "
+                "'phot_g_mean_mag + 5*log10(parallax/100)' with parallax in mas). Only columns present in the stored "
+                "result can be referenced â€” derived columns like M_G do NOT pre-exist; compute them inline here or "
+                "alias them in the SQL SELECT first."
+            ),
             function=self._datalab_catalog_scatter,
             parameters={
                 "type": "object",
                 "properties": {
                     "result_id": {"type": "string"},
-                    "x_expr": {"type": "string"},
-                    "y_expr": {"type": "string"},
+                    "x_expr": {
+                        "type": "string",
+                        "description": "Expression over result columns for the x axis, e.g. 'bp_rp' or 'g - r'.",
+                    },
+                    "y_expr": {
+                        "type": "string",
+                        "description": "Expression over result columns for the y axis, e.g. 'phot_g_mean_mag + 5*log10(parallax/100)'.",
+                    },
                     "color_by": {"type": "string"},
                     "invert_y": {"type": "boolean", "default": False},
                     "invert_x": {"type": "boolean", "default": False},
@@ -2111,7 +2133,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
         self.tool_registry.register(Tool(
             name="datalab_color_color_diagram",
-            description="ONE-SHOT color-color diagram (e.g. g-r vs r-i) for a catalog cone. Queries + plots in a single call; auto-splits into stars vs galaxies (2 panels) using the catalog's morphology column (e.g. DES spread_model_r) unless split_col is given. Use this for 'show me a color-color diagram'/'separate stars from galaxies' requests — do NOT chain separate query+plot tools.",
+            description="ONE-SHOT color-color diagram (e.g. g-r vs r-i) for a catalog cone. Queries + plots in a single call; auto-splits into stars vs galaxies (2 panels) using the catalog's morphology column (e.g. DES spread_model_r) unless split_col is given. Use this for 'show me a color-color diagram'/'separate stars from galaxies' requests â€” do NOT chain separate query+plot tools.",
             function=self._datalab_color_color_diagram,
             parameters={
                 "type": "object",
@@ -2156,7 +2178,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         ))
         self.tool_registry.register(Tool(
             name="datalab_tiled_search",
-            description="P15: tiled region-bounded overdensity search over a footprint. Runs a server-side density aggregate per q3c cone tile, finds matched-filter peaks, and ranks candidates. Executes as a background job; for a large area it returns needs_confirmation first — re-call with confirm=true after confirming the sky area with the user.",
+            description="P15: tiled region-bounded overdensity search over a footprint. Runs a server-side density aggregate per q3c cone tile, finds matched-filter peaks, and ranks candidates. Executes as a background job; for a large area it returns needs_confirmation first â€” re-call with confirm=true after confirming the sky area with the user.",
             function=self._datalab_tiled_search,
             parameters={
                 "type": "object",
@@ -2394,6 +2416,55 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis",
         ))
         self.tool_registry.register(Tool(
+            name="search_space_lightcurves",
+            description="List available TESS/Kepler/K2 light curves for a target; returns a table whose index can be used with plot_space_lightcurve or period_search.",
+            function=self._search_space_lightcurves,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "mission": {"type": "string", "enum": ["TESS", "Kepler", "K2"]},
+                    "max_rows": {"type": "integer", "default": 20},
+                },
+                "required": ["target"],
+            },
+            category="archive",
+        ))
+        self.tool_registry.register(Tool(
+            name="plot_space_lightcurve",
+            description="Download and plot a TESS/Kepler/K2 light curve for a target.",
+            function=self._plot_space_lightcurve,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "mission": {"type": "string", "enum": ["TESS", "Kepler", "K2"]},
+                    "index": {"type": "integer", "default": 0},
+                },
+                "required": ["target"],
+            },
+            category="analysis",
+        ))
+        self.tool_registry.register(Tool(
+            name="period_search",
+            description="Lomb-Scargle period search plus phase-folded plot on a TESS/Kepler light curve or a ZTF object by ALeRCE oid; returns best period, FAP, and top alternatives.",
+            function=self._period_search,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "enum": ["tess", "kepler", "ztf"]},
+                    "identifier": {"type": "string"},
+                    "mission": {"type": "string", "enum": ["TESS", "Kepler", "K2"]},
+                    "min_period_d": {"type": "number", "default": 0.05},
+                    "max_period_d": {"type": "number", "default": 30.0},
+                    "fid": {"type": "integer"},
+                    "index": {"type": "integer", "default": 0},
+                },
+                "required": ["source", "identifier"],
+            },
+            category="analysis",
+        ))
+        self.tool_registry.register(Tool(
             name="ned_sed_plot",
             description="Plot a literature SED from NED photometry for a named target.",
             function=self._ned_sed_plot,
@@ -2456,7 +2527,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── Data Download Tools ───────────────────────────────────
+        # â”€â”€ Data Download Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="download_mast_data",
             description=(
@@ -2476,7 +2547,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── CASA Script Generator Tools ────────────────────────────
+        # â”€â”€ CASA Script Generator Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="generate_casa_imaging_script",
             description="Generate a complete CASA tclean imaging script for ALMA/VLA data. Returns ready-to-run Python code for radio interferometry imaging.",
@@ -2515,7 +2586,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── GCN / GW Alert Tools ───────────────────────────────────
+        # â”€â”€ GCN / GW Alert Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="get_latest_gw_events",
             description="Get the latest gravitational wave events from the GWOSC (Gravitational Wave Open Science Center) catalog. Use for multi-messenger astronomy queries.",
@@ -2559,7 +2630,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
         ))
 
-        # ── NASA ADS Literature Tools ──────────────────────────────────────
+        # â”€â”€ NASA ADS Literature Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _ads = self.ads_client  # may be None if no key
 
         self.tool_registry.register(Tool(
@@ -2567,7 +2638,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             description=(
                 "Search the NASA ADS database for astronomical papers. "
                 "Returns titles, authors, abstracts, citation counts, DOIs, and a direct link to each paper on NASA ADS. "
-                "IMPORTANT: Pass the user's request as natural language — an internal AI query builder will "
+                "IMPORTANT: Pass the user's request as natural language â€” an internal AI query builder will "
                 "automatically translate it into optimal ADS syntax using keyword searches, bibgroup filters, "
                 "SIMBAD object linking, second-order discovery operators (trending, similar, useful), and more.\n"
                 "Examples of what to pass as query:\n"
@@ -2578,7 +2649,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "- 'foundational papers on planet formation'\n"
                 "- 'review articles on AGN feedback'\n"
                 "- 'papers by Sean Andrews on disk surveys'\n"
-                "Do NOT try to construct ADS field syntax yourself — just pass the natural language query."
+                "Do NOT try to construct ADS field syntax yourself â€” just pass the natural language query."
             ),
             function=lambda query, max_results=15, sort="date desc", **kw: (
                 self._search_papers(query, max_results=max_results, sort=sort)
@@ -2846,7 +2917,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="literature"
         ))
 
-        # ── OpenAlex Researcher & Bibliometric Tools ──────────────────────
+        # â”€â”€ OpenAlex Researcher & Bibliometric Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _oalex = self.openalex_client
 
         self.tool_registry.register(Tool(
@@ -2889,7 +2960,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "query.  Returns total paper count and yearly breakdown.\n"
                 "Use when the user asks 'How much research is being done on X?', "
                 "'Is interest in X growing?', 'Publication trends for FRBs'.\n"
-                "Also returns the funding landscape — which funders (NSF, NASA, ESA, etc.) "
+                "Also returns the funding landscape â€” which funders (NSF, NASA, ESA, etc.) "
                 "have funded research on the topic."
             ),
             function=self._get_research_trends,
@@ -2940,7 +3011,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
-        # ── FITS Image Rendering Tools ─────────────────────────────
+        # â”€â”€ FITS Image Rendering Tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="render_fits_image",
             description=(
@@ -2954,7 +3025,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "type": "object",
                 "properties": {
                     "url":      {"type": "string", "description": "Direct URL to the FITS file (from access_url, DataLink, or CADC cutout service)."},
-                    "title":    {"type": "string", "description": "Title for the rendered image (e.g., 'JWST NIRCam F200W — Hubble Ultra Deep Field')."},
+                    "title":    {"type": "string", "description": "Title for the rendered image (e.g., 'JWST NIRCam F200W â€” Hubble Ultra Deep Field')."},
                     "colormap": {"type": "string", "description": "Matplotlib colormap. Default 'inferno'. Options: 'viridis', 'plasma', 'magma', 'gray', 'hot'."},
                     "stretch":  {"type": "string", "enum": ["sqrt", "log", "linear", "asinh"], "description": "Pixel stretch. Default 'sqrt'."},
                 },
@@ -3063,7 +3134,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
-        # ── Spectral Line Profile Fitter (R3) ──────────────────────
+        # â”€â”€ Spectral Line Profile Fitter (R3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="fit_spectral_line",
             description=(
@@ -3089,7 +3160,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
-        # ── Astronomy Calculators (U9, U10, R6, R4) ───────────────
+        # â”€â”€ Astronomy Calculators (U9, U10, R6, R4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="calculate_redshift",
             description=(
@@ -3185,7 +3256,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
-        # ── Finding Chart Generator (O6) ──────────────────────────
+        # â”€â”€ Finding Chart Generator (O6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="generate_finding_chart",
             description=(
@@ -3211,7 +3282,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="analysis"
         ))
 
-        # ── DataLink + FITS Remote Header Tools (Phase 0) ──────────
+        # â”€â”€ DataLink + FITS Remote Header Tools (Phase 0) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.tool_registry.register(Tool(
             name="list_alma_files",
             description=(
@@ -3307,7 +3378,204 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             category="archive"
         ))
 
-    # ── Phase 0: DataLink + FITS backing methods ──────────────────────────
+        self.tool_registry.register(Tool(
+            name="survey_coverage",
+            description="List surveys/datasets whose sky coverage (MOC) includes a position or region; use first for data-existence/coverage questions before broad archive searches, with optional dataproduct_type, regime, or keyword filters.",
+            function=self._survey_coverage,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve, e.g. NGC 253 or 3C 273."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                    "radius_deg": {"type": "number", "description": "Cone radius in degrees. Default 0 for a point query.", "default": 0.0},
+                    "dataproduct_type": {"type": "string", "enum": ["image", "catalog", "cube"], "description": "Optional product type filter."},
+                    "keyword": {"type": "string", "description": "Optional case-insensitive substring filter on dataset ID and title."},
+                    "regime": {"type": "string", "enum": ["radio", "mm/sub-mm", "infrared", "optical", "UV", "X-ray", "gamma"], "description": "Optional wavelength-regime filter derived from em_min/em_max."},
+                    "max_rows": {"type": "integer", "description": "Maximum rows to return, capped at 200.", "default": 50},
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="survey_covers_position",
+            description="Check whether a named survey (e.g. VLASS, SDSS, GLEAM) covers a given position; returns covered true/false and matching dataset IDs.",
+            function=self._survey_covers_position,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "survey_keyword": {"type": "string", "description": "Survey name or keyword to match in MOCServer dataset IDs/titles."},
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                },
+                "required": ["survey_keyword"]
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="galactic_extinction",
+            description=(
+                "Galactic dust reddening E(B-V) (SFD98 + Schlafly-Finkbeiner 2011) "
+                "and per-band extinction A_lambda at a sky position -- use before any "
+                "photometric correction, color, or distance-modulus work."
+            ),
+            function=self._galactic_extinction,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve, e.g. M87 or 3C 273."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                    "bands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional extinction bands. Exact keys include V, sdss_r, ps1_g, J, Ks, W1. Omit for all supported bands."
+                    },
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="gaia_distance",
+            description="Bailer-Jones (2021) geometric/photogeometric distances for Gaia DR3 sources near a position -- the correct way to turn parallax into distance for stars.",
+            function=self._gaia_distance,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve, e.g. Barnard's Star."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                    "radius_arcsec": {"type": "number", "description": "Cone radius in arcseconds, capped at 300. Default 10; named-target default calls expand to 30 for high-proper-motion tolerance.", "default": 10},
+                    "max_rows": {"type": "integer", "description": "Maximum rows to return, capped at 50.", "default": 10},
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="ned_distance",
+            description="NED redshift-independent distance measurements (Cepheids, TRGB, SNIa, ...) for a named galaxy, with median summary.",
+            function=self._ned_distance,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Named galaxy, e.g. M83 or NGC 253."},
+                },
+                "required": ["target_name"]
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="velocity_frame_distance",
+            description="Convert a heliocentric velocity or redshift to GSR, Local Group, and CMB frames and give Hubble-flow distances (Planck18 H0) -- use for nearby-galaxy distances and flow corrections.",
+            function=self._velocity_frame_distance,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                    "v_helio_kms": {"type": "number", "description": "Heliocentric velocity in km/s. Provide exactly one of v_helio_kms or z."},
+                    "z": {"type": "number", "description": "Redshift converted relativistically to heliocentric velocity. Provide exactly one of v_helio_kms or z."},
+                },
+                "required": []
+            },
+            category="analysis"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="search_pulsars",
+            description="Search the ATNF pulsar catalogue around a sky position; returns period, DM, 1400 MHz flux, distance, binarity, associations.",
+            function=self._search_pulsars,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve, e.g. Crab Nebula."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                    "radius_deg": {"type": "number", "description": "Cone radius in degrees, capped at 30. Default 1.", "default": 1.0},
+                    "max_rows": {"type": "integer", "description": "Maximum rows to return, capped at 200. Default 25.", "default": 25},
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+
+        self.tool_registry.register(Tool(
+            name="pulsar_lookup",
+            description="Look up a pulsar by J/B name in the ATNF catalogue and return its full timing/derived parameters.",
+            function=self._pulsar_lookup,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Pulsar J-name or B-name, with or without the PSR prefix."},
+                },
+                "required": ["name"]
+            },
+            category="archive"
+        ))
+        self.tool_registry.register(Tool(
+            name="solar_system_ephemeris",
+            description="JPL Horizons ephemeris for a planet, asteroid, or comet over a date range: RA/Dec, observer/heliocentric distances, magnitude, and elongation.",
+            function=self._solar_system_ephemeris,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Solar-system body name or designation, e.g. 'Ceres', 'Mars', '2020 SO'."},
+                    "start": {"type": "string", "description": "Start date/time, ISO, e.g. '2026-07-03'."},
+                    "stop": {"type": "string", "description": "Stop date/time, ISO, e.g. '2026-07-08'."},
+                    "step": {"type": "string", "description": "Step size, e.g. '1d', '6h', '30m'.", "default": "1d"},
+                },
+                "required": ["target", "start", "stop"]
+            },
+            category="archive"
+        ))
+        self.tool_registry.register(Tool(
+            name="moving_object_check",
+            description="List known asteroids/comets inside a field at a given epoch (IMCCE SkyBoT) â€” use to check whether a transient or odd detection is a known moving object.",
+            function=self._moving_object_check,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Target name to resolve for the field centre."},
+                    "ra": {"type": "number", "description": "RA in decimal degrees (ICRS); used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Dec in decimal degrees (ICRS); used with ra if target_name is omitted."},
+                    "radius_deg": {"type": "number", "description": "Cone radius in degrees (<=10).", "default": 0.2},
+                    "epoch": {"type": "string", "description": "Epoch (ISO UTC or JD); defaults to now."},
+                },
+                "required": []
+            },
+            category="archive"
+        ))
+        self.tool_registry.register(Tool(
+            name="radio_sed",
+            description=(
+                "Compile a compact-source radio continuum SED from TGSS, GLEAM, SUMSS, NVSS, and FIRST catalog fluxes; "
+                "fit the spectral index alpha (S~nu^alpha), plot it, and return flags for resolution/epoch caveats."
+            ),
+            function=self._radio_sed,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_name": {"type": "string", "description": "Astronomical target name to resolve, e.g. 3C 273 or M87."},
+                    "ra": {"type": "number", "description": "Right ascension in decimal degrees (ICRS). Used with dec if target_name is omitted."},
+                    "dec": {"type": "number", "description": "Declination in decimal degrees (ICRS). Used with ra if target_name is omitted."},
+                    "radius_arcsec": {"type": "number", "description": "Cone-search radius in arcsec, capped at 120. Default 30.", "default": 30.0},
+                },
+                "required": []
+            },
+            category="analysis"
+        ))
+
+    # â”€â”€ Phase 0: DataLink + FITS backing methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     @log_tool
     def _list_alma_files(self, mous_uid: str, filename_pattern: str = None) -> Dict[str, Any]:
@@ -3414,7 +3682,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         return None
 
-    # ── Astronomy acronym dictionary for web search disambiguation ─────
+    # â”€â”€ Astronomy acronym dictionary for web search disambiguation â”€â”€â”€â”€â”€
     def _route_cross_archive_source_match_query(self, query: str) -> Optional[Dict[str, Any]]:
         """Map custom coordinate cross-match prompts to deterministic tool args."""
         raw = str(query or "")
@@ -3888,7 +4156,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         "TMT":    "TMT (Thirty Meter Telescope)",
         "GMT":    "GMT (Giant Magellan Telescope)",
         "NOEMA":  "NOEMA (NOrthern Extended Millimeter Array)",
-        "IRAM":   "IRAM (Institut de Radioastronomie Millimétrique)",
+        "IRAM":   "IRAM (Institut de Radioastronomie MillimÃ©trique)",
         "LOFAR":  "LOFAR (Low-Frequency Array)",
         "MeerKAT":"MeerKAT (Karoo Array Telescope)",
         "ASKAP":  "ASKAP (Australian Square Kilometre Array Pathfinder)",
@@ -3910,7 +4178,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         "NRAO":   "NRAO (National Radio Astronomy Observatory)",
         "SIMBAD": "SIMBAD (Set of Identifications, Measurements, and Bibliography for Astronomical Data)",
         "NED":    "NED (NASA/IPAC Extragalactic Database)",
-        "CDS":    "CDS (Centre de Données astronomiques de Strasbourg)",
+        "CDS":    "CDS (Centre de DonnÃ©es astronomiques de Strasbourg)",
         # Software & pipelines
         "CASA":   "CASA (Common Astronomy Software Applications)",
         "CARTA":  "CARTA (Cube Analysis and Rendering Tool for Astronomy)",
@@ -3925,14 +4193,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         "FRB":    "FRB (Fast Radio Burst)",
         "SED":    "SED (Spectral Energy Distribution)",
         "RFI":    "RFI (Radio Frequency Interference)",
-        "RA":     None,  # skip — too common
-        "DEC":    None,  # skip — too common
+        "RA":     None,  # skip â€” too common
+        "DEC":    None,  # skip â€” too common
     }
 
     def _expand_astro_query(self, query: str) -> str:
         """Expand astronomy acronyms in a web search query so generic
         search engines return domain-relevant results instead of
-        irrelevant hits (e.g., 'ALMA' → 'ALMA (Atacama Large Millimeter Array)')."""
+        irrelevant hits (e.g., 'ALMA' â†’ 'ALMA (Atacama Large Millimeter Array)')."""
         import re as _re
         words = query.split()
         expanded = False
@@ -4010,7 +4278,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             summary = resp.output_text.strip()
             if "NO_RELEVANT_INFO" in summary.upper():
-                # Web results don't answer the question — suppress the
+                # Web results don't answer the question â€” suppress the
                 # "From the Web" section entirely rather than appending a
                 # "the snippets do not provide..." non-answer.
                 print("[WEB SEARCH] Synthesis judged web snippets irrelevant; omitting web section")
@@ -4111,7 +4379,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         Returns source URLs + related images for ChatGPT-style inline display.
         Falls back to BrowserService if keys are unavailable.
         """
-        # ── Langfuse: create a child span for this tool call ──
+        # â”€â”€ Langfuse: create a child span for this tool call â”€â”€
         from core.llm_client import get_langfuse_parent
         parent = get_langfuse_parent()
         lf_span = None
@@ -4160,7 +4428,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             except Exception:
                 ret_val = {"success": False, "error": "Search failed"}
 
-        # ── Langfuse: end the span with the results ──
+        # â”€â”€ Langfuse: end the span with the results â”€â”€
         if lf_span:
             try:
                 lf_span.end(output=ret_val)
@@ -4259,6 +4527,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "search_cadc_archive": "Searching CADC archive",
             "search_eso_archive": "Searching ESO Science Archive",
             "search_irsa": "Searching IRSA catalogs",
+            "galactic_extinction": "Querying IRSA dust maps",
             "get_sky_image": "Fetching sky image",
             "overlay_archive_images": "Overlaying archive images",
             "overlay_fits_images": "Overlaying FITS images",
@@ -4277,9 +4546,22 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "hips_multiband_panel": "Fetching multiband HiPS panel",
             "vlass_cutout": "Fetching VLASS 3 GHz cutout",
             "search_ztf_alerts": "Searching ALeRCE/ZTF alerts",
+            "search_space_lightcurves": "Searching TESS/Kepler light curves",
+            "plot_space_lightcurve": "Plotting space light curve",
+            "period_search": "Running Lomb-Scargle period search",
+            "search_pulsars": "Searching ATNF pulsar catalogue",
+            "pulsar_lookup": "Looking up pulsar parameters",
+            "solar_system_ephemeris": "Querying JPL Horizons",
+            "moving_object_check": "Checking for moving objects (SkyBoT)",
+            "gaia_distance": "Querying Gaia/Bailer-Jones distances",
+            "ned_distance": "Fetching NED-D distances",
+            "velocity_frame_distance": "Computing velocity-frame corrections",
+            "survey_coverage": "Checking sky coverage (MOCServer)",
+            "survey_covers_position": "Checking survey footprint",
             "ztf_light_curve": f"Plotting ZTF light curve {args.get('oid', '')}",
             "ztf_stamps": f"Fetching ZTF stamps {args.get('oid', '')}",
             "ned_sed_plot": f"Plotting NED SED {args.get('target_name', '')}",
+            "radio_sed": "Compiling radio SED + spectral index",
             "sparcl_find_spectra": "Searching SparCL spectra",
             "sparcl_plot_spectrum": f"Plotting SparCL spectrum {args.get('sparcl_id', '')}",
         }
@@ -4701,21 +4983,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         results = results[results[b_col].astype(str).apply(
                             lambda x: any(str(b) in [v.strip() for v in x.split(',')] for b in band_vals)
                         )]
-                        print(f"[FILTER] Band {band}: {before} → {len(results)} rows")
+                        print(f"[FILTER] Band {band}: {before} â†’ {len(results)} rows")
 
             scan_filter_label = ""
             if facility_label == "ALMA" and scan_intent:
                 before = len(results)
                 results, scan_filter_label = self._filter_by_scan_intent(results, scan_intent)
                 if scan_filter_label:
-                    print(f"[FILTER] {scan_filter_label}: {before} â†’ {len(results)} rows")
+                    print(f"[FILTER] {scan_filter_label}: {before} Ã¢â€ â€™ {len(results)} rows")
 
             self.last_search_results = results
             self.last_run_result = {
                 "type": "data",
                 "data": results,
                 "source": facility_label,
-                "filter_label": f"{facility_label} â€º position" + (f" [{scan_filter_label}]" if scan_filter_label else ""),
+                "filter_label": f"{facility_label} Ã¢â‚¬Âº position" + (f" [{scan_filter_label}]" if scan_filter_label else ""),
                 "tool_name": "search_by_position",
             }
 
@@ -4756,7 +5038,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "top_access_urls": top_urls,
                 "top_project_codes": top_projects,
                 "filters_applied": [scan_filter_label] if scan_filter_label else [],
-                "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+                "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table â€” the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -4774,14 +5056,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                           public_only: bool = False) -> Dict[str, Any]:
         """Search ALMA (default) or NRAO VLA/VLBA/GBT archives by target name,
         with optional native post-filters."""
-        # ── Normalize facility for routing + result labeling ──
+        # â”€â”€ Normalize facility for routing + result labeling â”€â”€
         facility_label = (facility or "ALMA").strip().upper()
         if facility_label in ("EVLA", "JVLA"):
             facility_label = "VLA"
         if facility_label not in ("VLA", "VLBA", "GBT"):
             facility_label = "ALMA"
 
-        # ── Normalize band to a list (multi-band support) ──
+        # â”€â”€ Normalize band to a list (multi-band support) â”€â”€
         band_list_input: List[int] = []
         if band is not None:
             if isinstance(band, list):
@@ -4807,7 +5089,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             else:
                 print(f"[FILTER] Ignoring unrecognized band={band}")
 
-        # ── Safety: ignore near-zero/zero min values (LLM default filling) ──
+        # â”€â”€ Safety: ignore near-zero/zero min values (LLM default filling) â”€â”€
         # The LLM often fills 0 for optional params despite being told not to.
         # A value of 0 for resolution/frequency/exptime means "no filter".
         if min_resolution is not None and min_resolution <= 0:
@@ -4827,15 +5109,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             max_freq_ghz = None
 
         try:
-            # ── Multi-target support ──────────────────────────────────
+            # â”€â”€ Multi-target support â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # Detect "M87 and Sz65" or "M87, NGC 1068" patterns
             # Also handles per-target band specs like:
-            #   "M87 in band 6, Sz65 in band 7"  →  per-target bands
-            #   "M87, Sz65, NGC23"               →  shared bands (from band= param)
+            #   "M87 in band 6, Sz65 in band 7"  â†’  per-target bands
+            #   "M87, Sz65, NGC23"               â†’  shared bands (from band= param)
             import re as _re
             raw_names = [n.strip() for n in _re.split(r'\s+and\s+|\s*,\s*', target_name) if n.strip()]
 
-            # ── Parse per-target band specifications ──────────────────
+            # â”€â”€ Parse per-target band specifications â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # If target_name contains inline band specs (e.g. "M87 in band 6"),
             # extract them so each target gets its own filter.
             _per_target_specs = []  # list of (name, [bands]) tuples
@@ -4879,9 +5161,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                             all_frames.append(df)
                             band_label = ",".join(str(b) for b in _tgt_bands) if _tgt_bands else "all"
                             searched_names.append(_tgt)
-                            print(f"[PER-TARGET] '{_tgt}' band={band_label} → {len(df)} results")
+                            print(f"[PER-TARGET] '{_tgt}' band={band_label} â†’ {len(df)} results")
                         else:
-                            print(f"[PER-TARGET] '{_tgt}' → 0 results")
+                            print(f"[PER-TARGET] '{_tgt}' â†’ 0 results")
                     except Exception as e:
                         print(f"[PER-TARGET] '{_tgt}' failed: {e}")
 
@@ -4890,7 +5172,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     target_name = " + ".join(searched_names)
                 else:
                     results = pd.DataFrame()
-                # Skip shared band filtering below — bands already applied per target
+                # Skip shared band filtering below â€” bands already applied per target
                 band_list_input = []
 
             elif len(raw_names) > 1:
@@ -4905,9 +5187,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         if not df.empty:
                             all_frames.append(df)
                             searched_names.append(name)
-                            print(f"[MULTI] '{name}' → {len(df)} results")
+                            print(f"[MULTI] '{name}' â†’ {len(df)} results")
                         else:
-                            print(f"[MULTI] '{name}' → 0 results")
+                            print(f"[MULTI] '{name}' â†’ 0 results")
                     except Exception as e:
                         print(f"[MULTI] '{name}' failed: {e}")
 
@@ -4922,8 +5204,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 )
 
             if results.empty:
-                # ── Automatic positional fallback ─────────────────────
-                # The name-based search uses a tight radius (0.05°).
+                # â”€â”€ Automatic positional fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # The name-based search uses a tight radius (0.05Â°).
                 # Many ALMA observations have offset pointing centers, so
                 # retry with a wider cone search to avoid losing results
                 # (and critically, to keep band/filter params applied).
@@ -4932,13 +5214,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     resolved = self._resolve_target(target_name)
                     if resolved.get("success") and resolved.get("ra") is not None:
                         _fb_ra, _fb_dec = resolved["ra"], resolved["dec"]
-                        print(f"[FALLBACK] Resolved to RA={_fb_ra:.4f}, Dec={_fb_dec:.4f} — cone search 0.14°")
+                        print(f"[FALLBACK] Resolved to RA={_fb_ra:.4f}, Dec={_fb_dec:.4f} â€” cone search 0.14Â°")
                         results = self.search_service.cone_search(
                             _fb_ra, _fb_dec, radius=0.14,
                             facility=facility, max_results=max_results
                         )
                         if not results.empty:
-                            print(f"[FALLBACK] Cone search found {len(results)} results — continuing with filters")
+                            print(f"[FALLBACK] Cone search found {len(results)} results â€” continuing with filters")
                 except Exception as _fb_err:
                     print(f"[FALLBACK] Positional fallback failed: {_fb_err}")
 
@@ -4946,7 +5228,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 self.last_run_result = {"type": "data", "data": results, "source": facility_label, "tool_name": "search_by_target"}
                 return {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
 
-            # ── Tier 2: Pandas post-filters (non-band) ─────────────────
+            # â”€â”€ Tier 2: Pandas post-filters (non-band) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             filter_parts = []
 
             # Resolution filter
@@ -4955,30 +5237,30 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 if max_resolution is not None:
                     before = len(results)
                     results = results[pd.to_numeric(results[res_col], errors="coerce") <= max_resolution]
-                    filter_parts.append(f"res ≤ {max_resolution}\"")
-                    print(f"[FILTER] max_resolution {max_resolution}: {before} → {len(results)} rows")
+                    filter_parts.append(f"res â‰¤ {max_resolution}\"")
+                    print(f"[FILTER] max_resolution {max_resolution}: {before} â†’ {len(results)} rows")
                 if min_resolution is not None:
                     before = len(results)
                     results = results[pd.to_numeric(results[res_col], errors="coerce") >= min_resolution]
-                    filter_parts.append(f"res ≥ {min_resolution}\"")
+                    filter_parts.append(f"res â‰¥ {min_resolution}\"")
 
             # Frequency filter
             freq_col = next((c for c in ["frequency", "min_frequency", "freq_min"] if c in results.columns), None)
             if freq_col:
                 if min_freq_ghz is not None:
                     results = results[pd.to_numeric(results[freq_col], errors="coerce") >= min_freq_ghz]
-                    filter_parts.append(f"freq ≥ {min_freq_ghz} GHz")
+                    filter_parts.append(f"freq â‰¥ {min_freq_ghz} GHz")
                 if max_freq_ghz is not None:
                     results = results[pd.to_numeric(results[freq_col], errors="coerce") <= max_freq_ghz]
-                    filter_parts.append(f"freq ≤ {max_freq_ghz} GHz")
+                    filter_parts.append(f"freq â‰¤ {max_freq_ghz} GHz")
 
             # Integration time filter
             exp_col = next((c for c in ["t_exptime", "integration"] if c in results.columns), None)
             if exp_col and min_exp_s is not None:
                 results = results[pd.to_numeric(results[exp_col], errors="coerce") >= min_exp_s]
-                filter_parts.append(f"exp ≥ {min_exp_s}s")
+                filter_parts.append(f"exp â‰¥ {min_exp_s}s")
 
-            # ── Multi-band handling ────────────────────────────────────
+            # â”€â”€ Multi-band handling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # When multiple bands are requested (e.g. [6, 7]), produce a
             # separate data card for each band via _accumulated_run_results.
             if facility_label == "ALMA" and scan_intent:
@@ -4986,7 +5268,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 results, scan_filter_label = self._filter_by_scan_intent(results, scan_intent)
                 if scan_filter_label:
                     filter_parts.append(scan_filter_label)
-                    print(f"[FILTER] {scan_filter_label}: {before} â†’ {len(results)} rows")
+                    print(f"[FILTER] {scan_filter_label}: {before} Ã¢â€ â€™ {len(results)} rows")
 
             band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
 
@@ -5005,10 +5287,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 if not combined.empty:
                     results = combined
                     band_label = ", ".join(f"Band {b}" for b in band_list_input)
-                    filter_label = f"{facility_label} › {target_name} [{band_label}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
+                    filter_label = f"{facility_label} â€º {target_name} [{band_label}" + (", ".join([""] + filter_parts) if filter_parts else "") + "]"
                 else:
-                    # None of the bands matched — show unfiltered
-                    filter_label = f"{facility_label} › {target_name}"
+                    # None of the bands matched â€” show unfiltered
+                    filter_label = f"{facility_label} â€º {target_name}"
                     if filter_parts:
                         filter_label += " [" + ", ".join(filter_parts) + "]"
 
@@ -5026,9 +5308,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     lambda bands, _b=b: any(str(_b).strip() == x.strip() for x in bands)
                 )]
                 filter_parts.append(f"Band {b}")
-                print(f"[FILTER] Band {b}: {before} → {len(results)} rows")
+                print(f"[FILTER] Band {b}: {before} â†’ {len(results)} rows")
 
-                filter_label = f"{facility_label} › {target_name}"
+                filter_label = f"{facility_label} â€º {target_name}"
                 if filter_parts:
                     filter_label += " [" + ", ".join(filter_parts) + "]"
                 self.last_search_results = results
@@ -5039,7 +5321,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 }
             else:
                 # No band filter
-                filter_label = f"{facility_label} › {target_name}"
+                filter_label = f"{facility_label} â€º {target_name}"
                 if filter_parts:
                     filter_label += " [" + ", ".join(filter_parts) + "]"
                 self.last_search_results = results
@@ -5085,7 +5367,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "top_mous_uids": top_mous,
                 "top_access_urls": top_urls,
                 "top_project_codes": top_projects,
-                "note": f"Found {len(results)} observations matching your constraints. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+                "note": f"Found {len(results)} observations matching your constraints. Full data with sky previews shown in UI table. Do NOT render a table â€” the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -5108,12 +5390,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             self.last_search_results = results
             self.last_run_result = {"type": "data", "data": results,
                                     "source": facility_label,
-                                    "filter_label": f"{facility_label} › {min_freq_ghz}–{max_freq_ghz} GHz",
+                                    "filter_label": f"{facility_label} â€º {min_freq_ghz}â€“{max_freq_ghz} GHz",
                                     "tool_name": "search_by_frequency"}
             return {
                 "success": True,
                 "total_results": len(results),
-                "note": f"Found {len(results)} observations at {min_freq_ghz}–{max_freq_ghz} GHz. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+                "note": f"Found {len(results)} observations at {min_freq_ghz}â€“{max_freq_ghz} GHz. Full data with sky previews shown in UI table. Do NOT render a table â€” the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -5179,7 +5461,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 self.last_run_result = {"type": "data", "data": df, "source": "CADC", "tool_name": "search_cadc_archive"}
                 note = f"No CADC observations found near "
                 note += f"'{target_name}'" if target_name else f"RA={ra:.4f}, Dec={dec:.4f}"
-                note += f" (radius={radius}°)"
+                note += f" (radius={radius}Â°)"
                 if collection:
                     note += f" for {collection}"
                 return {"success": True, "total_results": 0, "note": note}
@@ -5188,7 +5470,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             telescopes = df["obs_collection"].unique().tolist() if "obs_collection" in df.columns else []
             filter_label = "CADC"
             if target_name:
-                filter_label += f" › {target_name}"
+                filter_label += f" â€º {target_name}"
             if collection:
                 filter_label += f" [{collection}]"
             elif telescopes:
@@ -5218,7 +5500,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "note": (
                     f"Found {len(df)} observations from {len(telescopes)} telescope(s): "
                     f"{', '.join(f'{t} ({c})' for t, c in tel_summary.items())}. "
-                    f"Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+                    f"Full data with sky previews shown in UI table. Do NOT render a table â€” the UI already displays one."
                 )
             }
         except ImportError:
@@ -5226,7 +5508,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": f"CADC TAP query failed: {str(e)}"}
 
-    # ── MAST Archive Handlers ──────────────────────────────────────────
+    # â”€â”€ MAST Archive Handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _search_mast(self, target_name: Optional[str] = None,
                      mission: Optional[str] = None,
@@ -5264,7 +5546,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # Build source label
             filter_label = "MAST"
             if target_name:
-                filter_label += f" › {target_name}"
+                filter_label += f" â€º {target_name}"
             if mission:
                 filter_label += f" [{mission}]"
             if instrument:
@@ -5291,7 +5573,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "note": (
                     f"Found {len(df)} MAST observations. "
                     f"Missions: {', '.join(f'{m} ({c})' for m, c in mission_summary.items())}. "
-                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                    f"Full data shown in UI table. Do NOT render a table â€” the UI already displays one."
                 )
             }
         except Exception as e:
@@ -5333,7 +5615,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             filter_label = "MAST Criteria"
             if mission: filter_label += f" [{mission}]"
             if proposal_id: filter_label += f" Program {proposal_id}"
-            if target_name: filter_label += f" › {target_name}"
+            if target_name: filter_label += f" â€º {target_name}"
 
             self.last_search_results = df
             self.last_run_result = {
@@ -5408,7 +5690,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": f"MAST product listing failed: {str(e)}"}
 
-    # ── ESO Archive Handler ────────────────────────────────────────────
+    # â”€â”€ ESO Archive Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _search_eso(self, target_name: Optional[str] = None,
                     instrument: Optional[str] = None,
@@ -5442,7 +5724,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # Build source label
             filter_label = "ESO"
             if target_name:
-                filter_label += f" › {target_name}"
+                filter_label += f" â€º {target_name}"
             if instrument:
                 filter_label += f" [{instrument}]"
 
@@ -5464,13 +5746,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "note": (
                     f"Found {len(df)} ESO observations. "
                     f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
-                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                    f"Full data shown in UI table. Do NOT render a table â€” the UI already displays one."
                 )
             }
         except Exception as e:
             return {"success": False, "error": f"ESO archive search failed: {str(e)}"}
 
-    # ── IRSA Archive Handler ───────────────────────────────────────────
+    # â”€â”€ IRSA Archive Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _search_irsa(self, target_name: Optional[str] = None,
                      catalog: Optional[str] = None,
@@ -5502,9 +5784,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 self.last_run_result = {"type": "data", "data": df, "source": "IRSA", "tool_name": "search_irsa"}
                 return {"success": True, "total_results": 0, "note": note}
 
-            filter_label = f"IRSA › {catalog.upper()}"
+            filter_label = f"IRSA â€º {catalog.upper()}"
             if target_name:
-                filter_label += f" › {target_name}"
+                filter_label += f" â€º {target_name}"
 
             self.last_search_results = df
             self.last_run_result = {
@@ -5520,13 +5802,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "columns": list(df.columns[:15]),  # First 15 columns for LLM context
                 "note": (
                     f"Found {len(df)} sources in IRSA {catalog.upper()} catalog. "
-                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                    f"Full data shown in UI table. Do NOT render a table â€” the UI already displays one."
                 )
             }
         except Exception as e:
             return {"success": False, "error": f"IRSA search failed: {str(e)}"}
 
-    # ── Sky Survey Image Handler ───────────────────────────────────────
+    # â”€â”€ Sky Survey Image Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
     # Data Lab P0 handlers
@@ -5559,6 +5841,54 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
             self._alerce_client_instance = AlerceClient()
         return self._alerce_client_instance
+
+    def _get_radio_sed_service(self):
+        if not hasattr(self, "_radio_sed_service_instance"):
+            from services.radio_sed import RadioSedService
+
+            self._radio_sed_service_instance = RadioSedService()
+        return self._radio_sed_service_instance
+
+    def _get_lightcurve_suite(self):
+        if not hasattr(self, "_lightcurve_suite_instance"):
+            from services.lightcurve_suite import LightCurveSuite
+
+            self._lightcurve_suite_instance = LightCurveSuite()
+        return self._lightcurve_suite_instance
+    def _get_pulsar_catalog_service(self):
+        if not hasattr(self, "_pulsar_catalog_service_instance"):
+            from services.pulsar_catalog import PulsarCatalogService
+
+            self._pulsar_catalog_service_instance = PulsarCatalogService()
+        return self._pulsar_catalog_service_instance
+
+    def _get_solar_system_service(self):
+        if not hasattr(self, "_solar_system_service_instance"):
+            from services.solar_system import SolarSystemService
+
+            self._solar_system_service_instance = SolarSystemService()
+        return self._solar_system_service_instance
+
+    def _get_distance_service(self):
+        if not hasattr(self, "_distance_service_instance"):
+            from services.distance_service import DistanceService
+
+            self._distance_service_instance = DistanceService()
+        return self._distance_service_instance
+
+    def _get_dust_extinction_service(self):
+        if not hasattr(self, "_dust_extinction_service_instance"):
+            from services.dust_extinction import DustExtinctionService
+
+            self._dust_extinction_service_instance = DustExtinctionService()
+        return self._dust_extinction_service_instance
+
+    def _get_moc_coverage_service(self):
+        if not hasattr(self, "_moc_coverage_service_instance"):
+            from services.moc_coverage import MocCoverageService
+
+            self._moc_coverage_service_instance = MocCoverageService()
+        return self._moc_coverage_service_instance
 
     def _get_ned_photometry_service(self):
         if not hasattr(self, "_ned_photometry_service_instance"):
@@ -5745,6 +6075,25 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         payload = {"success": False, "error": str(error)}
         if isinstance(error, datalab_sql_policy.DatalabPolicyError):
             payload["fix_hint"] = error.fix_hint
+            return payload
+        text = str(error).lower()
+        if "column" in text and "does not exist" in text:
+            payload["fix_hint"] = (
+                "A column name in the query is wrong. Use the HINT in the error if present, or call "
+                "datalab_describe_table(catalog, table) to list the valid columns, then re-run the "
+                "corrected query. Do not give up after this error."
+            )
+        elif "relation" in text and "does not exist" in text:
+            payload["fix_hint"] = (
+                "The table name is wrong. Call datalab_list_catalogs and datalab_describe_table to "
+                "find the correct schema-qualified table, then re-run the query."
+            )
+        elif "not found for expression" in str(error) or "unsupported expression" in text:
+            payload["fix_hint"] = (
+                "Fix the expression using the available columns listed in the error, then call the "
+                "plot tool again. Derived quantities can be computed inline, e.g. "
+                "'phot_g_mean_mag + 5*log10(parallax/100)'."
+            )
         return payload
 
     @staticmethod
@@ -5755,8 +6104,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     @staticmethod
     def _summarize_tool_outcomes(tool_results) -> str:
         """When the model called tools but emitted no final text, summarize what the tools
-        did (and surface any errors) so the user gets a useful reply — and so a silent failure
-        becomes self-explaining — instead of the dead-end 'didn't generate a text response'."""
+        did (and surface any errors) so the user gets a useful reply â€” and so a silent failure
+        becomes self-explaining â€” instead of the dead-end 'didn't generate a text response'."""
         produced, errors, queried = [], [], []
         for tr in (tool_results or []):
             try:
@@ -5789,6 +6138,81 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         return " ".join(parts)
 
     @staticmethod
+    def _user_facing_provider_error(error: Exception) -> str:
+        """Convert a raw provider exception into a message fit for the chat UI.
+
+        Raw litellm/openai error payloads (harmony channel markup, model-group
+        dumps) must never appear as the assistant's answer."""
+        text = str(error)
+        if "Failed to parse tool call" in text or "Invalid function calling output" in text:
+            return (
+                "The language model produced a malformed tool call that the provider rejected, "
+                "so this request could not be completed. This occasionally happens with open "
+                "models such as gpt-oss-120b â€” please resend the question (a retry usually "
+                "succeeds), or switch to another model if it persists."
+            )
+        status = getattr(error, "status_code", None)
+        detail = f" (HTTP {status})" if status else ""
+        return (
+            f"The language-model provider returned an error{detail} and the request could not "
+            "be completed. Please try again; if the problem persists, try a different model."
+        )
+
+    def _compose_final_answer_from_tools(
+        self,
+        user_query: str,
+        tool_results,
+        selected_model: str,
+        user_id=None,
+        conversation_id=None,
+        run_token=None,
+    ) -> str:
+        """One extra no-tools round that turns raw tool results into a real answer.
+
+        Weaker models sometimes exhaust the tool loop without emitting any final
+        text; without this round the user would only see the mechanical step
+        summary from _summarize_tool_outcomes."""
+        compact = [str(tr.get("output") or "")[:1500] for tr in (tool_results or [])[-12:]]
+        compact = [c for c in compact if c]
+        if not compact:
+            return ""
+        prompt = (
+            "The user asked:\n" + str(user_query or "") + "\n\n"
+            "Tools were already executed for this request. Their JSON results (possibly truncated):\n"
+            + "\n".join(compact)
+            + "\n\nWrite the final answer to the user's question based ONLY on these results. "
+            "Plots and data cards produced by the tools are already displayed above your reply, "
+            "so refer to them naturally. If some steps failed, briefly say what failed and answer "
+            "with what succeeded. Do not call tools; reply in plain text now."
+        )
+        request_kwargs = {
+            "model": selected_model,
+            "input": prompt,
+            "instructions": self.system_prompt,
+            "temperature": self.config.temperature,
+            "max_output_tokens": self.config.max_tokens,
+            "stream": False,
+            "user_id": user_id,
+            "session_id": conversation_id,
+        }
+        _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini", "deepseek-v4-pro", "deepseek-v4-flash"}
+        if selected_model in _no_temp:
+            request_kwargs.pop("temperature", None)
+        try:
+            resp = self.client.responses.create(**request_kwargs)
+            text = safe_assistant_text(getattr(resp, "output_text", "") or "").strip()
+            # Deliberately do NOT register this response as the conversation
+            # head: the prompt above is a standalone summary built WITHOUT
+            # previous_response_id, so making it the head would drop the real
+            # conversation/tool chain and break follow-ups ("use the second
+            # source"). This round only produces display text; the main loop
+            # keeps ownership of conversation state.
+            return text
+        except Exception as final_err:
+            print(f"[WARNING] Final-answer composition round failed: {final_err}")
+            return ""
+
+    @staticmethod
     def _datalab_fit_rows(frame, max_rows: int, *, char_budget: int = 6000):
         """Return (rows, truncated) trimmed so the JSON stays under char_budget.
 
@@ -5804,7 +6228,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         truncated = total > len(rows)
         blob = json.dumps(rows, default=str)
         if len(blob) > char_budget:
-            # Estimate how many rows fit (one dump), then trim in small steps —
+            # Estimate how many rows fit (one dump), then trim in small steps â€”
             # avoids an O(n^2) pop-one-at-a-time loop on large results.
             avg = max(1, len(blob) // max(1, len(rows)))
             rows = rows[: max(1, char_budget // avg)]
@@ -5817,7 +6241,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             ncols = max(1, len(rows[0]))
             per_cell = max(40, char_budget // (len(rows) * ncols))
             rows = [
-                {k: (v[:per_cell] + "…" if isinstance(v, str) and len(v) > per_cell else v) for k, v in r.items()}
+                {k: (v[:per_cell] + "â€¦" if isinstance(v, str) and len(v) > per_cell else v) for k, v in r.items()}
                 for r in rows
             ]
             truncated = True
@@ -5905,7 +6329,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "type": "data",
             "data": df,
             "source": source,
-            "filter_label": f"{catalog_label} › cone RA={eff_ra:.5f}, Dec={eff_dec:.5f}, r={eff_radius:g} arcsec",
+            "filter_label": f"{catalog_label} â€º cone RA={eff_ra:.5f}, Dec={eff_dec:.5f}, r={eff_radius:g} arcsec",
             "tool_name": "search_mmu_hats_catalog",
             "table_kind": "mmu_hats",
             "warnings": result.get("warnings", []),
@@ -5973,7 +6397,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "type": "data",
             "data": df,
             "source": source,
-            "filter_label": f"{left_label} × {right_label} › crossmatch RA={eff_ra:.5f}, Dec={eff_dec:.5f}, r={eff_radius:g} arcsec",
+            "filter_label": f"{left_label} Ã— {right_label} â€º crossmatch RA={eff_ra:.5f}, Dec={eff_dec:.5f}, r={eff_radius:g} arcsec",
             "tool_name": "crossmatch_mmu_hats_catalogs",
             "table_kind": "mmu_hats",
             "warnings": result.get("warnings", []),
@@ -6030,7 +6454,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             return float(resolved["ra_deg"]), float(resolved["dec_deg"]), str(target_name)
         raise ValueError("Provide either ra+dec or target_name")
 
-    # ── P2 orchestration handlers (Tier 6-7) ───────────────────────────────
+    # â”€â”€ P2 orchestration handlers (Tier 6-7) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Live imagery / external catalog handlers
     def _live_imagery_coordinates(
         self,
@@ -6165,6 +6589,219 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _survey_coverage(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_deg: float = 0.0,
+        dataproduct_type: Optional[str] = None,
+        keyword: Optional[str] = None,
+        max_rows: int = 50,
+        regime: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_moc_coverage_service().coverage_at(
+                ra_f,
+                dec_f,
+                radius_deg=radius_deg,
+                dataproduct_type=dataproduct_type,
+                keyword=keyword,
+                max_rows=max_rows,
+                regime=regime,
+            )
+            if not result.get("success"):
+                return result
+            columns = ["id", "title", "dataproduct_type", "regime", "moc_sky_fraction"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            radius_label = float(result.get("provenance", {}).get("radius_deg", radius_deg))
+            return self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="CDS MOCServer",
+                filter_label=f"coverage at {label}, r={radius_label:g} deg",
+                tool_name="survey_coverage",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _survey_covers_position(
+        self,
+        survey_keyword: str,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_moc_coverage_service().survey_covers(survey_keyword, ra_f, dec_f)
+            out = dict(result)
+            out["target"] = label
+            return out
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _galactic_extinction(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        bands: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_dust_extinction_service().extinction_table(ra_f, dec_f, bands=bands)
+            if not result.get("success"):
+                return result
+            columns = ["band", "A_lambda", "coeff"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            ebv_sfd = float(result.get("ebv_sfd"))
+            ebv_sf11 = float(result.get("ebv_sf11"))
+            table_result = self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="IRSA DUST (SFD98/SF11)",
+                filter_label=f"E(B-V) at {label}: SFD={ebv_sfd:.4f}, SF11={ebv_sf11:.4f}",
+                tool_name="galactic_extinction",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+            for key in ("ebv_sfd", "ebv_sf11", "ebv_sfd_mean", "ebv_sf11_mean"):
+                table_result[key] = result.get(key)
+                if self.last_run_result is not None:
+                    self.last_run_result[key] = result.get(key)
+            table_result["target"] = label
+            return table_result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _gaia_distance(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_arcsec: float = 10,
+        max_rows: int = 10,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            wrapper_warnings: List[str] = []
+            effective_radius_arcsec = radius_arcsec
+            try:
+                radius_value = float(radius_arcsec)
+            except (TypeError, ValueError):
+                radius_value = None
+            if target_name and (ra is None or dec is None) and radius_value == 10.0:
+                effective_radius_arcsec = 30
+                wrapper_warnings.append(
+                    "named-target Gaia query radius expanded from 10 to 30 arcsec to tolerate proper-motion/epoch offsets"
+                )
+            result = self._get_distance_service().gaia_distances(
+                ra_f,
+                dec_f,
+                radius_arcsec=effective_radius_arcsec,
+                max_rows=max_rows,
+            )
+            if not result.get("success"):
+                return result
+            columns = [
+                "source_id",
+                "g_mag",
+                "parallax_mas",
+                "r_geo_pc",
+                "r_geo_lo_pc",
+                "r_geo_hi_pc",
+                "r_photogeo_pc",
+                "r_photogeo_lo_pc",
+                "r_photogeo_hi_pc",
+                "sep_arcsec",
+            ]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns[:6]
+            radius_label = float(result.get("provenance", {}).get("radius_arcsec", effective_radius_arcsec))
+            return self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="ESA Gaia DR3 x Bailer-Jones EDR3 distances",
+                filter_label=f"Gaia/Bailer-Jones cone {label}, r={radius_label:g} arcsec",
+                tool_name="gaia_distance",
+                warnings=wrapper_warnings + list(result.get("warnings", [])),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _ned_distance(self, target_name: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_distance_service().ned_distances(target_name)
+            if not result.get("success"):
+                return result
+            columns = ["dist_mpc", "dist_modulus", "dist_modulus_err", "method", "refcode"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            summary = result.get("summary") or {}
+            median = summary.get("median_mpc")
+            median_label = f"median={float(median):.4g} Mpc" if median is not None else "no valid moduli"
+            table_result = self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="NED-D redshift-independent distances",
+                filter_label=f"NED-D {target_name}: {median_label}",
+                tool_name="ned_distance",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+            table_result["summary"] = summary
+            if self.last_run_result is not None:
+                self.last_run_result["summary"] = summary
+            return table_result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _velocity_frame_distance(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        v_helio_kms: Optional[float] = None,
+        z: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_distance_service().velocity_frames(ra_f, dec_f, v_helio_kms=v_helio_kms, z=z)
+            if not result.get("success"):
+                return result
+            columns = ["frame", "v_kms", "d_hubble_mpc"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            input_label = f"z={float(z):g}" if z is not None else f"v_helio={float(v_helio_kms):g} km/s"
+            table_result = self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="Velocity-frame corrections (NED/Planck conventions)",
+                filter_label=f"Velocity frames for {label}, {input_label}",
+                tool_name="velocity_frame_distance",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+            table_result["target"] = label
+            if self.last_run_result is not None:
+                self.last_run_result["target"] = label
+            return table_result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def _search_ztf_alerts(
         self,
         target_name: Optional[str] = None,
@@ -6188,6 +6825,212 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 source="ALeRCE ZTF alerts",
                 filter_label=f"ALeRCE/ZTF cone {label}, r={float(result.get('provenance', {}).get('radius_arcsec', radius_arcsec)):g} arcsec",
                 tool_name="search_ztf_alerts",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+    def _search_space_lightcurves(
+        self,
+        target: str,
+        mission: Optional[str] = None,
+        max_rows: int = 20,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_lightcurve_suite().search_space_lightcurves(target, mission=mission, max_rows=max_rows)
+            if not result.get("success"):
+                return result
+            columns = ["index", "mission", "year", "author", "exptime_s", "target_name", "distance_arcsec"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            return self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="MAST via lightkurve",
+                filter_label=f"TESS/Kepler/K2 light curves for {target}",
+                tool_name="search_space_lightcurves",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _plot_space_lightcurve(
+        self,
+        target: str,
+        mission: Optional[str] = None,
+        index: int = 0,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_lightcurve_suite().plot_space_lightcurve(target, mission=mission, index=index)
+            return self._datalab_attach_image_result(result, f"{mission or 'TESS/Kepler'} light curve: {target}")
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _period_search(
+        self,
+        source: str,
+        identifier: str,
+        mission: Optional[str] = None,
+        min_period_d: float = 0.05,
+        max_period_d: float = 30.0,
+        fid: Optional[int] = None,
+        index: int = 0,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_lightcurve_suite().period_search(
+                source,
+                identifier,
+                mission=mission,
+                min_period_d=min_period_d,
+                max_period_d=max_period_d,
+                fid=fid,
+                index=index,
+            )
+            if not result.get("success"):
+                return result
+            period = result.get("best_period_d")
+            fap = result.get("fap")
+            period_text = f"{float(period):.6g}" if period is not None else "n/a"
+            fap_text = f"{float(fap):.2g}" if fap is not None and math.isfinite(float(fap)) else "n/a"
+            caption = f"Period search: {identifier} - P={period_text} d (FAP={fap_text})"
+            return self._datalab_attach_image_result(result, caption)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _search_pulsars(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_deg: float = 1.0,
+        max_rows: int = 25,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_pulsar_catalog_service().search_pulsars(ra_f, dec_f, radius_deg=radius_deg, max_rows=max_rows)
+            if not result.get("success"):
+                return result
+            columns = ["jname", "p0_s", "dm_pc_cm3", "s1400_mjy", "dist_kpc", "binary", "assoc", "sep_arcmin"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            radius_label = float(result.get("provenance", {}).get("radius_deg", radius_deg))
+            table_result = self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="ATNF Pulsar Catalogue",
+                filter_label=f"ATNF pulsar cone {label}, r={radius_label:g} deg",
+                tool_name="search_pulsars",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+            table_result["target"] = label
+            if self.last_run_result is not None:
+                self.last_run_result["target"] = label
+            return table_result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _pulsar_lookup(self, name: str) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_pulsar_catalog_service().pulsar_lookup(name)
+            if not result.get("success"):
+                return result
+            columns = [
+                "jname",
+                "name",
+                "bname",
+                "ra_deg",
+                "dec_deg",
+                "p0_s",
+                "p1",
+                "dm_pc_cm3",
+                "dist_kpc",
+                "age_yr",
+                "bsurf_g",
+                "edot_erg_s",
+                "s1400_mjy",
+                "binary",
+                "assoc",
+                "type",
+            ]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            table_result = self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="ATNF Pulsar Catalogue",
+                filter_label=f"ATNF pulsar lookup {name}",
+                tool_name="pulsar_lookup",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+            table_result["name"] = name
+            if self.last_run_result is not None:
+                self.last_run_result["name"] = name
+            return table_result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _solar_system_ephemeris(
+        self,
+        target: str,
+        start: str,
+        stop: str,
+        step: str = "1d",
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            result = self._get_solar_system_service().horizons_ephemeris(target, start, stop, step=step)
+            if not result.get("success"):
+                return result
+            columns = ["datetime", "ra_deg", "dec_deg", "delta_au", "r_au", "v_mag", "elong_deg"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            return self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="JPL Horizons",
+                filter_label=f"{target}: {start} â†’ {stop} (step {step})",
+                tool_name="solar_system_ephemeris",
+                warnings=result.get("warnings", []),
+                provenance=result.get("provenance", {}),
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _moving_object_check(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        radius_deg: float = 0.2,
+        epoch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_run_result = None
+        try:
+            ra_f, dec_f, label = self._live_imagery_coordinates(target_name=target_name, ra=ra, dec=dec)
+            result = self._get_solar_system_service().skybot_cone(ra_f, dec_f, radius_deg=radius_deg, epoch=epoch)
+            if not result.get("success"):
+                return result
+            columns = ["name", "class", "v_mag", "ra_deg", "dec_deg", "sep_arcsec", "pos_err_arcsec"]
+            rows = result.get("rows") or []
+            present_columns = [col for col in columns if any(col in row for row in rows)] or columns
+            epoch_iso = result.get("provenance", {}).get("epoch_iso", "now")
+            radius_label = float(result.get("provenance", {}).get("radius_deg", radius_deg))
+            return self._external_catalog_table_result(
+                rows,
+                columns=present_columns,
+                source="IMCCE SkyBoT",
+                filter_label=f"moving objects at {label}, r={radius_label:g} deg, epoch {epoch_iso}",
+                tool_name="moving_object_check",
                 warnings=result.get("warnings", []),
                 provenance=result.get("provenance", {}),
             )
@@ -6471,7 +7314,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     image_result["meta"] = dict(meta)
                 self.last_run_result = image_result
         # Keep the heavy base64 OUT of the LLM-facing tool result: it bloats context and, worse,
-        # gets truncated mid-string by the 8000-char tool-output slice → malformed JSON → the model
+        # gets truncated mid-string by the 8000-char tool-output slice â†’ malformed JSON â†’ the model
         # emits an empty response ("didn't generate a text response"). The image goes to the UI card above.
         if result.get("image_base64"):
             result = {k: v for k, v in result.items() if k != "image_base64"}
@@ -6772,7 +7615,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
             # If we have a preview PNG, set it as the run result for UI display.
             # NB: the SSE layer emits image cards from the `image_url` key ONLY, and the
-            # preview lives in ~/quasar_data (not web-served) — so copy it into the served
+            # preview lives in ~/quasar_data (not web-served) â€” so copy it into the served
             # /plots dir and reference that URL (base64 data-URI as a fallback). The old
             # `image_path` key was silently ignored and SkyView images never displayed.
             if result.get("preview_path"):
@@ -6817,7 +7660,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": f"Sky image fetch failed: {str(e)}"}
 
-    # ── MAST Data Download Handler ─────────────────────────────────────
+    # â”€â”€ MAST Data Download Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _download_mast_data(self, product_type: str = "SCIENCE",
                              extension: str = "fits",
@@ -6850,7 +7693,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
             df = self.last_search_results.copy()
 
-            # ── Friendly column alias mapping ──────────────────────────────────
+            # â”€â”€ Friendly column alias mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ALIAS = {
                 "band":       ["band_list", "Band", "band"],
                 "resolution": ["spatial_resolution", "s_resolution", "resolution"],
@@ -6872,7 +7715,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 available = [c for c in df.columns][:15]
                 return {"success": False, "error": f"Column '{column}' not found. Available: {available}"}
 
-            # ── Apply filter ──────────────────────────────────────────────────
+            # â”€â”€ Apply filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             before = len(df)
             numeric_series = pd.to_numeric(df[real_col], errors="coerce")
 
@@ -6885,7 +7728,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             mask = OPS[operator](numeric_series, value)
             df = df[mask]
 
-            print(f"[FILTER] {real_col} {operator} {value}: {before} → {len(df)} rows")
+            print(f"[FILTER] {real_col} {operator} {value}: {before} â†’ {len(df)} rows")
 
             # Update agent state so UI shows filtered table
             self.last_search_results = df
@@ -6903,7 +7746,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "rows_before": before,
                 "rows_after": len(df),
                 "filter": f"{real_col} {operator} {value}",
-                "note": f"Filtered from {before} to {len(df)} rows. Updated table shown in UI. Do NOT render a table — the UI already displays one."
+                "note": f"Filtered from {before} to {len(df)} rows. Updated table shown in UI. Do NOT render a table â€” the UI already displays one."
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -6983,15 +7826,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     ) -> Dict[str, Any]:
         """
         Search ALMA archive for observations covering CO emission lines at a given
-        redshift range.  Fully stateless — no prior search needed.
+        redshift range.  Fully stateless â€” no prior search needed.
 
         Method (from ALMA archive notebook nb6):
           1. For each CO transition, compute the observed frequency at z_min and z_max.
           2. Issue a TAP ADQL query with the frequency-containment WHERE clause.
           3. Union results across all transitions; deduplicate; return summary table.
 
-        The ALMA obscore table has NO 'redshift' column — this tool implements the
-        correct indirect approach (ν_obs = ν_rest / (1+z)).
+        The ALMA obscore table has NO 'redshift' column â€” this tool implements the
+        correct indirect approach (Î½_obs = Î½_rest / (1+z)).
         """
         import pandas as pd
 
@@ -7008,7 +7851,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         # Build ADQL frequency-range OR conditions for all transitions
         # Each transition covers a *range* of frequencies depending on the z range.
-        # ν_obs_min (at z_max) to ν_obs_max (at z_min)
+        # Î½_obs_min (at z_max) to Î½_obs_max (at z_min)
         freq_conditions = []
         transition_map = {}  # (freq_min, freq_max) -> transition label
 
@@ -7064,7 +7907,7 @@ ORDER BY target_name
                     "success": True,
                     "count": 0,
                     "message": (
-                        f"No ALMA observations found covering CO lines at z={z_min}–{z_max}. "
+                        f"No ALMA observations found covering CO lines at z={z_min}â€“{z_max}. "
                         "The archive may not have public data for this parameter space, or "
                         "the frequency range falls outside ALMA's standard bands."
                     ),
@@ -7450,7 +8293,7 @@ ORDER BY target_name
                                     x_column: str = None, y_column: str = None,
                                     color_by: str = None, title: str = None,
                                     dark_mode: bool = False) -> Dict[str, Any]:
-        """Unified plot handler — supports quick overview and publication scatter modes."""
+        """Unified plot handler â€” supports quick overview and publication scatter modes."""
         try:
             if not hasattr(self, 'last_search_results') or self.last_search_results is None or self.last_search_results.empty:
                 return {"success": False, "error": "No results available to plot. Please run a search first."}
@@ -7750,7 +8593,7 @@ ORDER BY s_resolution
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # ── Phase 1 Tool Handlers: Astronomy Calculators ───────────────────
+    # â”€â”€ Phase 1 Tool Handlers: Astronomy Calculators â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _fit_spectral_line(self, url: str, ra_deg: float = None, dec_deg: float = None,
                            x_pixel: int = None, y_pixel: int = None,
@@ -7871,7 +8714,7 @@ ORDER BY s_resolution
             if not self.ads_client:
                 return {"success": False, "error": "NASA ADS Client not initialized (check API Key)"}
 
-            # Use the smart NL→ADS query builder for rich query translation
+            # Use the smart NLâ†’ADS query builder for rich query translation
             result = self.ads_client.search_natural_language(
                 question=query,
                 max_results=max_results,
@@ -7881,10 +8724,10 @@ ORDER BY s_resolution
             papers_list = result.get("papers", [])
             ads_query = result.get("query", query)
 
-            # ── Silent OpenAlex enrichment ────────────────────────────
+            # â”€â”€ Silent OpenAlex enrichment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # Batch-enrich papers with funding data, FWCI scores, citation
             # percentiles, and OA PDF URLs that ADS doesn't provide.
-            # Failures are silently swallowed — enrichment is best-effort.
+            # Failures are silently swallowed â€” enrichment is best-effort.
             try:
                 oalex = self.openalex_client
                 dois = [p.get("doi", "") for p in papers_list if p.get("doi")]
@@ -8180,7 +9023,7 @@ PAPERS:
 
 PRODUCE YOUR ANALYSIS IN THIS EXACT FORMAT:
 
-## 📊 Field Consensus: [Strong Agreement / Moderate Agreement / Divided / Strong Disagreement]
+## ðŸ“Š Field Consensus: [Strong Agreement / Moderate Agreement / Divided / Strong Disagreement]
 **Confidence:** [High / Medium / Low] (based on {len(papers_list)} papers, weighted by citation count)
 **Papers Analyzed:** {len(papers_list)}
 
@@ -8213,7 +9056,7 @@ What does the literature identify as unresolved? What would settle the debate?
 IMPORTANT RULES:
 - ALWAYS cite papers by their [number] reference
 - Include the author name and year when first citing a paper
-- Be specific about evidence — don't just say "some papers agree"
+- Be specific about evidence â€” don't just say "some papers agree"
 - Weight highly-cited papers more heavily in your assessment
 - If a question is too narrow or the papers don't directly address it, say so honestly
 """
@@ -8286,7 +9129,7 @@ IMPORTANT RULES:
             arxiv_id = identifier.strip()
             # If it looks like a bibcode, try to get the arXiv ID from ADS
             if '.' not in arxiv_id or len(arxiv_id) > 20:
-                # Likely an ADS bibcode — try to resolve via ADS
+                # Likely an ADS bibcode â€” try to resolve via ADS
                 if self.ads_client:
                     try:
                         details = self.ads_client.get_paper_details(arxiv_id)
@@ -8544,7 +9387,7 @@ IMPORTANT RULES:
                 "target_name": target_name,
                 "ra_deg": round(coord.ra.deg, 6),
                 "dec_deg": round(coord.dec.deg, 6),
-                "message": f"Resolved '{target_name}' to RA={coord.ra.deg:.4f}°, Dec={coord.dec.deg:.4f}°. Use search_by_position with these coordinates."
+                "message": f"Resolved '{target_name}' to RA={coord.ra.deg:.4f}Â°, Dec={coord.dec.deg:.4f}Â°. Use search_by_position with these coordinates."
             }
         except ImportError:
             return {"success": False, "error": "astroquery not installed. Cannot resolve target names."}
@@ -8767,9 +9610,9 @@ IMPORTANT RULES:
         """
         return self.stream_response_api(query, message_placeholder, user_id)
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # CONDUCTOR TOOL EXECUTOR — Bridges sub-agents to the full tool set
-    # ═══════════════════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # CONDUCTOR TOOL EXECUTOR â€” Bridges sub-agents to the full tool set
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _conductor_tool_executor(self, task_description: str, dep_context: str = "", subtask_model: str = "") -> str:
         """
@@ -8787,15 +9630,15 @@ IMPORTANT RULES:
         system_instructions = (
             "You are a radio astronomy specialist executing one step of a larger analysis. "
             "Use the available tools to complete this specific task. "
-            "Be concise — return only the relevant data/findings, no preamble.\n\n"
-            "CRITICAL — You have tools to DOWNLOAD and RENDER FITS images directly:\n"
+            "Be concise â€” return only the relevant data/findings, no preamble.\n\n"
+            "CRITICAL â€” You have tools to DOWNLOAD and RENDER FITS images directly:\n"
             "- render_fits_image(url, title, colormap): Download a FITS file and render as PNG\n"
             "- overlay_fits_images(base_url, contour_url, ...): Overlay contours from one FITS on another\n"
             "- compute_moment_map(url, order): Compute moment 0/1/2 from a spectral cube\n"
             "- extract_spectrum(url, ra_deg, dec_deg): Extract 1D spectrum at a position\n"
             "- search_cadc_archive: Search JWST/HST/etc. (returns access_url for download)\n"
             "- list_alma_files: List FITS files for an ALMA observation (returns file URLs)\n\n"
-            "When the task says visualize, render, show, or display — you MUST call the rendering "
+            "When the task says visualize, render, show, or display â€” you MUST call the rendering "
             "tools with actual URLs. Do NOT just describe steps or give recommendations. "
             "ACTUALLY call the tools to produce the result."
         )
@@ -8805,11 +9648,11 @@ IMPORTANT RULES:
             user_input = f"Context from prior steps:\n{dep_context}\n\nYour task: {task_description}"
 
         try:
-            # ── Use _build_tools_for_responses_api() — reads from self.tool_registry
+            # â”€â”€ Use _build_tools_for_responses_api() â€” reads from self.tool_registry
             # (self.tools does not exist; _build_tool_definitions() would crash)
             tools = self._build_tools_for_responses_api()
 
-            # ── Model selection: use the routed model if provided,
+            # â”€â”€ Model selection: use the routed model if provided,
             # otherwise fall back to conductor_model (deepseek-v4-pro)
             if subtask_model:
                 model_to_use = subtask_model
@@ -8836,7 +9679,7 @@ IMPORTANT RULES:
                 ]
 
                 if not tool_calls:
-                    # No more tool calls — extract text from every possible location
+                    # No more tool calls â€” extract text from every possible location
                     # 1. Convenience property (works for OpenAI and LLMResponse shim)
                     if hasattr(response, "output_text") and response.output_text:
                         output_text = response.output_text
@@ -8870,7 +9713,7 @@ IMPORTANT RULES:
                     if on_status:
                         on_status(_status_label, "completed")
 
-                    # ── Capture image results IMMEDIATELY after each tool call ──
+                    # â”€â”€ Capture image results IMMEDIATELY after each tool call â”€â”€
                     _conductor_image_result = (
                         self.last_run_result
                         if _run_result_is_new(_rr_before, self.last_run_result)
@@ -8887,7 +9730,7 @@ IMPORTANT RULES:
                         img_url = _conductor_image_result.get("image_url", "")
                         caption = _conductor_image_result.get("caption", "")
                         tool_summaries.append(
-                            f"✅ Image rendered via {fn_name}: {caption} "
+                            f"âœ… Image rendered via {fn_name}: {caption} "
                             f"[image_url: {img_url}]"
                         )
                     else:
@@ -8927,7 +9770,7 @@ IMPORTANT RULES:
             )
             return f"[Tool execution error: {e}]"
         finally:
-            # Images already captured in the loop above — just clean up.
+            # Images already captured in the loop above â€” just clean up.
             # CRITICAL: Preserve self.last_search_results so that subsequent sequential subtasks
             # (e.g. check_co_lines following search_by_target) can access the cached DataFrame.
             self.last_run_result = None
@@ -8940,7 +9783,7 @@ IMPORTANT RULES:
         trace (surfaced as the SSE ``tool_trace`` event; consumed by the UI's
         debug view and by Benchmark/datalabbench). Never raises.
 
-        ``result_obj`` is the untruncated result dict when the caller has it —
+        ``result_obj`` is the untruncated result dict when the caller has it â€”
         structured fields are read from it so an 8000-char ``result_str``
         slice can never cost the trace its SQL/rowcount."""
         try:
@@ -9016,18 +9859,18 @@ IMPORTANT RULES:
         self._record_tool_trace(tool_name, args, result_str, result_obj=result_obj)
         return result_str
 
-    # ═══════════════════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # RESPONSES API METHOD (New Architecture)
-    # ═══════════════════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     
-    # ── Knowledge cutoff detection ──────────────────────────────────────────
+    # â”€â”€ Knowledge cutoff detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    # LLM training knowledge cutoff — GPT-4o data ends ~Oct 2024
+    # LLM training knowledge cutoff â€” GPT-4o data ends ~Oct 2024
     _LLM_CUTOFF_YEAR = 2024
     _LLM_CUTOFF_MONTH = 10   # October 2024
 
-    # ── Live-data query detection ───────────────────────────────────────
-    # Queries served by QUASAR's built-in live-data tools — observation
+    # â”€â”€ Live-data query detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Queries served by QUASAR's built-in live-data tools â€” observation
     # archives (ALMA/CADC/...), ADS/arXiv papers, ALeRCE/ZTF alerts,
     # Data Lab catalogs, SparCL spectra, NED photometry, SIMBAD/VizieR
     # lookups, HiPS imagery/cutouts, cone searches, crossmatches.
@@ -9040,11 +9883,15 @@ IMPORTANT RULES:
         r'cross-?match(?:es|ing|ed)?|photometry|spectra|spectrum|'
         r'catalogs?|catalogues?|sky\s*map|skymap|'
         r'ztf|alerce|sparcl|data\s*lab|vlass|hips|aladin|'
-        r'simbad|vizier|gaia|sdss|desi|pan-?starrs|2mass)\b'
+        r'simbad|vizier|gaia|sdss|desi|pan-?starrs|2mass|'
+        r'decam|legacy\s*surveys?|smash|delve|skymapper|(?:un|all|cat)wise|'
+        r'nsc\s*dr\d|des\s*dr\d|(?:color|colour)[-\s]magnitude|cmds?|'
+        r'hr\s*diagrams?|overdensit(?:y|ies)|proper\s*motions?|parallax(?:es)?)\b'
     )
     _LIVE_DATA_VERBS_RE = re.compile(
-        r'\b(?:find|search|show|get|list|query|look\s*up|plot|display)\b.*'
-        r'\b(?:observations?|data|archives?|images?|spectra|spectrum|alerts?)\b'
+        r'\b(?:find|search|show|get|list|query|look\s*up|plot|display|select|identify)\b.*'
+        r'\b(?:observations?|data|archives?|images?|spectra|spectrum|alerts?|'
+        r'stars?|sources?|magnitudes?|cutouts?|diagrams?|candidates?)\b'
     )
     _LIVE_DATA_FACILITY_RE = re.compile(
         r'\b(?:alma|vla|vlba|gbt|ngvla|jwst|hst|gemini|jcmt|cfht|chandra|xmm|'
@@ -9067,7 +9914,7 @@ IMPORTANT RULES:
     def _is_live_data_query(self, query: str) -> bool:
         """True when the query is answered by QUASAR's built-in live-data
         tools (archives, papers, alerts, catalogs, imagery, spectra,
-        photometry, cone searches) — web search adds nothing for these."""
+        photometry, cone searches) â€” web search adds nothing for these."""
         _q = query.lower()
         return bool(
             self._LIVE_DATA_KEYWORDS_RE.search(_q)
@@ -9088,14 +9935,14 @@ IMPORTANT RULES:
         - Freshness keywords:    "latest", "current", "recent", "now",
                                   "today", "this year", "this month"
 
-        Does NOT trigger on archive search queries — those hit live databases
+        Does NOT trigger on archive search queries â€” those hit live databases
         (ALMA, CADC, etc.) directly and don't need web search augmentation.
         """
         _q = query.lower()
 
-        # ── Skip web search for live-data / paper queries ───────────────
+        # â”€â”€ Skip web search for live-data / paper queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # These are served by dedicated live databases (ALMA archive, ADS,
-        # ALeRCE alerts, Data Lab, SparCL, NED, HiPS imagery, ...) — web
+        # ALeRCE alerts, Data Lab, SparCL, NED, HiPS imagery, ...) â€” web
         # search adds nothing and just wastes time / clutters the response.
         if self._is_live_data_query(_q):
             return None
@@ -9129,7 +9976,7 @@ IMPORTANT RULES:
             if m_year == self._LLM_CUTOFF_YEAR and month_names[m_name] > self._LLM_CUTOFF_MONTH:
                 return query
 
-        # 3. Selective freshness keywords — only high-confidence temporal phrases
+        # 3. Selective freshness keywords â€” only high-confidence temporal phrases
         #    that strongly imply the user wants current-year information.
         #    Avoids broad terms like "latest", "current", "recent" which cause
         #    false positives on nearly every query.
@@ -9189,7 +10036,7 @@ IMPORTANT RULES:
                 "3. Asks you to write code, scripts, or format something (e.g., 'write a python script to plot a fits file').\n"
                 "4. Asks for scientific papers or publications (these are searched via NASA ADS/arXiv tool, not general web search).\n"
                 "5. Is a follow-up query related to astronomical data, observations, or archives discussed in the recent conversation (e.g. asking for another band, project code, or target details of an observation already found).\n"
-                "6. Asks for astronomical data served by the assistant's built-in live tools: observation archives, transient/ZTF alerts, catalog cone-searches or crossmatches, photometry, spectra, light curves, or sky images/cutouts (e.g., 'any ZTF alerts near M87?', 'DESI spectra of this target', 'SDSS photometry of NGC 1275'). These query live astronomical databases directly — even though the data is real-time, general web search adds nothing.\n\n"
+                "6. Asks for astronomical data served by the assistant's built-in live tools: observation archives, transient/ZTF alerts, catalog cone-searches or crossmatches, photometry, spectra, light curves, or sky images/cutouts (e.g., 'any ZTF alerts near M87?', 'DESI spectra of this target', 'SDSS photometry of NGC 1275'). These query live astronomical databases directly â€” even though the data is real-time, general web search adds nothing.\n\n"
                 "Reply with ONLY one word: YES or NO"
             )
             
@@ -9254,7 +10101,7 @@ IMPORTANT RULES:
         raw_query : str, optional
             The original, un-enriched user message.  When the caller wraps
             the user's question inside personal-RAG context (e.g.
-            ``"The user has …\n---\nUser's question: …"``), the enriched
+            ``"The user has â€¦\n---\nUser's question: â€¦"``), the enriched
             text should go in *query* (so the LLM sees everything) while
             the bare question goes in *raw_query* (used for complexity
             detection, cutoff checks, and conductor routing).  If omitted,
@@ -9303,7 +10150,7 @@ IMPORTANT RULES:
             _uq
         )) or not web_search or "[GROUNDED_SUMMARY_MODE]" in query
 
-        # Skip web search for live-data and paper queries — archives, alerts,
+        # Skip web search for live-data and paper queries â€” archives, alerts,
         # catalogs, imagery, spectra, photometry all hit dedicated live
         # databases (ALMA/CADC, ALeRCE, Data Lab, SparCL, NED, ...), not the web.
         _is_archive_or_paper = self._is_live_data_query(_uq)
@@ -9385,9 +10232,9 @@ IMPORTANT RULES:
                 if on_status:
                     msg = "Searching the web in parallel"
                     if _web_search_reason == "cutoff":
-                        msg = "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                        msg = "âš¡ Time period beyond training knowledge cutoff detected â€” searching the web in parallel"
                     elif _web_search_reason == "intent_detection":
-                        msg = "🌐 Query requires real-time information — searching the web in parallel"
+                        msg = "ðŸŒ Query requires real-time information â€” searching the web in parallel"
                     on_status(msg, "running")
 
                 def _bg_web_search():
@@ -9403,7 +10250,7 @@ IMPORTANT RULES:
                 _web_thread = threading.Thread(target=_bg_web_search, daemon=True)
                 _web_thread.start()
 
-        # 1. Smart RAG — only search documentation for queries that likely
+        # 1. Smart RAG â€” only search documentation for queries that likely
         #    relate to ALMA/radio astronomy/technical documentation.
         #    SKIP for archive data-fetch queries (e.g. "find ALMA observations of M87")
         #    because those hit the live archive, not documentation.
@@ -9427,7 +10274,7 @@ IMPORTANT RULES:
         from services.rag_service import is_domain_relevant
         _should_rag = is_domain_relevant(_user_query) and any(kw in _query_lower for kw in _rag_keywords)
 
-        # Skip RAG for pure archive data-fetch queries — the user wants data
+        # Skip RAG for pure archive data-fetch queries â€” the user wants data
         # from the live archive, not ALMA technical documentation.
         _is_archive_fetch = bool(re.search(
             r'\b(?:find|search|show|get|list|query|look\s*up|fetch)\b.*'
@@ -9486,14 +10333,28 @@ IMPORTANT RULES:
         if _is_cross_archive_source_match_query or _is_archive_overlay_query:
             _should_rag = False
 
-        # Skip RAG for paper/literature queries — these go through NASA ADS
+        # Imagery requests ("show me a color image of M31 from DECam") must end
+        # in a fresh tool-produced image (hips_cutout & co.), never a text-only
+        # answer or web snippets â€” force a tool call on round 0.
+        # Only FORCE a tool when an explicit imagery noun is present. The bare
+        # "what does X look like" phrasing is intentionally NOT forced here: it
+        # matches knowledge questions ("what does the ALMA pipeline look
+        # like?") and would push an arbitrary tool call. The model can still
+        # choose an imagery tool for those on its own.
+        _is_imagery_request = bool(re.search(
+            r'\b(?:show|display|make|create|generate|render|get|give)\b.*'
+            r'\b(?:image|images|imagery|cutouts?|postage\s*stamps?|picture|pictures)\b',
+            _query_lower,
+        ))
+
+        # Skip RAG for paper/literature queries â€” these go through NASA ADS
         # (search_papers tool), NOT ALMA documentation. Words like "disk",
         # "spectral", "radio" in "recent papers on protoplanetary disks" would
         # false-positive on _rag_keywords and waste time searching manuals.
         #
-        # Simple rule: if ANY paper/literature word appears → skip RAG.
+        # Simple rule: if ANY paper/literature word appears â†’ skip RAG.
         # Exception: "summarize this paper" / "explain this article" with an
-        # attachment is a DOCUMENT query, not a search — handled separately.
+        # attachment is a DOCUMENT query, not a search â€” handled separately.
         _has_paper_word = bool(re.search(
             r'\b(?:papers?|publications?|articles?|literature|studies|preprints?)\b',
             _query_lower,
@@ -9533,7 +10394,7 @@ IMPORTANT RULES:
                 )
                 _intent = _intent_resp.output_text.strip().upper()
                 _is_paper_query = "PAPERS" in _intent
-                print(f"[INTENT] Query: '{_user_query[:60]}...' → {_intent} (paper_query={_is_paper_query})")
+                print(f"[INTENT] Query: '{_user_query[:60]}...' â†’ {_intent} (paper_query={_is_paper_query})")
             except Exception as e:
                 # Fallback to keyword-based detection if LLM call fails
                 print(f"[INTENT] LLM verification failed, falling back to keyword: {e}")
@@ -9542,9 +10403,9 @@ IMPORTANT RULES:
         if _is_paper_query:
             _should_rag = False
 
-        # Detect OpenAlex-targeted queries — researcher lookups, funding,
+        # Detect OpenAlex-targeted queries â€” researcher lookups, funding,
         # metrics, popularity, and trend questions. These ALWAYS trigger the
-        # OpenAlex tool (even if RAG also runs — the two are additive).
+        # OpenAlex tool (even if RAG also runs â€” the two are additive).
         # IMPORTANT: use _user_query (bare question) not _query_lower
         # (enriched query) because the enrichment wrapper may contain ALMA
         # terms that would falsely trigger the exclusion regex.
@@ -9572,7 +10433,7 @@ IMPORTANT RULES:
         ))
         _is_openalex_query = _is_researcher_query or _is_trend_query
         if _is_openalex_query:
-            # Do NOT set _should_rag = False — OpenAlex is additive, not
+            # Do NOT set _should_rag = False â€” OpenAlex is additive, not
             # exclusive. RAG may still provide useful ALMA-related context.
             # The OpenAlex directive (injected later) ensures the tool is called
             # regardless of whether RAG context is present.
@@ -9627,7 +10488,7 @@ IMPORTANT RULES:
                 if on_status:
                     on_status("Searching ALMA Manuals & Documentation", "running")
 
-                # ── Year-aware filtering ──────────────────────────────
+                # â”€â”€ Year-aware filtering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Auto-detect year references in the query so we prefer
                 # the most relevant version of the documentation.
                 _rag_min_year = None
@@ -9635,7 +10496,7 @@ IMPORTANT RULES:
                 if _rag_year_matches:
                     _rag_min_year = max(int(y) for y in _rag_year_matches)
 
-                # Also detect "Cycle N" → year mapping
+                # Also detect "Cycle N" â†’ year mapping
                 _cycle_year_map = {
                     "1": 2013, "2": 2014, "3": 2015, "4": 2016,
                     "5": 2017, "6": 2018, "7": 2019, "8": 2020,
@@ -9698,7 +10559,7 @@ IMPORTANT RULES:
                             f"{d.page_content}"
                         )
                     rag_context = (
-                        "\n\n📚 DOCUMENTATION CONTEXT (from ALMA Technical Documentation):\n"
+                        "\n\nðŸ“š DOCUMENTATION CONTEXT (from ALMA Technical Documentation):\n"
                         + "\n---\n".join(context_pieces)
                     )
 
@@ -9708,7 +10569,7 @@ IMPORTANT RULES:
                     _year_conflict = (_rag_diag or {}).get("year_conflict")
                     if _year_conflict and _year_conflict.get("message"):
                         rag_context += (
-                            "\n\n⚠️ FRESHNESS NOTICE: "
+                            "\n\nâš ï¸ FRESHNESS NOTICE: "
                             + _year_conflict["message"]
                             + " Attribute each value to its specific cycle/year. If the "
                             "user asked about a particular cycle or year, use that "
@@ -9779,7 +10640,7 @@ IMPORTANT RULES:
                     on_status("Searching ALMA Manuals & Documentation", "completed")
                 print(f"[WARNING] RAG search failed: {e}")
         
-        # 2. Retrieve long-term memories (from mem0) — only for authenticated users
+        # 2. Retrieve long-term memories (from mem0) â€” only for authenticated users
         memory_context = ""
         _is_anonymous = (not user_id or user_id == "anonymous")
         if self.long_term_memory and not _is_anonymous:
@@ -9816,21 +10677,21 @@ IMPORTANT RULES:
                 "\n\nIMPORTANT CITATION & STRUCTURE RULES:\n"
                 "1. INLINE CITATIONS: Place each citation IMMEDIATELY after the sentence that uses the information. "
                 "NEVER create a 'References:' or 'Sources:' section at the bottom. "
-                "Each document chunk above has a CITE_AS tag — you MUST copy that EXACT string verbatim as your citation. "
+                "Each document chunk above has a CITE_AS tag â€” you MUST copy that EXACT string verbatim as your citation. "
                 "Do NOT modify, rephrase, or invent citation fields. The CITE_AS tag already contains the correct "
                 "Page number, Date, and Relevance score. Example: if CITE_AS says "
                 "'[Source: alma-proposers-guide-cycle13.pdf, Page 36, Date: February 2026, Relevance: 0.88]', "
                 "write EXACTLY that string after the sentence that uses info from that chunk. "
                 "NEVER write 'Page unknown', 'Date: unknown', or make up your own Relevance scores.\n"
                 "2. After presenting the documentation-based answer, add a disclaimer line: "
-                "'*📚 The above is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies.*'\n"
+                "'*ðŸ“š The above is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies.*'\n"
                 "3. WEB SECTION: If web search results are available in your context, you MUST present them under "
-                "'🌐 Updated Information from the Web:' with a detailed paragraph. NEVER say 'No additional updates were found'. "
+                "'ðŸŒ Updated Information from the Web:' with a detailed paragraph. NEVER say 'No additional updates were found'. "
                 "Always extract and present the actual content from the web results, even if it overlaps with the documentation."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}{disabled_web_note}\n\nUser: {query}"
 
-        # 4b. Paper query safety net — even if RAG context leaked in above,
+        # 4b. Paper query safety net â€” even if RAG context leaked in above,
         #     force the LLM to call search_papers (ADS) for paper queries.
         #     Reuse the _has_paper_word / _is_paper_query flags from step 1.
         # OpenAlex queries take priority over paper queries when both match.
@@ -9857,7 +10718,7 @@ IMPORTANT RULES:
                     "Present the OpenAlex profile data as the core of your answer. "
                     "If web search results are also available, combine them with the OpenAlex profile "
                     "to provide additional context (e.g. recent news, awards, personal webpage). "
-                    "Do NOT skip calling `lookup_researcher` — always call it first."
+                    "Do NOT skip calling `lookup_researcher` â€” always call it first."
                 )
 
                 # Join the email search thread and inject contact info into
@@ -9939,26 +10800,26 @@ IMPORTANT RULES:
             )
             full_input += science_directive
         elif rag_context:
-            # Knowledge query with RAG context — explicitly prevent search_papers
+            # Knowledge query with RAG context â€” explicitly prevent search_papers
             knowledge_directive = (
                 "\n\n[SYSTEM NOTE: This is a KNOWLEDGE query answered from ALMA documentation. "
-                "Do NOT call `search_papers` — the user is asking about ALMA procedures, policies, "
+                "Do NOT call `search_papers` â€” the user is asking about ALMA procedures, policies, "
                 "or technical details, NOT requesting scientific papers or publications. "
                 "Answer using the DOCUMENTATION CONTEXT provided above.]"
             )
             full_input += knowledge_directive
 
-        # 4c. Prevent duplicate web searches — when the parallel cutoff search
+        # 4c. Prevent duplicate web searches â€” when the parallel cutoff search
         #     is already running, tell the LLM not to call web_search itself.
         #     This eliminates redundant Tavily calls and speeds up response time.
         if _web_search_query is not None:
             full_input += (
                 "\n\n[SYSTEM NOTE: A web search is already running in parallel for this query. "
-                "Do NOT call the `web_search` tool yourself — the results will be appended "
+                "Do NOT call the `web_search` tool yourself â€” the results will be appended "
                 "automatically after your response. Focus on answering from your knowledge.]"
             )
 
-        # 4a. Conductor check — delegate complex queries to DAG orchestration
+        # 4a. Conductor check â€” delegate complex queries to DAG orchestration
         #     IMPORTANT: The Conductor receives `_user_query` (the bare user question),
         #     NOT `query` (which may be wrapped with personal RAG context, mem0 memories,
         #     citation instructions, etc.).  The ALMA documentation RAG context is passed
@@ -9972,18 +10833,18 @@ IMPORTANT RULES:
                 if on_status:
                     on_status("__run_mode__:conductor", "meta")
 
-                # Classify complexity tier → controls max subtasks
+                # Classify complexity tier â†’ controls max subtasks
                 _tier_name, _tier_max = Conductor.classify_tier(complexity)
 
-                # ① Mark detection as COMPLETED immediately so the UI shows a ✓
+                # â‘  Mark detection as COMPLETED immediately so the UI shows a âœ“
                 if on_status:
                     on_status(
                         f"Complex query detected (score={complexity:.2f}, tier={_tier_name}) "
-                        f"— activating multi-agent workforce",
+                        f"â€” activating multi-agent workforce",
                         "completed",
                     )
 
-                # ② Build on_event emitter — forwards task_group / task_update / task_list
+                # â‘¡ Build on_event emitter â€” forwards task_group / task_update / task_list
                 #    events through the SSE queue in api/main.py
                 def on_event(evt: dict):
                     if on_status:
@@ -9992,14 +10853,14 @@ IMPORTANT RULES:
                 # Store on_status so _conductor_tool_executor can emit tool-call steps
                 self._last_on_status = on_status
 
-                # ③ Run the async Conductor in a dedicated thread with its own event loop.
+                # â‘¢ Run the async Conductor in a dedicated thread with its own event loop.
                 #    We CANNOT use pool.submit(asyncio.run, coro) here because this
                 #    function already runs inside a ThreadPoolExecutor thread, and some
                 #    Python/asyncio combinations deadlock when nesting executors that way.
                 conductor_answer = None
                 conductor_exc = None
                 self._conductor_images = []  # Accumulate images from sub-agents
-                self._conductor_images_lock = threading.Lock()  # Thread-safe — subtasks run in parallel
+                self._conductor_images_lock = threading.Lock()  # Thread-safe â€” subtasks run in parallel
                 _done = threading.Event()
 
                 def _run_conductor():
@@ -10037,7 +10898,7 @@ IMPORTANT RULES:
                     print(f"[WARNING] Conductor orchestration failed: {conductor_exc}. Falling back to standard path.")
                     self.query_tracer.end_trace(trace_id, "failed")
                 elif conductor_answer is not None:
-                    # Conductor ran — use its answer (even if some subtasks failed).
+                    # Conductor ran â€” use its answer (even if some subtasks failed).
                     # Guard against empty synthesis: if the model returned blank,
                     # build a minimal fallback from the DAG status.
                     if not conductor_answer.strip():
@@ -10061,7 +10922,7 @@ IMPORTANT RULES:
                             _web_status_label = (
                                 "Searching the web for updated information"
                                 if _web_search_reason == "rag_supplement"
-                                else "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                                else "âš¡ Time period beyond training knowledge cutoff detected â€” searching the web in parallel"
                             )
                             on_status(_web_status_label, "completed")
                         web_data = _web_result_holder.get("data")
@@ -10074,9 +10935,9 @@ IMPORTANT RULES:
                             if tavily_answer:
                                 web_section = "\n\n---\n\n"
                                 if _web_search_reason == "rag_supplement":
-                                    web_section += "🌐 **Updated Information from the Web:** "
+                                    web_section += "ðŸŒ **Updated Information from the Web:** "
                                 else:
-                                    web_section += "🌐 **From the Web:** "
+                                    web_section += "ðŸŒ **From the Web:** "
                                 web_section += tavily_answer + "\n"
                                 conductor_answer += web_section
                                 if on_token:
@@ -10109,7 +10970,7 @@ IMPORTANT RULES:
                     # Companion notebook attachment has been disabled for Conductor tasks as per requirements.
 
                     return safe_assistant_text(conductor_answer)
-                # Conductor returned None → not complex enough, fall through to standard path
+                # Conductor returned None â†’ not complex enough, fall through to standard path
         except Exception as e:
             print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
         
@@ -10152,6 +11013,7 @@ IMPORTANT RULES:
                 if _round == 0 and (
                     _is_archive_fetch or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
+                    or _is_imagery_request
                 ):
                     request_kwargs["tool_choice"] = "required"
 
@@ -10221,17 +11083,17 @@ IMPORTANT RULES:
                         if on_thought:
                             on_thought(event.delta)
                         elif not _reasoning_emitted and on_status:
-                            on_status("🧠 Reasoning", "running")
+                            on_status("ðŸ§  Reasoning", "running")
                             _reasoning_emitted = True
                     elif event.type == "response.reasoning_summary_text.done":
-                        # Reasoning summary complete — emit the full text as a thinking step
+                        # Reasoning summary complete â€” emit the full text as a thinking step
                         if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
                             # Split into individual lines for readable thinking steps
                             for line in _reasoning_summary_text.strip().splitlines():
                                 line = line.strip()
                                 if line:
-                                    on_status(f"💭 {line}", "completed")
-                            on_status("🧠 Reasoning", "completed")
+                                    on_status(f"ðŸ’­ {line}", "completed")
+                            on_status("ðŸ§  Reasoning", "completed")
                         _reasoning_summary_text = ""
                         _reasoning_emitted = False
                     elif event.type == "response.output_text.delta":
@@ -10241,9 +11103,9 @@ IMPORTANT RULES:
                             for line in _reasoning_summary_text.strip().splitlines():
                                 line = line.strip()
                                 if line:
-                                    on_status(f"💭 {line}", "completed")
+                                    on_status(f"ðŸ’­ {line}", "completed")
                             if _reasoning_emitted:
-                                on_status("🧠 Reasoning", "completed")
+                                on_status("ðŸ§  Reasoning", "completed")
                             _reasoning_summary_text = ""
                             _reasoning_emitted = False
                         if _buffer_round_text:
@@ -10328,7 +11190,7 @@ IMPORTANT RULES:
                                             if fn_name and not function_calls[item_id]["name"]:
                                                 function_calls[item_id]["name"] = fn_name
                                         elif final_cid not in function_calls:
-                                            # Entirely new — create the entry
+                                            # Entirely new â€” create the entry
                                             function_calls[final_cid] = {
                                                 "name": fn_name,
                                                 "arguments": fn_args,
@@ -10341,7 +11203,7 @@ IMPORTANT RULES:
                         output_text += _round_text_buffer
                         if on_token:
                             on_token(_round_text_buffer)
-                    break  # No tool calls — we have the final text
+                    break  # No tool calls â€” we have the final text
 
                 _had_tool_calls = True
                 if _buffer_round_text and _round_text_buffer:
@@ -10353,7 +11215,7 @@ IMPORTANT RULES:
                 # Track output growth for smart budget
                 _token_budget.record_output(len(output_text))
                 if not _token_budget.should_continue():
-                    print(f"[TOKEN BUDGET] Stopping — {_token_budget.get_stats()}")
+                    print(f"[TOKEN BUDGET] Stopping â€” {_token_budget.get_stats()}")
                     break
                 
                 # Execute each function call and collect results
@@ -10430,7 +11292,7 @@ IMPORTANT RULES:
                             # (e.g. multi-target search appends per-target results),
                             # eagerly emit each new result for parallel data card rendering.
                             if _acc_len_after > _acc_len_before:
-                                # Tool accumulated its own results — emit each new one
+                                # Tool accumulated its own results â€” emit each new one
                                 if on_status:
                                     for _new_idx in range(_acc_len_before, _acc_len_after):
                                         _new_rc = self._accumulated_run_results[_new_idx]
@@ -10442,7 +11304,7 @@ IMPORTANT RULES:
                                             # Stash inline data for the SSE handler to pick up
                                             on_status(f"__eager_data__{json.dumps(_new_rc, default=str)}", "data")
                             elif _primary_run_result is not None:
-                                # Tool didn't accumulate — add last_run_result ourselves
+                                # Tool didn't accumulate â€” add last_run_result ourselves
                                 _rc = (
                                     _primary_run_result.copy()
                                     if isinstance(_primary_run_result, dict)
@@ -10496,7 +11358,7 @@ IMPORTANT RULES:
                         "output": result_str,
                     })
 
-                # Apply tool result budget — truncate oversized old results
+                # Apply tool result budget â€” truncate oversized old results
                 tool_results = apply_tool_result_budget(tool_results)
                 _all_tool_results.extend(tool_results)
 
@@ -10512,8 +11374,29 @@ IMPORTANT RULES:
                 output_text = self._synthesize_web_tool_answer(_user_query, _web_tool_results)
                 if output_text and on_token:
                     on_token(output_text)
-            # Safety net: the model called tools but produced no final text. Summarize what
-            # the tools did (incl. errors) so the user gets a useful, self-explaining reply.
+            # Safety net: the model called tools but produced no final text. First ask the
+            # model once more â€” without tools â€” to compose a real answer from the tool
+            # results; only if that also yields nothing fall back to the mechanical
+            # step summary.
+            if (
+                not output_text
+                and _had_tool_calls
+                and self._response_run_active(conversation_id, selected_model, run_token)
+            ):
+                if on_status:
+                    on_status("Composing final answer from tool results", "running")
+                output_text = self._compose_final_answer_from_tools(
+                    _user_query,
+                    _all_tool_results,
+                    selected_model,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    run_token=run_token,
+                )
+                if on_status:
+                    on_status("Composing final answer from tool results", "completed")
+                if output_text and on_token:
+                    on_token(output_text)
             if not output_text and _had_tool_calls:
                 _tool_summary = self._summarize_tool_outcomes(_all_tool_results)
                 if _tool_summary:
@@ -10535,7 +11418,7 @@ IMPORTANT RULES:
                     _web_status_label = (
                         "Searching the web for updated information"
                         if _web_search_reason == "rag_supplement"
-                        else "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                        else "âš¡ Time period beyond training knowledge cutoff detected â€” searching the web in parallel"
                     )
                     on_status(_web_status_label, "completed")
                 web_data = _web_result_holder.get("data")
@@ -10548,9 +11431,9 @@ IMPORTANT RULES:
                     if tavily_answer:
                         web_section = "\n\n---\n\n"
                         if _web_search_reason == "rag_supplement":
-                            web_section += "🌐 **Updated Information from the Web:** "
+                            web_section += "ðŸŒ **Updated Information from the Web:** "
                         else:
-                            web_section += "🌐 **From the Web:** "
+                            web_section += "ðŸŒ **From the Web:** "
                         web_section += tavily_answer + "\n"
                         output_text += web_section
                         if on_token:
@@ -10576,7 +11459,7 @@ IMPORTANT RULES:
                     print(f"[WEB SEARCH] Parallel web search failed: {_web_result_holder['error']}")
             
 
-            # 8. Update long-term memory — only for authenticated users
+            # 8. Update long-term memory â€” only for authenticated users
             output_text = safe_assistant_text(output_text)
             output_text = append_citation_warning(
                 output_text,
@@ -10605,6 +11488,9 @@ IMPORTANT RULES:
         except Exception as e:
             # If the error is about a hanging tool call, clear the poisoned
             # response ID for THIS conversation so it doesn't keep failing.
+            # Malformed tool-call 400s (gpt-oss sometimes emits arithmetic or
+            # comments inside tool-call JSON, rejected upstream at parse time)
+            # are stochastic, so they get the same clear-state-and-retry.
             _is_hanging_tool_err = any(
                 msg in str(e)
                 for msg in [
@@ -10612,6 +11498,8 @@ IMPORTANT RULES:
                     "must be followed by tool messages",
                     "insufficient tool messages",
                     "tool_calls",
+                    "Failed to parse tool call",
+                    "Invalid function calling output",
                 ]
             )
             if _is_hanging_tool_err:
@@ -10645,9 +11533,8 @@ IMPORTANT RULES:
                         run_token=run_token,
                         _history_recovery_attempted=True,
                     )
-            error_msg = f"Error with Responses API: {str(e)}"
-            print(f"[ERROR] {error_msg}")
-            return error_msg
+            print(f"[ERROR] Error with Responses API: {str(e)}")
+            return self._user_facing_provider_error(e)
     
     def _build_tools_for_responses_api(self) -> list:
         """
@@ -10843,7 +11730,7 @@ IMPORTANT RULES:
         if self.config.verbose:
             print(f"[cyan]Model changed to: {model} (provider: {new_provider})[/cyan]")
         if old_provider != new_provider:
-            logger.info(f"Provider switch: {old_provider} → {new_provider}")
+            logger.info(f"Provider switch: {old_provider} â†’ {new_provider}")
 
     def _update_memory(self, query: str, user_id: str = "user"):
         """Extract and save new memories from user interaction using Responses API"""
@@ -10889,3 +11776,7 @@ IMPORTANT RULES:
                 return pd.DataFrame(papers)
         
         return None
+
+
+
+

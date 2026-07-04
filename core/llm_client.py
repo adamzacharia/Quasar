@@ -1233,6 +1233,8 @@ class ResponsesShim:
             call_kwargs["tools"] = openai_tools
             if tool_choice:
                 call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
+                if tool_choice == "required":
+                    call_kwargs["messages"] = self._apply_required_tool_choice_nudge(call_kwargs["messages"])
         if json_mode and os.getenv("TACC_ENABLE_RESPONSE_FORMAT", "").lower() in {"1", "true", "yes"}:
             call_kwargs["response_format"] = {"type": "json_object"}
 
@@ -1303,6 +1305,8 @@ class ResponsesShim:
             call_kwargs["tools"] = openai_tools
             if tool_choice:
                 call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
+                if tool_choice == "required":
+                    call_kwargs["messages"] = self._apply_required_tool_choice_nudge(call_kwargs["messages"])
 
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
@@ -1413,6 +1417,15 @@ class ResponsesShim:
 
         return messages
 
+    # GPT-OSS models occasionally emit arithmetic ("radius_deg": 10.0/60.0) or
+    # comments inside tool-call argument JSON; the serving side then rejects the
+    # whole turn with a 400 "Failed to parse tool call from GPT OSS output".
+    _GPT_OSS_TOOL_JSON_RULE = (
+        "Tool-call arguments MUST be strictly valid JSON: every number must be a plain "
+        "literal (NEVER arithmetic such as 10.0/60.0 — compute the value yourself and "
+        "write 0.1667), with no comments, no trailing commas, and no expressions."
+    )
+
     @staticmethod
     def _configure_gpt_oss_instructions(instructions: str, model: str) -> str:
         """Set GPT-OSS reasoning effort using its supported system-message format."""
@@ -1432,10 +1445,36 @@ class ResponsesShim:
             r"(?im)^[ \t]*Reasoning:[ \t]*(?:low|medium|high)[ \t]*$"
         )
         if existing_pattern.search(instructions):
-            return existing_pattern.sub(reasoning_instruction, instructions, count=1)
-        if instructions:
-            return f"{reasoning_instruction}\n\n{instructions}"
-        return reasoning_instruction
+            updated = existing_pattern.sub(reasoning_instruction, instructions, count=1)
+        elif instructions:
+            updated = f"{reasoning_instruction}\n\n{instructions}"
+        else:
+            updated = reasoning_instruction
+        if ResponsesShim._GPT_OSS_TOOL_JSON_RULE not in updated:
+            updated = f"{updated}\n\n{ResponsesShim._GPT_OSS_TOOL_JSON_RULE}"
+        return updated
+
+    @staticmethod
+    def _apply_required_tool_choice_nudge(messages: list) -> list:
+        """Emulate tool_choice="required" for providers that only accept "auto".
+
+        TACC/vLLM rejects "required", so the shim downgrades it to "auto" — which
+        silently lets weaker models answer in plain text instead of calling a
+        tool. Compensate by appending an explicit instruction to the system
+        message on a call-only copy (the conversation history cache keeps the
+        original messages so the pressure does not leak into later rounds).
+        """
+        nudge = (
+            "Tool use is REQUIRED for this turn: call the most appropriate tool "
+            "now instead of answering in plain text."
+        )
+        call_messages = [dict(m) if isinstance(m, dict) else m for m in messages]
+        first = call_messages[0] if call_messages else None
+        if isinstance(first, dict) and first.get("role") == "system" and isinstance(first.get("content"), str):
+            first["content"] = f"{first['content']}\n\n{nudge}"
+        else:
+            call_messages.insert(0, {"role": "system", "content": nudge})
+        return call_messages
 
     def _append_chat_input(self, messages: list, input_data) -> None:
         """Append Responses-style input to an existing Chat Completions history."""

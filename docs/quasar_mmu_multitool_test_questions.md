@@ -158,7 +158,9 @@ Verified anchor coordinates used throughout:
 |---|---|---|---|---|---|---|
 | 1 | | | | | | |
 
-Known open issue while testing: gpt-oss-120b occasionally emits malformed tool-call JSON
-(comments inside arguments) → surfaces as `Error with Responses API … Failed to parse tool
-call`. Hardening task is in flight; until it lands, count it as a *harness* failure, not a
-tool failure, and retry the question once.
+Resolved (2026-07): gpt-oss-120b occasionally emits malformed tool-call JSON (arithmetic or
+comments inside arguments) → used to surface as a raw `Error with Responses API … Failed to
+parse tool call` dump. The harness now (a) instructs gpt-oss models to emit strict-JSON tool
+arguments, (b) retries the turn once on a tool-call parse 400, and (c) never returns raw
+provider payloads to chat (`_user_facing_provider_error`). If a sanitized provider-error
+message still appears, score it as a *harness* failure and file it.

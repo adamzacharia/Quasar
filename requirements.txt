@@ -26,6 +26,8 @@ alminer
 # astro-datalab; python_version < "3.12"
 altair==4.2.2
 legacy-cgi>=2.6; python_version >= "3.13"
+lightkurve>=2.4
+psrqpy>=1.2
 
 # AI / LLM
 openai>=2.26.0
