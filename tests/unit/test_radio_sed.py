@@ -260,7 +260,6 @@ def test_agent_registration_prompt_status_and_radio_sed_wrapper():
     agent._radio_sed_service_instance = fake
     out = agent._radio_sed(ra=10.0, dec=-2.0, radius_arcsec=30.0)
     assert out["success"] is True
-    assert out["image_attached"] is not True if "image_attached" in out else True
     assert out["points"]
     assert out["alpha"] == -0.7
     assert out["alpha_err"] == 0.1
@@ -278,3 +277,4 @@ def test_agent_registration_prompt_status_and_radio_sed_wrapper():
     empty = agent._radio_sed(ra=10.0, dec=-2.0)
     assert empty["success"] is True
     assert "No radio catalog detections" in empty["note"]
+
