@@ -118,8 +118,15 @@ class DatalabClient:
         fmt: str = "pandas",
         timeout: Optional[float] = None,
         async_: bool = False,
+        async_fallback: bool = True,
     ) -> "DatalabResult | str":
-        """Run a native SQL or ADQL query. Returns DatalabResult, or a job id if async_."""
+        """Run a native SQL or ADQL query. Returns DatalabResult, or a job id if async_.
+
+        When a synchronous query hits the HTTP read timeout (heavy aggregates
+        routinely exceed the sync window), the same query is transparently
+        resubmitted as an async job and polled, instead of failing outright.
+        Disable with async_fallback=False or DATALAB_ASYNC_FALLBACK=0.
+        """
 
         query_text, mode = self._one_query(sql=sql, adql=adql)
         if async_:
@@ -128,11 +135,17 @@ class DatalabClient:
                 adql=query_text if mode == "adql" else None,
                 timeout=timeout,
             )
-        body = self._get(
-            "query",
-            {mode: query_text, "ofmt": "csv", "out": "", "async": "False", "drop": "True"},
-            timeout=timeout,
-        )
+        try:
+            body = self._get(
+                "query",
+                {mode: query_text, "ofmt": "csv", "out": "", "async": "False", "drop": "True"},
+                timeout=timeout,
+            )
+        except DatalabClientError as exc:
+            fallback_enabled = async_fallback and os.getenv("DATALAB_ASYNC_FALLBACK", "1") != "0"
+            if fallback_enabled and "timed out" in str(exc).lower():
+                return self._query_via_async_job(query_text, mode)
+            raise
         frame = self._csv_to_dataframe(body)
         catalog, table = self._first_table(query_text)
         provenance = {
@@ -183,6 +196,62 @@ class DatalabClient:
         return self._get("abort", {"jobid": str(jobid)}).strip()
 
     # ----- internals -------------------------------------------------------
+
+    def _query_via_async_job(self, query_text: str, mode: str) -> DatalabResult:
+        """Sync-timeout fallback: rerun the query as an async job and poll it.
+
+        Bounded by DATALAB_ASYNC_MAX_WAIT_SECONDS (default 150s) so a single tool
+        call cannot eat the whole agent turn; on poll expiry the job id is left
+        running server-side and surfaced in the error for datalab_job_results.
+        """
+        import time as _time
+
+        # Live-verified 2026-07-05: the Data Lab /status and /results endpoints
+        # reject the anonymous token with HTTP 401 ("provided security token is
+        # invalid"), so async jobs are only usable with a real login token.
+        if self.token == ANON_TOKEN:
+            raise DatalabClientError(
+                "Data Lab sync query timed out, and the async-job fallback requires a "
+                "real Data Lab login token (anonymous tokens get HTTP 401 from /status). "
+                "Narrow the query instead: smaller radius, a coarser HEALPix column, a "
+                "server-side aggregate, or selective value cuts."
+            )
+        max_wait = float(os.getenv("DATALAB_ASYNC_MAX_WAIT_SECONDS", "150"))
+        jobid = self.query(
+            sql=query_text if mode == "sql" else None,
+            adql=query_text if mode == "adql" else None,
+            async_=True,
+        )
+        deadline = _time.monotonic() + max_wait
+        poll_s = 4.0
+        while _time.monotonic() < deadline:
+            state = self.status(str(jobid)).upper()
+            if state == "COMPLETED":
+                result = self.results(str(jobid))
+                catalog, table = self._first_table(query_text)
+                # results() pre-fills catalog/table with None, so overwrite
+                # explicitly — setdefault would keep the Nones.
+                result.provenance.update(
+                    {
+                        "query": query_text,
+                        "mode": f"{mode}_async_fallback",
+                        "sync_timeout_fallback": True,
+                        "jobid": str(jobid),
+                        "catalog": catalog,
+                        "table": table,
+                    }
+                )
+                return result
+            if state == "ERROR":
+                raise DatalabClientError(
+                    f"Data Lab async fallback job {jobid} failed with status ERROR"
+                )
+            _time.sleep(poll_s)
+        raise DatalabClientError(
+            f"Data Lab sync query timed out and the async fallback job is still running "
+            f"after {max_wait:.0f}s. The job continues server-side — retrieve it with "
+            f"datalab_job_status/datalab_job_results using jobid={jobid}."
+        )
 
     def _one_query(self, *, sql: Optional[str], adql: Optional[str]) -> tuple[str, str]:
         has_sql = sql is not None and str(sql).strip() != ""

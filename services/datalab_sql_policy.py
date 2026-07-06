@@ -103,11 +103,18 @@ def validate(sql: str, *, source: str = "builder", meta: Optional[Mapping[str, A
     is_aggregate = _is_aggregate(clean)
     aggregate_safe = is_aggregate and any(_qualified(catalog, table) in registry.aggregate_safe_tables() for catalog, table in tables)
     exact_id_bound = bool(source == "builder" and metadata.get("exact_id_bound"))
-    spatial_bound = has_radial or has_poly or has_q3c_join or (has_box and box_allowed) or exact_id_bound
+    # Equality on a registry-listed indexed column (e.g. smash fieldid=169, id='169.429960')
+    # is the PDF-canonical bound for field-partitioned tables — accept it from any source.
+    indexed_eq = _has_indexed_equality(query, clean, tables)
+    if indexed_eq:
+        warnings.append(f"Accepted indexed equality bound on {indexed_eq}.")
+    spatial_bound = has_radial or has_poly or has_q3c_join or (has_box and box_allowed) or exact_id_bound or bool(indexed_eq)
     if not spatial_bound and not aggregate_safe:
         _raise(
-            "Row-level Data Lab queries require a q3c spatial bound or a registry-approved aggregate",
-            "Add q3c_radial_query/q3c_poly_query, use a box_ok table box, or use an aggregate builder.",
+            "Row-level Data Lab queries require a q3c spatial bound, an indexed-column equality "
+            "(e.g. smash fieldid = N or id = '...'), or a registry-approved aggregate",
+            "Add q3c_radial_query/q3c_poly_query, filter on an indexed id/fieldid column, "
+            "use a box_ok table box, or use an aggregate builder.",
         )
 
     row_level = not is_aggregate
@@ -222,6 +229,51 @@ def _has_ra_dec_between(clean: str) -> bool:
 
 def _all_boxes_allowed(tables: List[tuple[str, str]]) -> bool:
     return bool(tables) and all(registry.region_strategy(catalog, table) == "box_ok" for catalog, table in tables)
+
+
+_WHERE_SEGMENT_RE = re.compile(
+    r"\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bOFFSET\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _where_segment(text: str) -> str:
+    match = _WHERE_SEGMENT_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _has_indexed_equality(raw_sql: str, clean: str, tables: List[tuple[str, str]]) -> Optional[str]:
+    """Return the column name when the query is genuinely bounded by an equality
+    on a registry indexed-bound column (e.g. smash fieldid = 169, id = '169.429960').
+
+    Deliberately conservative — this loosening must not become a bypass:
+    - single-table queries only (multi-table joins need q3c bounds);
+    - no OR anywhere in the scrubbed logic (`col = 1 OR 1=1` is unbounded);
+    - the equality must appear inside the WHERE clause (a projection like
+      `SELECT fieldid = 169 AS is_field` is not a bound — Codex guard finding);
+    - a NUMERIC equality must appear in the literal/comment-scrubbed text, so
+      column names inside string literals or comments never count;
+    - a QUOTED equality must show `col =` in the scrubbed text (real code, since
+      scrubbing blanks literal interiors) AND `col = '<literal>'` in the raw
+      text, so the RHS is a literal — never another column reference.
+    """
+    if len(tables) != 1:
+        return None
+    if re.search(r"\bOR\b", clean, re.IGNORECASE):
+        return None
+    clean_where = _where_segment(clean)
+    raw_where = _where_segment(raw_sql)
+    if not clean_where.strip():
+        return None
+    catalog, table = tables[0]
+    for col in registry.indexed_bound_columns(catalog, table):
+        col_re = re.escape(col)
+        numeric_in_clean = re.search(rf"\b{col_re}\s*=\s*\d[\w.\-+]*", clean_where, re.IGNORECASE)
+        eq_in_clean = re.search(rf"\b{col_re}\s*=", clean_where, re.IGNORECASE)
+        quoted_in_raw = re.search(rf"\b{col_re}\s*=\s*'[^']+'", raw_where, re.IGNORECASE)
+        if numeric_in_clean or (eq_in_clean and quoted_in_raw):
+            return col
+    return None
 
 
 def _is_aggregate(clean: str) -> bool:

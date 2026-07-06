@@ -16,6 +16,7 @@ import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
 import { WebSourcesCard } from "./WebSourcesCard";
 import { HipsImageCard } from "./HipsImageCard";
+import { PlotlyCard } from "./PlotlyCard";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
@@ -642,6 +643,18 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     {title} · {cellCount} cells
                 </button>
             </div>
+        );
+    }
+
+    // ── Interactive Plotly figure (falls back to PNG image card) ──
+    if (message.type === "plotly" && (message.plotlySpec || message.plotlyPngFallback)) {
+        return (
+            <PlotlyCard
+                key={message.id}
+                spec={message.plotlySpec}
+                title={message.plotlyTitle}
+                pngFallback={message.plotlyPngFallback}
+            />
         );
     }
 

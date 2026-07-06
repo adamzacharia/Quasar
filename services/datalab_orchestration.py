@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -287,14 +288,316 @@ def density_then_cutouts(
     }
 
 
-def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store):
+def _tile_cone_centers(radius_deg: float, tile_radius_deg: float, cell_margin_deg: float = 0.3) -> List[tuple]:
+    """Tangent-plane (dx, dy) offsets in degrees for cone tiles that fully cover a
+    parent cone of radius_deg. Square grid with spacing s = sqrt(2)*(tile_r - margin):
+    the grid covering radius (s*sqrt(2)/2 = tile_r - margin) leaves `cell_margin_deg`
+    inside every tile, so any density cell (grid bin / coarse HEALPix pixel) smaller
+    than the margin is fully contained in at least one tile — required for the
+    max-count merge to be exact rather than undercounting along tile seams."""
+    r = float(tile_radius_deg)
+    margin = min(float(cell_margin_deg), 0.5 * r)
+    s = (r - margin) * math.sqrt(2.0)
+    keep = float(radius_deg) + s * 0.7072
+    n = int(math.ceil(keep / s))
+    centers = []
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            dx, dy = i * s, j * s
+            if math.hypot(dx, dy) <= keep:
+                centers.append((dx, dy))
+    # Scan the dense middle first so a time-budget stop drops rim tiles, not the core.
+    centers.sort(key=lambda c: math.hypot(*c))
+    return centers
+
+
+def tiled_density_aggregate(
+    catalog: str,
+    table: str,
+    *,
+    mode: str = "grid",
+    step_deg: float = 0.1,
+    healpix_column: Optional[str] = None,
+    ra: float,
+    dec: float,
+    radius_deg: float,
+    predicates: Optional[Sequence[str]] = None,
+    limit: int = 5000,
+    tile_radius_deg: Optional[float] = None,
+    max_seconds: Optional[float] = None,
+    client: Any = None,
+    result_store: Any = None,
+) -> Dict[str, Any]:
+    """P8 fallback: a wide density aggregate that beats the Data Lab 60s sync window
+    by tiling the parent cone into overlapping sub-cones, each ALSO bounded by the
+    parent cone (so semantics match the single-shot query exactly), then merging the
+    per-tile cells (dedup by cell key, keeping the max count — partial rim counts
+    from overlapping tiles are subsets of the full cell). Live-proven pattern:
+    deepseek manually tiled 6 cones over a 20°x20° NSC field when the single 10°
+    aggregate timed out (anon tokens cannot use the async-job path).
+    """
+    import pandas as pd
+
+    from services import datalab_registry as reg
+
+    client = client or _default_client()
+    result_store = result_store or _default_result_store()
+    mode_key = str(mode or "grid").strip().lower()
+    if mode_key not in {"grid", "healpix"}:
+        raise ValueError("tiled density aggregate mode must be grid or healpix")
+
+    info = reg.describe_table(catalog, table)
+    ra_col, dec_col = info["ra_column"], info["dec_column"]
+    parent_bound = (
+        f"q3c_radial_query({ra_col}, {dec_col}, {float(ra):.8g}, {float(dec):.8g}, {float(radius_deg):.8g})"
+    )
+    base_predicates = [str(p) for p in (predicates or [])] + [parent_bound]
+
+    max_tiles = int(os.getenv("DATALAB_TILED_AGG_MAX_TILES", "16"))
+    # Budget must leave room for the rest of the turn: the chat hard cap is
+    # 900s and a model may run 2+ aggregates (live DS-P8 attempt 1 died at the
+    # cap with a 360s budget: Galactic-center tiles all timed out serially).
+    if max_seconds is None:
+        max_seconds = float(os.getenv("DATALAB_TILED_AGG_MAX_SECONDS", "210"))
+    cell_margin = max(0.3, 2.0 * float(step_deg)) if mode_key == "grid" else 0.3
+    tile_r = float(tile_radius_deg or os.getenv("DATALAB_TILE_RADIUS_DEG", "5"))
+    tile_r = min(tile_r, max(0.5, float(radius_deg) / 1.5))
+    # Coarsen until the tile count fits the cap (bigger tiles may time out per-tile,
+    # which the subdivision fallback below absorbs).
+    centers = _tile_cone_centers(radius_deg, tile_r, cell_margin)
+    while len(centers) > max_tiles and tile_r < float(radius_deg):
+        tile_r *= 1.5
+        centers = _tile_cone_centers(radius_deg, tile_r, cell_margin)
+
+    def _run_tile(dx: float, dy: float, r: float) -> Optional[Any]:
+        tdec = max(-89.5, min(89.5, float(dec) + dy))
+        tra = (float(ra) + dx / _cosd(tdec)) % 360.0
+        sql, meta = builders.build_density_aggregate(
+            catalog, table, mode=mode_key, step_deg=step_deg, healpix_column=healpix_column,
+            ra=tra, dec=tdec, radius_deg=r, predicates=base_predicates, limit=limit,
+        )
+        validated = policy.validate(sql, source="builder", meta=meta)
+        return client.query(sql=validated.sql, fmt="pandas", async_fallback=False)
+
+    frames: List[Any] = []
+    tiles_run = 0
+    tile_errors = 0
+    subdivided = 0
+    outer_tiles_done = 0
+    started = time.monotonic()
+    budget_stop = False
+    for (dx, dy) in centers:
+        # Early abort for hopeless regions (live DS-P8: every Galactic-center
+        # NSC tile timed out serially, even subdivided — each failed tile costs
+        # up to 5x the sync window). If the first 2 outer tiles produced no
+        # data at all, this tile size cannot work; fail fast with the hint.
+        if outer_tiles_done >= 2 and not frames:
+            break
+        if time.monotonic() - started > max_seconds:
+            budget_stop = True
+            break
+        try:
+            frames.append(_run_tile(dx, dy, tile_r).dataframe)
+            tiles_run += 1
+        except Exception as exc:  # noqa: BLE001 - a slow/broken tile must not kill the map
+            if "timed out" not in str(exc).lower():
+                tile_errors += 1
+                continue
+            # One level of subdivision: 4 half-area cones covering the tile
+            # (child radius tile_r/sqrt(2) is the exact cover; add the cell
+            # margin so seam cells stay fully contained in one child).
+            subdivided += 1
+            child_r = tile_r / math.sqrt(2.0) + cell_margin
+            for (cx, cy) in ((-0.5, -0.5), (-0.5, 0.5), (0.5, -0.5), (0.5, 0.5)):
+                if time.monotonic() - started > max_seconds:
+                    budget_stop = True
+                    break
+                try:
+                    frames.append(_run_tile(dx + cx * tile_r, dy + cy * tile_r, child_r).dataframe)
+                    tiles_run += 1
+                except Exception:  # noqa: BLE001
+                    tile_errors += 1
+            if budget_stop:
+                break
+
+    frames = [f for f in frames if f is not None and len(f)]
+    if not frames:
+        raise RuntimeError(
+            f"Tiled density aggregate produced no data: {tiles_run} tiles ok, "
+            f"{tile_errors} failed. This field is too crowded for the anonymous 60s "
+            f"sync window even at {tile_r:.1f}° tiles. What works (live-verified): a "
+            "radius ≤2° cone on crowded fields, a BRIGHT magnitude cut (e.g. gmag < 18), "
+            "or a field away from the Galactic centre/plane (|b| > 5°). Get a working "
+            "map at radius 2° FIRST and render it, then widen if time permits."
+        )
+    merged = pd.concat(frames, ignore_index=True)
+    key_cols = ["healpix"] if mode_key == "healpix" else ["ra_bin", "dec_bin"]
+    for col in key_cols:
+        if col not in merged.columns:
+            raise RuntimeError(f"Tiled aggregate missing expected column {col!r}")
+    if mode_key == "grid":
+        # Guard against float-repr jitter in the SQL-computed bin keys.
+        merged[key_cols] = merged[key_cols].round(9)
+    merged = (
+        merged.groupby(key_cols, as_index=False)["source_count"].max()
+        .sort_values("source_count", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    warnings: List[str] = []
+    if budget_stop:
+        warnings.append(
+            f"Stopped at the {max_seconds:.0f}s tiling budget: {tiles_run} tile queries ran; "
+            "outer tiles were dropped, so the map underrepresents the region edges."
+        )
+    if tile_errors:
+        warnings.append(f"{tile_errors} tile queries failed and were skipped (partial coverage).")
+
+    hp_meta = None
+    if mode_key == "healpix":
+        hp_cols = info.get("healpix_columns") or []
+        want = str(healpix_column or (hp_cols[0].get("name") if hp_cols else "")).strip().lower()
+        hp_entry = next((h for h in hp_cols if h.get("name") == want), None)
+        if hp_entry:
+            hp_meta = {"column": want, "nside": hp_entry.get("nside"), "scheme": hp_entry.get("scheme")}
+    store_meta = {
+        "builder": "density_aggregate_tiled",
+        "catalog": info["catalog"],
+        "table": info["table"],
+        "tool_name": "datalab_density_aggregate",
+        "warnings": warnings,
+        "provenance": {
+            "catalog": info["catalog"],
+            "table": info["table"],
+            "mode": f"{mode_key}_tiled",
+            "parent_cone": {"ra": float(ra), "dec": float(dec), "radius_deg": float(radius_deg)},
+            "tile_radius_deg": tile_r,
+            "tiles_run": tiles_run,
+            "tiles_failed": tile_errors,
+            "tiles_subdivided": subdivided,
+            "sync_timeout_fallback": True,
+            **({"healpix": hp_meta} if hp_meta else {}),
+        },
+    }
+    result_id = result_store.put(merged, store_meta)
+    preview = merged.head(10).to_dict("records")
+    return {
+        "success": True,
+        "tool_name": "datalab_density_aggregate",
+        "result_id": result_id,
+        "rowcount": int(len(merged)),
+        "columns": list(merged.columns),
+        "catalog": info["catalog"],
+        "table": info["table"],
+        "tiled_fallback": True,
+        "tiles_run": tiles_run,
+        "tiles_failed": tile_errors,
+        "tile_radius_deg": round(tile_r, 3),
+        "warnings": warnings,
+        "query_summary": (
+            f"tiled density aggregate ({mode_key}): {tiles_run} cone tiles of {tile_r:.1f}° "
+            f"covering ra={float(ra):.4g}, dec={float(dec):.4g}, radius={float(radius_deg):.4g}°"
+        ),
+        "preview": preview,
+        "note": (
+            "The single wide aggregate exceeded the Data Lab 60s sync window, so the cone was "
+            "auto-tiled into sub-cones and merged (identical semantics: every tile is also bounded "
+            "by the parent cone). Render THIS result_id with datalab_sky_density_map NOW, before "
+            "attempting any wider region — turns have a hard time budget and a rendered map beats "
+            "an unrendered bigger one."
+        ),
+    }
+
+
+def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store,
+                       point_sources=False, extra_value_cuts=None):
     """Cone-select the magnitude (+extra) columns for a diagram and return (result_id, df, magcols)."""
     from services import datalab_registry as reg
     magcols = {b: reg.mag_column(catalog, table, b) for b in bands}
-    cols = ["ra", "dec"] + list(dict.fromkeys(magcols.values())) + [c for c in (extra_cols or []) if c]
-    sql, meta = builders.build_cone_select(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg, columns=cols, limit=limit)
+    info = reg.describe_table(catalog, table)
+    cols = [info["ra_column"], info["dec_column"]] + list(dict.fromkeys(magcols.values())) + [c for c in (extra_cols or []) if c]
+    # Server-side validity cuts: survey sentinel magnitudes (99.99 / -99) otherwise
+    # blow the axes out to ±80 and waste the LIMIT budget on junk photometry.
+    # Lower bound -5 keeps genuinely bright sources while excluding -9/-99 sentinels.
+    value_cuts = [dict(vc) for vc in (extra_value_cuts or [])]
+    for col in dict.fromkeys(magcols.values()):
+        value_cuts.append({"column": col, "op": ">", "value": _VALID_MAG_RANGE[0]})
+        value_cuts.append({"column": col, "op": "<", "value": _VALID_MAG_RANGE[1]})
+    morphology = None
+    ps_note = None
+    if point_sources:
+        morphology = reg.point_source_cut(catalog, table)
+        if morphology is None:
+            ps_note = (f"{catalog}.{table} has no registered star/galaxy separator; "
+                       "point_sources request ignored (returning ALL sources).")
+    predicates = builders.build_catalog_predicates(catalog, table, value_cuts=value_cuts, morphology=morphology)
+    sql, meta = builders.build_cone_select(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
+                                           columns=cols, limit=limit, predicates=predicates)
     result_id, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
+    meta = dict(meta or {})
+    meta["point_source_cut_applied"] = bool(morphology)
+    if ps_note:
+        meta.setdefault("warnings", []).append(ps_note)
     return result_id, result, magcols, meta
+
+
+_VALID_MAG_RANGE = (-5.0, 50.0)
+
+
+def _valid_mag_mask(*series):
+    """Finite AND inside the physical magnitude range for every series given."""
+    import numpy as np
+    import pandas as pd
+    mask = None
+    lo, hi = _VALID_MAG_RANGE
+    for s in series:
+        vals = pd.to_numeric(s, errors="coerce")
+        good = np.isfinite(vals) & (vals > lo) & (vals < hi)
+        mask = good if mask is None else (mask & good)
+    return mask
+
+
+def _plotly_scatter_spec(panels, *, x_label, y_label, title, invert_y=False, max_points=4000):
+    """Build a JSON-safe Plotly figure spec (traces + layout) for 1-2 scatter panels.
+
+    panels: [(label, x_values, y_values)] — values are downsampled to max_points
+    per panel so the spec stays light enough to stream over SSE.
+    """
+    import numpy as np
+    traces = []
+    n_panels = max(1, len(panels))
+    for idx, (label, xs, ys) in enumerate(panels):
+        x = np.asarray(xs, dtype=float)
+        y = np.asarray(ys, dtype=float)
+        if len(x) > max_points:
+            sel = np.random.default_rng(0).choice(len(x), size=max_points, replace=False)
+            x, y = x[sel], y[sel]
+        trace = {
+            # Plain SVG scatter, NOT scattergl: the frontend ships the basic
+            # Plotly bundle (no WebGL renderer), and points are capped anyway.
+            "type": "scatter",
+            "mode": "markers",
+            "name": f"{label} (n={len(xs)})",
+            "x": [round(float(v), 4) for v in x],
+            "y": [round(float(v), 4) for v in y],
+            "marker": {"size": 3, "opacity": 0.55},
+        }
+        if n_panels > 1:
+            trace["xaxis"] = f"x{idx + 1 if idx else ''}"
+            trace["yaxis"] = f"y{idx + 1 if idx else ''}"
+        traces.append(trace)
+    layout = {
+        "title": {"text": title},
+        "xaxis": {"title": {"text": x_label}},
+        "yaxis": {"title": {"text": y_label}, "autorange": "reversed" if invert_y else True},
+        "showlegend": n_panels > 1,
+        "margin": {"l": 55, "r": 15, "t": 45, "b": 45},
+    }
+    if n_panels > 1:
+        layout["grid"] = {"rows": 1, "columns": n_panels, "pattern": "independent"}
+        layout["xaxis2"] = {"title": {"text": x_label}}
+        layout["yaxis2"] = {"title": {"text": y_label}, "autorange": "reversed" if invert_y else True}
+    return {"data": traces, "layout": layout}
 
 
 def _render_diagram(plotting, fig, prefix, result_id, provenance, extra):
@@ -315,34 +618,40 @@ def color_color_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_bands=("g", "r"), y_bands=("r", "i"),
     split_col=None, split_threshold=0.005, limit=3000, title=None,
+    point_sources=False, value_cuts=None,
     client=None, result_store=None, plotting_service=None,
 ):
     """P5: one-shot color-color diagram. Queries the cone, optionally splits into stars/galaxies
     by a morphology column (auto-detected from the registry, e.g. DES spread_model_r), and renders
-    a 1- or 2-panel CCD as a single image."""
-    import numpy as np
+    a 1- or 2-panel CCD as a single image. Sentinel magnitudes (99.99) are cut both server- and
+    client-side so the axes stay physical."""
     import pandas as pd
     from services import datalab_registry as reg
     from services.plotting import PlottingService
     client = client or _default_client()
     result_store = result_store or _default_result_store()
     plotting = plotting_service or PlottingService()
-    if split_col is None:
+    if split_col is None and not point_sources:
         split_col = reg.morphology_split_column(catalog, table)
 
     bands = list(dict.fromkeys([*x_bands, *y_bands]))
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands,
         extra_cols=[split_col] if split_col else [], limit=limit, client=client, result_store=result_store,
+        point_sources=point_sources, extra_value_cuts=value_cuts,
     )
     df = result.dataframe
+    _ps_applied = bool(_meta.get("point_source_cut_applied"))
+    used_cols = [magcols[b] for b in dict.fromkeys([*x_bands, *y_bands])]
+    valid = _valid_mag_mask(*[df[c] for c in used_cols])
     x = pd.to_numeric(df[magcols[x_bands[0]]], errors="coerce") - pd.to_numeric(df[magcols[x_bands[1]]], errors="coerce")
     y = pd.to_numeric(df[magcols[y_bands[0]]], errors="coerce") - pd.to_numeric(df[magcols[y_bands[1]]], errors="coerce")
-    finite = np.isfinite(x) & np.isfinite(y)
+    finite = valid
     xl, yl = f"{x_bands[0]}-{x_bands[1]}", f"{y_bands[0]}-{y_bands[1]}"
 
     plt = plotting._apply_style(dark=False)
     populations = []
+    panels = []
     if split_col and split_col in df.columns:
         s = pd.to_numeric(df[split_col], errors="coerce")
         groups = [("stars", finite & (s <= split_threshold)), ("galaxies", finite & (s > split_threshold))]
@@ -352,27 +661,37 @@ def color_color_diagram(
             ax.set_xlabel(xl); ax.set_ylabel(yl); ax.grid(True, alpha=0.3)
             ax.set_title(f"{label} (n={int(mask.sum())})")
             populations.append({"population": label, "n": int(mask.sum())})
+            panels.append((label, x[mask].tolist(), y[mask].tolist()))
     else:
         fig, ax = plt.subplots(figsize=(5.0, 4.0))
         ax.scatter(x[finite], y[finite], s=6, alpha=0.4, edgecolors="none")
         ax.set_xlabel(xl); ax.set_ylabel(yl); ax.grid(True, alpha=0.3)
-        populations.append({"population": "all", "n": int(finite.sum())})
-    fig.suptitle(title or f"{catalog}.{table} — {xl} vs {yl}")
+        populations.append({"population": "point sources" if _ps_applied else "all", "n": int(finite.sum())})
+        panels.append(("point sources" if _ps_applied else "all", x[finite].tolist(), y[finite].tolist()))
+    plot_title = title or f"{catalog}.{table} — {xl} vs {yl}"
+    fig.suptitle(plot_title)
     fig.tight_layout()
+    plotly_spec = _plotly_scatter_spec(panels, x_label=xl, y_label=yl, title=plot_title)
+    ps_applied = bool(_meta.get("point_source_cut_applied"))
     return _render_diagram(plotting, fig, "datalab_ccd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
-                           {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col, "populations": populations})
+                           {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col,
+                            "point_sources": ps_applied, "populations": populations,
+                            "warnings": list(_meta.get("warnings") or []),
+                            "excluded_invalid_mags": int(len(df) - int(finite.sum())),
+                            "plotly_spec": plotly_spec})
 
 
 def color_magnitude_diagram(
     catalog, table, ra, dec, radius_deg, *,
     blue_band="g", red_band="r", mag_band=None, limit=5000, title=None,
+    point_sources=False, value_cuts=None,
     client=None, result_store=None, plotting_service=None,
 ):
-    """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted."""
-    import numpy as np
+    """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted.
+    Sentinel magnitudes are excluded server- and client-side; point_sources=True applies the
+    catalog's registered star/galaxy cut (e.g. NSC class_star > 0.5)."""
     import pandas as pd
-    from services import datalab_registry as reg
     from services.plotting import PlottingService
     client = client or _default_client()
     result_store = result_store or _default_result_store()
@@ -381,22 +700,35 @@ def color_magnitude_diagram(
     bands = list(dict.fromkeys([blue_band, red_band, mag_band]))
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands, extra_cols=[], limit=limit,
-        client=client, result_store=result_store,
+        client=client, result_store=result_store, point_sources=point_sources,
+        extra_value_cuts=value_cuts,
     )
     df = result.dataframe
+    valid = _valid_mag_mask(*[df[magcols[b]] for b in dict.fromkeys([blue_band, red_band, mag_band])])
     color = pd.to_numeric(df[magcols[blue_band]], errors="coerce") - pd.to_numeric(df[magcols[red_band]], errors="coerce")
     mag = pd.to_numeric(df[magcols[mag_band]], errors="coerce")
-    finite = np.isfinite(color) & np.isfinite(mag)
+    finite = valid
     xl, yl = f"{blue_band}-{red_band}", f"{mag_band}"
     plt = plotting._apply_style(dark=False)
     fig, ax = plt.subplots(figsize=(5.0, 5.0))
     ax.scatter(color[finite], mag[finite], s=6, alpha=0.4, edgecolors="none")
     ax.set_xlabel(xl); ax.set_ylabel(yl); ax.invert_yaxis(); ax.grid(True, alpha=0.3)
-    ax.set_title(title or f"{catalog}.{table} CMD — {yl} vs {xl}")
+    plot_title = title or f"{catalog}.{table} CMD — {yl} vs {xl}"
+    ax.set_title(plot_title)
     fig.tight_layout()
+    ps_applied = bool(_meta.get("point_source_cut_applied"))
+    label = "point sources" if ps_applied else "all sources"
+    plotly_spec = _plotly_scatter_spec(
+        [(label, color[finite].tolist(), mag[finite].tolist())],
+        x_label=xl, y_label=yl, title=plot_title, invert_y=True,
+    )
     return _render_diagram(plotting, fig, "datalab_cmd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
-                           {"rowcount": int(len(df)), "x": xl, "y": yl, "points": int(finite.sum())})
+                           {"rowcount": int(len(df)), "x": xl, "y": yl, "points": int(finite.sum()),
+                            "point_sources": ps_applied,
+                            "warnings": list(_meta.get("warnings") or []),
+                            "excluded_invalid_mags": int(len(df) - int(finite.sum())),
+                            "plotly_spec": plotly_spec})
 
 
 __all__ = [

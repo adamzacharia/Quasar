@@ -56,12 +56,14 @@ class TokenBudget:
         self._last_check_chars = 0
         self._second_last_check_chars = 0
         self._consecutive_low_growth = 0
+        self._last_round_tool_calls = 0
         self._start_time = time.time()
 
-    def record_output(self, chars: int):
-        """Record that the agent produced output in this iteration."""
+    def record_output(self, chars: int, tool_calls: int = 0):
+        """Record that the agent produced output (and ran tools) this iteration."""
         self._total_output_chars += chars
         self._iteration += 1
+        self._last_round_tool_calls = int(tool_calls)
 
     def should_continue(self) -> bool:
         """
@@ -96,7 +98,13 @@ class TokenBudget:
         self._last_check_chars = self._total_output_chars
 
         if self._iteration > 2:  # Need at least 2 iterations to check
-            if growth_since_last < DIMINISHING_THRESHOLD_CHARS:
+            if self._last_round_tool_calls > 0:
+                # A round that executed tools IS progress even with little text —
+                # methodical models narrate briefly between tool batches, and the
+                # old text-only heuristic killed their turns mid-workflow
+                # (2026-07-04 live test: deepseek P1/P8/P11 truncated mid-plan).
+                self._consecutive_low_growth = 0
+            elif growth_since_last < DIMINISHING_THRESHOLD_CHARS:
                 self._consecutive_low_growth += 1
             else:
                 self._consecutive_low_growth = 0
@@ -131,4 +139,5 @@ class TokenBudget:
         self._last_check_chars = 0
         self._second_last_check_chars = 0
         self._consecutive_low_growth = 0
+        self._last_round_tool_calls = 0
         self._start_time = time.time()

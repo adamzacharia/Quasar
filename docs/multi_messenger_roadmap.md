@@ -84,7 +84,7 @@ flowchart TD
 
 ## 3. The 4 Core Feature Moats (Building What Lium Structurally Cannot)
 
-These four ideas deepen Quasar’s open-source moat and leverage its biggest strengths: the **Sandboxed REPL**, **instrument-specific depth**, and **academic community lock-in**.
+These four ideas deepen Quasar’s source-available moat and leverage its biggest strengths: the **Sandboxed REPL**, **instrument-specific depth**, and **academic community lock-in**.
 
 ### Idea A: The "Rubin / LSST Alert Filter"
 *   **The Context:** The Vera C. Rubin Observatory (LSST) will generate **10 million alerts every single night**. Astronomers are terrified of getting drowned in noise.

@@ -66,6 +66,20 @@ class SkyMonitorService:
         cur = conn.cursor()
         cur.execute(_TARGETS_DDL)
         cur.execute(_HITS_DDL)
+        # guard review P2: DB-enforced case-insensitive name uniqueness so a
+        # concurrent add_target("same") pair cannot both insert.
+        try:
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sky_monitor_target_name "
+                "ON sky_monitor_targets (LOWER(name))"
+            )
+        except Exception as idx_err:
+            # A legacy DB can already hold case-insensitive duplicate names
+            # (pre-index disable + re-add). Failing _connect() forever would
+            # brick every operation including the remove_target needed to fix
+            # it, so degrade to the app-level check alone for this database.
+            if "unique" not in str(idx_err).lower():
+                raise
         conn.commit()
         return conn
 
@@ -102,11 +116,18 @@ class SkyMonitorService:
                                 "error": (f"Target {row[1]!r} (id {row[0]}) is already watched "
                                           f"{sep:.1f} arcsec from this position.")}
                 created = _utc_now_iso()
-                cur.execute(
-                    "INSERT INTO sky_monitor_targets (name, ra, dec, radius_arcsec, enabled, created_at, note) "
-                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
-                    (name_s, ra_f, dec_f, radius, created, str(note) if note else None),
-                )
+                try:
+                    cur.execute(
+                        "INSERT INTO sky_monitor_targets (name, ra, dec, radius_arcsec, enabled, created_at, note) "
+                        "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        (name_s, ra_f, dec_f, radius, created, str(note) if note else None),
+                    )
+                except Exception as ins_err:  # unique-index race loser
+                    if "unique" in str(ins_err).lower():
+                        return {"success": False,
+                                "error": (f"A watchlist entry named {name_s!r} already exists "
+                                          f"(possibly disabled — list targets to see it).")}
+                    raise
                 conn.commit()
                 target_id = cur.lastrowid
             finally:
@@ -221,39 +242,56 @@ class SkyMonitorService:
                 if not result.get("success"):
                     warnings.append(f"ALeRCE check failed for {tname!r}: {result.get('error')}")
                     continue
-                checked += 1
-                now_iso = _utc_now_iso()
-                conn = self._connect()
-                try:
-                    cur = conn.cursor()
-                    for obj in result.get("rows") or []:
-                        oid = str(obj.get("oid") or "").strip()
-                        if not oid:
-                            continue
-                        cur.execute(
-                            "SELECT 1 FROM sky_monitor_hits WHERE target_id = ? AND oid = ?",
-                            (tid, oid),
-                        )
-                        if cur.fetchone() is not None:
-                            continue
-                        class_name = obj.get("classalerce") or obj.get("class") or obj.get("classification")
-                        cur.execute(
-                            "INSERT INTO sky_monitor_hits (target_id, oid, first_seen_at, last_mjd, ndet, class_name) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (tid, oid, now_iso, _to_float(obj.get("lastmjd")),
-                             _to_int(obj.get("ndet")), str(class_name) if class_name else None),
-                        )
-                        new_alerts.append({"target_name": tname, "oid": oid,
-                                           "ndet": _to_int(obj.get("ndet")),
-                                           "lastmjd": _to_float(obj.get("lastmjd")),
-                                           "class_name": str(class_name) if class_name else None})
-                    cur.execute(
-                        "UPDATE sky_monitor_targets SET last_checked_at = ? WHERE id = ?",
-                        (now_iso, tid),
+                rows = result.get("rows") or []
+                if len(rows) >= 200:
+                    warnings.append(
+                        f"{tname!r}: ALeRCE returned the 200-object page cap; results in this "
+                        f"dense field may be truncated — consider a smaller radius."
                     )
-                    conn.commit()
-                finally:
-                    conn.close()
+                now_iso = _utc_now_iso()
+                # A DB failure on ONE target must not discard alerts already
+                # found for the others; alerts are reported only after their
+                # commit lands, so an uncommitted batch re-surfaces next check
+                # (duplicate-safe direction) instead of vanishing.
+                target_alerts: List[Dict[str, Any]] = []
+                try:
+                    conn = self._connect()
+                    try:
+                        cur = conn.cursor()
+                        for obj in rows:
+                            oid = str(obj.get("oid") or "").strip()
+                            if not oid:
+                                continue
+                            class_name = obj.get("classalerce") or obj.get("class") or obj.get("classification")
+                            # guard review P2: INSERT OR IGNORE is race-safe under
+                            # UNIQUE(target_id, oid) — "new" means the row actually
+                            # landed (rowcount 1), not that a prior SELECT saw nothing.
+                            cur.execute(
+                                "INSERT OR IGNORE INTO sky_monitor_hits "
+                                "(target_id, oid, first_seen_at, last_mjd, ndet, class_name) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (tid, oid, now_iso, _to_float(obj.get("lastmjd")),
+                                 _to_int(obj.get("ndet")), str(class_name) if class_name else None),
+                            )
+                            if getattr(cur, "rowcount", 0) != 1:
+                                continue
+                            target_alerts.append({"target_name": tname, "oid": oid,
+                                                  "ndet": _to_int(obj.get("ndet")),
+                                                  "lastmjd": _to_float(obj.get("lastmjd")),
+                                                  "class_name": str(class_name) if class_name else None})
+                        cur.execute(
+                            "UPDATE sky_monitor_targets SET last_checked_at = ? WHERE id = ?",
+                            (now_iso, tid),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception as db_err:
+                    warnings.append(f"Database write failed for {tname!r}: {db_err}; "
+                                    f"its alerts will be re-detected on the next check.")
+                    continue
+                checked += 1
+                new_alerts.extend(target_alerts)
 
             return {"success": True, "new_alerts": new_alerts, "n_new": len(new_alerts),
                     "n_targets_checked": checked, "warnings": warnings,
@@ -266,18 +304,27 @@ class SkyMonitorService:
         try:
             interval = max(60, int(interval_s))
             if self._thread is not None and self._thread.is_alive():
-                return {"success": True, "already_running": True, "interval_s": interval}
+                if not self._thread_stop.is_set():
+                    return {"success": True, "already_running": True, "interval_s": interval}
+                # A stop is pending: that loop is about to exit, so reporting
+                # already_running would leave monitoring silently off. Let it
+                # finish (it wakes immediately from its wait) and start fresh.
+                self._thread.join(timeout=5.0)
 
-            self._thread_stop.clear()
+            # Each loop owns a PRIVATE stop event captured in its closure: a
+            # stale loop that outlives its join (e.g. mid network call) still
+            # exits on its own event and can never be revived by a later clear.
+            stop_event = threading.Event()
+            self._thread_stop = stop_event
 
             def _loop():
-                while not self._thread_stop.is_set():
+                while not stop_event.is_set():
                     try:
                         self.check_now()
                     except Exception:
                         pass
                     # jitter so multiple instances never sync-hammer ALeRCE
-                    self._thread_stop.wait(interval + random.uniform(0, interval * 0.1))
+                    stop_event.wait(interval + random.uniform(0, interval * 0.1))
 
             self._thread = threading.Thread(target=_loop, name="sky-monitor", daemon=True)
             self._thread.start()
@@ -287,6 +334,9 @@ class SkyMonitorService:
 
     def stop_background(self) -> Dict[str, Any]:
         self._thread_stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
         return {"success": True}
 
 
@@ -307,6 +357,8 @@ def _normalize_radius(radius_arcsec: Any) -> Tuple[float, List[str]]:
         radius = float(radius_arcsec)
     except (TypeError, ValueError):
         return 120.0, ["radius_arcsec was not numeric; using 120."]
+    if not math.isfinite(radius):
+        return 120.0, ["radius_arcsec was not finite; using 120."]
     if radius <= 0:
         warnings.append(f"radius_arcsec {radius:g} is non-positive; using 120.")
         radius = 120.0

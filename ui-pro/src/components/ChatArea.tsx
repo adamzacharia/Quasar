@@ -510,6 +510,30 @@ export function ChatArea() {
                                 imageMeta: normalizeHipsImageMeta(img.meta),
                             });
                         },
+                        onPlotly: (plot) => {
+                            // Interactive Plotly figure — same flow as images (ephemeral,
+                            // not persisted server-side). Resolve the PNG fallback URL to
+                            // an absolute backend URL like image cards do.
+                            const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+                            const rawFallback = plot.png_fallback || "";
+                            const pngFallback = rawFallback
+                                ? (rawFallback.startsWith("http") || rawFallback.startsWith("data:") ? rawFallback : `${apiBase}${rawFallback}`)
+                                : undefined;
+                            const spec = plot.spec && typeof plot.spec === "object" && Array.isArray(plot.spec.data)
+                                ? { data: plot.spec.data, layout: plot.spec.layout }
+                                : undefined;
+                            if (!spec && !pngFallback) return; // nothing renderable
+                            addMessage({
+                                id: generateId(),
+                                role: "assistant",
+                                content: plot.title || "",
+                                type: "plotly",
+                                timestamp: new Date(),
+                                plotlySpec: spec,
+                                plotlyTitle: plot.title || "",
+                                plotlyPngFallback: pngFallback,
+                            });
+                        },
                         onTaskGroup: (group) => handleTaskGroup(group),
                         onTaskUpdate: (update) => handleTaskUpdate(update),
                         onTaskList: (list) => handleTaskList(list),

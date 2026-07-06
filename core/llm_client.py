@@ -227,6 +227,11 @@ class LLMResponse:
     id: str = ""
     output: List[Any] = field(default_factory=list)
     usage: Optional[LLMUsage] = None
+    # Chat Completions finish_reason ("stop" | "length" | "tool_calls" | ...).
+    # "length" means the provider truncated the response at its output-token
+    # cap — the agent loop uses this to auto-continue instead of treating the
+    # cut-off text as the final answer. None = provider did not report one.
+    finish_reason: Optional[str] = None
 
     def __post_init__(self):
         if not self.id:
@@ -1211,13 +1216,7 @@ class ResponsesShim:
             if fmt.get("type") == "json_object":
                 json_mode = True
 
-        with self._history_lock:
-            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
-        if cached_messages:
-            messages = cached_messages
-            self._append_chat_input(messages, input_data)
-        else:
-            messages = self._build_chat_messages(instructions, input_data, json_mode)
+        messages = self._chat_messages_for_input(prev_id, instructions, input_data, json_mode)
 
         messages = self._inject_images_into_messages(messages, attachments)
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
@@ -1280,13 +1279,7 @@ class ResponsesShim:
         tools_raw = kwargs.get("tools", None)
         prev_id = kwargs.get("previous_response_id", None)
 
-        with self._history_lock:
-            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
-        if cached_messages:
-            messages = cached_messages
-            self._append_chat_input(messages, input_data)
-        else:
-            messages = self._build_chat_messages(instructions, input_data)
+        messages = self._chat_messages_for_input(prev_id, instructions, input_data)
 
         messages = self._inject_images_into_messages(messages, attachments)
         openai_tools = self._translate_tools_for_chat_completions(tools_raw) if tools_raw else None
@@ -1314,6 +1307,7 @@ class ResponsesShim:
         function_calls = {}
         output_text = ""
         usage_obj = None
+        finish_reason = None
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         stream = completions_engine.create(**call_kwargs)
@@ -1327,6 +1321,8 @@ class ResponsesShim:
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
 
             delta = choice.delta
             if delta.content:
@@ -1359,12 +1355,18 @@ class ResponsesShim:
             yield StreamEvent(type="response.output_item.done", item=fc)
 
         completed_items = [fc for fc in function_calls.values()]
+        if finish_reason and finish_reason != "stop":
+            print(
+                f"[PROVIDER] tacc stream finish_reason={finish_reason!r} "
+                f"output_chars={len(output_text)} tool_calls={len(completed_items)}"
+            )
         yield StreamEvent(
             type="response.completed",
             response=LLMResponse(
                 id=resp_id,
                 output=completed_items,
                 usage=usage_obj,
+                finish_reason=finish_reason,
             ),
         )
 
@@ -1389,6 +1391,44 @@ class ResponsesShim:
             new_messages.append({"role": "assistant", "content": output_text})
         with self._history_lock:
             self._history_cache[resp_id] = new_messages
+
+    def _chat_messages_for_input(self, prev_id, instructions: str, input_data, json_mode: bool = False) -> list:
+        """Resolve the message list for a chat-completions round.
+
+        Normal path: extend the cached history for prev_id. Healing path: when
+        the chain is broken (a deadline kill clears the history cache while the
+        agent thread is still inside a long tool call — live DS-P8 2026-07-05),
+        a tool-results input would otherwise become [system, tool, tool], which
+        providers reject with 400 "role 'tool' must be a response to ...".
+        Convert the orphaned tool outputs into a user message so the round
+        stays valid and the model can continue from the results it produced.
+        """
+        with self._history_lock:
+            cached = list(self._history_cache.get(prev_id, [])) if prev_id else []
+        if cached:
+            self._append_chat_input(cached, input_data)
+            return cached
+        is_tool_results = isinstance(input_data, list) and any(
+            isinstance(i, dict) and i.get("type") == "function_call_output" for i in input_data
+        )
+        if prev_id and is_tool_results:
+            parts = [
+                str(i.get("output", ""))[:4000]
+                for i in input_data
+                if isinstance(i, dict) and i.get("type") == "function_call_output"
+            ]
+            print(
+                f"[PROVIDER] history chain broken for {prev_id} — converting "
+                f"{len(parts)} orphaned tool output(s) into a user message"
+            )
+            recovery_text = (
+                "[SYSTEM NOTE] The tool-call history was reset mid-turn. These are "
+                "the results of the tool calls you just made:\n\n"
+                + "\n\n---\n\n".join(parts)
+                + "\n\nContinue the user's request from these results."
+            )
+            return self._build_chat_messages(instructions, recovery_text, json_mode)
+        return self._build_chat_messages(instructions, input_data, json_mode)
 
     def _build_chat_messages(self, instructions: str, input_data, json_mode: bool = False) -> list:
         """Build Chat Completions messages from responses.create() args."""
@@ -1543,6 +1583,7 @@ class ResponsesShim:
             id=resp.id if hasattr(resp, 'id') else f"resp_{uuid.uuid4().hex[:16]}",
             output=output_items,
             usage=usage,
+            finish_reason=getattr(choice, 'finish_reason', None),
         )
 
     @staticmethod
@@ -1582,6 +1623,22 @@ class ResponsesShim:
 
         return messages
 
+    @staticmethod
+    def _deepseek_max_tokens(requested) -> int:
+        """Clamp DeepSeek max_tokens to a predictable ceiling.
+
+        DeepSeek truncates output at its provider-side cap regardless of an
+        oversized request (live 2026-07-05: MAX_TOKENS=200000 turns died
+        mid-sentence with no error). A bounded request keeps truncation
+        detectable via finish_reason=length so the agent loop can auto-continue.
+        """
+        cap = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "32768"))
+        try:
+            req = int(requested)
+        except (TypeError, ValueError):
+            req = cap
+        return max(1, min(req, cap))
+
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
         """Translate responses.create() to DeepSeek Chat Completions API."""
@@ -1589,7 +1646,7 @@ class ResponsesShim:
         model = kwargs.get("model", self._llm.default_model)
         instructions = kwargs.get("instructions", "")
         input_data = kwargs.get("input", "")
-        max_tokens = kwargs.get("max_output_tokens", 2000)
+        max_tokens = self._deepseek_max_tokens(kwargs.get("max_output_tokens", 2000))
         tools_raw = kwargs.get("tools", None)
         prev_id = kwargs.get("previous_response_id", None)
         json_mode = False
@@ -1599,14 +1656,7 @@ class ResponsesShim:
             if fmt.get("type") == "json_object":
                 json_mode = True
 
-        # Load from history cache if available to chain message history
-        with self._history_lock:
-            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
-        if cached_messages:
-            messages = cached_messages
-            self._append_chat_input(messages, input_data)
-        else:
-            messages = self._build_chat_messages(instructions, input_data, json_mode)
+        messages = self._chat_messages_for_input(prev_id, instructions, input_data, json_mode)
 
         if attachments and any(att.get("type") == "image_url" or "image_url" in att for att in attachments):
             logger.warning("Dropping raw image attachments for DeepSeek; use the image prepass upstream.")
@@ -1635,6 +1685,10 @@ class ResponsesShim:
         completions_engine = getattr(getattr(client, "chat"), "completions")
         resp = completions_engine.create(**call_kwargs)
         result = self._chat_completion_to_llm_response(resp)
+        print(
+            f"[PROVIDER] deepseek finish_reason={result.finish_reason!r} "
+            f"max_tokens={max_tokens} output_chars={len(result.output_text or '')}"
+        )
 
         # Extract reasoning_content from the response message
         msg = resp.choices[0].message if resp.choices else None
@@ -1677,18 +1731,11 @@ class ResponsesShim:
         model = kwargs.get("model", self._llm.default_model)
         instructions = kwargs.get("instructions", "")
         input_data = kwargs.get("input", "")
-        max_tokens = kwargs.get("max_output_tokens", 2000)
+        max_tokens = self._deepseek_max_tokens(kwargs.get("max_output_tokens", 2000))
         tools_raw = kwargs.get("tools", None)
         prev_id = kwargs.get("previous_response_id", None)
 
-        # Load from history cache if available to chain message history
-        with self._history_lock:
-            cached_messages = list(self._history_cache.get(prev_id, [])) if prev_id else []
-        if cached_messages:
-            messages = cached_messages
-            self._append_chat_input(messages, input_data)
-        else:
-            messages = self._build_chat_messages(instructions, input_data)
+        messages = self._chat_messages_for_input(prev_id, instructions, input_data)
 
         if attachments and any(att.get("type") == "image_url" or "image_url" in att for att in attachments):
             logger.warning("Dropping raw image attachments for DeepSeek streaming; use the image prepass upstream.")
@@ -1722,6 +1769,7 @@ class ResponsesShim:
         output_text = ""
         reasoning_content = ""
         usage_obj = None
+        finish_reason = None
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
         stream = completions_engine.create(**call_kwargs)
@@ -1737,6 +1785,8 @@ class ResponsesShim:
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
+            if getattr(choice, 'finish_reason', None):
+                finish_reason = choice.finish_reason
 
             delta = choice.delta
 
@@ -1791,12 +1841,18 @@ class ResponsesShim:
             yield StreamEvent(type="response.output_item.done", item=fc)
 
         completed_items = [fc for fc in function_calls.values()]
+        print(
+            f"[PROVIDER] deepseek stream finish_reason={finish_reason!r} "
+            f"max_tokens={max_tokens} output_chars={len(output_text)} "
+            f"reasoning_chars={len(reasoning_content)} tool_calls={len(completed_items)}"
+        )
         yield StreamEvent(
             type="response.completed",
             response=LLMResponse(
                 id=resp_id,
                 output=completed_items,
                 usage=usage_obj,
+                finish_reason=finish_reason,
             )
         )
 

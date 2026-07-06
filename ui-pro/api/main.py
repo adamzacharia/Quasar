@@ -8,6 +8,17 @@ Run with:  uvicorn api.main:app --reload --port 8000
 import sys, os, json, asyncio, uuid, re
 import queue as stdlib_queue
 
+# ── Windows fix: cp1252 stdout/stderr crash the agent loop when a print()
+# carries non-Latin-1 text (live 2026-07-05: a tool-call log with U+2212 from
+# the user's prompt raised UnicodeEncodeError mid-turn and killed the round).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        # line_buffering: stdout redirected to a log file is otherwise 8KB
+        # block-buffered, so diagnostic prints lag minutes behind reality.
+        _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
+
 # ── Windows fix: langchain_community.document_loaders.pebblo imports 'pwd' (Unix-only) ──
 if sys.platform == "win32" and "pwd" not in sys.modules:
     import types
@@ -1435,6 +1446,16 @@ def _stream_chat_response(
         inactivity_timeout = int(os.getenv("CHAT_INACTIVITY_TIMEOUT_SECONDS", "90"))
         standard_timeout = int(os.getenv("CHAT_STANDARD_TIMEOUT_SECONDS", "240"))
         conductor_timeout = int(os.getenv("CHAT_CONDUCTOR_TIMEOUT_SECONDS", "360"))
+        # Methodical reasoning providers legitimately need more than 240s of
+        # multi-round tool work (2026-07-04 live test: four deepseek turns were
+        # killed mid-analysis by this cap while actively calling tools). The
+        # inactivity watchdog still catches genuinely stuck runs.
+        if provider == "deepseek":
+            standard_timeout = int(os.getenv("CHAT_DEEPSEEK_TIMEOUT_SECONDS", "480"))
+            conductor_timeout = max(conductor_timeout, standard_timeout + 120)
+        # Ceiling for progress-aware deadline extensions (tool completions and
+        # heartbeats push the turn deadline out, but never past this).
+        hard_max_timeout = int(os.getenv("CHAT_HARD_MAX_TIMEOUT_SECONDS", "900"))
         run_started_at = _time.perf_counter()
         run_status = "started"
         run_error_code = ""
@@ -1473,7 +1494,10 @@ def _stream_chat_response(
             "provider": provider,
             "conversation_id": conv_id or request.conversation_id or "",
             "inactivity_timeout_seconds": inactivity_timeout,
-            "turn_timeout_seconds": standard_timeout,
+            # Advertise the HARD ceiling: the effective turn deadline extends while
+            # tools are completing, so the frontend watchdog must not pre-empt an
+            # actively-progressing backend at the base value.
+            "turn_timeout_seconds": hard_max_timeout,
         }
         yield f"data: {json.dumps(run_meta)}\n\n"
 
@@ -1801,6 +1825,7 @@ def _stream_chat_response(
                 standard_seconds=standard_timeout,
                 conductor_seconds=conductor_timeout,
                 started_at=run_started_at,
+                hard_max_seconds=hard_max_timeout,
             )
 
             while True:
@@ -1840,6 +1865,15 @@ def _stream_chat_response(
                 deadline.mark_activity(_time.perf_counter())
                 if isinstance(msg, tuple) and len(msg) == 3:
                     msg_type, step, state = msg
+                    if msg_type == "status" and isinstance(step, str) and (
+                        step.startswith("__tool_heartbeat__")
+                        or (state == "completed" and not step.startswith("__"))
+                    ):
+                        # Completed tool steps and live tool heartbeats are real
+                        # progress — push the total-turn deadline out so long
+                        # multi-tool workflows aren't killed mid-analysis while
+                        # actively working (2026-07 live test P6/P9/P14/P15).
+                        deadline.extend_for_progress(_time.perf_counter())
                     if msg_type == "status":
                         if step == "__run_mode__:conductor":
                             deadline.enable_conductor()
@@ -1880,6 +1914,23 @@ def _stream_chat_response(
                                     if _eager_result.get("type") == "data":
                                         # Do not eagerly emit data cards during streaming to avoid showing intermediate results
                                         print(f"[EAGER] Bypassed eager emission for data card idx={_eager_idx} during streaming")
+                                    elif _eager_result.get("type") == "image":
+                                        # Figures render the moment their tool completes; a
+                                        # deadline-killed turn no longer loses already-built
+                                        # plots. _emitted_image_urls keeps the done-path from
+                                        # re-emitting these.
+                                        img_url = _eager_result.get("image_url", "")
+                                        caption = _eager_result.get("caption", "")
+                                        meta = _eager_result.get("meta")
+                                        plotly_spec = _eager_result.get("plotly_spec")
+                                        if img_url and img_url not in _emitted_image_urls:
+                                            _emitted_image_urls.add(img_url)
+                                            if plotly_spec:
+                                                yield f"data: {json.dumps({'type': 'plotly', 'spec': plotly_spec, 'title': caption, 'png_fallback': img_url, 'meta': meta})}\n\n"
+                                            else:
+                                                yield f"data: {json.dumps({'type': 'image', 'url': img_url, 'caption': caption, 'meta': meta})}\n\n"
+                                            _record_rich_image(img_url, caption, meta)
+                                            print(f"[EAGER] Image emitted during streaming: {str(img_url)[:100]}")
                                     else:
                                         card = _build_data_card_event(_eager_result)
                                         if card:
@@ -2100,12 +2151,21 @@ def _stream_chat_response(
                     img_url = _run_result.get("image_url", "")
                     caption = _run_result.get("caption", "")
                     meta = _run_result.get("meta")
+                    plotly_spec = _run_result.get("plotly_spec")
                     if img_url and img_url not in _emitted_image_urls:
                         _emitted_image_urls.add(img_url)
-                        image_event = json.dumps({
-                            "type": "image", "url": img_url, "caption": caption, "meta": meta,
-                        })
-                        yield f"data: {image_event}\n\n"
+                        if plotly_spec:
+                            # Interactive card; the PNG stays as fallback + history record.
+                            plotly_event = json.dumps({
+                                "type": "plotly", "spec": plotly_spec, "title": caption,
+                                "png_fallback": img_url, "meta": meta,
+                            })
+                            yield f"data: {plotly_event}\n\n"
+                        else:
+                            image_event = json.dumps({
+                                "type": "image", "url": img_url, "caption": caption, "meta": meta,
+                            })
+                            yield f"data: {image_event}\n\n"
                         _record_rich_image(img_url, caption, meta)
                         await asyncio.sleep(0.05)
 

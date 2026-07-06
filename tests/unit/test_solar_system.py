@@ -257,3 +257,20 @@ def test_horizons_range_guard_truncates_and_rejects():
     out3 = svc.horizons_ephemeris("Ceres", "2026-07-05", "2026-07-03")
     assert out3["success"] is False
     assert "must be after" in out3["error"]
+
+
+def test_skybot_nan_radius_rejected(monkeypatch):
+    # guard review P3: NaN must not reach the wire.
+    calls = {}
+
+    def fake_get(url, params=None, timeout=None):
+        calls["params"] = dict(params or {})
+        return FakeResponse([])
+
+    from services import solar_system
+
+    monkeypatch.setattr(solar_system.requests, "get", fake_get)
+    out = SolarSystemService().skybot_cone(10.0, 10.0, radius_deg=float("nan"))
+    assert out["success"] is True
+    assert calls["params"]["-rd"] == 0.2
+    assert any("finite" in w for w in out["warnings"])

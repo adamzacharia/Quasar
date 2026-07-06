@@ -44,16 +44,24 @@ def build_cone_select(
     radius_deg: float,
     columns: Optional[Sequence[str]] = None,
     limit: int = DEFAULT_ROW_LIMIT,
+    predicates: Optional[Sequence[str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     _validate_sky(ra, dec, radius_deg)
     row_limit = _limit(limit)
     select_cols = _select_columns(info, columns)
+    # Extra cuts must come from build_catalog_predicates (registry-validated),
+    # so the LIMIT budget is spent on rows that survive the selection.
+    where_parts = [f"q3c_radial_query({ra_col}, {dec_col}, {_num(ra)}, {_num(dec)}, {_num(radius_deg)})"]
+    for pred in (predicates or []):
+        text = str(pred).strip()
+        if text:
+            where_parts.append(f"({text})")
     sql = (
         f"SELECT {select_cols}\n"
         f"FROM {info['qualified_name']}\n"
-        f"WHERE q3c_radial_query({ra_col}, {dec_col}, {_num(ra)}, {_num(dec)}, {_num(radius_deg)})\n"
+        f"WHERE " + "\n  AND ".join(where_parts) + "\n"
         f"LIMIT {row_limit}"
     )
     return sql, _meta("cone_select", info, spatial_bound=True, row_limit=row_limit)
@@ -162,6 +170,17 @@ def build_density_aggregate(
         raise ValueError("density aggregate mode must be grid or healpix")
     meta = _meta("density_aggregate", info, aggregate=True, spatial_bound=has_cone, row_limit=row_limit)
     meta["warnings"] = warnings
+    if mode_key == "healpix":
+        # Record the column's authoritative pixelization: decoding RING pixels
+        # with the renderer's NESTED default scatters cells across the sky
+        # (live DS-P8: a 2° Galactic-center cone rendered as two blobs 100° apart).
+        hp_entry = next((h for h in (info.get("healpix_columns") or []) if h.get("name") == hpix), None)
+        if hp_entry:
+            meta["healpix"] = {
+                "column": hpix,
+                "nside": hp_entry.get("nside"),
+                "scheme": hp_entry.get("scheme"),
+            }
     return sql, meta
 
 

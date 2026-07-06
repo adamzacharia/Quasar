@@ -375,6 +375,8 @@ def _normalize_radius(radius_deg: Any) -> Tuple[float, List[str]]:
         radius = float(radius_deg)
     except (TypeError, ValueError):
         return 0.2, ["radius_deg was not numeric; using 0.2 deg."]
+    if not math.isfinite(radius):
+        return 0.2, ["radius_deg was not finite; using 0.2 deg."]
     if radius <= 0:
         warnings.append(f"radius_deg {radius:g} is non-positive; using 0.2 deg.")
         radius = 0.2

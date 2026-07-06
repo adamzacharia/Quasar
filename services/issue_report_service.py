@@ -39,16 +39,36 @@ class ChatDeadline:
         standard_seconds: int,
         conductor_seconds: int,
         started_at: Optional[float] = None,
+        hard_max_seconds: Optional[int] = None,
     ):
         self.inactivity_seconds = max(1, int(inactivity_seconds))
         self.standard_seconds = max(1, int(standard_seconds))
         self.conductor_seconds = max(self.standard_seconds, int(conductor_seconds))
+        # Ceiling for progress-aware extensions (see extend_for_progress).
+        self.hard_max_seconds = max(
+            self.conductor_seconds,
+            int(hard_max_seconds) if hard_max_seconds is not None else int(self.standard_seconds * 2.5),
+        )
         self.started_at = time.monotonic() if started_at is None else float(started_at)
         self.last_activity_at = self.started_at
         self.total_seconds = self.standard_seconds
 
     def mark_activity(self, now: Optional[float] = None) -> None:
         self.last_activity_at = time.monotonic() if now is None else float(now)
+
+    def extend_for_progress(self, now: Optional[float] = None, *, extension_seconds: int = 90) -> None:
+        """Push the total-turn deadline out when real work just completed.
+
+        A turn that keeps finishing tool calls is progressing, not stuck — the
+        fixed total cap was killing legitimate long multi-tool workflows
+        (2026-07 live test). Guarantees at least `extension_seconds` of total
+        budget after each completed tool call, capped at hard_max_seconds; the
+        inactivity watchdog still ends genuinely stalled runs.
+        """
+        current = time.monotonic() if now is None else float(now)
+        elapsed = current - self.started_at
+        if self.total_seconds - elapsed < extension_seconds:
+            self.total_seconds = min(float(self.hard_max_seconds), elapsed + float(extension_seconds))
 
     def enable_conductor(self) -> None:
         self.total_seconds = self.conductor_seconds

@@ -168,3 +168,128 @@ def test_background_thread_idempotent(tmp_path):
         assert second["already_running"] is True
     finally:
         svc.stop_background()
+
+
+def test_nan_radius_and_insert_or_ignore_semantics(tmp_path):
+    # guard review P3: NaN radius must not pass validation.
+    svc = _svc(tmp_path)
+    out = svc.add_target("nan-target", 10.0, 10.0, radius_arcsec=float("nan"))
+    assert out["success"] is True
+    assert out["target"]["radius_arcsec"] == 120.0
+    assert any("finite" in w for w in out["warnings"])
+
+
+def test_check_now_race_safe_when_hit_preinserted(tmp_path):
+    # guard review P2: a hit inserted between cone query and INSERT (simulating
+    # a concurrent checker) must NOT be double-counted or crash the check.
+    alerce = FakeAlerce()
+    svc = _svc(tmp_path, alerce)
+    tid = svc.add_target("race", 10.0, 10.0)["target"]["id"]
+
+    # pre-insert the hit exactly as a concurrent run would
+    conn = svc._connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sky_monitor_hits (target_id, oid, first_seen_at) VALUES (?, ?, ?)",
+        (tid, "ZTFRACE", "2026-07-04T00:00:00+00:00"),
+    )
+    conn.commit(); conn.close()
+
+    alerce.push(rows=[_obj("ZTFRACE")])
+    out = svc.check_now()
+    assert out["success"] is True
+    assert out["n_new"] == 0  # INSERT OR IGNORE swallowed the duplicate
+
+
+def test_legacy_db_with_duplicate_names_does_not_brick(tmp_path):
+    # follow-on to guard P2 unique index: a pre-index DB can hold
+    # case-insensitive duplicate names (disable + re-add). CREATE UNIQUE INDEX
+    # then fails forever — every op, including the remove needed to fix it,
+    # must still work (degraded to the app-level check).
+    import sqlite3
+
+    from services.sky_monitor import _HITS_DDL, _TARGETS_DDL
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(_TARGETS_DDL)
+    conn.execute(_HITS_DDL)
+    for name in ("SN dup", "sn DUP"):
+        conn.execute(
+            "INSERT INTO sky_monitor_targets (name, ra, dec, radius_arcsec, enabled, created_at) "
+            "VALUES (?, 10.0, 10.0, 120, 1, '2026-01-01T00:00:00+00:00')",
+            (name,),
+        )
+    conn.commit(); conn.close()
+
+    svc = SkyMonitorService(db_path=str(db), alerce_client=FakeAlerce())
+    listing = svc.list_targets()
+    assert listing["success"] is True and listing["count"] == 2
+    removed = svc.remove_target(listing["rows"][0]["id"])
+    assert removed["success"] is True
+
+
+def test_stop_then_restart_actually_restarts(tmp_path):
+    # follow-on to guard review: stop set the event without joining, so an
+    # immediate restart could see the dying thread, report already_running,
+    # and leave monitoring silently off once the old loop exited.
+    svc = _svc(tmp_path)
+    try:
+        assert svc.start_background(interval_s=60)["already_running"] is False
+        assert svc.stop_background()["success"] is True
+        restarted = svc.start_background(interval_s=60)
+        assert restarted["success"] is True
+        assert restarted["already_running"] is False
+        assert svc._thread is not None and svc._thread.is_alive()
+        assert not svc._thread_stop.is_set()
+    finally:
+        svc.stop_background()
+
+
+def test_check_now_warns_at_page_cap(tmp_path):
+    # cone_objects fetches a single 200-row page with no total count; a dense
+    # field hitting the cap must warn instead of silently truncating.
+    alerce = FakeAlerce()
+    svc = _svc(tmp_path, alerce)
+    svc.add_target("dense", 270.0, -30.0)
+
+    alerce.push(rows=[_obj(f"ZTFD{i:03d}") for i in range(200)])
+    out = svc.check_now()
+    assert out["success"] is True and out["n_new"] == 200
+    assert any("page cap" in w for w in out["warnings"])
+
+
+def test_db_failure_on_one_target_keeps_other_alerts(tmp_path):
+    # a DB write failure for one target must neither discard alerts already
+    # committed for other targets nor mark its own alerts as seen.
+    alerce = FakeAlerce()
+    svc = _svc(tmp_path, alerce)
+    svc.add_target("ok", 10.0, 10.0)
+    svc.add_target("dbfail", 50.0, -30.0)
+
+    real_connect = svc._connect
+    calls = {"n": 0}
+
+    def flaky_connect():
+        # call 1 = target select, call 2 = 'ok' write, call 3 = 'dbfail' write
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("disk I/O error (simulated)")
+        return real_connect()
+
+    svc._connect = flaky_connect
+    alerce.push(rows=[_obj("ZTFOK")])
+    alerce.push(rows=[_obj("ZTFLOST")])
+    out = svc.check_now()
+
+    assert out["success"] is True
+    assert out["n_new"] == 1 and out["new_alerts"][0]["oid"] == "ZTFOK"
+    assert out["n_targets_checked"] == 1
+    assert any("dbfail" in w and "re-detected" in w for w in out["warnings"])
+
+    # the failed target's alert was NOT marked seen — it surfaces next check
+    svc._connect = real_connect
+    alerce.push(rows=[])            # 'ok' target: nothing new
+    alerce.push(rows=[_obj("ZTFLOST")])
+    out2 = svc.check_now()
+    assert out2["n_new"] == 1 and out2["new_alerts"][0]["oid"] == "ZTFLOST"

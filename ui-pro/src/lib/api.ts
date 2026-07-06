@@ -31,6 +31,7 @@ export interface StreamCallbacks {
     onPapers?: (papers: Record<string, unknown>[]) => void;
     onNotebook?: (notebook: Record<string, unknown>) => void;
     onImage?: (image: { url: string; caption: string; meta?: unknown }) => void;
+    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string }) => void;
     onStatus?: (step: string, state: string) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
@@ -151,6 +152,11 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                 const pieces = splitProviderChunk(provider, content);
                 for (const piece of pieces) {
                     callbacks.onToken(piece);
+                    // The drip pauses the read loop, so it must also feed the
+                    // inactivity watchdog: in a throttled background tab the 8ms
+                    // waits stretch to 1s+ and the watchdog would otherwise cancel
+                    // a stream whose payload has already fully arrived.
+                    lastMeaningfulEventAt = Date.now();
                     await new Promise(resolve => setTimeout(resolve, 8));
                 }
                 return;
@@ -216,6 +222,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onNotebook(parsed);
                         } else if (parsed.type === "image" && callbacks.onImage) {
                             callbacks.onImage(parsed);
+                        } else if (parsed.type === "plotly" && callbacks.onPlotly) {
+                            callbacks.onPlotly(parsed);
                         } else if (parsed.type === "task_group" && callbacks.onTaskGroup) {
                             callbacks.onTaskGroup(parsed);
                         } else if (parsed.type === "task_update" && callbacks.onTaskUpdate) {

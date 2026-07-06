@@ -30,7 +30,7 @@ We do not knowingly collect, store, or solicit personal information from childre
 ## 2. Platform Usage & License Grant
 
 ### 2.1 License Grant
-Subject to your compliance with these Terms, we grant you a limited, non-exclusive, non-transferable, revocable, and personal license to access and use Quasar and its associated features for your scientific, academic, and professional research.
+Subject to your compliance with these Terms, we grant you a limited, non-exclusive, non-transferable, revocable, and personal license to access and use Quasar and its associated features for your scientific, academic, and other **noncommercial** research purposes. This grant is consistent with the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) under which the Quasar software is licensed (see the `LICENSE` file): noncommercial use — including personal use, research, education, and use by nonprofits, public research organizations, and government institutions — is permitted, while commercial use of any kind is prohibited without a separate written commercial license from us.
 
 ### 2.2 Sandboxed Execution Environment
 Quasar provides a Sandboxed Python REPL to run data reduction scripts and mathematical calculations.

@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Maximize2, Minus, Plus, RefreshCw, X } from "lucide-react";
 import { AladinSkyView, SURVEYS } from "./AladinSkyView";
+import { ImageLightbox } from "./ImageLightbox";
 import type { HipsImageMeta } from "../lib/types";
 import { clampHipsFov, hips2fitsUrl, normalizeHipsSurveyId } from "../lib/hips-imagery";
 
@@ -28,14 +29,16 @@ function FullSizeLink({ href }: { href: string }) {
 }
 
 function PlainImageCard({ imageUrl, caption }: { imageUrl: string; caption?: string }) {
+    const [lightboxOpen, setLightboxOpen] = useState(false);
     return (
         <div className="pl-11">
             <div className="mt-4 rounded-xl border border-cyan-500/30 bg-slate-900/60 overflow-hidden shadow-xl shadow-cyan-500/5">
                 <img
                     src={imageUrl}
                     alt={caption || "Rendered FITS image"}
-                    className="w-full max-h-[600px] object-contain bg-black"
+                    className="w-full max-h-[600px] object-contain bg-black cursor-zoom-in hover:brightness-110 transition"
                     loading="lazy"
+                    onClick={() => setLightboxOpen(true)}
                 />
                 {caption && (
                     <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between">
@@ -44,6 +47,9 @@ function PlainImageCard({ imageUrl, caption }: { imageUrl: string; caption?: str
                     </div>
                 )}
             </div>
+            {lightboxOpen && (
+                <ImageLightbox src={imageUrl} caption={caption} onClose={() => setLightboxOpen(false)} />
+            )}
         </div>
     );
 }
@@ -75,6 +81,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
     const [loading, setLoading] = useState(false);
     const [failed, setFailed] = useState(false);
     const [interactiveOpen, setInteractiveOpen] = useState(false);
+    const [lightboxOpen, setLightboxOpen] = useState(false);
 
 
     useEffect(() => {
@@ -114,8 +121,9 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
                     <img
                         src={displayedUrl}
                         alt={caption || "Rendered FITS image"}
-                        className="w-full max-h-[600px] object-contain bg-black"
+                        className="w-full max-h-[600px] object-contain bg-black cursor-zoom-in hover:brightness-110 transition"
                         loading="lazy"
+                        onClick={() => setLightboxOpen(true)}
                         onLoad={() => setLoading(false)}
                         onError={() => {
                             setLoading(false);
@@ -208,6 +216,10 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
                     </div>
                 </div>
             </div>
+
+            {lightboxOpen && (
+                <ImageLightbox src={displayedUrl} caption={caption} onClose={() => setLightboxOpen(false)} />
+            )}
 
             {interactiveOpen && canInteract && (
                 <div

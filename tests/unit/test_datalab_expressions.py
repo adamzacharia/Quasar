@@ -111,6 +111,15 @@ def test_constant_only_expression_rejected():
         _eval_expression(frame, "5 + 3")
 
 
+@pytest.mark.parametrize("expr", ["minimum(g)", "arctan2(g)", "log10()"])
+def test_wrong_function_arity_raises_valueerror_with_grammar_note(expr):
+    # Arity errors surface as numpy TypeErrors inside eval; they must come back
+    # as ValueError carrying the grammar note so the model can self-correct.
+    frame = pd.DataFrame({"g": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="log10"):
+        _eval_expression(frame, expr)
+
+
 def test_catalog_scatter_renders_hr_diagram_with_log10():
     store = DatalabResultStore()
     result_id = store.put(_gaia_frame(), {"catalog": "gaia_dr3", "table": "gaia_source"})

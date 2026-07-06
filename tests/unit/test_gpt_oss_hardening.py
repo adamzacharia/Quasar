@@ -57,6 +57,122 @@ def test_required_tool_choice_nudge_without_system_message():
     assert len(messages) == 1
 
 
+# ── TACC provider path: required → auto downgrade + nudge actually sent ──────
+
+from types import SimpleNamespace  # noqa: E402
+
+from core.llm_client import LLMClient  # noqa: E402
+
+
+class _FakeTaccCompletions:
+    def __init__(self):
+        self.calls = []
+        self.count = 0
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        self.count += 1
+        if kwargs.get("stream"):
+            return self._stream(f"answer {self.count}")
+        return SimpleNamespace(
+            id=f"resp_{self.count}",
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=f"answer {self.count}", tool_calls=None)
+                )
+            ],
+            usage=None,
+        )
+
+    @staticmethod
+    def _stream(content):
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content=content, tool_calls=None))]
+        )
+
+
+def _client_with_fake_tacc():
+    client = LLMClient(model="gpt-oss-120b")
+    completions = _FakeTaccCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    client._get_tacc_client = lambda: fake_client
+    return client, completions
+
+
+_TOOLS = [{
+    "type": "function",
+    "name": "hips_cutout",
+    "description": "Fetch a cutout.",
+    "parameters": {"type": "object", "properties": {}},
+}]
+
+
+def test_tacc_required_tool_choice_downgraded_with_nudge_nonstreaming():
+    client, completions = _client_with_fake_tacc()
+    client.responses.create(
+        model="gpt-oss-120b",
+        instructions="system prompt",
+        input="show me an image of M31",
+        tools=_TOOLS,
+        tool_choice="required",
+    )
+    sent = completions.calls[-1]
+    assert sent["tool_choice"] == "auto"
+    assert sent["messages"][0]["role"] == "system"
+    assert "Tool use is REQUIRED" in sent["messages"][0]["content"]
+
+
+def test_tacc_required_tool_choice_downgraded_with_nudge_streaming():
+    client, completions = _client_with_fake_tacc()
+    list(client.responses.create(
+        model="gpt-oss-120b",
+        instructions="system prompt",
+        input="show me an image of M31",
+        tools=_TOOLS,
+        tool_choice="required",
+        stream=True,
+    ))
+    sent = completions.calls[-1]
+    assert sent["tool_choice"] == "auto"
+    assert "Tool use is REQUIRED" in sent["messages"][0]["content"]
+
+
+def test_tacc_required_nudge_does_not_leak_into_history():
+    client, completions = _client_with_fake_tacc()
+    first = client.responses.create(
+        model="gpt-oss-120b",
+        instructions="system prompt",
+        input="show me an image of M31",
+        tools=_TOOLS,
+        tool_choice="required",
+    )
+    # Follow-up round without forcing: cached history must be nudge-free.
+    client.responses.create(
+        model="gpt-oss-120b",
+        instructions="system prompt",
+        previous_response_id=first.id,
+        input="thanks",
+        tools=_TOOLS,
+        tool_choice="auto",
+    )
+    followup_messages = completions.calls[-1]["messages"]
+    assert all("Tool use is REQUIRED" not in str(m.get("content")) for m in followup_messages)
+
+
+def test_tacc_auto_tool_choice_gets_no_nudge():
+    client, completions = _client_with_fake_tacc()
+    client.responses.create(
+        model="gpt-oss-120b",
+        instructions="system prompt",
+        input="hello",
+        tools=_TOOLS,
+        tool_choice="auto",
+    )
+    sent = completions.calls[-1]
+    assert sent["tool_choice"] == "auto"
+    assert "Tool use is REQUIRED" not in sent["messages"][0]["content"]
+
+
 # ── Agent: provider errors must never reach the chat verbatim ────────────────
 
 @pytest.fixture(scope="module")

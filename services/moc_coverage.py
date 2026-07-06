@@ -215,6 +215,10 @@ def _normalize_radius_deg(radius_deg: Any) -> Tuple[float, List[str]]:
         warnings.append(f"radius_deg {radius:g} exceeds 30; clamped to 30 deg.")
         radius = 30.0
     if 0.0 < radius < MIN_NONZERO_RADIUS_DEG:
+        warnings.append(
+            f"radius_deg {radius:g} is below MocServer's working minimum; "
+            f"clamped up to {MIN_NONZERO_RADIUS_DEG:g} deg."
+        )
         radius = MIN_NONZERO_RADIUS_DEG
     return radius, warnings
 

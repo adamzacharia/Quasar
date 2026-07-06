@@ -120,6 +120,7 @@ def sky_density_map(
     sigma_large: float = 3.0,
     peak_threshold: float = 3.0,
     max_peaks: int = 10,
+    log_scale: bool = True,
     title: str = "Data Lab sky density map",
     result_store: Any = None,
     plotting_service: Optional[PlottingService] = None,
@@ -134,23 +135,44 @@ def sky_density_map(
     if mode_key == "healpix" or (healpix_col in frame.columns and ra_col is None and dec_col is None):
         if healpix_col not in frame.columns:
             raise ValueError(f"HEALPix column {healpix_col!r} not found")
-        if nside is None:
+        # The pixelization stored with the result is authoritative — decoding
+        # RING pixels as NESTED (the old default) scattered a 2° cone across
+        # 100° of sky (live DS-P8), and _infer_nside underestimates nside for
+        # partial-sky maps. Caller values only apply when the result carries
+        # no pixelization metadata.
+        try:
+            hp_meta = dict((res.provenance or {}).get("healpix") or {})
+        except Exception:
+            hp_meta = {}
+        if hp_meta.get("scheme"):
+            order = "ring" if str(hp_meta["scheme"]).strip().upper().startswith("RING") else "nested"
+        if hp_meta.get("nside"):
+            nside = int(hp_meta["nside"])
+        elif nside is None:
             nside = _infer_nside(frame[healpix_col])
         fig = plt.figure(figsize=(6.0, 4.0))
-        used_healpy = _try_healpy_plot(fig, frame, healpix_col, count_col, int(nside), order, title)
+        used_healpy = _try_healpy_plot(fig, frame, healpix_col, count_col, int(nside), order, title, log_scale)
         if not used_healpy:
             ax = fig.add_subplot(111)
             ra, dec = _healpix_centers(frame[healpix_col], int(nside), order)
             values = _values(frame, count_col)
-            sc = ax.scatter(ra, dec, c=values, s=20, cmap="viridis", edgecolors="none")
-            fig.colorbar(sc, ax=ax, label=count_col if count_col in frame.columns else "count")
+            norm = _log_norm(values) if log_scale else None
+            if norm is not None:
+                # Floor zero/NaN pixels to vmin so returned cells stay visible
+                # instead of being masked out by LogNorm.
+                values = _floor_nonpositive(values, float(norm.vmin))
+            sc = ax.scatter(ra, dec, c=values, s=20, cmap="viridis", edgecolors="none", norm=norm)
+            cb_label = count_col if count_col in frame.columns else "count"
+            if norm is not None:
+                cb_label += " (log scale)"
+            fig.colorbar(sc, ax=ax, label=cb_label)
             ax.set_xlabel("RA (deg)")
             ax.set_ylabel("Dec (deg)")
             ax.invert_xaxis()
             ax.set_title(title)
             ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        extra = {"mode": "healpix", "nside": int(nside), "order": order, "peaks": peaks}
+        extra = {"mode": "healpix", "nside": int(nside), "order": order, "log_scale": bool(log_scale), "peaks": peaks}
         return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra=extra)
 
     ra_name = _pick_column(frame, ra_col, ["ra", "ra_bin", "mean_fiber_ra", "s_ra"])
@@ -168,8 +190,15 @@ def sky_density_map(
         peaks = _matched_filter_peaks(hist, xedges, yedges, sigma_small, sigma_large, peak_threshold, max_peaks)
 
     fig, ax = plt.subplots(figsize=(6.0, 4.2))
-    mesh = ax.pcolormesh(xedges, yedges, hist.T, shading="auto", cmap="viridis")
-    fig.colorbar(mesh, ax=ax, label=count_col if count_col in frame.columns else "count")
+    # Peak detection runs on the raw counts above; only the rendered color scale
+    # is log-transformed. Empty bins (count 0) fall below LogNorm's vmin floor and
+    # render as the background — an honest "no data here" rather than "low density".
+    norm = _log_norm(hist) if log_scale else None
+    mesh = ax.pcolormesh(xedges, yedges, hist.T, shading="auto", cmap="viridis", norm=norm)
+    cb_label = count_col if count_col in frame.columns else "count"
+    if norm is not None:
+        cb_label += " (log scale)"
+    fig.colorbar(mesh, ax=ax, label=cb_label)
     if peaks:
         ax.scatter([p["ra"] for p in peaks], [p["dec"] for p in peaks], marker="x", c="red", s=60, label="Peaks")
         ax.legend(fontsize=8)
@@ -178,7 +207,7 @@ def sky_density_map(
     ax.invert_xaxis()
     ax.set_title(title)
     fig.tight_layout()
-    return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra={"mode": "hist2d", "peaks": peaks})
+    return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra={"mode": "hist2d", "log_scale": norm is not None, "peaks": peaks})
 
 
 def period_fold(
@@ -482,6 +511,29 @@ def _values(frame: pd.DataFrame, count_col: str) -> np.ndarray:
     return np.ones(len(frame), dtype=float)
 
 
+def _log_norm(values: np.ndarray) -> Any:
+    """LogNorm spanning the positive finite values, or None when a log scale is
+    impossible (no positive data). vmin is floored to the smallest positive
+    value so zero/NaN cells never drive log(0)/log(negative)."""
+    from matplotlib.colors import LogNorm
+
+    arr = np.asarray(values, dtype=float)
+    finite_pos = arr[np.isfinite(arr) & (arr > 0)]
+    if finite_pos.size == 0:
+        return None
+    vmin = float(finite_pos.min())
+    vmax = float(finite_pos.max())
+    if not (vmax > vmin):
+        vmax = vmin * 10.0  # single-valued map — give the colorbar a decade
+    return LogNorm(vmin=vmin, vmax=vmax)
+
+
+def _floor_nonpositive(values: np.ndarray, floor: float) -> np.ndarray:
+    """Replace zero/NaN/negative cells with ``floor`` so they survive LogNorm."""
+    arr = np.asarray(values, dtype=float)
+    return np.where(np.isfinite(arr) & (arr > 0), arr, floor)
+
+
 def _matched_filter_peaks(
     hist: np.ndarray,
     xedges: np.ndarray,
@@ -521,7 +573,7 @@ def _matched_filter_peaks(
     return peaks
 
 
-def _try_healpy_plot(fig: Any, frame: pd.DataFrame, healpix_col: str, count_col: str, nside: int, order: str, title: str) -> bool:
+def _try_healpy_plot(fig: Any, frame: pd.DataFrame, healpix_col: str, count_col: str, nside: int, order: str, title: str, log_scale: bool = True) -> bool:
     # Guard against a dense all-sky allocation for high nside: hp.nside2npix(4096)
     # is ~2e8 floats and would OOM the worker for a sparse map. Above the cap, fall
     # back to the sparse scatter path (renders only the returned pixels).
@@ -540,7 +592,13 @@ def _try_healpy_plot(fig: Any, frame: pd.DataFrame, healpix_col: str, count_col:
             p_i = int(p)
             if 0 <= p_i < len(values):
                 values[p_i] = c
-    hp.mollview(values, nest=str(order).lower().startswith("nest"), title=title, fig=fig.number)
+    hp.mollview(
+        values,
+        nest=str(order).lower().startswith("nest"),
+        title=title,
+        fig=fig.number,
+        norm="log" if log_scale else None,
+    )
     return True
 
 

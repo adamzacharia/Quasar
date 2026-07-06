@@ -39,6 +39,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {},
         "bitmasks": {},
         "sia_endpoints": [],
+        "footprint": "All-sky (space astrometry mission; covers the LMC/SMC, Galactic plane, both hemispheres).",
         "citation": {
             "text": "Gaia Data Release 3",
             "doi": "10.1051/0004-6361/202243940",
@@ -68,6 +69,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {"class_star": "class_star ~1 = star-like, lower = extended (point-source proxy)"},
         "bitmasks": {},
         "sia_endpoints": ["https://datalab.noirlab.edu/sia/coadd_all"],
+        "footprint": "~35,000 deg² of archival DECam/Bok/Mosaic imaging — nearly all of the sky south of Dec ≈ +40° plus patchy northern coverage; includes the LMC/SMC region and much of the Galactic plane (depth varies strongly by field).",
         "citation": {
             "text": "NOIRLab Source Catalog Data Release 2",
             "doi": None,
@@ -102,6 +104,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         },
         "bitmasks": {},
         "sia_endpoints": [],
+        "footprint": "~5,000 deg² of the southern high-Galactic-latitude sky (roughly -65° < Dec < +5°, avoiding the Galactic plane); does NOT cover the LMC/SMC main bodies.",
         "citation": {"text": "Dark Energy Survey Data Release 1", "doi": "10.3847/1538-4365/ab4f2b", "url": "https://des.ncsa.illinois.edu/releases/dr1"},
     },
     "smash_dr1": {
@@ -129,6 +132,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {"sharp": "stellar sharpness diagnostic (|sharp|<0.5 ~ stellar)", "depthflag": "exposure-depth flag (>1 = deeper)"},
         "bitmasks": {},
         "sia_endpoints": [],
+        "footprint": "~480 deg² of targeted DECam fields covering the Magellanic system — LMC, SMC, Bridge, and periphery; field-partitioned (query by fieldid).",
         "citation": {"text": "Survey of the MAgellanic Stellar History Data Release 1", "doi": "10.3847/1538-4365/ab6e6c", "url": "https://datalab.noirlab.edu/smash/"},
     },
     "smash_dr2": {
@@ -154,6 +158,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {"sharp": "stellar sharpness diagnostic", "depthflag": "exposure-depth flag"},
         "bitmasks": {},
         "sia_endpoints": [],
+        "footprint": "~480 deg² of targeted DECam fields covering the Magellanic system — LMC, SMC, Bridge, and periphery; field-partitioned (query by fieldid).",
         "citation": {"text": "Survey of the MAgellanic Stellar History Data Release 2", "doi": None, "url": "https://datalab.noirlab.edu/smash/"},
     },
     "delve_dr3": {
@@ -179,6 +184,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {"ext_coadd": "0=hi-conf star, 1=candidate star, 2=mostly galaxy, 3=hi-conf galaxy, -9=no data"},
         "bitmasks": {},
         "sia_endpoints": ["https://datalab.noirlab.edu/sia/delve_dr3", "https://datalab.noirlab.edu/sia/coadd_all"],
+        "footprint": "~21,000 deg² of the southern high-Galactic-latitude sky (DECam, Dec ≲ +30°), including dedicated coverage of the Magellanic periphery; avoids the inner Galactic plane.",
         "citation": {"text": "DECam Local Volume Exploration Survey Data Release 3", "doi": None, "url": "https://datalab.noirlab.edu/delve/"},
     },
     "desi_dr1": {
@@ -199,6 +205,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {},
         "bitmasks": {"desi_target": {"LRG": 0, "ELG": 1, "QSO": 2, "BGS_ANY": 60, "MWS_ANY": 61}},
         "sia_endpoints": [],
+        "footprint": "DESI spectroscopic footprint: high-Galactic-latitude northern/equatorial sky (roughly Dec > -20°); does NOT cover the LMC/SMC or the Galactic plane.",
         "citation": {"text": "DESI Data Release 1", "doi": None, "url": "https://data.desi.lbl.gov/doc/releases/dr1/"},
     },
     "sdss_dr17": {
@@ -217,6 +224,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {"class": "SDSS spectroscopic class label (GALAXY/STAR/QSO)"},
         "bitmasks": {},
         "sia_endpoints": [],
+        "footprint": "~14,500 deg² of mostly northern high-Galactic-latitude sky (Dec ≳ -10° plus equatorial stripes); does NOT cover the LMC/SMC.",
         "citation": {"text": "Sloan Digital Sky Survey Data Release 17", "doi": "10.3847/1538-4365/acda98", "url": "https://www.sdss4.org/dr17/"},
     },
     "ls_dr9": {
@@ -238,25 +246,98 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "morphology": {"type": "Legacy Surveys Tractor morphological type; type != 'PSF' => extended"},
         "bitmasks": {},
         "sia_endpoints": ["https://datalab.noirlab.edu/sia/coadd_all"],
+        "footprint": "~19,700 deg² of high-Galactic-latitude sky in both hemispheres (roughly -68° < Dec < +84°, |b| ≳ 18°); does NOT cover the LMC/SMC or the Galactic plane.",
         "citation": {"text": "Legacy Surveys Data Release 9", "doi": None, "url": "https://www.legacysurvey.org/dr9/"},
     },
     "vhs_dr5": {
         "region_strategy": "q3c",
         "tables": {
-            "source": {
-                "columns": ["sourceid", "ra", "dec", "japermag3", "hapermag3", "ksapermag3", "mergedclass"],
-                "ra_column": "ra",
-                "dec_column": "dec",
+            # Verified against live tap_schema.tables (2026-07-05): the DR5 relation is
+            # vhs_dr5.vhs_cat_v3 — the old "source" name does not exist server-side and
+            # every query against it returned HTTP 400. Coordinates are ra2000/dec2000.
+            "vhs_cat_v3": {
+                "columns": [
+                    "sourceid", "ra2000", "dec2000",
+                    "japermag3", "japermag3err", "hapermag3", "hapermag3err",
+                    "ksapermag3", "ksapermag3err", "mergedclass", "pstar",
+                    "ring256", "nest4096",
+                ],
+                "ra_column": "ra2000",
+                "dec_column": "dec2000",
                 "aggregate_safe": True,
             }
         },
-        "healpix_columns": [],
-        "morphology": {"mergedclass": "VISTA source morphology class (J/H/Ks near-infrared photometry)"},
+        "healpix_columns": [
+            {"name": "ring256", "nside": 256, "scheme": "RING"},
+            {"name": "nest4096", "nside": 4096, "scheme": "NEST"},
+        ],
+        "morphology": {
+            "mergedclass": "VSA merged morphology class (-1 star, -2 probable star, 1 galaxy)",
+            "pstar": "probability the source is point-like (0-1)",
+        },
         "bitmasks": {},
         "sia_endpoints": [],
+        "footprint": "Southern-hemisphere near-IR (J/H/Ks) survey (~20,000 deg², Dec < 0°); by design EXCLUDES tiles owned by other VISTA surveys — VVV (Galactic plane/bulge) and VMC (inner LMC/SMC) — so inner Magellanic coverage is incomplete; verify per-position.",
         "citation": {"text": "VISTA Hemisphere Survey Data Release 5", "doi": None, "url": "https://datalab.noirlab.edu/"},
     },
 }
+
+
+# Columns whose equality predicate is an indexed, selective bound on its own —
+# the PDF's canonical SMASH queries are bounded by `fieldid = N` (no cone), and
+# its crowding-proof variable-star idiom is `id = '169.429960'`. The SQL governor
+# accepts an equality on any of these as a valid row-level bound.
+INDEXED_BOUND_COLUMNS: Dict[str, List[str]] = {
+    "gaia_dr3.gaia_source": ["source_id"],
+    "nsc_dr2.object": ["id"],
+    "smash_dr1.object": ["fieldid", "id"],
+    "smash_dr1.source": ["fieldid", "id"],
+    "smash_dr2.object": ["fieldid", "id"],
+    "smash_dr2.source": ["fieldid", "id"],
+    "desi_dr1.zpix": ["targetid"],
+    "des_dr1.main": ["coadd_object_id"],
+    "delve_dr3.coadd_objects": ["quick_object_id"],
+    "sdss_dr17.specobj": ["specobjid"],
+}
+
+
+def indexed_bound_columns(catalog: str, table: str) -> List[str]:
+    """Columns whose equality predicate alone bounds a row-level query."""
+    qualified = describe_table(catalog, table)["qualified_name"]
+    return list(INDEXED_BOUND_COLUMNS.get(qualified, []))
+
+
+def default_table(catalog: str) -> str:
+    """The catalog's primary table — lets one-shot tools accept catalog-only calls."""
+    catalog_key = _normalize_identifier(catalog)
+    if catalog_key not in DATALAB_CATALOGS:
+        raise ValueError(f"Unknown Data Lab catalog: {catalog}")
+    tables = sorted(DATALAB_CATALOGS[catalog_key].get("tables", {}).keys())
+    if not tables:
+        raise ValueError(f"No tables registered for Data Lab catalog: {catalog}")
+    return tables[0]
+
+
+# Default point-source (star) selection per table, in the build_catalog_predicates
+# morphology-argument schema. Used when a caller asks for point_sources without an
+# explicit cut. Thresholds follow each survey's documented star/galaxy convention.
+_POINT_SOURCE_CUTS = {
+    "nsc_dr2.object": {"column": "class_star", "op": ">", "value": 0.5},
+    "des_dr1.main": {"column": "spread_model_r", "between": [-0.005, 0.005]},
+    "delve_dr3.coadd_objects": {"column": "ext_coadd", "between": [0, 1]},  # 0/1 = star/candidate star
+    "smash_dr1.object": {"column": "sharp", "between": [-0.5, 0.5]},
+    "smash_dr2.object": {"column": "sharp", "between": [-0.5, 0.5]},
+    "vhs_dr5.vhs_cat_v3": {"column": "mergedclass", "in": [-1, -2]},  # VSA: -1 star, -2 probable star
+}
+
+
+def point_source_cut(catalog: str, table: str) -> Optional[Dict[str, Any]]:
+    """Default star/point-source morphology cut for a table, or None if the catalog
+    has no registered star/galaxy separator (e.g. gaia_dr3, desi_dr1)."""
+    cut = _POINT_SOURCE_CUTS.get(describe_table(catalog, table)["qualified_name"])
+    if not cut:
+        return None
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in cut.items()}
 
 
 def list_catalogs() -> List[Dict[str, Any]]:
@@ -269,6 +350,7 @@ def list_catalogs() -> List[Dict[str, Any]]:
                 "catalog": name,
                 "tables": sorted(entry.get("tables", {}).keys()),
                 "region_strategy": entry.get("region_strategy", "q3c"),
+                "footprint": entry.get("footprint"),
                 "citation": entry.get("citation", {}).get("text"),
             }
         )
@@ -304,6 +386,7 @@ def describe_table(catalog: str, table: str) -> Dict[str, Any]:
         "morphology": dict(entry.get("morphology", {})),
         "bitmasks": dict(entry.get("bitmasks", {})),
         "aggregate_safe": bool(table_entry.get("aggregate_safe")),
+        "footprint": entry.get("footprint"),
         "citation": dict(entry.get("citation", {})),
     }
 

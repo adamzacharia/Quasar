@@ -67,6 +67,7 @@ user_uploads/
 # ============================================
 tmp/
 tmp_*.py
+pytest_tmp_root/
 scratch_*.py
 *.log
 *.log.mark

@@ -3,7 +3,13 @@ import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 
 export type MessageRole = "user" | "assistant" | "system";
 
-export type MessageType = "text" | "data" | "papers" | "tool_call" | "image" | "critique" | "notebook" | "web_sources";
+export type MessageType = "text" | "data" | "papers" | "tool_call" | "image" | "plotly" | "critique" | "notebook" | "web_sources";
+
+/** Standard Plotly figure JSON (traces + layout) from "plotly" SSE events. */
+export interface PlotlyFigureSpec {
+    data: unknown[];
+    layout?: Record<string, unknown>;
+}
 
 export interface NotebookData {
     title: string;
@@ -39,6 +45,9 @@ export interface Message {
     runMeta?: import("./api").ChatRunMeta;
     imageCaption?: string;
     imageMeta?: HipsImageMeta;
+    plotlySpec?: PlotlyFigureSpec;   // interactive figure ("plotly" messages)
+    plotlyTitle?: string;
+    plotlyPngFallback?: string;      // static PNG used if plotly can't render
     thinkingSteps?: ThoughtStep[];
     thinking?: string;
     thinkingDuration?: number;
