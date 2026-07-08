@@ -137,6 +137,7 @@ TACC_VISIBLE_MODEL_IDS = [
     "gpt-oss-120b",
     "Qwen3-32B",
     "gemma-4-31B-it",
+    "MiniMax-M2.7",
 ]
 
 TACC_MODEL_ID_SET = frozenset(TACC_MODEL_IDS)
@@ -612,6 +613,84 @@ class ResponsesShim:
 
     # ── Anthropic (Claude) ───────────────────────────────────────────────
 
+    # Claude Opus 4.7+, Sonnet 5, Fable 5, and Mythos 5 removed the sampling
+    # parameters — sending temperature / top_p / top_k returns a 400
+    # invalid_request_error. Older Claude models (Haiku 4.5, Opus 4.6 /
+    # Sonnet 4.6 and earlier) still accept them, so strip only for the
+    # newer families rather than dropping temperature everywhere.
+    _ANTHROPIC_NO_SAMPLING_PREFIXES = (
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    )
+
+    @classmethod
+    def _anthropic_accepts_sampling(cls, model: str) -> bool:
+        """Return False for Claude models that reject temperature/top_p/top_k."""
+        model_id = (model or "").strip().lower()
+        return not any(model_id.startswith(p) for p in cls._ANTHROPIC_NO_SAMPLING_PREFIXES)
+
+    # Referencing an uploaded file (Files API) in a document block requires this
+    # beta header on the messages request as well as on the upload.
+    _ANTHROPIC_FILES_BETA_HEADER = {"anthropic-beta": "files-api-2025-04-14"}
+
+    @staticmethod
+    def _anthropic_has_document(attachments) -> bool:
+        return any(
+            isinstance(a, dict) and a.get("kind") == "anthropic_document_file"
+            for a in (attachments or [])
+        )
+
+    def _anthropic_messages_for_input(self, prev_id, input_data, attachments=None) -> list:
+        """Resolve the Anthropic message list, replaying cached history.
+
+        Mirrors _chat_messages_for_input: the Anthropic Messages API is
+        stateless and rejects a tool_result turn that is not preceded by the
+        assistant tool_use block it answers (HTTP 400). So on a continuation
+        round we start from the cached prior turns (user -> assistant tool_use)
+        and append the new turn (tool_result blocks, or a follow-up user
+        message). On a broken chain (a deadline kill cleared the cache mid-turn)
+        an orphaned tool_result would still 400, so fold the tool outputs into a
+        plain user message instead.
+        """
+        with self._history_lock:
+            cached = list(self._history_cache.get(prev_id, [])) if prev_id else []
+        if cached:
+            cached.extend(self._build_anthropic_messages(input_data, attachments=attachments))
+            return cached
+        is_tool_results = isinstance(input_data, list) and any(
+            isinstance(i, dict) and i.get("type") == "function_call_output" for i in input_data
+        )
+        if prev_id and is_tool_results:
+            parts = [
+                str(i.get("output", ""))[:4000]
+                for i in input_data
+                if isinstance(i, dict) and i.get("type") == "function_call_output"
+            ]
+            print(
+                f"[PROVIDER] anthropic history chain broken for {prev_id} — converting "
+                f"{len(parts)} orphaned tool output(s) into a user message"
+            )
+            recovery_text = (
+                "[SYSTEM NOTE] The tool-call history was reset mid-turn. These are "
+                "the results of the tool calls you just made:\n\n"
+                + "\n\n---\n\n".join(parts)
+                + "\n\nContinue the user's request from these results."
+            )
+            return self._build_anthropic_messages(recovery_text, attachments=attachments)
+        return self._build_anthropic_messages(input_data, attachments=attachments)
+
+    def _cache_anthropic_turn(self, response_id: str, messages: list, assistant_content) -> None:
+        """Store the conversation so the next round can replay tool_use blocks."""
+        if not response_id or assistant_content is None:
+            return
+        new_messages = list(messages)
+        new_messages.append({"role": "assistant", "content": assistant_content})
+        with self._history_lock:
+            self._history_cache[response_id] = new_messages
+
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_anthropic(
         self,
@@ -633,8 +712,11 @@ class ResponsesShim:
             if fmt.get("type") == "json_object":
                 json_mode = True
 
-        # Build messages
-        messages = self._build_anthropic_messages(input_data, attachments=attachments)
+        # Build messages, replaying cached history so tool_result turns follow
+        # the assistant tool_use blocks that produced them (Anthropic 400s on an
+        # orphaned tool_result).
+        prev_id = kwargs.get("previous_response_id", None)
+        messages = self._anthropic_messages_for_input(prev_id, input_data, attachments=attachments)
 
         # Translate tool schemas
         anthropic_tools = None
@@ -649,18 +731,23 @@ class ResponsesShim:
         call_kwargs = {
             "model": model,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": messages,
         }
+        if self._anthropic_accepts_sampling(model):
+            call_kwargs["temperature"] = temperature
         if system_text:
             call_kwargs["system"] = system_text
         if anthropic_tools:
             call_kwargs["tools"] = anthropic_tools
+        if self._anthropic_has_document(attachments):
+            call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
 
         resp = client.messages.create(**call_kwargs)
 
-        # Convert to LLMResponse
-        return self._anthropic_to_llm_response(resp)
+        # Convert to LLMResponse and cache the turn for the next round.
+        result = self._anthropic_to_llm_response(resp)
+        self._cache_anthropic_turn(result.id, messages, getattr(resp, "content", None))
+        return result
 
     def _stream_anthropic(
         self,
@@ -676,19 +763,23 @@ class ResponsesShim:
         max_tokens = kwargs.get("max_output_tokens", 2000)
         tools_raw = kwargs.get("tools", None)
 
-        messages = self._build_anthropic_messages(input_data, attachments=attachments)
+        prev_id = kwargs.get("previous_response_id", None)
+        messages = self._anthropic_messages_for_input(prev_id, input_data, attachments=attachments)
         anthropic_tools = self._translate_tools_for_anthropic(tools_raw) if tools_raw else None
 
         call_kwargs = {
             "model": model,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": messages,
         }
+        if self._anthropic_accepts_sampling(model):
+            call_kwargs["temperature"] = temperature
         if instructions:
             call_kwargs["system"] = instructions
         if anthropic_tools:
             call_kwargs["tools"] = anthropic_tools
+        if self._anthropic_has_document(attachments):
+            call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
 
         # Return a generator that yields StreamEvent objects
         return self._anthropic_stream_generator(client, call_kwargs)
@@ -747,6 +838,7 @@ class ResponsesShim:
 
         # Extract final message usage
         usage_obj = None
+        final_msg = None
         try:
             final_msg = stream.get_final_message()
             if final_msg and hasattr(final_msg, 'usage') and final_msg.usage:
@@ -766,6 +858,17 @@ class ResponsesShim:
                 usage=usage_obj,
             )
         )
+
+        # Cache the assistant turn (text + tool_use blocks) so a follow-up
+        # tool_result / user round can replay it — otherwise Anthropic 400s on
+        # an orphaned tool_result and multi-turn context is lost.
+        try:
+            if final_msg is not None:
+                self._cache_anthropic_turn(
+                    resp_id, call_kwargs.get("messages", []), getattr(final_msg, "content", None)
+                )
+        except Exception:
+            pass
 
     def _build_anthropic_messages(self, input_data, attachments: Optional[List[Dict[str, Any]]] = None) -> list:
         """Convert responses.create() input to Anthropic messages format."""

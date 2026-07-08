@@ -2,6 +2,7 @@ export const TACC_MODELS = [
     "gpt-oss-120b",
     "Qwen3-32B",
     "gemma-4-31B-it",
+    "MiniMax-M2.7",
 ];
 
 export const OPENAI_MODELS = [
