@@ -1,8 +1,27 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 const ALADIN_SCRIPT_ID = "aladin-lite-v3-3-8-2";
+const ALADIN_SCRIPT_ORIGIN = "https://aladin.cds.unistra.fr";
 const ALADIN_SCRIPT_SRC = "https://aladin.cds.unistra.fr/AladinLite/api/v3/3.8.2/aladin.js";
-const ALADIN_LOAD_TIMEOUT_MS = 20_000;
+// The script is fetched from an external CDN whose cold-cache latency is
+// occasionally >20s (observed live: the viewer "hung" then worked hours later
+// once the browser had cached it). Allow a more generous cold-load window and
+// retry once on a hard network error before giving up.
+const ALADIN_LOAD_TIMEOUT_MS = 35_000;
+const ALADIN_MAX_SCRIPT_ATTEMPTS = 2;
+
+function preconnectAladinOrigin() {
+    if (typeof document === "undefined") return;
+    if (document.querySelector(`link[data-aladin-preconnect]`)) return;
+    for (const rel of ["preconnect", "dns-prefetch"]) {
+        const link = document.createElement("link");
+        link.rel = rel;
+        link.href = ALADIN_SCRIPT_ORIGIN;
+        link.crossOrigin = "anonymous";
+        link.setAttribute("data-aladin-preconnect", "1");
+        document.head.appendChild(link);
+    }
+}
 
 function clearFailedLoad() {
     if (typeof window !== "undefined") {
@@ -83,22 +102,34 @@ export function loadAladin(): Promise<any> {
             return;
         }
 
-        let script = document.getElementById(ALADIN_SCRIPT_ID) as HTMLScriptElement | null;
-        if (!script) {
-            script = document.createElement("script");
+        preconnectAladinOrigin();
+
+        const injectScript = (attempt: number) => {
+            const existing = document.getElementById(ALADIN_SCRIPT_ID);
+            existing?.parentNode?.removeChild(existing);
+            const script = document.createElement("script");
             script.id = ALADIN_SCRIPT_ID;
-            script.src = ALADIN_SCRIPT_SRC;
+            // Cache-bust on retry so a failed fetch is not served from a poisoned cache entry.
+            script.src = attempt > 1 ? `${ALADIN_SCRIPT_SRC}?retry=${attempt}` : ALADIN_SCRIPT_SRC;
             script.async = true;
             script.defer = true;
+            script.onload = () => {
+                void complete();
+            };
+            script.onerror = () => {
+                if (settled) return;
+                if (attempt < ALADIN_MAX_SCRIPT_ATTEMPTS) {
+                    window.setTimeout(() => {
+                        if (!settled) injectScript(attempt + 1);
+                    }, 1500 * attempt);
+                } else {
+                    fail("Aladin Lite could not be downloaded (CDN unreachable after retries).");
+                }
+            };
             document.head.appendChild(script);
-        }
+        };
 
-        script.onload = () => {
-            void complete();
-        };
-        script.onerror = () => {
-            fail("Aladin Lite could not be downloaded.");
-        };
+        injectScript(1);
     });
 
     return window.__aladinLoader;

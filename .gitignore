@@ -213,3 +213,5 @@ CLAUDE.local.md
 # Design handoff exports (local only)
 # ============================================
 Quasar-handoff/
+tmp/codex/
+codex-bridge/tmp/

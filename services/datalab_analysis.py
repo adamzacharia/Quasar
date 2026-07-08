@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import html
 import math
 import os
 import re
@@ -51,6 +52,18 @@ _ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)
 _ALLOWED_UNARYOPS = (ast.USub, ast.UAdd)
 
 
+def _clean_label(text: Any) -> str:
+    """Sanitize a model-supplied display string (plot title/axis label).
+
+    Models sometimes HTML-escape angle brackets in tool arguments (e.g. a title
+    "NSC density g&lt;18" instead of "g<18"); matplotlib then renders the literal
+    entity. Unescape once and trim so the figure reads correctly.
+    """
+    if text is None:
+        return ""
+    return html.unescape(str(text)).strip()
+
+
 def catalog_scatter(
     result_id: str,
     x_expr: str,
@@ -66,6 +79,7 @@ def catalog_scatter(
     result_store: Any = None,
     plotting_service: Optional[PlottingService] = None,
 ) -> Dict[str, Any]:
+    title = _clean_label(title)
     res = _get_result(result_id, result_store)
     frame = res.dataframe
     x = _eval_expression(frame, x_expr)
@@ -125,6 +139,7 @@ def sky_density_map(
     result_store: Any = None,
     plotting_service: Optional[PlottingService] = None,
 ) -> Dict[str, Any]:
+    title = _clean_label(title)
     res = _get_result(result_id, result_store)
     frame = res.dataframe.copy()
     plotting = plotting_service or PlottingService()
@@ -150,17 +165,24 @@ def sky_density_map(
             nside = int(hp_meta["nside"])
         elif nside is None:
             nside = _infer_nside(frame[healpix_col])
+        # Decide log-scaling once from the actual counts so every render path
+        # (healpy mollview, sparse scatter) agrees and extra["log_scale"]
+        # reports what was ACTUALLY applied — a map with no positive finite
+        # counts can't be log-scaled, so we fall back to linear.
+        pix_values = _values(frame, count_col)
+        applied_log = bool(log_scale) and _log_norm(pix_values) is not None
         fig = plt.figure(figsize=(6.0, 4.0))
-        used_healpy = _try_healpy_plot(fig, frame, healpix_col, count_col, int(nside), order, title, log_scale)
+        used_healpy = _try_healpy_plot(fig, frame, healpix_col, count_col, int(nside), order, title, applied_log)
         if not used_healpy:
             ax = fig.add_subplot(111)
             ra, dec = _healpix_centers(frame[healpix_col], int(nside), order)
-            values = _values(frame, count_col)
-            norm = _log_norm(values) if log_scale else None
+            values = pix_values
+            norm = _log_norm(values) if applied_log else None
             if norm is not None:
-                # Floor zero/NaN pixels to vmin so returned cells stay visible
-                # instead of being masked out by LogNorm.
-                values = _floor_nonpositive(values, float(norm.vmin))
+                # Zero/NaN/negative pixels have no log — mask them to the
+                # background rather than flooring them to the min color, which
+                # would paint surveyed-but-empty pixels as low-density sources.
+                values = np.where(np.isfinite(values) & (values > 0), values, np.nan)
             sc = ax.scatter(ra, dec, c=values, s=20, cmap="viridis", edgecolors="none", norm=norm)
             cb_label = count_col if count_col in frame.columns else "count"
             if norm is not None:
@@ -172,7 +194,7 @@ def sky_density_map(
             ax.set_title(title)
             ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        extra = {"mode": "healpix", "nside": int(nside), "order": order, "log_scale": bool(log_scale), "peaks": peaks}
+        extra = {"mode": "healpix", "nside": int(nside), "order": order, "log_scale": applied_log, "peaks": peaks}
         return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra=extra)
 
     ra_name = _pick_column(frame, ra_col, ["ra", "ra_bin", "mean_fiber_ra", "s_ra"])
@@ -216,6 +238,8 @@ def period_fold(
     time_col: str = "mjd",
     mag_col: str = "cmag",
     error_col: Optional[str] = "cerr",
+    band: Optional[str] = None,
+    band_col: str = "filter",
     min_frequency: float = 1.0,
     max_frequency: float = 10.0,
     title: str = "Data Lab period-folded light curve",
@@ -227,14 +251,40 @@ def period_fold(
     except ImportError as exc:
         raise ImportError("astropy.timeseries is required for period folding") from exc
 
+    title = _clean_label(title)
     res = _get_result(result_id, result_store)
     frame = res.dataframe
     for col in (time_col, mag_col):
         if col not in frame.columns:
             raise ValueError(f"Column {col!r} not found")
+    # Single-band selection: NSC/DES/SMASH light curves interleave g/r/i/z epochs
+    # in one table, and folding mixed bands smears the phased light curve (each
+    # band has its own zero-point and amplitude). When a band is requested and the
+    # frame carries a band/filter column, restrict to it; otherwise leave the data
+    # untouched and report band_applied=None so we never pretend to have filtered.
+    band_applied: Optional[str] = None
+    if band is not None and str(band).strip():
+        want = str(band).strip()
+        if band_col not in frame.columns:
+            # The caller explicitly asked to fold ONE band, but the frame has no
+            # such column. Folding all bands anyway would silently smear the curve
+            # (mixed zero-points/amplitudes) and look successful — fail loudly so
+            # the caller fixes the column name instead of trusting a wrong result.
+            raise ValueError(
+                f"band={want!r} requested but band column {band_col!r} not found; "
+                f"pass band_col=<your filter column> or omit band"
+            )
+        band_series = frame[band_col].astype(str).str.strip().str.casefold()
+        frame = frame[band_series == want.casefold()]
+        band_applied = want
+        if frame.empty:
+            raise ValueError(f"No rows with {band_col}={want!r} to fold")
     t = pd.to_numeric(frame[time_col], errors="coerce")
     mag = pd.to_numeric(frame[mag_col], errors="coerce")
-    mask = np.isfinite(t) & np.isfinite(mag)
+    # Reject non-finite AND sentinel magnitudes: surveys pad missing photometry
+    # with |mag| >= 90 (e.g. 99.99 / -99), which would inject a spurious flat
+    # baseline into the periodogram if folded.
+    mask = np.isfinite(t) & np.isfinite(mag) & (np.abs(mag) < 90.0)
     # Only weight by uncertainties when enough epochs have FINITE, POSITIVE errors;
     # otherwise fall back to an unweighted periodogram. Passing NaN/zero dy to
     # LombScargle yields all-NaN power and crashes nanargmax.
@@ -285,7 +335,7 @@ def period_fold(
         "datalab_period",
         result_id,
         res.provenance,
-        extra={"best_period_days": best_period, "best_frequency_per_day": best_frequency, "points": int(len(t_v))},
+        extra={"best_period_days": best_period, "best_frequency_per_day": best_frequency, "points": int(len(t_v)), "band": band_applied},
     )
 
 
@@ -299,6 +349,7 @@ def sed_plot(
     plotting_service: Optional[PlottingService] = None,
     svo_client: Any = None,
 ) -> Dict[str, Any]:
+    title = _clean_label(title)
     res = _get_result(result_id, result_store)
     frame = res.dataframe
     if frame.empty:
@@ -364,6 +415,7 @@ def lss_wedge(
     except ImportError as exc:
         raise ImportError("astropy.cosmology is required for lss_wedge") from exc
 
+    title = _clean_label(title)
     res = _get_result(result_id, result_store)
     frame = res.dataframe
     ra_name = _pick_column(frame, ra_col, ["ra", "mean_fiber_ra"])
@@ -528,12 +580,6 @@ def _log_norm(values: np.ndarray) -> Any:
     return LogNorm(vmin=vmin, vmax=vmax)
 
 
-def _floor_nonpositive(values: np.ndarray, floor: float) -> np.ndarray:
-    """Replace zero/NaN/negative cells with ``floor`` so they survive LogNorm."""
-    arr = np.asarray(values, dtype=float)
-    return np.where(np.isfinite(arr) & (arr > 0), arr, floor)
-
-
 def _matched_filter_peaks(
     hist: np.ndarray,
     xedges: np.ndarray,
@@ -592,12 +638,22 @@ def _try_healpy_plot(fig: Any, frame: pd.DataFrame, healpix_col: str, count_col:
             p_i = int(p)
             if 0 <= p_i < len(values):
                 values[p_i] = c
+    # Guard the log scale the same way the other render paths do: healpy derives
+    # vmin from ALL finite pixels (zeros included), so a bare norm="log" raises
+    # "values must all be positive" on any map containing a zero-count pixel.
+    # Mask non-positive pixels to the background and pin min/max to the positive
+    # range so mollview never sees a non-positive vmin.
+    norm = _log_norm(values) if log_scale else None
+    kwargs: Dict[str, Any] = {}
+    if norm is not None:
+        values = np.where(np.isfinite(values) & (values > 0), values, np.nan)
+        kwargs = {"norm": "log", "min": float(norm.vmin), "max": float(norm.vmax)}
     hp.mollview(
         values,
         nest=str(order).lower().startswith("nest"),
         title=title,
         fig=fig.number,
-        norm="log" if log_scale else None,
+        **kwargs,
     )
     return True
 

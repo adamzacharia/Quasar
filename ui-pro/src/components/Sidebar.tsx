@@ -68,11 +68,11 @@ const MODEL_PRICING: Record<string, { in: number, out: number }> = {
     "gpt-4o": { in: 2.50, out: 10.00 },
     "gpt-4o-mini": { in: 0.15, out: 0.60 },
     
-    // Anthropic
-    "claude-3-7-sonnet": { in: 3.00, out: 15.00 },
-    "claude-3-5-sonnet-20241022": { in: 3.00, out: 15.00 },
-    "claude-3-5-haiku-20241022": { in: 0.25, out: 1.25 },
-    "claude-3-opus-20240229": { in: 15.00, out: 75.00 },
+    // Anthropic (current Messages API model IDs)
+    "claude-opus-4-8": { in: 5.00, out: 25.00 },
+    "claude-sonnet-5": { in: 3.00, out: 15.00 },
+    "claude-haiku-4-5": { in: 1.00, out: 5.00 },
+    "claude-fable-5": { in: 10.00, out: 50.00 },
     
     // Google Gemini
     "gemini-2.5-pro": { in: 1.25, out: 5.00 },
@@ -95,9 +95,10 @@ function getModelCost(model: string) {
     if (model.includes("gpt-5.4-mini")) return MODEL_PRICING["gpt-5.4-mini"];
     if (model.includes("gpt-5.4")) return MODEL_PRICING["gpt-5.4"];
     if (model.includes("gpt-4.1") || model.includes("gpt-4o")) return MODEL_PRICING["gpt-4o"];
-    if (model.includes("sonnet")) return MODEL_PRICING["claude-3-5-sonnet-20241022"];
-    if (model.includes("haiku")) return MODEL_PRICING["claude-3-5-haiku-20241022"];
-    if (model.includes("opus")) return MODEL_PRICING["claude-3-opus-20240229"];
+    if (model.includes("fable")) return MODEL_PRICING["claude-fable-5"];
+    if (model.includes("sonnet")) return MODEL_PRICING["claude-sonnet-5"];
+    if (model.includes("haiku")) return MODEL_PRICING["claude-haiku-4-5"];
+    if (model.includes("opus")) return MODEL_PRICING["claude-opus-4-8"];
     if (model.includes("flash")) return MODEL_PRICING["gemini-1.5-flash"];
     if (model.includes("pro") && model.includes("gemini")) return MODEL_PRICING["gemini-1.5-pro"];
     return null;

@@ -805,6 +805,7 @@ GUIDELINES:
 - **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
 - **WEB TOOL ROUTING**: Keyword query → `web_search`. Full URL(s) to read/summarize/quote → `web_extract_url`. Site root URL plus "find pages" → `web_map_site`. Site section plus "crawl/docs" → `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
 - **IMAGERY ROUTING**: when the user asks to SEE something (show me X / what does X look like / image of X), call an imaging tool (hips_cutout / hips_multiband_panel / vlass_cutout / stamps) in THIS turn - even if a similar image was produced earlier in the conversation. Prior images are not re-displayed with a new answer; an answer about appearance without a fresh tool-produced image is incomplete.
+- **DATA LAB / LEGACY SURVEYS IMAGERY**: For a Legacy Surveys / DECam / "coadd" color image (e.g. "color image of M31 from the DECam Legacy Surveys"), call `datalab_color_image` with just ra/dec/fov — it auto-selects an available 3-band triplet and renders the Lupton RGB. Do NOT hand-pick bands or pre-judge coverage. Key facts: (1) **LS DR9 imaging bands are g, r, z — there is NO i band**; never conclude "no color image" because i is missing. (2) Pick the FOV from the target's apparent size and the "center" intent (M31's D25 ≈ 3°, so "center" ≈ 0.1–0.2°), not a fixed constant. (3) The `coadd_all` cutout service has genuinely BROKEN/partial coverage at some bright nearby galaxies (e.g. the exact center of M31 has only usable z-band; the g/r/i tiles there are broken Local Group Survey refs). When `datalab_color_image` returns coverage_gap because fewer than 3 bands are usable, DO NOT just report failure and stop — the user asked for a color image, so **deliver it from a survey that does cover the target**: call `hips_cutout` (DSS2/color) or `hips_multiband_panel` for an optical color view. Report honestly that the Legacy Surveys coadd lacked full multi-band coverage at this position and that the color image shown is from the fallback survey. Only claim an image "shown" when a tool actually rendered one this turn.
 - **STRICT WEB SAFETY**: Never provide, summarize, cite, or link to pornographic, sexually explicit, nude, erotic, escort, or adult-entertainment content. Never emit general-web image URLs. If the web safety filter withholds results, state only that results were withheld by the safety filter and do not reconstruct the blocked content from memory.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
@@ -847,7 +848,7 @@ GUIDELINES:
   Chain datalab_select_catalog_rows→plotting only when no one-shot tool fits.
 - **DATA LAB EXPERT SQL**: datalab_sql_query requires a bound: a q3c cone (q3c_radial_query), an indexed equality (e.g. SMASH `fieldid = 169`, `id = '169.429960'`, DESI `targetid = N`), a registry-approved BETWEEN box, or a GROUP BY aggregate on an aggregate-safe table. All-sky ROW-level pulls are rejected — use aggregates for footprints/histograms. Wide `datalab_density_aggregate` cones that exceed the sync window auto-tile into sub-cones and merge — call it ONCE with the full cone rather than hand-tiling. If a query returns a jobid, poll datalab_job_status a FEW times only; when the result says stop_polling, end the turn and tell the user the job is still running.
 - **SURVEY COVERAGE CLAIMS**: Before claiming a catalog contains (or lacks) a target/region, check the `footprint` field returned by datalab_list_catalogs / datalab_describe_table, or call survey_covers_position for the exact position. NEVER list every catalog as covering a target — curate by footprint (e.g. the LMC is NOT covered by SDSS, DESI, LS DR9, or DES).
-- **CROSSMATCH → MEMBER SELECTION**: For stream/cluster membership science (e.g. Pal 5 tidal tails), a raw positional crossmatch is only step one. Apply the science cuts server-side (value_cuts for proper-motion windows, color_cut for the population/CMD locus) and make the FINAL sky/CMD plots from the SELECTED member sample — never present the raw crossmatch as the result. State the exact cuts in your answer.
+- **CROSSMATCH → MEMBER SELECTION**: For stream/cluster membership science (e.g. Pal 5 tidal tails), a raw positional crossmatch is only step one. Apply the science cuts server-side (value_cuts for proper-motion windows, color_cut for the population/CMD locus) and make the FINAL sky/CMD plots from the SELECTED member sample — never present the raw crossmatch as the result. State the exact cuts in your answer. For the ON-SKY plot, use the PM+CMD-SELECTED single-catalog rows over the FULL cone (e.g. the Gaia datalab_select_catalog_rows result), NOT a row-capped q3c_crossmatch result — the crossmatch LIMIT slices the sample to a spatial corner and the map then misses the cluster/stream entirely. Only claim the map shows the cluster/tails if the cluster center is actually within the plotted RA/Dec range.
 
 DUAL-SOURCE RESPONSE STRUCTURE (RAG + Web):
 When your answer draws on BOTH the documentation context provided below AND web search results, you MUST structure your response in this EXACT order:
@@ -2146,7 +2147,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         self.tool_registry.register(Tool(
             name="datalab_period_fold",
-            description="Run Lomb-Scargle period search on a stored Data Lab light curve and render the folded light curve.",
+            description=(
+                "Run Lomb-Scargle period search on a stored Data Lab light curve and render the folded light curve. "
+                "Multi-band light curves (NSC/DES/SMASH interleave g/r/i/z epochs in one table) should be folded ONE band "
+                "at a time — pass band (e.g. 'g') to restrict to a single filter; mixing bands smears the phased curve."
+            ),
             function=self._datalab_period_fold,
             parameters={
                 "type": "object",
@@ -2155,6 +2160,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "time_col": {"type": "string", "default": "mjd"},
                     "mag_col": {"type": "string", "default": "cmag"},
                     "error_col": {"type": "string", "default": "cerr"},
+                    "band": {"type": "string", "description": "Single filter to fold (e.g. 'g', 'r', 'i', 'z'). Restricts to rows where band_col equals this value. Leave unset to fold all rows."},
+                    "band_col": {"type": "string", "default": "filter", "description": "Column holding the filter/band label (NSC/SMASH use 'filter')."},
                     "min_frequency": {"type": "number", "default": 1.0},
                     "max_frequency": {"type": "number", "default": 10.0},
                     "title": {"type": "string"},
@@ -7777,11 +7784,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     ) -> Dict[str, Any]:
         self.last_run_result = None
         try:
+            # Null-coerce optional numerics: models sometimes send explicit
+            # "step_deg": null / "fov_deg": null / "top_n": null, which would
+            # crash on float(None)/int(None). Fall back to the documented defaults
+            # (mirrors the color-magnitude/color-color handlers).
+            radius_deg = 0.5 if radius_deg is None else float(radius_deg)
+            step_deg = 0.05 if step_deg is None else float(step_deg)
+            top_n = 5 if top_n is None else int(top_n)
+            fov_deg = 0.05 if fov_deg is None else float(fov_deg)
+            band = band or "g"
             ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
             out = datalab_orchestration.density_then_cutouts(
-                catalog, table, ra_f, dec_f, float(radius_deg), step_deg=float(step_deg),
+                catalog, table, ra_f, dec_f, radius_deg, step_deg=step_deg,
                 color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
-                top_n=int(top_n), fov_deg=float(fov_deg), band=band,
+                top_n=top_n, fov_deg=fov_deg, band=band,
             )
             out["target"] = label
             # The cutout grid must reach the UI as an image card (2026-07-04 live test:
@@ -8217,6 +8233,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         time_col: str = "mjd",
         mag_col: str = "cmag",
         error_col: Optional[str] = "cerr",
+        band: Optional[str] = None,
+        band_col: str = "filter",
         min_frequency: float = 1.0,
         max_frequency: float = 10.0,
         title: str = "Data Lab period-folded light curve",
@@ -8230,6 +8248,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 time_col=time_col,
                 mag_col=mag_col,
                 error_col=error_col,
+                band=band,
+                band_col=band_col,
                 min_frequency=min_frequency,
                 max_frequency=max_frequency,
                 title=title,

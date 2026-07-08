@@ -100,7 +100,21 @@ class DatalabImageService:
         for cand in candidates:
             row = cand["row"]
             try:
-                return row, self._load_image(row, ra=ra, dec=dec, fov_deg=fov_deg), errors
+                image = self._load_image(row, ra=ra, dec=dec, fov_deg=fov_deg)
+                # A tile can download with a structurally valid FITS yet be an
+                # all-zero / all-NaN placeholder at THIS position (observed at M31
+                # in coadd_all). That renders as a solid black image because ZScale
+                # collapses to vmin==vmax. Treat a degenerate cutout region like a
+                # failed tile and fall through to the next candidate.
+                probe = self._cutout_image(image, ra=ra, dec=dec, fov_deg=fov_deg)
+                if self._is_degenerate(probe.data):
+                    self._cleanup_paths([image.path])
+                    errors.append(
+                        f"{str(_row_get(row, 'access_url'))[:120]} -> empty/degenerate tile "
+                        "(all-NaN or single-valued at this position)"
+                    )
+                    continue
+                return row, image, errors
             except Exception as exc:  # noqa: BLE001 - fall through to the next candidate tile
                 errors.append(f"{str(_row_get(row, 'access_url'))[:120]} -> {exc}")
         return None, None, errors
@@ -186,17 +200,31 @@ class DatalabImageService:
         if search.get("coverage_gap"):
             return self._gap_result(search, bands=[], provenance_extra={"ra": ra, "dec": dec, "fov_deg": fov_deg})
         rows = search.get("rows") or []
-        # RGB band selection (red, green, blue). Default: blue=g, green=r, and red=i
-        # when present else z — LS DR9's registered bands are g/r/z, so i is often
-        # absent and a fixed i/r/g triplet would wrongly report a coverage gap.
+        # RGB band selection (red, green, blue). Choose from bands that have a
+        # NON-broken cutout ref: coadd_all indexes broken cross-survey tiles
+        # (e.g. Local Group Survey i/r refs at M31 that 500 with an empty col=),
+        # and advertising those as "available" made the model chase dead bands or
+        # refuse. LS DR9's real bands are g/r/z (NO i), so we order by wavelength
+        # and build blue->red from the healthy set.
+        _WL_ORDER = ["u", "g", "r", "i", "z", "y"]  # blue -> red
         if bands:
             rgb_bands = [str(b).strip().lower() for b in bands]
             if len(rgb_bands) != 3:
                 raise ValueError("bands must be a 3-item sequence (red, green, blue)")
         else:
-            avail = self.deepest_by_band(rows, ["g", "r", "i", "z"])
-            red = "i" if "i" in avail else ("z" if "z" in avail else "i")
-            rgb_bands = [red, "r", "g"]
+            healthy = [b for b in _WL_ORDER if b in set(self._bands_with_healthy_refs(rows))]
+            if len(healthy) < 3:
+                # Fewer than 3 healthy bands -> a true 3-color composite is impossible
+                # here (e.g. only z is healthy at the exact M31 center). Report the
+                # honest healthy-band list so the model can offer a single-band cutout,
+                # a slightly offset/wider field, or a HiPS/DSS2 optical color panel.
+                return self._gap_result(
+                    search, bands=healthy,
+                    provenance_extra={"healthy_bands": healthy, "reason": "fewer than 3 bands with usable tiles"},
+                )
+            blue_b, red_b = healthy[0], healthy[-1]
+            green_b = healthy[len(healthy) // 2]
+            rgb_bands = [red_b, green_b, blue_b]
         red_b, green_b, blue_b = rgb_bands
         band_candidates = self.candidates_by_band(rows, rgb_bands)
         missing = [band for band in rgb_bands if not band_candidates.get(band)]
@@ -295,7 +323,12 @@ class DatalabImageService:
                 else:
                     image = self._load_image(chosen[str(band).lower()]["row"], ra=peak["ra"], dec=peak["dec"], fov_deg=fov_deg)
                     cut = self._cutout_image(image, ra=peak["ra"], dec=peak["dec"], fov_deg=fov_deg)
-                    norm = ImageNormalize(cut.data, interval=ZScaleInterval(), stretch=AsinhStretch())
+                    if self._is_degenerate(cut.data):
+                        self._cleanup_paths([image.path])
+                        raise ValueError("empty/degenerate tile at this peak (all-NaN or constant)")
+                    finite = np.asarray(cut.data, dtype=float)
+                    finite = finite[np.isfinite(finite)]
+                    norm = ImageNormalize(finite, interval=ZScaleInterval(), stretch=AsinhStretch())
                     ax.imshow(cut.data, origin="lower", cmap="gray", norm=norm)
                     any_image = True
                     panel["selected_row"] = self._row_provenance(chosen[str(band).lower()]["row"])
@@ -368,14 +401,30 @@ class DatalabImageService:
         except Exception:
             return image
 
+    @staticmethod
+    def _is_degenerate(data: Any) -> bool:
+        """True when the array has no usable dynamic range — all-NaN, empty, or a
+        single constant value. Such a tile renders as a solid black image because
+        ZScale collapses to vmin==vmax; callers should skip it."""
+        arr = np.asarray(data, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return True
+        return float(np.max(finite)) == float(np.min(finite))
+
     def _render_single_band(self, data: Any, wcs: Any, title: str) -> Dict[str, Any]:
         plt = self.plotting_service._apply_style(dark=False)
         from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
 
+        # Backstop: never render a degenerate tile as a (misleading) black image.
+        if self._is_degenerate(data):
+            raise ValueError("cutout tile has no dynamic range (empty/all-NaN/constant) — not a valid image")
+        arr = np.asarray(data, dtype=float)
         fig = plt.figure(figsize=(5, 5))
         ax = fig.add_subplot(111, projection=wcs) if wcs is not None else fig.add_subplot(111)
-        norm = ImageNormalize(data, interval=ZScaleInterval(), stretch=AsinhStretch())
-        ax.imshow(data, origin="lower", cmap="gray", norm=norm)
+        finite = arr[np.isfinite(arr)]
+        norm = ImageNormalize(finite, interval=ZScaleInterval(), stretch=AsinhStretch())
+        ax.imshow(arr, origin="lower", cmap="gray", norm=norm)
         ax.set_title(title)
         fig.tight_layout()
         return self.plotting_service._save_and_encode(fig, f"datalab_cutout_{uuid.uuid4().hex[:10]}")
@@ -415,13 +464,26 @@ class DatalabImageService:
         provenance = dict(search.get("provenance") or {})
         provenance.update(dict(provenance_extra or {}))
         missing = list((provenance_extra or {}).get("missing_bands") or [])
+        retry = ""
+        if bands and len(bands) >= 3:
+            retry = (
+                f" However, band(s) {list(bands)} DO have usable tiles here — call "
+                "datalab_color_image (it auto-selects an available g/r/z triplet; LS DR9 uses "
+                "g/r/z, NOT i) to build the composite from those before reporting a gap."
+            )
+        elif bands:
+            retry = (
+                f" Band(s) {list(bands)} have usable tiles here — RETRY datalab_image_cutout with "
+                f"band='{list(bands)[0]}' (a color image needs 3 bands, unavailable here)."
+            )
         note = (
-            "No image produced (coverage gap): insufficient DECam coverage at this position"
+            "No image produced (coverage gap): insufficient coverage for the requested band(s) at this position"
             + (f" — missing band(s) {missing}; only {list(bands)} available." if missing
                else f" — only {list(bands)} band(s) available." if bands
                else " — the SIA search returned 0 rows.")
-            + " NOIRLab Astro Data Lab / DECam Legacy Surveys coverage is limited here. Report the"
-            " coverage gap to the user; do NOT describe an image, and do NOT claim any bands were rendered."
+            + retry
+            + " Only report a coverage gap if no retry above is possible; NEVER describe an image or"
+            " claim bands were rendered when none were."
         )
         return {
             "success": True,

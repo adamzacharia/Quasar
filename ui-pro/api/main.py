@@ -634,6 +634,40 @@ TACC_MENU_MODEL_IDS = _visible_model_list(
     list(TACC_VISIBLE_MODEL_IDS),
 )
 
+
+def _anthropic_models_enabled() -> bool:
+    """Whether Anthropic (Claude) models are surfaced in the model picker.
+
+    Default: visible locally (development/testing) and hidden on the deployed
+    production service, so Claude only shows up where it's intended to be used.
+    Override explicitly with QUASAR_ENABLE_ANTHROPIC (1/0, true/false, yes/no,
+    on/off) — e.g. set it to 1 in production once an ANTHROPIC_API_KEY is added.
+    """
+    override = os.getenv("QUASAR_ENABLE_ANTHROPIC", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    environment = (
+        os.getenv("QUASAR_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+    return environment not in {"production", "prod"}
+
+
+ANTHROPIC_DEFAULT_MODEL_IDS = [
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+]
+ANTHROPIC_VISIBLE_MODEL_IDS = (
+    _visible_model_list("QUASAR_ANTHROPIC_MODELS", ANTHROPIC_DEFAULT_MODEL_IDS)
+    if _anthropic_models_enabled()
+    else []
+)
+
 def get_current_user(authorization: Optional[str] = Header(None)):
     if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1318,6 +1352,18 @@ def _stream_chat_response(
 
     requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b")
     provider = detect_provider(requested_model)
+    # Enforce the local-only gate on the request path too — the /api/models
+    # filter only hides Claude from the picker, so without this a BYOK user or a
+    # synced conversation whose stored model is claude-* could still invoke it in
+    # production. Keep "hidden" and "unavailable" in sync.
+    if provider == "anthropic" and not _anthropic_models_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Anthropic (Claude) models are not enabled on this deployment. "
+                "They are available locally; set QUASAR_ENABLE_ANTHROPIC=1 to enable them here."
+            ),
+        )
     current_user_id = current_user.get("sub") if current_user else None
     current_user_email = _current_user_email(current_user)
     
@@ -2444,6 +2490,7 @@ async def list_models():
     cloud_models = _unique_models([
         *OPENAI_VISIBLE_MODEL_IDS,
         *DEEPSEEK_VISIBLE_MODEL_IDS,
+        *ANTHROPIC_VISIBLE_MODEL_IDS,
         *TACC_MENU_MODEL_IDS,
     ])
 
@@ -2474,7 +2521,7 @@ def _test_provider_key(provider: str, api_key: str) -> None:
     test_models = {
         "openai": os.getenv("OPENAI_KEY_TEST_MODEL", "gpt-4o-mini"),
         "deepseek": os.getenv("DEEPSEEK_KEY_TEST_MODEL", "deepseek-chat"),
-        "anthropic": os.getenv("ANTHROPIC_KEY_TEST_MODEL", "claude-3-5-haiku-latest"),
+        "anthropic": os.getenv("ANTHROPIC_KEY_TEST_MODEL", "claude-haiku-4-5"),
         "google": os.getenv("GEMINI_KEY_TEST_MODEL", "gemini-1.5-flash"),
         "tacc": os.getenv("TACC_KEY_TEST_MODEL", "Meta-Llama-3.2-1B-Instruct"),
     }

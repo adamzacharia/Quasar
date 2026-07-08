@@ -83,6 +83,30 @@ def test_build_catalog_predicates_and_density_with_cuts():
         B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "gmag", "op": "DROP", "value": 1}])
 
 
+def test_value_cut_operator_aliases_and_string_literals():
+    from services import datalab_query_builders as B
+    # '==' (Python/JS equality) coerces to SQL '='; '<>' coerces to '!='.
+    preds = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "gmag", "op": "==", "value": 20}])
+    assert preds == ["gmag = 20"]
+    preds = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "gmag", "op": "<>", "value": 20}])
+    assert preds == ["gmag != 20"]
+    # String value on '=' becomes a quoted, escaped SQL literal (the P13 class='GALAXY' case).
+    preds = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "type", "op": "=", "value": "GALAXY"}])
+    assert preds == ["type = 'GALAXY'"]
+    # A value the model already quoted is not double-quoted.
+    preds = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "type", "op": "=", "value": "'STAR'"}])
+    assert preds == ["type = 'STAR'"]
+    # Numeric strings stay numeric (no quoting).
+    preds = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "fieldid", "op": "=", "value": "169"}])
+    assert preds == ["fieldid = 169"]
+    # Single quotes in a string value are escaped, not passed through raw (injection guard).
+    preds = B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "type", "op": "=", "value": "O'Brien"}])
+    assert preds == ["type = 'O''Brien'"]
+    # A non-numeric string is rejected for inequality operators (only =/!= take strings).
+    with pytest.raises(ValueError):
+        B.build_catalog_predicates("nsc_dr2", "object", value_cuts=[{"column": "gmag", "op": "<", "value": "GALAXY"}])
+
+
 def test_confirm_sky_area_gates_wide_scans():
     from services import datalab_orchestration as orch
     small = orch.confirm_sky_area({"ra_min": 10, "ra_max": 11, "dec_min": 0, "dec_max": 1}, 1.0, max_tiles=64)

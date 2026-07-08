@@ -191,6 +191,113 @@ def test_datalab_analysis_functions_render_from_synthetic_result_store(monkeypat
     assert lss["success"] and lss["image_base64"]
 
 
+class _NormCapturingPlottingService(_MemoryPlottingService):
+    """Records the color-scale norm class used on each mappable, so tests can
+    assert whether LogNorm (vs a linear Normalize) was actually applied."""
+
+    def _save_and_encode(self, fig, filename):
+        self.norms = [type(coll.norm).__name__ for ax in fig.axes for coll in ax.collections]
+        return super()._save_and_encode(fig, filename)
+
+
+def test_sky_density_map_log_scale_default_and_toggle():
+    """DLB-08: density colorbars are log-scaled by default; log_scale=False stays linear."""
+    from services import datalab_analysis
+
+    store = DatalabResultStore(enable_disk_cache=False)
+    field = pd.DataFrame({"ra": [10.0, 10.0, 10.1, 12.0], "dec": [0.0, 0.0, 0.1, 1.0]})
+    did = store.put(field, {"catalog": "synthetic", "table": "sky"})
+
+    p = _NormCapturingPlottingService()
+    r = datalab_analysis.sky_density_map(did, bins=20, result_store=store, plotting_service=p)
+    assert r["success"] and r["log_scale"] is True
+    assert "LogNorm" in p.norms
+
+    p = _NormCapturingPlottingService()
+    r = datalab_analysis.sky_density_map(did, bins=20, log_scale=False, result_store=store, plotting_service=p)
+    assert r["log_scale"] is False
+    assert "LogNorm" not in p.norms
+
+
+def test_sky_density_map_log_scale_falls_back_to_linear_on_nonpositive_counts():
+    """A map with no positive finite counts cannot be log-scaled — degrade to
+    linear and report log_scale=False (never claim a log scale that wasn't applied)."""
+    from services import datalab_analysis
+
+    store = DatalabResultStore(enable_disk_cache=False)
+    frame = pd.DataFrame({"healpix": [1, 2, 3], "source_count": [0.0, 0.0, 0.0]})
+    hid = store.put(frame, {"catalog": "synthetic", "table": "hpx0"})
+    p = _NormCapturingPlottingService()
+    r = datalab_analysis.sky_density_map(hid, mode="healpix", nside=4, result_store=store, plotting_service=p)
+    assert r["success"] and r["log_scale"] is False
+    assert "LogNorm" not in p.norms
+
+
+def test_try_healpy_plot_masks_zero_pixels_and_never_passes_nonpositive_vmin(monkeypatch):
+    """healpy derives vmin from ALL finite pixels, so a bare norm='log' crashes on any
+    map containing a zero-count pixel. Guard: mask non-positive pixels and pin min/max
+    to the positive range; on an all-nonpositive map, fall back to a linear scale."""
+    from services import datalab_analysis
+
+    captured = {}
+
+    class _FakeHP:
+        UNSEEN = -1.6375e30
+
+        @staticmethod
+        def nside2npix(nside):
+            return 12 * nside * nside
+
+        @staticmethod
+        def mollview(values, **kwargs):
+            captured["values"] = np.asarray(values, dtype=float)
+            captured["kwargs"] = dict(kwargs)
+
+    monkeypatch.setitem(sys.modules, "healpy", _FakeHP)
+    store = DatalabResultStore(enable_disk_cache=False)
+
+    # Mixed zeros + positives, log requested → norm='log', min from POSITIVE values, zeros masked.
+    mix = pd.DataFrame({"healpix": [0, 1, 2, 3], "source_count": [0.0, 5.0, 0.0, 20.0]})
+    mid = store.put(mix, {"catalog": "synthetic", "table": "mix"})
+    r = datalab_analysis.sky_density_map(mid, mode="healpix", nside=4, result_store=store,
+                                         plotting_service=_MemoryPlottingService())
+    assert r["log_scale"] is True
+    assert captured["kwargs"].get("norm") == "log"
+    assert captured["kwargs"].get("min") == 5.0 and captured["kwargs"].get("max") == 20.0
+    assert np.isnan(captured["values"][0]) and np.isnan(captured["values"][2])  # zero-count → masked
+    assert captured["values"][1] == 5.0 and captured["values"][3] == 20.0
+
+    # All-zero map, log requested → linear (no norm kwarg), no ValueError.
+    zero = pd.DataFrame({"healpix": [0, 1, 2], "source_count": [0.0, 0.0, 0.0]})
+    zid = store.put(zero, {"catalog": "synthetic", "table": "z"})
+    r = datalab_analysis.sky_density_map(zid, mode="healpix", nside=4, result_store=store,
+                                         plotting_service=_MemoryPlottingService())
+    assert r["log_scale"] is False
+    assert "norm" not in captured["kwargs"]
+
+
+def test_tool_call_args_html_entities_are_unescaped():
+    """deepseek emitted a plot title 'g&lt;18' that rendered the literal entity; the
+    agent loop unescapes common HTML entities in string args (values, recursively)."""
+    from core.agent import _unescape_tool_args, _unescape_html_entities
+
+    assert _unescape_html_entities("g&lt;18") == "g<18"
+    assert _unescape_html_entities("x &gt;= 5 &amp;&amp; y &lt; 2") == "x >= 5 && y < 2"
+    assert _unescape_html_entities("name = &#39;foo&#39;") == "name = 'foo'"
+    # A '&copy'-style non-target sequence in a URL query string is left intact.
+    assert _unescape_html_entities("http://x/?a=1&copy=2") == "http://x/?a=1&copy=2"
+
+    out = _unescape_tool_args({
+        "title": "counts g&lt;18",
+        "value_cuts": [{"column": "g", "op": "&lt;", "value": 18}],
+        "n": 3,
+        "flag": True,
+    })
+    assert out["title"] == "counts g<18"
+    assert out["value_cuts"][0]["op"] == "<"
+    assert out["n"] == 3 and out["flag"] is True  # non-strings untouched
+
+
 def test_agent_registers_p1_tools():
     from tests.unit.test_datalab_p0 import _make_agent
 
@@ -257,6 +364,85 @@ def test_period_fold_tolerates_nonfinite_uncertainties():
     folded = datalab_analysis.period_fold(lc_id, min_frequency=1.0, max_frequency=4.0, result_store=store, plotting_service=plotter)
     assert folded["success"]
     assert folded["best_period_days"] == pytest.approx(period, abs=0.02)
+
+
+def test_period_fold_single_band_selection():
+    """A multi-band light curve must fold ONE band cleanly; the mixed set smears it."""
+    from services import datalab_analysis
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+    period = 0.6
+    t = np.linspace(0, 18, 160)
+    g_mag = 15.0 + 0.25 * np.sin(2 * np.pi * t / period)
+    # r-band epochs at a totally different period + zero-point (would corrupt a mixed fold).
+    r_mag = 17.0 + 0.4 * np.sin(2 * np.pi * t / 0.21)
+    frame = pd.DataFrame({
+        "mjd": np.concatenate([t, t]),
+        "cmag": np.concatenate([g_mag, r_mag]),
+        "cerr": np.full(2 * len(t), 0.03),
+        "filter": ["g"] * len(t) + ["r"] * len(t),
+    })
+    lc_id = store.put(frame, {"catalog": "nsc_dr2", "table": "meas"})
+    folded = datalab_analysis.period_fold(
+        lc_id, band="g", min_frequency=1.0, max_frequency=4.0,
+        result_store=store, plotting_service=plotter,
+    )
+    assert folded["success"]
+    assert folded["band"] == "g"
+    assert folded["points"] == len(t)  # only the g-band epochs were folded
+    assert folded["best_period_days"] == pytest.approx(period, abs=0.02)
+
+
+def test_period_fold_band_is_case_insensitive_and_validates_absent_rows():
+    from services import datalab_analysis
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+    t = np.linspace(0, 18, 120)
+    frame = pd.DataFrame({
+        "mjd": t,
+        "cmag": 15.0 + 0.25 * np.sin(2 * np.pi * t / 0.6),
+        "cerr": np.full_like(t, 0.03),
+        "filter": ["G"] * len(t),   # stored upper-case; request lower-case
+    })
+    lc_id = store.put(frame, {"catalog": "nsc_dr2", "table": "meas"})
+    folded = datalab_analysis.period_fold(lc_id, band="g", result_store=store, plotting_service=plotter)
+    assert folded["success"] and folded["band"] == "g" and folded["points"] == len(t)
+    # A band with no matching rows must raise, not silently fold nothing.
+    with pytest.raises(ValueError):
+        datalab_analysis.period_fold(lc_id, band="z", result_store=store, plotting_service=plotter)
+    # A band requested against a frame that has NO band column must raise, not
+    # silently fold every band (which would smear the phased curve).
+    no_band = pd.DataFrame({"mjd": t, "cmag": 15.0 + 0.2 * np.sin(2 * np.pi * t / 0.6), "cerr": np.full_like(t, 0.03)})
+    nb_id = store.put(no_band, {"catalog": "synthetic", "table": "lc"})
+    with pytest.raises(ValueError):
+        datalab_analysis.period_fold(nb_id, band="g", result_store=store, plotting_service=plotter)
+
+
+def test_period_fold_rejects_sentinel_magnitudes():
+    """99.99 / -99 padding must be dropped before the periodogram, not folded."""
+    from services import datalab_analysis
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+    period = 0.6
+    t = np.linspace(0, 18, 160)
+    mag = 15.0 + 0.25 * np.sin(2 * np.pi * t / period)
+    mag[::5] = 99.99   # sentinel padding on 1/5 of epochs
+    lc_id = store.put(pd.DataFrame({"mjd": t, "cmag": mag, "cerr": np.full_like(t, 0.03)}),
+                      {"catalog": "synthetic", "table": "lc"})
+    folded = datalab_analysis.period_fold(lc_id, min_frequency=1.0, max_frequency=4.0,
+                                          result_store=store, plotting_service=plotter)
+    assert folded["success"]
+    assert folded["points"] == int(np.sum(np.abs(mag) < 90.0))  # sentinels excluded
+    assert folded["best_period_days"] == pytest.approx(period, abs=0.02)
+
+
+def test_clean_label_unescapes_html_entities_in_titles():
+    """Models sometimes HTML-escape angle brackets in a plot title (e.g. 'g&lt;18')."""
+    from services import datalab_analysis
+    assert datalab_analysis._clean_label("NSC density g&lt;18") == "NSC density g<18"
+    assert datalab_analysis._clean_label("M31 &amp; M32") == "M31 & M32"
+    assert datalab_analysis._clean_label("  plain title  ") == "plain title"
+    assert datalab_analysis._clean_label(None) == ""
 
 
 def test_try_healpy_plot_guards_high_nside():

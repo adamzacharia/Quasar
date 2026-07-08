@@ -21,6 +21,42 @@ MAX_ROW_LIMIT = 5000
 MAX_CONE_RADIUS_DEG = float(os.getenv("DATALAB_MAX_CONE_RADIUS_DEG", "30"))
 # Whitelisted comparison operators for structured selection cuts.
 _CUT_OPS = {"<", ">", "<=", ">=", "=", "!="}
+# Operator spellings LLMs frequently emit that mean the same thing: Python/JS
+# equality "==" and SQL-standard not-equal "<>".
+_CUT_OP_ALIASES = {"==": "=", "<>": "!="}
+
+
+def _normalize_cut_op(op: Any) -> str:
+    """Canonicalize a value-cut operator, mapping common aliases ('==' -> '=')."""
+    text = str(op or "").strip()
+    text = _CUT_OP_ALIASES.get(text, text)
+    if text not in _CUT_OPS:
+        raise ValueError(f"unsupported value-cut operator {op!r}")
+    return text
+
+
+def _cut_rhs(op: str, value: Any) -> str:
+    """Render the right-hand side of a value cut as a safe SQL literal.
+
+    Numeric values (including numeric strings like '169') become numeric
+    literals. Non-numeric strings are allowed ONLY for '='/'!=' and become
+    single-quoted, quote-escaped string literals (e.g. ``class = 'GALAXY'``),
+    which the SQL policy layer recognizes. Inequality operators still require a
+    number.
+    """
+    try:
+        return _num(float(value))
+    except (TypeError, ValueError):
+        pass
+    if op not in ("=", "!="):
+        raise ValueError(f"value-cut operator {op!r} requires a numeric value, got {value!r}")
+    text = str(value).strip()
+    # Tolerate a value the model already wrapped in quotes.
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    if not text or len(text) > 128 or any(ord(ch) < 32 for ch in text):
+        raise ValueError(f"invalid string value for value cut: {value!r}")
+    return "'" + text.replace("'", "''") + "'"
 
 
 def build_cone_count(catalog: str, table: str, *, ra: float, dec: float, radius_deg: float) -> Tuple[str, Dict[str, Any]]:
@@ -216,10 +252,8 @@ def build_catalog_predicates(
             preds.append(f"{expr} <= {_num(float(color_cut['max']))}")
     for vc in (value_cuts or []):
         col = _column(info, vc["column"])
-        op = str(vc.get("op", "")).strip()
-        if op not in _CUT_OPS:
-            raise ValueError(f"unsupported value-cut operator {op!r}")
-        preds.append(f"{col} {op} {_num(float(vc['value']))}")
+        op = _normalize_cut_op(vc.get("op", ""))
+        preds.append(f"{col} {op} {_cut_rhs(op, vc['value'])}")
     if morphology:
         col = _column(info, morphology["column"])
         if morphology.get("in"):
@@ -229,10 +263,8 @@ def build_catalog_predicates(
             lo, hi = morphology["between"]
             preds.append(f"{col} BETWEEN {_num(float(lo))} AND {_num(float(hi))}")
         if morphology.get("op"):
-            op = str(morphology["op"]).strip()
-            if op not in _CUT_OPS:
-                raise ValueError(f"unsupported morphology operator {op!r}")
-            preds.append(f"{col} {op} {_num(float(morphology['value']))}")
+            op = _normalize_cut_op(morphology["op"])
+            preds.append(f"{col} {op} {_cut_rhs(op, morphology['value'])}")
     return preds
 
 

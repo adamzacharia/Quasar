@@ -60,6 +60,11 @@ function tokenLabelFor(content: string, usageTokens?: number): string {
     return estimate > 0 ? `~${formatTokenCount(estimate)} tokens` : "";
 }
 
+/* Per-response token readout is temporarily hidden in the UI pending fixes to the
+   usage accounting. Re-enable by setting NEXT_PUBLIC_SHOW_TOKEN_USAGE=1 (or flip
+   this default to true). */
+const SHOW_TOKEN_USAGE = process.env.NEXT_PUBLIC_SHOW_TOKEN_USAGE === "1";
+
 function MessageActions({ message, reportPrompt = "" }: { message: Message; reportPrompt?: string }) {
     const [copied, setCopied] = useState(false);
     const [feedback, setFeedback] = useState<"like" | "dislike" | null>(null);
@@ -161,7 +166,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                         <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
                     </button>
                 </div>
-                {tokenLabel && (
+                {SHOW_TOKEN_USAGE && tokenLabel && (
                     <span className="ml-1 text-[11px] text-slate-500 tabular-nums select-none" title={message.usageTokens ? "Tokens used for this response (provider-reported)" : "Estimated from response length"}>
                         {tokenLabel}
                     </span>
@@ -201,7 +206,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                             {reportError && <div className="mt-2 text-[11px] text-red-300">{reportError}</div>}
                             <button type="button" onClick={submitIssueReport}
                                 disabled={!canSubmitIssueReport(description, message.runMeta?.run_id) || reportState === "sending"}
-                                className="mt-3 flex items-center gap-2 rounded-lg bg-red-500/15 px-3 py-2 text-xs font-semibold text-red-200 disabled:opacity-40">
+                                className="mt-3 flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300">
                                 {reportState === "sending" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
                                 Send report
                             </button>
