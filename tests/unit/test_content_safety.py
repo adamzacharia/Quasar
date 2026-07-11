@@ -74,8 +74,26 @@ def test_explicit_context_withholds_all_sources_images_and_answer(monkeypatch):
     assert result["content_filter"]["blocked_images"] == 1
 
 
-def test_general_web_images_are_disabled_by_default(monkeypatch):
+def test_general_web_images_are_enabled_by_default(monkeypatch):
     monkeypatch.delenv("QUASAR_WEB_IMAGES_ENABLED", raising=False)
+
+    assert web_images_enabled() is True
+    result = sanitize_web_payload(
+        {
+            "success": True,
+            "results": [{"title": "Safe", "url": "https://example.com", "snippet": "Safe"}],
+            "images": [{"url": "https://example.com/image.jpg", "description": "Safe image"}],
+        }
+    )
+
+    assert len(result["results"]) == 1
+    assert len(result["images"]) == 1
+    assert result["content_filter"]["blocked_images"] == 0
+    assert result["content_filter"]["web_images_enabled"] is True
+
+
+def test_env_override_disables_general_web_images(monkeypatch):
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "false")
 
     assert web_images_enabled() is False
     result = sanitize_web_payload(
@@ -89,6 +107,7 @@ def test_general_web_images_are_disabled_by_default(monkeypatch):
     assert len(result["results"]) == 1
     assert result["images"] == []
     assert result["content_filter"]["blocked_images"] == 1
+    assert result["content_filter"]["web_images_enabled"] is False
 
 
 def test_sanitizer_is_idempotent(monkeypatch):

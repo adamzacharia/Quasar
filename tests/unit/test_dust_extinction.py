@@ -147,6 +147,32 @@ def test_extinction_table_math_aliases_unknown_band_and_all_coefficients():
     assert all_bands["rows"][0]["band"] == "U"
 
 
+def test_natural_band_names_resolve_like_bare_letters():
+    # "V band", "Johnson V", "Cousins R", "Bessell V" must resolve to the same
+    # SF11 Landolt keys as bare "V"/"B" instead of an empty table.
+    svc = DustExtinctionService(http_get=lambda *args, **kwargs: FakeResponse(XML_SFD_ONLY))
+    out = svc.extinction_table(
+        10,
+        0,
+        bands=[
+            "V band",
+            "B band",
+            "Johnson V",
+            "Johnson B",
+            "johnson u",
+            "Cousins R",
+            "Cousins I",
+            "Bessell V",
+            "Johnson-Cousins I",
+        ],
+    )
+
+    assert out["success"] is True
+    assert [row["band"] for row in out["rows"]] == ["V", "B", "U", "R", "I"]
+    assert math.isclose(out["rows"][0]["A_lambda"], 2.742 * 0.086)
+    assert not any("Unknown" in warning or "ambiguous" in warning for warning in out["warnings"])
+
+
 def test_env_overrides(monkeypatch):
     monkeypatch.setenv("IRSA_DUST_BASE_URL", "https://env.test/dust")
     monkeypatch.setenv("IRSA_DUST_TIMEOUT", "11")

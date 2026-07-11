@@ -294,5 +294,124 @@ def test_agent_registers_diagram_tools():
     from tests.unit.test_datalab_p0 import _make_agent
     agent = _make_agent()
     agent._register_tools()
-    assert agent.tool_registry.get_tool("datalab_color_color_diagram") is not None
-    assert agent.tool_registry.get_tool("datalab_color_magnitude_diagram") is not None
+    for name in ("datalab_color_color_diagram", "datalab_color_magnitude_diagram"):
+        tool = agent.tool_registry.get_tool(name)
+        assert tool is not None
+        # DLB-03 gap fix: the diagram tools must expose point-source/morphology selection.
+        assert "point_sources" in tool.parameters["properties"]
+        assert "morphology" in tool.parameters["properties"]
+
+
+# ── Point-source / morphology cuts in the one-shot diagrams (DLB-03 gap) ───────
+class _RecordingDiagramClient(_FakeDiagramClient):
+    """DES-style diagram client that records every executed SQL."""
+
+    def __init__(self):
+        self.sql = []
+
+    def query(self, *, sql=None, **kwargs):
+        self.sql.append(sql or "")
+        return super().query(sql=sql, **kwargs)
+
+
+class _FakeNSCDiagramClient:
+    """NSC-style columns (gmag/rmag/imag); records every executed SQL."""
+
+    def __init__(self):
+        self.sql = []
+
+    def query(self, *, sql=None, adql=None, fmt="pandas", **kwargs):
+        self.sql.append(sql or "")
+        rng = np.random.default_rng(2)
+        n = 200
+        df = pd.DataFrame({
+            "ra": rng.uniform(259.7, 260.4, n), "dec": rng.uniform(57.6, 58.2, n),
+            "gmag": rng.uniform(17, 24, n), "rmag": rng.uniform(16.5, 23.5, n),
+            "imag": rng.uniform(16, 23, n),
+        })
+        return DatalabResult.from_dataframe(df, {"catalog": "nsc_dr2", "table": "object", "query": sql})
+
+
+def test_build_cone_select_accepts_predicates():
+    from services import datalab_query_builders as B
+    preds = B.build_catalog_predicates("nsc_dr2", "object", morphology={"column": "class_star", "op": ">", "value": 0.5})
+    sql, meta = B.build_cone_select(
+        "nsc_dr2", "object", ra=260.06, dec=57.92, radius_deg=0.4,
+        columns=["ra", "dec", "gmag", "rmag"], limit=1000, predicates=preds,
+    )
+    assert "q3c_radial_query" in sql and "AND (class_star > 0.5)" in sql and "LIMIT 1000" in sql
+    assert meta["spatial_bound"] is True
+    # No predicates -> the WHERE stays a single spatial clause (unchanged behavior).
+    sql2, _ = B.build_cone_select("nsc_dr2", "object", ra=260.06, dec=57.92, radius_deg=0.4)
+    assert "AND" not in sql2
+
+
+def test_point_source_cut_registry_defaults():
+    from services import datalab_registry as reg
+    assert reg.point_source_cut("nsc_dr2", "object") == {"column": "class_star", "op": ">", "value": 0.5}
+    assert reg.point_source_cut("des_dr1", "main") == {"column": "spread_model_r", "between": [-0.005, 0.005]}
+    assert reg.point_source_cut("gaia_dr3", "gaia_source") is None  # no star/galaxy separator
+    # Returned cut is a copy: mutating it must not corrupt the registry default.
+    cut = reg.point_source_cut("des_dr1", "main")
+    cut["between"].append(99)
+    assert reg.point_source_cut("des_dr1", "main")["between"] == [-0.005, 0.005]
+
+
+def test_cmd_point_sources_applies_registry_morphology_cut():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _FakeNSCDiagramClient()
+    out = orch.color_magnitude_diagram(
+        "nsc_dr2", "object", 260.06, 57.92, 0.4, blue_band="g", red_band="r", point_sources=True,
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and out["image_base64"] and out["points"] > 0
+    assert "class_star > 0.5" in client.sql[0]  # the cut is in the executed SQL, not post-hoc
+    assert out["morphology"] == {"column": "class_star", "op": ">", "value": 0.5}
+
+
+def test_cmd_explicit_morphology_overrides_point_sources():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _FakeNSCDiagramClient()
+    out = orch.color_magnitude_diagram(
+        "nsc_dr2", "object", 260.06, 57.92, 0.4, point_sources=True,
+        morphology={"column": "class_star", "op": ">=", "value": 0.9},
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and "class_star >= 0.9" in client.sql[0]
+
+
+def test_cmd_point_sources_without_registered_cut_notes_and_runs():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _FakeNSCDiagramClient()
+    out = orch.color_magnitude_diagram(
+        "gaia_dr3", "gaia_source", 10.0, 0.0, 0.4, point_sources=True,
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and out["morphology"] is None
+    assert any("no star/galaxy morphology cut" in n for n in out["notes"])
+    assert "class_star" not in client.sql[0]
+
+
+def test_ccd_point_sources_applies_cut_and_skips_star_galaxy_split():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _RecordingDiagramClient()
+    out = orch.color_color_diagram(
+        "des_dr1", "main", 30.0, -50.0, 0.5, point_sources=True,
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and "spread_model_r BETWEEN -0.005 AND 0.005" in client.sql[0]
+    # The sample is already stars-only, so there is no stars/galaxies auto-split.
+    assert out["split_col"] is None
+    assert [p["population"] for p in out["populations"]] == ["all"]
