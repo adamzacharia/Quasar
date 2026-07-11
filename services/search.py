@@ -19,13 +19,30 @@ Also provides: plot generation, data download, line coverage checks,
 and catalog search — all delegated to ALminerClient.
 """
 
+import logging
 from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 from datetime import datetime
 from integrations.alminer_client import ALminerClient
 
+logger = logging.getLogger(__name__)
+
 # Facilities served by the NRAO TAP archive (data-query.nrao.edu)
 NRAO_FACILITIES = {"VLA", "VLBA", "EVLA", "JVLA", "GBT"}
+
+
+def _errored_frame(error: str) -> pd.DataFrame:
+    """An empty DataFrame that carries an archive-error marker in ``.attrs``.
+
+    Backward compatible: ``.empty`` / ``len()`` still report the frame as empty,
+    so existing callers that only check ``.empty`` are unaffected. Callers that
+    need to tell "archive unavailable / query failed" apart from "no matching
+    data" can read ``df.attrs.get("quasar_error")``. This keeps a failed search
+    from being silently reported as a successful zero-row result. (C3)
+    """
+    df = pd.DataFrame()
+    df.attrs["quasar_error"] = error
+    return df
 
 
 class SearchService:
@@ -63,8 +80,8 @@ class SearchService:
         if self.is_nrao_facility(facility):
             client = self.nrao_client
             if client is None:
-                print("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
-                return pd.DataFrame()
+                logger.warning("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
+                return _errored_frame("NRAO TAP archive is unavailable — cannot search VLA/VLBA/GBT.")
             try:
                 return client.search_by_position(
                     ra, dec, radius,
@@ -72,14 +89,14 @@ class SearchService:
                     max_results=max_results,
                 )
             except Exception as e:
-                print(f"NRAO TAP search failed: {e}")
-                return pd.DataFrame()
+                logger.warning("NRAO TAP position search failed: %s", e)
+                return _errored_frame(f"NRAO TAP position search failed: {e}")
 
         try:
             return self.alminer_client.search_by_position(ra, dec, radius)
         except Exception as e:
-            print(f"ALminer search failed: {e}")
-            return pd.DataFrame()
+            logger.warning("ALminer position search failed: %s", e)
+            return _errored_frame(f"ALMA archive position search failed: {e}")
 
     def search_by_target(self, target_name: str,
                         facility: Optional[str] = None,
@@ -89,8 +106,8 @@ class SearchService:
         if self.is_nrao_facility(facility):
             client = self.nrao_client
             if client is None:
-                print("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
-                return pd.DataFrame()
+                logger.warning("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
+                return _errored_frame("NRAO TAP archive is unavailable — cannot search VLA/VLBA/GBT.")
             try:
                 return client.search_vla_vlba(
                     target_name,
@@ -98,14 +115,14 @@ class SearchService:
                     instruments=self._nrao_instruments(facility),
                 )
             except Exception as e:
-                print(f"NRAO TAP search failed: {e}")
-                return pd.DataFrame()
+                logger.warning("NRAO TAP target search failed: %s", e)
+                return _errored_frame(f"NRAO TAP target search failed: {e}")
 
         try:
             return self.alminer_client.search_by_target(target_name)
         except Exception as e:
-            print(f"ALminer search failed: {e}")
-            return pd.DataFrame()
+            logger.warning("ALminer target search failed: %s", e)
+            return _errored_frame(f"ALMA archive target search failed: {e}")
 
     def search_by_frequency(self, min_freq_ghz: float, max_freq_ghz: float,
                            facility: Optional[str] = None,
@@ -114,8 +131,8 @@ class SearchService:
         if self.is_nrao_facility(facility):
             client = self.nrao_client
             if client is None:
-                print("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
-                return pd.DataFrame()
+                logger.warning("[SearchService] NRAO TAP unavailable — cannot search VLA/VLBA/GBT")
+                return _errored_frame("NRAO TAP archive is unavailable — cannot search VLA/VLBA/GBT.")
             try:
                 return client.search_by_frequency_range(
                     min_freq_ghz, max_freq_ghz,
@@ -123,8 +140,8 @@ class SearchService:
                     max_results=max_results,
                 )
             except Exception as e:
-                print(f"NRAO TAP search failed: {e}")
-                return pd.DataFrame()
+                logger.warning("NRAO TAP frequency search failed: %s", e)
+                return _errored_frame(f"NRAO TAP frequency search failed: {e}")
 
         return self.alminer_client.search_by_frequency(min_freq_ghz, max_freq_ghz)
 
@@ -137,16 +154,16 @@ class SearchService:
         try:
             return self.alminer_client.search_by_sql(query)
         except Exception as e:
-            print(f"Advanced search failed: {e}")
-            return pd.DataFrame()
+            logger.warning("Advanced ADQL/TAP search failed: %s", e)
+            return _errored_frame(f"ALMA advanced ADQL/TAP query failed: {e}")
 
     def search_alma_with_keywords(self, keywords: Dict[str, Any]) -> pd.DataFrame:
         """Search ALMA using specific keywords (project_code, pi_name, etc.)"""
         try:
             return self.alminer_client.search_by_keywords(keywords)
         except Exception as e:
-            print(f"Keyword search failed: {e}")
-            return pd.DataFrame()
+            logger.warning("ALMA keyword search failed: %s", e)
+            return _errored_frame(f"ALMA keyword search failed: {e}")
 
     def plot_alma_results(self, df: pd.DataFrame, plot_type: str = "sky") -> bytes:
         """
@@ -177,8 +194,9 @@ class SearchService:
         """
         try:
             return self.alminer_client.search_by_target(source_name)
-        except Exception:
-            return pd.DataFrame()
+        except Exception as e:
+            logger.warning("ALMA source search failed: %s", e)
+            return _errored_frame(f"ALMA source search failed: {e}")
 
     def check_line_coverage(self, line_freq_ghz: float, z: float = 0.0, line_name: str = "Line") -> pd.DataFrame:
         """

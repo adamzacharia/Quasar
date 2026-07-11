@@ -33,7 +33,6 @@ from openai import OpenAI
 from core.task_dag import TaskDAG, TaskNode, TaskStatus
 from core.workflow_memory import WorkflowMemory
 from core.dag_cache import DAGCache
-from core.result_cache import ResultCache
 from core.observability import estimate_cost
 from core.langfuse_integration import get_langfuse, langfuse_trace, langfuse_generation
 from services.citation_verifier import append_citation_warning
@@ -302,8 +301,6 @@ class Conductor:
         self.dag = TaskDAG()
         # (#14) Cross-session DAG learning
         self.dag_cache = DAGCache(cache_path="data/dag_cache.json")
-        # (#11) Result deduplication cache
-        self.result_cache = ResultCache(ttl_seconds=300)
 
     # ── SSE Event Helpers ──────────────────────────────────────────────────
 
@@ -741,11 +738,17 @@ class Conductor:
                         if dep_parts:
                             dep_context = "\n".join(dep_parts)
 
-                    # (#2) Use RecoveryEngine for resilient execution
+                    # (#2) Use RecoveryEngine for resilient execution.
+                    # Route recovery through the FULL node executor (model
+                    # routing, sandbox dispatch, structured dependency context,
+                    # SLA) instead of a bare tool_executor lambda that dropped
+                    # all of that. execute_with_recovery detects the coroutine
+                    # and calls it with the node, re-running _execute_node after
+                    # each REPLAN/REASSIGN (which mutate node.description). (C7)
                     if self.recovery:
                         result = await self.recovery.execute_with_recovery(
                             node,
-                            lambda desc, ctx="", model="": self.tool_executor(desc, ctx, model) if self.tool_executor else self._direct_answer(desc, ctx),
+                            self._execute_node,
                             on_status=on_status,
                             dep_context=dep_context,
                         )
@@ -946,15 +949,11 @@ class Conductor:
                 if result:
                     return result
             except Exception as e:
+                # Recovery (RETRY/REPLAN/REASSIGN/DECOMPOSE) is now applied by the
+                # OUTER execute_with_recovery wrapper in _run_one, which calls
+                # this method. Re-invoking recovery here would double-nest it, so
+                # just log and fall through to the direct-answer fallback. (C7)
                 logger.error("Tool executor failed for %s: %s", node.id, e)
-                # If we have a recovery engine, try recovery
-                if self.recovery:
-                    try:
-                        return await self.recovery.execute_with_recovery(
-                            node, self.tool_executor
-                        )
-                    except Exception as re:
-                        logger.error("Recovery also failed for %s: %s", node.id, re)
 
         # Fallback: direct LLM answer
         return self._direct_answer(full_task, dep_context)

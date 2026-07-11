@@ -74,31 +74,33 @@ class ProviderKeyService:
 
     def _init_db(self) -> None:
         conn = self._conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_provider_keys (
-                user_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                encrypted_key TEXT NOT NULL,
-                key_last4 TEXT NOT NULL,
-                token_limit INTEGER,
-                status TEXT NOT NULL DEFAULT 'untested',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_tested_at TEXT,
-                PRIMARY KEY (user_id, provider)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_provider_keys (
+                    user_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    encrypted_key TEXT NOT NULL,
+                    key_last4 TEXT NOT NULL,
+                    token_limit INTEGER,
+                    status TEXT NOT NULL DEFAULT 'untested',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_tested_at TEXT,
+                    PRIMARY KEY (user_id, provider)
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_user_provider_keys_user
-            ON user_provider_keys(user_id)
-            """
-        )
-        conn.commit()
-        conn.close()
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_provider_keys_user
+                ON user_provider_keys(user_id)
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     @staticmethod
     def _metadata_from_row(row) -> Dict:
@@ -114,32 +116,36 @@ class ProviderKeyService:
 
     def list_keys(self, user_id: str) -> List[Dict]:
         conn = self._conn()
-        rows = conn.execute(
-            """
-            SELECT user_id, provider, encrypted_key, key_last4, token_limit,
-                   status, created_at, updated_at, last_tested_at
-            FROM user_provider_keys
-            WHERE user_id = ?
-            ORDER BY provider
-            """,
-            (user_id,),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                """
+                SELECT user_id, provider, encrypted_key, key_last4, token_limit,
+                       status, created_at, updated_at, last_tested_at
+                FROM user_provider_keys
+                WHERE user_id = ?
+                ORDER BY provider
+                """,
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
         return [self._metadata_from_row(row) for row in rows]
 
     def get_metadata(self, user_id: str, provider: str) -> Optional[Dict]:
         provider = _normalize_provider(provider)
         conn = self._conn()
-        row = conn.execute(
-            """
-            SELECT user_id, provider, encrypted_key, key_last4, token_limit,
-                   status, created_at, updated_at, last_tested_at
-            FROM user_provider_keys
-            WHERE user_id = ? AND provider = ?
-            """,
-            (user_id, provider),
-        ).fetchone()
-        conn.close()
+        try:
+            row = conn.execute(
+                """
+                SELECT user_id, provider, encrypted_key, key_last4, token_limit,
+                       status, created_at, updated_at, last_tested_at
+                FROM user_provider_keys
+                WHERE user_id = ? AND provider = ?
+                """,
+                (user_id, provider),
+            ).fetchone()
+        finally:
+            conn.close()
         return self._metadata_from_row(row) if row else None
 
     def save_key(self, user_id: str, provider: str, raw_key: str, token_limit: Optional[int] = None) -> Dict:
@@ -155,46 +161,50 @@ class ProviderKeyService:
         now = datetime.now(timezone.utc).isoformat()
 
         conn = self._conn()
-        existing = conn.execute(
-            "SELECT created_at, token_limit FROM user_provider_keys WHERE user_id = ? AND provider = ?",
-            (user_id, provider),
-        ).fetchone()
-        if existing:
-            created_at = existing[0]
-            if token_limit is None:
-                token_limit = existing[1]
-            conn.execute(
-                """
-                UPDATE user_provider_keys
-                SET encrypted_key = ?, key_last4 = ?, token_limit = ?, status = 'untested',
-                    updated_at = ?, last_tested_at = NULL
-                WHERE user_id = ? AND provider = ?
-                """,
-                (encrypted, last4, token_limit, now, user_id, provider),
-            )
-        else:
-            created_at = now
-            conn.execute(
-                """
-                INSERT INTO user_provider_keys
-                (user_id, provider, encrypted_key, key_last4, token_limit, status,
-                 created_at, updated_at, last_tested_at)
-                VALUES (?, ?, ?, ?, ?, 'untested', ?, ?, NULL)
-                """,
-                (user_id, provider, encrypted, last4, token_limit, created_at, now),
-            )
-        conn.commit()
-        conn.close()
+        try:
+            existing = conn.execute(
+                "SELECT created_at, token_limit FROM user_provider_keys WHERE user_id = ? AND provider = ?",
+                (user_id, provider),
+            ).fetchone()
+            if existing:
+                created_at = existing[0]
+                if token_limit is None:
+                    token_limit = existing[1]
+                conn.execute(
+                    """
+                    UPDATE user_provider_keys
+                    SET encrypted_key = ?, key_last4 = ?, token_limit = ?, status = 'untested',
+                        updated_at = ?, last_tested_at = NULL
+                    WHERE user_id = ? AND provider = ?
+                    """,
+                    (encrypted, last4, token_limit, now, user_id, provider),
+                )
+            else:
+                created_at = now
+                conn.execute(
+                    """
+                    INSERT INTO user_provider_keys
+                    (user_id, provider, encrypted_key, key_last4, token_limit, status,
+                     created_at, updated_at, last_tested_at)
+                    VALUES (?, ?, ?, ?, ?, 'untested', ?, ?, NULL)
+                    """,
+                    (user_id, provider, encrypted, last4, token_limit, created_at, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
         return self.get_metadata(user_id, provider) or {}
 
     def decrypt_key(self, user_id: str, provider: str) -> Optional[str]:
         provider = _normalize_provider(provider)
         conn = self._conn()
-        row = conn.execute(
-            "SELECT encrypted_key FROM user_provider_keys WHERE user_id = ? AND provider = ?",
-            (user_id, provider),
-        ).fetchone()
-        conn.close()
+        try:
+            row = conn.execute(
+                "SELECT encrypted_key FROM user_provider_keys WHERE user_id = ? AND provider = ?",
+                (user_id, provider),
+            ).fetchone()
+        finally:
+            conn.close()
         if not row:
             return None
         try:
@@ -216,16 +226,18 @@ class ProviderKeyService:
         normalized = self._normalize_token_limit(token_limit) if token_limit is not None else None
         now = datetime.now(timezone.utc).isoformat()
         conn = self._conn()
-        cur = conn.execute(
-            """
-            UPDATE user_provider_keys
-            SET token_limit = ?, updated_at = ?
-            WHERE user_id = ? AND provider = ?
-            """,
-            (normalized, now, user_id, provider),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.execute(
+                """
+                UPDATE user_provider_keys
+                SET token_limit = ?, updated_at = ?
+                WHERE user_id = ? AND provider = ?
+                """,
+                (normalized, now, user_id, provider),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         if getattr(cur, "rowcount", 0) == 0:
             raise ProviderKeyError("Provider key not found.")
         return self.get_metadata(user_id, provider) or {}
@@ -234,27 +246,31 @@ class ProviderKeyService:
         provider = _normalize_provider(provider)
         now = datetime.now(timezone.utc).isoformat()
         conn = self._conn()
-        conn.execute(
-            """
-            UPDATE user_provider_keys
-            SET status = ?, last_tested_at = ?, updated_at = ?
-            WHERE user_id = ? AND provider = ?
-            """,
-            ("valid" if ok else "invalid", now, now, user_id, provider),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                UPDATE user_provider_keys
+                SET status = ?, last_tested_at = ?, updated_at = ?
+                WHERE user_id = ? AND provider = ?
+                """,
+                ("valid" if ok else "invalid", now, now, user_id, provider),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return self.get_metadata(user_id, provider) or {}
 
     def delete_key(self, user_id: str, provider: str) -> bool:
         provider = _normalize_provider(provider)
         conn = self._conn()
-        cur = conn.execute(
-            "DELETE FROM user_provider_keys WHERE user_id = ? AND provider = ?",
-            (user_id, provider),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.execute(
+                "DELETE FROM user_provider_keys WHERE user_id = ? AND provider = ?",
+                (user_id, provider),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return getattr(cur, "rowcount", 0) > 0
 
     @staticmethod

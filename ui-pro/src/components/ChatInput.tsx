@@ -104,16 +104,23 @@ export function ChatInput({
         }
     };
 
-    // The hero composer is a full pill only while empty. Once an attachment row
+    // The composer is a full pill only while empty. Once an attachment row
     // stacks on top, the box grows tall — and rounded-full (radius = 50% of
     // height) would warp it into a distorted stadium with the chips/input row
     // pushed out of alignment. Switch to a fixed corner radius in that state.
-    const pillShape = isHero && attachments.length === 0;
-    const radius = pillShape ? "rounded-full" : isHero ? "rounded-3xl" : "rounded-2xl";
+    // Docked stays a pill on phones (the mobile home dock) and squares off at md.
+    const noAttachments = attachments.length === 0;
+    const radius = isHero
+        ? (noAttachments ? "rounded-full" : "rounded-3xl")
+        : (noAttachments ? "rounded-full md:rounded-2xl" : "rounded-2xl");
 
     return (
         <div className={isHero ? "w-full z-20" : "w-full px-4 md:px-8 pb-3 pt-2 z-20"}>
-            <div className={`w-full mx-auto relative ${isHero ? "max-w-[var(--q-suggestion-grid-width)]" : "max-w-[var(--q-chat-input-width)]"}`}>
+            {/* --q-chat-input-width carries an 8vw inset meant to keep the composer
+                off the edges of a wide monitor. On a phone that inset stacks on top
+                of the px-4 gutter and squeezes the dock narrower than the content
+                above it, so it only applies from md up. */}
+            <div className={`w-full mx-auto relative ${isHero ? "max-w-[var(--q-suggestion-grid-width)]" : "max-w-none md:max-w-[var(--q-chat-input-width)]"}`}>
                 <form onSubmit={handleSubmit} className="relative group">
                     <div className={`absolute inset-0 bg-primary/20 ${radius} blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500`} />
                     <div className={`relative w-full glass-surface ${radius} ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all`}>

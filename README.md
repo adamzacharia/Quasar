@@ -4,7 +4,7 @@
 
 **Quasar** is a free, source-available AI research assistant that makes ALMA Science Archive search and data retrieval as simple as asking a question in natural language. It is a *domain-specialized agent framework* that wraps any general-purpose LLM with the tools, knowledge, and orchestration needed to perform real radio astronomy tasks.
 
-Quasar pairs a registry of **75+ domain-specific tools** covering archive data search, retrieval, and analysis with a **Conductor** orchestration engine that decomposes complex, multi-step research queries into Directed Acyclic task Graphs (DAGs). By externalizing task planning into the Conductor, Quasar enables even smaller or non-reasoning LLMs to reliably execute sophisticated archive workflows through structured tool composition.
+Quasar pairs a registry of **140+ domain-specific tools** ([full list](docs/TOOLS.md)) covering archive data search, retrieval, and analysis with a **Conductor** orchestration engine that decomposes complex, multi-step research queries into Directed Acyclic task Graphs (DAGs). By externalizing task planning into the Conductor, Quasar enables even smaller or non-reasoning LLMs to reliably execute sophisticated archive workflows through structured tool composition.
 
 > **Key insight:** A general-purpose LLM becomes a capable scientific assistant not through model fine-tuning alone, but in combination with careful domain engineering.
 
@@ -50,7 +50,7 @@ flowchart LR
     DIRECT["Agent Tool Loop<br/>(Simple Queries)"]
     COND["Conductor<br/>DAG Orchestration"]
     REPL["Sandboxed REPL<br/>numpy · astropy · pandas"]
-    SVC["75+ Domain Tools<br/>Search · ADS · DataLink · FITS · CASA"]
+    SVC["140+ Domain Tools<br/>Search · ADS · DataLink · FITS · CASA"]
     EXT["External Systems<br/>ALMA Archive · NASA ADS · CADC · SIMBAD"]
     SSE["SSE Events<br/>token · status · tool · task"]
 

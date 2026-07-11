@@ -6,42 +6,53 @@ import { useChatStore } from "../lib/store";
 import { AuthModal } from "@/components/AuthModal";
 import { OnboardingOverlay, useShowOnboarding } from "@/components/OnboardingOverlay";
 import { useAuthStore } from "../lib/auth-store";
+import { useIsMobile } from "../lib/use-is-mobile";
 import { useEffect, useState } from "react";
 import { Lock, Compass, FileText, Activity, Sparkles, LogIn } from "lucide-react";
 
 export default function Home() {
   const sidebarOpen = useChatStore((s) => s.sidebarOpen);
   const toggleSidebar = useChatStore((s) => s.toggleSidebar);
-  const { isAuthenticated, openAuthModal } = useAuthStore();
+  const { isAuthenticated, isInitialized, openAuthModal } = useAuthStore();
   const [mounted, setMounted] = useState(false);
-  const [isMobile, setIsMobile] = useState(false);
+  const isMobile = useIsMobile();
   const [showOnboarding, dismissOnboarding] = useShowOnboarding();
 
   useEffect(() => {
     // Client hydration state is intentionally established after the first render.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setMounted(true);
-
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handleChange = (e: MediaQueryListEvent | MediaQueryList) => {
-      setIsMobile(e.matches);
-      if (e.matches && useChatStore.getState().sidebarOpen) {
-        useChatStore.getState().toggleSidebar();
-      }
-    };
-    handleChange(mq);
-    mq.addEventListener("change", handleChange);
-    return () => mq.removeEventListener("change", handleChange);
   }, []);
 
-  // Proactively open Auth Modal on initial mount if guest tries to view landing page
+  // A sidebar left open on desktop must not reappear as a drawer when the
+  // viewport narrows past the breakpoint.
   useEffect(() => {
-    if (mounted && !isAuthenticated) {
+    if (isMobile && useChatStore.getState().sidebarOpen) {
+      useChatStore.getState().toggleSidebar();
+    }
+  }, [isMobile]);
+
+  // Escape closes the drawer, matching ImageLightbox/SettingsModal.
+  useEffect(() => {
+    if (!isMobile || !sidebarOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") toggleSidebar();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isMobile, sidebarOpen, toggleSidebar]);
+
+  // Proactively open Auth Modal for guests — only AFTER the cookie session has
+  // been verified (/api/auth/me), so a valid-cookie reload never flashes it.
+  useEffect(() => {
+    if (mounted && isInitialized && !isAuthenticated) {
       openAuthModal();
     }
-  }, [mounted, isAuthenticated, openAuthModal]);
+  }, [mounted, isInitialized, isAuthenticated, openAuthModal]);
 
-  if (!mounted) return null; // Prevent hydration mismatch Flash
+  // Neutral gate: prevents both the hydration-mismatch flash and a premature
+  // signed-out screen while the httpOnly-cookie session is being verified.
+  if (!mounted || !isInitialized) return null;
 
   // ── Authentication Lock Screen / Landing Gate ──
   if (!isAuthenticated) {
@@ -145,17 +156,23 @@ export default function Home() {
   // ── Authorized Workspace Layout ──
   return (
     <>
-      {/* ── MOBILE: sidebar as a full-screen overlay ── */}
+      {/* ── MOBILE: sidebar as a slide-in drawer ── */}
       {isMobile && sidebarOpen && (
-        <div className="fixed inset-0 z-40 flex">
-          {/* Dark backdrop — click to close */}
+        <div className="fixed inset-0 z-40">
+          {/* Scrim — tap to close */}
           <div
-            className="fixed inset-0 bg-black/60 backdrop-blur-lg z-40"
+            className="drawer-scrim animate-scrim-in absolute inset-0"
             onClick={toggleSidebar}
+            aria-hidden="true"
           />
-          {/* Sidebar panel */}
-          <div className="relative z-50 w-[var(--q-sidebar-width)] h-full animate-in slide-in-from-left duration-200">
-            <Sidebar onToggle={toggleSidebar} />
+          {/* Drawer panel */}
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Navigation"
+            className="animate-drawer-in absolute inset-y-0 left-0 z-50 w-[var(--q-drawer-width)]"
+          >
+            <Sidebar variant="drawer" onClose={toggleSidebar} />
           </div>
         </div>
       )}

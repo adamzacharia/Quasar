@@ -56,6 +56,13 @@ jobs:
         run: |
           pytest tests/unit/ -v --tb=short -q
 
+      # ── Benchmark scorer self-test ─────────────────────────
+      # Offline integrity check of the DataLabBench partial-credit scorer,
+      # penalties, and tier rollup (no API, no judge LLM).
+      - name: Run DataLabBench scorer self-test
+        run: |
+          python Benchmark/datalabbench/run_datalabbench.py --self-test
+
       - name: Run opt-in live provider smoke tests
         if: ${{ vars.RUN_LIVE_PROVIDER_TESTS == '1' }}
         env:
@@ -97,6 +104,14 @@ jobs:
           from api.main import app
           print('FastAPI app created successfully ✅')
           "
+
+      # ── Generated-docs drift check ─────────────────────────
+      # docs/TOOLS.md is generated from the live tool registry. Fail if a tool
+      # was added/removed/renamed without regenerating it (kills tool-count
+      # drift). Regenerate locally with: python scripts/gen_tool_registry_doc.py
+      - name: Check tool-registry doc is up to date
+        run: |
+          python scripts/gen_tool_registry_doc.py --check
 
       - name: Install frontend dependencies
         working-directory: ui-pro

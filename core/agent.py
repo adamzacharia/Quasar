@@ -7,7 +7,7 @@ CALLS:     All services/* modules, integrations/*, core/complexity.py,
            core/sandbox.py, OpenAI API (GPT-4o), mem0 (long-term memory)
 
 This is the heart of Quasar. The QuasarAgent class:
-  1. Registers 27+ tools as OpenAI function-calling schemas
+  1. Registers 140+ tools as OpenAI function-calling schemas
   2. Routes user queries through complexity detection → Conductor DAG
   3. Manages RAG context, conversation memory, and long-term memory
   4. Streams responses via Chat Completions API or Responses API
@@ -551,9 +551,20 @@ class QuasarAgent:
                 t = threading.Thread(target=lambda: asyncio.run(_run_client()), daemon=True)
                 t.start()
                 
+            from services.mcp_server_service import mcp_stdio_enabled
             for cfg in configs:
+                transport = (cfg.get("transport") or "stdio").lower()
+                if transport == "stdio" and not mcp_stdio_enabled():
+                    # RCE guard: don't spawn local-command MCP servers unless
+                    # explicitly enabled for a trusted environment. (S2)
+                    print(
+                        f"[MCPServers] Skipping stdio server "
+                        f"'{cfg.get('name', '?')}' — local command spawning is "
+                        "disabled (QUASAR_ENABLE_MCP_STDIO off)."
+                    )
+                    continue
                 _start_mcp_bridge(cfg)
-                
+
         except Exception as e:
             print(f"[MCPServers] Failed to set up MCP clients: {e}")
 
@@ -1838,7 +1849,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_list_catalogs",
             description="List supported NOIRLab Astro Data Lab P0 catalogs and registered tables.",
-            function=self._datalab_list_catalogs,
+            function=self._datalab_tool_fn("datalab_list_catalogs"),
             parameters={"type": "object", "properties": {}, "required": []},
             category="datalab",
         ))
@@ -1846,7 +1857,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_describe_table",
             description="Describe a registered Data Lab catalog table, columns, region strategy, morphology hints, and citation.",
-            function=self._datalab_describe_table,
+            function=self._datalab_tool_fn("datalab_describe_table"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1861,7 +1872,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_cone_count",
             description="Count rows in a Data Lab catalog cone using a governed q3c_radial_query builder.",
-            function=self._datalab_cone_count,
+            function=self._datalab_tool_fn("datalab_cone_count"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1879,7 +1890,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_select_catalog_rows",
             description="Select capped rows from a Data Lab catalog cone using governed structured SQL; returns result_id, not the full table. Apply selection cuts server-side via value_cuts/color_cut/morphology so the row budget is spent on rows you want.",
-            function=self._datalab_select_catalog_rows,
+            function=self._datalab_tool_fn("datalab_select_catalog_rows"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1902,7 +1913,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_density_aggregate",
             description="Aggregate Data Lab source density by RA/Dec grid or registered HEALPix column over a cone region; returns a stable result_id. Requires a cone (ra/dec/radius_deg) unless all_sky=true is set explicitly. Wide cones that exceed the 60s sync window are automatically tiled into sub-cones and merged — do NOT hand-tile the region yourself; call once with the full cone.",
-            function=self._datalab_density_aggregate,
+            function=self._datalab_tool_fn("datalab_density_aggregate"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1928,7 +1939,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_q3c_crossmatch",
             description="Planner-safe Data Lab q3c crossmatch: materializes the small Gaia-like side first and joins the large indexed catalog second.",
-            function=self._datalab_q3c_crossmatch,
+            function=self._datalab_tool_fn("datalab_q3c_crossmatch"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1957,7 +1968,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "Requires expert_ack=true and a reason; q3c_join remains blocked outside the structured crossmatch builder. "
                 "Returns result_id only, not the full table."
             ),
-            function=self._datalab_sql_query,
+            function=self._datalab_tool_fn("datalab_sql_query"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1973,7 +1984,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_get_result",
             description="Fetch the rows of a stored Data Lab result_id (from a prior datalab_* tool), capped at max_rows (<=5000).",
-            function=self._datalab_get_result,
+            function=self._datalab_tool_fn("datalab_get_result"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1989,7 +2000,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_image_cutout",
             description="Render a single-band NOIRLab Astro Data Lab SIA cutout at RA/Dec or a resolvable target name.",
-            function=self._datalab_image_cutout,
+            function=self._datalab_image_tool_fn("datalab_image_cutout"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2010,7 +2021,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_color_image",
             description="Render a Data Lab color image from deepest SIA stack images, reprojected to a common WCS before Lupton RGB composition. Auto-selects RGB bands (red=i or z, green=r, blue=g) unless 'bands' is given.",
-            function=self._datalab_color_image,
+            function=self._datalab_image_tool_fn("datalab_color_image"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2033,7 +2044,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_cutout_grid",
             description="Render a multi-panel Data Lab SIA cutout grid for peak coordinates; panels without coverage are labeled instead of failing the grid.",
-            function=self._datalab_cutout_grid,
+            function=self._datalab_image_tool_fn("datalab_cutout_grid"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2085,7 +2096,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "result can be referenced — derived columns like M_G do NOT pre-exist; compute them inline here or "
                 "alias them in the SQL SELECT first."
             ),
-            function=self._datalab_catalog_scatter,
+            function=self._datalab_image_tool_fn("datalab_catalog_scatter"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2119,7 +2130,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "(log_scale=true) — leave it on for 'log counts'/'log source count' requests; set "
                 "log_scale=false only when the user explicitly wants a linear count scale."
             ),
-            function=self._datalab_sky_density_map,
+            function=self._datalab_image_tool_fn("datalab_sky_density_map"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2152,7 +2163,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "Multi-band light curves (NSC/DES/SMASH interleave g/r/i/z epochs in one table) should be folded ONE band "
                 "at a time — pass band (e.g. 'g') to restrict to a single filter; mixing bands smears the phased curve."
             ),
-            function=self._datalab_period_fold,
+            function=self._datalab_image_tool_fn("datalab_period_fold"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2174,7 +2185,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_sed_plot",
             description="Render an LS DR9-style SED from a stored Data Lab result_id using SVO FPS wavelengths.",
-            function=self._datalab_sed_plot,
+            function=self._datalab_image_tool_fn("datalab_sed_plot"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2191,7 +2202,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_lss_wedge",
             description="Render a stored spectroscopic Data Lab result_id as a comoving large-scale-structure wedge or 3D scatter plot.",
-            function=self._datalab_lss_wedge,
+            function=self._datalab_image_tool_fn("datalab_lss_wedge"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2235,7 +2246,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_color_color_diagram",
             description="ONE-SHOT color-color diagram (e.g. g-r vs r-i) for a catalog cone. Queries + plots in a single call; auto-splits into stars vs galaxies (2 panels) using the catalog's morphology column (e.g. DES spread_model_r) unless split_col is given. Sentinel magnitudes (99.99) are excluded automatically. Use this for 'show me a color-color diagram'/'separate stars from galaxies' requests — do NOT chain separate query+plot tools.",
-            function=self._datalab_color_color_diagram,
+            function=self._datalab_image_tool_fn("datalab_color_color_diagram"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2251,6 +2262,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "split_threshold": {"type": "number", "default": 0.005},
                     "limit": {"type": "integer", "default": 3000},
                     "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (single panel, no star/galaxy split)."},
+                    "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5} or {'column':'ext_coadd','between':[0,1]}; overrides point_sources (single panel, no star/galaxy split)."},
                     "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "Extra server-side cuts, e.g. [{'column':'flags_g','op':'=','value':0}]."},
                 },
                 "required": ["catalog"],
@@ -2260,7 +2272,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_color_magnitude_diagram",
             description="ONE-SHOT color-magnitude diagram (CMD): mag_band vs (blue-red) color for a catalog cone. Queries + plots in a single call (magnitude axis inverted). Sentinel magnitudes (99.99) are excluded automatically; set point_sources=true when the user asks for stars/point sources. Use this for 'plot a CMD'/'g vs g-r' requests instead of chaining query+plot tools.",
-            function=self._datalab_color_magnitude_diagram,
+            function=self._datalab_image_tool_fn("datalab_color_magnitude_diagram"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2275,6 +2287,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "mag_band": {"type": "string", "description": "Magnitude (y) band; defaults to blue_band."},
                     "limit": {"type": "integer", "default": 5000},
                     "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (e.g. NSC class_star>0.5)."},
+                    "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5} or {'column':'ext_coadd','between':[0,1]}; overrides point_sources."},
                     "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "Extra server-side cuts, e.g. [{'column':'parallax_over_error','op':'>','value':5}]."},
                 },
                 "required": ["catalog"],
@@ -2311,7 +2324,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_confirm_sky_area",
             description="Estimate the sky area and tile count for a tiled search before fanning out (guardrail: confirm wide scans with the user first).",
-            function=self._datalab_confirm_sky_area,
+            function=self._datalab_tool_fn("datalab_confirm_sky_area"),
             parameters={
                 "type": "object",
                 "properties": {
@@ -2326,21 +2339,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         self.tool_registry.register(Tool(
             name="datalab_job_status",
             description="Poll the status of a Data Lab background job (e.g. a tiled search).",
-            function=self._datalab_job_status,
+            function=self._datalab_tool_fn("datalab_job_status"),
             parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
             category="datalab",
         ))
         self.tool_registry.register(Tool(
             name="datalab_job_results",
             description="Fetch the result of a Data Lab background job (ranked candidates for a tiled search).",
-            function=self._datalab_job_results,
+            function=self._datalab_tool_fn("datalab_job_results"),
             parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
             category="datalab",
         ))
         self.tool_registry.register(Tool(
             name="datalab_job_cancel",
             description="Cancel a running Data Lab background job.",
-            function=self._datalab_job_cancel,
+            function=self._datalab_tool_fn("datalab_job_cancel"),
             parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
             category="datalab",
         ))
@@ -5206,6 +5219,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 ra, dec, radius, facility, max_results
             )
 
+            # If the archive query failed, surface a typed error rather than
+            # masking the outage as a confirmed empty result. (C3)
+            _pos_err = results.attrs.get("quasar_error") if hasattr(results, "attrs") else None
+            if results.empty and _pos_err:
+                return {
+                    "success": False,
+                    "error": _pos_err,
+                    "ra": ra, "dec": dec, "radius_deg": radius,
+                    "note": (
+                        "The archive query did not complete, so it is unknown whether "
+                        "data exist at this position — this is an archive/service error, "
+                        "not a confirmed 'no data' result."
+                    ),
+                }
+
             # Post-filter by band if specified
             if band is not None and not results.empty:
                 import re as _re_band
@@ -5382,6 +5410,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 # Per-target band mode: search each target with its own band filter
                 all_frames = []
                 searched_names = []
+                _sub_errs = []  # archive errors per target (C3 — don't mask outages)
                 for _tgt, _tgt_bands in _per_target_specs:
                     if not _tgt:
                         continue
@@ -5389,6 +5418,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         df = self.search_service.search_by_target(
                             _tgt, facility, date_range, max_results
                         )
+                        _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
+                        if _e:
+                            _sub_errs.append(f"{_tgt}: {_e}")
                         if not df.empty and _tgt_bands:
                             # Apply per-target band filter
                             b_col = next((c for c in ["band_list", "Band", "band"] if c in df.columns), None)
@@ -5404,6 +5436,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         else:
                             print(f"[PER-TARGET] '{_tgt}' → 0 results")
                     except Exception as e:
+                        _sub_errs.append(f"{_tgt}: {e}")
                         print(f"[PER-TARGET] '{_tgt}' failed: {e}")
 
                 if all_frames:
@@ -5411,6 +5444,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     target_name = " + ".join(searched_names)
                 else:
                     results = pd.DataFrame()
+                    if _sub_errs:  # preserve the archive-error signal (C3)
+                        results.attrs["quasar_error"] = "; ".join(_sub_errs)
                 # Skip shared band filtering below — bands already applied per target
                 band_list_input = []
 
@@ -5418,11 +5453,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 # Search each target independently, concatenate results
                 all_frames = []
                 searched_names = []
+                _sub_errs = []  # archive errors per target (C3 — don't mask outages)
                 for name in raw_names[:10]:  # Cap at 10 targets
                     try:
                         df = self.search_service.search_by_target(
                             name, facility, date_range, max_results
                         )
+                        _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
+                        if _e:
+                            _sub_errs.append(f"{name}: {_e}")
                         if not df.empty:
                             all_frames.append(df)
                             searched_names.append(name)
@@ -5430,6 +5469,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                         else:
                             print(f"[MULTI] '{name}' → 0 results")
                     except Exception as e:
+                        _sub_errs.append(f"{name}: {e}")
                         print(f"[MULTI] '{name}' failed: {e}")
 
                 if all_frames:
@@ -5437,6 +5477,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     target_name = " + ".join(searched_names)  # update label
                 else:
                     results = pd.DataFrame()
+                    if _sub_errs:  # preserve the archive-error signal (C3)
+                        results.attrs["quasar_error"] = "; ".join(_sub_errs)
             else:
                 results = self.search_service.search_by_target(
                     target_name, facility, date_range, max_results
@@ -5465,6 +5507,24 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
             if results.empty:
                 self.last_run_result = {"type": "data", "data": results, "source": facility_label, "tool_name": "search_by_target"}
+                # Distinguish an archive failure from a genuine empty result:
+                # search.py tags failed/unavailable searches via df.attrs so we
+                # don't report "no data" when the archive was simply down. (C3)
+                try:
+                    _search_err = results.attrs.get("quasar_error")
+                except Exception:
+                    _search_err = None
+                if _search_err:
+                    return {
+                        "success": False,
+                        "error": _search_err,
+                        "target": target_name,
+                        "note": (
+                            "The archive query did not complete, so it is unknown whether "
+                            "data exist for this target — this is an archive/service error, "
+                            "not a confirmed 'no data' result."
+                        ),
+                    }
                 return {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
 
             # ── Tier 2: Pandas post-filters (non-band) ─────────────────
@@ -6062,6 +6122,101 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             self._datalab_result_store_instance = default_result_store()
         return self._datalab_result_store_instance
 
+    # ── Per-turn (request-scoped) Data Lab state ───────────────────────────
+    # Owned by the agent and RESET per turn in stream_response_api. Injected into
+    # CallContext.services so the migrated capabilities can mutate it without
+    # touching `self`. The context provider re-reads the attribute on every tool
+    # call, so the per-turn rebind is picked up automatically — do NOT cache
+    # these objects anywhere. Lazy-create mirrors the legacy inline getattr().
+    def _get_datalab_agg_timeout_tables(self) -> set:
+        tables = getattr(self, "_datalab_agg_timeout_tables", None)
+        if tables is None:
+            tables = self._datalab_agg_timeout_tables = set()
+        return tables
+
+    def _get_datalab_job_poll_counts(self) -> dict:
+        counts = getattr(self, "_job_poll_counts", None)
+        if counts is None:
+            counts = self._job_poll_counts = {}
+        return counts
+
+    # ── V2 capabilities layer (shared core) ────────────────────────────────
+    def _datalab_tool_fn(self, name: str):
+        """Return the capability-backed callable for a migrated Data Lab tool.
+
+        Used directly in the tool registration (``function=self._datalab_tool_fn(...)``)
+        so the inline ``_datalab_*`` method can be DELETED and the capability in
+        ``capabilities/datalab.py`` is the single implementation (no flag, no
+        inline duplicate). The Data Lab client / result store are resolved lazily
+        per call via the context provider. (docs/v2 P1)"""
+        from capabilities.datalab import CAPABILITIES
+        from adapters.native import build_tool
+        cap = next((c for c in CAPABILITIES if c.name == name), None)
+        if cap is None:  # pragma: no cover - registration wiring guard
+            raise KeyError(f"No migrated Data Lab capability named '{name}'")
+        return build_tool(cap, self._datalab_ctx_provider).function
+
+    def _datalab_image_tool_fn(self, name: str):
+        """Like _datalab_tool_fn, but for image/plot-producing Data Lab capabilities.
+
+        The capability stays transport-pure: it returns the raw plot result (with
+        image_base64/path/plotly_spec) as data. This wrapper applies the SSE/UI
+        transport at the adapter boundary via the existing
+        _datalab_attach_image_result — it sets last_run_result to a displayable
+        image card and strips the heavy base64/figure spec out of the LLM-facing
+        dict (adding image_attached). Byte-parity with the legacy inline plot
+        methods. (docs/v2 P1)"""
+        from capabilities.datalab import CAPABILITIES
+        from adapters.native import build_tool
+        cap = next((c for c in CAPABILITIES if c.name == name), None)
+        if cap is None:  # pragma: no cover - registration wiring guard
+            raise KeyError(f"No migrated Data Lab capability named '{name}'")
+        base_fn = build_tool(cap, self._datalab_ctx_provider).function
+
+        def _fn(**kwargs):
+            raw = base_fn(**kwargs)
+            if not isinstance(raw, dict):
+                return raw
+            # A capability may pass a computed caption via the private "_caption"
+            # key; pop it so it drives the image card WITHOUT leaking into the
+            # LLM-facing dict (legacy SIA tools add no caption key).
+            caption = (
+                kwargs.get("title")
+                or raw.pop("_caption", None)
+                or raw.get("title")
+                or raw.get("caption")
+                or "Data Lab plot"
+            )
+            return self._datalab_attach_image_result(raw, caption)
+
+        return _fn
+
+    def _datalab_ctx_provider(self):
+        """Build the per-call CallContext for Data Lab capabilities and apply the
+        one transport concern the capability must not: clearing last_run_result
+        so the streaming loop can't re-emit a stale data card (Data Lab tools
+        emit summaries/result_ids, not cards)."""
+        from capabilities.base import CallContext
+        self.last_run_result = None
+        return CallContext(
+            services={
+                "datalab_client": self._get_datalab_client(),
+                "svo_fps_client": self._get_svo_fps_client(),
+                "datalab_image_service": self._get_datalab_image_service(),
+                "datalab_job_service": default_job_service(),
+                # Bound callable → byte-identical coordinate resolution (target
+                # name → ra/dec via _resolve_target) as the inline tools use.
+                "resolve_coordinates": self._datalab_coordinates,
+                # Per-turn mutable state the capabilities own the semantics of but
+                # not the lifetime: re-read (never cached) so the per-turn reset in
+                # stream_response_api takes effect on the next tool call.
+                "datalab_agg_timeout_tables": self._get_datalab_agg_timeout_tables(),
+                "datalab_job_poll_counts": self._get_datalab_job_poll_counts(),
+            },
+            result_store=self._get_datalab_result_store(),
+            user_id=getattr(getattr(self, "config", None), "user_id", None),
+        )
+
     def _get_mmu_hats_service(self):
         if not hasattr(self, "_mmu_hats_service_instance"):
             self._mmu_hats_service_instance = default_mmu_hats_service()
@@ -6157,248 +6312,25 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             self._sparcl_spectra_service_instance = SparclSpectraService()
         return self._sparcl_spectra_service_instance
 
-    def _datalab_list_catalogs(self) -> Dict[str, Any]:
-        self.last_run_result = None  # Data Lab tools emit summaries, not stale data cards
-        try:
-            catalogs = datalab_registry.list_catalogs()
-            return {"success": True, "catalogs": catalogs, "count": len(catalogs)}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    # NOTE: _datalab_list_catalogs / _datalab_describe_table / _datalab_cone_count /
+    # _datalab_select_catalog_rows were migrated to capabilities/datalab.py and are
+    # now registered via _datalab_tool_fn(...). The inline copies were deleted so the
+    # capability is the single implementation. (docs/v2 P1)
 
-    def _datalab_describe_table(self, catalog: str, table: str) -> Dict[str, Any]:
-        self.last_run_result = None  # Data Lab tools emit summaries, not stale data cards
-        try:
-            return {"success": True, "table": datalab_registry.describe_table(catalog, table)}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    # NOTE: _datalab_density_aggregate (incl. its auto-tiling + per-turn
+    # sync-timeout table set) was migrated to capabilities/datalab.py and is
+    # registered via _datalab_tool_fn("datalab_density_aggregate"). The per-turn
+    # state it mutates is injected through CallContext.services — see
+    # _get_datalab_agg_timeout_tables. Inline copy deleted. (docs/v2 P1)
 
-    def _datalab_cone_count(self, catalog: str, table: str, ra: float, dec: float, radius_deg: float) -> Dict[str, Any]:
-        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
-        try:
-            sql, meta = datalab_query_builders.build_cone_count(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg)
-            return self._execute_datalab_sql(sql, meta, tool_name="datalab_cone_count")
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_q3c_crossmatch / _datalab_sql_query were migrated to
+    # capabilities/datalab.py (registered via _datalab_tool_fn). Inline copies
+    # deleted — the capability is the single implementation. (docs/v2 P1)
 
-    def _datalab_select_catalog_rows(
-        self,
-        catalog: str,
-        table: str,
-        ra: float,
-        dec: float,
-        radius_deg: float,
-        columns: Optional[List[str]] = None,
-        limit: int = 500,
-        value_cuts: Optional[List[Dict[str, Any]]] = None,
-        color_cut: Optional[Dict[str, Any]] = None,
-        morphology: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
-        try:
-            # Models consistently expect the density-tool cut schema here too
-            # (live test RV-P6 guessed value_cuts twice); accept it so selective
-            # cuts run server-side instead of failing on an unknown kwarg.
-            predicates = None
-            if value_cuts or color_cut or morphology:
-                predicates = datalab_query_builders.build_catalog_predicates(
-                    catalog, table, color_cut=color_cut, value_cuts=value_cuts, morphology=morphology
-                )
-            sql, meta = datalab_query_builders.build_cone_select(
-                catalog, table, ra=ra, dec=dec, radius_deg=radius_deg, columns=columns, limit=limit,
-                predicates=predicates,
-            )
-            return self._execute_datalab_sql(sql, meta, tool_name="datalab_select_catalog_rows")
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_density_aggregate(
-        self,
-        catalog: str,
-        table: str,
-        mode: str = "grid",
-        step_deg: float = 0.1,
-        healpix_column: Optional[str] = None,
-        ra: Optional[float] = None,
-        dec: Optional[float] = None,
-        radius_deg: Optional[float] = None,
-        all_sky: bool = False,
-        color_cut: Optional[Dict[str, Any]] = None,
-        value_cuts: Optional[List[Dict[str, Any]]] = None,
-        morphology: Optional[Dict[str, Any]] = None,
-        limit: int = 5000,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
-        try:
-            predicates = datalab_query_builders.build_catalog_predicates(
-                catalog, table, color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
-            )
-            sql, meta = datalab_query_builders.build_density_aggregate(
-                catalog, table, mode=mode, step_deg=step_deg, healpix_column=healpix_column,
-                ra=ra, dec=dec, radius_deg=radius_deg, all_sky=all_sky, predicates=predicates, limit=limit,
-            )
-            has_cone = ra is not None and dec is not None and radius_deg is not None
-            # Once one aggregate on this table has sync-timed-out this turn,
-            # go straight to tiling for further wide cones — the doomed 60s
-            # sync attempt per call burned ~3 minutes of live DS-P8's clock.
-            timeout_tables = getattr(self, "_datalab_agg_timeout_tables", None)
-            if timeout_tables is None:
-                timeout_tables = self._datalab_agg_timeout_tables = set()
-            table_key = f"{catalog}.{table}".lower()
-            skip_sync = has_cone and float(radius_deg) >= 2.0 and table_key in timeout_tables
-            if skip_sync:
-                out = {"success": False, "error": "sync skipped: earlier aggregate on this table timed out"}
-            else:
-                out = self._execute_datalab_sql(sql, meta, tool_name="datalab_density_aggregate")
-            # Wide-cone sync timeout (anonymous tokens cannot use the async-job
-            # path — live P8 both models): auto-tile the cone into sub-cones
-            # sized for the 60s window and merge, instead of failing the tool.
-            if (
-                not out.get("success")
-                and ("timed out" in str(out.get("error", "")).lower() or skip_sync)
-                and has_cone
-                and float(radius_deg) >= 2.0
-            ):
-                print(
-                    f"[DATALAB] density aggregate timed out at radius {radius_deg}° — "
-                    f"auto-tiling ({catalog}.{table}, mode={mode}, sync_skipped={skip_sync})"
-                )
-                # Repeat attempts on a table that already proved slow get a
-                # smaller tiling budget, so the model keeps enough turn clock
-                # for more probes and the final render (live DS-P8 attempt 3:
-                # four 210s probes of the Galactic centre ate the whole 900s).
-                _budget_override = 120.0 if table_key in timeout_tables else None
-                timeout_tables.add(table_key)
-                return datalab_orchestration.tiled_density_aggregate(
-                    catalog, table, mode=mode, step_deg=step_deg, healpix_column=healpix_column,
-                    ra=float(ra), dec=float(dec), radius_deg=float(radius_deg),
-                    predicates=predicates, limit=limit,
-                    max_seconds=_budget_override,
-                    client=self._get_datalab_client(),
-                    result_store=self._get_datalab_result_store(),
-                )
-            return out
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_q3c_crossmatch(
-        self,
-        ra: float,
-        dec: float,
-        radius_deg: float,
-        small_catalog: str = "gaia_dr3",
-        small_table: str = "gaia_source",
-        big_catalog: str = "nsc_dr2",
-        big_table: str = "object",
-        match_radius_arcsec: float = 1.0,
-        small_columns: Optional[List[str]] = None,
-        big_columns: Optional[List[str]] = None,
-        small_limit: int = 10000,
-        limit: int = 500,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None  # builder may raise before _execute_datalab_sql clears it
-        try:
-            sql, meta = datalab_query_builders.build_q3c_crossmatch(
-                small_catalog=small_catalog,
-                small_table=small_table,
-                big_catalog=big_catalog,
-                big_table=big_table,
-                ra=ra,
-                dec=dec,
-                radius_deg=radius_deg,
-                match_radius_arcsec=match_radius_arcsec,
-                small_columns=small_columns,
-                big_columns=big_columns,
-                small_limit=small_limit,
-                limit=limit,
-            )
-            return self._execute_datalab_sql(sql, meta, tool_name="datalab_q3c_crossmatch")
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_sql_query(self, sql: str, expert_ack: bool = False, reason: str = "") -> Dict[str, Any]:
-        self.last_run_result = None  # clear before the early expert-ack rejection path too
-        try:
-            if expert_ack is not True or not str(reason or "").strip():
-                return {
-                    "success": False,
-                    "error": "datalab_sql_query is restricted expert/debug mode and requires expert_ack=true plus a reason.",
-                }
-            meta = {"source": "expert", "builder": "raw_sql", "expert_reason": str(reason).strip()}
-            return self._execute_datalab_sql(sql, meta, tool_name="datalab_sql_query", source="expert")
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _execute_datalab_sql(
-        self,
-        sql: str,
-        meta: Dict[str, Any],
-        *,
-        tool_name: str,
-        source: str = "builder",
-    ) -> Dict[str, Any]:
-        # Data Lab tools return summaries/result_ids, not data cards; clear any prior
-        # tool's last_run_result so the streaming loop can't re-emit a stale card.
-        self.last_run_result = None
-        try:
-            validated = datalab_sql_policy.validate(sql, source=source, meta=meta)
-            result = self._get_datalab_client().query(sql=validated.sql, fmt="pandas")
-            store_meta = {
-                **validated.meta,
-                "tool_name": tool_name,
-                "validated_sql": validated.sql,
-                "warnings": validated.warnings,
-                "provenance": {
-                    **result.provenance,
-                    "query": validated.sql,
-                    "tool_name": tool_name,
-                    "policy_source": source,
-                    # HEALPix pixelization travels with the result so renderers
-                    # decode with the true scheme/nside, not their defaults.
-                    **(
-                        {"healpix": validated.meta["healpix"]}
-                        if isinstance(validated.meta, dict) and validated.meta.get("healpix")
-                        else {}
-                    ),
-                },
-            }
-            result_id = self._get_datalab_result_store().put(result.dataframe, store_meta)
-            # Preview the most COMPLETE rows first: Data Lab often returns NaN-heavy
-            # rows at the top, and a NaN-leading preview misled the model into
-            # believing the whole result was NaN (live test DS-P6 burned 3 debug
-            # rounds on it). The stored result keeps the original order.
-            preview_df = result.dataframe
-            preview_reordered = False
-            if len(preview_df) > 10:
-                _nan_counts = preview_df.isna().sum(axis=1)
-                if int(_nan_counts.head(10).sum()) > 0:
-                    preview_df = preview_df.loc[_nan_counts.sort_values(kind="stable").index]
-                    preview_reordered = True
-            preview_rows, preview_more = self._datalab_fit_rows(preview_df, 10, char_budget=4000)
-            summary: Dict[str, Any] = {
-                "success": True,
-                "tool_name": tool_name,
-                "result_id": result_id,
-                "rowcount": int(len(result.dataframe)),
-                "columns": result.columns[:30],
-                "warnings": validated.warnings,
-                "catalog": validated.meta.get("catalog") or result.provenance.get("catalog"),
-                "table": validated.meta.get("table") or result.provenance.get("table"),
-                "query_summary": self._datalab_query_summary(validated.sql),
-                "preview": preview_rows,
-                "preview_truncated": preview_more,
-                "note": (
-                    "Preview shows the most complete rows (some rows contain NaNs; the full "
-                    "result keeps its original order); fetch up to 5000 rows with "
-                    "datalab_get_result(result_id)."
-                    if preview_reordered
-                    else "Preview shows the first rows; fetch up to 5000 rows with datalab_get_result(result_id)."
-                ),
-            }
-            if "row_count" in result.dataframe.columns and not result.dataframe.empty:
-                summary["reported_count"] = int(result.dataframe.iloc[0]["row_count"])
-            return summary
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _execute_datalab_sql + _datalab_query_summary were retired with the
+    # last inline SQL tool (density_aggregate). Their single implementation now
+    # lives in capabilities/datalab.py as execute_datalab_sql / _query_summary.
+    # (docs/v2 P1)
 
     def _datalab_error(self, error: Exception) -> Dict[str, Any]:
         payload = {"success": False, "error": str(error)}
@@ -6424,11 +6356,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "'phot_g_mean_mag + 5*log10(parallax/100)'."
             )
         return payload
-
-    @staticmethod
-    def _datalab_query_summary(sql: str) -> str:
-        compact = " ".join(str(sql or "").split())
-        return compact[:700] + ("..." if len(compact) > 700 else "")
 
     @staticmethod
     def _summarize_tool_outcomes(tool_results) -> str:
@@ -6576,25 +6503,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             truncated = True
         return rows, truncated
 
-    def _datalab_get_result(self, result_id: str, max_rows: int = 200) -> Dict[str, Any]:
-        """Fetch stored Data Lab rows (size-bounded) for a result_id from a prior tool."""
-        self.last_run_result = None
-        try:
-            res = self._get_datalab_result_store().get(result_id)
-            cap = max(1, min(int(max_rows or 200), 5000))
-            rows, truncated = self._datalab_fit_rows(res.dataframe, cap)
-            return {
-                "success": True,
-                "result_id": result_id,
-                "rowcount": int(len(res.dataframe)),
-                "returned_rows": len(rows),
-                "columns": res.columns,
-                "rows": rows,
-                "provenance": res.provenance,
-                "truncated": truncated,
-            }
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_get_result was migrated to capabilities/datalab.py
+    # (registered via _datalab_tool_fn). Inline copy deleted. (docs/v2 P1)
 
     # MMU/HATS catalog handlers
 
@@ -7758,13 +7668,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def _datalab_confirm_sky_area(self, ra_min: float, ra_max: float, dec_min: float, dec_max: float, tile_radius_deg: float = 2.0) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            fp = {"ra_min": ra_min, "ra_max": ra_max, "dec_min": dec_min, "dec_max": dec_max}
-            return {"success": True, **datalab_orchestration.confirm_sky_area(fp, float(tile_radius_deg))}
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_confirm_sky_area migrated to capabilities/datalab.py
+    # (registered via _datalab_tool_fn). Inline copy deleted. (docs/v2 P1)
 
     def _datalab_density_vetting(
         self,
@@ -7814,78 +7719,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return self._datalab_error(e)
 
-    def _datalab_color_color_diagram(
-        self,
-        catalog: str,
-        table: Optional[str] = None,
-        radius_deg: float = 0.5,
-        ra: Optional[float] = None,
-        dec: Optional[float] = None,
-        target_name: Optional[str] = None,
-        x_bands: Optional[List[str]] = None,
-        y_bands: Optional[List[str]] = None,
-        split_col: Optional[str] = None,
-        split_threshold: float = 0.005,
-        limit: int = 3000,
-        title: Optional[str] = None,
-        point_sources: bool = False,
-        value_cuts: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_registry as _dl_reg
-            # Coerce null/omitted optional args (models often pass null) to sane defaults.
-            table = table or _dl_reg.default_table(catalog)
-            radius_deg = float(radius_deg) if radius_deg is not None else 0.5
-            split_threshold = float(split_threshold) if split_threshold is not None else 0.005
-            limit = int(limit) if limit is not None else 3000
-            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
-            out = datalab_orchestration.color_color_diagram(
-                catalog, table, ra_f, dec_f, radius_deg,
-                x_bands=tuple(x_bands) if x_bands else ("g", "r"),
-                y_bands=tuple(y_bands) if y_bands else ("r", "i"),
-                split_col=split_col, split_threshold=split_threshold, limit=limit,
-                title=title or f"{catalog} color-color: {label}",
-                point_sources=bool(point_sources), value_cuts=value_cuts,
-            )
-            return self._datalab_attach_image_result(out, title or f"Color-color diagram: {label}")
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_color_magnitude_diagram(
-        self,
-        catalog: str,
-        table: Optional[str] = None,
-        radius_deg: float = 0.4,
-        ra: Optional[float] = None,
-        dec: Optional[float] = None,
-        target_name: Optional[str] = None,
-        blue_band: str = "g",
-        red_band: str = "r",
-        mag_band: Optional[str] = None,
-        limit: int = 5000,
-        title: Optional[str] = None,
-        point_sources: bool = False,
-        value_cuts: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_registry as _dl_reg
-            table = table or _dl_reg.default_table(catalog)
-            radius_deg = float(radius_deg) if radius_deg is not None else 0.4
-            limit = int(limit) if limit is not None else 5000
-            blue_band = blue_band or "g"
-            red_band = red_band or "r"
-            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
-            out = datalab_orchestration.color_magnitude_diagram(
-                catalog, table, ra_f, dec_f, radius_deg,
-                blue_band=blue_band, red_band=red_band, mag_band=mag_band, limit=limit,
-                title=title or f"{catalog} CMD: {label}",
-                point_sources=bool(point_sources), value_cuts=value_cuts,
-            )
-            return self._datalab_attach_image_result(out, title or f"Color-magnitude diagram: {label}")
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_color_color_diagram / _datalab_color_magnitude_diagram migrated
+    # to capabilities/datalab.py (registered via _datalab_image_tool_fn). Inline
+    # copies deleted. (docs/v2 P1)
 
     def _datalab_tiled_search(
         self,
@@ -7928,46 +7764,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return self._datalab_error(e)
 
-    def _datalab_job_status(self, job_id: str) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            out = {"success": True, **default_job_service().status(job_id)}
-            # Job-aware turn ending (live DS-P15: the model polled a slow tiled
-            # scan 18x until it silently hit HARD_MAX_ITERATIONS with no closing
-            # message). After a few polls of a still-running job, tell the model
-            # to stop polling and end the turn gracefully.
-            if str(out.get("status", "")).lower() in {"queued", "running"}:
-                counts = getattr(self, "_job_poll_counts", None)
-                if counts is None:
-                    counts = self._job_poll_counts = {}
-                counts[str(job_id)] = counts.get(str(job_id), 0) + 1
-                if counts[str(job_id)] >= 3:
-                    out["stop_polling"] = True
-                    out["instruction"] = (
-                        f"This job is still {out.get('status')} server-side after "
-                        f"{counts[str(job_id)]} polls. STOP polling now. End your answer: "
-                        "summarize any results you already have, state that job "
-                        f"{job_id} is still running, and tell the user to ask you to "
-                        "check it again in a few minutes (datalab_job_status / "
-                        "datalab_job_results). Do NOT call datalab_job_status again this turn."
-                    )
-            return out
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_job_results(self, job_id: str) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            return {"success": True, **default_job_service().results(job_id)}
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_job_cancel(self, job_id: str) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            return {"success": True, **default_job_service().cancel(job_id)}
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_job_status / _datalab_job_results / _datalab_job_cancel
+    # migrated to capabilities/datalab.py (registered via _datalab_tool_fn).
+    # job_status's per-turn poll counter is injected through
+    # CallContext.services — see _get_datalab_job_poll_counts. Inline copies
+    # deleted. (docs/v2 P1)
 
     def _datalab_export_notebook(
         self,
@@ -8028,108 +7829,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             result["image_attached"] = True
         return result
 
-    def _datalab_image_cutout(
-        self,
-        fov_deg: float,
-        ra: Optional[float] = None,
-        dec: Optional[float] = None,
-        target_name: Optional[str] = None,
-        band: str = "g",
-        catalog: str = "ls_dr9",
-        endpoint: Optional[str] = None,
-        title: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
-            service = self._get_datalab_image_service()
-            caption = title or f"Data Lab {band}-band cutout: {label}"
-            result = service.cutout(
-                ra_f,
-                dec_f,
-                float(fov_deg),
-                band=band,
-                catalog=catalog,
-                endpoint=endpoint,
-                title=caption,
-            )
-            # Auto-substitute a working band: models often stop instead of retrying, so if the
-            # requested band has no usable tiles but another does (e.g. M31: no g/r/i, working
-            # MzLS z), render that band deterministically and label the substitution clearly.
-            no_image = not (result.get("image_base64") or result.get("path"))
-            suggested = list(result.get("suggested_bands") or [])
-            if no_image and suggested:
-                sub_band = suggested[0]
-                sub_caption = title or f"Data Lab {sub_band}-band cutout: {label} (requested {band}, not available here)"
-                retry = service.cutout(
-                    ra_f, dec_f, float(fov_deg), band=sub_band,
-                    catalog=catalog, endpoint=endpoint, title=sub_caption,
-                )
-                if retry.get("image_base64") or retry.get("path"):
-                    retry["band_substituted"] = {"requested": str(band), "used": sub_band}
-                    retry["note"] = (
-                        f"No usable {band}-band tiles at this position; rendered the {sub_band}-band "
-                        f"cutout instead. State the substitution to the user."
-                    )
-                    return self._datalab_attach_image_result(retry, sub_caption)
-            return self._datalab_attach_image_result(result, caption)
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_color_image(
-        self,
-        fov_deg: float,
-        ra: Optional[float] = None,
-        dec: Optional[float] = None,
-        target_name: Optional[str] = None,
-        catalog: str = "ls_dr9",
-        endpoint: Optional[str] = None,
-        bands: Optional[List[str]] = None,
-        q: float = 8.0,
-        stretch: float = 0.5,
-        title: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            ra_f, dec_f, label = self._datalab_coordinates(target_name=target_name, ra=ra, dec=dec)
-            caption = title or f"Data Lab color image: {label}"
-            result = self._get_datalab_image_service().color_image(
-                ra_f,
-                dec_f,
-                float(fov_deg),
-                catalog=catalog,
-                endpoint=endpoint,
-                bands=bands,
-                q=float(q),
-                stretch=float(stretch),
-                title=caption,
-            )
-            return self._datalab_attach_image_result(result, caption)
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_cutout_grid(
-        self,
-        peaks: List[Dict[str, Any]],
-        fov_deg: float,
-        band: str = "g",
-        catalog: str = "ls_dr9",
-        endpoint: Optional[str] = None,
-        title: str = "Data Lab cutout grid",
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            result = self._get_datalab_image_service().cutout_grid(
-                peaks,
-                float(fov_deg),
-                band=band,
-                catalog=catalog,
-                endpoint=endpoint,
-                title=title,
-            )
-            return self._datalab_attach_image_result(result, title)
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_image_cutout / _color_image / _cutout_grid were migrated to
+    # capabilities/datalab.py (SIA image capabilities) and are registered via
+    # _datalab_image_tool_fn(...). Inline copies deleted — one implementation
+    # each. Coordinate resolution + the image service are injected via
+    # CallContext; the band-substitution + image-card transport are preserved. (docs/v2 P1)
 
     def _svo_filter_wavelength(
         self,
@@ -8147,168 +7851,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return self._datalab_error(e)
 
-    def _datalab_catalog_scatter(
-        self,
-        result_id: str,
-        x_expr: str,
-        y_expr: str,
-        color_by: Optional[str] = None,
-        invert_y: bool = False,
-        invert_x: bool = False,
-        title: str = "Data Lab catalog scatter",
-        x_label: Optional[str] = None,
-        y_label: Optional[str] = None,
-        overlay_locus: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_analysis
-
-            result = datalab_analysis.catalog_scatter(
-                result_id,
-                x_expr,
-                y_expr,
-                color_by=color_by,
-                invert_y=invert_y,
-                invert_x=invert_x,
-                title=title,
-                x_label=x_label,
-                y_label=y_label,
-                overlay_locus=overlay_locus,
-                result_store=self._get_datalab_result_store(),
-            )
-            return self._datalab_attach_image_result(result, title)
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_sky_density_map(
-        self,
-        result_id: str,
-        mode: str = "hist2d",
-        ra_col: Optional[str] = None,
-        dec_col: Optional[str] = None,
-        count_col: str = "source_count",
-        bins: int = 80,
-        healpix_col: str = "healpix",
-        nside: Optional[int] = None,
-        order: str = "nested",
-        matched_filter: bool = False,
-        sigma_small: float = 1.0,
-        sigma_large: float = 3.0,
-        peak_threshold: float = 3.0,
-        max_peaks: int = 10,
-        log_scale: bool = True,
-        title: str = "Data Lab sky density map",
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_analysis
-
-            result = datalab_analysis.sky_density_map(
-                result_id,
-                mode=mode,
-                ra_col=ra_col,
-                dec_col=dec_col,
-                count_col=count_col,
-                bins=bins,
-                healpix_col=healpix_col,
-                nside=nside,
-                order=order,
-                matched_filter=matched_filter,
-                sigma_small=sigma_small,
-                sigma_large=sigma_large,
-                peak_threshold=peak_threshold,
-                max_peaks=max_peaks,
-                log_scale=log_scale,
-                title=title,
-                result_store=self._get_datalab_result_store(),
-            )
-            return self._datalab_attach_image_result(result, title)
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_period_fold(
-        self,
-        result_id: str,
-        time_col: str = "mjd",
-        mag_col: str = "cmag",
-        error_col: Optional[str] = "cerr",
-        band: Optional[str] = None,
-        band_col: str = "filter",
-        min_frequency: float = 1.0,
-        max_frequency: float = 10.0,
-        title: str = "Data Lab period-folded light curve",
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_analysis
-
-            result = datalab_analysis.period_fold(
-                result_id,
-                time_col=time_col,
-                mag_col=mag_col,
-                error_col=error_col,
-                band=band,
-                band_col=band_col,
-                min_frequency=min_frequency,
-                max_frequency=max_frequency,
-                title=title,
-                result_store=self._get_datalab_result_store(),
-            )
-            return self._datalab_attach_image_result(result, title)
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_sed_plot(
-        self,
-        result_id: str,
-        row_index: int = 0,
-        filter_columns: Optional[Dict[str, str]] = None,
-        title: str = "Data Lab SED",
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_analysis
-
-            result = datalab_analysis.sed_plot(
-                result_id,
-                row_index=row_index,
-                filter_columns=filter_columns,
-                title=title,
-                result_store=self._get_datalab_result_store(),
-                svo_client=self._get_svo_fps_client(),
-            )
-            return self._datalab_attach_image_result(result, title)
-        except Exception as e:
-            return self._datalab_error(e)
-
-    def _datalab_lss_wedge(
-        self,
-        result_id: str,
-        ra_col: Optional[str] = None,
-        dec_col: Optional[str] = None,
-        z_col: str = "z",
-        class_col: Optional[str] = None,
-        pie_slice: bool = False,
-        title: str = "Data Lab large-scale structure wedge",
-    ) -> Dict[str, Any]:
-        self.last_run_result = None
-        try:
-            from services import datalab_analysis
-
-            result = datalab_analysis.lss_wedge(
-                result_id,
-                ra_col=ra_col,
-                dec_col=dec_col,
-                z_col=z_col,
-                class_col=class_col,
-                pie_slice=pie_slice,
-                title=title,
-                result_store=self._get_datalab_result_store(),
-            )
-            return self._datalab_attach_image_result(result, title)
-        except Exception as e:
-            return self._datalab_error(e)
+    # NOTE: _datalab_catalog_scatter / _sky_density_map / _period_fold / _sed_plot /
+    # _lss_wedge were migrated to capabilities/datalab.py (PLOT_CAPABILITIES) and are
+    # registered via _datalab_image_tool_fn(...). Inline copies deleted — one
+    # implementation each. The image-card transport (_datalab_attach_image_result)
+    # is applied by the image wrapper at the adapter boundary. (docs/v2 P1)
 
     def _get_sky_image(self, target_name: Optional[str] = None,
                        survey: str = "dss2",
@@ -8394,84 +7941,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": f"MAST download failed: {str(e)}"}
 
-    def _filter_results(self, column: str, operator: str, value: float) -> Dict[str, Any]:
-        """
-        Apply a numeric or string filter to the LAST search results.
-        Friendly column aliases are supported (e.g. 'Band', 'resolution', 'frequency').
-        Updates last_run_result so the filtered table is shown in the UI.
-        """
-        try:
-            if self.last_search_results is None or self.last_search_results.empty:
-                return {
-                    "success": False,
-                    "error": "No ALMA/archive search results to filter. This tool only sees archive search tables.",
-                    "hint": (
-                        "For Data Lab catalog data, apply the cut inside the query instead: "
-                        "datalab_select_catalog_rows(value_cuts=[{'column': ..., 'op': ..., 'value': ...}]), "
-                        "a WHERE clause in datalab_sql_query, or point_sources=true on the one-shot diagram tools."
-                    ),
-                }
-
-            df = self.last_search_results.copy()
-
-            # ── Friendly column alias mapping ──────────────────────────────────
-            ALIAS = {
-                "band":       ["band_list", "Band", "band"],
-                "resolution": ["spatial_resolution", "s_resolution", "resolution"],
-                "frequency":  ["frequency", "min_frequency", "freq_min", "freq"],
-                "freq":       ["frequency", "min_frequency", "freq_min"],
-                "exp":        ["t_exptime", "integration"],
-                "exptime":    ["t_exptime", "integration"],
-                "pi":         ["pi_name"],
-                "project":    ["project_code"],
-            }
-            # Resolve column name
-            col_lower = column.lower()
-            candidates = ALIAS.get(col_lower, [column])
-            real_col = next((c for c in candidates if c in df.columns), None)
-            if real_col is None:
-                # Try direct match (case-insensitive)
-                real_col = next((c for c in df.columns if c.lower() == col_lower), None)
-            if real_col is None:
-                available = [c for c in df.columns][:15]
-                return {"success": False, "error": f"Column '{column}' not found. Available: {available}"}
-
-            # ── Apply filter ──────────────────────────────────────────────────
-            before = len(df)
-            numeric_series = pd.to_numeric(df[real_col], errors="coerce")
-
-            OPS = {"<": lambda s, v: s < v, "<=": lambda s, v: s <= v,
-                   ">": lambda s, v: s > v, ">=": lambda s, v: s >= v,
-                   "==": lambda s, v: s == v, "!=": lambda s, v: s != v}
-            if operator not in OPS:
-                return {"success": False, "error": f"Invalid operator '{operator}'. Use: < <= > >= == !="}
-
-            mask = OPS[operator](numeric_series, value)
-            df = df[mask]
-
-            print(f"[FILTER] {real_col} {operator} {value}: {before} → {len(df)} rows")
-
-            # Update agent state so UI shows filtered table
-            self.last_search_results = df
-            prev_label = (self.last_run_result or {}).get("filter_label", "ALMA")
-            filter_label = f"{prev_label} | {real_col} {operator} {value}"
-            self.last_run_result = {
-                **(self.last_run_result or {}),
-                "data": df,
-                "filter_label": filter_label,
-                "tool_name": "filter_results",
-            }
-
-            return {
-                "success": True,
-                "rows_before": before,
-                "rows_after": len(df),
-                "filter": f"{real_col} {operator} {value}",
-                "note": f"Filtered from {before} to {len(df)} rows. Updated table shown in UI. Do NOT render a table — the UI already displays one."
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
+    # NOTE: an earlier, richer `_filter_results` implementation lived here but was
+    # dead code — the class defines `_filter_results` again further down
+    # (the later definition wins in Python), so this copy never executed. Removed
+    # to eliminate the duplicate-method smell flagged as C11. The live version is
+    # the one below in this class.
 
     def _get_observation_details(self, obs_id: str) -> Dict[str, Any]:
         """Get detailed observation information"""
@@ -8500,6 +7974,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             analysis = self.analysis_service.analyze_uv_coverage(ms_path)
             # Store analysis result potentially?
             self.last_run_result = {"type": "analysis", "data": analysis}
+            # Reflect the service's own success flag so a CASA-unavailable
+            # error isn't surfaced to the model as a successful analysis. (C1)
+            if isinstance(analysis, dict) and analysis.get("success") is False:
+                return {
+                    "success": False,
+                    "error": analysis.get("message") or analysis.get("error") or "UV analysis unavailable",
+                    "analysis": analysis,
+                }
             return {"success": True, "analysis": analysis}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -10296,7 +9778,7 @@ IMPORTANT RULES:
         """
         Bridge from sandbox call_tool(name, **kwargs) to registered Quasar tools.
 
-        Any of the 27+ registered Quasar tools can be called from inside the
+        Any of the 140+ registered Quasar tools can be called from inside the
         sandbox Python environment:
           call_tool("search_by_target", target_name="Elias 2-27")
           call_tool("check_line_coverage", line_freq_ghz=230.538, z=0.0)
@@ -11309,7 +10791,14 @@ IMPORTANT RULES:
                 # near-zero for off-domain queries (live test P14 cited chunks at 0.02).
                 # Junk context is worse than none — it invites answering from the docs.
                 def _rag_doc_score(d):
-                    raw = d.metadata.get("_score", d.metadata.get("_semantic_score"))
+                    # Gate on the semantic (cosine) relevance score, which lives
+                    # on a 0–1 scale. NOT the RRF fusion `_score`: with rrf_k=60
+                    # that caps near ~0.016, so comparing it against a 0–1
+                    # threshold silently dropped EVERY reranked doc and disabled
+                    # RAG context entirely. Upstream already filters
+                    # `_semantic_score >= min_score`, so this stays a harmless
+                    # secondary floor while restoring the retrieved context. (C5)
+                    raw = d.metadata.get("_semantic_score", d.metadata.get("_score"))
                     try:
                         return float(raw)
                     except (TypeError, ValueError):
@@ -12463,6 +11952,14 @@ IMPORTANT RULES:
                         run_token=run_token,
                         _history_recovery_attempted=True,
                     )
+            # Log the full traceback server-side; the user only ever sees the
+            # friendly message from _user_facing_provider_error.
+            logger.error(
+                "Responses API request failed for conversation %s: %s",
+                conversation_id,
+                str(e),
+                exc_info=True,
+            )
             print(f"[ERROR] Error with Responses API: {str(e)}")
             return self._user_facing_provider_error(e)
     
@@ -12701,10 +12198,17 @@ IMPORTANT RULES:
 
         # Use NASA ADS if available
         if self.ads_client:
-            papers = self.ads_client.search_by_target(source_name)
+            # ADS now raises on missing key / archive failure (no fabricated
+            # papers). This Optional[DataFrame] helper returns None on error
+            # rather than propagating an unhandled exception. (C2 guard)
+            try:
+                papers = self.ads_client.search_by_target(source_name)
+            except Exception as e:
+                print(f"[search_papers] ADS lookup failed for '{source_name}': {e}")
+                return None
             if papers:
                 return pd.DataFrame(papers)
-        
+
         return None
 
 

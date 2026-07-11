@@ -42,7 +42,9 @@ export function AuthModal() {
                     if (btnContainer) {
                         window.google.accounts.id.renderButton(
                             btnContainer,
-                            { theme: "outline", size: "large", width: 320, text: "continue_with" }
+                            // Without `locale`, Google localizes the button label to the
+                            // signed-in user's Google account language, not the app's.
+                            { theme: "outline", size: "large", width: 320, text: "continue_with", locale: "en" }
                         );
                     }
                 }, 100);
@@ -64,7 +66,7 @@ export function AuthModal() {
         setIsLoading(true);
         setError(null);
         try {
-            const res = await fetch(`${API_BASE}/api/auth/google`, {
+            const res = await fetch(`${API_BASE}/api/auth/google`, { credentials: "include",
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ credential: response.credential }),
@@ -72,7 +74,8 @@ export function AuthModal() {
             const data = await res.json();
             if (!res.ok) throw new Error(data.detail || "Google authentication failed");
 
-            setAuth(data.user, data.token);
+            // Auth now lives in the httpOnly cookie set by this response.
+            setAuth(data.user);
             closeAuthModal();
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } catch (err: any) {
@@ -93,7 +96,7 @@ export function AuthModal() {
             : { username: email, password, email, display_name: displayName };
 
         try {
-            const res = await fetch(`${API_BASE}${endpoint}`, {
+            const res = await fetch(`${API_BASE}${endpoint}`, { credentials: "include",
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
@@ -102,7 +105,8 @@ export function AuthModal() {
 
             if (!res.ok) throw new Error(data.detail || "Authentication failed");
 
-            setAuth(data.user, data.token);
+            // Auth now lives in the httpOnly cookie set by this response.
+            setAuth(data.user);
             closeAuthModal();
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } catch (err: any) {

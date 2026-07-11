@@ -81,7 +81,7 @@ function formatTokens(value?: number | null) {
 // ── Personalization Panel ─────────────────────────────────────────────────
 
 function PersonalizationPanel() {
-    const { isAuthenticated, token } = useAuthStore();
+    const { isAuthenticated } = useAuthStore();
     const [docs, setDocs] = useState<PersonalDoc[]>([]);
     const [loading, setLoading] = useState(false);
     const [uploading, setUploading] = useState(false);
@@ -90,27 +90,27 @@ function PersonalizationPanel() {
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const fetchDocs = useCallback(async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/personalization/documents`, { headers: { Authorization: `Bearer ${token}` } });
+            const res = await fetch(`${API_BASE}/api/personalization/documents`, { credentials: "include" });
             if (res.ok) setDocs(await res.json());
         } catch { /* noop */ }
         setLoading(false);
-    }, [token]);
+    }, [isAuthenticated]);
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (isAuthenticated) fetchDocs(); }, [isAuthenticated, fetchDocs]);
 
     const uploadFiles = async (files: FileList | File[]) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setUploading(true);
         setUploadMsg(null);
         const form = new FormData();
         Array.from(files).forEach(f => form.append("files", f));
         try {
-            const res = await fetch(`${API_BASE}/api/personalization/upload`, {
-                method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form,
+            const res = await fetch(`${API_BASE}/api/personalization/upload`, { credentials: "include",
+                method: "POST", body: form,
             });
             const data = await res.json();
             if (res.ok) {
@@ -127,11 +127,11 @@ function PersonalizationPanel() {
     };
 
     const deleteDoc = async (docId: string, filename: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         if (!confirm(`Remove "${filename}" from your personal knowledge base?`)) return;
         try {
-            const res = await fetch(`${API_BASE}/api/personalization/document/${encodeURIComponent(docId)}`, {
-                method: "DELETE", headers: { Authorization: `Bearer ${token}` },
+            const res = await fetch(`${API_BASE}/api/personalization/document/${encodeURIComponent(docId)}`, { credentials: "include",
+                method: "DELETE",
             });
             if (res.ok) setDocs(prev => prev.filter(d => d.id !== docId));
         } catch { /* noop */ }
@@ -264,7 +264,7 @@ def search_my_service(query: str, max_results: int = 5) -> dict:
 `;
 
 function CustomToolsPanel() {
-    const { isAuthenticated, token } = useAuthStore();
+    const { isAuthenticated } = useAuthStore();
     const [activeTab, setActiveTab] = useState<"templates" | "add" | "installed">("installed");
     const [tools, setTools] = useState<UserTool[]>([]);
     const [loading, setLoading] = useState(false);
@@ -279,22 +279,22 @@ function CustomToolsPanel() {
     const [saving, setSaving] = useState(false);
 
     const fetchTools = useCallback(async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/user-tools`, { headers: { Authorization: `Bearer ${token}` } });
+            const res = await fetch(`${API_BASE}/api/user-tools`, { credentials: "include" });
             if (res.ok) {
                 setTools(await res.json());
             }
         } catch { /* noop */ }
         setLoading(false);
-    }, [token]);
+    }, [isAuthenticated]);
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (isAuthenticated) fetchTools(); }, [isAuthenticated, fetchTools]);
 
     const handleSave = async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setFormMsg(null);
         if (!tName.trim() || !tCode.trim()) {
             setFormMsg({ type: "error", text: "Tool name and code are required." });
@@ -303,11 +303,10 @@ function CustomToolsPanel() {
         
         setSaving(true);
         try {
-            const res = await fetch(`${API_BASE}/api/user-tools`, {
+            const res = await fetch(`${API_BASE}/api/user-tools`, { credentials: "include",
                 method: "POST",
                 headers: { 
                     "Content-Type": "application/json",
-                    Authorization: `Bearer ${token}` 
                 },
                 body: JSON.stringify({
                     name: tName,
@@ -334,13 +333,12 @@ function CustomToolsPanel() {
     };
 
     const handleDelete = async (name: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         if (!confirm(`Delete custom tool "${name}"?`)) return;
         
         try {
-            const res = await fetch(`${API_BASE}/api/user-tools/${encodeURIComponent(name)}`, {
+            const res = await fetch(`${API_BASE}/api/user-tools/${encodeURIComponent(name)}`, { credentials: "include",
                 method: "DELETE",
-                headers: { Authorization: `Bearer ${token}` }
             });
             if (res.ok) fetchTools();
         } catch { /* noop */ }
@@ -543,7 +541,7 @@ function CustomToolsPanel() {
 // ── MCP Servers Panel ───────────────────────────────────────────────────────
 
 function MCPServersPanel() {
-    const { isAuthenticated, token } = useAuthStore();
+    const { isAuthenticated } = useAuthStore();
     const [activeTab, setActiveTab] = useState<"installed" | "add">("installed");
     const [servers, setServers] = useState<MCPServer[]>([]);
     const [loading, setLoading] = useState(false);
@@ -559,20 +557,20 @@ function MCPServersPanel() {
     const [saving, setSaving] = useState(false);
 
     const fetchServers = useCallback(async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/mcp-servers`, { headers: { Authorization: `Bearer ${token}` } });
+            const res = await fetch(`${API_BASE}/api/mcp-servers`, { credentials: "include" });
             if (res.ok) setServers(await res.json());
         } catch { /* noop */ }
         setLoading(false);
-    }, [token]);
+    }, [isAuthenticated]);
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (isAuthenticated) fetchServers(); }, [isAuthenticated, fetchServers]);
 
     const handleSave = async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setFormMsg(null);
         if (!sName.trim()) {
             setFormMsg({ type: "error", text: "Server name is required." });
@@ -615,9 +613,9 @@ function MCPServersPanel() {
                 env: envDict
             };
             
-            const res = await fetch(`${API_BASE}/api/mcp-servers`, {
+            const res = await fetch(`${API_BASE}/api/mcp-servers`, { credentials: "include",
                 method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(bodyPayload)
             });
             const data = await res.json();
@@ -636,11 +634,11 @@ function MCPServersPanel() {
     };
 
     const handleDelete = async (name: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         if (!confirm(`Delete MCP server "${name}"?`)) return;
         try {
-            const res = await fetch(`${API_BASE}/api/mcp-servers/${encodeURIComponent(name)}`, {
-                method: "DELETE", headers: { Authorization: `Bearer ${token}` }
+            const res = await fetch(`${API_BASE}/api/mcp-servers/${encodeURIComponent(name)}`, { credentials: "include",
+                method: "DELETE"
             });
             if (res.ok) fetchServers();
         } catch { /* noop */ }
@@ -836,7 +834,7 @@ const PLATFORM_PROVIDER_LABELS: Record<string, string> = {
 };
 
 function ProviderKeysPanel() {
-    const { isAuthenticated, token } = useAuthStore();
+    const { isAuthenticated } = useAuthStore();
     const [keys, setKeys] = useState<ProviderKeyMeta[]>([]);
     const [quota, setQuota] = useState<UsageQuota | null>(null);
     const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
@@ -847,11 +845,11 @@ function ProviderKeysPanel() {
     const getKey = (provider: string) => keys.find(k => k.provider === provider);
 
     const fetchState = useCallback(async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         try {
             const [keysRes, quotaRes] = await Promise.all([
-                fetch(`${API_BASE}/api/provider-keys`, { headers: { Authorization: `Bearer ${token}` } }),
-                fetch(`${API_BASE}/api/usage-quota`, { headers: { Authorization: `Bearer ${token}` } }),
+                fetch(`${API_BASE}/api/provider-keys`, { credentials: "include" }),
+                fetch(`${API_BASE}/api/usage-quota`, { credentials: "include" }),
             ]);
             if (keysRes.ok) {
                 const data = await keysRes.json();
@@ -866,12 +864,12 @@ function ProviderKeysPanel() {
         } catch {
             setMessage({ type: "error", text: "Could not load provider key settings." });
         }
-    }, [token]);
+    }, [isAuthenticated]);
 
     useEffect(() => { if (isAuthenticated) fetchState(); }, [isAuthenticated, fetchState]);
 
     const saveKey = async (provider: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         const rawKey = (apiKeys[provider] || "").trim();
         if (!rawKey) {
             setMessage({ type: "error", text: "Enter an API key before saving." });
@@ -881,9 +879,9 @@ function ProviderKeysPanel() {
         setBusy(`${provider}:save`);
         setMessage(null);
         try {
-            const res = await fetch(`${API_BASE}/api/provider-keys`, {
+            const res = await fetch(`${API_BASE}/api/provider-keys`, { credentials: "include",
                 method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     provider,
                     api_key: rawKey,
@@ -903,14 +901,14 @@ function ProviderKeysPanel() {
     };
 
     const updateLimit = async (provider: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         const limitText = (limits[provider] || "").trim();
         setBusy(`${provider}:limit`);
         setMessage(null);
         try {
-            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/limit`, {
+            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/limit`, { credentials: "include",
                 method: "PATCH",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ token_limit: limitText ? Number(limitText) : null }),
             });
             const data = await res.json();
@@ -925,13 +923,12 @@ function ProviderKeysPanel() {
     };
 
     const testKey = async (provider: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setBusy(`${provider}:test`);
         setMessage(null);
         try {
-            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/test`, {
+            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/test`, { credentials: "include",
                 method: "POST",
-                headers: { Authorization: `Bearer ${token}` },
             });
             const data = await res.json();
             if (!res.ok) throw new Error(data.detail || "Test failed.");
@@ -945,14 +942,13 @@ function ProviderKeysPanel() {
     };
 
     const deleteKey = async (provider: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         if (!confirm(`Delete your ${provider} API key?`)) return;
         setBusy(`${provider}:delete`);
         setMessage(null);
         try {
-            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}`, {
+            const res = await fetch(`${API_BASE}/api/provider-keys/${provider}`, { credentials: "include",
                 method: "DELETE",
-                headers: { Authorization: `Bearer ${token}` },
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.detail || "Delete failed.");
@@ -1116,7 +1112,7 @@ interface AdminIssueReport {
     };
 }
 
-function IssueReportsPanel({ token }: { token: string }) {
+function IssueReportsPanel() {
     const [reports, setReports] = useState<AdminIssueReport[]>([]);
     const [loading, setLoading] = useState(true);
     const [filters, setFilters] = useState({
@@ -1135,8 +1131,7 @@ function IssueReportsPanel({ token }: { token: string }) {
             Object.entries(filters).filter(([, value]) => value) as [string, string][],
         );
         try {
-            const response = await fetch(`${API_BASE}/api/admin/issue-reports?${params}`, {
-                headers: { Authorization: `Bearer ${token}` },
+            const response = await fetch(`${API_BASE}/api/admin/issue-reports?${params}`, { credentials: "include",
             });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const payload = await response.json();
@@ -1146,17 +1141,16 @@ function IssueReportsPanel({ token }: { token: string }) {
         } finally {
             setLoading(false);
         }
-    }, [filters, token]);
+    }, [filters]);
 
     useEffect(() => {
         loadReports().catch(() => setReports([]));
     }, [loadReports]);
 
     const updateReport = async (report: AdminIssueReport, status = report.status) => {
-        const response = await fetch(`${API_BASE}/api/admin/issue-reports/${report.id}`, {
+        const response = await fetch(`${API_BASE}/api/admin/issue-reports/${report.id}`, { credentials: "include",
             method: "PATCH",
             headers: {
-                Authorization: `Bearer ${token}`,
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({ status, admin_notes: notes[report.id] || "" }),
@@ -1170,8 +1164,7 @@ function IssueReportsPanel({ token }: { token: string }) {
             ...Object.fromEntries(Object.entries(filters).filter(([, value]) => value)),
             format,
         });
-        const response = await fetch(`${API_BASE}/api/admin/issue-reports/export?${params}`, {
-            headers: { Authorization: `Bearer ${token}` },
+        const response = await fetch(`${API_BASE}/api/admin/issue-reports/export?${params}`, { credentials: "include",
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const blob = await response.blob();
@@ -1261,18 +1254,17 @@ function IssueReportsPanel({ token }: { token: string }) {
 }
 
 function AnalyticsPanel() {
-    const { token } = useAuthStore();
+    const { isAuthenticated } = useAuthStore();
     const [data, setData] = useState<AnalyticsSummary | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [downloading, setDownloading] = useState<string | null>(null);
 
     const downloadFile = async (url: string, filename: string, key: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setDownloading(key);
         try {
-            const res = await fetch(`${API_BASE}${url}`, {
-                headers: { Authorization: `Bearer ${token}` },
+            const res = await fetch(`${API_BASE}${url}`, { credentials: "include",
             });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const blob = await res.blob();
@@ -1290,16 +1282,15 @@ function AnalyticsPanel() {
     };
 
     useEffect(() => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setLoading(true);
-        fetch(`${API_BASE}/api/admin/analytics/summary`, {
-            headers: { Authorization: `Bearer ${token}` },
+        fetch(`${API_BASE}/api/admin/analytics/summary`, { credentials: "include",
         })
             .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
             .then(d => { setData(d); setError(null); })
             .catch(e => setError(e.message))
             .finally(() => setLoading(false));
-    }, [token]);
+    }, [isAuthenticated]);
 
     if (loading) return <div className="flex items-center justify-center h-full gap-2 text-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" /> Loading analytics...</div>;
     if (error) return <div className="flex items-center justify-center h-full text-red-400 text-sm">Error: {error}</div>;
@@ -1379,7 +1370,7 @@ function AnalyticsPanel() {
                 </div>
             )}
 
-            {token && <IssueReportsPanel token={token} />}
+            {isAuthenticated && <IssueReportsPanel />}
 
             {/* Export / Download */}
             <div>

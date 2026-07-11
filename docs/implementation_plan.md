@@ -43,13 +43,13 @@
 
 | File | Status | What It Does |
 |---|---|---|
-| [agent.py](file:///c:/Users/adama/Desktop/Quasar-main/core/agent.py) | ✅ **2,382 lines** | Central orchestrator — 27+ tools, [stream_response_api()](file:///c:/Users/adama/Desktop/Quasar-main/core/agent.py#1985-2174) with 12-round tool loop, model routing, mem0 |
+| [agent.py](file:///c:/Users/adama/Desktop/Quasar-main/core/agent.py) | ✅ **2,382 lines** | Central orchestrator — 140+ tools (see [docs/TOOLS.md](TOOLS.md)), [stream_response_api()](file:///c:/Users/adama/Desktop/Quasar-main/core/agent.py#1985-2174) with 12-round tool loop, model routing, mem0 |
 | [rlm.py](file:///c:/Users/adama/Desktop/Quasar-main/core/rlm.py) | ✅ **409 lines** | Complexity detection (heuristic + LLM), sequential decomposition, tool executor bridge |
 | [rlm_environment.py](file:///c:/Users/adama/Desktop/Quasar-main/core/rlm_environment.py) | ✅ **564 lines** | Sandboxed REPL with [call_tool()](file:///c:/Users/adama/Desktop/Quasar-main/core/rlm_environment.py#379-386), [llm_query()](file:///c:/Users/adama/Desktop/Quasar-main/core/rlm_environment.py#376-378) (recursive child REPLs), persistent namespace |
 | [memory.py](file:///c:/Users/adama/Desktop/Quasar-main/core/memory.py) | ✅ 6KB | Short-term conversation memory with topic detection |
 | [tools.py](file:///c:/Users/adama/Desktop/Quasar-main/core/tools.py) | ✅ 2KB | ToolRegistry for OpenAI function-calling schemas |
 
-### 27+ Registered Tools (Already Built ✅)
+### 140+ Registered Tools (Already Built ✅)
 
 Archive (6) · Data Ops (5) · Visualization (3) · Spectral Lines (4) · Web Browsing (4) · Literature (10+) · Multi-Messenger (4) · Analysis (1) · Notebooks (1)
 
@@ -90,7 +90,7 @@ flowchart TB
     end
 
     subgraph Existing["EXISTING: Services + Integrations + Tools"]
-        ToolReg["ToolRegistry (27+ tools)"]
+        ToolReg["ToolRegistry (140+ tools)"]
         Svc["All 14 Services"]
         Int["All 6 Integrations"]
         Memory["ConversationMemory\n+ mem0 + ChromaDB"]
@@ -252,7 +252,7 @@ class ModelRouter:
 
 Each sub-agent gets:
 - Its own **system prompt** optimized for its domain
-- Access to only **its subset** of the 27+ tools
+- Access to only **its subset** of the 140+ tools
 - A [run(task, context, workflow_memory)](file:///c:/Users/adama/Desktop/Quasar-main/core/rlm_environment.py#361-510) method
 
 | Agent | File | Tools It Uses (from existing registry) |

@@ -42,6 +42,10 @@ langchain-openai>=0.3.0,<0.4.0
 qdrant-client>=1.7.0,<2.0.0
 langchain-pymupdf4llm>=0.2.0,<1.0.0
 tiktoken>=0.7.0,<1.0.0
+# BM25 keyword scoring for hybrid RAG rerank (services/rag_service._hybrid_rerank).
+# Import is guarded, but without this dep hybrid search silently degrades to
+# semantic-only — declaring it makes the documented hybrid behaviour real. (C6)
+rank_bm25>=0.2.2,<1.0.0
 
 # Web / API
 fastapi

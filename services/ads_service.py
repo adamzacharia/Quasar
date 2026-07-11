@@ -97,7 +97,13 @@ class ADSService:
             return []
 
         if not self.api_key:
-            return self._get_example_papers(query)
+            # Never fabricate literature results (C2). This module is a dead
+            # duplicate of integrations/ads_client.py (slated for consolidation
+            # in P5) but must not harbour a fabrication path either.
+            raise ADSServiceError(
+                "NASA ADS API key is not configured — the literature archive "
+                "cannot be searched. No papers were returned."
+            )
 
         fields = fields or self._DEFAULT_FIELDS
         rows = max(1, min(max_results, 200))  # ADS hard limit 200 per request
@@ -116,8 +122,9 @@ class ADSService:
         try:
             data = self._perform_get("/search/query", params)
         except ADSServiceError as exc:
+            # Propagate the typed error instead of fabricating example papers. (C2)
             logger.error("ADS search failed: %s", exc)
-            return self._get_example_papers(query)
+            raise
 
         docs = data.get("response", {}).get("docs", [])
         return self._format_papers(docs)
@@ -441,55 +448,6 @@ class ADSService:
             'link': f"https://ui.adsabs.harvard.edu/abs/{paper.get('bibcode', '')}"
         }
     
-    def _get_example_papers(self, query: str) -> List[Dict[str, Any]]:
-        """Return example papers when ADS API is not available"""
-        examples = [
-            {
-                'title': 'The Very Large Array Sky Survey (VLASS): Science Case and Survey Design',
-                'authors': 'Lacy, M. et al.',
-                'year': '2020',
-                'journal': 'PASP',
-                'bibcode': '2020PASP..132c5001L',
-                'abstract': 'The Very Large Array Sky Survey (VLASS) is a synoptic, all-sky radio sky survey...',
-                'citations': 250,
-                'doi': '10.1088/1538-3873/ab63eb',
-                'link': 'https://ui.adsabs.harvard.edu/abs/2020PASP..132c5001L'
-            },
-            {
-                'title': 'ALMA Observations of Molecular Gas in High-Redshift Galaxies',
-                'authors': 'Casey, C. M. et al.',
-                'year': '2023',
-                'journal': 'ApJ',
-                'bibcode': '2023ApJ...950..123C',
-                'abstract': 'We present ALMA observations of CO emission in a sample of high-redshift galaxies...',
-                'citations': 45,
-                'doi': '10.3847/1538-4357/acd123',
-                'link': 'https://ui.adsabs.harvard.edu/abs/2023ApJ...950..123C'
-            },
-            {
-                'title': 'Radio Properties of Active Galactic Nuclei: A VLA Survey',
-                'authors': 'Smith, J. A. et al.',
-                'year': '2024',
-                'journal': 'MNRAS',
-                'bibcode': '2024MNRAS.520..456S',
-                'abstract': 'We present results from a comprehensive VLA survey of radio-loud AGN...',
-                'citations': 12,
-                'doi': '10.1093/mnras/stad789',
-                'link': 'https://ui.adsabs.harvard.edu/abs/2024MNRAS.520..456S'
-            }
-        ]
-        
-        # Filter examples based on query keywords
-        query_lower = query.lower()
-        filtered = []
-        
-        for paper in examples:
-            if any(keyword in paper['title'].lower() or keyword in paper['abstract'].lower() 
-                   for keyword in query_lower.split()):
-                filtered.append(paper)
-        
-        return filtered if filtered else examples[:2]
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

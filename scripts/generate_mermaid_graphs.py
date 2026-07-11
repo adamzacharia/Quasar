@@ -454,7 +454,7 @@ graph TD
     Conductor --> Recovery["core/recovery.py<br/><i>Error Recovery</i>"]
     Conductor --> WorkflowMem["core/workflow_memory.py<br/><i>Shared State</i>"]
 
-    Agent --> ToolRegistry["core/tools.py<br/><i>27+ Tools</i>"]
+    Agent --> ToolRegistry["core/tools.py<br/><i>140+ Tools</i>"]
     ToolRegistry --> SearchSvc["services/search.py"]
     ToolRegistry --> RAGSvc["services/rag_service.py"]
     ToolRegistry --> ADSSvc["services/ads_service.py"]

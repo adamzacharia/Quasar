@@ -212,8 +212,16 @@ def test_agent_registers_and_dispatches_datalab_tools_without_full_rows():
 
 
 def test_agent_raw_sql_requires_expert_ack():
+    # datalab_sql_query is now capability-backed (capabilities/datalab.py); dispatch
+    # through the registry rather than the deleted inline method. (docs/v2 P1)
     agent = _make_agent()
-    result = agent._datalab_sql_query("SELECT * FROM gaia_dr3.gaia_source LIMIT 1", expert_ack=False, reason="")
+    agent._register_tools()
+    result = json.loads(
+        agent._dispatch_tool_call(
+            "datalab_sql_query",
+            json.dumps({"sql": "SELECT * FROM gaia_dr3.gaia_source LIMIT 1", "expert_ack": False, "reason": ""}),
+        )
+    )
     assert result["success"] is False
     assert "expert" in result["error"]
 
@@ -263,12 +271,16 @@ def test_policy_accepts_non_radec_crossmatch():
 
 
 def test_get_result_payload_is_size_bounded_and_valid_json():
+    # datalab_get_result is now capability-backed; dispatch through the registry.
     import pandas as pd
     agent = _make_agent()
+    agent._register_tools()
     wide = pd.DataFrame([{f"c{i}": i * 1.0 for i in range(20)} for _ in range(300)])
     # Put into the AGENT's own store (the test fixture uses a non-singleton store).
     rid = agent._get_datalab_result_store().put(wide, {"catalog": "x", "table": "y"})
-    payload = agent._datalab_get_result(rid, max_rows=300)
+    payload = json.loads(
+        agent._dispatch_tool_call("datalab_get_result", json.dumps({"result_id": rid, "max_rows": 300}))
+    )
     assert payload["success"] is True and payload["truncated"] is True
     assert payload["returned_rows"] < 300
     assert len(json.dumps(payload["rows"], default=str)) <= 6000
@@ -276,10 +288,67 @@ def test_get_result_payload_is_size_bounded_and_valid_json():
 
 
 def test_datalab_tool_clears_last_run_result():
+    # The capability's context provider clears last_run_result at the adapter
+    # boundary (Data Lab tools emit summaries, not data cards). (docs/v2 P1)
     agent = _make_agent()
+    agent._register_tools()
     agent.last_run_result = {"type": "data", "stale": True}
-    agent._datalab_list_catalogs()
+    agent._dispatch_tool_call("datalab_list_catalogs", json.dumps({}))
     assert agent.last_run_result is None
+
+
+def test_datalab_image_wrapper_emits_card_and_strips_base64(monkeypatch):
+    # The image wrapper (_datalab_image_tool_fn) applies the SSE/UI transport at
+    # the adapter boundary: sets a displayable image card on last_run_result and
+    # strips the heavy base64 out of the LLM-facing dict. (docs/v2 P1)
+    import services.datalab_analysis as da
+    monkeypatch.setattr(
+        da, "catalog_scatter",
+        lambda *a, **k: {"success": True, "image_base64": "BIGB64", "path": "/plots/s.png", "n": 5},
+    )
+    agent = _make_agent()
+    agent._register_tools()
+    agent.last_run_result = {"stale": True}
+    out = json.loads(
+        agent._dispatch_tool_call(
+            "datalab_catalog_scatter",
+            json.dumps({"result_id": "rid", "x_expr": "g - r", "y_expr": "g", "title": "My Plot"}),
+        )
+    )
+    # LLM-facing output: base64 gone, image_attached added, other fields kept.
+    assert out["success"] is True and out.get("image_attached") is True
+    assert "image_base64" not in out
+    assert out["n"] == 5
+    # UI card set on last_run_result.
+    assert agent.last_run_result["type"] == "image"
+    assert agent.last_run_result["image_url"] == "/plots/s.png"
+    assert agent.last_run_result["caption"] == "My Plot"
+
+
+def test_datalab_image_cutout_wrapper_end_to_end():
+    # Full SIA path: image service injected via CallContext, coordinate resolution
+    # via _datalab_coordinates (ra/dec), image-card transport + base64 strip +
+    # no _caption leak. (docs/v2 P1)
+    agent = _make_agent()
+    agent._register_tools()
+
+    class _Svc:
+        def cutout(self, ra, dec, fov, **k):
+            return {"success": True, "image_base64": "B64", "path": "/plots/x.png"}
+
+    agent._datalab_image_service_instance = _Svc()
+    agent.last_run_result = {"stale": True}
+    out = json.loads(
+        agent._dispatch_tool_call(
+            "datalab_image_cutout",
+            json.dumps({"fov_deg": 0.1, "ra": 10.0, "dec": 20.0, "band": "g"}),
+        )
+    )
+    assert out["success"] is True and out.get("image_attached") is True
+    assert "image_base64" not in out and "_caption" not in out  # stripped + not leaked
+    assert agent.last_run_result["type"] == "image"
+    assert agent.last_run_result["image_url"] == "/plots/x.png"
+    assert agent.last_run_result["caption"] == "Data Lab g-band cutout: RA=10.00000, Dec=20.00000"
 
 
 def test_result_store_memory_ttl_expiry(monkeypatch):

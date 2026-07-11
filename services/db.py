@@ -11,15 +11,21 @@ cloud Turso DB (persistent). Otherwise, falls back to local SQLite
 (for development).
 """
 
+import atexit
 import os
 import sqlite3
+import threading
 from typing import Any, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Configuration
+#
+# Everything here is resolved per call rather than snapshotted at import.
+# ``config`` and ``core.agent`` call ``load_dotenv()`` when they are imported,
+# so whether TURSO_* is present in ``os.environ`` depends on *when* this module
+# happens to be imported. An import-time snapshot froze that answer for the
+# life of the process, which made the routing depend on module import order.
 # ---------------------------------------------------------------------------
-TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
-TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 
 def _truthy(value: str) -> bool:
@@ -35,19 +41,74 @@ def _current_environment() -> str:
     ).strip().lower()
 
 
-_FORCE_LOCAL_DB = _truthy(os.environ.get("QUASAR_FORCE_LOCAL_DB"))
-_IS_PRODUCTION = _current_environment() in {"production", "prod"}
-if _FORCE_LOCAL_DB and _IS_PRODUCTION:
-    raise RuntimeError(
-        "QUASAR_FORCE_LOCAL_DB cannot be used when QUASAR_ENV/ENVIRONMENT is production."
-    )
+def _force_local_db() -> bool:
+    return _truthy(os.environ.get("QUASAR_FORCE_LOCAL_DB"))
 
-_USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and not _FORCE_LOCAL_DB)
+
+def _is_production() -> bool:
+    return _current_environment() in {"production", "prod"}
+
+
+def _turso_credentials() -> Tuple[Optional[str], Optional[str]]:
+    return os.environ.get("TURSO_DATABASE_URL"), os.environ.get("TURSO_AUTH_TOKEN")
+
+
+def _check_force_local_allowed() -> None:
+    if _force_local_db() and _is_production():
+        raise RuntimeError(
+            "QUASAR_FORCE_LOCAL_DB cannot be used when QUASAR_ENV/ENVIRONMENT is production."
+        )
+
+
+def _use_turso() -> bool:
+    _check_force_local_allowed()
+    url, token = _turso_credentials()
+    return bool(url and token and not _force_local_db())
+
+
+# Fail fast on a misconfigured process rather than only on the first query.
+_check_force_local_allowed()
 
 
 # ---------------------------------------------------------------------------
 # Turso wrapper that mimics sqlite3's connection/cursor pattern
 # ---------------------------------------------------------------------------
+
+# Every live _TursoConnection, so shutdown can close the ones a caller stranded.
+_open_connections = set()
+_open_connections_lock = threading.Lock()
+
+
+def _close_open_connections() -> None:
+    """Close any _TursoConnection a caller never closed.
+
+    ``create_client_sync`` runs its event loop on a NON-daemon thread that stops
+    only on ``client.close()``, and the thread is already started by the time we
+    get the client, so it cannot be re-flagged as a daemon. Python joins
+    non-daemon threads during interpreter shutdown, so one connection stranded by
+    a raising statement hangs the process forever — the symptom being a test run
+    that prints its summary and then never exits.
+
+    This must run BEFORE that join. ``threading._register_atexit`` fires inside
+    ``threading._shutdown()``, ahead of the join; a plain ``atexit`` handler runs
+    after it and would never get the chance. (``concurrent.futures`` reaches for
+    the same private hook for the same reason.)
+    """
+    with _open_connections_lock:
+        stranded = list(_open_connections)
+    for conn in stranded:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+_register_shutdown = getattr(threading, "_register_atexit", None)
+if _register_shutdown is not None:
+    _register_shutdown(_close_open_connections)
+else:  # pragma: no cover - only on interpreters without the private hook
+    atexit.register(_close_open_connections)
+
 
 class _TursoCursor:
     """Minimal cursor-like wrapper around libsql_client result sets."""
@@ -88,15 +149,18 @@ class _TursoConnection:
 
     def __init__(self):
         import libsql_client
+
+        url, auth_token = _turso_credentials()
         # Convert libsql:// to https:// for HTTP transport
         # (wss transport can fail with 505 on some platforms)
-        url = TURSO_DATABASE_URL
         if url.startswith("libsql://"):
             url = url.replace("libsql://", "https://", 1)
         self._client = libsql_client.create_client_sync(
             url=url,
-            auth_token=TURSO_AUTH_TOKEN,
+            auth_token=auth_token,
         )
+        with _open_connections_lock:
+            _open_connections.add(self)
 
     def cursor(self) -> _TursoCursor:
         return _TursoCursor(self._client)
@@ -109,6 +173,8 @@ class _TursoConnection:
         pass
 
     def close(self):
+        with _open_connections_lock:
+            _open_connections.discard(self)
         try:
             self._client.close()
         except Exception:
@@ -133,11 +199,15 @@ def get_connection(local_db_path: str = None) -> Any:
     If TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are set → Turso cloud DB.
     Otherwise → local SQLite at *local_db_path* (for development).
 
+    NOTE: *local_db_path* is the local-fallback location, NOT an override —
+    when Turso is configured every caller shares the one cloud database, and
+    the path is ignored. Set QUASAR_FORCE_LOCAL_DB=1 to pin the SQLite branch.
+
     The returned object quacks like a sqlite3.Connection: it has
     .cursor(), .execute(), .commit(), .close(), and works as a
     context manager.
     """
-    if _USE_TURSO:
+    if _use_turso():
         return _TursoConnection()
     else:
         # Local SQLite fallback for development
@@ -151,4 +221,4 @@ def get_connection(local_db_path: str = None) -> Any:
 
 def is_using_turso() -> bool:
     """Return True when running against the cloud Turso database."""
-    return _USE_TURSO
+    return _use_turso()

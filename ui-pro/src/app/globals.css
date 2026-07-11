@@ -9,6 +9,13 @@ html {
   --q-sidebar-width: 280px;
   --q-sidebar-rail-width: 68px;
   /*
+   * The mobile navigation drawer. Deliberately NOT --q-sidebar-width: that
+   * token also sizes the push panel on /help, /spectral-lines and /workbench,
+   * which have no mobile overlay branch. 318px is the design width; the vw cap
+   * keeps a tappable strip of scrim on a 375px phone.
+   */
+  --q-drawer-width: min(318px, 85vw);
+  /*
    * Keep the chat responsive to the available main-pane width. Fixed rem
    * caps left very large empty margins on wide displays and made the
    * composer appear disconnected from the conversation.
@@ -89,6 +96,10 @@ html {
   --q-glass-surface: rgba(18, 12, 32, 0.62);
   --q-glass-strong: rgba(18, 12, 32, 0.82);
   --q-glass-sidebar: rgba(10, 7, 20, 0.55);
+  --q-glass-drawer: rgba(12, 8, 22, 0.88);
+  --q-drawer-border: rgba(255, 255, 255, 0.12);
+  --q-drawer-shadow: 24px 0 60px rgba(0, 0, 0, 0.55);
+  --q-drawer-scrim: rgba(4, 2, 10, 0.55);
   --q-glass-popover: rgba(10, 7, 20, 0.95);
   --q-glass-control: rgba(255, 255, 255, 0.06);
   --q-glass-control-hover: rgba(255, 255, 255, 0.1);
@@ -128,6 +139,10 @@ html {
   --q-glass-surface: rgba(255, 255, 255, 0.72);
   --q-glass-strong: rgba(255, 255, 255, 0.88);
   --q-glass-sidebar: rgba(255, 255, 255, 0.74);
+  --q-glass-drawer: rgba(255, 255, 255, 0.9);
+  --q-drawer-border: rgba(120, 90, 160, 0.18);
+  --q-drawer-shadow: 24px 0 60px rgba(80, 50, 130, 0.22);
+  --q-drawer-scrim: rgba(28, 21, 48, 0.26);
   --q-glass-popover: rgba(255, 255, 255, 0.97);
   --q-glass-control: rgba(255, 255, 255, 0.6);
   --q-glass-control-hover: rgba(255, 255, 255, 0.85);
@@ -210,11 +225,15 @@ html {
   transition: all 0.3s ease;
 }
 
-.glass-card:hover {
-  background: var(--q-glass-strong);
-  border-color: var(--q-glass-hover-border);
-  transform: translateY(-2px);
-  box-shadow: 0 10px 30px -10px var(--q-shadow-glow);
+/* Guarded: on touch, :hover latches after a tap, so an unguarded lift leaves the
+   tapped card floating until the user taps elsewhere. */
+@media (hover: hover) {
+  .glass-card:hover {
+    background: var(--q-glass-strong);
+    border-color: var(--q-glass-hover-border);
+    transform: translateY(-2px);
+    box-shadow: 0 10px 30px -10px var(--q-shadow-glow);
+  }
 }
 
 .logo-glow {
@@ -317,6 +336,44 @@ html {
   background-clip: padding-box;
 }
 
+/* Mobile navigation drawer — denser than .glass-sidebar (0.88/0.90 vs 0.55/0.74)
+   because it floats over live content rather than sitting beside it. */
+.glass-drawer {
+  background: var(--q-glass-drawer);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  border-right: 1px solid var(--q-drawer-border);
+  box-shadow: var(--q-drawer-shadow);
+  background-clip: padding-box;
+}
+
+.drawer-scrim {
+  background: var(--q-drawer-scrim);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+/* This project has no tailwindcss-animate, so `animate-in slide-in-from-left`
+   resolves to nothing. These are the real keyframes. */
+@keyframes q-drawer-in {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+@keyframes q-scrim-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.animate-drawer-in {
+  animation: q-drawer-in 0.24s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.animate-scrim-in {
+  animation: q-scrim-in 0.24s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-drawer-in,
+  .animate-scrim-in { animation: none; }
+}
+
 .glass-popover {
   background: var(--q-glass-popover);
   backdrop-filter: blur(24px) saturate(155%);
@@ -398,6 +455,13 @@ html {
 [data-theme="light"] aside {
   background: var(--q-sidebar) !important;
   border-color: var(--q-border) !important;
+}
+
+/* The mobile drawer floats over live content, so it keeps its translucency
+   instead of collapsing to the opaque --q-sidebar fill the rule above forces
+   on the docked sidebar. Higher specificity, so it wins the !important tie. */
+[data-theme="light"] aside.glass-drawer {
+  background: var(--q-glass-drawer) !important;
 }
 
 /* ── All hardcoded bg-slate-800, bg-slate-700, bg-slate-900 surfaces ── */

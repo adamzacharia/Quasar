@@ -16,6 +16,7 @@ gets cascading recovery instead of ad-hoc retry logic.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 from enum import Enum
@@ -102,14 +103,26 @@ class RecoveryEngine:
 
         for attempt in range(self.max_retries):
             try:
-                # executor_fn might be sync (from Conductor tool_executor)
+                # executor_fn may be a coroutine (preferred: the full node
+                # executor, called with the node) or sync (legacy: called with
+                # description/context).
                 if asyncio.iscoroutinefunction(executor_fn):
-                    result = await executor_fn(task_node)
+                    coro = executor_fn(task_node)
                 else:
                     loop = asyncio.get_event_loop()
-                    result = await loop.run_in_executor(
+                    coro = loop.run_in_executor(
                         None, executor_fn, task_node.description, ""
                     )
+
+                # Enforce the task's SLA on the attempt so the TimeoutError
+                # handler below (RETRY → DECOMPOSE) can actually fire — without
+                # this wrapper nothing imposed a deadline and that branch was
+                # dead code. (C7)
+                sla = getattr(task_node, "sla_seconds", None)
+                if isinstance(sla, (int, float)) and sla > 0:
+                    result = await asyncio.wait_for(coro, timeout=sla)
+                else:
+                    result = await coro
 
                 # Check for soft failures (result with embedded error)
                 soft_err = self._check_soft_failure(result)
@@ -325,8 +338,17 @@ class RecoveryEngine:
                 logger.info("DECOMPOSE sub-task %d/%d: %s", i + 1, len(sub_tasks), sub_desc[:60])
                 try:
                     if asyncio.iscoroutinefunction(executor_fn):
+                        # executor_fn is the full node executor and takes a
+                        # TaskNode, not (desc, ctx). Run each sub-piece through a
+                        # shallow-cloned node with the sub-description so routing/
+                        # SLA metadata is preserved. (C7 — DECOMPOSE arity fix)
+                        sub_node = copy.copy(task_node)
+                        try:
+                            sub_node.description = sub_desc
+                        except Exception:
+                            sub_node = task_node
                         result = await asyncio.wait_for(
-                            executor_fn(sub_desc, ""),
+                            executor_fn(sub_node),
                             timeout=task_node.sla_seconds,
                         )
                     else:

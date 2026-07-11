@@ -4,7 +4,7 @@
 
 Quasar is a full stack research application built around ALMA archive workflows. The active runtime system combines a Next.js frontend, a FastAPI streaming backend, and a Python agent runtime that can search the archive, retrieve documentation and literature context, inspect remote FITS headers, and generate workflow guidance such as CASA scripts. The default backbone model is `gpt-4.1`.
 
-This document describes the current implementation. It does not treat `ARCHITECTURE.md` as the source of truth. Where the repository contains older, parallel, or experimental paths, this file identifies the active runtime path and calls out important gaps.
+This document describes the current implementation and is the runtime source of truth. (The former aspirational `ARCHITECTURE.md` has been removed because it drifted from the code; the tool registry is now documented by the auto-generated `docs/TOOLS.md`.) Where the repository contains older, parallel, or experimental paths, this file identifies the active runtime path and calls out important gaps.
 
 ## 2. Deployment Surfaces
 
@@ -422,7 +422,7 @@ The API layer stores document metadata in SQL and indexes document content into 
 
 The following points are important for operating or extending the current system:
 
-- `ARCHITECTURE.md` should not be treated as the current source of truth.
+- The stale `ARCHITECTURE.md` design doc has been removed; `docs/TOOLS.md` (auto-generated from the live registry) is the source of truth for the tool set.
 - The active user-facing runtime is the Next.js frontend plus FastAPI backend under `ui-pro/`.
 - The backend import path is `api.main:app` from the `ui-pro` directory. If started from the repository root, `uvicorn --app-dir ui-pro api.main:app --reload --port 8000` should be used.
 - The default LLM model is `gpt-4.1` (configured via `DEFAULT_LLM_MODEL` in `.env`).

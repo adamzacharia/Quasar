@@ -76,7 +76,9 @@ scratch_*.py
 # ============================================
 # Generated/runtime artifacts
 # ============================================
-/Benchmark/
+# Benchmark run OUTPUTS only. The harness SOURCE (runners, datasets, question
+# sets, rubrics) is tracked so CI can run the DataLabBench scorer self-test and
+# the golden benchmark tests (tests/unit/test_benchmark_golden.py).
 /Benchmark/results/
 /Benchmark/datalabbench/results/
 /data/dag_cache.json

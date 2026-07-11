@@ -6,12 +6,14 @@ Uses Turso (cloud) when TURSO_DATABASE_URL is set, else local SQLite.
 """
 
 import hashlib
+import hmac
 import os
 import uuid
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
 from services.db import get_connection, is_using_turso
+from services.login_rate_limit import LoginRateLimiter, get_default_login_rate_limiter
 import jwt
 
 _LOCAL_JWT_SECRET = "quasar-local-development-jwt-secret"
@@ -64,6 +66,9 @@ JWT_EXPIRATION_HOURS = 24 * 7  # 1 week
 
 def _default_db_path() -> str:
     """Return a stable DB path relative to the project root (local fallback only)."""
+    override = os.environ.get("QUASAR_USERS_DB_PATH")
+    if override and override.strip():
+        return override.strip()
     root = Path(__file__).resolve().parent.parent
     data_dir = root / "data"
     data_dir.mkdir(exist_ok=True)
@@ -74,14 +79,29 @@ def _truthy(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _coerce_bytes(value) -> bytes:
+    """Normalise a DB-returned value to ``bytes`` for constant-time comparison.
+
+    SQLite returns BLOBs as ``bytes``; the Turso wrapper may return
+    ``memoryview``/``bytearray``. ``hmac.compare_digest`` requires matching
+    bytes-like operands, so coerce defensively.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return bytes(value)
+
+
 class AuthService:
     """
     Authentication Service
     Handles user registration and login using SQLite and PBKDF2 hashing.
     """
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, rate_limiter: LoginRateLimiter = None):
         self._local_db_path = db_path or _default_db_path()
+        self._rate_limiter = rate_limiter or get_default_login_rate_limiter()
         self._init_db()
         self._seed_local_test_user_if_enabled()
 
@@ -126,6 +146,12 @@ class AuthService:
             except Exception:
                 pass
 
+            # S3: per-user admin role (replaces the hard-coded admin email).
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
+            except Exception:
+                pass
+
             conn.commit()
 
     def _seed_local_test_user_if_enabled(self) -> None:
@@ -146,6 +172,9 @@ class AuthService:
         email = os.environ.get("QUASAR_LOCAL_TEST_EMAIL", username).strip()
         display_name = os.environ.get("QUASAR_LOCAL_TEST_DISPLAY_NAME", "1").strip()
         password = os.environ.get("QUASAR_LOCAL_TEST_PASSWORD", "1")
+        # The disposable local login carries admin via the DB role column (S3),
+        # replacing the removed hard-coded '1@1' admin email.
+        role = os.environ.get("QUASAR_LOCAL_TEST_ROLE", "admin").strip() or "admin"
 
         if not username or not password:
             raise RuntimeError("Local test username and password cannot be empty.")
@@ -161,15 +190,15 @@ class AuthService:
                 cursor.execute(
                     """UPDATE users
                        SET password_hash = ?, salt = ?, email = ?, display_name = ?,
-                           auth_provider = 'local'
+                           auth_provider = 'local', role = ?
                        WHERE username = ?""",
-                    (pwd_hash, salt, email, display_name, username),
+                    (pwd_hash, salt, email, display_name, role, username),
                 )
             else:
                 cursor.execute(
                     """INSERT INTO users
-                       (id, username, password_hash, salt, created_at, email, display_name, auth_provider)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (id, username, password_hash, salt, created_at, email, display_name, auth_provider, role)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(uuid.uuid4()),
                         username,
@@ -179,6 +208,7 @@ class AuthService:
                         email,
                         display_name,
                         "local",
+                        role,
                     ),
                 )
             conn.commit()
@@ -236,6 +266,22 @@ class AuthService:
                 if cursor.fetchone():
                     return False, "Username already exists", ""
 
+                # SECURITY (CX-01): email must be unique. Admin is granted by
+                # email — via the ADMIN_EMAILS allowlist AND the DB role lookup,
+                # both of which match on the email column. Without this check a
+                # new account could register under an existing admin's email and
+                # inherit that admin's privileges (its JWT carries that email).
+                # Matched case-insensitively against BOTH columns because for
+                # local/Google users the username IS the email.
+                normalized_email = email.strip().lower()
+                cursor.execute(
+                    "SELECT id FROM users "
+                    "WHERE lower(email) = ? OR lower(username) = ? LIMIT 1",
+                    (normalized_email, normalized_email),
+                )
+                if cursor.fetchone():
+                    return False, "Email already registered", ""
+
                 # Create user
                 user_id = str(uuid.uuid4())
                 pwd_hash, salt = self._hash_password(password)
@@ -252,8 +298,35 @@ class AuthService:
         except Exception as e:
             return False, f"Registration failed: {str(e)}", ""
 
+    @staticmethod
+    def _rate_key(username: str) -> str:
+        """Limiter key = the EXACT identity the DB authenticates.
+
+        SECURITY (CX-03): login resolves the account with ``WHERE username = ?``
+        (exact match), so the throttle bucket must key on that same exact string.
+        Normalizing (``strip().lower()``) would merge case/whitespace-variant
+        accounts into one bucket, letting the owner of an alias account
+        (``Admin@x.org``) reset a victim's (``admin@x.org``) throttle by logging
+        into their own alias.
+        """
+        return username or ""
+
     def login_user(self, username: str, password: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str], str]:
         """Login a user. Returns (success, user_id, email, display_name, message)"""
+        rate_key = self._rate_key(username)
+
+        # S6: basic rate limiting — block online password guessing after too
+        # many failed attempts for this identity.
+        retry_after = self._rate_limiter.seconds_until_unblocked(rate_key)
+        if retry_after is not None:
+            return (
+                False,
+                None,
+                None,
+                None,
+                f"Too many failed login attempts. Please try again in {int(retry_after) + 1} seconds.",
+            )
+
         try:
             with self._get_conn() as conn:
                 cursor = conn.cursor()
@@ -262,24 +335,89 @@ class AuthService:
                 result = cursor.fetchone()
 
             if not result:
+                self._rate_limiter.record_failure(rate_key)
                 return False, None, None, None, "Invalid username or password"
 
             user_id, stored_hash, salt, auth_provider, email, display_name = result
-            
+
             if auth_provider == 'google':
                 return False, None, None, None, "Please login with Google"
 
-            # Verify password
-            pwd_hash, _ = self._hash_password(password, salt)
+            # Verify password with a constant-time comparison (S6).
+            pwd_hash, _ = self._hash_password(password, _coerce_bytes(salt) if salt is not None else None)
 
-            if pwd_hash == stored_hash:
+            if stored_hash is not None and hmac.compare_digest(_coerce_bytes(pwd_hash), _coerce_bytes(stored_hash)):
+                self._rate_limiter.reset(rate_key)
                 return True, user_id, email, display_name, "Login successful"
             else:
+                self._rate_limiter.record_failure(rate_key)
                 return False, None, None, None, "Invalid username or password"
 
         except Exception as e:
             return False, None, None, None, f"Login failed: {str(e)}"
-            
+
+    def login_retry_after(self, username: str) -> Optional[float]:
+        """Seconds until this identity may attempt login again, or None.
+
+        Lets the API layer answer an already-locked identity with HTTP 429 +
+        Retry-After BEFORE hashing anything (S6). The attempt that trips the
+        limiter still flows through login_user and returns a normal failure.
+        """
+        key = self._rate_key(username)
+        if not key:
+            return None
+        return self._rate_limiter.seconds_until_unblocked(key)
+
+    def get_user_role(self, identity: str) -> Optional[str]:
+        """Return the ``role`` for a user matched by username or email."""
+        key = (identity or "").strip().lower()
+        if not key:
+            return None
+        try:
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT role FROM users WHERE lower(username) = ? OR lower(email) = ? LIMIT 1",
+                    (key, key),
+                )
+                row = cursor.fetchone()
+            if not row:
+                return None
+            return row[0]
+        except Exception:
+            return None
+
+    def set_user_role(self, identity: str, role: str) -> bool:
+        """Set a user's ``role`` (e.g. 'admin'/'user'). Returns True on match.
+
+        Grants admin without a hard-coded email or a redeploy (S3). Callers
+        that gate on admin should invalidate the admin-role cache afterwards
+        via ``services.admin_access.clear_admin_role_cache()``.
+        """
+        key = (identity or "").strip().lower()
+        if not key:
+            return False
+        try:
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE users SET role = ? WHERE lower(username) = ? OR lower(email) = ?",
+                    (role, key, key),
+                )
+                conn.commit()
+                changed = getattr(cursor, "rowcount", 0)
+            # Invalidate the admin-role cache so a grant/revoke takes effect
+            # immediately (the cache is keyed by username OR email; clear all).
+            try:
+                from services.admin_access import clear_admin_role_cache
+
+                clear_admin_role_cache()
+            except Exception:
+                pass
+            return bool(changed) if changed and changed > 0 else self.get_user_role(key) == role
+        except Exception:
+            return False
+
     def register_or_login_google_user(self, email: str, display_name: str, picture_url: str = None) -> Tuple[bool, str, str, str]:
         """Register or login a user via Google. Returns (success, user_id, message, token)"""
         username = email # Use email as username for Google auth

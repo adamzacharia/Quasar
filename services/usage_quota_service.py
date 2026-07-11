@@ -51,36 +51,38 @@ class UsageQuotaService:
 
     def _init_db(self) -> None:
         conn = self._conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS llm_usage_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                key_source TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS llm_usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    key_source TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_user_provider_source
-            ON llm_usage_events(user_id, provider, key_source)
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_user_provider_source_created
-            ON llm_usage_events(user_id, provider, key_source, created_at)
-            """
-        )
-        conn.commit()
-        conn.close()
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_user_provider_source
+                ON llm_usage_events(user_id, provider, key_source)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_user_provider_source_created
+                ON llm_usage_events(user_id, provider, key_source, created_at)
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     @staticmethod
     def normalize_provider(provider: str) -> str:
@@ -111,20 +113,22 @@ class UsageQuotaService:
         provider = self.normalize_provider(provider)
         key_source = self.normalize_key_source(key_source)
         conn = self._conn()
-        params = [user_id, provider, key_source]
-        since_clause = ""
-        if since is not None:
-            since_clause = " AND created_at >= ?"
-            params.append(since.astimezone(timezone.utc).isoformat())
-        row = conn.execute(
-            f"""
-            SELECT COALESCE(SUM(total_tokens), 0)
-            FROM llm_usage_events
-            WHERE user_id = ? AND provider = ? AND key_source = ?{since_clause}
-            """,
-            tuple(params),
-        ).fetchone()
-        conn.close()
+        try:
+            params = [user_id, provider, key_source]
+            since_clause = ""
+            if since is not None:
+                since_clause = " AND created_at >= ?"
+                params.append(since.astimezone(timezone.utc).isoformat())
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(total_tokens), 0)
+                FROM llm_usage_events
+                WHERE user_id = ? AND provider = ? AND key_source = ?{since_clause}
+                """,
+                tuple(params),
+            ).fetchone()
+        finally:
+            conn.close()
         return int(row[0] or 0) if row else 0
 
     def ensure_allowed(
@@ -180,25 +184,27 @@ class UsageQuotaService:
         if total <= 0:
             return
         conn = self._conn()
-        conn.execute(
-            """
-            INSERT INTO llm_usage_events
-            (user_id, provider, model, key_source, input_tokens, output_tokens, total_tokens, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.user_id,
-                provider,
-                record.model or "",
-                key_source,
-                max(0, int(record.input_tokens or 0)),
-                max(0, int(record.output_tokens or 0)),
-                total,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT INTO llm_usage_events
+                (user_id, provider, model, key_source, input_tokens, output_tokens, total_tokens, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.user_id,
+                    provider,
+                    record.model or "",
+                    key_source,
+                    max(0, int(record.input_tokens or 0)),
+                    max(0, int(record.output_tokens or 0)),
+                    total,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def usage_summary(
         self,

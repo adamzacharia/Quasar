@@ -356,7 +356,7 @@ export default function WorkbenchPage() {
     const sessionId = String(params.sessionId || "");
     const sidebarOpen = useChatStore((s) => s.sidebarOpen);
     const toggleSidebar = useChatStore((s) => s.toggleSidebar);
-    const { token, isAuthenticated, isInitialized, openAuthModal } = useAuthStore();
+    const { isAuthenticated, isInitialized, openAuthModal } = useAuthStore();
 
     const [mounted, setMounted] = useState(false);
     const [metadata, setMetadata] = useState<WorkbenchMetadata | null>(null);
@@ -525,28 +525,28 @@ export default function WorkbenchPage() {
     }, []);
 
     const startOperationJob = useCallback(async (operation: string, payload: Record<string, unknown>, loadingKey: string) => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setActionLoading(loadingKey);
         setError(null);
         try {
-            const response = await startWorkbenchJob(sessionId, { operation, payload }, token);
+            const response = await startWorkbenchJob(sessionId, { operation, payload });
             setJobs(response.jobs?.length ? response.jobs : [response.job]);
             setActiveJobId(response.job.job_id);
         } catch (jobError) {
             setActionLoading(null);
             setError(jobError instanceof Error ? jobError.message : "Could not start workbench job.");
         }
-    }, [sessionId, token]);
+    }, [sessionId, isAuthenticated]);
 
     const loadWorkbench = useCallback(async () => {
-        if (!token || !sessionId) {
+        if (!isAuthenticated || !sessionId) {
             setLoading(false);
             return;
         }
         setLoading(true);
         setError(null);
         try {
-            const nextMetadata = await getWorkbenchMetadata(sessionId, token);
+            const nextMetadata = await getWorkbenchMetadata(sessionId);
             const nextMetadataRecord = nextMetadata.metadata ?? {};
             const nextRestFrequency = metadataNumber(nextMetadataRecord, ["rest_freq_ghz", "restFreqGhz"]);
             const nextShape = metadataArray(nextMetadataRecord, ["shape", "raw_shape", "cube_shape"]);
@@ -582,7 +582,7 @@ export default function WorkbenchPage() {
             setPvY2(String(asNumber(nextPvEnd.y) ?? Math.round(nextHeight * 0.5)));
             setPvWidth(asNumber(nextPvState.width_pixels) ?? 3);
             const [nextExports, nextPresets] = await Promise.all([
-                getWorkbenchExports(sessionId, EXPORT_FORMATS, token),
+                getWorkbenchExports(sessionId, EXPORT_FORMATS),
                 getWorkbenchLinePresets(),
             ]);
             setExportsData(nextExports);
@@ -592,7 +592,7 @@ export default function WorkbenchPage() {
         } finally {
             setLoading(false);
         }
-    }, [sessionId, token]);
+    }, [sessionId, isAuthenticated]);
 
     useEffect(() => {
         setMounted(true);
@@ -609,13 +609,13 @@ export default function WorkbenchPage() {
     }, [isAuthenticated, isInitialized, loadWorkbench, mounted, openAuthModal]);
 
     useEffect(() => {
-        if (!token || !sessionId || !activeJobId) return;
+        if (!isAuthenticated || !sessionId || !activeJobId) return;
         let stopped = false;
         let timer: number | null = null;
 
         const pollJob = async () => {
             try {
-                const response = await getWorkbenchJob(sessionId, activeJobId, token);
+                const response = await getWorkbenchJob(sessionId, activeJobId);
                 if (stopped) return;
                 const nextJob = response.job;
                 setJobs(response.jobs?.length ? response.jobs : [nextJob]);
@@ -625,8 +625,8 @@ export default function WorkbenchPage() {
                     setCancelingJob(false);
                     try {
                         const [nextMetadata, nextExports] = await Promise.all([
-                            getWorkbenchMetadata(sessionId, token),
-                            getWorkbenchExports(sessionId, EXPORT_FORMATS, token),
+                            getWorkbenchMetadata(sessionId),
+                            getWorkbenchExports(sessionId, EXPORT_FORMATS),
                         ]);
                         if (!stopped) {
                             setMetadata(nextMetadata);
@@ -653,7 +653,7 @@ export default function WorkbenchPage() {
             stopped = true;
             if (timer) window.clearTimeout(timer);
         };
-    }, [activeJobId, applyJobResult, sessionId, token]);
+    }, [activeJobId, applyJobResult, sessionId, isAuthenticated]);
 
     const pointFromPointer = useCallback((event: PointerEvent<HTMLDivElement>): ImagePoint | null => {
         const rect = event.currentTarget.getBoundingClientRect();
@@ -757,7 +757,7 @@ export default function WorkbenchPage() {
     }
 
     const findLines = async () => {
-        if (!token) return;
+        if (!isAuthenticated) return;
         setActionLoading("lines");
         setError(null);
         try {
@@ -767,7 +767,7 @@ export default function WorkbenchPage() {
                 redshift,
                 tolerance_ghz: tolerance,
                 top_n: 10,
-            }, token);
+            });
             setLineData(nextLines);
             if (nextLines.presets?.length) setLinePresets(nextLines.presets);
             if (nextLines.query_observed_frequency_ghz) setFrequency(String(nextLines.query_observed_frequency_ghz));
@@ -800,11 +800,11 @@ export default function WorkbenchPage() {
     };
 
     const cancelActiveJob = async () => {
-        if (!token || !runningJob) return;
+        if (!isAuthenticated || !runningJob) return;
         setCancelingJob(true);
         setError(null);
         try {
-            const response = await cancelWorkbenchJob(sessionId, runningJob.job_id, token);
+            const response = await cancelWorkbenchJob(sessionId, runningJob.job_id);
             setJobs(response.jobs?.length ? response.jobs : [response.job]);
             setActiveJobId(response.job.job_id);
         } catch (cancelError) {
@@ -814,7 +814,10 @@ export default function WorkbenchPage() {
         }
     };
 
-    if (!mounted) return null;
+    // Wait for the httpOnly-cookie session to be verified before deciding
+    // signed-in vs signed-out — otherwise an authenticated reload flashes the
+    // sign-in gate during the /api/auth/me round-trip (matches app/page.tsx).
+    if (!mounted || !isInitialized) return null;
 
     if (!isAuthenticated) {
         return (

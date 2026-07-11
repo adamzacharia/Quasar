@@ -104,6 +104,14 @@ class IssueReportService:
 
     def _init_db(self) -> None:
         conn = self._conn()
+        try:
+            self._create_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _create_schema(conn) -> None:
         cur = conn.cursor()
         cur.execute(
             """
@@ -186,8 +194,6 @@ class IssueReportService:
             ON issue_reports(provider, model, created_at DESC)
             """
         )
-        conn.commit()
-        conn.close()
 
     def start_run(
         self,
@@ -203,30 +209,32 @@ class IssueReportService:
     ) -> Dict[str, Any]:
         now = _utc_now()
         conn = self._conn()
-        conn.execute(
-            """
-            INSERT INTO chat_runs (
-                id, user_id, conversation_id, trace_id, model, provider,
-                key_source, status, started_at, updated_at, tools_called, client_ip
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                user_id,
-                conversation_id or "",
-                trace_id or "",
-                model,
-                provider,
-                key_source or "platform",
-                "started",
-                now,
-                now,
-                "[]",
-                client_ip or "",
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT INTO chat_runs (
+                    id, user_id, conversation_id, trace_id, model, provider,
+                    key_source, status, started_at, updated_at, tools_called, client_ip
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    user_id,
+                    conversation_id or "",
+                    trace_id or "",
+                    model,
+                    provider,
+                    key_source or "platform",
+                    "started",
+                    now,
+                    now,
+                    "[]",
+                    client_ip or "",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return self.get_run(run_id, user_id=user_id) or {}
 
     def update_run_activity(
@@ -246,12 +254,14 @@ class IssueReportService:
             params.append(json.dumps(list(dict.fromkeys(tools_called))))
         params.append(run_id)
         conn = self._conn()
-        conn.execute(
-            f"UPDATE chat_runs SET {', '.join(assignments)} WHERE id = ?",
-            tuple(params),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                f"UPDATE chat_runs SET {', '.join(assignments)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def finalize_run(
         self,
@@ -270,56 +280,60 @@ class IssueReportService:
             raise ValueError(f"Unsupported run status: {status}")
         now = _utc_now()
         conn = self._conn()
-        conn.execute(
-            """
-            UPDATE chat_runs
-            SET status = ?, updated_at = ?, completed_at = ?, duration_ms = ?,
-                tools_called = ?, last_status = ?, error_code = ?, error_message = ?,
-                first_token_ms = ?, provider_chunk_count = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                now,
-                now,
-                max(0, int(duration_ms)),
-                json.dumps(list(dict.fromkeys(tools_called or []))),
-                _clean_text(last_status, 500),
-                _clean_text(error_code, 100),
-                _clean_text(error_message),
-                first_token_ms,
-                max(0, int(provider_chunk_count)),
-                run_id,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                UPDATE chat_runs
+                SET status = ?, updated_at = ?, completed_at = ?, duration_ms = ?,
+                    tools_called = ?, last_status = ?, error_code = ?, error_message = ?,
+                    first_token_ms = ?, provider_chunk_count = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    now,
+                    now,
+                    max(0, int(duration_ms)),
+                    json.dumps(list(dict.fromkeys(tools_called or []))),
+                    _clean_text(last_status, 500),
+                    _clean_text(error_code, 100),
+                    _clean_text(error_message),
+                    first_token_ms,
+                    max(0, int(provider_chunk_count)),
+                    run_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_run(self, run_id: str, *, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         conn = self._conn()
-        if user_id is None:
-            row = conn.execute(
-                """
-                SELECT id, user_id, conversation_id, trace_id, model, provider,
-                       key_source, status, started_at, updated_at, completed_at,
-                       duration_ms, tools_called, last_status, error_code,
-                       error_message, client_ip, first_token_ms, provider_chunk_count
-                FROM chat_runs WHERE id = ?
-                """,
-                (run_id,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                """
-                SELECT id, user_id, conversation_id, trace_id, model, provider,
-                       key_source, status, started_at, updated_at, completed_at,
-                       duration_ms, tools_called, last_status, error_code,
-                       error_message, client_ip, first_token_ms, provider_chunk_count
-                FROM chat_runs WHERE id = ? AND user_id = ?
-                """,
-                (run_id, user_id),
-            ).fetchone()
-        conn.close()
+        try:
+            if user_id is None:
+                row = conn.execute(
+                    """
+                    SELECT id, user_id, conversation_id, trace_id, model, provider,
+                           key_source, status, started_at, updated_at, completed_at,
+                           duration_ms, tools_called, last_status, error_code,
+                           error_message, client_ip, first_token_ms, provider_chunk_count
+                    FROM chat_runs WHERE id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT id, user_id, conversation_id, trace_id, model, provider,
+                           key_source, status, started_at, updated_at, completed_at,
+                           duration_ms, tools_called, last_status, error_code,
+                           error_message, client_ip, first_token_ms, provider_chunk_count
+                    FROM chat_runs WHERE id = ? AND user_id = ?
+                    """,
+                    (run_id, user_id),
+                ).fetchone()
+        finally:
+            conn.close()
         if not row:
             return None
         keys = [
@@ -374,38 +388,40 @@ class IssueReportService:
             "client": technical_context or {},
         }
         conn = self._conn()
-        conn.execute(
-            """
-            INSERT INTO issue_reports (
-                id, run_id, user_id, conversation_id, message_id, category,
-                description, include_context, prompt_excerpt, response_excerpt,
-                model, provider, trace_id, technical_context, status,
-                admin_notes, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                report_id,
-                run_id,
-                user_id,
-                run.get("conversation_id") or "",
-                message_id,
-                category,
-                description,
-                1 if include_context else 0,
-                safe_prompt,
-                safe_response,
-                run.get("model") or "",
-                run.get("provider") or "",
-                run.get("trace_id") or "",
-                _clean_text(json.dumps(diagnostics, default=str), 8000),
-                "new",
-                "",
-                now,
-                now,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT INTO issue_reports (
+                    id, run_id, user_id, conversation_id, message_id, category,
+                    description, include_context, prompt_excerpt, response_excerpt,
+                    model, provider, trace_id, technical_context, status,
+                    admin_notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_id,
+                    run_id,
+                    user_id,
+                    run.get("conversation_id") or "",
+                    message_id,
+                    category,
+                    description,
+                    1 if include_context else 0,
+                    safe_prompt,
+                    safe_response,
+                    run.get("model") or "",
+                    run.get("provider") or "",
+                    run.get("trace_id") or "",
+                    _clean_text(json.dumps(diagnostics, default=str), 8000),
+                    "new",
+                    "",
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return self.get_report(report_id) or {}
 
     def get_report(self, report_id: str) -> Optional[Dict[str, Any]]:
@@ -445,20 +461,22 @@ class IssueReportService:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, min(int(limit), 1000)))
         conn = self._conn()
-        rows = conn.execute(
-            f"""
-            SELECT id, run_id, user_id, conversation_id, message_id, category,
-                   description, include_context, prompt_excerpt, response_excerpt,
-                   model, provider, trace_id, technical_context, status,
-                   admin_notes, created_at, updated_at
-            FROM issue_reports
-            {where}
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            tuple(params),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT id, run_id, user_id, conversation_id, message_id, category,
+                       description, include_context, prompt_excerpt, response_excerpt,
+                       model, provider, trace_id, technical_context, status,
+                       admin_notes, created_at, updated_at
+                FROM issue_reports
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        finally:
+            conn.close()
         keys = [
             "id", "run_id", "user_id", "conversation_id", "message_id",
             "category", "description", "include_context", "prompt_excerpt",
@@ -495,12 +513,14 @@ class IssueReportService:
             params.append(_clean_text(admin_notes, 4000))
         params.append(report_id)
         conn = self._conn()
-        cursor = conn.execute(
-            f"UPDATE issue_reports SET {', '.join(assignments)} WHERE id = ?",
-            tuple(params),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            cursor = conn.execute(
+                f"UPDATE issue_reports SET {', '.join(assignments)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         if getattr(cursor, "rowcount", 0) == 0:
             raise LookupError("Issue report not found")
         return self.get_report(report_id) or {}

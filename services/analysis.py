@@ -19,23 +19,26 @@ class RadioAnalysisService:
             pass
 
     def analyze_uv_coverage(self, ms_path: str) -> Dict[str, Any]:
-        """Analyze UV coverage of a measurement set"""
+        """Analyze UV coverage of a measurement set.
+
+        Requires CASA (``casatools``). When CASA is unavailable we return a
+        typed error rather than fabricated UV statistics — inventing baseline
+        lengths, antenna counts, or imaging parameters would be scientifically
+        misleading (a science tool that invents data is worse than one that
+        errors). See docs/v2 C1. (C1)
+        """
         if not self.casa_available:
             return {
-                "status": "analysis_pending",
-                "message": f"UV analysis for {ms_path} requires CASA installation",
-                "mock_results": {
-                    "max_baseline_km": 16.0,
-                    "min_baseline_km": 0.015,
-                    "num_antennas": 50,
-                    "num_baselines": 1225,
-                    "uv_range": "0.015-16 km",
-                    "telescope": "ALMA 12m",
-                    "recommended_imaging": {
-                        "cell_size_arcsec": 0.02,
-                        "image_size_pixels": 4096
-                    }
-                }
+                "status": "error",
+                "success": False,
+                "error": "casa_unavailable",
+                "message": (
+                    f"UV coverage analysis for '{ms_path}' requires CASA "
+                    "(casatools), which is not installed in this environment. "
+                    "No UV statistics (baselines, antennas, imaging parameters) "
+                    "can be computed here. Run this on a CASA-enabled host or "
+                    "install casatools."
+                ),
             }
 
         try:

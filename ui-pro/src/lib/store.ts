@@ -18,6 +18,8 @@ import {
     updateLastAssistantThinking as updateAssistantThinking,
 } from "./chat-message-updaters";
 import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
+import { registerSessionScrubber } from "./auth-store";
+import { currentAuthGeneration } from "./auth-generation";
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
 import { normalizeHipsImageMeta } from "./hips-imagery";
 
@@ -76,10 +78,10 @@ interface ChatStore {
     clearTaskExecution: () => void;
     savePaper: (paper: Paper) => void;
     removePaper: (paperId: string) => void;
-    // Server-sync actions
-    loadConversations: (token: string) => Promise<void>;
-    loadConversationMessages: (conversationId: string, token: string) => Promise<void>;
-    deleteConversation: (conversationId: string, token: string) => Promise<void>;
+    // Server-sync actions (auth rides the httpOnly cookie; token is legacy-optional)
+    loadConversations: (token?: string) => Promise<void>;
+    loadConversationMessages: (conversationId: string, token?: string) => Promise<void>;
+    deleteConversation: (conversationId: string, token?: string) => Promise<void>;
     setActiveConversationId: (id: string | null) => void;
     clearAllConversations: () => void;
 }
@@ -545,7 +547,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     fetchModels: async () => {
         try {
             const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-            const res = await fetch(`${API_BASE}/api/models`);
+            const res = await fetch(`${API_BASE}/api/models`, { credentials: "include" });
             if (res.ok) {
                 const data = await res.json();
                 set({ availableModels: mergeAvailableModels(data.models) });
@@ -639,8 +641,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     // ── Server-sync Actions ─────────────────────────────────────────────────
 
-    loadConversations: async (token: string) => {
+    loadConversations: async (token?: string) => {
+        // CX-07: a slow response from account A must not commit over account B.
+        const generation = currentAuthGeneration();
         const serverConvos = await apiFetchConversations(token);
+        if (generation !== currentAuthGeneration()) return; // account changed mid-flight
         const localConvos = serverConvos.map(serverConvToLocal);
 
         // Preserve locally-cached messages when refreshing the list
@@ -665,7 +670,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         });
     },
 
-    loadConversationMessages: async (conversationId: string, token: string) => {
+    loadConversationMessages: async (conversationId: string, token?: string) => {
         // Always fetch from server — the local cache may have been
         // invalidated by loadConversations refreshing the list.
         const serverMsgs = await apiFetchMessages(conversationId, token);
@@ -688,7 +693,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         });
     },
 
-    deleteConversation: async (conversationId: string, token: string) => {
+    deleteConversation: async (conversationId: string, token?: string) => {
         // Optimistic update: remove from UI immediately for instant feedback
         const prevState = get();
         const removedConv = prevState.conversations.find(c => c.id === conversationId);
@@ -737,3 +742,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         _conversationsLoaded: false,
     }),
 }));
+
+// Scrub per-user chat state on sign-out / account change so the next account on
+// this browser can never see the previous user's conversations or messages
+// (CX-06). Registered imperatively — and synchronously at sign-out — rather than
+// via a React effect, which would race component unmount.
+registerSessionScrubber(() => {
+    useChatStore.getState().clearAllConversations();
+    useChatStore.setState({ _pendingDeletes: new Set() });
+});

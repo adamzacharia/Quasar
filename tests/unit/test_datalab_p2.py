@@ -297,7 +297,8 @@ def test_agent_registers_diagram_tools():
     for name in ("datalab_color_color_diagram", "datalab_color_magnitude_diagram"):
         tool = agent.tool_registry.get_tool(name)
         assert tool is not None
-        # DLB-03 gap fix: the diagram tools must expose point-source/morphology selection.
+        # DLB-03 gap fix: the diagram tools must expose point-source selection
+        # plus an explicit morphology-cut override.
         assert "point_sources" in tool.parameters["properties"]
         assert "morphology" in tool.parameters["properties"]
 
@@ -369,7 +370,21 @@ def test_cmd_point_sources_applies_registry_morphology_cut():
     )
     assert out["success"] is True and out["image_base64"] and out["points"] > 0
     assert "class_star > 0.5" in client.sql[0]  # the cut is in the executed SQL, not post-hoc
-    assert out["morphology"] == {"column": "class_star", "op": ">", "value": 0.5}
+    assert out["point_sources"] is True
+
+
+def test_cmd_explicit_value_cut_lands_in_sql():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _FakeNSCDiagramClient()
+    out = orch.color_magnitude_diagram(
+        "nsc_dr2", "object", 260.06, 57.92, 0.4,
+        value_cuts=[{"column": "class_star", "op": ">=", "value": 0.9}],
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and "class_star >= 0.9" in client.sql[0]
 
 
 def test_cmd_explicit_morphology_overrides_point_sources():
@@ -377,13 +392,39 @@ def test_cmd_explicit_morphology_overrides_point_sources():
     from services.datalab_result_store import DatalabResultStore
     from tests.unit.test_datalab_p1 import _MemoryPlottingService
     client = _FakeNSCDiagramClient()
+    cut = {"column": "class_star", "op": ">=", "value": 0.9}
     out = orch.color_magnitude_diagram(
-        "nsc_dr2", "object", 260.06, 57.92, 0.4, point_sources=True,
-        morphology={"column": "class_star", "op": ">=", "value": 0.9},
+        "nsc_dr2", "object", 260.06, 57.92, 0.4, point_sources=True, morphology=cut,
         client=client, result_store=DatalabResultStore(enable_disk_cache=False),
         plotting_service=_MemoryPlottingService(),
     )
-    assert out["success"] is True and "class_star >= 0.9" in client.sql[0]
+    assert out["success"] is True
+    # The explicit cut lands in the executed SQL; the registry star cut does NOT.
+    assert "class_star >= 0.9" in client.sql[0]
+    assert "class_star > 0.5" not in client.sql[0]
+    # The resolved cut is surfaced verbatim; point_sources reports the registry
+    # cut was NOT the one applied.
+    assert out["morphology"] == cut
+    assert out["point_sources"] is False
+
+
+def test_ccd_explicit_morphology_skips_star_galaxy_split():
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _RecordingDiagramClient()
+    out = orch.color_color_diagram(
+        "des_dr1", "main", 30.0, -50.0, 0.5,
+        morphology={"column": "spread_model_r", "op": ">", "value": 0.005},
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True and "spread_model_r > 0.005" in client.sql[0]
+    # A morphology-selected sample is one population — no stars/galaxies auto-split.
+    assert out["split_col"] is None
+    assert out["point_sources"] is False
+    assert out["morphology"] == {"column": "spread_model_r", "op": ">", "value": 0.005}
+    assert [p["population"] for p in out["populations"]] == ["selected"]
 
 
 def test_cmd_point_sources_without_registered_cut_notes_and_runs():
@@ -396,8 +437,8 @@ def test_cmd_point_sources_without_registered_cut_notes_and_runs():
         client=client, result_store=DatalabResultStore(enable_disk_cache=False),
         plotting_service=_MemoryPlottingService(),
     )
-    assert out["success"] is True and out["morphology"] is None
-    assert any("no star/galaxy morphology cut" in n for n in out["notes"])
+    assert out["success"] is True and out["point_sources"] is False
+    assert any("no registered star/galaxy separator" in w for w in out["warnings"])
     assert "class_star" not in client.sql[0]
 
 
@@ -414,4 +455,5 @@ def test_ccd_point_sources_applies_cut_and_skips_star_galaxy_split():
     assert out["success"] is True and "spread_model_r BETWEEN -0.005 AND 0.005" in client.sql[0]
     # The sample is already stars-only, so there is no stars/galaxies auto-split.
     assert out["split_col"] is None
-    assert [p["population"] for p in out["populations"]] == ["all"]
+    assert out["point_sources"] is True
+    assert [p["population"] for p in out["populations"]] == ["point sources"]

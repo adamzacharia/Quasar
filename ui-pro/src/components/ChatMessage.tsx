@@ -87,12 +87,10 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
         setFeedback(newFeedback);
         if (!newFeedback) return; // toggled off — no API call
         try {
-            const token = useAuthStore.getState().token;
-            await fetch(`${API_BASE}/api/feedback`, {
+            await fetch(`${API_BASE}/api/feedback`, { credentials: "include",
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
                 body: JSON.stringify({
                     message_id: message.id,
@@ -114,12 +112,10 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
         setReportState("sending");
         setReportError("");
         try {
-            const token = useAuthStore.getState().token;
-            const response = await fetch(`${API_BASE}/api/issue-reports`, {
+            const response = await fetch(`${API_BASE}/api/issue-reports`, { credentials: "include",
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
                 body: JSON.stringify({
                     run_id: message.runMeta.run_id,

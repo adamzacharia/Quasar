@@ -378,9 +378,13 @@ function SavedPapersContent() {
 interface SidebarProps {
     collapsed?: boolean;
     onToggle?: () => void;
+    /** "drawer" = the phone slide-over (own width, close button, search field). */
+    variant?: "panel" | "drawer";
+    /** Dismisses the drawer. Also fired after any navigation so the panel gets out of the way. */
+    onClose?: () => void;
 }
 
-export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
+export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClose }: SidebarProps) {
     const {
         conversations, activeConversationId, setActiveConversation,
         createNewConversation, selectedModel, availableModels, setSelectedModel,
@@ -388,24 +392,27 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
         deleteConversation, clearAllConversations,
     } = useChatStore();
 
-    const { user, logout, isAuthenticated, openAuthModal, token } = useAuthStore();
+    const { user, logout, isAuthenticated, openAuthModal } = useAuthStore();
     const pathname = usePathname();
     const router = useRouter();
 
     // Fetch model list from backend on mount
     useEffect(() => { fetchModels(); }, [fetchModels]);
 
-    // Load conversations from server when authenticated
+    // Load conversations from server when authenticated (auth rides the cookie)
     useEffect(() => {
-        if (isAuthenticated && token) {
-            loadConversations(token);
+        if (isAuthenticated) {
+            loadConversations();
         } else {
             clearAllConversations();
         }
-    }, [isAuthenticated, token, loadConversations, clearAllConversations]);
+    }, [isAuthenticated, loadConversations, clearAllConversations]);
 
     const [activePanel, setActivePanel] = useState<"papers" | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [query, setQuery] = useState("");
+
+    const isDrawer = variant === "drawer";
 
     const togglePanel = (panel: "papers") => {
         setActivePanel((prev) => (prev === panel ? null : panel));
@@ -415,15 +422,16 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
         setActiveConversation(convId);
         setActivePanel(null);
         // Load messages from server if not already loaded
-        if (token) {
-            loadConversationMessages(convId, token);
+        if (isAuthenticated) {
+            loadConversationMessages(convId);
         }
+        onClose?.();
     };
 
     const handleDeleteConversation = (e: React.MouseEvent, convId: string) => {
         e.stopPropagation();
-        if (token) {
-            deleteConversation(convId, token);
+        if (isAuthenticated) {
+            deleteConversation(convId);
         }
     };
 
@@ -433,7 +441,12 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
         if (pathname !== "/") {
             router.push("/");
         }
+        onClose?.();
     };
+
+    const visibleConversations = query.trim()
+        ? conversations.filter((c) => c.title.toLowerCase().includes(query.trim().toLowerCase()))
+        : conversations;
 
     // Get user initials from display name, or fallback to username initials
     const initials = user?.display_name
@@ -509,41 +522,83 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
         );
     }
     return (
-        <aside className="relative w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 flex flex-col h-full shrink-0 overflow-hidden">
+        <aside className={`relative flex flex-col h-full overflow-hidden ${isDrawer
+            ? "w-full glass-drawer"
+            : "w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 shrink-0"}`}>
             {/* Collapse is handled by the single toggle in the chat header (ChatArea)
-                — no duplicate button here. */}
+                — no duplicate button here. The drawer gets its own close button,
+                since on a phone there is no chat header behind it to reach. */}
             {/* Logo */}
-            <Link href="/" className="p-6 flex items-center gap-3">
-                <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
-                <div className="flex flex-col">
-                    <h1 className="text-lg font-bold tracking-tight text-white">QUASAR</h1>
-                    <span className="text-xs text-slate-400 font-medium">Research Assistant</span>
+            {isDrawer ? (
+                <div className="flex items-center gap-[11px] px-4 py-3">
+                    <img src="/quasar_logo.png" alt="" className="size-[38px] shrink-0 object-contain" />
+                    <Link href="/" onClick={onClose} className="flex flex-1 flex-col min-w-0">
+                        <h1 className="text-[15.5px] font-bold tracking-[-0.01em]" style={{ color: "var(--q-text)" }}>QUASAR</h1>
+                        <span className="text-[10.5px]" style={{ color: "var(--q-text-secondary)" }}>Research Assistant</span>
+                    </Link>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        aria-label="Close navigation"
+                        className="glass-control flex size-[32px] shrink-0 items-center justify-center rounded-full"
+                        style={{ color: "var(--q-text-secondary)" }}
+                    >
+                        <X className="size-[13px]" strokeWidth={1.9} />
+                    </button>
                 </div>
-            </Link>
+            ) : (
+                <Link href="/" className="p-6 flex items-center gap-3">
+                    <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
+                    <div className="flex flex-col">
+                        <h1 className="text-lg font-bold tracking-tight text-white">QUASAR</h1>
+                        <span className="text-xs text-slate-400 font-medium">Research Assistant</span>
+                    </div>
+                </Link>
+            )}
 
             {/* New Chat */}
-            <div className="px-4 mb-6">
+            <div className={isDrawer ? "px-3.5 mb-2.5" : "px-4 mb-6"}>
                 <button onClick={handleNewChat}
-                    className="btn-new-chat w-full flex items-center justify-center gap-2 font-semibold py-3 px-4 rounded-xl group">
-                    <Plus className="w-5 h-5 transition-transform group-hover:rotate-90" />
+                    className={`w-full flex items-center justify-center gap-2 font-semibold px-4 group ${isDrawer
+                        ? "btn-accent py-2.5 rounded-[13px] text-[13.5px] shadow-[0_10px_24px_rgba(147,51,234,0.45)]"
+                        : "btn-new-chat py-3 rounded-xl"}`}>
+                    <Plus className={`${isDrawer ? "size-[17px]" : "w-5 h-5"} transition-transform group-hover:rotate-90`} />
                     <span>New Chat</span>
                 </button>
             </div>
 
-            <div className="px-4 mb-4">
-                <Link href="/spectral-lines"
-                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors text-sm ${pathname === "/spectral-lines" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                    <Waves className="w-4 h-4" />
+            {/* Conversation filter — drawer only, where the recents list is the
+                primary way back into a session. */}
+            {isDrawer && (
+                <div className="px-3.5 mb-2.5">
+                    <label className="glass-control flex items-center gap-2.5 rounded-[11px] px-3 py-2">
+                        <Search className="size-[14px] shrink-0" style={{ color: "var(--q-text-muted)" }} />
+                        <input
+                            type="text"
+                            value={query}
+                            onChange={(e) => setQuery(e.target.value)}
+                            placeholder="Search research…"
+                            aria-label="Search research"
+                            className="w-full min-w-0 bg-transparent border-none outline-none text-xs placeholder:text-[var(--q-text-muted)]"
+                        />
+                    </label>
+                </div>
+            )}
+
+            <div className={isDrawer ? "px-3.5 mb-3" : "px-4 mb-4"}>
+                <Link href="/spectral-lines" onClick={onClose}
+                    className={`w-full flex items-center gap-3 rounded-xl transition-colors ${isDrawer ? "px-3 py-2.5 text-[12.5px] font-medium" : "px-3 py-2.5 text-sm"} ${pathname === "/spectral-lines" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                    <Waves className={isDrawer ? "size-[15px]" : "w-4 h-4"} />
                     Spectral Line Explorer
                 </Link>
             </div>
 
             {/* Conversation History */}
             <div className="flex-1 overflow-y-auto px-3 space-y-1">
-                {conversations.length > 0 ? (
+                {visibleConversations.length > 0 ? (
                     <>
                         <div className="px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">Recent Research</div>
-                        {conversations.map((conv) => {
+                        {visibleConversations.map((conv) => {
                             const isActive = conv.id === activeConversationId;
                             return (
                                 <div key={conv.id} className="relative group/item">
@@ -568,6 +623,10 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
                             );
                         })}
                     </>
+                ) : query.trim() ? (
+                    <div className="px-3 py-8 text-center">
+                        <p className="text-sm text-slate-500">No matches for “{query.trim()}”.</p>
+                    </div>
                 ) : (
                     <div className="px-3 py-8 text-center">
                         <p className="text-sm text-slate-500">No conversations yet.</p>
@@ -597,7 +656,7 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
                         className="flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs text-slate-400 hover:bg-white/10 hover:text-white">
                         <Settings className="w-4 h-4 shrink-0" />Settings
                     </button>
-                    <Link href="/help"
+                    <Link href="/help" onClick={onClose}
                         title="Help & Docs"
                         className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                         <HelpCircle className="w-4 h-4 shrink-0" />Help

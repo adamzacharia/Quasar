@@ -112,11 +112,11 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             request.attachments.forEach(f => form.append("files", f));
             const headers: Record<string, string> = {};
             if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
-            response = await fetch(`${API_BASE}/api/chat/upload`, { method: "POST", headers, body: form, signal });
+            response = await fetch(`${API_BASE}/api/chat/upload`, { credentials: "include", method: "POST", headers, body: form, signal });
         } else {
             const headers: Record<string, string> = { "Content-Type": "application/json" };
             if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
-            response = await fetch(`${API_BASE}/api/chat`, {
+            response = await fetch(`${API_BASE}/api/chat`, { credentials: "include",
                 method: "POST",
                 headers,
                 body: JSON.stringify({
@@ -275,7 +275,7 @@ export async function submitPlanFeedback(
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers["Authorization"] = `Bearer ${token}`;
 
-    const res = await fetch(`${API_BASE}/api/plan-feedback`, {
+    const res = await fetch(`${API_BASE}/api/plan-feedback`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -294,7 +294,7 @@ export async function submitPlanFeedback(
 
 export async function getModels(): Promise<string[]> {
     try {
-        const res = await fetch(`${API_BASE}/api/models`);
+        const res = await fetch(`${API_BASE}/api/models`, { credentials: "include" });
         const data = await res.json();
         return mergeAvailableModels(data.models);
     }
@@ -424,7 +424,7 @@ function spectralAuthHeaders(token?: string | null, json = false): Record<string
 }
 
 export async function getSpectralLineMetadata(token?: string | null): Promise<SpectralLineMetadata> {
-    const res = await fetch(`${API_BASE}/api/spectral-lines/metadata`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/metadata`, { credentials: "include",
         headers: spectralAuthHeaders(token),
     });
     return parseJsonResponse<SpectralLineMetadata>(res);
@@ -436,7 +436,7 @@ export async function searchSpectralSpecies(
     token?: string | null,
 ): Promise<{ species: SpectralSpecies[]; query: string }> {
     const params = new URLSearchParams({ query, limit: String(limit) });
-    const res = await fetch(`${API_BASE}/api/spectral-lines/species?${params}`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/species?${params}`, { credentials: "include",
         headers: spectralAuthHeaders(token),
     });
     return parseJsonResponse<{ species: SpectralSpecies[]; query: string }>(res);
@@ -451,7 +451,7 @@ export async function resolveSpectralTarget(
     },
     token?: string | null,
 ): Promise<Record<string, unknown>> {
-    const res = await fetch(`${API_BASE}/api/spectral-lines/resolve-target`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/resolve-target`, { credentials: "include",
         method: "POST",
         headers: spectralAuthHeaders(token, true),
         body: JSON.stringify(input),
@@ -464,7 +464,7 @@ export async function startSpectralLineJob(
     payload: Record<string, unknown>,
     token?: string | null,
 ): Promise<SpectralLineJob> {
-    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs`, { credentials: "include",
         method: "POST",
         headers: spectralAuthHeaders(token, true),
         body: JSON.stringify({ operation, payload }),
@@ -481,7 +481,7 @@ export async function getSpectralLineJob(
 ): Promise<SpectralLineJob> {
     const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
     if (dataset) params.set("dataset", dataset);
-    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}?${params}`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}?${params}`, { credentials: "include",
         headers: spectralAuthHeaders(token),
     });
     return parseJsonResponse<SpectralLineJob>(res);
@@ -491,7 +491,7 @@ export async function cancelSpectralLineJob(
     jobId: string,
     token?: string | null,
 ): Promise<SpectralLineJob> {
-    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}`, { credentials: "include",
         method: "DELETE",
         headers: spectralAuthHeaders(token),
     });
@@ -505,7 +505,7 @@ export async function downloadSpectralLineExport(
     token?: string | null,
 ): Promise<{ blob: Blob; filename: string }> {
     const params = new URLSearchParams({ dataset, format });
-    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}/export?${params}`, {
+    const res = await fetch(`${API_BASE}/api/spectral-lines/jobs/${jobId}/export?${params}`, { credentials: "include",
         headers: spectralAuthHeaders(token),
     });
     if (!res.ok) throw await createApiError(res);
@@ -710,7 +710,7 @@ export async function createWorkbenchSession(
 ): Promise<WorkbenchSession> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/session`, {
+    const res = await fetch(`${API_BASE}/api/workbench/session`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -721,7 +721,7 @@ export async function createWorkbenchSession(
 export async function getWorkbenchMetadata(sessionId: string, token?: string | null): Promise<WorkbenchMetadata> {
     const headers: Record<string, string> = {};
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/metadata`, { headers });
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/metadata`, { credentials: "include", headers });
     return parseJsonResponse<WorkbenchMetadata>(res);
 }
 
@@ -735,7 +735,7 @@ export async function startWorkbenchJob(
 ): Promise<WorkbenchJobResponse> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -750,7 +750,7 @@ export async function getWorkbenchJob(
 ): Promise<WorkbenchJobResponse> {
     const headers: Record<string, string> = {};
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, { headers });
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, { credentials: "include", headers });
     return parseJsonResponse<WorkbenchJobResponse>(res);
 }
 
@@ -761,7 +761,7 @@ export async function cancelWorkbenchJob(
 ): Promise<WorkbenchJobResponse> {
     const headers: Record<string, string> = {};
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, { credentials: "include",
         method: "DELETE",
         headers,
     });
@@ -783,7 +783,7 @@ export async function planWorkbenchRender(
 ): Promise<WorkbenchRenderPlan> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/render`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/render`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -803,7 +803,7 @@ export async function prepareWorkbenchProduct(
 ): Promise<WorkbenchPrepareResult> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/prepare`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/prepare`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -824,7 +824,7 @@ export async function planWorkbenchSpectrum(
 ): Promise<WorkbenchSpectrumPlan> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/spectrum`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/spectrum`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -843,7 +843,7 @@ export async function planWorkbenchPvSlice(
 ): Promise<WorkbenchPvSlicePlan> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/pv-slice`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/pv-slice`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -864,7 +864,7 @@ export async function getWorkbenchLineOverlays(
 ): Promise<WorkbenchLineOverlays> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/line-overlays`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/line-overlays`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify(input),
@@ -873,7 +873,7 @@ export async function getWorkbenchLineOverlays(
 }
 
 export async function getWorkbenchLinePresets(): Promise<WorkbenchLinePresetResponse> {
-    const res = await fetch(`${API_BASE}/api/workbench/line-presets`);
+    const res = await fetch(`${API_BASE}/api/workbench/line-presets`, { credentials: "include" });
     return parseJsonResponse<WorkbenchLinePresetResponse>(res);
 }
 
@@ -884,7 +884,7 @@ export async function getWorkbenchExports(
 ): Promise<WorkbenchExports> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/export`, {
+    const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/export`, { credentials: "include",
         method: "POST",
         headers,
         body: JSON.stringify({ formats }),
@@ -892,13 +892,19 @@ export async function getWorkbenchExports(
     return parseJsonResponse<WorkbenchExports>(res);
 }
 
-export async function reviewProposal(file: File, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
+export async function reviewProposal(file: File, callbacks: StreamCallbacks, signal?: AbortSignal, token?: string | null): Promise<void> {
     try {
         const form = new FormData();
         form.append("file", file);
 
-        const response = await fetch(`${API_BASE}/api/proposals/review`, {
+        // S5: /api/proposals/review now requires authentication. Send the
+        // user's Bearer token (do NOT set Content-Type — the browser sets the
+        // multipart/form-data boundary for FormData automatically).
+        const headers: Record<string, string> = {};
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const response = await fetch(`${API_BASE}/api/proposals/review`, { credentials: "include",
             method: "POST",
+            headers,
             body: form,
             signal,
         });
@@ -948,8 +954,12 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks, sig
 
 // ── Conversation History API ────────────────────────────────────
 
-function authHeaders(token: string): Record<string, string> {
-    return { "Content-Type": "application/json", "Authorization": `Bearer ${token}` };
+function authHeaders(token?: string | null): Record<string, string> {
+    // Auth normally rides the httpOnly cookie (credentials: "include"); the
+    // Bearer header is only added for legacy callers that still hold a token.
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    return headers;
 }
 
 export interface ServerConversation {
@@ -967,9 +977,9 @@ export interface ServerMessage {
     metadata?: Record<string, unknown>;
 }
 
-export async function fetchConversations(token: string): Promise<ServerConversation[]> {
+export async function fetchConversations(token?: string): Promise<ServerConversation[]> {
     try {
-        const res = await fetch(`${API_BASE}/api/conversations`, { headers: authHeaders(token) });
+        const res = await fetch(`${API_BASE}/api/conversations`, { credentials: "include", headers: authHeaders(token) });
         if (!res.ok) return [];
         const data = await res.json();
         return data.conversations || [];
@@ -978,9 +988,9 @@ export async function fetchConversations(token: string): Promise<ServerConversat
     }
 }
 
-export async function fetchConversationMessages(conversationId: string, token: string): Promise<ServerMessage[]> {
+export async function fetchConversationMessages(conversationId: string, token?: string): Promise<ServerMessage[]> {
     try {
-        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages`, { headers: authHeaders(token) });
+        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages`, { credentials: "include", headers: authHeaders(token) });
         if (!res.ok) return [];
         const data = await res.json();
         return data.messages || [];
@@ -989,13 +999,13 @@ export async function fetchConversationMessages(conversationId: string, token: s
     }
 }
 
-export async function deleteConversationApi(conversationId: string, token: string): Promise<boolean> {
+export async function deleteConversationApi(conversationId: string, token?: string): Promise<boolean> {
     // Retry up to 3 times — Render cold starts can cause transient failures
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+            const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, { credentials: "include",
                 method: "DELETE",
-                headers: { "Authorization": `Bearer ${token}` },
+                headers: authHeaders(token),
             });
             if (res.ok) {
                 console.log(`[Quasar] Deleted conversation ${conversationId}`);

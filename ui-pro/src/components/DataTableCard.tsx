@@ -547,7 +547,7 @@ function SkyMapLightbox({
                         <Map className="w-4 h-4 text-cyan-400" />
                         {sourceName ? `${sourceName} — Sky Distribution` : "Sky Distribution"}
                     </p>
-                    <div className="inline-flex rounded-lg border border-slate-700/70 bg-slate-950/50 p-1">
+                    <div className="inline-flex rounded-lg border border-cyan-400/25 bg-slate-900/40 p-1">
                         {tabs.map((tab) => {
                             const disabled = tab.id === "interactive" && Boolean(interactiveFallbackReason);
                             return (
@@ -558,8 +558,8 @@ function SkyMapLightbox({
                                     title={disabled ? interactiveFallbackReason || undefined : undefined}
                                     onClick={() => setActiveTab(tab.id)}
                                     className={`rounded-md px-3 py-1 text-[11px] font-semibold transition-colors ${activeTab === tab.id
-                                        ? "bg-cyan-500/15 text-cyan-200"
-                                        : "text-slate-400 hover:bg-slate-800/80 hover:text-slate-200"} ${disabled ? "cursor-not-allowed opacity-40 hover:bg-transparent hover:text-slate-400" : ""}`}
+                                        ? "bg-sky-400 text-slate-950 shadow-sm shadow-sky-500/40"
+                                        : "text-slate-200 hover:bg-sky-400/10 hover:text-white"} ${disabled ? "cursor-not-allowed opacity-40 hover:bg-transparent hover:text-slate-200" : ""}`}
                                 >
                                     {tab.label}
                                 </button>
@@ -1070,7 +1070,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const columns = data.columns ?? [];
     const rows = data.rows ?? [];
     const isAlmaProducts = data.tableKind === "alma_products";
-    const { token, openAuthModal } = useAuthStore();
+    const { isAuthenticated, openAuthModal } = useAuthStore();
     const [lightbox, setLightbox] = useState<{
         src: string; target?: string; ra?: string; dec?: string;
     } | null>(null);
@@ -1113,11 +1113,10 @@ export function DataTableCard({ data }: DataTableCardProps) {
         setPreviewError(null);
         setPreviewLoadingRow(rowIndex);
         try {
-            const response = await fetch(`${API_BASE}/api/fits/preview`, {
+            const response = await fetch(`${API_BASE}/api/fits/preview`, { credentials: "include",
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
                 },
                 body: JSON.stringify({
                     url,
@@ -1139,7 +1138,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const handleOpenWorkbench = async (row: Record<string, string | number>, rowIndex: number) => {
         const url = String(row["_link"] || "");
         if (!url) return;
-        if (!token) {
+        if (!isAuthenticated) {
             setPreviewError("Sign in to open a persistent FITS workbench session.");
             openAuthModal();
             return;
@@ -1152,7 +1151,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 filename: optionalCellText(row.File),
                 project_code: optionalCellText(row["Proposal ID"]),
                 mous_uid: optionalCellText(row["MOUS ID"]),
-            }, token);
+            });
             window.open(`/workbench/${encodeURIComponent(session.session_id)}`, "_blank", "noopener,noreferrer");
         } catch (error) {
             setPreviewError(error instanceof Error ? error.message : "Could not open FITS workbench.");

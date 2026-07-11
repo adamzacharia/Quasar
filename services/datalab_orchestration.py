@@ -510,7 +510,7 @@ def tiled_density_aggregate(
 
 
 def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store,
-                       point_sources=False, extra_value_cuts=None):
+                       point_sources=False, morphology=None, extra_value_cuts=None):
     """Cone-select the magnitude (+extra) columns for a diagram and return (result_id, df, magcols)."""
     from services import datalab_registry as reg
     magcols = {b: reg.mag_column(catalog, table, b) for b in bands}
@@ -523,19 +523,24 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     for col in dict.fromkeys(magcols.values()):
         value_cuts.append({"column": col, "op": ">", "value": _VALID_MAG_RANGE[0]})
         value_cuts.append({"column": col, "op": "<", "value": _VALID_MAG_RANGE[1]})
-    morphology = None
+    # An explicit morphology cut wins over point_sources (which pulls the
+    # catalog's registered star/galaxy cut). Both go through build_catalog_predicates.
+    morph_cut = dict(morphology) if morphology else None
+    ps_applied = False
     ps_note = None
-    if point_sources:
-        morphology = reg.point_source_cut(catalog, table)
-        if morphology is None:
+    if morph_cut is None and point_sources:
+        morph_cut = reg.point_source_cut(catalog, table)
+        ps_applied = morph_cut is not None
+        if morph_cut is None:
             ps_note = (f"{catalog}.{table} has no registered star/galaxy separator; "
                        "point_sources request ignored (returning ALL sources).")
-    predicates = builders.build_catalog_predicates(catalog, table, value_cuts=value_cuts, morphology=morphology)
+    predicates = builders.build_catalog_predicates(catalog, table, value_cuts=value_cuts, morphology=morph_cut)
     sql, meta = builders.build_cone_select(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
                                            columns=cols, limit=limit, predicates=predicates)
     result_id, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
     meta = dict(meta or {})
-    meta["point_source_cut_applied"] = bool(morphology)
+    meta["point_source_cut_applied"] = ps_applied
+    meta["morphology"] = morph_cut
     if ps_note:
         meta.setdefault("warnings", []).append(ps_note)
     return result_id, result, magcols, meta
@@ -618,27 +623,28 @@ def color_color_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_bands=("g", "r"), y_bands=("r", "i"),
     split_col=None, split_threshold=0.005, limit=3000, title=None,
-    point_sources=False, value_cuts=None,
+    point_sources=False, morphology=None, value_cuts=None,
     client=None, result_store=None, plotting_service=None,
 ):
     """P5: one-shot color-color diagram. Queries the cone, optionally splits into stars/galaxies
     by a morphology column (auto-detected from the registry, e.g. DES spread_model_r), and renders
     a 1- or 2-panel CCD as a single image. Sentinel magnitudes (99.99) are cut both server- and
-    client-side so the axes stay physical."""
+    client-side so the axes stay physical. An explicit morphology cut overrides point_sources."""
     import pandas as pd
     from services import datalab_registry as reg
     from services.plotting import PlottingService
     client = client or _default_client()
     result_store = result_store or _default_result_store()
     plotting = plotting_service or PlottingService()
-    if split_col is None and not point_sources:
+    # A morphology-selected sample is one population — don't auto-split it into stars/galaxies.
+    if split_col is None and not point_sources and not morphology:
         split_col = reg.morphology_split_column(catalog, table)
 
     bands = list(dict.fromkeys([*x_bands, *y_bands]))
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands,
         extra_cols=[split_col] if split_col else [], limit=limit, client=client, result_store=result_store,
-        point_sources=point_sources, extra_value_cuts=value_cuts,
+        point_sources=point_sources, morphology=morphology, extra_value_cuts=value_cuts,
     )
     df = result.dataframe
     _ps_applied = bool(_meta.get("point_source_cut_applied"))
@@ -666,8 +672,9 @@ def color_color_diagram(
         fig, ax = plt.subplots(figsize=(5.0, 4.0))
         ax.scatter(x[finite], y[finite], s=6, alpha=0.4, edgecolors="none")
         ax.set_xlabel(xl); ax.set_ylabel(yl); ax.grid(True, alpha=0.3)
-        populations.append({"population": "point sources" if _ps_applied else "all", "n": int(finite.sum())})
-        panels.append(("point sources" if _ps_applied else "all", x[finite].tolist(), y[finite].tolist()))
+        pop_label = "point sources" if _ps_applied else ("selected" if _meta.get("morphology") else "all")
+        populations.append({"population": pop_label, "n": int(finite.sum())})
+        panels.append((pop_label, x[finite].tolist(), y[finite].tolist()))
     plot_title = title or f"{catalog}.{table} — {xl} vs {yl}"
     fig.suptitle(plot_title)
     fig.tight_layout()
@@ -676,7 +683,8 @@ def color_color_diagram(
     return _render_diagram(plotting, fig, "datalab_ccd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col,
-                            "point_sources": ps_applied, "populations": populations,
+                            "point_sources": ps_applied, "morphology": _meta.get("morphology"),
+                            "populations": populations,
                             "warnings": list(_meta.get("warnings") or []),
                             "excluded_invalid_mags": int(len(df) - int(finite.sum())),
                             "plotly_spec": plotly_spec})
@@ -685,12 +693,13 @@ def color_color_diagram(
 def color_magnitude_diagram(
     catalog, table, ra, dec, radius_deg, *,
     blue_band="g", red_band="r", mag_band=None, limit=5000, title=None,
-    point_sources=False, value_cuts=None,
+    point_sources=False, morphology=None, value_cuts=None,
     client=None, result_store=None, plotting_service=None,
 ):
     """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted.
     Sentinel magnitudes are excluded server- and client-side; point_sources=True applies the
-    catalog's registered star/galaxy cut (e.g. NSC class_star > 0.5)."""
+    catalog's registered star/galaxy cut (e.g. NSC class_star > 0.5). An explicit morphology
+    cut overrides point_sources."""
     import pandas as pd
     from services.plotting import PlottingService
     client = client or _default_client()
@@ -701,7 +710,7 @@ def color_magnitude_diagram(
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands, extra_cols=[], limit=limit,
         client=client, result_store=result_store, point_sources=point_sources,
-        extra_value_cuts=value_cuts,
+        morphology=morphology, extra_value_cuts=value_cuts,
     )
     df = result.dataframe
     valid = _valid_mag_mask(*[df[magcols[b]] for b in dict.fromkeys([blue_band, red_band, mag_band])])
@@ -717,7 +726,7 @@ def color_magnitude_diagram(
     ax.set_title(plot_title)
     fig.tight_layout()
     ps_applied = bool(_meta.get("point_source_cut_applied"))
-    label = "point sources" if ps_applied else "all sources"
+    label = "point sources" if ps_applied else ("selected" if _meta.get("morphology") else "all sources")
     plotly_spec = _plotly_scatter_spec(
         [(label, color[finite].tolist(), mag[finite].tolist())],
         x_label=xl, y_label=yl, title=plot_title, invert_y=True,
@@ -725,7 +734,7 @@ def color_magnitude_diagram(
     return _render_diagram(plotting, fig, "datalab_cmd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "points": int(finite.sum()),
-                            "point_sources": ps_applied,
+                            "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "warnings": list(_meta.get("warnings") or []),
                             "excluded_invalid_mags": int(len(df) - int(finite.sum())),
                             "plotly_spec": plotly_spec})

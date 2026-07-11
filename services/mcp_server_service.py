@@ -4,6 +4,20 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 
+def mcp_stdio_enabled() -> bool:
+    """Whether per-user stdio MCP servers (local command spawning) are allowed.
+
+    OFF by default. A stdio config persists ``{command, args, env}`` that the
+    agent later spawns as a subprocess — arbitrary command execution on the
+    host. HTTP/SSE (remote URL) MCP servers stay allowed; that is the intended
+    consumption model (e.g. MANNA). Set ``QUASAR_ENABLE_MCP_STDIO=1`` only in a
+    trusted local/dev environment (see docs/v2 S2). (S2)
+    """
+    return os.getenv("QUASAR_ENABLE_MCP_STDIO", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 class MCPServerConfig(BaseModel):
     name: str              # e.g., "sqlite_db" or "github"
     transport: str = "stdio" # "stdio" or "http" (SSE)
@@ -49,6 +63,14 @@ class MCPServerService:
         # Validations
         if not server_config.name:
             raise ValueError("Server name is required.")
+        if server_config.transport == "stdio" and not mcp_stdio_enabled():
+            # RCE guard: refuse to persist a local-command MCP server. Use an
+            # http/SSE URL instead (or enable QUASAR_ENABLE_MCP_STDIO in a
+            # trusted local/dev environment). (S2)
+            raise ValueError(
+                "stdio MCP servers (local command spawning) are disabled on this "
+                "deployment. Provide an http/SSE server URL instead."
+            )
         if server_config.transport == "stdio" and not server_config.command:
             raise ValueError("Server command is required for stdio transport.")
         if server_config.transport == "http" and not server_config.url:

@@ -17,6 +17,19 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# ── Never let tests reach a remote database ──────────────────────
+# config/__init__.py and config/settings.py call load_dotenv() when imported,
+# which copies the developer's real TURSO_* credentials into os.environ. Once
+# they are there, services.db sends EVERY get_connection() to the cloud database
+# — including the calls that pass an explicit local sqlite path, because that
+# path is only the local fallback, never an override. So in a whole-directory
+# run, the first test module that imported `config` silently moved the rest of
+# the session onto one shared remote DB, and tests began seeing rows committed
+# by earlier tests (and by earlier runs).
+#
+# This has to happen before anything imports services.db.
+os.environ["QUASAR_FORCE_LOCAL_DB"] = "1"
+
 # ── Set dummy env vars for offline testing ───────────────────────
 # These prevent ImportError / KeyError during module import.
 # They are NOT valid keys — no real API calls should be made in unit tests.

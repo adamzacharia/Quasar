@@ -134,7 +134,6 @@ function SpectralLineExplorer() {
     const searchParams = useSearchParams();
     const sidebarOpen = useChatStore((state) => state.sidebarOpen);
     const toggleSidebar = useChatStore((state) => state.toggleSidebar);
-    const token = useAuthStore((state) => state.token);
     const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
     const isInitialized = useAuthStore((state) => state.isInitialized);
     const openAuthModal = useAuthStore((state) => state.openAuthModal);
@@ -198,13 +197,13 @@ function SpectralLineExplorer() {
             return;
         }
         authModalOpened.current = false;
-        getSpectralLineMetadata(token).then(setMetadata).catch(handleSpectralError);
-    }, [handleSpectralError, isAuthenticated, isInitialized, openAuthModal, token]);
+        getSpectralLineMetadata().then(setMetadata).catch(handleSpectralError);
+    }, [handleSpectralError, isAuthenticated, isInitialized, openAuthModal]);
 
     useEffect(() => {
-        if (!token || !speciesQuery.trim()) return;
+        if (!isAuthenticated || !speciesQuery.trim()) return;
         const timer = window.setTimeout(() => {
-            searchSpectralSpecies(speciesQuery, 12, token)
+            searchSpectralSpecies(speciesQuery, 12)
                 .then((result) => setSpeciesMatches(result.species))
                 .catch((reason) => {
                     setSpeciesMatches([]);
@@ -212,12 +211,12 @@ function SpectralLineExplorer() {
                 });
         }, 250);
         return () => window.clearTimeout(timer);
-    }, [handleSpectralError, speciesQuery, token]);
+    }, [handleSpectralError, speciesQuery, isAuthenticated]);
 
     useEffect(() => {
         const speciesId = searchParams.get("species");
-        if (!speciesId || selectedSpecies.length || !token) return;
-        searchSpectralSpecies(speciesId, 100, token).then((result) => {
+        if (!speciesId || selectedSpecies.length || !isAuthenticated) return;
+        searchSpectralSpecies(speciesId, 100).then((result) => {
             const selected = result.species.find((item) => String(item.species_id) === speciesId);
             if (selected) {
                 setSelectedSpecies([selected]);
@@ -226,7 +225,7 @@ function SpectralLineExplorer() {
         }).catch((reason) => {
             if (isUnauthorizedApiError(reason)) handleSpectralError(reason);
         });
-    }, [handleSpectralError, searchParams, selectedSpecies.length, token]);
+    }, [handleSpectralError, searchParams, selectedSpecies.length, isAuthenticated]);
 
     const buildQuery = useCallback(() => {
         const primaryWindows = windowMin && windowMax
@@ -294,7 +293,7 @@ function SpectralLineExplorer() {
     }, [band, frame, mode, redshift, router, selectedSpecies, speciesQuery, target, transition, windowMax, windowMin, windowUnit]);
 
     const startJob = useCallback(async (operation: SpectralLineJob["operation"], selectedLine?: SpectralLineRecord) => {
-        if (!token) {
+        if (!isAuthenticated) {
             openAuthModal();
             return;
         }
@@ -323,23 +322,23 @@ function SpectralLineExplorer() {
             };
             nextTab = "confusion";
         }
-        const started = await startSpectralLineJob(operation, payload, token);
+        const started = await startSpectralLineJob(operation, payload);
         setJob(started);
         setResultTab(nextTab);
         setPage(1);
         syncUrl(operation === "alma_coverage" ? "coverage" : "search");
-    }, [buildQuery, mode, openAuthModal, radialVelocity, redshift, selectedLineIds, syncUrl, target, token]);
+    }, [buildQuery, mode, openAuthModal, radialVelocity, redshift, selectedLineIds, syncUrl, target, isAuthenticated]);
 
     useEffect(() => {
-        if (!job || TERMINAL.has(job.status) || !token) return;
+        if (!job || TERMINAL.has(job.status) || !isAuthenticated) return;
         const pollingJobId = job.job_id;
         const timer = window.setInterval(() => {
-            getSpectralLineJob(pollingJobId, page, 100, token)
+            getSpectralLineJob(pollingJobId, page, 100)
                 .then((nextJob) => setJob((current) => current?.job_id === pollingJobId ? nextJob : current))
                 .catch(handleSpectralError);
         }, 1500);
         return () => window.clearInterval(timer);
-    }, [handleSpectralError, job, page, token]);
+    }, [handleSpectralError, job, page, isAuthenticated]);
 
     const jobId = job?.job_id;
     const jobStatus = job?.status;
@@ -355,24 +354,24 @@ function SpectralLineExplorer() {
                         ? "lines"
                         : undefined;
     useEffect(() => {
-        if (!jobId || !jobStatus || !TERMINAL.has(jobStatus) || !token) return;
-        getSpectralLineJob(jobId, page, 100, token, requestedDataset)
+        if (!jobId || !jobStatus || !TERMINAL.has(jobStatus) || !isAuthenticated) return;
+        getSpectralLineJob(jobId, page, 100, undefined, requestedDataset)
             .then((nextJob) => setJob((current) => current?.job_id === jobId ? nextJob : current))
             .catch((reason) => {
                 if (isUnauthorizedApiError(reason)) handleSpectralError(reason);
             });
-    }, [handleSpectralError, jobId, jobStatus, page, requestedDataset, token]);
+    }, [handleSpectralError, jobId, jobStatus, page, requestedDataset, isAuthenticated]);
 
     useEffect(() => {
         const autorun = searchParams.get("autorun");
         const autorunKey = searchParams.toString();
-        if (!autorun || autorunHandled.current === autorunKey || !metadata || !token) return;
+        if (!autorun || autorunHandled.current === autorunKey || !metadata || !isAuthenticated) return;
         autorunHandled.current = autorunKey;
         const timer = window.setTimeout(() => {
             startJob(autorun === "coverage" ? "alma_coverage" : "catalog_search").catch(handleSpectralError);
         }, 350);
         return () => window.clearTimeout(timer);
-    }, [handleSpectralError, metadata, searchParams, startJob, token]);
+    }, [handleSpectralError, metadata, searchParams, startJob, isAuthenticated]);
 
     const rows = (job?.rows || []) as SpectralLineRecord[];
     const projects = (job?.rows || []) as SpectralCoverageProject[];
@@ -390,9 +389,9 @@ function SpectralLineExplorer() {
     };
 
     const download = async (dataset: "lines" | "raw_lines" | "coverage" | "candidates", format: "csv" | "tsv" | "json" | "casa") => {
-        if (!job || !token) return;
+        if (!job || !isAuthenticated) return;
         try {
-            const result = await downloadSpectralLineExport(job.job_id, dataset, format, token);
+            const result = await downloadSpectralLineExport(job.job_id, dataset, format);
             const url = URL.createObjectURL(result.blob);
             const link = document.createElement("a");
             link.href = url;
@@ -405,21 +404,21 @@ function SpectralLineExplorer() {
     };
 
     const cancelJob = async () => {
-        if (!job || !token) return;
+        if (!job || !isAuthenticated) return;
         try {
-            setJob(await cancelSpectralLineJob(job.job_id, token));
+            setJob(await cancelSpectralLineJob(job.job_id));
         } catch (reason) {
             handleSpectralError(reason);
         }
     };
 
     const compareRawEntries = async (line: SpectralLineRecord) => {
-        if (!job || !token) {
+        if (!job || !isAuthenticated) {
             setRawComparison({ line, rows: [] });
             return;
         }
         try {
-            const rawJob = await getSpectralLineJob(job.job_id, 1, 500, token, "raw_lines");
+            const rawJob = await getSpectralLineJob(job.job_id, 1, 500, undefined, "raw_lines");
             const rawIds = new Set((line.raw_line_ids || []).map(String));
             const matches = (rawJob.rows || []).filter((candidate) => {
                 const raw = candidate as SpectralLineRecord;

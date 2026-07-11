@@ -154,7 +154,7 @@ export function AladinSkyView({
                 aria-label="Sky survey"
                 value={selectedSurvey}
                 onChange={(event) => setSelectedSurvey(event.target.value)}
-                className="absolute right-3 top-3 z-20 max-w-[190px] rounded-md border border-slate-600/70 bg-slate-950/90 px-2 py-1 text-[11px] font-medium text-slate-100 shadow-lg outline-none backdrop-blur focus:border-cyan-400"
+                className="absolute right-3 top-3 z-20 max-w-[190px] rounded-md border border-sky-400/50 bg-slate-950/90 px-2 py-1 text-[11px] font-medium text-white shadow-lg outline-none backdrop-blur focus:border-sky-300"
             >
                 {SURVEYS.map((option) => (
                     <option key={option.id} value={option.id}>

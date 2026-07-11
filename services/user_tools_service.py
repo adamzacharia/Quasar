@@ -33,6 +33,20 @@ def _secrets_file(user_id: str) -> Path:
     return _user_dir(user_id) / "secrets.json"
 
 
+def _user_tool_exec_enabled() -> bool:
+    """Whether user-authored Python tools may be exec()'d in this process.
+
+    OFF by default. exec()'ing user-supplied code with full ``__builtins__`` +
+    ``os`` inside the shared API process is an arbitrary-code-execution (RCE)
+    surface. Set ``QUASAR_ENABLE_USER_TOOL_EXEC=1`` only in a trusted, isolated
+    local/dev environment. In V2 this is superseded by out-of-process MCP
+    servers; the exec() path is slated for deletion in P3 (see docs/v2 S1). (S1)
+    """
+    return os.getenv("QUASAR_ENABLE_USER_TOOL_EXEC", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 # ─── Validation ───────────────────────────────────────────────────────────────
 
 TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
@@ -59,6 +73,17 @@ def _derive_schema(code: str, func_name: str) -> Dict[str, Any]:
         "dict": "object",
         "NoneType": "null",
     }
+
+    if not _user_tool_exec_enabled():
+        # Do not exec user code just to introspect its signature when user-tool
+        # execution is disabled. Persist a permissive schema instead; the tool
+        # will not be executed (build_callable is gated by the same flag). (S1)
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "_schema_error": "user tool execution disabled (QUASAR_ENABLE_USER_TOOL_EXEC off)",
+        }
 
     try:
         ns: Dict[str, Any] = {}
@@ -235,6 +260,14 @@ class UserToolsService:
         """
         name = tool_def["name"]
         code = tool_def.get("code", "")
+        if not _user_tool_exec_enabled():
+            # RCE guard: never exec user-authored code in the shared process
+            # unless explicitly enabled for a trusted local/dev environment. (S1)
+            raise RuntimeError(
+                f"User-defined tool '{name}' was not loaded: in-process execution "
+                "of user Python is disabled (QUASAR_ENABLE_USER_TOOL_EXEC is off). "
+                "Register the capability as an external MCP server instead."
+            )
         ns: Dict[str, Any] = {
             "__builtins__": __builtins__,
             "os": os,

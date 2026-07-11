@@ -7,6 +7,8 @@ import { sendChatMessage, reviewProposal, submitPlanFeedback } from "../lib/api"
 import { EmptyState } from "./EmptyState";
 import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
+import { MobileHomeBar } from "./MobileHomeBar";
+import { useIsMobile } from "../lib/use-is-mobile";
 import type { ResearchGraph } from "./ObservationPaperGraph";
 import { DownloadProgress } from "./DownloadProgress";
 import { PlanReviewWidget } from "./PlanReviewWidget";
@@ -38,13 +40,8 @@ export function ChatArea() {
         setActiveConversationId, loadConversations,
     } = useChatStore();
 
-    const { token, isAuthenticated, openAuthModal } = useAuthStore();
-
-    // Use a ref so handleSend always reads the CURRENT token (avoids stale closure)
-    const tokenRef = useRef<string | null>(null);
-    useEffect(() => {
-        tokenRef.current = token ?? null;
-    }, [token]);
+    const { isAuthenticated, clearAuth } = useAuthStore();
+    const isMobile = useIsMobile();
 
     const [inputValue, setInputValue] = useState("");
     // Composer options + visit counter live here (not in ChatInput) so they
@@ -56,7 +53,7 @@ export function ChatArea() {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 4000);
         const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        fetch(`${apiBase}/api/analytics/hit`, { signal: controller.signal })
+        fetch(`${apiBase}/api/analytics/hit`, { credentials: "include", signal: controller.signal })
             .then((res) => res.json())
             .then((data) => { if (typeof data.hits === "number") setHitCount(data.hits); })
             .catch(() => {/* silent: timeout or network error */})
@@ -380,7 +377,7 @@ export function ChatArea() {
                         updateLastAssistantMessage(`Error: ${error}`);
                         setStreaming(false);
                     }
-                }, controller.signal);
+                }, controller.signal);  // S5 auth rides the httpOnly cookie (credentials: "include")
             } else {
                 // Standard workflow
                 let accumulatedWebSources: {
@@ -399,7 +396,6 @@ export function ChatArea() {
                         conversation_id: activeConversationId && !activeConversationId.startsWith("conv-") ? activeConversationId : undefined,
                         model: selectedModel,
                         attachments: attachments?.map(a => a.file),
-                        token: tokenRef.current || undefined,  // always reads current auth state
                         grounded_summary: Boolean(options?.groundedSummary),
                         web_search: options?.webSearch !== false,
                     },
@@ -610,14 +606,17 @@ export function ChatArea() {
                             
                             setStreaming(false);
                             // Reload conversation list from server so new/updated chats appear in sidebar
-                            if (isAuthenticated && tokenRef.current) {
-                                loadConversations(tokenRef.current);
+                            if (isAuthenticated) {
+                                loadConversations();
                             }
                         },
                         onError: (error: string, status?: number) => {
                             attachThinkingToLastMessage();
                             if (status === 401) {
-                                openAuthModal();
+                                // CX-05: a runtime 401 means the cookie expired —
+                                // drop local auth state (and scrub session data)
+                                // instead of leaving isAuthenticated=true.
+                                clearAuth();
                                 updateLastAssistantMessage("Your session expired — please sign in again.");
                             } else {
                                 updateLastAssistantMessage(`Error: ${error}`);
@@ -658,11 +657,10 @@ export function ChatArea() {
         handleTaskGroup,
         handleTaskUpdate,
         handleTaskList,
-        tokenRef,
         setActiveConversationId,
         loadConversations,
         isAuthenticated,
-        openAuthModal,
+        clearAuth,
         normalizeWebSourcesPayload,
     ]);
 
@@ -672,7 +670,7 @@ export function ChatArea() {
         if (!cid || !pendingPlan) return;
         setPlanSubmitting(true);
         try {
-            await submitPlanFeedback(cid, true, "", tokenRef.current || undefined);
+            await submitPlanFeedback(cid, true, "");
             setPendingPlan(null);
         } catch (err) {
             console.error("Plan approval failed:", err);
@@ -690,7 +688,7 @@ export function ChatArea() {
         if (!cid || !pendingPlan) return;
         setPlanSubmitting(true);
         try {
-            await submitPlanFeedback(cid, false, feedback, tokenRef.current || undefined);
+            await submitPlanFeedback(cid, false, feedback);
             // Don't clear pendingPlan — the Conductor will emit a new plan_review event
         } catch (err) {
             console.error("Plan feedback failed:", err);
@@ -704,32 +702,39 @@ export function ChatArea() {
 
     const handleSuggestionClick = (prompt: string) => { setInputValue(prompt); handleSend(prompt); };
     const hasMessages = messages.length > 0;
+    // The phone home screen gets its own chrome: a drawer trigger, the wordmark,
+    // and a theme toggle. Once a chat exists it reverts to the standard header.
+    const isMobileHome = isMobile && !hasMessages;
     const conversationTitle = activeConversationId
         ? conversations.find(c => c.id === activeConversationId)?.title || "New Research Session"
         : "New Research Session";
 
     return (
         <main className={`flex-1 flex flex-col h-full overflow-hidden relative z-10 ${hasMessages ? "chat-session-active" : ""}`}>
-            <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-1.5 md:py-2 border-b border-slate-800/80 glass-panel">
-                <div className="flex items-center gap-3">
-                    <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/10 transition-all"><PanelLeft className="w-5 h-5" /></button>
-                    <h2 className="text-base font-semibold text-white tracking-tight">
-                        {hasMessages ? messages[0].content.slice(0, 50) + (messages[0].content.length > 50 ? "…" : "") : conversationTitle}
-                    </h2>
-                </div>
-                <div className="flex items-center gap-1 transition-opacity">
-                    <button
-                        onClick={() => activeConversationId && toggleStar(activeConversationId)}
-                        title="Star this chat"
-                        className={`p-2 rounded-lg transition-all ${isStarred
-                            ? "text-yellow-500 hover:bg-white/10 hover:text-yellow-400"
-                            : "text-slate-400 hover:text-yellow-500 hover:bg-white/10"
-                            }`}
-                    >
-                        <Star className="w-[18px] h-[18px]" fill={isStarred ? "currentColor" : "none"} />
-                    </button>
-                </div>
-            </header>
+            {isMobileHome ? (
+                <MobileHomeBar />
+            ) : (
+                <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-1.5 md:py-2 border-b border-slate-800/80 glass-panel">
+                    <div className="flex items-center gap-3">
+                        <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/10 transition-all"><PanelLeft className="w-5 h-5" /></button>
+                        <h2 className="text-base font-semibold text-white tracking-tight">
+                            {hasMessages ? messages[0].content.slice(0, 50) + (messages[0].content.length > 50 ? "…" : "") : conversationTitle}
+                        </h2>
+                    </div>
+                    <div className="flex items-center gap-1 transition-opacity">
+                        <button
+                            onClick={() => activeConversationId && toggleStar(activeConversationId)}
+                            title="Star this chat"
+                            className={`p-2 rounded-lg transition-all ${isStarred
+                                ? "text-yellow-500 hover:bg-white/10 hover:text-yellow-400"
+                                : "text-slate-400 hover:text-yellow-500 hover:bg-white/10"
+                                }`}
+                        >
+                            <Star className="w-[18px] h-[18px]" fill={isStarred ? "currentColor" : "none"} />
+                        </button>
+                    </div>
+                </header>
+            )}
 
             {hasMessages ? (
               <>
@@ -826,17 +831,29 @@ export function ChatArea() {
                 />
               </>
             ) : (
+              <>
+                {/* On phones the composer docks at the bottom of the screen instead
+                    of sitting inline under the hero, so it stays thumb-reachable. */}
                 <EmptyState
                     onSuggestionClick={handleSuggestionClick}
                     hitCount={hitCount}
-                    composer={
+                    showDisclaimer={!isMobileHome}
+                    composer={isMobileHome ? undefined : (
                         <ChatInput
                             variant="hero" onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
                             grounded={grounded} onGroundedChange={setGrounded}
                             webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
                         />
-                    }
+                    )}
                 />
+                {isMobileHome && (
+                    <ChatInput
+                        onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
+                        grounded={grounded} onGroundedChange={setGrounded}
+                        webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
+                    />
+                )}
+              </>
             )}
         </main>
     );
