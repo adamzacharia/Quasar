@@ -86,7 +86,9 @@ def test_refresh_tap_schema_keys_on_qualified_table_name(isolated_cache):
         "gaia_dr3.gaia_source", {"ra": True, "dec": True, "parallax": False}
     )
     client = _FakeSchemaClient(tables_df, columns_df)
-    payload = reg.refresh_tap_schema(client)
+    # Scope to one table so the fetch is a single chunk (2 queries); the default
+    # scope is chunked across several queries (see the scope test below).
+    payload = reg.refresh_tap_schema(client, tables=["gaia_dr3.gaia_source"])
 
     # Live-verified contract: tap_schema.columns has NO schema_name column —
     # both fetches must filter on the fully-qualified table_name.
@@ -110,9 +112,58 @@ def test_refresh_scope_defaults_to_registered_tables(isolated_cache):
     tables_df, columns_df = _schema_frames("gaia_dr3.gaia_source", {"ra": True})
     client = _FakeSchemaClient(tables_df, columns_df)
     reg.refresh_tap_schema(client)
-    # Every curated table (including the four new catalogs) is in the IN list.
+    # Every curated table (including the four new catalogs) is fetched — the scope
+    # is now chunked across several queries, so search all of them.
+    all_sql = " ".join(client.calls)
     for name in ("unwise_dr1.object", "twomass.psc", "allwise.source", "splus_dr4.dual"):
-        assert f"'{name}'" in client.calls[0]
+        assert f"'{name}'" in all_sql
+
+
+def test_default_refresh_scope_includes_expansion_tables(isolated_cache):
+    tables_df, columns_df = _schema_frames("gaia_dr3.gaia_source", {"ra": True})
+    client = _FakeSchemaClient(tables_df, columns_df)
+    reg.refresh_tap_schema(client)
+    # The verified expansion catalogs join the default fetch scope so they are
+    # cached (and thus queryable) after the nightly refresh. Scope is chunked
+    # across several queries, so search all of them.
+    all_sql = " ".join(client.calls)
+    for name in ("delve_dr2.objects", "catwise2020.main", "ls_dr10.tractor"):
+        assert f"'{name}'" in all_sql
+    # Curated tables stay in scope alongside them.
+    assert "'gaia_dr3.gaia_source'" in all_sql
+
+
+def test_expansion_table_describes_via_live_fallback_with_overlay(isolated_cache):
+    # delve_dr2 is NOT a curated catalog; once its schema is cached it must be
+    # describable via the live fallback, with the curated footprint/citation.
+    _seed_live_payload(
+        isolated_cache,
+        {"delve_dr2.objects": ["ra", "dec", "mag_auto_g", "mag_auto_r", "ring256"]},
+    )
+    entry = reg.describe_table("delve_dr2", "objects")
+    assert entry["ra_column"] == "ra" and entry["dec_column"] == "dec"
+    assert entry["region_strategy"] == "q3c"
+    assert entry["source"] == "live_tap_schema"
+    assert "DECam Local Volume" in (entry["footprint"] or "")
+    assert "DELVE" in entry["citation"].get("text", "")
+    assert entry["citation"].get("doi") == "10.3847/1538-4365/ac78eb"
+
+
+def test_expansion_catalogs_listed_and_queryable(isolated_cache):
+    # Advertised in list_catalogs so the agent can discover them.
+    listed = {row["catalog"] for row in reg.list_catalogs()}
+    assert {"delve_dr2", "catwise2020", "ls_dr10"} <= listed
+    # And a governed q3c cone query on a cached expansion table is accepted.
+    _seed_live_payload(
+        isolated_cache,
+        {"ls_dr10.tractor": ["ra", "dec", "dered_flux_g", "dered_flux_r"]},
+    )
+    vq = policy.validate(
+        "SELECT ra, dec FROM ls_dr10.tractor "
+        "WHERE q3c_radial_query(ra, dec, 10.0, 41.0, 0.01)",
+        source="builder",
+    )
+    assert "ls_dr10.tractor" in vq.sql.lower()
 
 
 def test_refresh_extra_tables_and_bad_names_rejected(isolated_cache):
@@ -173,7 +224,9 @@ def test_ensure_fresh_accepts_factory(isolated_cache, monkeypatch):
         return client
 
     assert reg.ensure_tap_schema_fresh(factory, background=False) == "refreshed"
-    assert made and len(made[0].calls) == 2
+    # The factory client ran the (chunked) refresh — an even number of queries,
+    # in tables/columns pairs, at least one chunk.
+    assert made and len(made[0].calls) >= 2 and len(made[0].calls) % 2 == 0
 
 
 # ── known_columns ─────────────────────────────────────────────────────────────

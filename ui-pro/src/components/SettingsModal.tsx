@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, BarChart3, Download, Sparkles, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
-import { useAuthStore } from "../lib/auth-store";
+import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { resetOnboarding } from "./OnboardingOverlay";
 import { useThemeStore } from "../lib/theme-store";
 
@@ -86,7 +86,7 @@ function PersonalizationPanel() {
         if (!isAuthenticated) return;
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/personalization/documents`, { credentials: "include" });
+            const res = await fetch(`${API_BASE}/api/personalization/documents`, { credentials: "include", headers: authBearerHeaders() });
             if (res.ok) setDocs(await res.json());
         } catch { /* noop */ }
         setLoading(false);
@@ -103,7 +103,7 @@ function PersonalizationPanel() {
         Array.from(files).forEach(f => form.append("files", f));
         try {
             const res = await fetch(`${API_BASE}/api/personalization/upload`, { credentials: "include",
-                method: "POST", body: form,
+                method: "POST", headers: authBearerHeaders(), body: form,
             });
             const data = await res.json();
             if (res.ok) {
@@ -125,6 +125,7 @@ function PersonalizationPanel() {
         try {
             const res = await fetch(`${API_BASE}/api/personalization/document/${encodeURIComponent(docId)}`, { credentials: "include",
                 method: "DELETE",
+                headers: authBearerHeaders(),
             });
             if (res.ok) setDocs(prev => prev.filter(d => d.id !== docId));
         } catch { /* noop */ }
@@ -256,7 +257,7 @@ function MCPServersPanel() {
         if (!isAuthenticated) return;
         setLoading(true);
         try {
-            const res = await fetch(`${API_BASE}/api/mcp-servers`, { credentials: "include" });
+            const res = await fetch(`${API_BASE}/api/mcp-servers`, { credentials: "include", headers: authBearerHeaders() });
             if (res.ok) setServers(await res.json());
         } catch { /* noop */ }
         setLoading(false);
@@ -311,7 +312,7 @@ function MCPServersPanel() {
             
             const res = await fetch(`${API_BASE}/api/mcp-servers`, { credentials: "include",
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify(bodyPayload)
             });
             const data = await res.json();
@@ -334,7 +335,8 @@ function MCPServersPanel() {
         if (!confirm(`Delete MCP server "${name}"?`)) return;
         try {
             const res = await fetch(`${API_BASE}/api/mcp-servers/${encodeURIComponent(name)}`, { credentials: "include",
-                method: "DELETE"
+                method: "DELETE",
+                headers: authBearerHeaders(),
             });
             if (res.ok) fetchServers();
         } catch { /* noop */ }
@@ -544,8 +546,8 @@ function ProviderKeysPanel() {
         if (!isAuthenticated) return;
         try {
             const [keysRes, quotaRes] = await Promise.all([
-                fetch(`${API_BASE}/api/provider-keys`, { credentials: "include" }),
-                fetch(`${API_BASE}/api/usage-quota`, { credentials: "include" }),
+                fetch(`${API_BASE}/api/provider-keys`, { credentials: "include", headers: authBearerHeaders() }),
+                fetch(`${API_BASE}/api/usage-quota`, { credentials: "include", headers: authBearerHeaders() }),
             ]);
             if (keysRes.ok) {
                 const data = await keysRes.json();
@@ -577,7 +579,7 @@ function ProviderKeysPanel() {
         try {
             const res = await fetch(`${API_BASE}/api/provider-keys`, { credentials: "include",
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({
                     provider,
                     api_key: rawKey,
@@ -604,7 +606,7 @@ function ProviderKeysPanel() {
         try {
             const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/limit`, { credentials: "include",
                 method: "PATCH",
-                headers: { "Content-Type": "application/json" },
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({ token_limit: limitText ? Number(limitText) : null }),
             });
             const data = await res.json();
@@ -625,6 +627,7 @@ function ProviderKeysPanel() {
         try {
             const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/test`, { credentials: "include",
                 method: "POST",
+                headers: authBearerHeaders(),
             });
             const data = await res.json();
             if (!res.ok) throw new Error(data.detail || "Test failed.");
@@ -645,6 +648,7 @@ function ProviderKeysPanel() {
         try {
             const res = await fetch(`${API_BASE}/api/provider-keys/${provider}`, { credentials: "include",
                 method: "DELETE",
+                headers: authBearerHeaders(),
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.detail || "Delete failed.");
@@ -828,6 +832,7 @@ function IssueReportsPanel() {
         );
         try {
             const response = await fetch(`${API_BASE}/api/admin/issue-reports?${params}`, { credentials: "include",
+                headers: authBearerHeaders(),
             });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const payload = await response.json();
@@ -846,9 +851,7 @@ function IssueReportsPanel() {
     const updateReport = async (report: AdminIssueReport, status = report.status) => {
         const response = await fetch(`${API_BASE}/api/admin/issue-reports/${report.id}`, { credentials: "include",
             method: "PATCH",
-            headers: {
-                "Content-Type": "application/json",
-            },
+            headers: authBearerHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ status, admin_notes: notes[report.id] || "" }),
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -861,6 +864,7 @@ function IssueReportsPanel() {
             format,
         });
         const response = await fetch(`${API_BASE}/api/admin/issue-reports/export?${params}`, { credentials: "include",
+            headers: authBearerHeaders(),
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const blob = await response.blob();
@@ -961,6 +965,7 @@ function AnalyticsPanel() {
         setDownloading(key);
         try {
             const res = await fetch(`${API_BASE}${url}`, { credentials: "include",
+                headers: authBearerHeaders(),
             });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const blob = await res.blob();
@@ -981,6 +986,7 @@ function AnalyticsPanel() {
         if (!isAuthenticated) return;
         setLoading(true);
         fetch(`${API_BASE}/api/admin/analytics/summary`, { credentials: "include",
+            headers: authBearerHeaders(),
         })
             .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
             .then(d => { setData(d); setError(null); })

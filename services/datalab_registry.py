@@ -627,6 +627,18 @@ def list_catalogs() -> List[Dict[str, Any]]:
                 "citation": entry.get("citation", {}).get("text"),
             }
         )
+    # Verified expansion catalogs, reachable through the live TAP-schema fallback
+    # (columns read from the live service; footprint/citation curated).
+    for entry in EXPANSION_CATALOGS:
+        rows.append(
+            {
+                "catalog": entry["catalog"],
+                "tables": [entry["table"]],
+                "region_strategy": "q3c",
+                "footprint": entry.get("footprint"),
+                "citation": (entry.get("citation") or {}).get("text"),
+            }
+        )
     return rows
 
 
@@ -841,6 +853,9 @@ _TAP_SCHEMA_CACHE_KEY = "tap_schema_v2"
 # Minimum spacing between refresh ATTEMPTS, so a dead service is not re-polled
 # on every SQL call once the cached payload has gone stale.
 _MIN_REFRESH_RETRY_SECONDS = 600.0
+# Tables fetched per tap_schema query — small enough that the columns query
+# stays well within the ~60s sync window even for 100-200-column breadth tables.
+_SCHEMA_FETCH_CHUNK = 5
 
 _SCHEMA_REFRESH_LOCK = threading.Lock()
 _SCHEMA_REFRESH_STATE: Dict[str, Any] = {"in_flight": False, "last_attempt": 0.0}
@@ -853,12 +868,73 @@ def _reset_refresh_state_for_tests() -> None:
 
 
 def registered_qualified_tables() -> List[str]:
-    """Every curated catalog.table, qualified — the default TAP-schema fetch scope."""
+    """Every curated catalog.table, qualified."""
     return sorted(
         f"{catalog}.{table}"
         for catalog, entry in DATALAB_CATALOGS.items()
         for table in entry.get("tables", {})
     )
+
+
+# Extra Data Lab tables reachable through the live-TAP-schema fallback
+# (describe_table -> live_table_entry). Each was verified live (2026-07-13) to
+# exist with an indexed q3c ra/dec pair and to answer a governed q3c cone query;
+# they are kept OUT of the hand-curated DATALAB_CATALOGS on purpose — their
+# column lists are large (100-200+ cols) and are better read from the live
+# schema than hardcoded. Seeding them into the default refresh scope makes them
+# queryable and describable out of the box: survey breadth as data, not code.
+# footprint/citation are the canonical survey references (columns still come
+# from the live schema, never guessed).
+EXPANSION_CATALOGS: List[Dict[str, Any]] = [
+    {
+        "catalog": "delve_dr2", "table": "objects",
+        "footprint": "DECam Local Volume Exploration Survey DR2 — ~21,000 deg² of the "
+                     "high-Galactic-latitude southern sky and Magellanic periphery (grizY).",
+        "citation": {
+            "text": "DELVE Data Release 2 (Drlica-Wagner et al. 2022)",
+            "doi": "10.3847/1538-4365/ac78eb",
+            "url": "https://datalab.noirlab.edu/delve/",
+        },
+    },
+    {
+        "catalog": "catwise2020", "table": "main",
+        "footprint": "CatWISE2020 — all-sky W1+W2 co-adds from WISE/NEOWISE (2010–2018).",
+        "citation": {
+            "text": "CatWISE2020 (Marocco et al. 2021)",
+            "doi": "10.3847/1538-4365/abd805",
+            "url": "https://catwise.github.io/",
+        },
+    },
+    {
+        "catalog": "ls_dr10", "table": "tractor",
+        "footprint": "DESI Legacy Imaging Surveys DR10 — ~20,000 deg² of grizW1–W4 tractor "
+                     "photometry (DECam + BASS/MzLS).",
+        "citation": {
+            "text": "DESI Legacy Imaging Surveys DR10 (Dey et al. 2019)",
+            "doi": "10.3847/1538-3881/ab089d",
+            "url": "https://www.legacysurvey.org/dr10/",
+        },
+    },
+]
+
+_EXPANSION_BY_QUALIFIED: Dict[str, Dict[str, Any]] = {
+    f"{entry['catalog']}.{entry['table']}": entry for entry in EXPANSION_CATALOGS
+}
+
+
+def expansion_qualified_tables() -> List[str]:
+    """The verified live-fallback tables, qualified."""
+    return [f"{entry['catalog']}.{entry['table']}" for entry in EXPANSION_CATALOGS]
+
+
+def default_refresh_tables() -> List[str]:
+    """Default TAP-schema fetch scope: every curated table plus the verified
+    expansion set, so breadth catalogs are cached (and thus queryable through
+    the governor) after the nightly refresh. Order-stable and de-duplicated."""
+    ordered: Dict[str, None] = {}
+    for name in registered_qualified_tables() + expansion_qualified_tables():
+        ordered.setdefault(name, None)
+    return list(ordered)
 
 
 def tap_schema_ttl_seconds() -> int:
@@ -884,48 +960,56 @@ def refresh_tap_schema(
     "refreshed_at": epoch}``.
     """
 
-    wanted = list(tables) if tables else registered_qualified_tables()
-    # Identifier safety: every name is registry-supplied or caller code (never
-    # end-user text), and _normalize_qualified rejects anything but [\w.].
-    in_list = ", ".join("'" + _normalize_qualified(name) + "'" for name in wanted)
-    tables_df = client.query(
-        sql=(
-            "SELECT table_name, table_type, description FROM tap_schema.tables "
-            f"WHERE table_name IN ({in_list})"
-        ),
-        fmt="pandas",
-    ).dataframe
-    columns_df = client.query(
-        sql=(
-            "SELECT table_name, column_name, datatype, unit, indexed FROM tap_schema.columns "
-            f"WHERE table_name IN ({in_list})"
-        ),
-        fmt="pandas",
-    ).dataframe
+    wanted = list(tables) if tables else default_refresh_tables()
 
     tables_map: Dict[str, Dict[str, Any]] = {}
-    for row in tables_df.to_dict("records"):
-        name = str(row.get("table_name") or "").strip().lower()
-        if name:
-            tables_map[name] = {
-                "table_type": row.get("table_type"),
-                "description": row.get("description"),
-            }
     columns_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for row in columns_df.to_dict("records"):
-        name = str(row.get("table_name") or "").strip().lower()
-        column = str(row.get("column_name") or "").strip().lower()
-        if not name or not column:
-            continue
-        try:
-            indexed = bool(int(row.get("indexed") or 0))
-        except (TypeError, ValueError):
-            indexed = False
-        columns_map.setdefault(name, {})[column] = {
-            "datatype": row.get("datatype"),
-            "unit": row.get("unit"),
-            "indexed": indexed,
-        }
+    # Fetch in small chunks: a single tap_schema.columns query over the full
+    # default scope (curated + the 100-200-column breadth tables) exceeds the
+    # ~60s sync window and times out (live-verified 2026-07-13: 17 tables in one
+    # IN-list timed out, 4-5 per query returns in seconds). Per-chunk merge keeps
+    # the payload identical to a single query.
+    for start in range(0, len(wanted), _SCHEMA_FETCH_CHUNK):
+        chunk = wanted[start:start + _SCHEMA_FETCH_CHUNK]
+        # Identifier safety: every name is registry-supplied or caller code
+        # (never end-user text); _normalize_qualified rejects anything but [\w.].
+        in_list = ", ".join("'" + _normalize_qualified(name) + "'" for name in chunk)
+        tables_df = client.query(
+            sql=(
+                "SELECT table_name, table_type, description FROM tap_schema.tables "
+                f"WHERE table_name IN ({in_list})"
+            ),
+            fmt="pandas",
+        ).dataframe
+        columns_df = client.query(
+            sql=(
+                "SELECT table_name, column_name, datatype, unit, indexed FROM tap_schema.columns "
+                f"WHERE table_name IN ({in_list})"
+            ),
+            fmt="pandas",
+        ).dataframe
+
+        for row in tables_df.to_dict("records"):
+            name = str(row.get("table_name") or "").strip().lower()
+            if name:
+                tables_map[name] = {
+                    "table_type": row.get("table_type"),
+                    "description": row.get("description"),
+                }
+        for row in columns_df.to_dict("records"):
+            name = str(row.get("table_name") or "").strip().lower()
+            column = str(row.get("column_name") or "").strip().lower()
+            if not name or not column:
+                continue
+            try:
+                indexed = bool(int(row.get("indexed") or 0))
+            except (TypeError, ValueError):
+                indexed = False
+            columns_map.setdefault(name, {})[column] = {
+                "datatype": row.get("datatype"),
+                "unit": row.get("unit"),
+                "indexed": indexed,
+            }
 
     # MERGE with whatever is already cached (per-table replace): a scoped
     # refresh (tables=[...]) that seeded a non-curated table must survive the
@@ -1092,6 +1176,9 @@ def live_table_entry(catalog: str, table: str, *, cache_dir: Path | str | None =
                 healpix.append({"name": name, "nside": nside, "scheme": scheme})
     catalog_key = _normalize_identifier(catalog)
     table_key = _normalize_identifier(table)
+    # Verified expansion catalogs carry a curated footprint + citation overlay
+    # (the columns still come from the live schema, never hardcoded).
+    overlay = _EXPANSION_BY_QUALIFIED.get(f"{catalog_key}.{table_key}", {})
     return {
         "catalog": catalog_key,
         "table": table_key,
@@ -1104,8 +1191,8 @@ def live_table_entry(catalog: str, table: str, *, cache_dir: Path | str | None =
         "morphology": {},
         "bitmasks": {},
         "aggregate_safe": False,
-        "footprint": None,
-        "citation": {},
+        "footprint": overlay.get("footprint"),
+        "citation": dict(overlay.get("citation", {})),
         "source": "live_tap_schema",
     }
 
@@ -1167,12 +1254,15 @@ def dataframe_from_schema(rows: List[Mapping[str, Any]]) -> pd.DataFrame:
 
 __all__ = [
     "DATALAB_CATALOGS",
+    "EXPANSION_CATALOGS",
     "aggregate_safe_tables",
     "cached_tap_schema",
     "citation",
     "dataframe_from_schema",
+    "default_refresh_tables",
     "describe_table",
     "ensure_tap_schema_fresh",
+    "expansion_qualified_tables",
     "known_columns",
     "list_catalogs",
     "live_columns",

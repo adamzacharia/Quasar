@@ -3151,7 +3151,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 if self.last_search_results is not None and not self.last_search_results.empty
                 else []
             )
-        return self.plotting_service.plot_sky_map(data_records=records, **clean)
+        out = self.plotting_service.plot_sky_map(data_records=records, **clean)
+        if not isinstance(out, dict) or not out.get("success"):
+            return out
+        # Attach the image card ourselves: display must not depend on the model
+        # pasting the right URL (live P11 re-run: it embedded the WINDOWS FILE
+        # PATH from png_path, so a successful map never appeared in chat).
+        card = dict(out)
+        card["path"] = out.get("web_url")
+        card["image_base64"] = out.get("base64_png")
+        attached = self._datalab_attach_image_result(
+            card, str(kw.get("title") or clean.get("title") or "Sky distribution map")
+        )
+        attached.pop("base64_png", None)  # heavy duplicate of the stripped image_base64
+        return attached
 
     def _datalab_coordinates(
         self,

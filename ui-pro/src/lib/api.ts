@@ -1,7 +1,22 @@
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
 import { splitProviderChunk } from "./feedback-report";
+import { getStoredToken } from "./auth-store";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+/**
+ * INTERIM Bearer revert (2026-07-13): every helper below defaults to the
+ * persisted JWT when the caller passes no explicit token, because the S6
+ * httpOnly cookie is dropped by third-party-cookie blocking in the cross-site
+ * production topology (quasarassistant.com → onrender.com). The explicit
+ * `token` parameters are kept so legacy callers keep working. Remove the
+ * getStoredToken() fallbacks once the API is same-site
+ * (api.quasarassistant.com) and auth can ride the cookie alone again.
+ */
+function bearerOnlyHeaders(token?: string | null): Record<string, string> {
+    const t = token || getStoredToken();
+    return t ? { Authorization: `Bearer ${t}` } : {};
+}
 
 export interface ChatRequest {
     message: string;
@@ -100,6 +115,10 @@ export function isUnauthorizedApiError(error: unknown): boolean {
 export async function sendChatMessage(request: ChatRequest, callbacks: StreamCallbacks, signal?: AbortSignal): Promise<void> {
     try {
         let response: Response;
+        // INTERIM Bearer revert: fall back to the persisted token so the chat
+        // request authenticates even when the browser drops the cross-site
+        // auth cookie (the production failure mode).
+        const authToken = request.token || getStoredToken();
 
         if (request.attachments && request.attachments.length > 0) {
             // Multipart upload for attachments
@@ -110,12 +129,10 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             if (request.grounded_summary) form.append("grounded_summary", "true");
             form.append("web_search", request.web_search !== false ? "true" : "false");
             request.attachments.forEach(f => form.append("files", f));
-            const headers: Record<string, string> = {};
-            if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
+            const headers: Record<string, string> = bearerOnlyHeaders(authToken);
             response = await fetch(`${API_BASE}/api/chat/upload`, { credentials: "include", method: "POST", headers, body: form, signal });
         } else {
-            const headers: Record<string, string> = { "Content-Type": "application/json" };
-            if (request.token) headers["Authorization"] = `Bearer ${request.token}`;
+            const headers: Record<string, string> = { "Content-Type": "application/json", ...bearerOnlyHeaders(authToken) };
             response = await fetch(`${API_BASE}/api/chat`, { credentials: "include",
                 method: "POST",
                 headers,
@@ -303,8 +320,7 @@ export async function submitPlanFeedback(
     feedback: string = "",
     token?: string,
 ): Promise<{ status: string; action: string }> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const headers: Record<string, string> = { "Content-Type": "application/json", ...bearerOnlyHeaders(token) };
 
     const res = await fetch(`${API_BASE}/api/plan-feedback`, { credentials: "include",
         method: "POST",
@@ -448,9 +464,8 @@ export interface SpectralLineJob {
 }
 
 function spectralAuthHeaders(token?: string | null, json = false): Record<string, string> {
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = bearerOnlyHeaders(token);
     if (json) headers["Content-Type"] = "application/json";
-    if (token) headers.Authorization = `Bearer ${token}`;
     return headers;
 }
 
@@ -741,8 +756,7 @@ export async function createWorkbenchSession(
     },
     token?: string | null,
 ): Promise<WorkbenchSession> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/session`, { credentials: "include",
         method: "POST",
         headers,
@@ -752,8 +766,7 @@ export async function createWorkbenchSession(
 }
 
 export async function getWorkbenchMetadata(sessionId: string, token?: string | null): Promise<WorkbenchMetadata> {
-    const headers: Record<string, string> = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = bearerOnlyHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/metadata`, { credentials: "include", headers });
     return parseJsonResponse<WorkbenchMetadata>(res);
 }
@@ -766,8 +779,7 @@ export async function startWorkbenchJob(
     },
     token?: string | null,
 ): Promise<WorkbenchJobResponse> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs`, { credentials: "include",
         method: "POST",
         headers,
@@ -781,8 +793,7 @@ export async function getWorkbenchJob(
     jobId: string,
     token?: string | null,
 ): Promise<WorkbenchJobResponse> {
-    const headers: Record<string, string> = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = bearerOnlyHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, { credentials: "include", headers });
     return parseJsonResponse<WorkbenchJobResponse>(res);
 }
@@ -792,8 +803,7 @@ export async function cancelWorkbenchJob(
     jobId: string,
     token?: string | null,
 ): Promise<WorkbenchJobResponse> {
-    const headers: Record<string, string> = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = bearerOnlyHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/jobs/${jobId}`, { credentials: "include",
         method: "DELETE",
         headers,
@@ -814,8 +824,7 @@ export async function planWorkbenchRender(
     },
     token?: string | null,
 ): Promise<WorkbenchRenderPlan> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/render`, { credentials: "include",
         method: "POST",
         headers,
@@ -834,8 +843,7 @@ export async function prepareWorkbenchProduct(
     } = {},
     token?: string | null,
 ): Promise<WorkbenchPrepareResult> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/prepare`, { credentials: "include",
         method: "POST",
         headers,
@@ -855,8 +863,7 @@ export async function planWorkbenchSpectrum(
     },
     token?: string | null,
 ): Promise<WorkbenchSpectrumPlan> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/spectrum`, { credentials: "include",
         method: "POST",
         headers,
@@ -874,8 +881,7 @@ export async function planWorkbenchPvSlice(
     },
     token?: string | null,
 ): Promise<WorkbenchPvSlicePlan> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/pv-slice`, { credentials: "include",
         method: "POST",
         headers,
@@ -895,8 +901,7 @@ export async function getWorkbenchLineOverlays(
     },
     token?: string | null,
 ): Promise<WorkbenchLineOverlays> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/line-overlays`, { credentials: "include",
         method: "POST",
         headers,
@@ -915,8 +920,7 @@ export async function getWorkbenchExports(
     formats: string[] = ["casa", "carta", "ds9", "python"],
     token?: string | null,
 ): Promise<WorkbenchExports> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers: Record<string, string> = authHeaders(token);
     const res = await fetch(`${API_BASE}/api/workbench/${sessionId}/export`, { credentials: "include",
         method: "POST",
         headers,
@@ -933,8 +937,7 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks, sig
         // S5: /api/proposals/review now requires authentication. Send the
         // user's Bearer token (do NOT set Content-Type — the browser sets the
         // multipart/form-data boundary for FormData automatically).
-        const headers: Record<string, string> = {};
-        if (token) headers.Authorization = `Bearer ${token}`;
+        const headers: Record<string, string> = bearerOnlyHeaders(token);
         const response = await fetch(`${API_BASE}/api/proposals/review`, { credentials: "include",
             method: "POST",
             headers,
@@ -988,11 +991,10 @@ export async function reviewProposal(file: File, callbacks: StreamCallbacks, sig
 // ── Conversation History API ────────────────────────────────────
 
 function authHeaders(token?: string | null): Record<string, string> {
-    // Auth normally rides the httpOnly cookie (credentials: "include"); the
-    // Bearer header is only added for legacy callers that still hold a token.
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-    return headers;
+    // INTERIM Bearer revert: the Bearer header (explicit token, else the
+    // persisted one) is the credential that works everywhere; the httpOnly
+    // cookie still rides along for browsers that accept it cross-site.
+    return { "Content-Type": "application/json", ...bearerOnlyHeaders(token) };
 }
 
 export interface ServerConversation {
@@ -1081,7 +1083,7 @@ export interface MyTableEntry {
 }
 
 export async function listDatalabJobs(): Promise<DatalabJobRecord[]> {
-    const res = await fetch(`${API_BASE}/api/datalab/jobs`, { credentials: "include" });
+    const res = await fetch(`${API_BASE}/api/datalab/jobs`, { credentials: "include", headers: bearerOnlyHeaders() });
     const data = await parseJsonResponse<{ jobs: DatalabJobRecord[] }>(res);
     return data.jobs || [];
 }
@@ -1090,12 +1092,13 @@ export async function cancelDatalabJob(jobId: string): Promise<DatalabJobRecord>
     const res = await fetch(`${API_BASE}/api/datalab/jobs/${encodeURIComponent(jobId)}`, {
         credentials: "include",
         method: "DELETE",
+        headers: bearerOnlyHeaders(),
     });
     return parseJsonResponse<DatalabJobRecord>(res);
 }
 
 export async function listMyTables(): Promise<MyTableEntry[]> {
-    const res = await fetch(`${API_BASE}/api/datalab/mytables`, { credentials: "include" });
+    const res = await fetch(`${API_BASE}/api/datalab/mytables`, { credentials: "include", headers: bearerOnlyHeaders() });
     const data = await parseJsonResponse<{ my_tables: MyTableEntry[] }>(res);
     return data.my_tables || [];
 }
@@ -1104,6 +1107,7 @@ export async function deleteMyTable(name: string): Promise<boolean> {
     const res = await fetch(`${API_BASE}/api/datalab/mytables/${encodeURIComponent(name)}`, {
         credentials: "include",
         method: "DELETE",
+        headers: bearerOnlyHeaders(),
     });
     return res.ok;
 }

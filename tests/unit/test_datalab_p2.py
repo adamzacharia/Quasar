@@ -246,6 +246,37 @@ def test_plot_sky_map_numeric_color_by_uses_colorbar(monkeypatch):
     assert legend is not None and len(legend.get_texts()) <= 21
 
 
+def test_plot_sky_map_tool_attaches_image_card(monkeypatch):
+    """Live P11 re-run: plot_sky_map succeeded but the map never appeared in
+    chat — the model pasted the Windows png_path instead of the web URL. The
+    adapter now attaches the image card itself and strips the heavy base64."""
+    from tests.unit.test_datalab_p0 import _make_agent
+
+    agent = _make_agent()
+    agent.last_run_result = None
+    agent.last_search_results = None
+
+    def fake_map(data_records, **kw):
+        return {"success": True, "web_url": "/plots/sky_x.png",
+                "png_path": r"C:\abs\sky_x.png", "base64_png": "QUJD" * 4000,
+                "filename": "sky_x"}
+
+    import types as _types
+    agent.plotting_service = _types.SimpleNamespace(plot_sky_map=fake_map)
+    from services.datalab_result_store import DatalabResultStore
+    import services.datalab_result_store as store_mod
+    store = DatalabResultStore(enable_disk_cache=False)
+    rid = store.put(pd.DataFrame({"ra": [1.0, 2.0], "dec": [3.0, 4.0]}), {"catalog": "x", "table": "y"})
+    monkeypatch.setattr(store_mod, "default_result_store", lambda: store)
+
+    out = agent._plot_sky_map_tool(result_id=rid, title="LRG sky map")
+    assert out["image_attached"] is True
+    assert "base64_png" not in out and "image_base64" not in out
+    assert agent.last_run_result == {
+        "type": "image", "image_url": "/plots/sky_x.png", "caption": "LRG sky map",
+    }
+
+
 def test_async_submit_strips_materialized_sync_keeps_it(monkeypatch):
     """The async query manager's JSQLParser rejects `AS MATERIALIZED`
     ("Encountered MATERIALIZED", live P9 2026-07-13) while the sync endpoint

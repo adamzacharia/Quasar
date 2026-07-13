@@ -74,8 +74,10 @@ export function AuthModal() {
             const data = await res.json();
             if (!res.ok) throw new Error(data.detail || "Google authentication failed");
 
-            // Auth now lives in the httpOnly cookie set by this response.
-            setAuth(data.user);
+            // INTERIM Bearer revert: persist the body token again — the
+            // httpOnly cookie this response also sets is dropped by browsers
+            // that block third-party cookies (cross-site API topology).
+            setAuth(data.user, data.token);
             closeAuthModal();
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } catch (err: any) {
@@ -105,8 +107,9 @@ export function AuthModal() {
 
             if (!res.ok) throw new Error(data.detail || "Authentication failed");
 
-            // Auth now lives in the httpOnly cookie set by this response.
-            setAuth(data.user);
+            // INTERIM Bearer revert: persist the body token again (see the
+            // Google handler above for why).
+            setAuth(data.user, data.token);
             closeAuthModal();
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } catch (err: any) {

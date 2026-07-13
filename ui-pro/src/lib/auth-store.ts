@@ -19,11 +19,21 @@ export interface User {
 
 interface AuthStore {
     user: User | null;
+    /**
+     * INTERIM Bearer revert (2026-07-13): the JWT is persisted and sent as an
+     * Authorization header again because the production topology is cross-site
+     * (quasarassistant.com → quasar-oi14.onrender.com) and browsers that block
+     * third-party cookies silently drop the S6 httpOnly auth cookie, logging
+     * users out on their first request. Remove this field (and the Bearer
+     * plumbing that reads it) once the API moves to api.quasarassistant.com
+     * and the cookie becomes first-party.
+     */
+    token: string | null;
     isAuthenticated: boolean;
     /** False until the httpOnly-cookie session has been verified via /api/auth/me. */
     isInitialized: boolean;
     isAuthModalOpen: boolean;
-    setAuth: (user: User) => void;
+    setAuth: (user: User, token?: string | null) => void;
     /** Local sign-out + best-effort server cookie clear. */
     logout: () => void;
     /** Local-only sign-out (no server call) — for 401s discovered mid-session. */
@@ -36,7 +46,7 @@ interface AuthStore {
 // Per-user app state (conversations, workbench, etc.) must not leak across an
 // account change on the same browser. Registered by the chat store so this
 // store can scrub it on sign-out without an import cycle.
-let sessionScrubbers: Array<() => void> = [];
+const sessionScrubbers: Array<() => void> = [];
 export function registerSessionScrubber(fn: () => void): void {
     sessionScrubbers.push(fn);
 }
@@ -54,13 +64,15 @@ export const useAuthStore = create<AuthStore>()(
     persist(
         (set) => ({
             user: null,
+            token: null,
             isAuthenticated: false,
             isInitialized: false,
             isAuthModalOpen: false,
-            setAuth: (user) => {
+            setAuth: (user, token) => {
                 bumpAuthGeneration();
                 set({
                     user,
+                    token: token ?? null,
                     isAuthenticated: true,
                     isInitialized: true,
                     isAuthModalOpen: false,
@@ -82,6 +94,7 @@ export const useAuthStore = create<AuthStore>()(
                 // auth modal atomically so the signed-out UI is immediate.
                 set({
                     user: null,
+                    token: null,
                     isAuthenticated: false,
                     isInitialized: true,
                     isAuthModalOpen: true,
@@ -94,6 +107,7 @@ export const useAuthStore = create<AuthStore>()(
                 // the identity, keep isInitialized, prompt re-auth.
                 set({
                     user: null,
+                    token: null,
                     isAuthenticated: false,
                     isInitialized: true,
                     isAuthModalOpen: true,
@@ -105,15 +119,20 @@ export const useAuthStore = create<AuthStore>()(
         }),
         {
             name: "quasar-auth",
-            // v1 strips the legacy persisted JWT (S6: tokens never touch
-            // localStorage again — auth lives in the httpOnly cookie).
-            version: 1,
+            // v1 stripped the legacy persisted JWT (S6 cookie migration).
+            // v2 persists it again (INTERIM Bearer revert — see the `token`
+            // field comment): third-party-cookie blocking breaks the
+            // cross-site cookie in production, so auth rides the
+            // Authorization header until the API is same-site.
+            version: 2,
             migrate: (persisted: unknown) => {
+                // v0 states still carry their pre-S6 token — keep it (if the
+                // JWT secret rotated it will fail /me and clear cleanly).
+                // v1 states simply have no token; nothing to transform.
                 const state = (persisted ?? {}) as Record<string, unknown>;
-                delete state.token;
                 return state as never;
             },
-            partialize: (state) => ({ user: state.user }),
+            partialize: (state) => ({ user: state.user, token: state.token }),
             onRehydrateStorage: () => () => {
                 // Server-authoritative: the persisted user is display data only.
                 // isAuthenticated/isInitialized stay false until /api/auth/me
@@ -141,10 +160,19 @@ export const useAuthStore = create<AuthStore>()(
  */
 export async function verifyAuth(): Promise<void> {
     const generation = currentAuthGeneration();
+    // onRehydrateStorage fires this DURING the create() call above, so nothing
+    // here may touch useAuthStore synchronously (TDZ crash — blank app). Yield
+    // one microtask first: module evaluation finishes, the store binding
+    // exists, and only then do we read the token.
+    await Promise.resolve();
     try {
         const res = await fetch(`${API_BASE}/api/auth/me`, {
             credentials: "include",
             cache: "no-store",
+            // INTERIM Bearer revert: browsers that block third-party cookies
+            // never present the httpOnly cookie cross-site, so the persisted
+            // token is the credential that actually authenticates.
+            headers: authBearerHeaders(),
         });
         if (generation !== currentAuthGeneration()) return; // superseded by login/logout
         if (res.ok) {
@@ -169,15 +197,17 @@ export async function verifyAuth(): Promise<void> {
                 // the page-level gate (cold-start home vs. an in-app page).
                 useAuthStore.setState({
                     user: null,
+                    token: null,
                     isAuthenticated: false,
                     isInitialized: true,
                 });
             }
         } else if (res.status === 401) {
-            // No/expired cookie. The page-level gate decides whether to prompt
-            // (home opens the modal; deep pages show their own sign-in gate).
+            // No/expired credential. The page-level gate decides whether to
+            // prompt (home opens the modal; deep pages show their own gate).
             useAuthStore.setState({
                 user: null,
+                token: null,
                 isAuthenticated: false,
                 isInitialized: true,
             });
@@ -188,4 +218,77 @@ export async function verifyAuth(): Promise<void> {
         if (generation !== currentAuthGeneration()) return;
         useAuthStore.setState({ isInitialized: true });
     }
+}
+
+/**
+ * INTERIM Bearer revert (2026-07-13) — read the persisted JWT.
+ *
+ * The S6 httpOnly cookie is dropped by third-party-cookie blocking in the
+ * cross-site production topology (quasarassistant.com → onrender.com), so
+ * every backend call attaches the token as an Authorization header again.
+ * The backend has always accepted Bearer-or-cookie, so no server change is
+ * needed. Delete this helper (and its call sites) when the API moves to
+ * api.quasarassistant.com and the cookie becomes first-party.
+ */
+export function getStoredToken(): string | null {
+    return useAuthStore.getState().token;
+}
+
+// ── Cross-tab session sync (INTERIM Bearer revert) ───────────────────────────
+// The S6 cookie was browser-wide state: signing out in one tab made every
+// other tab 401 on its next request. A Bearer token lives per-tab in zustand
+// memory, so mirror auth changes through the persisted key instead:
+//  - a NEW-bundle tab (v2 write) signs out / token gone → sign out here too;
+//  - a NEW-bundle tab signs in with a different token → adopt that session;
+//  - a STALE pre-revert tab (v1 write, token stripped by its partialize)
+//    clobbers the key during the deploy-overlap window → re-persist our live
+//    state so the fresh token survives until stale tabs age out.
+// Guarded on token difference so two v2 tabs can never ping-pong writes.
+if (typeof window !== "undefined") {
+    window.addEventListener("storage", (event) => {
+        if (event.key !== "quasar-auth") return;
+        try {
+            const current = useAuthStore.getState();
+            const incoming = event.newValue ? JSON.parse(event.newValue) : null;
+            const version = incoming?.version;
+            const state = (incoming?.state ?? {}) as {
+                token?: string | null;
+                user?: User | null;
+            };
+            if (incoming && typeof version === "number" && version < 2) {
+                // Stale-bundle clobber: heal by re-persisting (any setState
+                // makes the persist middleware rewrite the key at v2).
+                if (current.token) useAuthStore.setState({});
+                return;
+            }
+            const incomingToken = state.token ?? null;
+            if (!incomingToken && current.isAuthenticated) {
+                current.clearAuth();
+            } else if (
+                incomingToken &&
+                incomingToken !== current.token &&
+                state.user &&
+                state.user.id
+            ) {
+                bumpAuthGeneration();
+                useAuthStore.setState({
+                    user: state.user,
+                    token: incomingToken,
+                    isAuthenticated: true,
+                    isInitialized: true,
+                    isAuthModalOpen: false,
+                });
+            }
+        } catch {
+            /* a malformed storage write must never break the app */
+        }
+    });
+}
+
+/** Merge an Authorization: Bearer header (when signed in) into `extra`. */
+export function authBearerHeaders(
+    extra: Record<string, string> = {},
+): Record<string, string> {
+    const token = getStoredToken();
+    return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
 }

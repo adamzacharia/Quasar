@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import { Download, Eye, ExternalLink, Link2, Loader2, X, Telescope, BarChart3, Map, AlertTriangle, Activity, Layers, FileCode, Radio, Copy, Check } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
 import { createWorkbenchSession } from "../lib/api";
-import { useAuthStore } from "../lib/auth-store";
+import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { AladinSkyView, type StcsFootprint } from "./AladinSkyView";
 import { buildCrossMatchPrompt, dispatchPrefillPrompt } from "../lib/prompt-dispatch";
 
@@ -1254,9 +1254,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
         try {
             const response = await fetch(`${API_BASE}/api/fits/preview`, { credentials: "include",
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({
                     url,
                     filename: String(row.File || ""),

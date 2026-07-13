@@ -9,7 +9,7 @@ import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, Send, X }
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message } from "../lib/types";
-import { useAuthStore } from "../lib/auth-store";
+import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { DataTableCard } from "./DataTableCard";
 import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
@@ -89,9 +89,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
         try {
             await fetch(`${API_BASE}/api/feedback`, { credentials: "include",
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({
                     message_id: message.id,
                     run_id: message.runMeta?.run_id || "",
@@ -114,9 +112,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
         try {
             const response = await fetch(`${API_BASE}/api/issue-reports`, { credentials: "include",
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({
                     run_id: message.runMeta.run_id,
                     message_id: message.id,
