@@ -62,7 +62,8 @@ class SkyMonitorService:
     def _connect(self):
         from services.db import get_connection  # lazy
 
-        conn = get_connection(local_db_path=self.db_path) if self.db_path else get_connection()
+        conn = (get_connection(local_db_path=self.db_path, autocommit=True)
+                if self.db_path else get_connection(autocommit=True))
         cur = conn.cursor()
         cur.execute(_TARGETS_DDL)
         cur.execute(_HITS_DDL)

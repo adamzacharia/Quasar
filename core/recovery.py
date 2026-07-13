@@ -377,6 +377,14 @@ class RecoveryEngine:
         if isinstance(result, str) and not result.strip():
             return True
         if isinstance(result, dict):
+            # C8: a SUCCESSFUL tool result with an explicit zero count is a
+            # meaningful scientific answer ("confirmed: no data found"), not a
+            # failure to recover from. C3 made genuine archive outages typed
+            # errors (success=False + error), which _check_soft_failure catches
+            # BEFORE this check — so recovering here only rewrote valid
+            # "none found" answers via RETRY/REPLAN.
+            if result.get("success") is True:
+                return False
             if result.get("total_results", -1) == 0:
                 return True
             if result.get("file_count", -1) == 0:

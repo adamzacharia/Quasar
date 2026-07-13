@@ -845,7 +845,6 @@ def fit_spectral_line(
                 fit_result = {"fit_error": str(fit_err)}
 
         # Plot
-        import math
         fig, ax = plt.subplots(figsize=(12, 5), facecolor="#0f172a")
         ax.set_facecolor("#0f172a")
 

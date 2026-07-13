@@ -217,3 +217,14 @@ CLAUDE.local.md
 Quasar-handoff/
 tmp/codex/
 codex-bridge/tmp/
+
+# ============================================
+# Internal development docs (local only — planning / handoff / design
+# scaffolding for building Quasar; not part of the shipped project)
+# ============================================
+docs/v2/
+docs/plans/
+docs/QUASAR_V2_DESIGN.md
+docs/QUASAR_V2_EXECUTION_PLAN.md
+docs/implementation_plan.md
+# (Quasar-main.code-workspace already covered by /*.code-workspace above)

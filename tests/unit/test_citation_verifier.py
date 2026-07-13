@@ -143,3 +143,22 @@ def test_append_citation_warning_streams_warning_token_for_unresolved():
     assert "Unverified citations" in tokens[0]
     assert bad_bibcode in tokens[0]
     assert answer.endswith(tokens[0])
+
+
+def test_extract_citations_handles_unicode_dashes_in_dois():
+    """LLM typography swaps ASCII hyphens for U+2010..U+2014/U+2212; without
+    them in the DOI charset '10.1051/0004‑6361/202243940' truncates to
+    '10.1051/0004' and the verifier flags a mangled id (live P6)."""
+    from services.citation_verifier import extract_citations
+
+    text = (
+        "the selection follows the mission paper (DOI: 10.1051/0004‑6361/202243940) "
+        "and the en–dash variant 10.3847/1538–4357/ac5c50."
+    )
+    out = extract_citations(text)
+    # Dashes are normalized to ASCII so the (real) DOI resolves against ADS.
+    assert "10.1051/0004-6361/202243940" in out["dois"]
+    assert "10.3847/1538-4357/ac5c50" in out["dois"]
+    # Plain-ASCII DOIs still extract exactly, without trailing punctuation.
+    plain = extract_citations("see https://doi.org/10.1051/0004-6361/202243940, Fig 2.")
+    assert plain["dois"] == ["10.1051/0004-6361/202243940"]

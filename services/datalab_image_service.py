@@ -261,9 +261,158 @@ class DatalabImageService:
 
         ref = cutouts[green_b]
         reproj: Dict[str, Any] = {}
+        coverage: Dict[str, float] = {}
+        stale_paths: List[str] = []
+
+        def _covered_mask(arr: Any) -> Any:
+            # Coverage = finite AND non-zero: reproject fills outside the tile
+            # footprint with NaN, but SMASH/coadd tiles pad their unobserved
+            # region with exact ZEROS (live Hydra II: the z tile's zero strip
+            # survived a finite-only mask and rendered as a false-green band).
+            # Real sky-subtracted pixels are noisy floats — exact 0.0 is padding.
+            a = np.asarray(arr, dtype=float)
+            return np.isfinite(a) & (a != 0.0)
+
+        def _finite_frac(arr: Any) -> float:
+            mask = _covered_mask(arr)
+            return float(mask.sum()) / float(mask.size or 1)
+
         for band in rgb_bands:
             arr, _ = reproject_interp((cutouts[band].data, cutouts[band].wcs), ref.wcs, shape_out=ref.data.shape)
-            reproj[band] = arr
+            reproj[band] = np.asarray(arr, dtype=float)
+            coverage[band] = _finite_frac(reproj[band])
+
+        # Per-band overlap fallthrough: a tile that only PARTIALLY overlaps the
+        # field reprojects with NaN over the uncovered area, and Lupton renders
+        # that black (live P14 2026-07-12: a SMASH tile covering part of the
+        # Hydra II field produced a half-black composite). Try the remaining
+        # candidates for any low-coverage band before rendering.
+        MIN_BAND_COVERAGE = 0.9
+        for band in rgb_bands:
+            if coverage[band] >= MIN_BAND_COVERAGE:
+                continue
+            used_row = chosen[band]["row"]
+            idx = next(
+                (i for i, c in enumerate(band_candidates[band]) if c["row"] is used_row),
+                len(band_candidates[band]) - 1,
+            )
+            for cand in band_candidates[band][idx + 1:]:
+                try:
+                    image = self._load_image(cand["row"], ra=ra, dec=dec, fov_deg=fov_deg)
+                    cut = self._cutout_image(image, ra=ra, dec=dec, fov_deg=fov_deg)
+                    if self._is_degenerate(cut.data):
+                        self._cleanup_paths([image.path])
+                        continue
+                    arr, _ = reproject_interp((cut.data, cut.wcs), ref.wcs, shape_out=ref.data.shape)
+                    arr = np.asarray(arr, dtype=float)
+                    frac = _finite_frac(arr)
+                    if frac > coverage[band]:
+                        stale_paths.append(cutouts[band].path)
+                        cutouts[band] = cut
+                        chosen[band] = {"row": cand["row"]}
+                        reproj[band] = arr
+                        coverage[band] = frac
+                    else:
+                        self._cleanup_paths([image.path])
+                    if coverage[band] >= MIN_BAND_COVERAGE:
+                        break
+                except Exception:  # noqa: BLE001 - keep probing the remaining tiles
+                    continue
+
+        # Render only the region covered by ALL three bands. If that common
+        # region is a sliver, refuse honestly instead of shipping a mostly
+        # black image the model would then describe as the field.
+        common = np.ones(ref.data.shape, dtype=bool)
+        for band in rgb_bands:
+            common &= _covered_mask(reproj[band])
+        common_frac = float(common.mean()) if common.size else 0.0
+        coverage_summary = {band: round(coverage[band], 3) for band in rgb_bands}
+        coverage_note = None
+        render_wcs = ref.wcs
+        MIN_COMMON_COVERAGE = 0.25
+        if common_frac < MIN_COMMON_COVERAGE:
+            self._cleanup_paths([img.path for img in cutouts.values()] + stale_paths)
+            healthy = self._bands_with_healthy_refs(rows)
+            return {
+                "success": False,
+                "coverage_gap": True,
+                "image_base64": None,
+                "path": None,
+                "bands_used": [],
+                "band_coverage": coverage_summary,
+                "error": (
+                    f"The requested field is jointly covered by bands {rgb_bands} over only "
+                    f"{common_frac:.0%} of its area (per-band coverage: {coverage_summary}) — a "
+                    "composite here would be mostly black. Try a different band triplet "
+                    f"(healthy bands at this position: {healthy}), a smaller fov_deg, or a "
+                    "single-band cutout."
+                ),
+                "used_endpoint": search.get("used_endpoint"),
+                "provenance": dict(search.get("provenance") or {}),
+            }
+        if common_frac < 0.98:
+            # Largest contiguous block of majority-covered rows/columns: stray
+            # covered slivers at a tile edge would otherwise stretch a min-max
+            # bounding box back across the uncovered area (seen live at Hydra
+            # II: a one-pixel sliver at the frame top kept a black band in the
+            # render).
+            def _longest_run(mask: Any) -> tuple[int, int]:
+                best = (0, 0)
+                start = None
+                for i, v in enumerate(mask):
+                    if v and start is None:
+                        start = i
+                    if start is not None and (not v or i == len(mask) - 1):
+                        end = i + 1 if v else i
+                        if end - start > best[1] - best[0]:
+                            best = (start, end)
+                        start = None
+                return best
+
+            def _two_pass(first: str):
+                # The majority thresholds interact: once one axis is restricted
+                # (z covering a 38%-wide column band, live Hydra II), no line on
+                # the OTHER axis can reach 50% over the full frame — so profile
+                # the second axis only within the first axis's crop.
+                if first == "cols":
+                    x0, x1 = _longest_run(common.mean(axis=0) >= 0.5)
+                    if x1 <= x0:
+                        return None
+                    y0, y1 = _longest_run(common[:, x0:x1].mean(axis=1) >= 0.5)
+                else:
+                    y0, y1 = _longest_run(common.mean(axis=1) >= 0.5)
+                    if y1 <= y0:
+                        return None
+                    x0, x1 = _longest_run(common[y0:y1, :].mean(axis=0) >= 0.5)
+                if y1 <= y0 or x1 <= x0:
+                    return None
+                return y0, y1, x0, x1
+
+            crops = [c for c in (_two_pass("cols"), _two_pass("rows")) if c]
+            if crops:
+                y0, y1, x0, x1 = max(crops, key=lambda c: int(common[c[0]:c[1], c[2]:c[3]].sum()))
+            else:
+                ys, xs = np.nonzero(common)
+                y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+            try:
+                render_wcs = ref.wcs[y0:y1, x0:x1]
+            except Exception:  # noqa: BLE001 - a sliced WCS is display-only sugar
+                render_wcs = None
+            sub_common = common[y0:y1, x0:x1]
+            for band in rgb_bands:
+                arr = reproj[band][y0:y1, x0:x1]
+                # Black out residual uncovered pixels in EVERY channel — zeroing
+                # a single band paints false color instead of "no data".
+                reproj[band] = np.where(sub_common & np.isfinite(arr), arr, 0.0)
+            coverage_note = (
+                f"Composite cropped to the region covered by all three bands "
+                f"({common_frac:.0%} of the requested field; per-band coverage: {coverage_summary}). "
+                "State this crop when describing the image."
+            )
+        else:
+            for band in rgb_bands:
+                arr = reproj[band]
+                reproj[band] = np.where(np.isfinite(arr), arr, 0.0)
 
         try:
             from astropy.visualization import make_lupton_rgb
@@ -271,18 +420,20 @@ class DatalabImageService:
             raise ImportError("astropy.visualization is required for Data Lab color images") from exc
 
         rgb = make_lupton_rgb(reproj[red_b], reproj[green_b], reproj[blue_b], Q=q, stretch=stretch)
-        render = self._render_rgb(rgb, ref.wcs, title or f"Data Lab {blue_b}{green_b}{red_b} color image")
-        self._cleanup_paths([img.path for img in cutouts.values()])
-        return self._image_result(
-            render,
-            search,
-            bands=list(rgb_bands),
-            provenance_extra={
-                "selected_rows": {band: self._row_provenance(chosen[band]["row"]) for band in rgb_bands},
-                "reprojected_to": green_b,
-                "lupton_rgb_order": f"{red_b},{green_b},{blue_b}",
-            },
-        )
+        render = self._render_rgb(rgb, render_wcs, title or f"Data Lab {blue_b}{green_b}{red_b} color image")
+        self._cleanup_paths([img.path for img in cutouts.values()] + stale_paths)
+        provenance_extra = {
+            "selected_rows": {band: self._row_provenance(chosen[band]["row"]) for band in rgb_bands},
+            "reprojected_to": green_b,
+            "lupton_rgb_order": f"{red_b},{green_b},{blue_b}",
+            "band_coverage": coverage_summary,
+        }
+        if coverage_note:
+            provenance_extra["coverage_note"] = coverage_note
+        result = self._image_result(render, search, bands=list(rgb_bands), provenance_extra=provenance_extra)
+        if coverage_note:
+            result["note"] = coverage_note
+        return result
 
     def cutout_grid(
         self,

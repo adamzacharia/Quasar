@@ -53,7 +53,11 @@ export function attachThinkingStepsToLastAssistant(messages, thinkingSteps) {
     next[index] = {
         ...assistantMsg,
         thinkingSteps: finalSteps.length > 0 ? finalSteps : assistantMsg.thinkingSteps,
-        thinkingDuration: durationSeconds,
+        // A backend-reported duration (usage event durationMs) is authoritative;
+        // the wall-clock fallback measures stream LIFETIME, which drip
+        // throttling inflates in background tabs (live P15: 1,149s shown for a
+        // 253s turn).
+        thinkingDuration: assistantMsg.thinkingDuration || durationSeconds,
     };
     return { messages: next, didAttach: true };
 }

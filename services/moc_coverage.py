@@ -17,6 +17,12 @@ VALID_REGIMES = {"radio", "mm/sub-mm", "infrared", "optical", "uv", "x-ray", "ga
 # MocServer accepts SR=0 (point query) but returns HTTP 500 for 0 < SR < ~1e-4
 # (verified live 2026-07-03), so tiny nonzero radii are clamped up to this.
 MIN_NONZERO_RADIUS_DEG = 1e-4
+# MOC geometry fetch limits: order caps payload size (all-sky MOCs at order 10+
+# can be MBs); the cell cap triggers an automatic order downgrade.
+MAX_MOC_ORDER = 10
+MIN_MOC_ORDER = 3
+MAX_MOC_IDS = 4
+MAX_MOC_CELLS = 20000
 
 
 class MocCoverageService:
@@ -118,6 +124,86 @@ class MocCoverageService:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    def moc_geometry(self, ids: Any, order: Any = 8) -> Dict[str, Any]:
+        """Fetch MOC geometry (HEALPix cell maps) for survey/dataset IDs.
+
+        Returns, per id, the exact JSON format Aladin Lite's ``A.MOCFromJSON``
+        ingests ({"<order>": [cell, ...], ...}; verified live 2026-07-11).
+        Oversized MOCs are automatically downsampled to a coarser order."""
+        try:
+            id_list = [str(i).strip() for i in (ids or []) if str(i).strip()]
+            if not id_list:
+                return {"success": False, "error": "ids is required (MOCServer dataset IDs, e.g. 'CDS/P/SDSS9/color')."}
+            warnings: List[str] = []
+            if len(id_list) > MAX_MOC_IDS:
+                warnings.append(f"Fetching the first {MAX_MOC_IDS} of {len(id_list)} MOC geometries.")
+                id_list = id_list[:MAX_MOC_IDS]
+            try:
+                order_i = int(order)
+            except (TypeError, ValueError):
+                order_i = 8
+            order_i = max(MIN_MOC_ORDER, min(order_i, MAX_MOC_ORDER))
+
+            mocs: List[Dict[str, Any]] = []
+            for moc_id in id_list:
+                local_order = order_i
+                geometry = self._get_json_dict(
+                    {"ID": moc_id, "get": "moc", "fmt": "json", "order": local_order}
+                )
+                n_cells = _moc_cell_count(geometry)
+                while n_cells > MAX_MOC_CELLS and local_order > MIN_MOC_ORDER:
+                    local_order -= 1
+                    geometry = self._get_json_dict(
+                        {"ID": moc_id, "get": "moc", "fmt": "json", "order": local_order}
+                    )
+                    n_cells = _moc_cell_count(geometry)
+                if n_cells == 0:
+                    warnings.append(f"MOCServer returned an empty MOC for {moc_id!r}; skipped.")
+                    continue
+                if local_order != order_i:
+                    warnings.append(
+                        f"MOC for {moc_id!r} downsampled to order {local_order} ({n_cells} cells)."
+                    )
+                mocs.append({
+                    "id": moc_id,
+                    "moc_json": geometry,
+                    "n_cells": n_cells,
+                    "order": local_order,
+                })
+            if not mocs:
+                return {"success": False, "error": "No MOC geometry could be fetched for the given ids.", "warnings": warnings}
+            return {
+                "success": True,
+                "mocs": mocs,
+                "warnings": warnings,
+                "provenance": {
+                    "service": "CDS MOCServer",
+                    "endpoint": self.base_url,
+                    "order": order_i,
+                },
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def _get_json_dict(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Like _get_json but for endpoints whose payload is a JSON object
+        (MOC geometry responses are dicts, not record lists)."""
+        try:
+            response = self.http_get(self.base_url, params=params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"MOCServer request failed: {exc}") from exc
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            text = str(getattr(response, "text", "") or "")[:200]
+            raise RuntimeError(f"MOCServer returned HTTP {status}: {text}")
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError("MOCServer returned invalid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("MOCServer returned an unexpected JSON payload for a MOC geometry.")
+        return payload
+
     def _query_params(self, ra: float, dec: float, radius_deg: float) -> Dict[str, Any]:
         return {
             "RA": ra,
@@ -173,6 +259,10 @@ class MocCoverageService:
             "regime": _regime_label(em_min, em_max),
             "moc_sky_fraction": _float_or_none(record.get("moc_sky_fraction")),
         }
+
+
+def _moc_cell_count(geometry: Dict[str, Any]) -> int:
+    return sum(len(v) for v in geometry.values() if isinstance(v, list))
 
 
 def _env_float(name: str, default: float) -> float:

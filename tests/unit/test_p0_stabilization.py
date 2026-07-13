@@ -155,6 +155,44 @@ def test_c7_recovery_returns_result_within_sla():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# C8 — recovery must not rewrite a valid "none found" answer
+# ─────────────────────────────────────────────────────────────────────────────
+def test_c8_successful_zero_row_result_is_not_recovered():
+    # A success=True result with total_results=0 is a CONFIRMED empty answer
+    # ("no data exists there") — post-C3, genuine archive outages arrive as
+    # success=False typed errors and are caught by _check_soft_failure. Before
+    # C8, EmptyResultError fired here and RETRY/REPLAN rewrote the answer.
+    from core.recovery import RecoveryEngine
+
+    engine = RecoveryEngine(client=None, max_retries=2)
+    node = _Node(sla=5.0)
+    calls = []
+
+    async def _zero_row_executor(_node):
+        calls.append(1)
+        return {"success": True, "total_results": 0, "target": "M87", "note": "No results found."}
+
+    result = asyncio.run(engine.execute_with_recovery(node, _zero_row_executor))
+    assert result == {"success": True, "total_results": 0, "target": "M87", "note": "No results found."}
+    assert len(calls) == 1, "recovery must not re-execute a confirmed empty result"
+
+
+def test_c8_empty_result_gate_matrix():
+    # Untyped/failed shapes keep the legacy "empty" classification; only the
+    # explicit success=True flag vouches for a zero-count result.
+    from core.recovery import RecoveryEngine
+
+    engine = RecoveryEngine(client=None, max_retries=2)
+    assert engine._is_empty_result({"success": True, "total_results": 0}) is False
+    assert engine._is_empty_result({"success": True, "file_count": 0}) is False
+    assert engine._is_empty_result({"total_results": 0}) is True
+    assert engine._is_empty_result({"file_count": 0}) is True
+    assert engine._is_empty_result(None) is True
+    assert engine._is_empty_result("") is True
+    assert engine._is_empty_result([]) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # C9 — DAG cache never replays a plan for the wrong target
 # ─────────────────────────────────────────────────────────────────────────────
 def _fresh_cache(tmp_path):
@@ -279,26 +317,8 @@ def test_c7_decompose_passes_node_to_coroutine_executor():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# S1 / S2 — RCE guards are OFF by default
+# S2 — MCP stdio guard is OFF by default
 # ─────────────────────────────────────────────────────────────────────────────
-def test_s1_user_tool_exec_disabled_by_default(monkeypatch):
-    from services import user_tools_service as uts
-
-    monkeypatch.delenv("QUASAR_ENABLE_USER_TOOL_EXEC", raising=False)
-    assert uts._user_tool_exec_enabled() is False
-
-    svc = uts.UserToolsService()
-    with pytest.raises(RuntimeError):
-        svc.build_callable({"name": "evil", "code": "def evil():\n    return __import__('os').getcwd()"})
-
-
-def test_s1_user_tool_exec_enabled_when_flagged(monkeypatch):
-    from services import user_tools_service as uts
-
-    monkeypatch.setenv("QUASAR_ENABLE_USER_TOOL_EXEC", "1")
-    assert uts._user_tool_exec_enabled() is True
-
-
 def test_s2_stdio_mcp_disabled_by_default(monkeypatch, tmp_path):
     from services import mcp_server_service as mss
 

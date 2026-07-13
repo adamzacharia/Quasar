@@ -8,10 +8,15 @@ import { useAuthStore } from "../lib/auth-store";
 import {
     Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu, Waves
+    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu, Waves,
+    Database, RefreshCw
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
 import { isTaccModel } from "../lib/models";
+import {
+    listDatalabJobs, cancelDatalabJob, listMyTables, deleteMyTable,
+    type DatalabJobRecord, type MyTableEntry,
+} from "../lib/api";
 
 function timeAgo(date: Date): string {
     const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -373,6 +378,182 @@ function SavedPapersContent() {
 }
 
 /* ────────────────────────────────────────────
+   DATA LAB PANEL — background jobs + My tables
+   ──────────────────────────────────────────── */
+function jobStatusChip(status: string): string {
+    switch (status) {
+        case "running": return "bg-amber-500/15 text-amber-400";
+        case "queued":
+        case "submitted": return "bg-sky-500/15 text-sky-400";
+        case "succeeded": return "bg-emerald-500/15 text-emerald-400";
+        case "failed": return "bg-red-500/15 text-red-400";
+        case "canceled": return "bg-slate-500/15 text-slate-400";
+        default: return "bg-slate-500/15 text-slate-400";
+    }
+}
+
+function DatalabJobsContent() {
+    const [jobs, setJobs] = useState<DatalabJobRecord[]>([]);
+    const [loading, setLoading] = useState(true);
+
+    const refresh = async () => {
+        try { setJobs(await listDatalabJobs()); }
+        catch { /* backend offline / signed out — keep the last list */ }
+        finally { setLoading(false); }
+    };
+
+    useEffect(() => {
+        refresh();
+        const timer = setInterval(refresh, 5000);
+        return () => clearInterval(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const cancel = async (jobId: string) => {
+        try { await cancelDatalabJob(jobId); } catch { /* record may already be terminal */ }
+        refresh();
+    };
+
+    if (!loading && jobs.length === 0) {
+        return (
+            <div className="p-5 space-y-4">
+                <p className="text-xs text-slate-500">Background Data Lab queries (async submits, tiled scans) appear here.</p>
+                <div className="flex flex-col items-center justify-center py-10 text-center">
+                    <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center mb-4">
+                        <Database className="w-7 h-7 text-slate-600" />
+                    </div>
+                    <p className="text-sm text-slate-400 font-medium">No jobs yet</p>
+                    <p className="text-xs text-slate-600 mt-1.5 max-w-[210px]">
+                        Ask for a wide catalog query &ldquo;as a background job&rdquo; and track it here.
+                    </p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="p-4 space-y-2">
+            <div className="flex items-center justify-between px-1 mb-2">
+                <p className="text-xs text-slate-500">{jobs.length} job{jobs.length !== 1 ? "s" : ""} · refreshes every 5s</p>
+                <button onClick={refresh} title="Refresh now"
+                    className="p-1 rounded text-slate-500 hover:text-white transition-colors">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+            </div>
+            {jobs.map((job) => {
+                const active = ["queued", "running", "submitted"].includes(job.status);
+                return (
+                    <div key={job.job_id} className="glass-control rounded-xl p-3 space-y-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-white truncate" title={job.job_id}>
+                                {job.kind}{job.external ? " · server" : ""}
+                            </span>
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 ${jobStatusChip(job.status)}`}>
+                                {job.status}
+                            </span>
+                        </div>
+                        <p className="text-[10px] text-slate-500 font-mono truncate" title={job.job_id}>{job.job_id}</p>
+                        <div className="flex items-center justify-between gap-2">
+                            <p className="text-[10px] text-slate-400">
+                                {timeAgo(new Date(job.updated_at * 1000))}
+                                {job.result?.rowcount !== undefined ? ` · ${job.result.rowcount} rows` : ""}
+                                {job.result?.candidates_found !== undefined ? ` · ${job.result.candidates_found} candidates` : ""}
+                            </p>
+                            {active && (
+                                <button onClick={() => cancel(job.job_id)}
+                                    className="text-[10px] text-red-500/80 hover:text-red-400 transition-colors shrink-0">
+                                    Cancel
+                                </button>
+                            )}
+                        </div>
+                        {job.error && <p className="text-[10px] text-red-400/80 line-clamp-2">{job.error}</p>}
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
+
+function MyTablesContent() {
+    const [tables, setTables] = useState<MyTableEntry[]>([]);
+    const [loading, setLoading] = useState(true);
+
+    const refresh = async () => {
+        try { setTables(await listMyTables()); }
+        catch { /* backend offline / signed out */ }
+        finally { setLoading(false); }
+    };
+
+    useEffect(() => { refresh(); }, []);
+
+    const remove = async (name: string) => {
+        await deleteMyTable(name);
+        refresh();
+    };
+
+    if (!loading && tables.length === 0) {
+        return (
+            <div className="p-5 space-y-4">
+                <p className="text-xs text-slate-500">Durable tables saved from Data Lab results (they outlive the 1-hour result cache).</p>
+                <div className="flex flex-col items-center justify-center py-10 text-center">
+                    <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center mb-4">
+                        <Database className="w-7 h-7 text-slate-600" />
+                    </div>
+                    <p className="text-sm text-slate-400 font-medium">No saved tables yet</p>
+                    <p className="text-xs text-slate-600 mt-1.5 max-w-[210px]">
+                        After a catalog query, tell the assistant &ldquo;save this as &lt;name&gt;&rdquo;.
+                    </p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="p-4 space-y-2">
+            <p className="text-xs text-slate-500 px-1 mb-2">{tables.length} saved table{tables.length !== 1 ? "s" : ""}</p>
+            {tables.map((table) => (
+                <div key={table.name} className="glass-control rounded-xl p-3 space-y-1.5 group">
+                    <div className="flex items-start justify-between gap-2">
+                        <span className="text-xs font-semibold text-white font-mono flex-1 truncate" title={table.name}>
+                            {table.name}
+                        </span>
+                        <button onClick={() => remove(table.name)} title="Delete table"
+                            className="p-1 text-slate-500 hover:text-red-400 transition-colors shrink-0 opacity-0 group-hover:opacity-100">
+                            <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">
+                        {table.rowcount} rows
+                        {table.catalog ? ` · ${table.catalog}${table.table ? `.${table.table}` : ""}` : ""}
+                        {" · "}{timeAgo(new Date(table.saved_at * 1000))}
+                    </p>
+                    {table.description && <p className="text-[10px] text-slate-500 line-clamp-2">{table.description}</p>}
+                </div>
+            ))}
+        </div>
+    );
+}
+
+function DataLabPanelContent() {
+    const [tab, setTab] = useState<"jobs" | "tables">("jobs");
+    return (
+        <div className="flex flex-col h-full">
+            <div className="flex gap-1 px-4 pt-3">
+                {(["jobs", "tables"] as const).map((key) => (
+                    <button key={key} onClick={() => setTab(key)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${tab === key ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                        {key === "jobs" ? "Jobs" : "My tables"}
+                    </button>
+                ))}
+            </div>
+            <div className="flex-1 overflow-y-auto">
+                {tab === "jobs" ? <DatalabJobsContent /> : <MyTablesContent />}
+            </div>
+        </div>
+    );
+}
+
+/* ────────────────────────────────────────────
    MAIN SIDEBAR
    ──────────────────────────────────────────── */
 interface SidebarProps {
@@ -408,13 +589,13 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
         }
     }, [isAuthenticated, loadConversations, clearAllConversations]);
 
-    const [activePanel, setActivePanel] = useState<"papers" | null>(null);
+    const [activePanel, setActivePanel] = useState<"papers" | "datalab" | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [query, setQuery] = useState("");
 
     const isDrawer = variant === "drawer";
 
-    const togglePanel = (panel: "papers") => {
+    const togglePanel = (panel: "papers" | "datalab") => {
         setActivePanel((prev) => (prev === panel ? null : panel));
     };
 
@@ -485,6 +666,14 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
                         aria-label="Spectral Line Explorer"
                     >
                         <Waves className="w-5 h-5" />
+                    </Link>
+                    <Link
+                        href="/gallery"
+                        className={`sidebar-rail-button ${pathname === "/gallery" ? "text-primary bg-primary/10" : ""}`}
+                        title="Recipe Gallery"
+                        aria-label="Recipe Gallery"
+                    >
+                        <BookOpen className="w-5 h-5" />
                     </Link>
                 </div>
 
@@ -585,11 +774,16 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
                 </div>
             )}
 
-            <div className={isDrawer ? "px-3.5 mb-3" : "px-4 mb-4"}>
+            <div className={`${isDrawer ? "px-3.5 mb-3" : "px-4 mb-4"} space-y-1`}>
                 <Link href="/spectral-lines" onClick={onClose}
                     className={`w-full flex items-center gap-3 rounded-xl transition-colors ${isDrawer ? "px-3 py-2.5 text-[12.5px] font-medium" : "px-3 py-2.5 text-sm"} ${pathname === "/spectral-lines" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                     <Waves className={isDrawer ? "size-[15px]" : "w-4 h-4"} />
                     Spectral Line Explorer
+                </Link>
+                <Link href="/gallery" onClick={onClose}
+                    className={`w-full flex items-center gap-3 rounded-xl transition-colors ${isDrawer ? "px-3 py-2.5 text-[12.5px] font-medium" : "px-3 py-2.5 text-sm"} ${pathname === "/gallery" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                    <BookOpen className={isDrawer ? "size-[15px]" : "w-4 h-4"} />
+                    Recipe Gallery
                 </Link>
             </div>
 
@@ -644,12 +838,17 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
                     onSelect={setSelectedModel}
                 />
 
-                {/* Compact action row: Saved · Settings · Help */}
+                {/* Compact action row: Saved · Data Lab · Settings · Help */}
                 <div className="flex gap-1.5">
                     <button onClick={() => togglePanel("papers")}
                         title="Saved Papers"
                         className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${activePanel === "papers" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                         <Bookmark className="w-4 h-4 shrink-0" />Saved
+                    </button>
+                    <button onClick={() => togglePanel("datalab")}
+                        title="Data Lab jobs & saved tables"
+                        className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${activePanel === "datalab" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
+                        <Database className="w-4 h-4 shrink-0" />Data Lab
                     </button>
                     <button onClick={() => setSettingsOpen(true)}
                         title="Settings"
@@ -698,6 +897,9 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             {/* ── OVERLAY PANELS ── */}
             <OverlayPanel open={activePanel === "papers"} onClose={() => setActivePanel(null)} title="Saved Papers" icon={Bookmark}>
                 <SavedPapersContent />
+            </OverlayPanel>
+            <OverlayPanel open={activePanel === "datalab"} onClose={() => setActivePanel(null)} title="Data Lab" icon={Database}>
+                <DataLabPanelContent />
             </OverlayPanel>
 
             {/* Settings float modal — rendered outside sidebar via portal-like pattern */}

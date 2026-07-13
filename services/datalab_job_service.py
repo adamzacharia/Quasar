@@ -26,7 +26,14 @@ class DatalabJobService:
         workers = int(max_workers if max_workers is not None else os.getenv("DATALAB_JOB_MAX_WORKERS", "2"))
         self._sem = threading.Semaphore(max(1, workers))
 
-    def start(self, kind: str, fn: Callable[[Callable[[], bool]], Any], *, params: Optional[Dict[str, Any]] = None) -> str:
+    def start(
+        self,
+        kind: str,
+        fn: Callable[[Callable[[], bool]], Any],
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        owner_id: Optional[str] = None,
+    ) -> str:
         """Run ``fn(cancel_check)`` on a background thread; return a job id to poll."""
         job_id = "dlj_" + uuid.uuid4().hex
         cancel_event = threading.Event()
@@ -40,6 +47,7 @@ class DatalabJobService:
                 "error": None,
                 "created_at": time.time(),
                 "updated_at": time.time(),
+                "_owner_id": str(owner_id) if owner_id is not None else None,
                 "_cancel": cancel_event,
             }
 
@@ -64,26 +72,95 @@ class DatalabJobService:
         thread.start()
         return job_id
 
-    def status(self, job_id: str) -> Dict[str, Any]:
+    def register_external(
+        self,
+        job_id: str,
+        *,
+        kind: str = "server_query",
+        params: Optional[Dict[str, Any]] = None,
+        status: str = "submitted",
+        owner_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Track a SERVER-SIDE Data Lab job (jobid minted by the query manager,
+        not a local ``dlj_`` id) so ``list_jobs()`` and the Jobs panel can show
+        it. No thread is started — live status comes from DatalabClient.status();
+        callers sync it back with ``update_external``."""
         with self._lock:
-            rec = self._jobs.get(str(job_id))
-            if rec is None:
-                raise KeyError(f"Unknown Data Lab job: {job_id}")
+            self._jobs[str(job_id)] = {
+                "job_id": str(job_id),
+                "kind": str(kind),
+                "status": str(status),
+                "params": dict(params or {}),
+                "result": None,
+                "error": None,
+                "external": True,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "_owner_id": str(owner_id) if owner_id is not None else None,
+            }
+        return self.status(job_id, owner_id=owner_id)
+
+    def update_external(
+        self,
+        job_id: str,
+        *,
+        owner_id: Optional[str] = None,
+        **changes: Any,
+    ) -> None:
+        """Sync a server-side job record after a live status/results fetch."""
+        with self._lock:
+            rec = self._owned_record(str(job_id), owner_id)
+            rec.update(changes)
+            rec["updated_at"] = time.time()
+
+    def status(self, job_id: str, *, owner_id: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            rec = self._owned_record(str(job_id), owner_id)
             return {k: v for k, v in rec.items() if not k.startswith("_")}
 
-    def results(self, job_id: str) -> Dict[str, Any]:
-        return self.status(job_id)
+    def results(self, job_id: str, *, owner_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.status(job_id, owner_id=owner_id)
 
-    def cancel(self, job_id: str) -> Dict[str, Any]:
+    def list_jobs(
+        self,
+        *,
+        limit: int = 100,
+        owner_id: Optional[str] = None,
+    ) -> list[Dict[str, Any]]:
+        """Every known job (local + registered server jobs), newest first."""
+        normalized_owner = str(owner_id) if owner_id is not None else None
         with self._lock:
-            rec = self._jobs.get(str(job_id))
-            if rec is None:
-                raise KeyError(f"Unknown Data Lab job: {job_id}")
-            rec["_cancel"].set()
-            if rec["status"] == "queued":
+            records = [
+                {k: v for k, v in rec.items() if not k.startswith("_")}
+                for rec in self._jobs.values()
+                if normalized_owner is None or rec.get("_owner_id") == normalized_owner
+            ]
+        records.sort(key=lambda rec: float(rec.get("created_at") or 0.0), reverse=True)
+        return records[: max(1, int(limit))]
+
+    def cancel(self, job_id: str, *, owner_id: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            rec = self._owned_record(str(job_id), owner_id)
+            cancel_event = rec.get("_cancel")
+            if cancel_event is not None:
+                cancel_event.set()
+            if rec["status"] in {"queued", "submitted"}:
                 rec["status"] = "canceled"
                 rec["updated_at"] = time.time()
-        return self.status(job_id)
+        return self.status(job_id, owner_id=owner_id)
+
+    def _owned_record(
+        self,
+        job_id: str,
+        owner_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Return a record visible to ``owner_id``, or behave as if unknown."""
+        rec = self._jobs.get(job_id)
+        if rec is None:
+            raise KeyError(f"Unknown Data Lab job: {job_id}")
+        if owner_id is not None and rec.get("_owner_id") != str(owner_id):
+            raise KeyError(f"Unknown Data Lab job: {job_id}")
+        return rec
 
     def _update(self, job_id: str, **changes: Any) -> None:
         with self._lock:

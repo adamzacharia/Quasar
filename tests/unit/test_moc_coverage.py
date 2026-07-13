@@ -300,6 +300,109 @@ def test_tiny_nonzero_radius_clamped_up(monkeypatch):
     assert calls[0]["SR"] == moc_coverage.MIN_NONZERO_RADIUS_DEG
 
 
+def test_moc_geometry_fetches_json_cell_maps():
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(dict(params))
+        return FakeResponse({"1": [4, 5], "2": [25, 28, 30]})
+
+    svc = MocCoverageService(http_get=fake_get)
+    out = svc.moc_geometry(["CDS/P/SDSS9/color"], order=6)
+
+    assert out["success"] is True
+    assert calls[0]["get"] == "moc" and calls[0]["fmt"] == "json" and calls[0]["order"] == 6
+    moc = out["mocs"][0]
+    assert moc["id"] == "CDS/P/SDSS9/color"
+    assert moc["moc_json"] == {"1": [4, 5], "2": [25, 28, 30]}
+    assert moc["n_cells"] == 5 and moc["order"] == 6
+
+
+def test_moc_geometry_downsamples_oversized_mocs():
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(dict(params))
+        order = int(params["order"])
+        if order >= 6:
+            return FakeResponse({"6": list(range(30000))})  # over the 20k cap
+        return FakeResponse({"5": list(range(100))})
+
+    svc = MocCoverageService(http_get=fake_get)
+    out = svc.moc_geometry(["BIG/SURVEY"], order=6)
+
+    assert out["success"] is True
+    assert out["mocs"][0]["order"] == 5
+    assert out["mocs"][0]["n_cells"] == 100
+    assert any("downsampled" in w for w in out["warnings"])
+    assert [c["order"] for c in calls] == [6, 5]
+
+
+def test_moc_geometry_caps_ids_and_validates():
+    def fake_get(url, params=None, timeout=None):
+        return FakeResponse({"3": [1]})
+
+    svc = MocCoverageService(http_get=fake_get)
+    out = svc.moc_geometry([f"S/{k}" for k in range(6)])
+    assert out["success"] is True
+    assert len(out["mocs"]) == 4  # MAX_MOC_IDS
+    assert any("first 4" in w for w in out["warnings"])
+
+    out2 = svc.moc_geometry([])
+    assert out2["success"] is False and "ids" in out2["error"]
+
+    def dict_error_get(url, params=None, timeout=None):
+        return FakeResponse([1, 2, 3])  # list payload where a dict is required
+
+    out3 = MocCoverageService(http_get=dict_error_get).moc_geometry(["X/Y"])
+    assert out3["success"] is False and "unexpected JSON" in out3["error"]
+
+
+def test_agent_survey_footprint_builds_hips_card_with_mocs(monkeypatch):
+    agent = _make_agent()
+    agent._register_tools()
+    assert agent.tool_registry.get_tool("survey_footprint") is not None
+
+    class _FakeMocGeom:
+        def moc_geometry(self, ids, order=8):
+            return {
+                "success": True,
+                "mocs": [
+                    {"id": str(i), "moc_json": {"3": [1, 2]}, "n_cells": 2, "order": order}
+                    for i in ids
+                ],
+                "warnings": [],
+                "provenance": {},
+            }
+
+    class _FakeHips:
+        def cutout(self, ra, dec, fov_deg=None, survey=None, width=None):
+            return {"success": True, "image_base64": "IMG", "path": "/plots/fp.png",
+                    "fov_deg": fov_deg, "survey_id": "P/DSS2/color"}
+
+    agent._moc_coverage_service_instance = _FakeMocGeom()
+    agent._hips_image_service_instance = _FakeHips()
+    monkeypatch.setattr(
+        agent, "_live_imagery_coordinates",
+        lambda target_name=None, ra=None, dec=None: (10.0, -5.0, target_name or "X"),
+        raising=False,
+    )
+
+    out = agent._survey_footprint(["CDS/P/SDSS9/color", "CDS/P/DES-DR2/ColorIRG"], target_name="M31")
+    assert out["success"] is True
+    card = agent.last_run_result
+    assert card is not None
+    meta = card.get("meta") or {}
+    assert meta.get("kind") == "hips"
+    assert len(meta.get("mocs") or []) == 2
+    # distinct legend colors from the palette
+    colors = [m["color"] for m in meta["mocs"]]
+    assert len(set(colors)) == 2
+    # LLM-facing dict carries footprints WITHOUT the heavy moc_json
+    assert out["footprints"][0]["id"] == "CDS/P/SDSS9/color"
+    assert "moc_json" not in out["footprints"][0]
+
+
 def test_agent_registration_prompt_status_and_wrappers():
     _load_agent_module()
     agent = _make_agent()

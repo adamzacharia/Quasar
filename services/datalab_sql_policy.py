@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
@@ -64,6 +66,12 @@ def validate(sql: str, *, source: str = "builder", meta: Optional[Mapping[str, A
     tables = _tables(clean)
     if not tables:
         _raise("No registered Data Lab table found", "Query a registered catalog.table from the Data Lab registry.")
+
+    _check_column_references(clean, first, tables, warnings)
+    if source != "builder":
+        query, clean = _add_nan_guards(query, clean, warnings)
+        _warn_nan_unsafe_cuts(query, clean, warnings)
+        query, clean = _inject_default_quality_cuts(query, clean, tables, warnings)
 
     has_radial = bool(re.search(r"\bq3c_radial_query\s*\(", clean, re.IGNORECASE))
     has_poly = bool(re.search(r"\bq3c_poly_query\s*\(", clean, re.IGNORECASE))
@@ -130,13 +138,42 @@ def validate(sql: str, *, source: str = "builder", meta: Optional[Mapping[str, A
         if limit is None:
             final_sql = f"{query}\nLIMIT {DEFAULT_ROW_CAP}"
             warnings.append(f"Injected LIMIT {DEFAULT_ROW_CAP} output cap.")
+            metadata.setdefault("row_limit", DEFAULT_ROW_CAP)
         elif limit > MAX_ROW_CAP:
             _raise(
                 f"LIMIT {limit} exceeds the Data Lab row cap {MAX_ROW_CAP}",
                 f"Use LIMIT <= {MAX_ROW_CAP} or a builder aggregate.",
             )
+        else:
+            # Record the effective cap so execution layers can detect results
+            # that exactly filled it (LIMIT-truncated, storage-order slices).
+            metadata.setdefault("row_limit", limit)
 
     return ValidatedQuery(sql=final_sql, source=source, meta=metadata, warnings=warnings)
+
+
+# Rows come back in storage order, which is spatially clustered — a result that
+# exactly filled its LIMIT is a corner-of-the-field slice, not a sample (live
+# P7: the "field 169" map excluded Hydra II; live P9: the "Pal 5" map excluded
+# Pal 5 itself).
+TRUNCATION_GUIDANCE = (
+    "rows are a storage-order, spatially clustered slice of the full selection — NOT a "
+    "complete or random sample. Never build a sky-distribution or density map from this "
+    "result; use datalab_density_aggregate or datalab_density_vetting (server-side GROUP "
+    "BY over EVERY row) instead."
+)
+
+
+def limit_truncation_warning(rowcount: Any, row_limit: Any) -> Optional[str]:
+    """Warning text when a result exactly filled its row cap, else None."""
+    try:
+        limit = int(row_limit)
+        count = int(rowcount)
+    except (TypeError, ValueError):
+        return None
+    if limit > 0 and count >= limit:
+        return f"Result hit its row cap (LIMIT {limit}): " + TRUNCATION_GUIDANCE
+    return None
 
 
 def _strip_one_semicolon(sql: str) -> str:
@@ -199,6 +236,154 @@ def _scrub_sql(sql: str) -> str:
 def _first_keyword(clean: str) -> str:
     match = re.search(r"\b([A-Za-z]+)\b", clean)
     return match.group(1).upper() if match else ""
+
+
+# Bare lower-bound / not-equal cuts on nullable float columns silently admit
+# NaN rows (Data Lab stores missing values as NaN; Postgres orders NaN above
+# every real number). Builders add the guard themselves; expert/raw SQL gets a
+# warning so the model re-runs with `AND col < 'Infinity'` guards. A rewrite is
+# deliberately NOT attempted: _scrub_sql is not offset-preserving, so a regex
+# rewrite could corrupt queries containing escaped quotes.
+NAN_UNSAFE_CUT_RE = re.compile(r"\b([a-z_][\w]*)\s*(?:>=|>|!=|<>)\s*[-+]?[\d.]", re.IGNORECASE)
+# Columns that are structurally never NaN (positions, ids, counters, bins).
+_NAN_EXEMPT_COLUMNS = {
+    "ra", "dec", "ra_bin", "dec_bin", "glon", "glat", "mjd", "fieldid",
+    "exptime", "nepochs", "ndet", "nobs", "z_bin", "healpix", "nest4096",
+    "ring256", "targetid", "source_id", "objid", "source_count",
+}
+
+
+# A (possibly alias-qualified) column compared to a numeric literal with a
+# NaN-unsafe operator — the auto-rewrite target.
+NAN_GUARDABLE_RE = re.compile(
+    r"\b((?:[a-z_][\w]*\.)?([a-z_][\w]*))\s*(>=|>|!=|<>)\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _add_nan_guards(query: str, clean: str, warnings: List[str]) -> tuple[str, str]:
+    """Auto-guard NaN-unsafe numeric cuts in expert/raw SQL.
+
+    Advisory warnings alone demonstrably do not work: on the live P6 re-test
+    gpt-oss wrote bare cuts, ignored the warning, and shipped a 5,000-row
+    selection that was 97% NaN (4,839/5,000 rows with no astrometry). Rewriting
+    is only safe when the regex cannot touch quoted or commented text, so the
+    rewrite fires ONLY for SQL with no string literals or comments — anything
+    else falls through to _warn_nan_unsafe_cuts.
+    """
+    if any(tok in query for tok in ("'", '"', "--", "/*")):
+        return query, clean
+    guarded: List[str] = []
+
+    def _sub(match: "re.Match[str]") -> str:
+        full, col, op, num = match.group(1), match.group(2), match.group(3), match.group(4)
+        if col.lower() in _NAN_EXEMPT_COLUMNS:
+            return match.group(0)
+        # An existing upper bound on the same column already excludes NaN.
+        if re.search(rf"\b{re.escape(col)}\s*(?:<=?|BETWEEN)\s", clean, re.IGNORECASE):
+            return match.group(0)
+        guarded.append(f"{full} {op} {num}")
+        op_norm = "!=" if op == "<>" else op
+        return f"({full} {op_norm} {num} AND {full} < 'Infinity'::float8)"
+
+    rewritten = NAN_GUARDABLE_RE.sub(_sub, query)
+    if not guarded:
+        return query, clean
+    warnings.append(
+        "Auto-added NaN finiteness guards (col < 'Infinity') to: " + "; ".join(guarded) + ". "
+        "Data Lab stores missing floats as NaN, which Postgres orders ABOVE every real number, "
+        "so bare >/>=/!= cuts would have admitted every missing-value row."
+    )
+    return rewritten, _scrub_sql(rewritten)
+
+
+_CLAUSE_TAIL_RE = re.compile(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|OFFSET)\b", re.IGNORECASE)
+
+
+def _inject_default_quality_cuts(
+    query: str, clean: str, tables: List[tuple[str, str]], warnings: List[str]
+) -> tuple[str, str]:
+    """Apply registry survey-quality defaults to expert/raw SQL.
+
+    The structured tools merge these defaults themselves, but expert SQL relied
+    on a prompt rule the model follows only partially (live P11: the DESI
+    z-histogram applied zwarn=0 but omitted survey='main' AND main_primary, so
+    every low-z bin was inflated 11-27% by sv-survey duplicates). Injection is
+    restricted to single-table, single-SELECT queries whose scrub is offset-
+    preserving (no comments, no escaped quotes): the WHERE clause is located on
+    the literal-blanked text and spliced into the raw text at the same offsets,
+    so plain string literals like spectype = 'GALAXY' are safe. A column the
+    SQL mentions anywhere is treated as caller intent and never overridden.
+    """
+    if "--" in query or "/*" in query:
+        return query, clean
+    if len(query) != len(clean):  # escaped quotes shrink the scrub — offsets unusable
+        return query, clean
+    if len(tables) != 1 or re.search(r"\b(JOIN|UNION)\b", clean, re.IGNORECASE):
+        return query, clean
+    if len(re.findall(r"\bSELECT\b", clean, re.IGNORECASE)) != 1:
+        return query, clean
+    catalog, table = tables[0]
+    try:
+        defaults = registry.default_quality_cuts(catalog, table)
+    except Exception:  # noqa: BLE001 - unregistered tables simply have no defaults
+        return query, clean
+    missing = [
+        d for d in defaults
+        if not re.search(rf"\b{re.escape(str(d['column']))}\b", clean, re.IGNORECASE)
+    ]
+    if not missing:
+        return query, clean
+    preds = []
+    for d in missing:
+        val = d["value"]
+        lit = f"'{val}'" if isinstance(val, str) else str(val)
+        preds.append(f"{d['column']} {d['op']} {lit}")
+    pred_sql = " AND ".join(preds)
+    # Locate clauses on CLEAN (literals blanked, so 'WHERE'-in-a-string cannot
+    # match) and splice QUERY at the same offsets (lengths verified equal).
+    where_m = _WHERE_SEGMENT_RE.search(clean)
+    if where_m:
+        # Parenthesize the original condition: a top-level OR would otherwise
+        # let its right leg escape the injected cuts.
+        c0, c1 = where_m.span(1)
+        cond = query[c0:c1].strip()
+        new_query = f"{query[:c0]} {pred_sql} AND ({cond}) {query[c1:]}".rstrip()
+    else:
+        tail_m = _CLAUSE_TAIL_RE.search(clean)
+        if tail_m:
+            i = tail_m.start()
+            new_query = f"{query[:i]}WHERE {pred_sql} {query[i:]}"
+        else:
+            new_query = f"{query} WHERE {pred_sql}"
+    warnings.append(
+        f"Auto-applied {catalog}.{table} registry quality cuts to expert SQL: {pred_sql}. "
+        "These defaults make results comparable to the survey's canonical selection — "
+        "include your own cut on those columns to override."
+    )
+    return new_query, _scrub_sql(new_query)
+
+
+def _warn_nan_unsafe_cuts(raw: str, clean: str, warnings: List[str]) -> None:
+    unguarded: List[str] = []
+    for match in NAN_UNSAFE_CUT_RE.finditer(clean):
+        col = match.group(1).lower()
+        if col in _NAN_EXEMPT_COLUMNS or col in unguarded:
+            continue
+        # Any upper bound on the same column already excludes NaN. The
+        # 'Infinity' guard is checked against the RAW sql because _scrub_sql
+        # blanks string literals.
+        has_upper = re.search(rf"\b{re.escape(col)}\s*(?:<=?|BETWEEN)\s", clean, re.IGNORECASE)
+        has_inf_guard = re.search(rf"\b{re.escape(col)}\s*<\s*'Infinity'", raw, re.IGNORECASE)
+        if not has_upper and not has_inf_guard:
+            unguarded.append(col)
+    if unguarded:
+        warnings.append(
+            "NaN-unsafe cuts on: " + ", ".join(unguarded) + ". Data Lab stores missing floats as NaN, "
+            "which Postgres orders ABOVE every real number — bare >/>=/!= cuts admit every missing-value "
+            "row. If these are nullable float columns, re-run with a finiteness guard, "
+            "e.g. `AND parallax_over_error < 'Infinity'`."
+        )
 
 
 def _has_multiple_statements(clean: str) -> bool:
@@ -274,6 +459,156 @@ def _has_indexed_equality(raw_sql: str, clean: str, tables: List[tuple[str, str]
         if numeric_in_clean or (eq_in_clean and quoted_in_raw):
             return col
     return None
+
+
+# ── column grounding against the curated registry + cached live tap_schema ──
+#
+# The blog-parity goal: SQL that references a hallucinated column name fails
+# fast with real suggestions instead of a cryptic server error. Ground truth is
+# registry.known_columns (curated fast-path ∪ cached live tap_schema.columns).
+
+_SQL_KEYWORDS = frozenset({
+    "select", "from", "where", "and", "or", "not", "as", "on", "join", "inner",
+    "left", "right", "full", "outer", "cross", "with", "group", "by", "order",
+    "limit", "offset", "having", "distinct", "between", "in", "is", "null",
+    "like", "ilike", "case", "when", "then", "else", "end", "asc", "desc",
+    "nulls", "first", "last", "true", "false", "union", "all", "exists", "any",
+    "cast", "using", "escape", "array",
+    # window/expression keywords that appear as bare tokens
+    "over", "partition", "rows", "range", "unbounded", "preceding", "following",
+    "current", "row", "epoch", "for",
+    # type names (CAST targets and ::casts)
+    "numeric", "double", "precision", "integer", "bigint", "smallint", "real",
+    "float", "text", "varchar", "char", "boolean", "date", "timestamp", "interval",
+})
+
+_QUALIFIED_REF_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\b")
+# Identifiers not adjacent to a dot (qualified refs are handled separately) and
+# not preceded by a word char (so the 'e3' inside the literal 1e3 never matches).
+_BARE_IDENT_RE = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)(?![\w.])")
+_FROM_ALIAS_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)\.([A-Za-z_]\w*)(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?",
+    re.IGNORECASE,
+)
+_AS_ALIAS_RE = re.compile(r"\bAS\s+([A-Za-z_]\w*)", re.IGNORECASE)
+
+
+def _known_column_maps(tables: List[tuple[str, str]]) -> Optional[Dict[str, Dict[str, Any]]]:
+    known: Dict[str, Dict[str, Any]] = {}
+    for catalog, table in tables:
+        info = registry.known_columns(catalog, table)
+        if info is None or not info.get("columns"):
+            return None
+        known[_qualified(catalog, table)] = info
+    return known
+
+
+def _column_suggestions(name: str, candidates: set[str]) -> List[str]:
+    matches = difflib.get_close_matches(name.lower(), sorted(candidates), n=3, cutoff=0.55)
+    if not matches:
+        # Fall back to prefix/substring hits so e.g. 'w1' still suggests w1mpro.
+        matches = [c for c in sorted(candidates) if name.lower()[:3] and name.lower()[:3] in c][:3]
+    return matches
+
+
+def _check_column_references(clean: str, first_keyword: str, tables: List[tuple[str, str]], warnings: List[str]) -> None:
+    """Reject (or, when unverifiable, warn about) column names that exist in
+    neither the curated registry nor the cached live TAP schema.
+
+    Deliberately conservative to avoid false positives:
+    - identifiers followed by ``(`` are function calls — skipped;
+    - output aliases (``AS x``), table aliases, and catalog/table tokens are allowed;
+    - bare (unqualified) identifiers are only checked for single-table non-WITH
+      queries; qualified ``alias.col`` refs are checked whenever the alias maps
+      to a registered table;
+    - a miss is a hard error only when the live schema for every referenced
+      table is cached (``authoritative``); curated lists are subsets, so
+      curated-only misses just warn.
+    """
+
+    if os.getenv("DATALAB_COLUMN_CHECK", "1").strip().lower() in {"0", "false", "off"}:
+        return
+    known = _known_column_maps(tables)
+    if known is None:
+        return
+    authoritative = all(info.get("authoritative") for info in known.values())
+    all_columns: set[str] = set()
+    for info in known.values():
+        all_columns.update(info["columns"])
+
+    text = re.sub(r"::\s*[A-Za-z_]\w*", " ", clean)  # strip ::numeric-style casts
+
+    alias_map: Dict[str, str] = {}
+    for match in _FROM_ALIAS_RE.finditer(text):
+        catalog, table = match.group(1).lower(), match.group(2).lower()
+        qualified = _qualified(catalog, table)
+        if qualified not in known:
+            continue
+        alias_map.setdefault(table, qualified)
+        alias = (match.group(3) or "").lower()
+        if alias and alias not in _SQL_KEYWORDS:
+            alias_map.setdefault(alias, qualified)
+
+    allowed: set[str] = set(_SQL_KEYWORDS)
+    allowed.update(all_columns)
+    allowed.update(alias_map.keys())
+    for catalog, table in tables:
+        allowed.add(catalog)
+        allowed.add(table)
+    for match in _AS_ALIAS_RE.finditer(text):
+        allowed.add(match.group(1).lower())
+
+    output_aliases = {match.group(1).lower() for match in _AS_ALIAS_RE.finditer(text)}
+    unknown: Dict[str, set[str]] = {}
+
+    for match in _QUALIFIED_REF_RE.finditer(text):
+        prefix, column = match.group(1).lower(), match.group(2).lower()
+        qualified = alias_map.get(prefix)
+        if qualified is None:
+            continue  # CTE alias or the catalog.table token itself
+        rest = text[match.end():].lstrip()
+        if rest[:1] in ("(", "["):
+            continue  # function call / array subscript
+        # Check STRICTLY against the alias's own table (a column that exists
+        # only on some OTHER joined table is still wrong here — CX-02), plus
+        # output aliases and keywords.
+        if (
+            column not in known[qualified]["columns"]
+            and column not in output_aliases
+            and column not in _SQL_KEYWORDS
+        ):
+            unknown.setdefault(column, set()).update(known[qualified]["columns"])
+
+    if len(tables) == 1 and first_keyword == "SELECT":
+        for match in _BARE_IDENT_RE.finditer(text):
+            token = match.group(1).lower()
+            if token in allowed:
+                continue
+            rest = text[match.end():].lstrip()
+            if rest[:1] in ("(", "["):
+                continue  # function call / ARRAY[...] constructor
+            unknown.setdefault(token, set()).update(all_columns)
+
+    if not unknown:
+        return
+    parts = []
+    for name in sorted(unknown):
+        suggestions = _column_suggestions(name, unknown[name])
+        parts.append(f"'{name}'" + (f" (did you mean: {', '.join(suggestions)}?)" if suggestions else ""))
+    tables_text = ", ".join(sorted(known))
+    message = (
+        f"Unknown column(s) {'; '.join(parts)} for {tables_text} — "
+        "checked against the live Data Lab tap_schema" if authoritative else
+        f"Column(s) {'; '.join(parts)} not found in the curated registry for {tables_text} "
+        "(live schema not cached yet, so this may be a real but unregistered column)"
+    )
+    if authoritative:
+        _raise(
+            message,
+            "Use datalab_describe_table(catalog, table) to see the real column names, "
+            "then rewrite the query with those columns.",
+        )
+    warnings.append(message + ".")
 
 
 def _is_aggregate(clean: str) -> bool:

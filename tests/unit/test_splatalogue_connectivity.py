@@ -19,6 +19,9 @@ from services.splatalogue import (
 )
 
 
+pytestmark = pytest.mark.slow
+
+
 class FakeResponse:
     def __init__(self, payload, status_code=200):
         self.payload = payload

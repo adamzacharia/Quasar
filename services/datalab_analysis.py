@@ -64,6 +64,114 @@ def _clean_label(text: Any) -> str:
     return html.unescape(str(text)).strip()
 
 
+def _truncation_warnings(provenance: Any) -> List[str]:
+    """Warnings when the source result was LIMIT-truncated (spatially biased).
+
+    Rows come back in storage order, which is spatially clustered — a plot of a
+    capped result covers one corner of the field (live P7 excluded Hydra II;
+    live P9's map excluded Pal 5 itself)."""
+    prov = dict(provenance or {})
+    if not prov.get("limit_truncated"):
+        return []
+    limit = prov.get("row_limit")
+    return [
+        f"TRUNCATED SAMPLE: the source result hit its row cap (LIMIT {limit}) — the rows "
+        "are a storage-order, spatially clustered slice, NOT the full selection. Do NOT "
+        "present this plot as the on-sky distribution; rebuild it from "
+        "datalab_density_aggregate / datalab_density_vetting (server-side GROUP BY), and "
+        "state the truncation in the answer."
+    ]
+
+
+def _stamp_truncation_caption(fig, warnings: List[str]) -> None:
+    """Draw a visible truncation caveat on the figure itself so a biased map can
+    never be presented as the full sky distribution without the reader seeing it."""
+    if not warnings:
+        return
+    fig.text(
+        0.5, 0.005,
+        "⚠ TRUNCATED SAMPLE (hit row cap) — spatially biased; not the full distribution",
+        ha="center", va="bottom", fontsize=8, color="crimson",
+    )
+
+
+def _plotly_points_spec(
+    x,
+    y,
+    *,
+    x_label: str,
+    y_label: str,
+    title: str,
+    color=None,
+    color_label: Optional[str] = None,
+    text=None,
+    invert_x: bool = False,
+    invert_y: bool = False,
+    log_x: bool = False,
+    mode: str = "markers",
+    marker_symbol: Optional[str] = None,
+    error_y=None,
+    max_points: int = 4000,
+    sort_by_color_desc: bool = False,
+) -> Dict[str, Any]:
+    """JSON-safe single-trace Plotly spec.
+
+    The frontend ships the BASIC Plotly bundle (scatter/bar/pie only — no
+    heatmap, no WebGL, no 3D), so every interactive Data Lab figure must be
+    expressed as an SVG 'scatter' trace. Density maps become square markers
+    colored by count; wedges become the 2D cartesian projection.
+    """
+    xv = np.asarray(x, dtype=float)
+    yv = np.asarray(y, dtype=float)
+    cv = np.asarray(color, dtype=float) if color is not None else None
+    tv = list(text) if text is not None else None
+    ev = np.asarray(error_y, dtype=float) if error_y is not None else None
+    if len(xv) > max_points:
+        if sort_by_color_desc and cv is not None:
+            # Keep the highest-count cells so density structure survives the cap.
+            sel = np.argsort(cv)[::-1][:max_points]
+        else:
+            sel = np.random.default_rng(0).choice(len(xv), size=max_points, replace=False)
+        xv, yv = xv[sel], yv[sel]
+        cv = cv[sel] if cv is not None else None
+        ev = ev[sel] if ev is not None else None
+        tv = [tv[i] for i in sel] if tv is not None else None
+    marker: Dict[str, Any] = {"size": 4, "opacity": 0.7}
+    if marker_symbol:
+        marker["symbol"] = marker_symbol
+    if cv is not None:
+        marker["color"] = [round(float(v), 4) for v in cv]
+        marker["colorscale"] = "Viridis"
+        marker["showscale"] = True
+        if color_label:
+            marker["colorbar"] = {"title": {"text": color_label}}
+    trace: Dict[str, Any] = {
+        "type": "scatter",
+        "mode": mode,
+        "x": [round(float(v), 4) for v in xv],
+        "y": [round(float(v), 4) for v in yv],
+        "marker": marker,
+    }
+    if tv is not None:
+        trace["text"] = [str(t) for t in tv]
+    if ev is not None:
+        trace["error_y"] = {"type": "data", "array": [round(float(v), 4) for v in ev], "visible": True}
+    layout: Dict[str, Any] = {
+        "title": {"text": title},
+        "xaxis": {"title": {"text": x_label}},
+        "yaxis": {"title": {"text": y_label}},
+        "showlegend": False,
+        "margin": {"l": 55, "r": 15, "t": 45, "b": 45},
+    }
+    if invert_x:
+        layout["xaxis"]["autorange"] = "reversed"
+    if invert_y:
+        layout["yaxis"]["autorange"] = "reversed"
+    if log_x:
+        layout["xaxis"]["type"] = "log"
+    return {"data": [trace], "layout": layout}
+
+
 def catalog_scatter(
     result_id: str,
     x_expr: str,
@@ -104,8 +212,9 @@ def catalog_scatter(
             ax.legend(title=color_by, fontsize=8)
     else:
         ax.scatter(x, y, s=18, alpha=0.8, edgecolors="none")
+    _locus_info: Optional[Dict[str, Any]] = None
     if overlay_locus:
-        _overlay_locus(ax, str(overlay_locus), x, y)
+        _locus_info = _overlay_locus(ax, str(overlay_locus), x, y)
     ax.set_xlabel(x_label or x_expr)
     ax.set_ylabel(y_label or y_expr)
     ax.set_title(title)
@@ -115,7 +224,25 @@ def catalog_scatter(
         ax.invert_yaxis()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    return _plot_result(plotting, fig, "datalab_scatter", result_id, res.provenance, extra={"points": int(mask.sum())})
+    trunc = _truncation_warnings(res.provenance)
+    _stamp_truncation_caption(fig, trunc)
+    extra: Dict[str, Any] = {"points": int(mask.sum())}
+    if _locus_info:
+        extra.update(_locus_info)
+    if trunc:
+        extra["warnings"] = trunc
+    spec_color = None
+    if color_by and color_by in frame.columns:
+        spec_color_series = pd.to_numeric(frame.loc[mask, color_by], errors="coerce")
+        if spec_color_series.notna().any():
+            spec_color = np.asarray(spec_color_series, dtype=float)
+    extra["plotly_spec"] = _plotly_points_spec(
+        np.asarray(x, dtype=float), np.asarray(y, dtype=float),
+        x_label=x_label or x_expr, y_label=y_label or y_expr, title=title,
+        color=spec_color, color_label=color_by if spec_color is not None else None,
+        invert_x=invert_x, invert_y=invert_y,
+    )
+    return _plot_result(plotting, fig, "datalab_scatter", result_id, res.provenance, extra=extra)
 
 
 def sky_density_map(
@@ -195,6 +322,20 @@ def sky_density_map(
             ax.grid(True, alpha=0.3)
         fig.tight_layout()
         extra = {"mode": "healpix", "nside": int(nside), "order": order, "log_scale": applied_log, "peaks": peaks}
+        trunc = _truncation_warnings(res.provenance)
+        if trunc:
+            _stamp_truncation_caption(fig, trunc)
+            extra["warnings"] = trunc
+        spec_ra, spec_dec = _healpix_centers(frame[healpix_col], int(nside), order)
+        spec_vals = np.asarray(pix_values, dtype=float)
+        spec_ok = np.isfinite(spec_vals) & ((spec_vals > 0) if applied_log else np.ones(len(spec_vals), bool))
+        extra["plotly_spec"] = _plotly_points_spec(
+            np.asarray(spec_ra)[spec_ok], np.asarray(spec_dec)[spec_ok],
+            x_label="RA (deg)", y_label="Dec (deg)", title=title,
+            color=(np.log10(spec_vals[spec_ok]) if applied_log else spec_vals[spec_ok]),
+            color_label=(f"log10 {count_col}" if applied_log else count_col),
+            invert_x=True, marker_symbol="square", sort_by_color_desc=True,
+        )
         return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra=extra)
 
     ra_name = _pick_column(frame, ra_col, ["ra", "ra_bin", "mean_fiber_ra", "s_ra"])
@@ -229,7 +370,24 @@ def sky_density_map(
     ax.invert_xaxis()
     ax.set_title(title)
     fig.tight_layout()
-    return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra={"mode": "hist2d", "log_scale": norm is not None, "peaks": peaks})
+    trunc = _truncation_warnings(res.provenance)
+    _stamp_truncation_caption(fig, trunc)
+    extra: Dict[str, Any] = {"mode": "hist2d", "log_scale": norm is not None, "peaks": peaks}
+    if trunc:
+        extra["warnings"] = trunc
+    xc = 0.5 * (xedges[:-1] + xedges[1:])
+    yc = 0.5 * (yedges[:-1] + yedges[1:])
+    gx, gy = np.meshgrid(xc, yc, indexing="ij")
+    nz = hist > 0
+    cell_vals = hist[nz]
+    extra["plotly_spec"] = _plotly_points_spec(
+        gx[nz], gy[nz],
+        x_label="RA (deg)", y_label="Dec (deg)", title=title,
+        color=(np.log10(cell_vals) if norm is not None else cell_vals),
+        color_label=(f"log10 {cb_label.replace(' (log scale)', '')}" if norm is not None else cb_label),
+        invert_x=True, marker_symbol="square", sort_by_color_desc=True,
+    )
+    return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra=extra)
 
 
 def period_fold(
@@ -263,6 +421,7 @@ def period_fold(
     # frame carries a band/filter column, restrict to it; otherwise leave the data
     # untouched and report band_applied=None so we never pretend to have filtered.
     band_applied: Optional[str] = None
+    fold_warnings: List[str] = []
     if band is not None and str(band).strip():
         want = str(band).strip()
         if band_col not in frame.columns:
@@ -279,6 +438,21 @@ def period_fold(
         band_applied = want
         if frame.empty:
             raise ValueError(f"No rows with {band_col}={want!r} to fold")
+    elif band_col in frame.columns:
+        # No band requested but the light curve mixes filters: folding them
+        # together smears the phased curve (per-band zero-points/amplitudes).
+        # Default to the best-sampled band and SAY so, instead of silently
+        # producing a mixed-band fold (live P14).
+        band_series = frame[band_col].astype(str).str.strip().str.casefold()
+        counts = band_series.value_counts()
+        if len(counts) > 1:
+            pick = str(counts.idxmax())
+            frame = frame[band_series == pick]
+            band_applied = pick
+            fold_warnings.append(
+                f"Light curve mixes {len(counts)} bands; folded only the best-sampled "
+                f"band '{pick}' ({int(counts.max())} epochs). Pass band=<name> to fold another."
+            )
     t = pd.to_numeric(frame[time_col], errors="coerce")
     mag = pd.to_numeric(frame[mag_col], errors="coerce")
     # Reject non-finite AND sentinel magnitudes: surveys pad missing photometry
@@ -302,6 +476,8 @@ def period_fold(
     if len(t_v) < 5:
         raise ValueError("period_fold requires at least five finite observations")
 
+    if float(min_frequency) <= 0 or float(max_frequency) <= float(min_frequency):
+        raise ValueError("period_fold requires 0 < min_frequency < max_frequency")
     ls = LombScargle(t_v, mag_v, dy=dy)
     freq, power = ls.autopower(minimum_frequency=float(min_frequency), maximum_frequency=float(max_frequency))
     best_idx = int(np.nanargmax(power))
@@ -309,6 +485,83 @@ def period_fold(
     best_period = 1.0 / best_frequency
     phase = ((t_v - np.nanmin(t_v)) / best_period) % 1.0
     order = np.argsort(phase)
+    time_span = float(np.nanmax(t_v) - np.nanmin(t_v))
+
+    # False-alarm probability of the best peak (Baluev approximation — the
+    # astropy default). A tiny FAP means "not noise", NOT "the period is right":
+    # aliases carry low FAPs too, which is why the alternates are reported.
+    # The searched frequency range MUST be passed explicitly: astropy otherwise
+    # derives its own default ceiling and the FAP would describe a different
+    # trial range than the periodogram actually searched. (guard CX-05)
+    fap_kwargs = {
+        "minimum_frequency": float(min_frequency),
+        "maximum_frequency": float(max_frequency),
+    }
+    fap: Optional[float] = None
+    try:
+        fap = float(ls.false_alarm_probability(power[best_idx], **fap_kwargs))
+    except Exception:
+        fap = None
+
+    # Honesty verdict — the tool must declare a null result itself: the model
+    # demonstrably won't (live P14 claimed "consistent with an RR Lyrae" for a
+    # grid-edge best period with FAP=0.28; the post-fix run got FAP=1.0 at the
+    # 1-day alias). A best peak within one resolution element (Δf ≈ 1/T) of the
+    # searched-window boundary is a window artifact, and a large FAP is noise.
+    freq_res = (1.0 / time_span) if time_span > 0 else 0.0
+    grid_edge = bool(
+        best_idx <= 0
+        or best_idx >= len(freq) - 1
+        or (best_frequency - float(freq[0])) < freq_res
+        or (float(freq[-1]) - best_frequency) < freq_res
+    )
+    significance_notes: List[str] = []
+    if grid_edge:
+        significance_notes.append(
+            f"best period {best_period:.5g} d lies at the edge of the searched window "
+            f"({1.0 / float(max_frequency):.5g}-{1.0 / float(min_frequency):.5g} d) - likely a "
+            "window artifact; widen min_frequency/max_frequency and re-run"
+        )
+    if fap is None:
+        significance_notes.append("false-alarm probability could not be computed")
+    elif fap > 0.1:
+        significance_notes.append(
+            f"false-alarm probability {fap:.2g} > 0.1 - the peak is consistent with noise"
+        )
+    period_significant = bool(fap is not None and fap <= 0.1 and not grid_edge)
+    if not period_significant:
+        fold_warnings.append(
+            "NO SIGNIFICANT PERIOD detected: " + "; ".join(significance_notes) + ". Do not "
+            "present the folded curve as a real periodicity."
+        )
+
+    # Top alternate peaks: greedy pick by power, excluding a few natural
+    # resolution elements (Δf ≈ 1/T) around already-accepted peaks so one broad
+    # peak is not reported three times. ±1/day aliases survive by design.
+    exclusion = 3.0 / time_span if time_span > 0 else 0.0
+    alternates: List[Dict[str, Any]] = []
+    if exclusion > 0.0:
+        accepted = [best_frequency]
+        finite_power = np.where(np.isfinite(power), power, -np.inf)
+        for idx in np.argsort(finite_power)[::-1]:
+            if len(alternates) >= 3:
+                break
+            f_i = float(freq[idx])
+            if not np.isfinite(finite_power[idx]):
+                break
+            if any(abs(f_i - f_acc) < exclusion for f_acc in accepted):
+                continue
+            accepted.append(f_i)
+            entry = {
+                "period_days": 1.0 / f_i,
+                "frequency_per_day": f_i,
+                "power": float(power[idx]),
+            }
+            try:
+                entry["false_alarm_probability"] = float(ls.false_alarm_probability(power[idx], **fap_kwargs))
+            except Exception:
+                pass
+            alternates.append(entry)
 
     plotting = plotting_service or PlottingService()
     plt = plotting._apply_style(dark=False)
@@ -317,7 +570,12 @@ def period_fold(
     ax1.axvline(best_frequency, color="#D55E00", ls="--", lw=1.0)
     ax1.set_xlabel("Frequency (1/day)")
     ax1.set_ylabel("Lomb-Scargle power")
-    ax1.set_title(f"Best period = {best_period:.5g} d")
+    fap_label = f", FAP={fap:.2g}" if fap is not None else ""
+    if period_significant:
+        ax1.set_title(f"Best period = {best_period:.5g} d{fap_label}")
+    else:
+        # The figure itself must carry the null verdict — captions get dropped.
+        ax1.set_title(f"NO significant period (best {best_period:.5g} d{fap_label})", color="crimson")
     if dy is not None:
         ax2.errorbar(phase[order], mag_v[order], yerr=dy[order], fmt="o", ms=3, alpha=0.8)
         ax2.errorbar(phase[order] + 1.0, mag_v[order], yerr=dy[order], fmt="o", ms=3, alpha=0.8)
@@ -335,20 +593,113 @@ def period_fold(
         "datalab_period",
         result_id,
         res.provenance,
-        extra={"best_period_days": best_period, "best_frequency_per_day": best_frequency, "points": int(len(t_v)), "band": band_applied},
+        extra={
+            "best_period_days": best_period,
+            "best_frequency_per_day": best_frequency,
+            "false_alarm_probability": fap,
+            "period_significant": period_significant,
+            "significance": "significant" if period_significant else "no_significant_period",
+            "significance_notes": significance_notes,
+            "searched_period_days": [1.0 / float(max_frequency), 1.0 / float(min_frequency)],
+            "use_errors": use_errors,
+            "warnings": fold_warnings,
+            "alternate_periods": alternates,
+            "plotly_spec": _period_fold_plotly_spec(
+                freq, power, best_frequency, phase, mag_v, dy, order, mag_col,
+                title=(f"Best period = {best_period:.5g} d{fap_label}"
+                       if period_significant
+                       else f"NO significant period (best {best_period:.5g} d{fap_label})"),
+            ),
+            "points": int(len(t_v)),
+            "band": band_applied,
+        },
     )
+
+
+def _period_fold_plotly_spec(freq, power, best_frequency, phase, mag_v, dy, order, mag_col, *, title):
+    """Two-panel interactive fold: periodogram (left) + phase-folded curve (right)."""
+    f = np.asarray(freq, dtype=float)
+    p = np.asarray(power, dtype=float)
+    if len(f) > 2000:
+        stride = int(np.ceil(len(f) / 2000.0))
+        keep = np.zeros(len(f), dtype=bool)
+        keep[::stride] = True
+        keep[int(np.nanargmax(p))] = True  # never drop the peak itself
+        f, p = f[keep], p[keep]
+    ph = np.asarray(phase, dtype=float)[order]
+    mg = np.asarray(mag_v, dtype=float)[order]
+    er = np.asarray(dy, dtype=float)[order] if dy is not None else None
+    fold_trace: Dict[str, Any] = {
+        "type": "scatter",
+        "mode": "markers",
+        "name": "folded",
+        "x": [round(float(v), 4) for v in np.concatenate([ph, ph + 1.0])],
+        "y": [round(float(v), 4) for v in np.concatenate([mg, mg])],
+        "marker": {"size": 4, "opacity": 0.75},
+        "xaxis": "x2",
+        "yaxis": "y2",
+    }
+    if er is not None:
+        fold_trace["error_y"] = {
+            "type": "data",
+            "array": [round(float(v), 4) for v in np.concatenate([er, er])],
+            "visible": True,
+        }
+    return {
+        "data": [
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": "periodogram",
+                "x": [round(float(v), 5) for v in f],
+                "y": [round(float(v), 5) for v in p],
+                "line": {"width": 1},
+            },
+            fold_trace,
+        ],
+        "layout": {
+            "title": {"text": title},
+            "grid": {"rows": 1, "columns": 2, "pattern": "independent"},
+            "xaxis": {"title": {"text": "Frequency (1/day)"}},
+            "yaxis": {"title": {"text": "Lomb-Scargle power"}},
+            "xaxis2": {"title": {"text": "Phase"}},
+            "yaxis2": {"title": {"text": mag_col}, "autorange": "reversed"},
+            "showlegend": False,
+            "margin": {"l": 55, "r": 15, "t": 45, "b": 45},
+            "shapes": [{
+                "type": "line", "xref": "x", "yref": "paper",
+                "x0": round(float(best_frequency), 5), "x1": round(float(best_frequency), 5),
+                "y0": 0, "y1": 1, "line": {"dash": "dash", "width": 1},
+            }],
+        },
+    }
+
+
+_SED_MAX_OBJECTS = 300
 
 
 def sed_plot(
     result_id: str,
     *,
-    row_index: int = 0,
+    row_index: Optional[int] = None,
+    row_indices: Optional[Sequence[int]] = None,
+    sample_n: Optional[int] = None,
     filter_columns: Optional[Mapping[str, str]] = None,
     title: str = "Data Lab SED",
     result_store: Any = None,
     plotting_service: Optional[PlottingService] = None,
     svo_client: Any = None,
 ) -> Dict[str, Any]:
+    """SED(s) from stored photometry rows.
+
+    ``row_indices`` selects specific rows; ``sample_n`` overlays the first N
+    rows — each object a faint line with the per-band MEDIAN highlighted,
+    capped at 300 objects; an explicit ``row_index`` draws one object. With NO
+    selector at all, multi-row results default to the SAMPLE overlay: two live
+    P10 runs asked for "a few hundred" SEDs and the model called with no
+    selector both times despite the tool description — description-level
+    nudges demonstrably don't reach the call, so the default must.
+    """
     title = _clean_label(title)
     res = _get_result(result_id, result_store)
     frame = res.dataframe
@@ -361,33 +712,92 @@ def sed_plot(
         "w1": "dered_mag_w1",
         "w2": "dered_mag_w2",
     })
-    row = frame.iloc[int(row_index)]
-    filters: List[str] = []
-    mags: List[float] = []
-    for filt, col in mapping.items():
-        if col not in frame.columns:
-            continue
-        mag = _as_float(row[col])
-        if mag is None or not np.isfinite(mag) or mag >= 90:
-            continue
-        filters.append(str(filt))
-        mags.append(float(mag))
-    if not filters:
+
+    auto_sampled = False
+    if row_indices is not None:
+        indices = [int(i) for i in row_indices]
+    elif sample_n is not None and int(sample_n) > 1:
+        indices = list(range(min(int(sample_n), len(frame))))
+    elif row_index is not None:
+        indices = [int(row_index)]
+    elif len(frame) > 1:
+        # No selector on a multi-row result: sample-first (see docstring).
+        indices = list(range(min(_SED_MAX_OBJECTS, len(frame))))
+        auto_sampled = True
+    else:
+        indices = [0]
+    capped = len(indices) > _SED_MAX_OBJECTS
+    indices = indices[:_SED_MAX_OBJECTS]
+    multi = len(indices) > 1
+
+    present = {filt: col for filt, col in mapping.items() if col in frame.columns}
+    if not present:
+        raise ValueError("No SED filter columns found in the result")
+    # Per-object SEDs: filters must be shared across the figure, so collect the
+    # union of filters with at least one finite magnitude among selected rows.
+    seds: List[tuple] = []  # (index, {filter: mag})
+    used_filters: List[str] = []
+    for idx in indices:
+        row = frame.iloc[idx]
+        sed: Dict[str, float] = {}
+        for filt, col in present.items():
+            mag = _as_float(row[col])
+            if mag is None or not np.isfinite(mag) or mag >= 90:
+                continue
+            sed[str(filt)] = float(mag)
+            if filt not in used_filters:
+                used_filters.append(str(filt))
+        if sed:
+            seds.append((idx, sed))
+    if not seds:
         raise ValueError("No finite SED magnitudes found")
 
     if svo_client is None:
         from integrations.svo_fps_client import SvoFpsClient
 
         svo_client = SvoFpsClient()
-    wavelengths = svo_client.wavelengths(filters)
-    x = [float(wavelengths[f]["effective_micron"]) for f in filters]
+    wavelengths = svo_client.wavelengths(used_filters)
+    wl = {f: float(wavelengths[f]["effective_micron"]) for f in used_filters}
+    filt_order = sorted(used_filters, key=lambda f: wl[f])
 
     plotting = plotting_service or PlottingService()
     plt = plotting._apply_style(dark=False)
     fig, ax = plt.subplots(figsize=(5.2, 3.6))
-    ax.plot(x, mags, marker="o", lw=1.2)
-    for xx, yy, filt in zip(x, mags, filters):
-        ax.text(xx, yy, filt, fontsize=8, ha="left", va="bottom")
+    spec_traces: List[Dict[str, Any]] = []
+    if multi:
+        for _idx, sed in seds:
+            xs = [wl[f] for f in filt_order if f in sed]
+            ys = [sed[f] for f in filt_order if f in sed]
+            ax.plot(xs, ys, lw=0.6, alpha=0.18, color="#0072B2")
+            spec_traces.append({
+                "type": "scatter", "mode": "lines",
+                "x": [round(v, 4) for v in xs], "y": [round(v, 4) for v in ys],
+                "line": {"width": 1, "color": "rgba(0,114,178,0.18)"},
+                "hoverinfo": "skip", "showlegend": False,
+            })
+        med_x = [wl[f] for f in filt_order]
+        med_y = [float(np.median([sed[f] for _i, sed in seds if f in sed])) for f in filt_order]
+        ax.plot(med_x, med_y, marker="o", lw=2.0, color="#D55E00", label=f"median of {len(seds)}")
+        ax.legend(fontsize=8)
+        spec_traces.append({
+            "type": "scatter", "mode": "lines+markers", "name": f"median of {len(seds)}",
+            "x": [round(v, 4) for v in med_x], "y": [round(v, 4) for v in med_y],
+            "line": {"width": 2.5, "color": "#D55E00"}, "marker": {"size": 6},
+        })
+    else:
+        _idx, sed = seds[0]
+        xs = [wl[f] for f in filt_order if f in sed]
+        ys = [sed[f] for f in filt_order if f in sed]
+        labels = [f for f in filt_order if f in sed]
+        ax.plot(xs, ys, marker="o", lw=1.2)
+        for xx, yy, filt in zip(xs, ys, labels):
+            ax.text(xx, yy, filt, fontsize=8, ha="left", va="bottom")
+        spec_traces.append({
+            "type": "scatter", "mode": "lines+markers+text", "text": labels,
+            "textposition": "top center",
+            "x": [round(v, 4) for v in xs], "y": [round(v, 4) for v in ys],
+            "marker": {"size": 7},
+        })
     ax.set_xscale("log")
     ax.invert_yaxis()
     ax.set_xlabel("Wavelength (micron)")
@@ -395,7 +805,33 @@ def sed_plot(
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    return _plot_result(plotting, fig, "datalab_sed", result_id, res.provenance, extra={"filters": filters, "wavelengths": wavelengths})
+    extra: Dict[str, Any] = {
+        "filters": used_filters,
+        "wavelengths": wavelengths,
+        "objects_plotted": len(seds),
+    }
+    notes: List[str] = []
+    if capped:
+        notes.append(f"SED overlay capped at {_SED_MAX_OBJECTS} objects.")
+    if auto_sampled:
+        extra["auto_sampled"] = True
+        notes.append(
+            f"No row selector given — rendered the sample overlay ({len(seds)} of "
+            f"{len(frame)} rows with the per-band median). Pass row_index for a single object."
+        )
+    if notes:
+        extra["warnings"] = notes
+    extra["plotly_spec"] = {
+        "data": spec_traces,
+        "layout": {
+            "title": {"text": title},
+            "xaxis": {"title": {"text": "Wavelength (micron)"}, "type": "log"},
+            "yaxis": {"title": {"text": "Magnitude"}, "autorange": "reversed"},
+            "showlegend": multi,
+            "margin": {"l": 55, "r": 15, "t": 45, "b": 45},
+        },
+    }
+    return _plot_result(plotting, fig, "datalab_sed", result_id, res.provenance, extra=extra)
 
 
 def lss_wedge(
@@ -456,7 +892,19 @@ def lss_wedge(
     fig.colorbar(sc, ax=ax, label=class_col if colors is not None else "redshift")
     ax.set_title(title)
     fig.tight_layout()
-    return _plot_result(plotting, fig, "datalab_lss", result_id, res.provenance, extra={"points": int(mask.sum()), "pie_slice": bool(pie_slice)})
+    # Interactive counterpart: the basic Plotly bundle has no 3D traces, so the
+    # spec is the 2D comoving-plane projection (X-Y), colored by redshift.
+    spec = _plotly_points_spec(
+        x, y,
+        x_label="X (Mpc, comoving)", y_label="Y (Mpc, comoving)", title=title,
+        color=(np.asarray(colors, dtype=float) if colors is not None else z_v),
+        color_label=(class_col if colors is not None else "redshift"),
+    )
+    spec["layout"]["yaxis"]["scaleanchor"] = "x"
+    return _plot_result(
+        plotting, fig, "datalab_lss", result_id, res.provenance,
+        extra={"points": int(mask.sum()), "pie_slice": bool(pie_slice), "plotly_spec": spec},
+    )
 
 
 def _get_result(result_id: str, result_store: Any = None):
@@ -532,9 +980,9 @@ def _eval_expression(frame: pd.DataFrame, expr: str) -> pd.Series:
     return pd.Series(value, index=frame.index)
 
 
-def _overlay_locus(ax: Any, name: str, x: pd.Series, y: pd.Series) -> None:
+def _overlay_locus(ax: Any, name: str, x: pd.Series, y: pd.Series) -> Optional[Dict[str, Any]]:
     if name.lower() not in {"wd", "wd_sequence", "white_dwarf"} or x.empty:
-        return
+        return None
     xs = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 80)
     ys = 11.5 + 5.0 * xs
     yrange = (float(np.nanmin(y)), float(np.nanmax(y)))
@@ -544,6 +992,28 @@ def _overlay_locus(ax: Any, name: str, x: pd.Series, y: pd.Series) -> None:
     if mask.any():
         ax.plot(xs[mask], ys[mask], color="#D55E00", lw=1.2, ls="--", label="WD locus")
         ax.legend(fontsize=8)
+    # Side-of-line classification (DECISION-03 default). The drawn line IS the WD
+    # locus y = 11.5 + 5.0*x; finite points on the FAINT side (larger magnitude,
+    # y > line) are white-dwarf candidates, the rest are main-sequence/other.
+    # Returned so the tool result can quote real counts and a model cannot call
+    # the lower main sequence a "WD cooling track".
+    line_at_x = 11.5 + 5.0 * np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    finite = np.isfinite(y_arr) & np.isfinite(line_at_x)
+    is_wd = finite & (y_arr > line_at_x)
+    n_wd = int(is_wd.sum())
+    n_other = int((finite & ~is_wd).sum())
+    return {
+        "n_wd_candidates": n_wd,
+        "n_other": n_other,
+        "wd_locus_rule": "y = 11.5 + 5.0*x; faint side (y > line) = WD candidates",
+        "wd_locus_note": (
+            f"{n_wd} point(s) lie on the faint side of the white-dwarf locus "
+            f"(y = 11.5 + 5.0*x) and are WD candidates; {n_other} point(s) lie on "
+            f"the bright/main-sequence side. Do NOT label the main-sequence points "
+            f"a white-dwarf cooling track."
+        ),
+    }
 
 
 def _pick_column(frame: pd.DataFrame, preferred: Optional[str], candidates: Sequence[str]) -> str:

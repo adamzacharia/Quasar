@@ -242,6 +242,60 @@ def test_color_image_and_cutout_grid_capabilities():
     assert out2["success"] is True and out2["image_base64"] == "GRID"
 
 
+def test_sia_search_inventory_stores_rows_and_filters_band():
+    class _SvcInventory:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, ra, dec, fov, catalog=None, endpoint=None):
+            self.calls.append((ra, dec, fov, catalog, endpoint))
+            return {
+                "success": True,
+                "coverage_gap": False,
+                "used_endpoint": "https://datalab.noirlab.edu/sia/ls_dr9",
+                "provenance": {"service": "NOIRLab Astro Data Lab SIA"},
+                "rows": [
+                    {"obs_bandpass": "g DECam", "exptime": 900.0, "proctype": "Stack",
+                     "prodtype": "image", "access_url": "https://x/1"},
+                    {"obs_bandpass": "r DECam", "exptime": 500.0, "proctype": "Stack",
+                     "prodtype": "image", "access_url": "https://x/2"},
+                ],
+            }
+
+    svc = _SvcInventory()
+    ctx = _img_ctx(svc)
+    out = dl.SiaSearch().run(
+        dl.SiaSearchInput(target_name="M31", fov_deg=0.2, band="g", catalog="ls_dr9"),
+        ctx,
+    ).to_native()
+
+    assert out["success"] is True
+    assert out["rowcount"] == 1  # r-band row filtered out
+    assert out["result_id"].startswith("dlr_")
+    assert out["coverage_gap"] is False
+    assert out["position"]["label"] == "M31"
+    # preview shows display columns only; access_url stays in the stored rows
+    assert all("access_url" not in row for row in out["preview"])
+    stored = ctx.result_store.get(out["result_id"]).dataframe
+    assert list(stored["access_url"]) == ["https://x/1"]
+    assert svc.calls[0][3] == "ls_dr9"
+
+
+def test_sia_search_requires_result_store():
+    class _SvcBoom:
+        def search(self, *a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("search must not run without a result store")
+
+    ctx = CallContext(
+        services={"datalab_image_service": _SvcBoom(),
+                  "resolve_coordinates": lambda **k: (1.0, 2.0, "X")},
+        result_store=None,
+    )
+    out = dl.SiaSearch().run(dl.SiaSearchInput(ra=1.0, dec=2.0), ctx).to_native()
+    assert out["success"] is False
+    assert "result store" in out["error"]
+
+
 # ── Orchestration / job capabilities ─────────────────────────────────────────
 def test_confirm_sky_area_capability(monkeypatch):
     import services.datalab_orchestration as orch
@@ -285,9 +339,9 @@ def test_job_results_and_cancel_capabilities():
 
     store = DatalabResultStore(enable_disk_cache=False)
     ctx = CallContext(services={"datalab_job_service": _JobSvc()}, result_store=store)
-    out = dl.JobResults().run(dl.JobIdInput(job_id="j1"), ctx).to_native()
+    out = dl.JobResults().run(dl.JobIdInput(job_id="dlj_j1"), ctx).to_native()
     assert out["success"] is True and out["rows"] == [1, 2]
-    out2 = dl.JobCancel().run(dl.JobIdInput(job_id="j1"), ctx).to_native()
+    out2 = dl.JobCancel().run(dl.JobIdInput(job_id="dlj_j1"), ctx).to_native()
     assert out2["success"] is True and out2["cancelled"] is True
 
 
@@ -344,7 +398,9 @@ def _patch_tiling(monkeypatch):
 
 
 def _agg_input(**over):
-    base = dict(catalog="gaia_dr3", table="gaia_source", ra=266.4, dec=-29.0, radius_deg=3.0)
+    # radius 3.0 > the 2.5-degree unconfirmed cap (F-7 HITL gate), so the tiling
+    # tests model a user-confirmed wide scan.
+    base = dict(catalog="gaia_dr3", table="gaia_source", ra=266.4, dec=-29.0, radius_deg=3.0, confirm=True)
     base.update(over)
     return dl.DensityAggregateInput(**base)
 
@@ -462,21 +518,33 @@ def test_density_aggregate_missing_state_service_is_a_typed_error():
 
 
 @pytest.mark.parametrize("raw", ["false", "0", "no", "off", "maybe", 1, "true"])
-def test_density_aggregate_all_sky_keeps_legacy_truthiness(raw):
-    # The builder's gate is a bare `elif all_sky:` truthiness check, and the
-    # legacy method forwarded the raw JSON value — so ANY non-empty string
-    # (including "false") selected the all-sky branch. Typing the field `bool`
-    # would let pydantic coerce "false"/"0"/"no"/"off" to False and refuse the
-    # scan the legacy would have run. `Any` preserves parity exactly.
-    # (Same hazard as SqlQueryInput.expert_ack.)
+def test_density_aggregate_stringy_all_sky_is_rejected(raw):
+    # C18 (S45): the builder gate is now the strict identity `elif all_sky is
+    # True:`. The capability field stays `Any` (PV-3, no pydantic coercion), so
+    # a stringy "false" — which under the legacy bare-truthiness gate silently
+    # triggered an unbounded whole-catalog scan — now falls through to the
+    # "requires a cone" guard instead. Only the real JSON boolean true may
+    # select the all-sky branch.
     client = _FakeClient(_AGG_DF)
     ctx, _ = _agg_ctx(client)
     out = dl.DensityAggregate().run(
         dl.DensityAggregateInput(catalog="gaia_dr3", table="gaia_source", all_sky=raw), ctx
     ).to_native()
-    assert bool(raw), "test only covers truthy JSON values"
-    assert out["success"] is True                 # took the all-sky branch, as legacy did
-    assert "q3c_radial_query" not in client.last_sql   # unbounded: no cone predicate
+    assert bool(raw), "test only covers truthy-but-not-True JSON values"
+    assert out["success"] is False
+    assert "requires a cone" in out["error"]
+
+
+def test_density_aggregate_bool_true_all_sky_takes_all_sky_branch():
+    # The strict gate must still honor a genuine JSON true: unbounded aggregate,
+    # no cone predicate in the SQL.
+    client = _FakeClient(_AGG_DF)
+    ctx, _ = _agg_ctx(client)
+    out = dl.DensityAggregate().run(
+        dl.DensityAggregateInput(catalog="gaia_dr3", table="gaia_source", all_sky=True), ctx
+    ).to_native()
+    assert out["success"] is True
+    assert "q3c_radial_query" not in client.last_sql
 
 
 @pytest.mark.parametrize("falsy", [False, None, 0, ""])
@@ -521,36 +589,36 @@ def _job_ctx(svc, counts=None):
 def test_job_status_first_two_polls_do_not_stop_polling():
     ctx, counts = _job_ctx(_JobStatusSvc("running"))
     for expected in (1, 2):
-        out = dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx).to_native()
+        out = dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx).to_native()
         assert out["success"] is True and out["status"] == "running"
         assert "stop_polling" not in out
-        assert counts == {"j1": expected}
+        assert counts == {"dlj_j1": expected}
 
 
 def test_job_status_third_poll_tells_the_model_to_stop():
-    ctx, counts = _job_ctx(_JobStatusSvc("queued"), counts={"j1": 2})
-    out = dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx).to_native()
+    ctx, counts = _job_ctx(_JobStatusSvc("queued"), counts={"dlj_j1": 2})
+    out = dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx).to_native()
     assert out["stop_polling"] is True
-    assert counts == {"j1": 3}
-    assert "j1" in out["instruction"]
+    assert counts == {"dlj_j1": 3}
+    assert "dlj_j1" in out["instruction"]
     assert "after 3 polls" in out["instruction"]
     assert "Do NOT call datalab_job_status again this turn." in out["instruction"]
 
 
 def test_job_status_counts_each_job_id_separately():
     ctx, counts = _job_ctx(_JobStatusSvc("running"))
-    dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx)
-    dl.JobStatus().run(dl.JobIdInput(job_id="j2"), ctx)
-    dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx)
-    assert counts == {"j1": 2, "j2": 1}
+    dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx)
+    dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j2"), ctx)
+    dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx)
+    assert counts == {"dlj_j1": 2, "dlj_j2": 1}
     # neither reached the 3-poll nudge
-    assert dl.JobStatus().run(dl.JobIdInput(job_id="j2"), ctx).to_native().get("stop_polling") is None
+    assert dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j2"), ctx).to_native().get("stop_polling") is None
 
 
 def test_job_status_mixed_case_running_status_still_counts():
     ctx, counts = _job_ctx(_JobStatusSvc("RUNNING"))
-    dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx)
-    assert counts == {"j1": 1}
+    dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx)
+    assert counts == {"dlj_j1": 1}
 
 
 @pytest.mark.parametrize("terminal", ["succeeded", "failed", "canceled"])
@@ -560,7 +628,7 @@ def test_job_status_terminal_status_never_counts_or_stops(terminal):
     # path, so a terminal poll works even with no counter injected at all.
     svc = _JobStatusSvc(terminal)
     ctx = CallContext(services={"datalab_job_service": svc})
-    out = dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx).to_native()
+    out = dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx).to_native()
     assert out["success"] is True and out["status"] == terminal
     assert "stop_polling" not in out and "instruction" not in out
 
@@ -571,7 +639,7 @@ def test_job_status_service_failure_is_a_typed_error():
             raise RuntimeError("job store unreachable")
 
     ctx, _ = _job_ctx(_Boom())
-    out = dl.JobStatus().run(dl.JobIdInput(job_id="j1"), ctx).to_native()
+    out = dl.JobStatus().run(dl.JobIdInput(job_id="dlj_j1"), ctx).to_native()
     assert out["success"] is False and "job store unreachable" in out["error"]
 
 
@@ -597,6 +665,7 @@ def _wiring_agent():
 
 def test_ctx_provider_injects_the_agents_own_per_turn_state_objects():
     agent = _wiring_agent()
+    agent._tls.current_user_id = "alice"
     ctx1 = agent._datalab_ctx_provider()
     ctx2 = agent._datalab_ctx_provider()
 
@@ -607,6 +676,9 @@ def test_ctx_provider_injects_the_agents_own_per_turn_state_objects():
     # …and they ARE the agent's attributes, lazily created.
     assert ctx1.service("datalab_agg_timeout_tables") is agent._datalab_agg_timeout_tables
     assert ctx1.service("datalab_job_poll_counts") is agent._job_poll_counts
+    assert ctx1.user_id == "alice"
+    agent._sandbox_tool_bridge("missing", {}, user_id="bob")
+    assert agent._tls.current_user_id == "bob"
 
 
 def test_ctx_provider_picks_up_the_per_turn_reset():
@@ -644,7 +716,8 @@ def test_migrated_tools_keep_their_legacy_registration_surface():
 
     job = agent.tool_registry.get_tool("datalab_job_status")
     assert job is not None
-    assert job.description == "Poll the status of a Data Lab background job (e.g. a tiled search)."
+    assert job.description == ("Poll the status of a Data Lab background job — local 'dlj_' ids (tiled "
+                               "search, local async queries) and real server-side job ids from async_submit.")
     assert job.parameters["required"] == ["job_id"]
 
 
@@ -662,3 +735,521 @@ def test_density_aggregate_dispatches_through_the_registry():
     assert payload["success"] is True
     assert payload["tool_name"] == "datalab_density_aggregate"
     assert payload["result_id"].startswith("dlr_")
+
+
+# ── DensityVetting: nested image marked for the adapter-boundary attach ──────
+def _vetting_ctx(image_service=None):
+    store = DatalabResultStore(enable_disk_cache=False)
+
+    def resolver(target_name=None, ra=None, dec=None):
+        if ra is not None and dec is not None:
+            return float(ra), float(dec), f"RA={ra}, Dec={dec}"
+        return 10.0, 20.0, str(target_name)
+
+    return CallContext(
+        services={
+            "datalab_client": _FakeClient(_AGG_DF),
+            "datalab_image_service": image_service or _FakeImageService(),
+            "resolve_coordinates": resolver,
+        },
+        result_store=store,
+    )
+
+
+def _patch_vetting(monkeypatch, grid):
+    """Record the density_then_cutouts call and return a canned P12 result."""
+    calls = []
+
+    def fake(catalog, table, ra, dec, radius_deg, **kw):
+        calls.append({"catalog": catalog, "table": table, "ra": ra, "dec": dec,
+                      "radius_deg": radius_deg, **kw})
+        return {"success": True, "result_id": "dlr_vet", "n_peaks": 1,
+                "peaks": [{"ra": 1.0, "dec": 2.0, "label": "n=10"}], "cutout_grid": grid}
+
+    monkeypatch.setattr(dl.datalab_orchestration, "density_then_cutouts", fake)
+    return calls
+
+
+def test_density_vetting_marks_nested_grid_and_injects_services(monkeypatch):
+    grid = {"image_base64": "GRID64", "path": "/plots/grid.png"}
+    calls = _patch_vetting(monkeypatch, grid)
+    ctx = _vetting_ctx()
+    out = dl.DensityVetting().run(
+        dl.DensityVettingInput(catalog="nsc_dr2", table="object", radius_deg=0.3, ra=10.0, dec=20.0),
+        ctx,
+    ).to_native()
+
+    assert out["success"] is True
+    assert out["target"] == "RA=10.0, Dec=20.0"
+    # The nested grid is a COPY marked with the private caption under exactly
+    # the legacy attach condition (has image_base64/path) + success setdefault.
+    marked = out["cutout_grid"]
+    assert marked is not grid
+    assert marked["success"] is True
+    assert marked["_caption"] == "Density-peak cutout grid: RA=10.0, Dec=20.0 (top 5)"
+    assert marked["image_base64"] == "GRID64"  # capability does NOT strip — the wrapper does
+    # The orchestration got the ctx-injected client/store/image service.
+    assert calls[0]["client"] is ctx.service("datalab_client")
+    assert calls[0]["result_store"] is ctx.result_store
+    assert calls[0]["image_service"] is ctx.service("datalab_image_service")
+
+
+def test_density_vetting_imageless_grid_left_untouched(monkeypatch):
+    grid = {"panels": []}  # no image_base64 / path → legacy never attached
+    _patch_vetting(monkeypatch, grid)
+    out = dl.DensityVetting().run(
+        dl.DensityVettingInput(catalog="nsc_dr2", table="object", radius_deg=0.3, ra=10.0, dec=20.0),
+        _vetting_ctx(),
+    ).to_native()
+    assert out["cutout_grid"] is grid          # same object, no copy
+    assert "_caption" not in out["cutout_grid"]
+    assert "success" not in out["cutout_grid"]  # no setdefault outside the attach branch
+
+
+def test_density_vetting_null_coerces_optionals_to_legacy_defaults(monkeypatch):
+    calls = _patch_vetting(monkeypatch, {"panels": []})
+    out = dl.DensityVetting().run(
+        dl.DensityVettingInput(catalog="nsc_dr2", table="object", radius_deg=None,
+                               ra=10.0, dec=20.0, step_deg=None, top_n=None,
+                               fov_deg=None, band=None),
+        _vetting_ctx(),
+    ).to_native()
+    assert out["success"] is True
+    c = calls[0]
+    assert (c["radius_deg"], c["step_deg"], c["top_n"], c["fov_deg"], c["band"]) == (0.5, 0.05, 5, 0.05, "g")
+
+
+def test_density_vetting_radius_key_is_required_but_nullable():
+    # Legacy took radius_deg as a required positional and null-coerced an
+    # explicit null; the InputModel mirrors that: missing key → validation
+    # error, present-but-null → accepted (coerced in run()).
+    import pydantic
+    with pytest.raises(pydantic.ValidationError):
+        dl.DensityVettingInput(catalog="nsc_dr2", table="object")
+    inp = dl.DensityVettingInput(catalog="nsc_dr2", table="object", radius_deg=None)
+    assert inp.radius_deg is None
+
+
+def test_density_vetting_resolver_failure_is_typed(monkeypatch):
+    _patch_vetting(monkeypatch, {"panels": []})
+
+    def bad_resolver(target_name=None, ra=None, dec=None):
+        raise ValueError("Could not resolve target 'Nope'")
+
+    ctx = CallContext(
+        services={"datalab_client": _FakeClient(_AGG_DF),
+                  "datalab_image_service": _FakeImageService(),
+                  "resolve_coordinates": bad_resolver},
+        result_store=DatalabResultStore(enable_disk_cache=False),
+    )
+    out = dl.DensityVetting().run(
+        dl.DensityVettingInput(catalog="nsc_dr2", table="object", radius_deg=0.3, target_name="Nope"),
+        ctx,
+    ).to_native()
+    assert out["success"] is False and "Could not resolve" in out["error"]
+
+
+# ── TiledSearch: HITL gate + background job start ────────────────────────────
+class _FakeJobService:
+    def __init__(self):
+        self.started = []
+
+    def start(self, name, fn, params=None):
+        self.started.append({"name": name, "fn": fn, "params": params})
+        return f"job_{len(self.started)}"
+
+
+def _tiled_ctx(job_service=None):
+    svc = job_service or _FakeJobService()
+    return CallContext(services={"datalab_job_service": svc}), svc
+
+
+def _tiled_input(**over):
+    base = dict(catalog="nsc_dr2", table="object", ra_min=10.0, ra_max=12.0,
+                dec_min=-1.0, dec_max=1.0)
+    base.update(over)
+    return dl.TiledSearchInput(**base)
+
+
+def test_tiled_search_needs_confirmation_gate(monkeypatch):
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area",
+                        lambda fp, r, **k: {"needs_confirmation": True, "tiles": 200,
+                                            "area_deg2": 4000.0, "message": "confirm first"})
+    ctx, svc = _tiled_ctx()
+    out = dl.TiledSearch().run(_tiled_input(), ctx).to_native()
+    assert out["success"] is False and out["needs_confirmation"] is True
+    assert out["tiles"] == 200
+    assert "confirm=true" in out["hint"]
+    assert svc.started == []  # the scan was NOT started
+
+
+def test_tiled_search_starts_job_when_confirmed(monkeypatch):
+    seen = {}
+
+    def fake_confirm(fp, r, max_tiles=None):
+        seen["confirm_args"] = (fp, r, max_tiles)
+        return {"needs_confirmation": True, "tiles": 200, "area_deg2": 4000.0, "message": "m"}
+
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area", fake_confirm)
+    ctx, svc = _tiled_ctx()
+    out = dl.TiledSearch().run(_tiled_input(confirm=True, tile_radius_deg=1.5, max_tiles=32), ctx).to_native()
+
+    assert out["success"] is True and out["status"] == "queued"
+    assert out["job_id"] == "job_1"
+    assert "datalab_job_status" in out["note"]
+    assert out["tiles"] == 200  # the decision dict is merged into the reply
+    assert seen["confirm_args"] == ({"ra_min": 10.0, "ra_max": 12.0, "dec_min": -1.0, "dec_max": 1.0}, 1.5, 32)
+    assert svc.started[0]["name"] == "tiled_sky_scan"
+    assert svc.started[0]["params"] == {"catalog": "nsc_dr2", "table": "object",
+                                        "ra_min": 10.0, "ra_max": 12.0, "dec_min": -1.0, "dec_max": 1.0}
+
+
+def test_tiled_search_small_area_runs_without_confirm(monkeypatch):
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area",
+                        lambda fp, r, **k: {"needs_confirmation": False, "tiles": 4})
+    ctx, svc = _tiled_ctx()
+    out = dl.TiledSearch().run(_tiled_input(), ctx).to_native()
+    assert out["success"] is True and len(svc.started) == 1
+
+
+def test_tiled_search_confirm_keeps_legacy_truthiness(monkeypatch):
+    # The legacy gate is `... and not confirm` on the RAW JSON value, so a
+    # stringified "false"/"0" counted as confirmed and ran the scan. A `bool`
+    # field would coerce those to False and bounce the scan back. (Same
+    # hazard/fix as expert_ack and all_sky.)
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area",
+                        lambda fp, r, **k: {"needs_confirmation": True, "tiles": 200})
+    for raw in ("false", "0", "no"):
+        ctx, svc = _tiled_ctx()
+        out = dl.TiledSearch().run(_tiled_input(confirm=raw), ctx).to_native()
+        assert out["success"] is True, f"{raw!r} must count as confirmed (legacy truthiness)"
+        assert len(svc.started) == 1
+
+
+def test_tiled_search_job_closure_runs_the_scan_confirmed(monkeypatch):
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area",
+                        lambda fp, r, **k: {"needs_confirmation": False, "tiles": 4})
+    scan_calls = []
+
+    def fake_scan(catalog, table, fp, **kw):
+        scan_calls.append({"catalog": catalog, "table": table, "fp": fp, **kw})
+        return {"success": True, "candidates": []}
+
+    monkeypatch.setattr(dl.datalab_orchestration, "tiled_sky_scan", fake_scan)
+    ctx, svc = _tiled_ctx()
+    dl.TiledSearch().run(_tiled_input(step_deg=0.1, peak_threshold=2.5, candidate_budget=10), ctx)
+
+    # The deferred job body runs the scan with confirm FORCED True and the
+    # cancel_check handed through by the job service.
+    sentinel = object()
+    result = svc.started[0]["fn"](sentinel)
+    assert result == {"success": True, "candidates": []}
+    call = scan_calls[0]
+    assert call["confirm"] is True
+    assert call["cancel_check"] is sentinel
+    assert (call["tile_radius_deg"], call["step_deg"]) == (2.0, 0.1)
+    assert (call["peak_threshold"], call["max_tiles"], call["candidate_budget"]) == (2.5, 64, 10)
+
+
+def test_tiled_search_error_is_typed(monkeypatch):
+    def boom(fp, r, **k):
+        raise RuntimeError("registry offline")
+
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area", boom)
+    ctx, _ = _tiled_ctx()
+    out = dl.TiledSearch().run(_tiled_input(), ctx).to_native()
+    assert out["success"] is False and "registry offline" in out["error"]
+
+
+# ── ExportNotebook: injected generator owns the card transport ───────────────
+def _notebook_ctx(generator=None, record=None):
+    record = record if record is not None else []
+
+    def default_generator(title, steps):
+        record.append({"title": title, "steps": steps})
+        return {"success": True, "message": "Notebook generated successfully. Let the user know it is ready to download."}
+
+    return CallContext(services={"generate_notebook": generator or default_generator}), record
+
+
+def test_export_notebook_builds_steps_and_calls_the_injected_generator():
+    ctx, record = _notebook_ctx()
+    out = dl.ExportNotebook().run(
+        dl.ExportNotebookInput(sql="SELECT 1", catalog="gaia_dr3", table="gaia_source"), ctx
+    ).to_native()
+    assert out["success"] is True and "Notebook generated" in out["message"]
+    assert record[0]["title"] == "NOIRLab Data Lab analysis"  # legacy default title
+    assert isinstance(record[0]["steps"], list) and record[0]["steps"]
+
+
+def test_export_notebook_sia_recipe_needs_both_coordinates():
+    ctx, record = _notebook_ctx()
+    dl.ExportNotebook().run(dl.ExportNotebookInput(sql="SELECT 1", sia_ra=10.0), ctx)
+    steps_without = record[-1]["steps"]
+    dl.ExportNotebook().run(
+        dl.ExportNotebookInput(sql="SELECT 1", sia_ra=10.0, sia_dec=20.0, sia_fov_deg=0.2), ctx
+    )
+    steps_with = record[-1]["steps"]
+    # Adding the dec completes the SIA recipe → strictly more notebook steps.
+    assert len(steps_with) > len(steps_without)
+
+
+def test_export_notebook_unknown_catalog_citation_is_swallowed():
+    # datalab_registry.citation raises for unknown catalogs; legacy swallowed it
+    # and still produced the notebook.
+    ctx, record = _notebook_ctx()
+    out = dl.ExportNotebook().run(
+        dl.ExportNotebookInput(sql="SELECT 1", catalog="not_a_real_catalog"), ctx
+    ).to_native()
+    assert out["success"] is True and record
+
+
+def test_export_notebook_generator_failure_is_a_typed_error():
+    def failing_generator(title, steps):
+        return {"success": False, "error": "nbformat missing"}
+
+    ctx, _ = _notebook_ctx(generator=failing_generator)
+    tr = dl.ExportNotebook().run(dl.ExportNotebookInput(sql="SELECT 1"), ctx)
+    assert tr.success is False and tr.error == "nbformat missing"
+    assert tr.to_native() == {"success": False, "error": "nbformat missing"}  # verbatim
+
+
+# ── Agent wiring: nested-image attach + the clear_card opt-out ───────────────
+def test_density_vetting_wrapper_attaches_nested_grid_card(monkeypatch):
+    grid = {"image_base64": "GRID64", "path": "/plots/grid.png"}
+    _patch_vetting(monkeypatch, grid)
+    agent = _wiring_agent()
+    fn = agent._datalab_image_tool_fn("datalab_density_vetting", nested_key="cutout_grid")
+
+    out = fn(catalog="nsc_dr2", table="object", radius_deg=0.3, ra=10.0, dec=20.0)
+
+    # The UI card was set from the NESTED grid with the computed caption…
+    card = agent.last_run_result
+    assert card["type"] == "image"
+    assert card["image_url"] == "/plots/grid.png"
+    assert card["caption"] == "Density-peak cutout grid: RA=10.00000, Dec=20.00000 (top 5)"
+    # …the heavy base64 was stripped from the LLM-facing nested dict, the
+    # private mark never leaked, and the top level was left untouched.
+    assert out["cutout_grid"]["image_attached"] is True
+    assert "image_base64" not in out["cutout_grid"]
+    assert "_caption" not in out["cutout_grid"]
+    assert "image_attached" not in out
+    assert out["success"] is True and out["result_id"] == "dlr_vet"
+
+
+def test_export_notebook_wrapper_does_not_clear_the_card():
+    # datalab_export_notebook registers with clear_card=False: the injected
+    # generator sets the card, so the ctx provider must NOT wipe a prior one
+    # (legacy deliberately never cleared last_run_result here).
+    agent = _wiring_agent()
+    sentinel = {"type": "data", "data": "keep-me"}
+    agent.last_run_result = sentinel
+    agent._generate_notebook = lambda title, steps: {"success": True, "message": "ok"}
+
+    fn = agent._datalab_tool_fn("datalab_export_notebook", clear_card=False)
+    out = fn(sql="SELECT 1")
+
+    assert out["success"] is True
+    assert agent.last_run_result is sentinel  # untouched by the ctx provider
+
+
+def test_plain_tool_fn_still_clears_the_card():
+    # Contrast: every other datalab tool keeps the provider's clear.
+    agent = _wiring_agent()
+    agent.last_run_result = {"type": "data", "data": "stale"}
+    fn = agent._datalab_tool_fn("datalab_confirm_sky_area")
+    out = fn(ra_min=10.0, ra_max=10.5, dec_min=0.0, dec_max=0.5)
+    # Assert the call actually SUCCEEDED (CX-12): a context/adapter failure would
+    # also clear the card and make a bare `is None` assertion pass vacuously.
+    assert out["success"] is True
+    assert agent.last_run_result is None
+
+
+def test_export_notebook_end_to_end_sets_the_notebook_card():
+    # Through the agent's _generate_notebook: the notebook card is the
+    # deliverable. (The importlib harness stubs generate_analysis_notebook to
+    # return {} inside the loaded agent module, so assert the card SHAPE here;
+    # the real cell content is covered by the direct-capability test below.)
+    agent = _wiring_agent()
+    fn = agent._datalab_tool_fn("datalab_export_notebook", clear_card=False)
+    out = fn(sql="SELECT TOP 5 * FROM gaia_dr3.gaia_source", catalog="gaia_dr3", table="gaia_source")
+    assert out["success"] is True
+    card = agent.last_run_result
+    assert card["type"] == "notebook"
+    assert card["title"] == "NOIRLab Data Lab analysis"
+    assert isinstance(card["notebook_data"], dict)
+
+
+def test_export_notebook_real_generator_produces_cells():
+    # Same wiring as the agent's _generate_notebook, with the REAL (unstubbed)
+    # services.notebook_gen: the produced notebook has the TAP-recipe cells.
+    from services.notebook_gen import generate_analysis_notebook
+    cards = {}
+
+    def gen(title, steps):
+        nb = generate_analysis_notebook(title, steps)
+        cards["card"] = {"type": "notebook", "notebook_data": nb, "title": title}
+        return {"success": True, "message": "ok"}
+
+    ctx = CallContext(services={"generate_notebook": gen})
+    out = dl.ExportNotebook().run(
+        dl.ExportNotebookInput(sql="SELECT TOP 5 * FROM gaia_dr3.gaia_source",
+                               catalog="gaia_dr3", table="gaia_source"),
+        ctx,
+    ).to_native()
+    assert out["success"] is True
+    cells = cards["card"]["notebook_data"]["cells"]
+    assert cells
+    blob = "".join("".join(c.get("source", [])) for c in cells)
+    assert "qc.query(sql=q, fmt='pandas')" in blob  # the governed TAP recipe cell
+
+
+def test_new_tools_keep_their_legacy_registration_surface():
+    # The migration swapped only `function=`; description + parameters schema
+    # (the LLM-facing surface) must be byte-identical to the inline versions.
+    agent = _wiring_agent()
+    agent._register_tools()
+
+    vet = agent.tool_registry.get_tool("datalab_density_vetting")
+    assert vet is not None
+    assert vet.description.startswith("P12: find the densest catalog cells")
+    assert vet.parameters["required"] == ["catalog", "table", "radius_deg"]
+
+    tiled = agent.tool_registry.get_tool("datalab_tiled_search")
+    assert tiled is not None
+    assert tiled.description.startswith("P15: tiled region-bounded overdensity search")
+    assert tiled.parameters["required"] == ["catalog", "table", "ra_min", "ra_max", "dec_min", "dec_max"]
+    assert tiled.parameters["properties"]["confirm"]["default"] is False
+
+    nb = agent.tool_registry.get_tool("datalab_export_notebook")
+    assert nb is not None
+    assert nb.description.startswith("Export a reproducible Jupyter notebook")
+    assert nb.parameters["required"] == []
+
+
+# ── Registry-dispatch parity for the 3 new tools (CX-11) ─────────────────────
+# The tests above build the wrappers by hand; these dispatch through the ACTUAL
+# registered function via _dispatch_tool_call, so a wrong registered function,
+# a missing nested_key, or a lost clear_card=False would be caught end-to-end.
+def test_density_vetting_dispatches_through_the_registry(monkeypatch):
+    import json as _json
+    grid = {"image_base64": "GRID64", "path": "/plots/grid.png"}
+    _patch_vetting(monkeypatch, grid)
+    agent = _wiring_agent()
+    # density_then_cutouts is mocked, so the real image service is never needed.
+    agent._register_tools()
+    payload = _json.loads(
+        agent._dispatch_tool_call(
+            "datalab_density_vetting",
+            _json.dumps({"catalog": "nsc_dr2", "table": "object",
+                         "radius_deg": 0.3, "ra": 10.0, "dec": 20.0}),
+        )
+    )
+    assert payload["success"] is True and payload["result_id"] == "dlr_vet"
+    # nested_key wiring: the grid card attached, base64 stripped, top level clean.
+    assert payload["cutout_grid"]["image_attached"] is True
+    assert "image_base64" not in payload["cutout_grid"]
+    assert "_caption" not in payload["cutout_grid"]
+    card = agent.last_run_result
+    assert card["type"] == "image" and card["image_url"] == "/plots/grid.png"
+
+
+def test_tiled_search_dispatches_through_the_registry(monkeypatch):
+    import json as _json
+    monkeypatch.setattr(dl.datalab_orchestration, "confirm_sky_area",
+                        lambda fp, r, **k: {"needs_confirmation": True, "tiles": 200,
+                                            "area_deg2": 4000.0, "message": "confirm first"})
+    agent = _wiring_agent()
+    agent._register_tools()
+    payload = _json.loads(
+        agent._dispatch_tool_call(
+            "datalab_tiled_search",
+            _json.dumps({"catalog": "nsc_dr2", "table": "object",
+                         "ra_min": 10.0, "ra_max": 40.0, "dec_min": -10.0, "dec_max": 10.0}),
+        )
+    )
+    # HITL gate reached end-to-end (no confirm → no job started).
+    assert payload["success"] is False and payload["needs_confirmation"] is True
+    assert "confirm=true" in payload["hint"]
+
+
+def test_export_notebook_dispatches_through_the_registry():
+    import json as _json
+    agent = _wiring_agent()
+    agent._register_tools()
+    # Pre-seed a card; clear_card=False must leave it for the generator to set,
+    # not wipe it via the provider (end-to-end proof the flag is wired at
+    # registration, not just in a hand-built wrapper).
+    agent.last_run_result = {"type": "data", "data": "prior"}
+    payload = _json.loads(
+        agent._dispatch_tool_call(
+            "datalab_export_notebook",
+            _json.dumps({"sql": "SELECT 1", "catalog": "gaia_dr3", "table": "gaia_source"}),
+        )
+    )
+    assert payload["success"] is True
+    card = agent.last_run_result
+    assert card["type"] == "notebook"  # the generator's card, not the prior data card
+
+
+# ── Guard-verify fixes: fail-before-query + export service independence ───────
+def test_execute_datalab_sql_none_store_fails_before_query():
+    # Guard-verify NEW-REGRESSION fix: the agent provider wraps service getters
+    # in `_lazy` (a failing unrelated constructor → None). A None result_store
+    # must fail BEFORE the remote query fires, never issue client.query() and
+    # then crash at store.put(). Beta built the store eagerly at context build,
+    # so no query ran when the store was unavailable.
+    client = _FakeClient(_AGG_DF)
+    ctx = CallContext(services={"datalab_client": client}, result_store=None)
+    out = dl.execute_datalab_sql(
+        "SELECT count(*) FROM gaia_dr3.gaia_source", {"catalog": "gaia_dr3", "table": "gaia_source"},
+        tool_name="datalab_cone_count", ctx=ctx,
+    ).to_native()
+    assert out["success"] is False
+    assert "result store is unavailable" in out["error"].lower()
+    assert client.last_sql is None  # the remote query was NEVER issued
+
+
+def test_cone_count_none_store_does_not_query(monkeypatch):
+    # Same guarantee through a real capability (not just the helper).
+    client = _FakeClient(pd.DataFrame({"row_count": [1]}))
+    ctx = CallContext(services={"datalab_client": client}, result_store=None)
+    out = dl.ConeCount().run(
+        dl.ConeCountInput(catalog="gaia_dr3", table="gaia_source", ra=10.0, dec=0.0, radius_deg=0.05),
+        ctx,
+    ).to_native()
+    assert out["success"] is False and client.last_sql is None
+
+
+def test_export_notebook_provider_builds_no_datalab_services():
+    # Guard-verify CX-02 fix: export_notebook routes to the MINIMAL notebook
+    # provider, which constructs no Data Lab client / image service. Prove it by
+    # making those getters RAISE — export must still succeed because it never
+    # touches them (beta parity: a pure notebook export is independent of Data
+    # Lab service init).
+    agent = _wiring_agent()
+
+    def _boom(*a, **k):
+        raise RuntimeError("image service init failed (unwritable plots dir)")
+
+    agent._get_datalab_image_service = _boom
+    agent._get_datalab_client = _boom
+    agent._get_svo_fps_client = _boom
+    agent._register_tools()
+    import json as _json
+    payload = _json.loads(
+        agent._dispatch_tool_call(
+            "datalab_export_notebook",
+            _json.dumps({"sql": "SELECT 1", "catalog": "gaia_dr3", "table": "gaia_source"}),
+        )
+    )
+    assert payload["success"] is True  # export ran with zero Data Lab services
+    assert agent.last_run_result["type"] == "notebook"
+
+
+def test_export_notebook_minimal_provider_has_only_generator():
+    # The minimal provider injects generate_notebook and nothing Data Lab-y.
+    agent = _wiring_agent()
+    ctx = agent._datalab_notebook_ctx_provider()
+    assert set(ctx.services) == {"generate_notebook"}
+    assert ctx.result_store is None

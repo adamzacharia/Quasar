@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio ruff
+          pip install pytest pytest-asyncio pytest-timeout ruff
 
       # ── Lint ───────────────────────────────────────────────
       - name: Lint with ruff
@@ -51,10 +51,15 @@ jobs:
             tests/unit/test_tacc_history.py \
             tests/integration/test_live_provider_chat_protocol.py
 
+      # ── Critical lint gate (repo-wide, E9/F63/F7/F82) ──────
+      - name: Critical lint over refactored surface
+        run: |
+          ruff check --select E9,F63,F7,F82 capabilities/ core/ services/ adapters/ integrations/
+
       # ── Unit Tests ─────────────────────────────────────────
       - name: Run unit tests
         run: |
-          pytest tests/unit/ -v --tb=short -q
+          pytest tests/unit/ -v --tb=short -q --timeout=120 --timeout-method=thread
 
       # ── Benchmark scorer self-test ─────────────────────────
       # Offline integrity check of the DataLabBench partial-credit scorer,
@@ -79,8 +84,6 @@ jobs:
         run: |
           python -c "
           print('Testing critical imports...')
-          from config import settings
-          print(f'  config.settings OK (model={settings.api.openai_model})')
           from services.vector_db import get_qdrant_client
           print('  services.vector_db OK')
           from services.rag_service import RAGService

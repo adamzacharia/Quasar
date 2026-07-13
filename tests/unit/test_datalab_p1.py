@@ -89,7 +89,10 @@ def test_color_image_reprojects_all_bands_before_lupton(monkeypatch):
 
     def fake_load(row, **kwargs):
         value = {"g90.fits": 1.0, "r60.fits": 2.0, "i70.fits": 3.0}[row["access_url"]]
-        return FitsImage(data=np.full((4, 4), value), wcs=object(), header={}, path=row["access_url"], source_url=row["access_url"])
+        # Real tiles always carry noise; a CONSTANT fake trips the degenerate-tile
+        # guard (all-NaN/single-valued tiles are skipped as broken placeholders).
+        data = np.full((4, 4), value) + np.arange(16).reshape(4, 4) * 0.01
+        return FitsImage(data=data, wcs=object(), header={}, path=row["access_url"], source_url=row["access_url"])
 
     def fake_reproject(image_wcs, ref_wcs, shape_out=None):
         calls.append("reproject")
@@ -116,6 +119,93 @@ def test_color_image_reprojects_all_bands_before_lupton(monkeypatch):
     # Auto-selection yields RGB order (red, green, blue) = (i, r, g) when i is present.
     assert result["bands_used"] == ["i", "r", "g"]
     assert calls == ["reproject", "reproject", "reproject", "lupton"]
+
+
+def _overlap_service(monkeypatch, rows, partial_bases, captured=None):
+    """Color-image harness where fake tiles reproject with NaN gaps.
+
+    partial_bases: {base_value: keep_columns} — tiles whose pixel base value is
+    listed reproject with NaN outside their first keep_columns columns.
+    """
+    service = DatalabImageService(sia_client=_FakeSia(rows))
+    grad = np.arange(16).reshape(4, 4) * 0.01
+
+    def fake_load(row, **kw):
+        base = float(row["exptime"])  # encode identity in the pixel values
+        return FitsImage(data=np.full((4, 4), base) + grad, wcs=object(), header={}, path=row["access_url"], source_url=row["access_url"])
+
+    def fake_reproject(image_wcs, ref_wcs, shape_out=None):
+        base = round(float(np.asarray(image_wcs[0]).flat[0]))
+        out = np.full(shape_out or (4, 4), float(base)) + grad
+        keep = partial_bases.get(base)
+        if keep is not None:
+            out[:, keep:] = np.nan
+        return out, None
+
+    def fake_render(rgb, wcs, title):
+        if captured is not None:
+            captured["rgb_shape"] = np.asarray(rgb).shape
+        return {"base64_png": "abc", "web_url": "/p.png"}
+
+    fake_reproject_module = types.ModuleType("reproject")
+    fake_reproject_module.reproject_interp = fake_reproject
+    monkeypatch.setitem(sys.modules, "reproject", fake_reproject_module)
+    import astropy.visualization as visualization
+    monkeypatch.setattr(visualization, "make_lupton_rgb", lambda r, g, b, Q=8.0, stretch=0.5: np.stack([r, g, b], axis=-1))
+    monkeypatch.setattr(service, "_load_image", fake_load)
+    monkeypatch.setattr(service, "_cutout_image", lambda image, **kw: image)
+    monkeypatch.setattr(service, "_render_rgb", fake_render)
+    return service
+
+
+def test_color_image_partial_band_falls_through_to_covering_tile(monkeypatch):
+    """F-12 deferred item (live P14 07-12: half-black composite from a SMASH
+    tile partially overlapping the Hydra II field). A band whose deepest tile
+    covers <90% of the field must fall through to the next candidate."""
+    rows = [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "g", "exptime": 10, "access_url": "g.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 20, "access_url": "r.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "i", "exptime": 900, "access_url": "i_partial.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "i", "exptime": 500, "access_url": "i_full.fits"},
+    ]
+    service = _overlap_service(monkeypatch, rows, partial_bases={900: 2})  # deepest i: half covered
+    result = service.color_image(10.0, 0.0, 0.01)
+    assert result["success"] is True
+    assert result["provenance"]["band_coverage"] == {"i": 1.0, "r": 1.0, "g": 1.0}
+    assert "i_full.fits" in str(result["provenance"]["selected_rows"]["i"])
+    assert result.get("note") is None
+
+
+def test_color_image_crops_to_common_coverage_with_note(monkeypatch):
+    """No better tile exists: the composite is cropped to the jointly covered
+    region and the result says so, instead of rendering half the field black."""
+    rows = [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "g", "exptime": 10, "access_url": "g.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 20, "access_url": "r.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "i", "exptime": 900, "access_url": "i_partial.fits"},
+    ]
+    captured = {}
+    service = _overlap_service(monkeypatch, rows, partial_bases={900: 2}, captured=captured)
+    result = service.color_image(10.0, 0.0, 0.01)
+    assert result["success"] is True
+    assert "cropped" in str(result.get("note"))
+    assert result["provenance"]["band_coverage"]["i"] == 0.5
+    assert captured["rgb_shape"] == (4, 2, 3)  # only the covered half is rendered
+
+
+def test_color_image_refuses_sliver_common_coverage(monkeypatch):
+    """Bands that barely overlap each other -> structured refusal with per-band
+    coverage, not a mostly-black composite."""
+    rows = [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "g", "exptime": 10, "access_url": "g.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 20, "access_url": "r.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "i", "exptime": 900, "access_url": "i_sliver.fits"},
+    ]
+    service = _overlap_service(monkeypatch, rows, partial_bases={900: 0})  # i covers nothing
+    result = service.color_image(10.0, 0.0, 0.01)
+    assert result["success"] is False and result["coverage_gap"] is True
+    assert result["band_coverage"]["i"] == 0.0
+    assert "mostly black" in result["error"]
 
 
 def test_svo_client_returns_cached_wavelengths(monkeypatch):
@@ -336,7 +426,8 @@ def test_color_image_auto_selects_z_when_i_absent(monkeypatch):
         {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "z", "exptime": 70, "access_url": "z.fits"},
     ]
     service = DatalabImageService(sia_client=_FakeSia(rows))
-    monkeypatch.setattr(service, "_load_image", lambda row, **kw: FitsImage(data=np.ones((4, 4)), wcs=object(), header={}, path=row["access_url"], source_url=row["access_url"]))
+    # Non-constant data: constant fakes trip the degenerate-tile guard.
+    monkeypatch.setattr(service, "_load_image", lambda row, **kw: FitsImage(data=np.ones((4, 4)) + np.arange(16).reshape(4, 4) * 0.01, wcs=object(), header={}, path=row["access_url"], source_url=row["access_url"]))
     monkeypatch.setattr(service, "_cutout_image", lambda image, **kw: image)
     monkeypatch.setattr(service, "_render_rgb", lambda rgb, wcs, title: {"base64_png": "abc", "web_url": "/p.png"})
     fake_reproject_module = types.ModuleType("reproject")
@@ -494,7 +585,9 @@ def test_cutout_falls_through_broken_tiles(monkeypatch):
     def fake_load(row, **kwargs):
         if "broken" in row["access_url"]:
             raise RuntimeError("500 Server Error")
-        return FitsImage(data=np.ones((4, 4)), wcs=object(), header={}, path="good.fits", source_url=row["access_url"])
+        # Non-constant data: constant fakes trip the degenerate-tile guard.
+        data = np.ones((4, 4)) + np.arange(16).reshape(4, 4) * 0.01
+        return FitsImage(data=data, wcs=object(), header={}, path="good.fits", source_url=row["access_url"])
 
     monkeypatch.setattr(service, "_load_image", fake_load)
     monkeypatch.setattr(service, "_cutout_image", lambda image, **kw: image)
@@ -545,3 +638,183 @@ def test_attach_image_result_no_card_on_coverage_gap():
 
 
 
+
+
+def test_period_fold_declares_significance_and_null_results():
+    """The tool itself must declare a null result: live P14 claimed 'consistent
+    with an RR Lyrae' for a grid-edge period at FAP=0.28, and the post-fix run
+    presented FAP=1.0 at the 1-day alias."""
+    from services import datalab_analysis
+    rng = np.random.default_rng(3)
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+
+    # A clean 0.6487d sinusoid inside the search window -> significant.
+    period = 0.6487
+    t = np.sort(rng.uniform(0, 60, 240))
+    mag = 21.5 + 0.5 * np.sin(2 * np.pi * t / period) + rng.normal(0, 0.02, t.size)
+    lc = store.put(pd.DataFrame({"mjd": t, "cmag": mag}), {"catalog": "synthetic", "table": "lc"})
+    good = datalab_analysis.period_fold(lc, min_frequency=1.0, max_frequency=10.0,
+                                        result_store=store, plotting_service=plotter)
+    assert good["period_significant"] is True
+    assert good["significance"] == "significant"
+    assert good["best_period_days"] == pytest.approx(period, abs=0.005)
+    assert good["searched_period_days"] == [0.1, 1.0]
+    assert not good["warnings"]
+
+    # Pure noise -> FAP is large -> declared no_significant_period with warnings.
+    # Seed picked for a robustly in-window, high-FAP max peak (FAP~0.78): the
+    # Baluev FAP is deterministic for fixed data, so this cannot flake.
+    t_noise = np.sort(np.random.default_rng(0).uniform(0, 60, 240))
+    noise_mag = 21.5 + np.random.default_rng(100).normal(0, 0.3, t_noise.size)
+    lc2 = store.put(pd.DataFrame({"mjd": t_noise, "cmag": noise_mag}), {"catalog": "synthetic", "table": "lc"})
+    bad = datalab_analysis.period_fold(lc2, min_frequency=1.0, max_frequency=10.0,
+                                       result_store=store, plotting_service=plotter)
+    assert bad["period_significant"] is False
+    assert bad["significance"] == "no_significant_period"
+    assert any("NO SIGNIFICANT PERIOD" in w for w in bad["warnings"])
+
+    # A best peak sitting ON the searched-window boundary is a window artifact
+    # and must be flagged even when its FAP is tiny (the strong signal lands at
+    # freq[0] here because min_frequency == the signal frequency).
+    lc3 = store.put(pd.DataFrame({"mjd": t, "cmag": mag}), {"catalog": "synthetic", "table": "lc"})
+    edge = datalab_analysis.period_fold(lc3, min_frequency=1.0 / period, max_frequency=10.0,
+                                        result_store=store, plotting_service=plotter)
+    assert edge["period_significant"] is False
+    assert any("edge of the searched window" in n for n in edge["significance_notes"])
+
+
+def test_period_fold_mixed_bands_default_to_best_sampled():
+    """No band requested + multi-band frame: fold ONLY the best-sampled band and
+    say so, instead of silently smearing bands together (live P14)."""
+    from services import datalab_analysis
+    rng = np.random.default_rng(4)
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+    period = 0.6487
+    t_g = np.sort(rng.uniform(0, 60, 200))
+    t_r = np.sort(rng.uniform(0, 60, 40))
+    frame = pd.DataFrame({
+        "mjd": np.concatenate([t_g, t_r]),
+        "cmag": np.concatenate([
+            21.5 + 0.5 * np.sin(2 * np.pi * t_g / period) + rng.normal(0, 0.02, t_g.size),
+            21.0 + 0.4 * np.sin(2 * np.pi * t_r / period) + rng.normal(0, 0.02, t_r.size),
+        ]),
+        "filter": ["g"] * t_g.size + ["r"] * t_r.size,
+    })
+    lc = store.put(frame, {"catalog": "synthetic", "table": "lc"})
+    out = datalab_analysis.period_fold(lc, min_frequency=1.0, max_frequency=10.0,
+                                       result_store=store, plotting_service=plotter)
+    assert out["band"] == "g"
+    assert out["points"] == 200
+    assert any("best-sampled" in w for w in out["warnings"])
+    assert out["best_period_days"] == pytest.approx(period, abs=0.005)
+
+
+class _FakeSvo:
+    def wavelengths(self, filters):
+        values = {"g": 0.48, "r": 0.62, "z": 0.91, "w1": 3.4, "w2": 4.6}
+        return {f: {"effective_micron": values[f], "pivot_micron": values[f]} for f in filters}
+
+
+def test_plotly_specs_on_remaining_plot_tools():
+    """F-9: every Data Lab plot tool must emit a basic-bundle plotly_spec
+    (scatter traces only — the frontend ships plotly.js-basic-dist-min)."""
+    from services import datalab_analysis
+    rng = np.random.default_rng(11)
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+
+    # catalog_scatter
+    n = 50
+    df = pd.DataFrame({"bp_rp": rng.uniform(0, 2, n), "mg": rng.uniform(8, 15, n),
+                       "pm": rng.uniform(50, 300, n)})
+    rid = store.put(df, {"catalog": "gaia_dr3", "table": "gaia_source"})
+    out = datalab_analysis.catalog_scatter(rid, "bp_rp", "mg", color_by="pm", invert_y=True,
+                                           result_store=store, plotting_service=plotter)
+    spec = out["plotly_spec"]
+    assert spec["data"][0]["type"] == "scatter"
+    assert spec["layout"]["yaxis"]["autorange"] == "reversed"
+    assert spec["data"][0]["marker"]["showscale"] is True  # color_by wired
+
+    # sky_density_map (hist2d): square-marker scatter, RA reversed
+    dfd = pd.DataFrame({"ra_bin": rng.uniform(100, 102, 400), "dec_bin": rng.uniform(-1, 1, 400),
+                        "source_count": rng.integers(1, 50, 400)})
+    rid2 = store.put(dfd, {"catalog": "nsc_dr2", "table": "object"})
+    out2 = datalab_analysis.sky_density_map(rid2, ra_col="ra_bin", dec_col="dec_bin",
+                                            count_col="source_count",
+                                            result_store=store, plotting_service=plotter)
+    spec2 = out2["plotly_spec"]
+    assert spec2["data"][0]["type"] == "scatter"
+    assert spec2["data"][0]["marker"]["symbol"] == "square"
+    assert spec2["layout"]["xaxis"]["autorange"] == "reversed"
+
+    # period_fold: two-panel spec (periodogram line + folded markers)
+    period = 0.6487
+    t = np.sort(rng.uniform(0, 60, 200))
+    mag = 21.5 + 0.5 * np.sin(2 * np.pi * t / period) + rng.normal(0, 0.02, t.size)
+    rid3 = store.put(pd.DataFrame({"mjd": t, "cmag": mag}), {"catalog": "synthetic", "table": "lc"})
+    out3 = datalab_analysis.period_fold(rid3, result_store=store, plotting_service=plotter)
+    spec3 = out3["plotly_spec"]
+    assert [tr["type"] for tr in spec3["data"]] == ["scatter", "scatter"]
+    assert spec3["layout"]["grid"]["columns"] == 2
+    assert spec3["layout"]["yaxis2"]["autorange"] == "reversed"
+
+    # lss_wedge: 2D projection scatter with equal aspect
+    lss = pd.DataFrame({"ra": rng.uniform(150, 155, 40), "dec": rng.uniform(-2, 2, 40),
+                        "z": rng.uniform(0.05, 0.2, 40)})
+    rid4 = store.put(lss, {"catalog": "sdss_dr17", "table": "specobj"})
+    out4 = datalab_analysis.lss_wedge(rid4, result_store=store, plotting_service=plotter)
+    spec4 = out4["plotly_spec"]
+    assert spec4["data"][0]["type"] == "scatter"
+    assert spec4["layout"]["yaxis"]["scaleanchor"] == "x"
+
+
+def test_sed_plot_multi_object_overlay():
+    """F-10: sample_n/row_indices overlay many SEDs with a median line (live
+    P10 could only draw one 'example' SED for a 500-object sample)."""
+    from services import datalab_analysis
+    rng = np.random.default_rng(12)
+    store = DatalabResultStore(enable_disk_cache=False)
+    plotter = _MemoryPlottingService()
+    n = 40
+    frame = pd.DataFrame({
+        "dered_mag_g": rng.uniform(20, 22, n),
+        "dered_mag_r": rng.uniform(19, 21, n),
+        "dered_mag_z": rng.uniform(18.5, 20.5, n),
+        "dered_mag_w1": rng.uniform(18, 20, n),
+        "dered_mag_w2": rng.uniform(18, 20, n),
+    })
+    rid = store.put(frame, {"catalog": "ls_dr9", "table": "tractor"})
+    out = datalab_analysis.sed_plot(rid, sample_n=n, result_store=store,
+                                    svo_client=_FakeSvo(), plotting_service=plotter)
+    assert out["success"] and out["objects_plotted"] == n
+    spec = out["plotly_spec"]
+    # n faint per-object lines + 1 median trace
+    assert len(spec["data"]) == n + 1
+    assert spec["data"][-1]["name"].startswith("median of")
+    assert spec["layout"]["xaxis"]["type"] == "log"
+    # Single-object path unchanged (back-compat).
+    single = datalab_analysis.sed_plot(rid, row_index=0, result_store=store,
+                                       svo_client=_FakeSvo(), plotting_service=plotter)
+    assert single["objects_plotted"] == 1
+    assert len(single["plotly_spec"]["data"]) == 1
+    # The 300-object cap is enforced and disclosed.
+    big = pd.concat([frame] * 10, ignore_index=True)
+    rid_big = store.put(big, {"catalog": "ls_dr9", "table": "tractor"})
+    capped = datalab_analysis.sed_plot(rid_big, sample_n=400, result_store=store,
+                                       svo_client=_FakeSvo(), plotting_service=plotter)
+    assert capped["objects_plotted"] == 300
+    assert any("capped" in w for w in capped["warnings"])
+    # NO selector on a multi-row result -> sample-first default (two live P10
+    # runs: the model never passed sample_n despite the description/prompt).
+    auto = datalab_analysis.sed_plot(rid, result_store=store,
+                                     svo_client=_FakeSvo(), plotting_service=plotter)
+    assert auto["objects_plotted"] == n and auto["auto_sampled"] is True
+    assert any("sample overlay" in w for w in auto["warnings"])
+    assert len(auto["plotly_spec"]["data"]) == n + 1
+    # ...but a single-row result still draws one object with no selector.
+    rid_one = store.put(frame.iloc[:1], {"catalog": "ls_dr9", "table": "tractor"})
+    one = datalab_analysis.sed_plot(rid_one, result_store=store,
+                                    svo_client=_FakeSvo(), plotting_service=plotter)
+    assert one["objects_plotted"] == 1 and "auto_sampled" not in one

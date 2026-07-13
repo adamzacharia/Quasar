@@ -208,7 +208,10 @@ def scroll_all(
     filter_conditions: Optional[Dict[str, str]] = None,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """Scroll (paginate) through all points matching a filter."""
+    """Scroll (paginate) through points matching a filter, following
+    ``next_offset`` until ``limit`` points are collected or the scroll is
+    exhausted. (C15: the single-page version dropped ``next_offset``, so a
+    short server page silently truncated the result below ``limit``.)"""
     client = get_qdrant_client()
 
     existing = [c.name for c in client.get_collections().collections]
@@ -217,16 +220,24 @@ def scroll_all(
 
     q_filter = _build_filter(filter_conditions)
 
-    points, _next_offset = client.scroll(
-        collection_name=collection,
-        scroll_filter=q_filter,
-        limit=limit,
-        with_payload=True,
-    )
-    return [
-        {"id": str(p.id), "payload": p.payload or {}}
-        for p in points
-    ]
+    out: List[Dict[str, Any]] = []
+    offset = None
+    while len(out) < limit:
+        points, next_offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=q_filter,
+            limit=limit - len(out),
+            with_payload=True,
+            offset=offset,
+        )
+        out.extend(
+            {"id": str(p.id), "payload": p.payload or {}}
+            for p in points
+        )
+        if next_offset is None or not points:
+            break
+        offset = next_offset
+    return out[:limit]
 
 
 def delete_by_filter(collection: str, filter_conditions: Dict[str, str]) -> bool:

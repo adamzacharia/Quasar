@@ -70,6 +70,23 @@ def _qa2_status_from_table(df: Any) -> Optional[Any]:
     return None
 
 
+# Per-observation footprint overlays (STC-S s_region) for the sky map. A.footprintsFromSTCS
+# parses these on the client. Bounded so the card payload stays small and Aladin stays
+# responsive even for large obscore result sets. (T7.2)
+_STCS_SHAPE_TOKENS = ("POLYGON", "CIRCLE", "BOX", "POSITION", "UNION", "CONVEX", "ELLIPSE")
+_MAX_SKY_FOOTPRINTS = 512
+_MAX_STCS_LEN = 20000
+
+
+def _looks_like_stcs(text: str) -> bool:
+    """True when a string plausibly is an STC-S region (starts with a shape token).
+
+    STC-S puts the shape first (``POLYGON ICRS ...``, ``CIRCLE J2000 ...``,
+    ``Union(...)``), so a prefix check both accepts real regions and rejects
+    stray text / NaN without a full parser."""
+    return text.strip().upper().startswith(_STCS_SHAPE_TOKENS)
+
+
 # ── Demographics & FITS estimation helper ────────────────────
 def _compute_demographics(df) -> tuple:
     """Compute distribution data, FITS estimate, and sky coordinates from a search DataFrame.
@@ -100,11 +117,20 @@ def _compute_demographics(df) -> tuple:
         demographics["instruments"] = {str(k): int(v) for k, v in inst_counts.items()}
 
     # ── Sky coordinates for sky-map widget ──────────────────────
+    # Each entry carries the row's POSITIONAL index `i` within the same
+    # df.head(10000) slice the table rows[] are built from, plus a display
+    # label from the best identifier column — this is what lets a clicked
+    # sky marker open the matching table row (click-to-inspect).
     ra_col = next((c for c in ["s_ra", "ra"] if c in df.columns), None)
     dec_col = next((c for c in ["s_dec", "dec"] if c in df.columns), None)
+    label_col = next(
+        (c for c in ["target_name", "oid", "source_id", "sparcl_id", "obs_id", "id", "name"]
+         if c in df.columns),
+        None,
+    )
     if ra_col and dec_col:
         coords = []
-        for _, row in df.head(10000).iterrows():
+        for i, (_, row) in enumerate(df.head(10000).iterrows()):
             try:
                 ra_v = float(row[ra_col])
                 dec_v = float(row[dec_col])
@@ -113,11 +139,47 @@ def _compute_demographics(df) -> tuple:
                     continue
                 if abs(ra_v) < 0.001 and abs(dec_v) < 0.001:
                     continue
-                coords.append({"ra": round(ra_v, 4), "dec": round(dec_v, 4)})
+                coord = {"ra": round(ra_v, 4), "dec": round(dec_v, 4), "i": i}
+                if label_col is not None:
+                    label_v = row[label_col]
+                    if label_v is not None and str(label_v).strip() and str(label_v).lower() != "nan":
+                        coord["label"] = str(label_v)[:80]
+                coords.append(coord)
             except (ValueError, TypeError):
                 pass
         if coords:
             demographics["skyCoords"] = coords
+
+    # ── Per-observation footprints (STC-S s_region) for the sky map ──
+    # ObsCore rows (ALMA TAP `SELECT *`, VO) carry an s_region polygon per row;
+    # the interactive sky map draws them via A.footprintsFromSTCS. `i` matches
+    # the skyCoords / rows[] positional index so a footprint ties back to its
+    # row. Bounded (count + per-region length) to keep the payload small. (T7.2)
+    if "s_region" in df.columns:
+        footprints: List[Dict[str, Any]] = []
+        footprints_truncated = False
+        for i, (_, row) in enumerate(df.head(10000).iterrows()):
+            if len(footprints) >= _MAX_SKY_FOOTPRINTS:
+                footprints_truncated = True
+                break
+            raw = row["s_region"]
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text or text.lower() == "nan" or len(text) > _MAX_STCS_LEN:
+                continue
+            if not _looks_like_stcs(text):
+                continue
+            footprint: Dict[str, Any] = {"stcs": text, "i": i}
+            if label_col is not None:
+                label_v = row[label_col]
+                if label_v is not None and str(label_v).strip() and str(label_v).lower() != "nan":
+                    footprint["label"] = str(label_v)[:80]
+            footprints.append(footprint)
+        if footprints:
+            demographics["skyFootprints"] = footprints
+            if footprints_truncated:
+                demographics["skyFootprintsTruncated"] = True
 
     # ── Observation year timeline ────────────────────────────────
     if "obs_release_date" in df.columns:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from services import datalab_registry as registry
 
@@ -24,6 +24,14 @@ _CUT_OPS = {"<", ">", "<=", ">=", "=", "!="}
 # Operator spellings LLMs frequently emit that mean the same thing: Python/JS
 # equality "==" and SQL-standard not-equal "<>".
 _CUT_OP_ALIASES = {"==": "=", "<>": "!="}
+# Data Lab stores missing floats as NaN (not SQL NULL), and Postgres orders NaN
+# ABOVE every real number — so a bare `col > x` / `col >= x` / `col != x` cut
+# silently admits every NaN row (live P6: identical predicates gave 1,960 rows
+# on Data Lab vs 8 on the ESA archive; adding the guard gave exactly 8).
+# `<`/`<=` cuts already exclude NaN. The ::float8 cast keeps the guard valid on
+# integer columns too (an unadorned 'Infinity' literal would fail to coerce).
+_NAN_UNSAFE_OPS = {">", ">=", "!="}
+_NAN_GUARD = "< 'Infinity'::float8"
 
 
 def _normalize_cut_op(op: Any) -> str:
@@ -45,9 +53,19 @@ def _cut_rhs(op: str, value: Any) -> str:
     number.
     """
     try:
-        return _num(float(value))
+        number = float(value)
     except (TypeError, ValueError):
         pass
+    else:
+        if math.isnan(number):
+            raise ValueError("value-cut value cannot be NaN")
+        if math.isinf(number):
+            # Models write explicit finiteness guards ({"op": "<", "value":
+            # "Infinity"}) after the NaN-convention prompt rule; format() would
+            # render bare `inf`, which Data Lab reads as a column name (live P9:
+            # "Unknown column(s) 'inf'"). Emit the quoted float8 literal.
+            return f"'{'-' if number < 0 else ''}Infinity'::float8"
+        return _num(number)
     if op not in ("=", "!="):
         raise ValueError(f"value-cut operator {op!r} requires a numeric value, got {value!r}")
     text = str(value).strip()
@@ -57,6 +75,20 @@ def _cut_rhs(op: str, value: Any) -> str:
     if not text or len(text) > 128 or any(ord(ch) < 32 for ch in text):
         raise ValueError(f"invalid string value for value cut: {value!r}")
     return "'" + text.replace("'", "''") + "'"
+
+
+def _cut_predicate(col: str, op: str, value: Any) -> str:
+    """Render one value-cut predicate, NaN-guarded for NaN-unsafe operators.
+
+    String-valued cuts never need the guard — only numeric comparisons
+    (including quoted ±Infinity literals: `col > '-Infinity'` admits NaN)
+    can leak NaN rows.
+    """
+    rhs = _cut_rhs(op, value)
+    numeric_rhs = not rhs.startswith("'") or rhs.endswith("Infinity'::float8")
+    if op in _NAN_UNSAFE_OPS and numeric_rhs:
+        return f"({col} {op} {rhs} AND {col} {_NAN_GUARD})"
+    return f"{col} {op} {rhs}"
 
 
 def build_cone_count(catalog: str, table: str, *, ra: float, dec: float, radius_deg: float) -> Tuple[str, Dict[str, Any]]:
@@ -153,23 +185,31 @@ def build_density_aggregate(
     all_sky: bool = False,
     predicates: Optional[Sequence[str]] = None,
     limit: int = MAX_ROW_LIMIT,
+    field_bound: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
     row_limit = _limit(limit, maximum=MAX_ROW_LIMIT)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     # Require an explicit region: an unbounded GROUP BY over a billion-row catalog
-    # is a full-catalog scan. Give a cone, or opt in explicitly with all_sky=True.
+    # is a full-catalog scan. Give a cone, opt in explicitly with all_sky=True, or
+    # (field_bound) rely on an indexed-equality predicate such as SMASH
+    # `fieldid = 169` — the canonical bound for field-partitioned tables, and the
+    # only way to map a WHOLE survey field without guessing its center (live P7:
+    # a guessed 0.6° cone cut Hydra II out of the map).
     has_cone = ra is not None and dec is not None and radius_deg is not None
     warnings: List[str] = []
     clauses: List[str] = []
     if has_cone:
         _validate_sky(float(ra), float(dec), float(radius_deg))
         clauses.append(f"q3c_radial_query({ra_col}, {dec_col}, {_num(float(ra))}, {_num(float(dec))}, {_num(float(radius_deg))})")
-    elif all_sky:
+    elif field_bound and (predicates or []):
+        warnings.append("Aggregate bounded by an indexed-equality predicate (e.g. fieldid = N) instead of a cone.")
+    elif all_sky is True:
         warnings.append("Unbounded all-sky aggregate: scans the whole catalog server-side and may be slow/expensive.")
     else:
         raise ValueError(
-            "density aggregate requires a cone (ra, dec, radius_deg) or an explicit all_sky=True "
+            "density aggregate requires a cone (ra, dec, radius_deg), an indexed-equality "
+            "value_cut (e.g. fieldid = 169 on SMASH tables), or an explicit all_sky=True "
             "(an unbounded aggregate scans the whole catalog)"
         )
     # Selection cuts (color/magnitude/morphology) must come from build_catalog_predicates
@@ -247,13 +287,17 @@ def build_catalog_predicates(
         b0, b1 = _column(info, bands[0]), _column(info, bands[1])
         expr = f"({b0} - {b1})"
         if color_cut.get("min") is not None:
-            preds.append(f"{expr} >= {_num(float(color_cut['min']))}")
+            pred = f"{expr} >= {_num(float(color_cut['min']))}"
+            if color_cut.get("max") is None:
+                # A min-only color cut has no `<=` leg to exclude NaN colors.
+                pred = f"({pred} AND {expr} {_NAN_GUARD})"
+            preds.append(pred)
         if color_cut.get("max") is not None:
             preds.append(f"{expr} <= {_num(float(color_cut['max']))}")
     for vc in (value_cuts or []):
         col = _column(info, vc["column"])
         op = _normalize_cut_op(vc.get("op", ""))
-        preds.append(f"{col} {op} {_cut_rhs(op, vc['value'])}")
+        preds.append(_cut_predicate(col, op, vc["value"]))
     if morphology:
         col = _column(info, morphology["column"])
         if morphology.get("in"):
@@ -264,7 +308,7 @@ def build_catalog_predicates(
             preds.append(f"{col} BETWEEN {_num(float(lo))} AND {_num(float(hi))}")
         if morphology.get("op"):
             op = _normalize_cut_op(morphology["op"])
-            preds.append(f"{col} {op} {_cut_rhs(op, morphology['value'])}")
+            preds.append(_cut_predicate(col, op, morphology["value"]))
     return preds
 
 
@@ -298,6 +342,11 @@ def build_q3c_crossmatch(
         f"    SELECT {small_select}\n"
         f"    FROM {small['qualified_name']}\n"
         f"    WHERE q3c_radial_query({sra}, {sdec}, {_num(ra)}, {_num(dec)}, {_num(radius_deg)})\n"
+        # The CTE cap must be nearest-first too: a storage-order LIMIT here
+        # selects a spatially clustered corner of the cone BEFORE the join, and
+        # no outer ORDER BY can undo it (live P9 post-fix run: the map still
+        # showed the far-west edge because only the outer SELECT was ordered).
+        f"    ORDER BY q3c_dist({sra}, {sdec}, {_num(ra)}, {_num(dec)})\n"
         f"    LIMIT {small_row_limit}\n"
         ")\n"
         "SELECT g.*,\n"
@@ -305,6 +354,10 @@ def build_q3c_crossmatch(
         "FROM g\n"
         f"JOIN {big['qualified_name']} AS big\n"
         f"  ON q3c_join(g.{sra}, g.{sdec}, big.{bra}, big.{bdec}, {_num(match_radius_deg)})\n"
+        # Nearest-to-center first: when the row cap bites, the kept slice contains
+        # the cone CENTER (the cluster/stream the user asked about) instead of a
+        # storage-order corner chunk (live P9: the map excluded Pal 5 itself).
+        f"ORDER BY q3c_dist(g.{sra}, g.{sdec}, {_num(ra)}, {_num(dec)})\n"
         f"LIMIT {row_limit}"
     )
     meta = _meta("q3c_crossmatch", small, spatial_bound=True, row_limit=row_limit)
@@ -375,7 +428,7 @@ def build_zhistogram(
         f"SELECT ROUND(({z_col} / {_num(width)})::numeric, 0) * {_num(width)} AS z_bin,\n"
         f"       COUNT(*) AS source_count\n"
         f"FROM {info['qualified_name']}\n"
-        f"WHERE {z_col} IS NOT NULL\n"
+        f"WHERE {z_col} IS NOT NULL AND {z_col} {_NAN_GUARD}\n"
         f"GROUP BY z_bin\n"
         f"ORDER BY z_bin\n"
         f"LIMIT {row_limit}"
@@ -414,14 +467,94 @@ def build_sed_select(
     return sql, meta
 
 
+# Multi-epoch tables (per-epoch photometry rows) usable for variability work.
+_EPOCH_TABLE_COLUMNS = {"id", "mjd", "cmag", "cerr"}
+
+
+def _epoch_table_info(catalog: str) -> Dict[str, Any]:
+    """Registry info for a catalog's multi-epoch `source` table, or a clear error."""
+    info = _table_info(catalog, "source")
+    missing = _EPOCH_TABLE_COLUMNS - set(info.get("columns") or [])
+    if missing:
+        raise ValueError(
+            f"{info['qualified_name']} is not a multi-epoch photometry table "
+            f"(missing columns: {sorted(missing)}). Use a SMASH source table."
+        )
+    return info
+
+
+def _band_predicate(band: Optional[str]) -> str:
+    """Optional single-band filter clause for SMASH-style `filter` columns."""
+    if band is None or not str(band).strip():
+        return ""
+    text = str(band).strip().lower()
+    if not re.fullmatch(r"[a-z0-9]{1,8}", text):
+        raise ValueError(f"Invalid band {band!r}; use a single filter name like 'g'.")
+    return f"\n  AND filter = '{text}'"
+
+
+def build_variability_rank(
+    catalog: str = "smash_dr1",
+    *,
+    ra: float,
+    dec: float,
+    radius_deg: float,
+    band: Optional[str] = None,
+    min_epochs: int = 10,
+    limit: int = 100,
+) -> Tuple[str, Dict[str, Any]]:
+    """Per-object variability ranking over a multi-epoch cone (the blog's
+    'select high-variability stars' step): scatter, amplitude, and a
+    scatter-to-error significance ratio, ranked most-variable first."""
+    info = _epoch_table_info(catalog)
+    _validate_sky(float(ra), float(dec), float(radius_deg))
+    epochs = int(min_epochs) if min_epochs else 10
+    if epochs < 2:
+        raise ValueError("min_epochs must be >= 2 (variability needs repeat epochs)")
+    row_limit = _limit(limit)
+    band_clause = _band_predicate(band)
+    group_by_filter = not bool(band_clause)
+    filter_column = "       filter,\n" if group_by_filter else ""
+    sql = (
+        f"SELECT id,\n"
+        f"{filter_column}"
+        f"       AVG(ra) AS ra, AVG(dec) AS dec,\n"
+        # Distance from the cone center: when the user gave an exact target
+        # position, the right star is the NEAREST candidate, not the most
+        # variable one (live P14: the model folded a variable 2.2' away).
+        f"       q3c_dist(AVG(ra), AVG(dec), {_num(float(ra))}, {_num(float(dec))}) * 3600.0 AS dist_arcsec,\n"
+        f"       COUNT(*) AS nepochs,\n"
+        f"       AVG(cmag) AS mean_mag,\n"
+        f"       STDDEV(cmag) AS mag_rms,\n"
+        f"       MAX(cmag) - MIN(cmag) AS amplitude,\n"
+        f"       AVG(cerr) AS mean_err,\n"
+        f"       STDDEV(cmag) / NULLIF(AVG(cerr), 0) AS var_snr\n"
+        f"FROM {info['qualified_name']}\n"
+        f"WHERE q3c_radial_query(ra, dec, {_num(float(ra))}, {_num(float(dec))}, {_num(float(radius_deg))})\n"
+        f"  AND cmag < 50{band_clause}\n"
+        f"GROUP BY id{', filter' if group_by_filter else ''}\n"
+        f"HAVING COUNT(*) >= {epochs}\n"
+        f"ORDER BY var_snr DESC NULLS LAST\n"
+        f"LIMIT {row_limit}"
+    )
+    meta = _meta(
+        "variability_rank", info,
+        spatial_bound=True, aggregate=True, row_limit=row_limit,
+        min_epochs=epochs, grouped_by_filter=group_by_filter,
+        **({"band": str(band).strip().lower()} if band_clause else {}),
+    )
+    return sql, meta
+
+
 def build_variable_star_select(
     *,
+    catalog: str = "smash_dr1",
     source_id: Optional[str] = None,
     ra: Optional[float] = None,
     dec: Optional[float] = None,
     limit: int = DEFAULT_ROW_LIMIT,
 ) -> Tuple[str, Dict[str, Any]]:
-    info = _table_info("smash_dr1", "source")
+    info = _epoch_table_info(catalog)
     row_limit = _limit(limit)
     cols = _select_columns(info, ["id", "ra", "dec", "mjd", "filter", "cmag", "cerr"])
     exact_id_bound = False
@@ -438,7 +571,7 @@ def build_variable_star_select(
         spatial = True
     sql = (
         f"SELECT {cols}\n"
-        f"FROM smash_dr1.source\n"
+        f"FROM {info['qualified_name']}\n"
         f"WHERE {where}\n"
         f"  AND cmag < 99\n"
         f"ORDER BY mjd\n"
@@ -583,6 +716,7 @@ __all__ = [
     "build_q3c_crossmatch",
     "build_rectangular_region_select",
     "build_sed_select",
+    "build_variability_rank",
     "build_variable_star_select",
     "build_zhistogram",
 ]

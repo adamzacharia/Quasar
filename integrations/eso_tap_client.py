@@ -16,7 +16,6 @@ Registered agent tools:
 import pandas as pd
 import warnings
 from typing import Optional, Dict, Any, List
-from functools import lru_cache
 
 # Try to import pyvo, handle if missing
 try:
@@ -25,21 +24,8 @@ try:
 except ImportError:
     PYVO_AVAILABLE = False
 
-# Reuse the cached SIMBAD resolver
-try:
-    from integrations.alminer_client import _resolve_simbad_cached
-except ImportError:
-    @lru_cache(maxsize=256)
-    def _resolve_simbad_cached(target_name: str):
-        from astroquery.simbad import Simbad
-        from astropy.coordinates import SkyCoord
-        import astropy.units as u
-        result = Simbad.query_object(target_name)
-        if result is None or len(result) == 0:
-            return (None, None)
-        coord = SkyCoord(result['RA'][0], result['DEC'][0],
-                         unit=(u.hourangle, u.deg))
-        return (coord.ra.deg, coord.dec.deg)
+# Canonical cached SIMBAD resolver
+from integrations.simbad_resolver import _resolve_simbad_cached
 
 
 class ESOTAPClient:
@@ -80,7 +66,13 @@ class ESOTAPClient:
         if self._tap_service is None:
             if not PYVO_AVAILABLE:
                 raise ImportError("pyvo is required for ESO TAP queries")
-            self._tap_service = pyvo.dal.TAPService(self.TAP_URL)
+            from integrations.tap import _TimeoutHTTPSession
+            session = _TimeoutHTTPSession(timeout=30.0)
+            try:
+                self._tap_service = pyvo.dal.TAPService(self.TAP_URL, session=session)
+            except TypeError:
+                # Older pyvo without session support
+                self._tap_service = pyvo.dal.TAPService(self.TAP_URL)
         return self._tap_service
 
     def search_by_target(self, target: str, instrument: str = None,

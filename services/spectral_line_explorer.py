@@ -283,6 +283,21 @@ def _mass_from_tag(tag: str) -> Optional[int]:
         return None
 
 
+# Decimal-degree coordinate pair, space or comma separated ("150.096 +2.220").
+_COORD_PAIR_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)[\s,]+([+-]?\d+(?:\.\d+)?)\s*$")
+
+
+def _parse_coordinate_pair(text: str) -> Optional[tuple[float, float]]:
+    """Parse an ICRS decimal-degree "RA DEC" string, or None if it isn't one."""
+    match = _COORD_PAIR_RE.match(str(text or ""))
+    if not match:
+        return None
+    ra, dec = float(match.group(1)), float(match.group(2))
+    if 0.0 <= ra < 360.0 and -90.0 <= dec <= 90.0:
+        return ra, dec
+    return None
+
+
 class TargetResolver:
     """Resolve coordinates and redshift from SIMBAD and NED with provenance."""
 
@@ -297,11 +312,20 @@ class TargetResolver:
         target = str(target_name or "").strip()
         if not target and (explicit_ra_deg is None or explicit_dec_deg is None):
             raise ValueError("target_name or explicit coordinates are required")
+        # Coordinate-pair targets ("150.09561 +2.20013") short-circuit name
+        # resolution: SIMBAD/NED name lookups cannot resolve raw coordinate
+        # strings, and the SPARCL→SLE deep link hands exactly this form.
+        # Redshift must then come from explicit_redshift (the deep link carries
+        # it) or the user — state falls to needs_input otherwise. (guard CX-09)
+        coordinate_pair = _parse_coordinate_pair(target) if target else None
+        if coordinate_pair is not None and (explicit_ra_deg is None or explicit_dec_deg is None):
+            explicit_ra_deg, explicit_dec_deg = coordinate_pair
+        run_name_queries = bool(target) and coordinate_pair is None
         queried_at = utc_now_iso()
         executor = ThreadPoolExecutor(max_workers=2)
         try:
-            simbad_future = executor.submit(self._query_simbad, target) if target else None
-            ned_future = executor.submit(self._query_ned, target) if target else None
+            simbad_future = executor.submit(self._query_simbad, target) if run_name_queries else None
+            ned_future = executor.submit(self._query_ned, target) if run_name_queries else None
             deadline = time.monotonic() + 45
             simbad = self._future_result(
                 simbad_future,

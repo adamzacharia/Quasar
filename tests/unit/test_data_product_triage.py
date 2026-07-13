@@ -154,7 +154,11 @@ def test_scan_intent_filter_keeps_target_rows():
         {"target_name": "J1924-2914", "scan_intent": "BANDPASS FLUX WVR"},
     ])
 
-    filtered, label = QuasarAgent._filter_by_scan_intent(df, "TARGET only")
+    # QuasarAgent._filter_by_scan_intent moved to capabilities/alma.py with the
+    # ALMA family (docs/v2 P1) — the module function is the single implementation.
+    from capabilities.alma import filter_by_scan_intent
+
+    filtered, label = filter_by_scan_intent(df, "TARGET only")
 
     assert label == "Scan Intent TARGET"
     assert filtered["target_name"].tolist() == ["M87"]

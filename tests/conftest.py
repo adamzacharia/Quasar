@@ -43,6 +43,21 @@ _DUMMY_KEYS = {
     # tests opt back in explicitly.
     "SPLATALOGUE_QUERY_CACHE_ENABLED": "0",
 }
+# Never fire the background live TAP-schema refresh from unit tests: fake
+# Data Lab clients record last_sql, and a daemon-thread tap_schema query would
+# race those assertions (and hit the network with a real client). Deliberately
+# a HARD set, not setdefault — a developer environment exporting =1 must not
+# leak refreshes into tests (guard CX-04). Refresh-specific tests opt back in
+# via monkeypatch.
+os.environ["DATALAB_TAP_SCHEMA_AUTOREFRESH"] = "0"
+# Isolate the TAP-schema disk cache per test session: without this, a developer
+# machine with a real live cache under cache/datalab_tap_schema would flip the
+# SQL governor's column check from soft (curated-only) to authoritative and make
+# unit tests behave differently locally than in CI. Also a hard set.
+import tempfile  # noqa: E402
+os.environ["DATALAB_TAP_SCHEMA_CACHE_DIR"] = os.path.join(
+    tempfile.gettempdir(), f"quasar-test-tap-schema-{os.getpid()}"
+)
 for key, val in _DUMMY_KEYS.items():
     os.environ.setdefault(key, val)
 
@@ -72,3 +87,37 @@ def dummy_config():
         "temperature": 0.7,
         "max_tokens": 1000,
     }
+
+
+# ── Reset the process-wide login rate-limiter singletons between tests ──
+# Two module-level LoginRateLimiter singletons accumulate failure/lockout state
+# across test modules: services.login_rate_limit._default_limiter (the
+# per-username limiter the shared AuthService uses) and
+# ui-pro/api/routers/auth.py:_ip_limiter (per-IP). In a whole-directory run a
+# lockout tripped by one module made a later module's login return 429 instead
+# of 401 (the test_s3_s6_security.py flake). Clear both before every test.
+# Reads are defensive: a unit-only run that never loaded ui-pro just skips it.
+@pytest.fixture(autouse=True)
+def _reset_login_rate_limiters():
+    def _clear(limiter):
+        if limiter is None:
+            return
+        try:
+            with limiter._lock:
+                limiter._failures.clear()
+                limiter._locked_until.clear()
+                limiter._last_sweep = float("-inf")
+        except Exception:
+            pass
+
+    try:
+        import services.login_rate_limit as _lrl
+        _clear(getattr(_lrl, "_default_limiter", None))
+    except Exception:
+        pass
+
+    _auth_mod = sys.modules.get("api.routers.auth")
+    if _auth_mod is not None:
+        _clear(getattr(_auth_mod, "_ip_limiter", None))
+
+    yield

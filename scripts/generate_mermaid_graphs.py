@@ -22,15 +22,13 @@ from typing import Dict, List, Set, Tuple, Optional
 # ── Configuration ────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = PROJECT_ROOT / "docs" / "architecture"
+OUTPUT_DIR = Path(os.getenv("QUASAR_MERMAID_OUT", str(PROJECT_ROOT / "docs" / "architecture")))
 
 # Packages to scan (relative to PROJECT_ROOT)
 PACKAGES = [
     "core",
     "services",
-    "agents",
     "integrations",
-    "config",
     "utils",
 ]
 
@@ -46,9 +44,7 @@ SKIP_FILES = {"__pycache__", ".pyc", "__init__.py"}
 PACKAGE_COLORS = {
     "core":         "#1a1a2e",
     "services":     "#16213e",
-    "agents":       "#0f3460",
     "integrations": "#533483",
-    "config":       "#2b2d42",
     "utils":        "#3d405b",
     "entry":        "#e07a5f",
 }
@@ -105,7 +101,8 @@ def parse_file(filepath: Path) -> dict:
             if not any(
                 isinstance(parent, ast.ClassDef)
                 for parent in ast.walk(tree)
-                if node in getattr(parent, 'body', [])
+                if isinstance(getattr(parent, 'body', None), list)
+                and node in parent.body
             ):
                 if not node.name.startswith("_"):
                     result["functions"].append(node.name)
@@ -457,7 +454,7 @@ graph TD
     Agent --> ToolRegistry["core/tools.py<br/><i>140+ Tools</i>"]
     ToolRegistry --> SearchSvc["services/search.py"]
     ToolRegistry --> RAGSvc["services/rag_service.py"]
-    ToolRegistry --> ADSSvc["services/ads_service.py"]
+    ToolRegistry --> ADSClient["integrations/ads_client.py<br/><i>NASA ADS</i>"]
     ToolRegistry --> PlotSvc["services/plotting.py"]
     ToolRegistry --> FITSSvc["services/fits_service.py"]
     ToolRegistry --> NotebookSvc["services/notebook_gen.py"]
@@ -469,11 +466,9 @@ graph TD
     SearchSvc --> ESOClient["integrations/eso_tap_client.py<br/><i>ESO/VLT</i>"]
     SearchSvc --> IRSAClient["integrations/irsa_client.py<br/><i>WISE/2MASS</i>"]
 
-    ADSSvc --> ADSClient["integrations/ads_client.py<br/><i>NASA ADS</i>"]
 
     RAGSvc --> VectorDB["services/vector_db.py<br/><i>Qdrant</i>"]
 
-    Agent --> ContextMgr["core/context_manager.py<br/><i>Token Management</i>"]
     Agent --> SessionMem["core/session_memory.py<br/><i>Cross-Session</i>"]
     Agent --> Memory["core/memory.py<br/><i>Conversation Buffer</i>"]
 
@@ -490,7 +485,6 @@ graph TD
 
     style SearchSvc fill:#457b9d,color:#fff
     style RAGSvc fill:#457b9d,color:#fff
-    style ADSSvc fill:#457b9d,color:#fff
     style PlotSvc fill:#457b9d,color:#fff
     style FITSSvc fill:#457b9d,color:#fff
     style NotebookSvc fill:#457b9d,color:#fff
@@ -503,7 +497,6 @@ graph TD
     style IRSAClient fill:#e9c46a,color:#000
     style ADSClient fill:#e9c46a,color:#000
 
-    style ContextMgr fill:#e63946,color:#fff
     style SessionMem fill:#e63946,color:#fff
     style Memory fill:#e63946,color:#fff
     style LLMClient fill:#e63946,color:#fff

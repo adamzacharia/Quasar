@@ -5,7 +5,8 @@ import { Download, Eye, ExternalLink, Link2, Loader2, X, Telescope, BarChart3, M
 import type { DataTableResult } from "../lib/types";
 import { createWorkbenchSession } from "../lib/api";
 import { useAuthStore } from "../lib/auth-store";
-import { AladinSkyView } from "./AladinSkyView";
+import { AladinSkyView, type StcsFootprint } from "./AladinSkyView";
+import { buildCrossMatchPrompt, dispatchPrefillPrompt } from "../lib/prompt-dispatch";
 
 interface DataTableCardProps { data: DataTableResult; }
 
@@ -498,11 +499,118 @@ function finiteSkyRange(coords: { ra: number; dec: number }[]) {
     };
 }
 
+type SkySelection = { ra: number; dec: number; i?: number; label?: string };
+
+/** Right-hand inspect panel for a clicked sky marker (click-to-inspect). */
+function SourceInspectPanel({
+    selection, row, onShowInTable, onCrossMatch, onClose,
+}: {
+    selection: SkySelection;
+    row?: Record<string, string | number>;
+    onShowInTable?: () => void;
+    onCrossMatch?: () => void;
+    onClose: () => void;
+}) {
+    const fields = row
+        ? Object.entries(row).filter(([key, value]) =>
+            !key.startsWith("_") && String(value ?? "").trim() !== "")
+        : [];
+    const preview = row ? String(row["_preview"] ?? "") : "";
+    const crossMatchPrompt = buildCrossMatchPrompt({
+        ra: selection.ra,
+        dec: selection.dec,
+        label: selection.label,
+    });
+    const handleCrossMatch = () => {
+        if (!crossMatchPrompt) return;
+        // Prefill the composer (no auto-send), then close the sky-map modal so
+        // the prefilled prompt is visible and focused for review/edit. (T7.3)
+        dispatchPrefillPrompt(crossMatchPrompt);
+        onCrossMatch?.();
+    };
+    return (
+        <div className="absolute inset-y-0 right-0 z-20 flex w-64 flex-col border-l border-slate-700/50 bg-slate-950/90 backdrop-blur">
+            <div className="flex items-start justify-between gap-2 border-b border-slate-700/50 px-3 py-2.5">
+                <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-slate-100">
+                        {selection.label || "Selected source"}
+                    </p>
+                    <p className="font-mono text-[10px] text-slate-400">
+                        RA {selection.ra.toFixed(4)}° · Dec {selection.dec.toFixed(4)}°
+                    </p>
+                </div>
+                <button
+                    onClick={onClose}
+                    className="rounded p-0.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-200"
+                    aria-label="Close source details"
+                >
+                    <X className="h-3.5 w-3.5" />
+                </button>
+            </div>
+            <div className="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-3 py-2">
+                {preview && (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                        src={preview}
+                        alt="Sky thumbnail"
+                        className="mb-2 w-full rounded-md border border-slate-700/50"
+                        loading="lazy"
+                    />
+                )}
+                {fields.length > 0 ? (
+                    <dl className="space-y-1.5">
+                        {fields.map(([key, value]) => (
+                            <div key={key}>
+                                <dt className="text-[9px] font-semibold uppercase tracking-wider text-slate-500">{key}</dt>
+                                <dd className="break-words font-mono text-[11px] text-slate-200">{String(value)}</dd>
+                            </div>
+                        ))}
+                    </dl>
+                ) : (
+                    <p className="text-[11px] text-slate-500">
+                        No table row is linked to this marker.
+                    </p>
+                )}
+            </div>
+            {(onShowInTable || crossMatchPrompt) && (
+                <div className="space-y-1.5 border-t border-slate-700/50 p-2">
+                    {crossMatchPrompt && (
+                        <button
+                            onClick={handleCrossMatch}
+                            title="Prefill a chat prompt to cross-match this position against SIMBAD"
+                            className="flex w-full items-center justify-center gap-1.5 rounded-md border border-amber-400/30 px-2 py-1.5 text-[11px] font-semibold text-amber-300 transition-colors hover:bg-amber-400/10"
+                        >
+                            <Layers className="h-3.5 w-3.5" />
+                            Cross-match here
+                        </button>
+                    )}
+                    {onShowInTable && (
+                        <button
+                            onClick={onShowInTable}
+                            className="w-full rounded-md border border-cyan-500/30 px-2 py-1.5 text-[11px] font-semibold text-cyan-300 transition-colors hover:bg-cyan-500/10"
+                        >
+                            Show in table
+                        </button>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
 function SkyMapLightbox({
-    coords, sourceName, onClose,
-}: { coords: { ra: number; dec: number }[]; sourceName?: string; onClose: () => void }) {
+    coords, sourceName, rows, footprints, onShowInTable, onClose,
+}: {
+    coords: SkySelection[];
+    sourceName?: string;
+    rows?: Record<string, string | number>[];
+    footprints?: StcsFootprint[];
+    onShowInTable?: (rowIndex: number) => void;
+    onClose: () => void;
+}) {
     const [activeTab, setActiveTab] = useState<SkyMapTab>("interactive");
     const [interactiveFallbackReason, setInteractiveFallbackReason] = useState<string | null>(null);
+    const [selection, setSelection] = useState<SkySelection | null>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const animRef = useRef<number>(0);
 
@@ -569,15 +677,30 @@ function SkyMapLightbox({
                 </div>
 
                 {activeTab === "interactive" ? (
-                    <div className="h-[60vh] min-h-[300px] max-h-[420px] rounded-xl overflow-hidden border border-slate-700/50 bg-slate-950/80">
+                    <div className="relative h-[60vh] min-h-[300px] max-h-[420px] rounded-xl overflow-hidden border border-slate-700/50 bg-slate-950/80">
                         <AladinSkyView
                             coords={coords}
                             sourceName={sourceName}
+                            footprints={footprints}
                             onFallback={(reason) => {
                                 setInteractiveFallbackReason(reason);
                                 setActiveTab("allSky");
                             }}
+                            onSourceSelect={setSelection}
                         />
+                        {selection && (
+                            <SourceInspectPanel
+                                selection={selection}
+                                row={selection.i !== undefined && rows ? rows[selection.i] : undefined}
+                                onShowInTable={
+                                    selection.i !== undefined && onShowInTable
+                                        ? () => onShowInTable(selection.i as number)
+                                        : undefined
+                                }
+                                onCrossMatch={onClose}
+                                onClose={() => setSelection(null)}
+                            />
+                        )}
                     </div>
                 ) : (
                     <canvas
@@ -1075,6 +1198,21 @@ export function DataTableCard({ data }: DataTableCardProps) {
         src: string; target?: string; ra?: string; dec?: string;
     } | null>(null);
     const [skyMapOpen, setSkyMapOpen] = useState(false);
+    const [highlightRow, setHighlightRow] = useState<number | null>(null);
+    const rowRefs = useRef<Record<number, HTMLTableRowElement | null>>({});
+    const highlightTimerRef = useRef<number>(0);
+
+    // "Show in table" from the sky-map inspect panel: close the lightbox,
+    // scroll the matching row into view, and flash-highlight it.
+    const handleShowInTable = (rowIndex: number) => {
+        setSkyMapOpen(false);
+        setHighlightRow(rowIndex);
+        window.setTimeout(() => {
+            rowRefs.current[rowIndex]?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 50);
+        window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = window.setTimeout(() => setHighlightRow(null), 2500);
+    };
     const [fitsPreview, setFitsPreview] = useState<{
         preview: FitsPreviewResult;
         row: Record<string, string | number>;
@@ -1084,6 +1222,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const [previewError, setPreviewError] = useState<string | null>(null);
 
     const skyCoords = data.demographics?.skyCoords;
+    const skyFootprints = data.demographics?.skyFootprints;
     const hasDemographics = data.demographics && (
         data.demographics.bands || data.demographics.projects ||
         data.demographics.telescopes || data.demographics.instruments ||
@@ -1176,6 +1315,9 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 <SkyMapLightbox
                     coords={skyCoords}
                     sourceName={data.sourceName}
+                    rows={rows}
+                    footprints={skyFootprints}
+                    onShowInTable={handleShowInTable}
                     onClose={() => setSkyMapOpen(false)}
                 />
             )}
@@ -1306,13 +1448,18 @@ export function DataTableCard({ data }: DataTableCardProps) {
                                         || productKind.includes("fits")
                                         || productKind.includes("spectral cube")
                                     );
+                                    const isHighlighted = highlightRow === ri;
                                     return (
                                     <tr
                                         key={ri}
+                                        ref={(el) => { rowRefs.current[ri] = el; }}
                                         className="transition-colors"
-                                        style={{ borderBottom: '1px solid var(--q-border)' }}
-                                        onMouseEnter={(e) => e.currentTarget.style.background = 'var(--q-glass-hover)'}
-                                        onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                                        style={{
+                                            borderBottom: '1px solid var(--q-border)',
+                                            background: isHighlighted ? 'rgba(34, 211, 238, 0.14)' : undefined,
+                                        }}
+                                        onMouseEnter={(e) => { if (highlightRow !== ri) e.currentTarget.style.background = 'var(--q-glass-hover)'; }}
+                                        onMouseLeave={(e) => { if (highlightRow !== ri) e.currentTarget.style.background = 'transparent'; }}
                                     >
                                         {/* Preview thumbnail cell */}
                                         {data.hasPreview && (

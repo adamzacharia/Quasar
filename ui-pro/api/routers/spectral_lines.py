@@ -62,10 +62,19 @@ async def resolve_spectral_line_target(
     req: SpectralTargetResolveRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Resolve target coordinates and redshift with SIMBAD/NED provenance."""
+    """Resolve target coordinates and redshift with SIMBAD/NED provenance.
+
+    With ``include_sparcl`` the response also carries a best-effort NOIRLab
+    SPARCL availability probe at the resolved position — the reverse
+    SLE→SPARCL "optical spectrum available" chip."""
     _ensure_spectral_line_explorer_enabled()
+    from starlette.concurrency import run_in_threadpool
+
     try:
-        return spectral_line_job_service.resolver.resolve(
+        # SIMBAD/NED resolution is blocking network I/O — keep it off the event
+        # loop (guard CX-10).
+        resolution = await run_in_threadpool(
+            spectral_line_job_service.resolver.resolve,
             req.target_name,
             explicit_redshift=req.redshift,
             explicit_ra_deg=req.ra_deg,
@@ -73,6 +82,40 @@ async def resolve_spectral_line_target(
         )
     except Exception as exc:
         _raise_spectral_line_error(exc)
+    if req.include_sparcl and isinstance(resolution, dict):
+        ra = resolution.get("ra_deg")
+        dec = resolution.get("dec_deg")
+        if ra is not None and dec is not None:
+            # Always set the key so the UI can tell "checked: none found"
+            # (a dict with count 0) apart from "probe failed" (null) —
+            # find_spectra reports failures as {"success": False}, not raises.
+            sparcl_info = None
+            try:
+                from services.sparcl_spectra import SparclSpectraService
+
+                # limit is applied to the remote BOUNDING-BOX query before the
+                # local cone filter, so it must be generous — a tight limit can
+                # falsely report "no spectra in the cone" (guard CX-10).
+                probe = await run_in_threadpool(
+                    SparclSpectraService().find_spectra, ra, dec,
+                    radius_arcsec=10, limit=50,
+                )
+                if probe.get("success"):
+                    rows = probe.get("rows") or []
+                    sparcl_info = {
+                        "count": len(rows),
+                        "nearest": ({
+                            "sparcl_id": rows[0].get("sparcl_id"),
+                            "spectype": rows[0].get("spectype"),
+                            "redshift": rows[0].get("redshift"),
+                            "data_release": rows[0].get("data_release"),
+                            "distance_arcsec": rows[0].get("distance_arcsec"),
+                        } if rows else None),
+                    }
+            except Exception:
+                sparcl_info = None  # availability is a nice-to-have; never fail resolution
+            resolution["sparcl"] = sparcl_info
+    return resolution
 
 
 @router.post("/api/spectral-lines/jobs")

@@ -177,12 +177,45 @@ class PlottingService:
             fig, ax = plt.subplots(figsize=(5.0, 3.0))
 
             if color_by and color_by in df.columns:
-                categories = df[color_by].astype(str).unique()
-                color_map = {c: WONG_PALETTE[i % len(WONG_PALETTE)] for i, c in enumerate(sorted(categories))}
-                for cat, group in df.groupby(df[color_by].astype(str)):
-                    ax.scatter(group[ra_col], group[dec_col], c=color_map[cat],
-                               label=str(cat), s=12, alpha=0.7, edgecolors='none')
-                ax.legend(title=color_by.replace("_", " ").title(), markerscale=1.5, fontsize=8)
+                # Numeric color columns (mags, counts — live P9: big_gmag over
+                # 5,000 rows) must map to a colorbar: the categorical branch
+                # builds one legend entry per unique value, which exploded one
+                # figure to 1585x236,838 px. Discrete numeric codes with few
+                # values (band numbers, CCD ids) still read best as categories.
+                numeric_vals = pd.to_numeric(df[color_by], errors="coerce")
+                parseable = numeric_vals.notna().sum() >= max(1, int(0.95 * df[color_by].notna().sum()))
+                if parseable and numeric_vals.nunique(dropna=True) > 8:
+                    # Sentinel values (NSC gmag=99.99 for missing photometry)
+                    # stretch a naive colorbar until real values are one color.
+                    # Percentile clipping fails once sentinels exceed the tail
+                    # fraction (live Pal 5 field: 2.2% at 99.99 puts p99 at the
+                    # sentinel), so clip to a 3xIQR fence instead.
+                    finite = numeric_vals.dropna()
+                    vmin = vmax = None
+                    if len(finite) >= 20:
+                        q1, q3 = finite.quantile([0.25, 0.75])
+                        iqr = float(q3 - q1)
+                        if iqr > 0:
+                            lo, hi = float(q1 - 3 * iqr), float(q3 + 3 * iqr)
+                            if finite.min() < lo or finite.max() > hi:
+                                vmin = max(float(finite.min()), lo)
+                                vmax = min(float(finite.max()), hi)
+                    sc = ax.scatter(df[ra_col], df[dec_col], c=numeric_vals,
+                                    cmap="viridis", vmin=vmin, vmax=vmax,
+                                    s=12, alpha=0.7, edgecolors='none')
+                    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+                    cbar.set_label(color_by.replace("_", " ").title())
+                else:
+                    cats = df[color_by].astype(str)
+                    n_unique = cats.nunique()
+                    if n_unique > 20:  # keep string legends readable too
+                        top = set(cats.value_counts().index[:20])
+                        cats = cats.where(cats.isin(top), other=f"other ({n_unique - 20} values)")
+                    color_map = {c: WONG_PALETTE[i % len(WONG_PALETTE)] for i, c in enumerate(sorted(cats.unique()))}
+                    for cat, group in df.groupby(cats):
+                        ax.scatter(group[ra_col], group[dec_col], c=color_map[cat],
+                                   label=str(cat), s=12, alpha=0.7, edgecolors='none')
+                    ax.legend(title=color_by.replace("_", " ").title(), markerscale=1.5, fontsize=8)
             else:
                 ax.scatter(df[ra_col], df[dec_col], s=12, color=WONG_PALETTE[1], alpha=0.7)
 

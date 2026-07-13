@@ -358,6 +358,7 @@ class SandboxExecutor:
         max_iterations: int | None = None,
         status_callback: Callable[[str, str], None] | None = None,
         on_token: Callable[[str], None] | None = None,
+        user_id: str | None = None,
     ) -> str:
         """
         Execute the full sandbox loop for *query* over *context*.
@@ -367,13 +368,15 @@ class SandboxExecutor:
 
         # Build the two Python-callable functions to inject into the sandbox
         def _llm_query_fn(prompt: str, context_chunk: str = "") -> str:
-            return self._sub_query_llm(prompt, context_chunk)
+            return self._sub_query_llm(prompt, context_chunk, user_id=user_id)
 
         def _call_tool_fn(tool_name: str, **kwargs) -> Any:
             if self.tool_executor is None:
                 return {"error": "No tool executor configured on SandboxExecutor"}
             try:
-                return self.tool_executor(tool_name, kwargs)
+                if user_id is None:
+                    return self.tool_executor(tool_name, kwargs)
+                return self.tool_executor(tool_name, kwargs, user_id=user_id)
             except Exception as e:
                 return {"error": f"Tool '{tool_name}' raised: {e}"}
 
@@ -501,7 +504,13 @@ class SandboxExecutor:
             on_token(ans)
         return ans
 
-    def _sub_query_llm(self, prompt: str, context_chunk: str = "") -> str:
+    def _sub_query_llm(
+        self,
+        prompt: str,
+        context_chunk: str = "",
+        *,
+        user_id: str | None = None,
+    ) -> str:
         """
         True recursive sub-call.
 
@@ -519,7 +528,12 @@ class SandboxExecutor:
                 verbose=self.verbose,
                 tool_executor=self.tool_executor,  # tools pass down to children
             )
-            return child.run(prompt, context_chunk, max_iterations=6)
+            return child.run(
+                prompt,
+                context_chunk,
+                max_iterations=6,
+                user_id=user_id,
+            )
         else:
             # No sub-chunk context — direct LLM answer with sub-model
             try:

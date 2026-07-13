@@ -11,6 +11,16 @@ export interface PlotlyFigureSpec {
     layout?: Record<string, unknown>;
 }
 
+/** Cross-nav payload riding on "plotly" SSE events (e.g. a SPARCL spectrum
+ * card deep-linking into the Spectral Line Explorer). */
+export interface PlotlyCardMeta {
+    sparcl_id?: string;
+    spectype?: string;
+    redshift?: number | null;
+    line_explorer_url?: string;
+    [key: string]: unknown;
+}
+
 export interface NotebookData {
     title: string;
     data: Record<string, unknown>;
@@ -23,12 +33,25 @@ export interface CommandTag {
     color: string;
 }
 
+export interface MocOverlay {
+    id: string;
+    name?: string;
+    color?: string;
+    order?: number;
+    /** MOC geometry in Aladin Lite's A.MOCFromJSON format: {"<order>": [cell, ...]}. */
+    mocJson: Record<string, number[]>;
+}
+
 export interface HipsImageMeta {
     kind?: string;
     ra?: number;
     dec?: number;
     fovDeg?: number;
     survey?: string;
+    /** Raw FITS download URL for SIA cutouts (Data Lab host, linked directly). */
+    fitsUrl?: string;
+    /** Survey footprint overlays drawn on the interactive view. */
+    mocs?: MocOverlay[];
 }
 
 export interface Message {
@@ -48,6 +71,7 @@ export interface Message {
     plotlySpec?: PlotlyFigureSpec;   // interactive figure ("plotly" messages)
     plotlyTitle?: string;
     plotlyPngFallback?: string;      // static PNG used if plotly can't render
+    plotlyMeta?: PlotlyCardMeta;     // cross-nav payload (e.g. SPARCL → /spectral-lines)
     thinkingSteps?: ThoughtStep[];
     thinking?: string;
     thinkingDuration?: number;
@@ -116,7 +140,13 @@ export interface DataTableResult {
         projects?: Record<string, number>;
         telescopes?: Record<string, number>;
         instruments?: Record<string, number>;
-        skyCoords?: { ra: number; dec: number }[];  // RA/Dec positions for sky map
+        // RA/Dec positions for the sky map; `i` is the row's positional index
+        // in rows[] and `label` its identifier column (click-to-inspect).
+        skyCoords?: { ra: number; dec: number; i?: number; label?: string }[];
+        // Per-observation STC-S footprints (obscore s_region), drawn on the sky
+        // map via A.footprintsFromSTCS; `i` ties a footprint back to its row.
+        skyFootprints?: { stcs: string; i?: number; label?: string }[];
+        skyFootprintsTruncated?: boolean;
         observationYears?: Record<string, number>;  // Year → count timeline
         scienceCategories?: Record<string, number>; // Category → count
         resolutionBins?: Record<string, number>;    // Resolution range → count

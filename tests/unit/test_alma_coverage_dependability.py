@@ -13,6 +13,11 @@ from services.spectral_line_explorer import ALMACoverageService
 
 # -- frequency_support parsing (with channel resolution) ----------------------
 
+import pytest
+
+pytestmark = pytest.mark.slow
+
+
 def test_parse_windows_captures_channel_resolution_multi_spw():
     support = "[86.24..88.11GHz, 976.56kHz, XX] U [88.10..89.98GHz, 488.28kHz, YY]"
     windows = parse_frequency_support_windows(support)

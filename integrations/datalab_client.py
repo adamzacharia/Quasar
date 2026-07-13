@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -38,7 +39,16 @@ DEFAULT_SERVICE_URL = "https://datalab.noirlab.edu/query"
 
 
 class DatalabClientError(RuntimeError):
-    """Raised for Data Lab query-service transport/setup failures."""
+    """Raised for Data Lab query-service transport/setup failures.
+
+    ``jobid`` is set when a server-side job exists despite the failure (async
+    fallback still running / errored), so callers can register it with the
+    local job service and later polls resolve instead of "Unknown job".
+    """
+
+    def __init__(self, message: str, *, jobid: Optional[str] = None):
+        super().__init__(message)
+        self.jobid = jobid
 
 
 @dataclass
@@ -91,6 +101,28 @@ class DatalabClient:
             else float(os.getenv("DATALAB_TIMEOUT_SECONDS", "60"))
         )
         self.service_url = (service_url or os.getenv("DATALAB_QUERY_URL") or DEFAULT_SERVICE_URL).rstrip("/")
+
+    _AS_MATERIALIZED_RE = re.compile(r"\bAS\s+(?:NOT\s+)?MATERIALIZED\b", re.IGNORECASE)
+
+    @classmethod
+    def strip_materialized_for_async(cls, query_text: str) -> str:
+        """Drop PostgreSQL `AS [NOT] MATERIALIZED` CTE fences for async jobs.
+
+        The async query manager parses SQL with JSQLParser, which rejects the
+        keyword ("JSQLParserException: Encountered MATERIALIZED" — live P9,
+        2026-07-13); the sync endpoint accepts it. Only async submissions are
+        rewritten: on the sync path the fence is what keeps crossmatch CTEs
+        fast, so it must survive there. Replacement is quote-aware so string
+        literals are never touched.
+        """
+
+        text = str(query_text or "")
+        if "materialized" not in text.lower():
+            return text
+        parts = text.split("'")
+        for i in range(0, len(parts), 2):  # even segments are outside literals
+            parts[i] = cls._AS_MATERIALIZED_RE.sub("AS", parts[i])
+        return "'".join(parts)
 
     @staticmethod
     def sanitize_query(query: str) -> str:
@@ -146,7 +178,7 @@ class DatalabClient:
             if fallback_enabled and "timed out" in str(exc).lower():
                 return self._query_via_async_job(query_text, mode)
             raise
-        frame = self._csv_to_dataframe(body)
+        frame = self._csv_to_dataframe(body, self._string_dtypes(query_text))
         catalog, table = self._first_table(query_text)
         provenance = {
             "catalog": catalog,
@@ -168,6 +200,7 @@ class DatalabClient:
         """Submit an asynchronous Data Lab query and return the job id."""
 
         query_text, mode = self._one_query(sql=sql, adql=adql)
+        query_text = self.strip_materialized_for_async(query_text)
         body = self._get(
             "query",
             {mode: query_text, "ofmt": "csv", "out": "", "async": "True", "drop": "True"},
@@ -176,11 +209,33 @@ class DatalabClient:
         return body.strip().strip('"')
 
     def status(self, jobid: str) -> str:
-        return self._get("status", {"jobid": str(jobid)}).strip()
+        try:
+            return self._get("status", {"jobid": str(jobid)}).strip()
+        except DatalabClientError as exc:
+            # /status returns the literal state string, and "ERROR" is a valid
+            # job STATE — _get's ERROR-prefix transport check misread it as a
+            # failure (live P15/P14: "Data Lab /status error: ERROR" with no
+            # reason, and the caller's ERROR-state branch never ran).
+            if str(exc).rstrip().endswith("error: ERROR"):
+                return "ERROR"
+            raise
 
-    def results(self, jobid: str, *, fmt: str = "pandas") -> DatalabResult:
+    def error(self, jobid: str) -> str:
+        """Server-side error text for a failed job (query-manager /error)."""
+        try:
+            return self._get("error", {"jobid": str(jobid)}).strip()
+        except DatalabClientError as exc:
+            # The /error body itself starts with "ERROR ..." for real failures —
+            # that IS the reason text, not a transport error.
+            text = str(exc)
+            marker = f"/error error: "
+            if marker in text:
+                return text.split(marker, 1)[1]
+            raise
+
+    def results(self, jobid: str, *, fmt: str = "pandas", query_text: Optional[str] = None) -> DatalabResult:
         body = self._get("results", {"jobid": str(jobid), "delete": "False"})
-        frame = self._csv_to_dataframe(body)
+        frame = self._csv_to_dataframe(body, self._string_dtypes(query_text))
         provenance = {
             "catalog": None,
             "table": None,
@@ -227,7 +282,7 @@ class DatalabClient:
         while _time.monotonic() < deadline:
             state = self.status(str(jobid)).upper()
             if state == "COMPLETED":
-                result = self.results(str(jobid))
+                result = self.results(str(jobid), query_text=query_text)
                 catalog, table = self._first_table(query_text)
                 # results() pre-fills catalog/table with None, so overwrite
                 # explicitly — setdefault would keep the Nones.
@@ -243,14 +298,24 @@ class DatalabClient:
                 )
                 return result
             if state == "ERROR":
+                # Surface the server's actual reason (live P15/P14: bare
+                # "status ERROR" gave the model nothing to adapt to).
+                reason = ""
+                try:
+                    reason = self.error(str(jobid))
+                except Exception:  # noqa: BLE001 - reason fetch is best-effort
+                    reason = ""
                 raise DatalabClientError(
                     f"Data Lab async fallback job {jobid} failed with status ERROR"
+                    + (f": {reason[:400]}" if reason else ""),
+                    jobid=str(jobid),
                 )
             _time.sleep(poll_s)
         raise DatalabClientError(
             f"Data Lab sync query timed out and the async fallback job is still running "
             f"after {max_wait:.0f}s. The job continues server-side — retrieve it with "
-            f"datalab_job_status/datalab_job_results using jobid={jobid}."
+            f"datalab_job_status/datalab_job_results using jobid={jobid}.",
+            jobid=str(jobid),
         )
 
     def _one_query(self, *, sql: Optional[str], adql: Optional[str]) -> tuple[str, str]:
@@ -266,15 +331,35 @@ class DatalabClient:
         seconds = float(timeout if timeout is not None else self.timeout)
         if seconds <= 0:
             raise ValueError("Data Lab timeout must be positive")
+        # A scalar requests timeout is connect + PER-SOCKET-READ, not a total: a
+        # server that trickles bytes every <60s held a "60s sync window" open for
+        # 8 minutes (live P8). Stream the body under a hard wall-clock deadline;
+        # the "timed out" wording is load-bearing (the async fallback and the
+        # density-aggregate tiling both trigger on that substring).
+        wall_seconds = float(os.getenv("DATALAB_SYNC_WALL_SECONDS", "0") or 0) or seconds * 1.5
         # Mirror the official client: query string is GET with the SQL url-encoded.
         encoded = "&".join(f"{key}={quote_plus(str(value))}" for key, value in params.items())
         url = f"{self.service_url}/{endpoint}?{encoded}"
         headers = {"Content-Type": "application/x-www-form-urlencoded", "X-DL-AuthToken": self.token}
+        deadline = time.monotonic() + wall_seconds
         try:
-            resp = requests.get(url, headers=headers, timeout=seconds)
+            resp = requests.get(url, headers=headers, timeout=(min(seconds, 15.0), seconds), stream=True)
+            chunks = []
+            for chunk in resp.iter_content(chunk_size=65536):
+                if time.monotonic() > deadline:
+                    resp.close()
+                    raise DatalabClientError(
+                        f"Data Lab request to /{endpoint} failed: wall-clock deadline of "
+                        f"{wall_seconds:.0f}s exceeded while the response was still streaming "
+                        "(request timed out)"
+                    )
+                if chunk:
+                    chunks.append(chunk)
+            body = b"".join(chunks)
+            encoding = resp.encoding or "utf-8"
+            text = body.decode(encoding, errors="replace")
         except requests.RequestException as exc:
             raise DatalabClientError(f"Data Lab request to /{endpoint} failed: {exc}") from exc
-        text = resp.text if resp.text is not None else ""
         if resp.status_code != 200:
             raise DatalabClientError(
                 f"Data Lab /{endpoint} returned HTTP {resp.status_code}: {text.strip()[:500]}"
@@ -284,12 +369,35 @@ class DatalabClient:
         return text
 
     @staticmethod
-    def _csv_to_dataframe(text: str) -> pd.DataFrame:
+    def _string_dtypes(query_text: Optional[str]) -> Dict[str, Any]:
+        """dtype overrides that keep id-like columns as strings, never floats.
+
+        SMASH ids like '169.429960' carry a significant trailing zero; pandas
+        float inference corrupts them and downstream exact-id lookups then match
+        a different star (live P14). The registry declares which columns are
+        string-typed per table; imported lazily so the transport module stays
+        importable on its own.
+        """
+        try:
+            from services import datalab_registry as registry
+        except Exception:  # noqa: BLE001 - registry unavailable: no overrides
+            return {}
+        catalog = table = None
+        if query_text:
+            catalog, table = DatalabClient._first_table(query_text)
+        return {col: str for col in registry.string_id_columns(catalog, table)}
+
+    @staticmethod
+    def _csv_to_dataframe(text: str, dtype_overrides: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
         payload = (text or "").strip()
         if not payload:
             return pd.DataFrame()
         try:
-            return pd.read_csv(io.StringIO(text))
+            dtype = None
+            if dtype_overrides:
+                header = pd.read_csv(io.StringIO(text), nrows=0).columns
+                dtype = {col: kind for col, kind in dtype_overrides.items() if col in set(header)} or None
+            return pd.read_csv(io.StringIO(text), dtype=dtype)
         except Exception as exc:  # noqa: BLE001 - surface a clear transport error
             raise DatalabClientError(
                 f"Could not parse Data Lab CSV response: {exc}; body starts: {payload[:200]}"

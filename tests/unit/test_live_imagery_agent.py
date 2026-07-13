@@ -93,6 +93,65 @@ def test_hips_handler_attaches_image_and_strips_base64():
     }
 
 
+def test_sia_cutout_card_exposes_fits_download_url():
+    """A single-band SIA cutout retains the tile's Data Lab access URL in
+    provenance.source_url; the image card surfaces it as meta.fits_url so the
+    frontend can offer a raw FITS download (T7.1)."""
+    _load_agent_module()
+    agent = _make_agent()
+    src = "https://datalab.noirlab.edu/svc/cutout?id=abc&format=fits"
+    result = {
+        "success": True,
+        "image_base64": "abc123",
+        "path": "/plots/sia_test.png",
+        "coverage_gap": False,
+        "provenance": {"source_url": src, "ra": 10.0, "dec": -2.0},
+    }
+
+    out = agent._datalab_attach_image_result(result, "Data Lab g-band cutout")
+
+    assert agent.last_run_result["type"] == "image"
+    assert agent.last_run_result["meta"]["fits_url"] == src
+    # The heavy base64 is stripped from the LLM-facing dict as before.
+    assert "image_base64" not in out and out["image_attached"] is True
+
+
+def test_card_fits_url_ignores_local_paths_and_plots():
+    """_datalab_card_fits_url only returns http(s) source_urls; a coverage-gap or
+    plot result (no provenance.source_url) yields no download link."""
+    agent = _make_agent()
+    assert agent._datalab_card_fits_url({"provenance": {"source_url": "/tmp/local.fits"}}) is None
+    assert agent._datalab_card_fits_url({"provenance": {}}) is None
+    assert agent._datalab_card_fits_url({}) is None
+
+    # A plot result (no source_url) attaches a card with no fits_url key.
+    plot = {"success": True, "image_base64": "x", "path": "/plots/scatter.png", "provenance": {"fov_deg": 1.0}}
+    agent._datalab_attach_image_result(plot, "Catalog scatter")
+    assert "fits_url" not in (agent.last_run_result.get("meta") or {})
+
+
+def test_fits_url_merges_with_supplied_meta_without_clobbering():
+    """When a caller passes its own meta (e.g. HiPS ra/dec/survey), the derived
+    SIA fits_url merges in; an explicit fits_url already in meta is preserved."""
+    agent = _make_agent()
+    result = {
+        "success": True,
+        "image_base64": "abc",
+        "path": "/plots/x.png",
+        "provenance": {"source_url": "https://datalab.noirlab.edu/svc/cutout?id=1"},
+    }
+    agent._datalab_attach_image_result(result, "cut", meta={"kind": "hips", "ra": 1.0, "dec": 2.0})
+    meta = agent.last_run_result["meta"]
+    assert meta["kind"] == "hips" and meta["ra"] == 1.0
+    assert meta["fits_url"] == "https://datalab.noirlab.edu/svc/cutout?id=1"
+
+    agent2 = _make_agent()
+    agent2._datalab_attach_image_result(
+        result, "cut", meta={"fits_url": "https://datalab.noirlab.edu/preferred"}
+    )
+    assert agent2.last_run_result["meta"]["fits_url"] == "https://datalab.noirlab.edu/preferred"
+
+
 def test_run_result_identity_helper_rejects_stale_result_objects():
     module = _load_agent_module()
     prior = {"type": "image", "image_url": "/plots/a.png"}

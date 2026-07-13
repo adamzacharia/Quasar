@@ -58,7 +58,7 @@ interface ChatStore {
     updateLastAssistantMessage: (content: string) => void;
     updateLastAssistantThinking: (thinking: string) => void;
     updateLastAssistantRunMeta: (meta: import("./api").ChatRunMeta) => void;
-    updateLastAssistantUsage: (totalTokens: number) => void;
+    updateLastAssistantUsage: (totalTokens: number, durationMs?: number) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -350,6 +350,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     _pendingDeletes: new Set(),
 
     setActiveConversation: (id) => set((state) => {
+        // Switching chats mid-stream used to leave the GLOBAL isStreaming flag
+        // set forever (composer stuck on "QUASAR is thinking..." until a page
+        // reload — live F-12b, reproduced twice on 2026-07-13). The old chat's
+        // stream keeps running server-side and its answer persists; the UI for
+        // the newly opened chat must not stay locked by it.
+        const streamingReset = state.isStreaming
+            ? { isStreaming: false, thinkingSteps: [], streamingContent: "" }
+            : {};
         if (state.activeConversationId && state.messages.length > 0) {
             const updatedConversations = state.conversations.map(c =>
                 c.id === state.activeConversationId
@@ -358,6 +366,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             );
             const conv = updatedConversations.find((c) => c.id === id);
             return {
+                ...streamingReset,
                 conversations: updatedConversations,
                 activeConversationId: id,
                 messages: conv?.messages || [],
@@ -366,6 +375,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
         const conv = state.conversations.find((c) => c.id === id);
         return {
+            ...streamingReset,
             activeConversationId: id,
             messages: conv?.messages || [],
             selectedModel: conv?.model || state.selectedModel || "gpt-oss-120b",
@@ -489,11 +499,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         };
     }),
 
-    updateLastAssistantUsage: (totalTokens) => set((state) => {
+    updateLastAssistantUsage: (totalTokens, durationMs) => set((state) => {
         const messages = [...state.messages];
         const index = findLastAssistantTextIndex(messages);
         if (index < 0) return {};
-        messages[index] = { ...messages[index], usageTokens: totalTokens };
+        messages[index] = {
+            ...messages[index],
+            usageTokens: totalTokens,
+            // Backend compute time wins over the frontend stream-lifetime clock
+            // (drip throttling inflates the latter — live P15's "Thought 1149s").
+            ...(durationMs && durationMs > 0
+                ? { thinkingDuration: Math.max(1, Math.round(durationMs / 1000)) }
+                : {}),
+        };
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),
@@ -519,6 +537,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             activeConversationId: null,
             messages: [],
             streamingContent: "",
+            // Same stuck-composer gap as setActiveConversation: a New Chat
+            // opened mid-stream must not inherit the old chat's lock.
+            isStreaming: false,
+            thinkingSteps: [],
         };
     }),
 

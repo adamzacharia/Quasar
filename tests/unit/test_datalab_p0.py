@@ -21,6 +21,9 @@ from services.datalab_sql_policy import DatalabPolicyError, validate
 from tests.integration.test_agent_archive_tools import _load_agent_module
 
 
+pytestmark = pytest.mark.slow
+
+
 def test_client_sanitizes_trailing_semicolon_and_rejects_final_line_comment():
     assert DatalabClient.sanitize_query("SELECT * FROM gaia_dr3.gaia_source;  ") == "SELECT * FROM gaia_dr3.gaia_source"
     sql = "SELECT *\n-- inner comment is fine\nFROM gaia_dr3.gaia_source"
@@ -31,6 +34,11 @@ def test_client_sanitizes_trailing_semicolon_and_rejects_final_line_comment():
 
 def test_client_uses_anonymous_rest_transport_without_astro_datalab(monkeypatch):
     from integrations import datalab_client as dc
+
+    # Hermetic: earlier tests may import api.* which load_dotenv()s the owner's
+    # real DATALAB_TOKEN into the process env; this test asserts the DEFAULT
+    # (anonymous) transport, so the token must be absent.
+    monkeypatch.delenv("DATALAB_TOKEN", raising=False)
 
     # No astro-datalab dependency: defaults to the anonymous token + REST /query URL.
     client = dc.DatalabClient()
@@ -48,8 +56,15 @@ def test_client_uses_anonymous_rest_transport_without_astro_datalab(monkeypatch)
     class _Resp:
         status_code = 200
         text = "ra,dec\n1.0,-1.0\n"
+        encoding = "utf-8"
 
-    def fake_get(url, headers=None, timeout=None):
+        def iter_content(self, chunk_size=65536):
+            yield self.text.encode("utf-8")
+
+        def close(self):
+            pass
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
         captured["url"] = url
         captured["headers"] = headers
         return _Resp()
@@ -62,7 +77,7 @@ def test_client_uses_anonymous_rest_transport_without_astro_datalab(monkeypatch)
     assert captured["headers"]["X-DL-AuthToken"] == dc.ANON_TOKEN
 
     # Transport failures surface as DatalabClientError, not a raw requests error.
-    def boom(url, headers=None, timeout=None):
+    def boom(url, headers=None, timeout=None, stream=False):
         raise dc.requests.RequestException("network down")
 
     monkeypatch.setattr(dc.requests, "get", boom)
@@ -84,6 +99,9 @@ def test_crossmatch_builder_policy_accepts_planner_safe_form():
     assert "FROM gaia_dr3.gaia_source" in sql
     assert "JOIN nsc_dr2.object AS big" in sql
     assert "q3c_join(g.ra, g.dec, big.ra, big.dec," in sql
+    # Nearest-to-center first so a LIMIT-capped crossmatch keeps the cone CENTER
+    # (live P9: the storage-order slice excluded Pal 5 itself).
+    assert "ORDER BY q3c_dist(g.ra, g.dec, 229.022, -0.112)" in sql
     validated = validate(sql, source="builder", meta=meta)
     assert validated.sql == sql
 
@@ -142,11 +160,58 @@ def test_auxiliary_builders_keep_governor_metadata():
 
     var_sql, var_meta = build_variable_star_select(source_id="abc123")
     assert "id = 'abc123'" in var_sql
+    assert "smash_dr1.source" in var_sql
     assert validate(var_sql, source="builder", meta=var_meta).sql == var_sql
+
+    # catalog is now parameterized (Data Lab parity 2026-07)
+    var2_sql, _ = build_variable_star_select(catalog="smash_dr2", source_id="abc123")
+    assert "smash_dr2.source" in var2_sql
 
     z_sql, z_meta = build_zhistogram("desi_dr1", "zpix", bin=0.1)
     assert "/ 0.1" in z_sql
     assert validate(z_sql, source="builder", meta=z_meta).sql == z_sql
+
+def test_variability_rank_builder_emits_governed_aggregate():
+    from services.datalab_query_builders import build_variability_rank
+
+    sql, meta = build_variability_rank(
+        "smash_dr1", ra=15.0, dec=-72.0, radius_deg=0.3, band="g", min_epochs=12, limit=50
+    )
+    assert "smash_dr1.source" in sql
+    assert "q3c_radial_query(ra, dec, 15, -72, 0.3)" in sql
+    assert "STDDEV(cmag)" in sql and "GROUP BY id" in sql
+    # Distance from the cone center rides along so a target-position query can
+    # pick the NEAREST candidate, not the most variable one (live P14).
+    assert "q3c_dist(AVG(ra), AVG(dec), 15, -72) * 3600.0 AS dist_arcsec" in sql
+    assert "HAVING COUNT(*) >= 12" in sql
+    assert "filter = 'g'" in sql
+    assert "ORDER BY var_snr DESC NULLS LAST" in sql
+    assert meta["builder"] == "variability_rank"
+    assert meta["aggregate"] is True and meta["spatial_bound"] is True
+    assert meta["grouped_by_filter"] is False
+    # the governor accepts it as a builder aggregate without touching the LIMIT
+    assert validate(sql, source="builder", meta=meta).sql == sql
+
+    all_bands_sql, all_bands_meta = build_variability_rank(
+        "smash_dr1", ra=15.0, dec=-72.0, radius_deg=0.3, min_epochs=12, limit=50
+    )
+    assert "SELECT id,\n       filter," in all_bands_sql
+    assert "GROUP BY id, filter" in all_bands_sql
+    assert "filter =" not in all_bands_sql
+    assert all_bands_meta["grouped_by_filter"] is True
+    assert validate(all_bands_sql, source="builder", meta=all_bands_meta).sql == all_bands_sql
+
+
+def test_variability_rank_builder_rejects_bad_inputs():
+    from services.datalab_query_builders import build_variability_rank
+
+    with pytest.raises(ValueError, match="multi-epoch"):
+        build_variability_rank("gaia_dr3", ra=15.0, dec=-72.0, radius_deg=0.3)
+    with pytest.raises(ValueError, match="min_epochs"):
+        build_variability_rank("smash_dr1", ra=15.0, dec=-72.0, radius_deg=0.3, min_epochs=1)
+    with pytest.raises(ValueError, match="Invalid band"):
+        build_variability_rank("smash_dr1", ra=15.0, dec=-72.0, radius_deg=0.3, band="g'; DROP")
+
 
 def test_result_store_round_trips_dataframe_without_diskcache():
     store = DatalabResultStore(enable_disk_cache=False)
@@ -196,8 +261,22 @@ def test_agent_registers_and_dispatches_datalab_tools_without_full_rows():
         "datalab_q3c_crossmatch",
         "datalab_sql_query",
         "datalab_get_result",
+        "datalab_variable_candidates",
+        "datalab_star_lightcurve",
     ]:
         assert agent.tool_registry.get_tool(name) is not None
+
+    # Time-domain chain (Data Lab parity 2026-07): candidates dispatches the
+    # governed aggregate through the same fake client path.
+    var_payload = json.loads(
+        agent._dispatch_tool_call(
+            "datalab_variable_candidates",
+            json.dumps({"catalog": "smash_dr1", "ra": 15.0, "dec": -72.0, "radius_deg": 0.2}),
+        )
+    )
+    assert var_payload["success"] is True
+    assert var_payload["result_id"].startswith("dlr_")
+    assert "STDDEV" in agent._datalab_client_instance.sql
 
     payload = json.loads(
         agent._dispatch_tool_call(

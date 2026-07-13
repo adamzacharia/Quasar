@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, Copy, BarChart3, Download, Sparkles, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
+import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, BarChart3, Download, Sparkles, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
 import { useAuthStore } from "../lib/auth-store";
 import { resetOnboarding } from "./OnboardingOverlay";
 import { useThemeStore } from "../lib/theme-store";
@@ -16,13 +16,6 @@ interface PersonalDoc {
     size_bytes: number;
     uploaded_at: string;
     chunk_count: number;
-}
-
-interface UserTool {
-    name: string;
-    description: string;
-    code: string;
-    api_key_name: string;
 }
 
 interface MCPServer {
@@ -234,303 +227,6 @@ function PersonalizationPanel() {
                                 </button>
                             </div>
                         ))}
-                    </div>
-                )}
-            </div>
-        </div>
-    );
-}
-
-// ── Custom Tools Panel ────────────────────────────────────────────────────
-
-const _SIMPLE_TEMPLATE = `def greet_astronomer(name: str) -> dict:
-    """Greets a radio astronomer by name. Pass the astronomer's last name."""
-    return {"message": \`Hello, Dr. \${name}! Welcome to Quasar.\`}
-`;
-
-const _API_TEMPLATE = `import os, requests
-
-def search_my_service(query: str, max_results: int = 5) -> dict:
-    """Search MyService for astronomy data. Requires MY_SERVICE_KEY."""
-    api_key = os.environ.get("MY_SERVICE_KEY", "")
-    if not api_key:
-        return {"error": "MY_SERVICE_KEY not configured. Add it in the API Key fields."}
-    resp = requests.get(
-        "https://api.myservice.com/search",
-        params={"q": query, "limit": max_results, "key": api_key},
-        timeout=15,
-    )
-    return resp.json()
-`;
-
-function CustomToolsPanel() {
-    const { isAuthenticated } = useAuthStore();
-    const [activeTab, setActiveTab] = useState<"templates" | "add" | "installed">("installed");
-    const [tools, setTools] = useState<UserTool[]>([]);
-    const [loading, setLoading] = useState(false);
-    
-    // Form state
-    const [tName, setTName] = useState("");
-    const [tDesc, setTDesc] = useState("");
-    const [tCode, setTCode] = useState("");
-    const [tKeyName, setTKeyName] = useState("");
-    const [tKeyVal, setTKeyVal] = useState("");
-    const [formMsg, setFormMsg] = useState<{type: "success" | "error", text: string} | null>(null);
-    const [saving, setSaving] = useState(false);
-
-    const fetchTools = useCallback(async () => {
-        if (!isAuthenticated) return;
-        setLoading(true);
-        try {
-            const res = await fetch(`${API_BASE}/api/user-tools`, { credentials: "include" });
-            if (res.ok) {
-                setTools(await res.json());
-            }
-        } catch { /* noop */ }
-        setLoading(false);
-    }, [isAuthenticated]);
-
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    useEffect(() => { if (isAuthenticated) fetchTools(); }, [isAuthenticated, fetchTools]);
-
-    const handleSave = async () => {
-        if (!isAuthenticated) return;
-        setFormMsg(null);
-        if (!tName.trim() || !tCode.trim()) {
-            setFormMsg({ type: "error", text: "Tool name and code are required." });
-            return;
-        }
-        
-        setSaving(true);
-        try {
-            const res = await fetch(`${API_BASE}/api/user-tools`, { credentials: "include",
-                method: "POST",
-                headers: { 
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                    name: tName,
-                    description: tDesc || tName,
-                    code: tCode,
-                    api_key_name: tKeyName || undefined,
-                    api_key_value: tKeyVal || undefined
-                })
-            });
-            const data = await res.json();
-            
-            if (res.ok) {
-                setFormMsg({ type: "success", text: `Tool ${tName} added successfully!` });
-                setTName(""); setTDesc(""); setTCode(""); setTKeyName(""); setTKeyVal("");
-                fetchTools();
-                setTimeout(() => { setActiveTab("installed"); setFormMsg(null); }, 1500);
-            } else {
-                setFormMsg({ type: "error", text: data.detail || "Failed to save tool." });
-            }
-        } catch (e) {
-            setFormMsg({ type: "error", text: "Network error saving tool." });
-        }
-        setSaving(false);
-    };
-
-    const handleDelete = async (name: string) => {
-        if (!isAuthenticated) return;
-        if (!confirm(`Delete custom tool "${name}"?`)) return;
-        
-        try {
-            const res = await fetch(`${API_BASE}/api/user-tools/${encodeURIComponent(name)}`, { credentials: "include",
-                method: "DELETE",
-            });
-            if (res.ok) fetchTools();
-        } catch { /* noop */ }
-    };
-
-    const applyTemplate = (name: string, desc: string, code: string) => {
-        setTName(name);
-        setTDesc(desc);
-        setTCode(code);
-        setActiveTab("add");
-    };
-
-    if (!isAuthenticated) {
-        return (
-            <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
-                <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center">
-                    <Lock className="w-7 h-7 text-slate-500" />
-                </div>
-                <div>
-                    <p className="text-sm font-semibold text-slate-300">Sign in to use Custom Tools</p>
-                    <p className="text-xs text-slate-500 mt-1.5 max-w-xs">
-                        Your custom Python tools are tied to your account. Sign in to add tools that Quasar can use to solve tasks.
-                    </p>
-                </div>
-            </div>
-        );
-    }
-
-    return (
-        <div className="flex flex-col h-full bg-[#0a0a0f]">
-            {/* Top Sub-tabs */}
-            <div className="flex border-b border-slate-700/50 px-4 pt-2">
-                <button 
-                    onClick={() => setActiveTab("installed")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 \${activeTab === "installed" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
-                >
-                    Installed ({tools.length})
-                </button>
-                <button 
-                    onClick={() => setActiveTab("add")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 flex flex-row items-center gap-1.5 \${activeTab === "add" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
-                >
-                    <Plus className="w-4 h-4" /> Add Tool
-                </button>
-                <button 
-                    onClick={() => setActiveTab("templates")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 \${activeTab === "templates" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
-                >
-                    Templates
-                </button>
-            </div>
-
-            {/* Content Area */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                
-                {activeTab === "installed" && (
-                    <div>
-                        {loading && <div className="text-slate-400 text-sm flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin"/> Loading...</div>}
-                        {!loading && tools.length === 0 && (
-                            <div className="text-center py-12">
-                                <Wrench className="w-12 h-12 text-slate-700 mx-auto mb-3" />
-                                <p className="text-sm text-slate-400">No custom tools installed yet.</p>
-                                <button onClick={() => setActiveTab("add")} className="mt-4 text-xs font-semibold text-primary hover:text-primary-400">
-                                    + Create your first tool
-                                </button>
-                            </div>
-                        )}
-                        {!loading && tools.length > 0 && (
-                            <div className="space-y-3">
-                                {tools.map(tool => (
-                                    <div key={tool.name} className="glass-control rounded-xl p-4 group flex items-start justify-between">
-                                        <div className="min-w-0 flex-1 pr-4">
-                                            <div className="flex items-center gap-2 mb-1">
-                                                <h4 className="text-sm font-semibold text-slate-200 truncate">{tool.name}</h4>
-                                                <span className="text-[10px] uppercase font-bold tracking-wider text-slate-500 bg-slate-700/50 px-2 py-0.5 rounded">Custom</span>
-                                            </div>
-                                            <p className="text-xs text-slate-400 line-clamp-2">{tool.description || <span className="italic">No description</span>}</p>
-                                            {tool.api_key_name && (
-                                                <div className="mt-2 text-[10px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded inline-block">
-                                                    KEY: {tool.api_key_name}
-                                                </div>
-                                            )}
-                                        </div>
-                                        <button
-                                            onClick={() => handleDelete(tool.name)}
-                                            className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-all opacity-0 group-hover:opacity-100 shrink-0"
-                                            title="Delete tool"
-                                        >
-                                            <Trash2 className="w-4 h-4" />
-                                        </button>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                )}
-
-                {activeTab === "add" && (
-                    <div className="space-y-4 max-w-2xl">
-                        {formMsg && (
-                            <div className={`flex items-center gap-2.5 px-4 py-3 rounded-xl text-sm \${formMsg.type === "success" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"}`}>
-                                {formMsg.type === "success" ? <CheckCircle className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
-                                {formMsg.text}
-                            </div>
-                        )}
-
-                        <div>
-                            <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Tool Name</label>
-                            <input 
-                                type="text" 
-                                value={tName} onChange={e => setTName(e.target.value)}
-                                placeholder="my_custom_tool"
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary"
-                            />
-                            <p className="text-[10px] text-slate-500 mt-1">Lowercase, digits, underscores only. Must exactly match the Python function name.</p>
-                        </div>
-
-                        <div>
-                            <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Description</label>
-                            <textarea 
-                                value={tDesc} onChange={e => setTDesc(e.target.value)}
-                                placeholder="What does this tool do? Be descriptive, the AI reads this to know when to use it."
-                                rows={2}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary"
-                            />
-                        </div>
-
-                        <div>
-                            <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Python Code</label>
-                            <textarea 
-                                value={tCode} onChange={e => setTCode(e.target.value)}
-                                placeholder="def my_custom_tool(param: str) -> dict:\n    return {}"
-                                rows={8}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary leading-relaxed"
-                            />
-                        </div>
-
-                        <div className="glass-control p-4 rounded-xl space-y-3">
-                            <h4 className="text-xs font-semibold text-slate-300">API Key Storage (Optional)</h4>
-                            <p className="text-[10px] text-slate-500 leading-snug">If your tool needs an API key, name it here. We will securely inject it into <code className="text-primary">os.environ</code> when the agent starts.</p>
-                            <div className="flex gap-3">
-                                <div className="flex-1">
-                                    <input 
-                                        type="text" value={tKeyName} onChange={e => setTKeyName(e.target.value)}
-                                        placeholder="MY_SERVICE_KEY"
-                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-primary"
-                                    />
-                                </div>
-                                <div className="flex-1">
-                                    <input 
-                                        type="password" value={tKeyVal} onChange={e => setTKeyVal(e.target.value)}
-                                        placeholder="sk-..."
-                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-primary"
-                                    />
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="pt-2 flex justify-end">
-                            <button 
-                                onClick={handleSave}
-                                disabled={saving}
-                                className="btn-accent disabled:opacity-50 text-sm font-semibold py-2 px-6 rounded-lg flex items-center gap-2"
-                            >
-                                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
-                                Save & Register Tool
-                            </button>
-                        </div>
-                    </div>
-                )}
-
-                {activeTab === "templates" && (
-                    <div className="space-y-6 max-w-2xl pb-8">
-                        <div className="bg-indigo-500/10 border border-indigo-500/20 rounded-xl p-4 text-sm text-indigo-200">
-                            <strong>How tools work:</strong> Write a standard Python function. The AI sees your function&apos;s name, docstring, and parameter types to auto-generate the JSON schema. Must return a <code>dict</code> or <code>str</code>.
-                        </div>
-
-                        <div>
-                            <div className="flex items-center justify-between mb-2">
-                                <h4 className="text-sm font-bold text-white">Simple Tool</h4>
-                                <button onClick={() => applyTemplate("greet_astronomer", "Greets a radio astronomer by name.", _SIMPLE_TEMPLATE)} className="text-xs font-semibold text-primary hover:text-white flex items-center gap-1 bg-primary/10 hover:bg-primary px-2 py-1 rounded transition-colors"><Copy className="w-3 h-3"/> Use Template</button>
-                            </div>
-                            <pre className="text-xs font-mono text-slate-300 bg-[#0f1117] border border-slate-700 p-4 rounded-xl overflow-x-auto">{_SIMPLE_TEMPLATE}</pre>
-                        </div>
-
-                        <div>
-                            <div className="flex items-center justify-between mb-2">
-                                <h4 className="text-sm font-bold text-white">API Key Tool</h4>
-                                <button onClick={() => applyTemplate("search_my_service", "Search MyService for astronomy data.", _API_TEMPLATE)} className="text-xs font-semibold text-primary hover:text-white flex items-center gap-1 bg-primary/10 hover:bg-primary px-2 py-1 rounded transition-colors"><Copy className="w-3 h-3"/> Use Template</button>
-                            </div>
-                            <pre className="text-xs font-mono text-slate-300 bg-[#0f1117] border border-slate-700 p-4 rounded-xl overflow-x-auto">{_API_TEMPLATE}</pre>
-                        </div>
                     </div>
                 )}
             </div>
@@ -1437,7 +1133,7 @@ interface SettingsModalProps {
     onClose: () => void;
 }
 
-type TabType = 'personalization' | 'providerKeys' | 'tools' | 'mcp' | 'analytics';
+type TabType = 'personalization' | 'providerKeys' | 'mcp' | 'analytics';
 
 export function SettingsModal({ open, onClose }: SettingsModalProps) {
     const backdropRef = useRef<HTMLDivElement>(null);
@@ -1491,15 +1187,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                             Provider Keys
                         </button>
                         
-                        <button 
-                            onClick={() => setCurrentTab('tools')}
-                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors \${currentTab === 'tools' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
-                        >
-                            <Wrench className="w-4 h-4" />
-                            Custom Tools
-                        </button>
-
-                        <button 
+                        <button
                             onClick={() => setCurrentTab('mcp')}
                             className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors \${currentTab === 'mcp' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
                         >
@@ -1565,15 +1253,13 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                 <div className="flex-1 overflow-hidden flex flex-col">
                     <div className="px-6 py-5 border-b border-slate-700/50 shrink-0">
                         <h2 className="text-base font-semibold text-white">
-                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'providerKeys' ? "Provider Keys" : currentTab === 'tools' ? "Custom Tools" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
+                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'providerKeys' ? "Provider Keys" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
                         </h2>
                         <p className="text-xs text-slate-400 mt-0.5">
                             {currentTab === 'personalization' 
                                 ? "Your private knowledge base for smarter conversations" 
                                 : currentTab === 'providerKeys'
                                 ? "Bring your own provider API keys and view included quota"
-                                : currentTab === 'tools'
-                                ? "Extend Quasar with your own Python agent tools"
                                 : currentTab === 'analytics'
                                 ? "Platform usage metrics and feedback data"
                                 : "Connect standard Model Context Protocol servers"}
@@ -1583,7 +1269,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     <div className="flex-1 overflow-hidden">
                         {currentTab === 'personalization' && <PersonalizationPanel />}
                         {currentTab === 'providerKeys' && <ProviderKeysPanel />}
-                        {currentTab === 'tools' && <CustomToolsPanel />}
                         {currentTab === 'mcp' && <MCPServersPanel />}
                         {currentTab === 'analytics' && <AnalyticsPanel />}
                     </div>

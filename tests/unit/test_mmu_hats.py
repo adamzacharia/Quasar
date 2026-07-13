@@ -15,6 +15,9 @@ from services.mmu_hats import (
 )
 
 
+pytestmark = pytest.mark.slow
+
+
 class NestedDType:
     def __str__(self):
         return "nested<float64>"

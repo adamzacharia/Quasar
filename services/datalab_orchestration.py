@@ -53,13 +53,28 @@ def _default_image_service():
 
 def _run_builder_sql(sql: str, meta: Mapping[str, Any], *, client, result_store):
     """Validate builder SQL through the governor, run it, and store the frame -> result_id."""
+    from services import datalab_registry as registry
+    registry.ensure_tap_schema_fresh(client)
     validated = policy.validate(sql, source="builder", meta=meta)
     result = client.query(sql=validated.sql, fmt="pandas")
+    trunc_warning = policy.limit_truncation_warning(
+        len(result.dataframe), (validated.meta or {}).get("row_limit")
+    )
     store_meta = {
         **dict(meta or {}),
         "validated_sql": validated.sql,
-        "provenance": {**(getattr(result, "provenance", {}) or {}), "validated_sql": validated.sql},
+        "provenance": {
+            **(getattr(result, "provenance", {}) or {}),
+            "validated_sql": validated.sql,
+            **(
+                {"row_limit": int(validated.meta["row_limit"]), "limit_truncated": True}
+                if trunc_warning
+                else {}
+            ),
+        },
     }
+    if trunc_warning:
+        store_meta.setdefault("warnings", []).append(trunc_warning)
     result_id = result_store.put(result.dataframe, store_meta)
     return result_id, result
 
@@ -95,6 +110,36 @@ def tile_footprint(footprint: Mapping[str, float], tile_radius_deg: float) -> Li
     return tiles
 
 
+# Density scans wider than this radius need explicit user confirmation — a 30°
+# "quick look" is ~2,800 deg² of server-side aggregation (live P15 burned three
+# such scans into async ERRORs with no gate).
+MAX_UNCONFIRMED_CONE_RADIUS_DEG = float(os.getenv("DATALAB_MAX_UNCONFIRMED_RADIUS_DEG", "2.5"))
+
+
+def confirm_cone_area(ra: float, dec: float, radius_deg: float, *, max_radius_deg: Optional[float] = None) -> Dict[str, Any]:
+    """HITL gate for cone-based density tools (same shape as confirm_sky_area)."""
+    limit = float(max_radius_deg if max_radius_deg is not None else MAX_UNCONFIRMED_CONE_RADIUS_DEG)
+    r = float(radius_deg)
+    area = math.pi * r * r
+    needs = r > limit
+    message = ""
+    if needs:
+        message = (
+            f"This density scan covers a {r:g}° cone ≈ {area:.0f} deg² (unconfirmed cap: "
+            f"{limit:g}° radius). If the user explicitly asked for this region, re-call with "
+            "confirm=true; otherwise shrink the radius or ask the user first."
+        )
+    return {
+        "ra": float(ra),
+        "dec": float(dec),
+        "radius_deg": r,
+        "area_deg2": area,
+        "max_radius_deg": limit,
+        "needs_confirmation": needs,
+        "message": message,
+    }
+
+
 def confirm_sky_area(footprint: Mapping[str, float], tile_radius_deg: float, *, max_tiles: int = MAX_TILES) -> Dict[str, Any]:
     """HITL gate: report area + tile count and whether a wide scan needs user confirmation."""
     n = len(tile_footprint(footprint, tile_radius_deg))
@@ -116,9 +161,36 @@ def confirm_sky_area(footprint: Mapping[str, float], tile_radius_deg: float, *, 
     }
 
 
-def rank_candidates(candidates: Sequence[Mapping[str, Any]], *, by: str = "significance", limit: int = DEFAULT_CANDIDATE_BUDGET) -> List[Dict[str, Any]]:
+def rank_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    by: str = "significance",
+    limit: int = DEFAULT_CANDIDATE_BUDGET,
+    min_separation_deg: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """Rank by significance; optionally merge near-duplicates greedily.
+
+    Overlapping tiles find the SAME sky peak twice, and a broad clump spans
+    several histogram bins — without a minimum separation the 'top N
+    candidates' can be N views of one object (live P15: five sub-peaks of
+    Draco; live P12: 2 of 5 panels were neighbors of another peak).
+    """
     ranked = sorted((dict(c) for c in candidates), key=lambda c: float(c.get(by, 0.0) or 0.0), reverse=True)
-    return ranked[: int(limit)]
+    if not min_separation_deg or min_separation_deg <= 0:
+        return ranked[: int(limit)]
+    kept: List[Dict[str, Any]] = []
+    for cand in ranked:
+        if len(kept) >= int(limit):
+            break
+        ra_c, dec_c = float(cand.get("ra", 0.0)), float(cand.get("dec", 0.0))
+        cosd = _cosd(dec_c)
+        too_close = any(
+            math.hypot((ra_c - float(k["ra"])) * cosd, dec_c - float(k["dec"])) < float(min_separation_deg)
+            for k in kept
+        )
+        if not too_close:
+            kept.append(cand)
+    return kept
 
 
 def _tile_peaks(frame, *, analysis, bins: int, sigma_small: float, sigma_large: float, threshold: float, max_peaks: int) -> List[Dict[str, float]]:
@@ -185,7 +257,9 @@ def tiled_sky_scan(
         dropped_tiles = total_tiles - int(max_tiles)
         tiles = tiles[: int(max_tiles)]
 
-    predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=value_cuts, morphology=morphology)
+    from services import datalab_registry as registry
+    merged_cuts, quality_note = registry.merge_default_quality_cuts(catalog, table, list(value_cuts or []))
+    predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=merged_cuts, morphology=morphology)
     candidates: List[Dict[str, Any]] = []
     tiles_scanned = 0
     tile_errors = 0
@@ -215,12 +289,32 @@ def tiled_sky_scan(
                 "tile_center": [ra, dec],
             })
 
-    ranked = rank_candidates(candidates, limit=candidate_budget)
+    # Merge near-duplicates (overlapping tiles + multi-bin clumps) before the
+    # budget cut, then flag candidates that sit inside a KNOWN MW satellite or
+    # globular cluster (live P15 "discovered" Draco as candidate #1).
+    merge_radius = max(0.1, 3.0 * float(step_deg))
+    ranked = rank_candidates(candidates, limit=candidate_budget, min_separation_deg=merge_radius)
+    known_hits = 0
+    for cand in ranked:
+        known = registry.match_known_mw_object(cand["ra"], cand["dec"])
+        if known:
+            cand["known_object"] = f"{known['name']} ({known['kind']}, {known['separation_deg']}° away)"
+            known_hits += 1
     notes: List[str] = []
+    if quality_note:
+        notes.append(quality_note)
     if dropped_tiles:
         notes.append(f"Capped at {max_tiles} tiles; {dropped_tiles} of {total_tiles} tiles were not scanned.")
     if len(candidates) > len(ranked):
-        notes.append(f"Returned top {len(ranked)} of {len(candidates)} candidates (candidate_budget={candidate_budget}).")
+        notes.append(
+            f"Returned {len(ranked)} of {len(candidates)} peaks after merging near-duplicates "
+            f"(min separation {merge_radius:g}°) and applying candidate_budget={candidate_budget}."
+        )
+    if known_hits:
+        notes.append(
+            f"{known_hits} candidate(s) coincide with KNOWN MW satellites/globulars (see "
+            "known_object) — they are re-detections, NOT new discoveries; say so in the answer."
+        )
     if tile_errors:
         notes.append(f"{tile_errors} tile queries failed and were skipped.")
     return {
@@ -262,7 +356,9 @@ def density_then_cutouts(
     image_service = image_service or _default_image_service()
 
     top_n = max(1, int(top_n))
-    predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=value_cuts, morphology=morphology)
+    from services import datalab_registry as registry
+    merged_cuts, quality_note = registry.merge_default_quality_cuts(catalog, table, list(value_cuts or []))
+    predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=merged_cuts, morphology=morphology)
     sql, meta = builders.build_density_aggregate(
         catalog, table, mode="grid", step_deg=step_deg,
         ra=ra, dec=dec, radius_deg=radius_deg, predicates=predicates,
@@ -270,14 +366,36 @@ def density_then_cutouts(
     )
     result_id, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
     df = result.dataframe
-    # The aggregate is ORDER BY source_count DESC, so head(top_n) are the densest cells.
+    # The aggregate is ORDER BY source_count DESC. Greedily skip cells adjacent
+    # to an already-accepted peak (2 of live P12's 5 "candidates" were neighbor
+    # cells of the same clump), and flag peaks inside known MW objects.
+    min_sep = 2.0 * float(step_deg)
     peaks: List[Dict[str, Any]] = []
-    for _, row in df.head(top_n).iterrows():
-        peaks.append({
-            "ra": float(row["ra_bin"]),
-            "dec": float(row["dec_bin"]),
+    notes: List[str] = []
+    if quality_note:
+        notes.append(quality_note)
+    for _, row in df.iterrows():
+        if len(peaks) >= top_n:
+            break
+        ra_p, dec_p = float(row["ra_bin"]), float(row["dec_bin"])
+        cosd = _cosd(dec_p)
+        if any(math.hypot((ra_p - p["ra"]) * cosd, dec_p - p["dec"]) < min_sep for p in peaks):
+            continue
+        peak: Dict[str, Any] = {
+            "ra": ra_p,
+            "dec": dec_p,
             "label": f"n={int(row['source_count'])}",
-        })
+        }
+        known = registry.match_known_mw_object(ra_p, dec_p)
+        if known:
+            peak["known_object"] = f"{known['name']} ({known['kind']}, {known['separation_deg']}° away)"
+            peak["label"] += f" KNOWN: {known['name']}"
+        peaks.append(peak)
+    if any("known_object" in p for p in peaks):
+        notes.append(
+            "Some peaks coincide with KNOWN MW satellites/globulars (see known_object) — "
+            "they are re-detections, not new candidates."
+        )
     grid = image_service.cutout_grid(peaks, fov_deg, band=band, catalog=catalog) if peaks else {"success": True, "panels": []}
     return {
         "success": True,
@@ -285,6 +403,7 @@ def density_then_cutouts(
         "n_peaks": len(peaks),
         "peaks": peaks,
         "cutout_grid": grid,
+        **({"notes": notes} if notes else {}),
     }
 
 
@@ -419,6 +538,11 @@ def tiled_density_aggregate(
                     tile_errors += 1
             if budget_stop:
                 break
+        finally:
+            # The fail-fast check above reads this; it was never incremented,
+            # so the documented two-fruitless-outer-tiles abort was dead code
+            # and hopeless regions ran the whole wall budget.
+            outer_tiles_done += 1
 
     frames = [f for f in frames if f is not None and len(f)]
     if not frames:
@@ -519,7 +643,9 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     # Server-side validity cuts: survey sentinel magnitudes (99.99 / -99) otherwise
     # blow the axes out to ±80 and waste the LIMIT budget on junk photometry.
     # Lower bound -5 keeps genuinely bright sources while excluding -9/-99 sentinels.
-    value_cuts = [dict(vc) for vc in (extra_value_cuts or [])]
+    # Registry default quality cuts (e.g. DES flags_*=0) ride along unless the
+    # caller cut the same column (live P5: garbage colors stretched CCD axes).
+    value_cuts, quality_note = reg.merge_default_quality_cuts(catalog, table, [dict(vc) for vc in (extra_value_cuts or [])])
     for col in dict.fromkeys(magcols.values()):
         value_cuts.append({"column": col, "op": ">", "value": _VALID_MAG_RANGE[0]})
         value_cuts.append({"column": col, "op": "<", "value": _VALID_MAG_RANGE[1]})
@@ -543,10 +669,107 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     meta["morphology"] = morph_cut
     if ps_note:
         meta.setdefault("warnings", []).append(ps_note)
+    if quality_note:
+        meta.setdefault("warnings", []).append(quality_note)
+    trunc_warning = policy.limit_truncation_warning(len(result.dataframe), meta.get("row_limit"))
+    if trunc_warning:
+        meta.setdefault("warnings", []).append(
+            f"Diagram sample hit its row cap (LIMIT {int(meta['row_limit'])}) — it is a "
+            "storage-order subsample of the cone, disclose the sample size in the answer."
+        )
     return result_id, result, magcols, meta
 
 
 _VALID_MAG_RANGE = (-5.0, 50.0)
+
+
+def _expr_identifiers(expr: str) -> List[str]:
+    """Column names referenced by a plot expression (whitelisted AST walk).
+
+    Uses the same grammar as datalab_analysis._eval_expression, so anything
+    accepted here evaluates client-side later; function names are excluded.
+    """
+    import ast
+    from services.datalab_analysis import _EXPR_FUNCS
+    tree = ast.parse(str(expr or "").strip(), mode="eval")
+    names: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id not in _EXPR_FUNCS and node.id not in names:
+            names.append(node.id)
+    if not names:
+        raise ValueError(f"Expression {expr!r} references no result columns.")
+    return names
+
+
+def _expr_diagram(
+    catalog, table, ra, dec, radius_deg, *,
+    x_expr, y_expr, invert_y, prefix, limit, title,
+    point_sources=False, morphology=None, value_cuts=None,
+    client, result_store, plotting,
+):
+    """One-shot diagram with derived axes (e.g. a Gaia HR diagram:
+    x = bp_rp, y = phot_g_mean_mag + 5*log10(parallax) - 10).
+
+    The SELECT list comes from the expressions' own identifiers instead of the
+    per-band magnitude templates, and every referenced column gets a server-side
+    finiteness guard so NaN rows cannot eat the LIMIT budget (the live P6
+    pathology). Expressions are evaluated client-side by the same whitelisted
+    evaluator datalab_catalog_scatter uses.
+    """
+    import numpy as np
+    from services import datalab_analysis as analysis
+    from services import datalab_registry as reg
+
+    cols = list(dict.fromkeys(_expr_identifiers(x_expr) + _expr_identifiers(y_expr)))
+    info = reg.describe_table(catalog, table)
+    select_cols = [info["ra_column"], info["dec_column"]] + [c for c in cols if c not in (info["ra_column"], info["dec_column"])]
+    morph_cut = dict(morphology) if morphology else None
+    if morph_cut is None and point_sources:
+        morph_cut = reg.point_source_cut(catalog, table)
+    predicates = builders.build_catalog_predicates(
+        catalog, table, value_cuts=[dict(vc) for vc in (value_cuts or [])], morphology=morph_cut,
+    )
+    # NaN rows fail every expression anyway — exclude them server-side so they
+    # don't consume the row budget.
+    predicates = predicates + [f"{builders._column(info, c)} < 'Infinity'::float8" for c in cols]
+    sql, meta = builders.build_cone_select(
+        catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
+        columns=select_cols, limit=limit, predicates=predicates,
+    )
+    rid, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
+    df = result.dataframe
+    x = analysis._eval_expression(df, x_expr)
+    y = analysis._eval_expression(df, y_expr)
+    finite = np.isfinite(x) & np.isfinite(y)
+    warnings = []
+    trunc = policy.limit_truncation_warning(len(df), (meta or {}).get("row_limit"))
+    if trunc:
+        warnings.append(
+            f"Diagram sample hit its row cap (LIMIT {int(meta['row_limit'])}) — it is a "
+            "subsample of the cone; disclose the sample size in the answer."
+        )
+
+    plt = plotting._apply_style(dark=False)
+    fig, ax = plt.subplots(figsize=(5.0, 5.0))
+    ax.scatter(x[finite], y[finite], s=6, alpha=0.4, edgecolors="none")
+    ax.set_xlabel(x_expr)
+    ax.set_ylabel(y_expr)
+    if invert_y:
+        ax.invert_yaxis()
+    ax.grid(True, alpha=0.3)
+    plot_title = title or f"{catalog}.{table} — {y_expr} vs {x_expr}"
+    ax.set_title(plot_title)
+    fig.tight_layout()
+    plotly_spec = _plotly_scatter_spec(
+        [("selected", x[finite].tolist(), y[finite].tolist())],
+        x_label=x_expr, y_label=y_expr, title=plot_title, invert_y=invert_y,
+    )
+    return _render_diagram(plotting, fig, prefix, rid,
+                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
+                           {"rowcount": int(len(df)), "x": x_expr, "y": y_expr,
+                            "points": int(finite.sum()), "morphology": morph_cut,
+                            "warnings": warnings,
+                            "plotly_spec": plotly_spec})
 
 
 def _valid_mag_mask(*series):
@@ -624,18 +847,29 @@ def color_color_diagram(
     x_bands=("g", "r"), y_bands=("r", "i"),
     split_col=None, split_threshold=0.005, limit=3000, title=None,
     point_sources=False, morphology=None, value_cuts=None,
+    x_expr=None, y_expr=None,
     client=None, result_store=None, plotting_service=None,
 ):
     """P5: one-shot color-color diagram. Queries the cone, optionally splits into stars/galaxies
     by a morphology column (auto-detected from the registry, e.g. DES spread_model_r), and renders
     a 1- or 2-panel CCD as a single image. Sentinel magnitudes (99.99) are cut both server- and
-    client-side so the axes stay physical. An explicit morphology cut overrides point_sources."""
+    client-side so the axes stay physical. An explicit morphology cut overrides point_sources.
+    x_expr/y_expr switch to derived axes (single panel, no star/galaxy split)."""
     import pandas as pd
     from services import datalab_registry as reg
     from services.plotting import PlottingService
     client = client or _default_client()
     result_store = result_store or _default_result_store()
     plotting = plotting_service or PlottingService()
+    if x_expr or y_expr:
+        if not (x_expr and y_expr):
+            raise ValueError("Provide BOTH x_expr and y_expr (or neither) for a derived-axis CCD.")
+        return _expr_diagram(
+            catalog, table, ra, dec, radius_deg,
+            x_expr=str(x_expr), y_expr=str(y_expr), invert_y=False, prefix="datalab_ccd",
+            limit=limit, title=title, point_sources=point_sources, morphology=morphology,
+            value_cuts=value_cuts, client=client, result_store=result_store, plotting=plotting,
+        )
     # A morphology-selected sample is one population — don't auto-split it into stars/galaxies.
     if split_col is None and not point_sources and not morphology:
         split_col = reg.morphology_split_column(catalog, table)
@@ -694,17 +928,29 @@ def color_magnitude_diagram(
     catalog, table, ra, dec, radius_deg, *,
     blue_band="g", red_band="r", mag_band=None, limit=5000, title=None,
     point_sources=False, morphology=None, value_cuts=None,
+    x_expr=None, y_expr=None,
     client=None, result_store=None, plotting_service=None,
 ):
     """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted.
     Sentinel magnitudes are excluded server- and client-side; point_sources=True applies the
     catalog's registered star/galaxy cut (e.g. NSC class_star > 0.5). An explicit morphology
-    cut overrides point_sources."""
+    cut overrides point_sources. x_expr/y_expr switch to derived axes (e.g. a Gaia HR
+    diagram: x=bp_rp, y=phot_g_mean_mag + 5*log10(parallax) - 10) — previously these
+    params were silently IGNORED and the band fallback 400'd on Gaia (live P6)."""
     import pandas as pd
     from services.plotting import PlottingService
     client = client or _default_client()
     result_store = result_store or _default_result_store()
     plotting = plotting_service or PlottingService()
+    if x_expr or y_expr:
+        if not (x_expr and y_expr):
+            raise ValueError("Provide BOTH x_expr and y_expr (or neither) for a derived-axis CMD.")
+        return _expr_diagram(
+            catalog, table, ra, dec, radius_deg,
+            x_expr=str(x_expr), y_expr=str(y_expr), invert_y=True, prefix="datalab_cmd",
+            limit=limit, title=title, point_sources=point_sources, morphology=morphology,
+            value_cuts=value_cuts, client=client, result_store=result_store, plotting=plotting,
+        )
     mag_band = mag_band or blue_band
     bands = list(dict.fromkeys([blue_band, red_band, mag_band]))
     rid, result, magcols, _meta = _diagram_dataframe(

@@ -9,6 +9,9 @@ from services import plotting
 from services.ned_photometry import NedPhotometryService
 
 
+pytestmark = pytest.mark.slow
+
+
 def _plot_dir(name):
     path = os.path.join("test_results", "live_imagery", name)
     os.makedirs(path, exist_ok=True)

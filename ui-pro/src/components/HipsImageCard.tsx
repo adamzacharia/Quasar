@@ -2,7 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Maximize2, Minus, Plus, RefreshCw, X } from "lucide-react";
+import { Download, Maximize2, Minus, Plus, RefreshCw, X } from "lucide-react";
 import { AladinSkyView, SURVEYS } from "./AladinSkyView";
 import { ImageLightbox } from "./ImageLightbox";
 import type { HipsImageMeta } from "../lib/types";
@@ -28,8 +28,28 @@ function FullSizeLink({ href }: { href: string }) {
     );
 }
 
-function PlainImageCard({ imageUrl, caption }: { imageUrl: string; caption?: string }) {
+// Raw download anchor to a FITS product (hips2fits format=fits or a SIA tile URL).
+// These are CDS / Data Lab hosts, NOT almascience.*, so they are linked directly —
+// never routed through /api/fits/preview, which allowlists ALMA hosts only. (T7.1)
+function FitsDownloadLink({ href }: { href: string }) {
+    return (
+        <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            download
+            title="Download the FITS image"
+            className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1"
+        >
+            <Download className="w-3.5 h-3.5" />
+            FITS
+        </a>
+    );
+}
+
+function PlainImageCard({ imageUrl, caption, fitsHref }: { imageUrl: string; caption?: string; fitsHref?: string }) {
     const [lightboxOpen, setLightboxOpen] = useState(false);
+    const showFooter = Boolean(caption) || Boolean(fitsHref);
     return (
         <div className="pl-11">
             <div className="mt-4 rounded-xl border border-cyan-500/30 bg-slate-900/60 overflow-hidden shadow-xl shadow-cyan-500/5">
@@ -40,10 +60,13 @@ function PlainImageCard({ imageUrl, caption }: { imageUrl: string; caption?: str
                     loading="lazy"
                     onClick={() => setLightboxOpen(true)}
                 />
-                {caption && (
-                    <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between">
-                        <span className="text-xs text-slate-400">{caption}</span>
-                        <FullSizeLink href={imageUrl} />
+                {showFooter && (
+                    <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between gap-3">
+                        <span className="min-w-0 truncate text-xs text-slate-400">{caption}</span>
+                        <div className="flex shrink-0 items-center gap-3">
+                            {fitsHref && <FitsDownloadLink href={fitsHref} />}
+                            <FullSizeLink href={imageUrl} />
+                        </div>
                     </div>
                 )}
             </div>
@@ -98,6 +121,17 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
         return [{ id: selectedSurvey, label: selectedSurvey }, ...SURVEYS];
     }, [selectedSurvey]);
 
+    // FITS download target (T7.1). A switchable HiPS card builds its own hips2fits
+    // format=fits URL from the LIVE survey/fov so the download matches what is shown;
+    // a SIA cutout carries a raw Data Lab tile URL in imageMeta.fitsUrl. Multiband
+    // panels and coverage-gap cards have no single FITS product → no button.
+    const fitsHref = useMemo(() => {
+        if (canSwitchSurvey) {
+            return hips2fitsUrl({ ra, dec, fovDeg, survey: selectedSurvey, format: "fits" }) || undefined;
+        }
+        return imageMeta?.fitsUrl || undefined;
+    }, [canSwitchSurvey, ra, dec, fovDeg, selectedSurvey, imageMeta?.fitsUrl]);
+
     const applyClientImage = useCallback((survey: string, nextFov: number, retry = false) => {
         const nextUrl = hips2fitsUrl({ ra, dec, fovDeg: nextFov, survey });
         if (!nextUrl) {
@@ -111,7 +145,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
     }, [ra, dec]);
 
     if (!canSwitchSurvey && !canInteract) {
-        return <PlainImageCard imageUrl={imageUrl} caption={caption} />;
+        return <PlainImageCard imageUrl={imageUrl} caption={caption} fitsHref={fitsHref} />;
     }
 
     return (
@@ -212,6 +246,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
                                 Interactive
                             </button>
                         )}
+                        {fitsHref && <FitsDownloadLink href={fitsHref} />}
                         <FullSizeLink href={displayedUrl} />
                     </div>
                 </div>
@@ -245,6 +280,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
                                 coords={[{ ra, dec }]}
                                 sourceName={caption || "HiPS image"}
                                 survey={selectedSurvey}
+                                mocs={imageMeta?.mocs}
                                 onFallback={() => setInteractiveOpen(false)}
                             />
                         </div>

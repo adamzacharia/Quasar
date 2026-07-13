@@ -219,19 +219,23 @@ def test_parse_failure_matches_recovery_substrings():
 
 # ── Agent: Data Lab error fix hints ──────────────────────────────────────────
 
-def test_datalab_error_column_hint(agent_module):
-    agent = agent_module.QuasarAgent.__new__(agent_module.QuasarAgent)
-    payload = agent._datalab_error(Exception(
+def test_datalab_error_column_hint():
+    # QuasarAgent._datalab_error was retired (docs/v2 P1); the single
+    # implementation is capabilities.datalab.datalab_error.
+    from capabilities.datalab import datalab_error
+
+    payload = datalab_error(Exception(
         'Data Lab /query returned HTTP 400: Error: column "gmagmag" does not exist '
         'HINT: Perhaps you meant to reference the column "object.gmag".'
-    ))
+    )).to_native()
     assert payload["success"] is False
     assert "datalab_describe_table" in payload.get("fix_hint", "")
 
 
-def test_datalab_error_expression_hint(agent_module):
-    agent = agent_module.QuasarAgent.__new__(agent_module.QuasarAgent)
-    payload = agent._datalab_error(Exception("Column 'M_G' not found for expression 'M_G'"))
+def test_datalab_error_expression_hint():
+    from capabilities.datalab import datalab_error
+
+    payload = datalab_error(Exception("Column 'M_G' not found for expression 'M_G'")).to_native()
     assert "log10" in payload.get("fix_hint", "")
 
 

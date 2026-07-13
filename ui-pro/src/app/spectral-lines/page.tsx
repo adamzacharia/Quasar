@@ -32,6 +32,7 @@ import {
     getSpectralLineJob,
     getSpectralLineMetadata,
     isUnauthorizedApiError,
+    resolveSpectralTarget,
     searchSpectralSpecies,
     startSpectralLineJob,
     type SpectralCoverageProject,
@@ -151,6 +152,14 @@ function SpectralLineExplorer() {
     const [additionalWindows, setAdditionalWindows] = useState("");
     const [frame, setFrame] = useState(searchParams.get("frame") || "rest");
     const [target, setTarget] = useState(searchParams.get("target") || "");
+    const [explicitCoordinates, setExplicitCoordinates] = useState<{ raDeg: number; decDeg: number } | null>(() => {
+        const rawRa = searchParams.get("ra_deg");
+        const rawDec = searchParams.get("dec_deg");
+        if (rawRa === null || rawDec === null) return null;
+        const raDeg = Number(rawRa);
+        const decDeg = Number(rawDec);
+        return Number.isFinite(raDeg) && Number.isFinite(decDeg) ? { raDeg, decDeg } : null;
+    });
     const [redshift, setRedshift] = useState(searchParams.get("z") || "auto");
     const [radialVelocity, setRadialVelocity] = useState("");
     const [velocityConvention, setVelocityConvention] = useState("radio");
@@ -172,6 +181,58 @@ function SpectralLineExplorer() {
     const [resultTab, setResultTab] = useState<ResultTab>("lines");
     const [error, setError] = useState("");
     const autorunHandled = useRef("");
+    const sparclProbeGeneration = useRef(0);
+
+    // SPARCL cross-nav probe: "optical spectrum available" chip for the target.
+    const [sparclProbe, setSparclProbe] = useState<{
+        status: "idle" | "loading" | "done" | "error";
+        target: string;
+        count: number;
+        nearestId?: string;
+        nearestSpectype?: string;
+        nearestDistance?: number;
+    }>({ status: "idle", target: "", count: 0 });
+    useEffect(() => {
+        // A new target invalidates the previous probe result.
+        sparclProbeGeneration.current += 1;
+        setSparclProbe((prev) => (prev.target === target.trim() ? prev : { status: "idle", target: "", count: 0 }));
+    }, [target]);
+    const checkSparcl = useCallback(async () => {
+        const name = target.trim();
+        if (!name) return;
+        const generation = ++sparclProbeGeneration.current;
+        setSparclProbe({ status: "loading", target: name, count: 0 });
+        try {
+            const resolution = await resolveSpectralTarget({
+                target_name: name,
+                ra_deg: explicitCoordinates?.raDeg,
+                dec_deg: explicitCoordinates?.decDeg,
+                include_sparcl: true,
+            });
+            if (generation !== sparclProbeGeneration.current) return;
+            const sparcl = resolution && typeof resolution === "object"
+                ? (resolution as { sparcl?: { count?: number; nearest?: { sparcl_id?: string; spectype?: string; distance_arcsec?: number } | null } | null }).sparcl
+                : undefined;
+            if (!sparcl || typeof sparcl.count !== "number") {
+                // Probe failed or target had no resolvable coordinates — do not
+                // claim "no spectra" when we simply could not check.
+                setSparclProbe({ status: "error", target: name, count: 0 });
+                return;
+            }
+            setSparclProbe({
+                status: "done",
+                target: name,
+                count: sparcl.count,
+                nearestId: sparcl.nearest?.sparcl_id,
+                nearestSpectype: sparcl.nearest?.spectype,
+                nearestDistance: typeof sparcl.nearest?.distance_arcsec === "number"
+                    ? Math.round(sparcl.nearest.distance_arcsec * 10) / 10 : undefined,
+            });
+        } catch {
+            if (generation !== sparclProbeGeneration.current) return;
+            setSparclProbe({ status: "error", target: name, count: 0 });
+        }
+    }, [explicitCoordinates, target]);
     const authModalOpened = useRef(false);
     const [rawComparison, setRawComparison] = useState<{ line: SpectralLineRecord; rows: SpectralLineRecord[] } | null>(null);
 
@@ -287,10 +348,14 @@ function SpectralLineExplorer() {
         if (windowUnit) params.set("unit", windowUnit);
         params.set("frame", frame);
         if (target) params.set("target", target);
+        if (explicitCoordinates) {
+            params.set("ra_deg", String(explicitCoordinates.raDeg));
+            params.set("dec_deg", String(explicitCoordinates.decDeg));
+        }
         params.set("z", redshift || "auto");
         if (autorun) params.set("autorun", autorun);
         router.replace(`/spectral-lines?${params}`, { scroll: false });
-    }, [band, frame, mode, redshift, router, selectedSpecies, speciesQuery, target, transition, windowMax, windowMin, windowUnit]);
+    }, [band, explicitCoordinates, frame, mode, redshift, router, selectedSpecies, speciesQuery, target, transition, windowMax, windowMin, windowUnit]);
 
     const startJob = useCallback(async (operation: SpectralLineJob["operation"], selectedLine?: SpectralLineRecord) => {
         if (!isAuthenticated) {
@@ -306,6 +371,8 @@ function SpectralLineExplorer() {
             payload = {
                 ...payload,
                 target_name: target.trim(),
+                ra_deg: explicitCoordinates?.raDeg,
+                dec_deg: explicitCoordinates?.decDeg,
                 redshift: !radialVelocity && redshift !== "auto" && redshift !== "" ? Number(redshift) : undefined,
                 selected_line_ids: selectedLineIds,
                 radius_arcsec: 60,
@@ -327,7 +394,7 @@ function SpectralLineExplorer() {
         setResultTab(nextTab);
         setPage(1);
         syncUrl(operation === "alma_coverage" ? "coverage" : "search");
-    }, [buildQuery, mode, openAuthModal, radialVelocity, redshift, selectedLineIds, syncUrl, target, isAuthenticated]);
+    }, [buildQuery, explicitCoordinates, mode, openAuthModal, radialVelocity, redshift, selectedLineIds, syncUrl, target, isAuthenticated]);
 
     useEffect(() => {
         if (!job || TERMINAL.has(job.status) || !isAuthenticated) return;
@@ -560,8 +627,54 @@ function SpectralLineExplorer() {
                             )}
 
                             <Field label="Target for coverage">
-                                <input value={target} onChange={(event) => setTarget(event.target.value)} className={inputClass} placeholder="M87" />
+                                <input
+                                    value={target}
+                                    onChange={(event) => {
+                                        sparclProbeGeneration.current += 1;
+                                        setTarget(event.target.value);
+                                        setExplicitCoordinates(null);
+                                    }}
+                                    className={inputClass}
+                                    placeholder="M87"
+                                />
                             </Field>
+                            {/* SPARCL cross-nav: optical-spectrum availability at the resolved target */}
+                            {target.trim() && (
+                                <div className="-mt-2">
+                                    {sparclProbe.status === "idle" && (
+                                        <button
+                                            type="button"
+                                            onClick={checkSparcl}
+                                            className="text-[11px] font-medium text-slate-500 underline decoration-dotted underline-offset-2 transition-colors hover:text-cyan-300"
+                                        >
+                                            Check for optical spectra (SPARCL)
+                                        </button>
+                                    )}
+                                    {sparclProbe.status === "loading" && (
+                                        <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-500">
+                                            <Loader2 className="h-3 w-3 animate-spin" /> Checking SPARCL…
+                                        </span>
+                                    )}
+                                    {sparclProbe.status === "done" && sparclProbe.count > 0 && (
+                                        <button
+                                            type="button"
+                                            onClick={() => router.push(`/?prompt=${encodeURIComponent(
+                                                `Plot the SPARCL optical spectrum ${sparclProbe.nearestId ? `with sparcl_id ${sparclProbe.nearestId}` : `nearest to ${sparclProbe.target}`} with spectral lines marked.`
+                                            )}`)}
+                                            className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[11px] font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/15"
+                                            title={sparclProbe.nearestId ? `Nearest: ${sparclProbe.nearestSpectype || "?"} at ${sparclProbe.nearestDistance ?? "?"}″` : undefined}
+                                        >
+                                            ● Optical spectrum available ({sparclProbe.count}) — open in chat
+                                        </button>
+                                    )}
+                                    {sparclProbe.status === "done" && sparclProbe.count === 0 && (
+                                        <span className="text-[11px] text-slate-600">No SPARCL optical spectra within 10″ of {sparclProbe.target}.</span>
+                                    )}
+                                    {sparclProbe.status === "error" && (
+                                        <span className="text-[11px] text-slate-600">SPARCL availability check failed.</span>
+                                    )}
+                                </div>
+                            )}
 
                             {mode === "advanced" && (
                                 <div className="space-y-4 border-t border-slate-800 pt-4">

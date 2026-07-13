@@ -655,6 +655,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                 spec={message.plotlySpec}
                 title={message.plotlyTitle}
                 pngFallback={message.plotlyPngFallback}
+                meta={message.plotlyMeta}
             />
         );
     }

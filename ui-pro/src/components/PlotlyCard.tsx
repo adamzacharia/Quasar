@@ -2,15 +2,17 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Download, Loader2 } from "lucide-react";
+import Link from "next/link";
+import { Download, Loader2, Waves } from "lucide-react";
 import type { PlotlyModule } from "plotly.js-basic-dist-min";
-import type { PlotlyFigureSpec } from "../lib/types";
+import type { PlotlyFigureSpec, PlotlyCardMeta } from "../lib/types";
 import { ImageLightbox } from "./ImageLightbox";
 
 type PlotlyCardProps = {
     spec?: PlotlyFigureSpec;
     title?: string;
     pngFallback?: string;
+    meta?: PlotlyCardMeta;
 };
 
 function isValidSpec(spec: PlotlyFigureSpec | undefined): spec is PlotlyFigureSpec & { data: unknown[] } {
@@ -76,7 +78,7 @@ function fileSlug(title?: string): string {
  * never in the SSR bundle) and falls back to the PNG snapshot as a regular
  * image card if the bundle fails to load or the spec is invalid.
  */
-export function PlotlyCard({ spec, title, pngFallback }: PlotlyCardProps) {
+export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) {
     const plotRef = useRef<HTMLDivElement>(null);
     const plotlyRef = useRef<PlotlyModule | null>(null);
     const [status, setStatus] = useState<"loading" | "ready" | "fallback">(
@@ -198,16 +200,28 @@ export function PlotlyCard({ spec, title, pngFallback }: PlotlyCardProps) {
                 </div>
                 <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between gap-3">
                     <span className="min-w-0 truncate text-xs text-slate-400">{title || "Interactive plot"}</span>
-                    <button
-                        type="button"
-                        onClick={downloadPng}
-                        disabled={status !== "ready" || downloading}
-                        className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/15 disabled:opacity-40"
-                        title="Download as PNG"
-                    >
-                        {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-                        PNG
-                    </button>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                        {meta?.line_explorer_url && (
+                            <Link
+                                href={meta.line_explorer_url}
+                                className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/15"
+                                title={`Open in Spectral Line Explorer (target + z prefilled${typeof meta.redshift === "number" ? `, z=${meta.redshift.toPrecision(4)}` : ""})`}
+                            >
+                                <Waves className="h-3.5 w-3.5" />
+                                Line Explorer
+                            </Link>
+                        )}
+                        <button
+                            type="button"
+                            onClick={downloadPng}
+                            disabled={status !== "ready" || downloading}
+                            className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/15 disabled:opacity-40"
+                            title="Download as PNG"
+                        >
+                            {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+                            PNG
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>

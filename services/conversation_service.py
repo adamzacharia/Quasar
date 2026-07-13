@@ -394,9 +394,8 @@ class ConversationService:
                 ''',
                 (title, now, conversation_id, user_id),
             )
-            updated = cursor.rowcount > 0
-
             conn.commit()
+            updated = cursor.rowcount > 0
         finally:
             conn.close()
         return updated
@@ -548,9 +547,11 @@ class ConversationService:
                         now,
                     ),
                 )
-                ref_id = cursor.lastrowid
+                ref_id = None
 
             conn.commit()
+            if ref_id is None:
+                ref_id = cursor.lastrowid
         finally:
             conn.close()
 

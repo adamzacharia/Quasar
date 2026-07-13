@@ -26,6 +26,7 @@ import logging
 import os
 import queue as stdlib_queue
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from openai import OpenAI
@@ -232,6 +233,17 @@ Below are all the sub-agent results (each tackled a piece of the question):
 
 
 
+@dataclass
+class OrchestrationRun:
+    """Per-request orchestration state (C12) — one per orchestrate() call so
+    concurrent complex queries never share dag/workflow_memory/lf_trace/notebook
+    on the singleton Conductor."""
+    dag: "TaskDAG"
+    workflow_memory: "WorkflowMemory"
+    lf_trace: Any = None
+    notebook: Any = None
+
+
 class Conductor:
     """
     Central orchestrator — decomposes complex queries into a DAG,
@@ -275,7 +287,6 @@ class Conductor:
         tool_executor: Optional[Callable] = None,
         model_router: Optional[Any] = None,
         recovery_engine: Optional[Any] = None,
-        agent_pool: Optional[Any] = None,
         sandbox_executor: Optional[Any] = None,
         ads_client: Optional[Any] = None,
         on_status: Optional[Callable[[str, str], None]] = None,
@@ -291,14 +302,11 @@ class Conductor:
         self.tool_executor = tool_executor
         self.model_router = model_router
         self.recovery = recovery_engine
-        self.agent_pool = agent_pool
         self.sandbox_executor = sandbox_executor
         self.ads_client = ads_client
         self.on_status = on_status
         self.on_event = on_event
         self.verbose = verbose
-        self.workflow_memory = WorkflowMemory()
-        self.dag = TaskDAG()
         # (#14) Cross-session DAG learning
         self.dag_cache = DAGCache(cache_path="data/dag_cache.json")
 
@@ -316,11 +324,11 @@ class Conductor:
         if fn:
             fn(step, state)
 
-    def _emit_task_list(self, title: str,
+    def _emit_task_list(self, run, title: str,
                         on_event: Optional[Callable] = None):
         """Emit a task_list event showing DAG progress as a checklist."""
         tasks = []
-        for n in self.dag.nodes.values():
+        for n in run.dag.nodes.values():
             icon, _ = AGENT_ICONS.get(n.agent_type, ("⚡", "Task"))
             tasks.append({
                 "id": n.id,
@@ -386,16 +394,16 @@ class Conductor:
         plan_feedback_queue: Optional[stdlib_queue.Queue] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], Optional["OrchestrationRun"]]:
         """
         Main entry point for complex query orchestration.
 
-        Returns the final synthesized answer, or None if the query
+        Returns ``(final_answer, run)``, or ``(None, None)`` if the query
         isn't complex enough for DAG orchestration.
         """
         status_fn = on_status or self.on_status
         event_fn = on_event or self.on_event
-        self.workflow_memory.clear()
+        run = OrchestrationRun(dag=TaskDAG(), workflow_memory=WorkflowMemory())
 
         # Step 1: Decompose query into DAG (with cache lookup #14)
         self._emit_status("Analyzing query complexity and building execution plan", "running", status_fn)
@@ -423,13 +431,13 @@ class Conductor:
 
         if not subtasks:
             self._emit_status("Planner selected direct tool-calling path", "completed", status_fn)
-            return None  # Caller falls back to standard path
+            return None, None  # Caller falls back to standard path
 
         # Build the DAG
-        self.dag.build_from_subtasks(subtasks)
+        run.dag.build_from_subtasks(subtasks)
 
         # Log validation warnings (#3)
-        warnings = self.dag.get_validation_warnings()
+        warnings = run.dag.get_validation_warnings()
         if warnings:
             for w in warnings:
                 logger.warning("DAG validation: %s", w)
@@ -441,7 +449,7 @@ class Conductor:
 
         # ── Rollbar: attach trace context so any crash in this orchestration
         # is labelled with trace_id and query info ────────────────────────────
-        _trace_id = f"conductor-{id(self.dag)}"
+        _trace_id = f"conductor-{id(run.dag)}"
         if _ROLLBAR_AVAILABLE:
             try:
                 _rollbar.report_message(
@@ -489,7 +497,7 @@ class Conductor:
             except Exception as e:
                 logger.debug("[Langfuse] trace/span creation failed: %s", e)
         # Store on self so _execute_dag_with_events can create child spans
-        self._lf_trace = lf_trace
+        run.lf_trace = lf_trace
 
         # (#12) Human-in-the-loop: emit plan for review and await approval
         effective_max = max_subtasks or self.MAX_SUBTASKS
@@ -498,7 +506,7 @@ class Conductor:
         if plan_feedback_queue is not None:
             for iteration in range(MAX_REPLAN_ITERATIONS + 1):
                 # Emit plan_review event with full subtask details
-                plan_dict = self.dag.to_plan_dict()
+                plan_dict = run.dag.to_plan_dict()
                 self._emit({
                     "type": "plan_review",
                     "title": f"Execution Plan: {len(subtasks)} tasks, {plan_dict.get('estimated_parallel_rounds', '?')} rounds",
@@ -563,8 +571,8 @@ class Conductor:
                     break
 
                 # Rebuild DAG with revised subtasks
-                self.dag = TaskDAG()
-                self.dag.build_from_subtasks(subtasks)
+                run.dag = TaskDAG()
+                run.dag.build_from_subtasks(subtasks)
 
                 task_summary = ", ".join(f"{s['id']}:{s.get('agent_type', '?')}" for s in subtasks)
                 msg = f"Revised plan: {len(subtasks)} tasks ({task_summary})"
@@ -573,22 +581,22 @@ class Conductor:
                 # Loop back to emit updated plan_review
 
         # Emit task_list showing the full checklist
-        self._emit_task_list(f"Multi-step analysis: {query[:60]}...", event_fn)
+        self._emit_task_list(run, f"Multi-step analysis: {query[:60]}...", event_fn)
 
         # Step 2: Execute DAG with structured SSE events
         self._emit_status(f"Executing {len(subtasks)} sub-tasks (parallel where possible)", "running", status_fn)
 
-        results = await self._execute_dag_with_events(event_fn, status_fn)
+        results = await self._execute_dag_with_events(run, event_fn, status_fn, user_id=user_id)
 
         # (#7) Write results to workflow memory (already done per-task in _run_one,
         # but do a final pass to ensure all are captured)
         for task_id, result in results.items():
-            node = self.dag.nodes.get(task_id)
+            node = run.dag.nodes.get(task_id)
             agent_type = node.agent_type if node else "unknown"
-            self.workflow_memory.write(agent_type, task_id, result, task_id=task_id)
+            run.workflow_memory.write(agent_type, task_id, result, task_id=task_id)
 
         # Step 4: Emit final task_list showing all completed
-        self._emit_task_list(f"Multi-step analysis: {query[:60]}...", event_fn)
+        self._emit_task_list(run, f"Multi-step analysis: {query[:60]}...", event_fn)
 
         # Step 5: Synthesize final answer (#4 — streaming)
         self._emit_status("Synthesizing final answer from all results", "running", status_fn)
@@ -597,7 +605,7 @@ class Conductor:
             "running", "Combining results from all agents...", "", event_fn,
         )
 
-        final_answer = self._synthesize(query, results, on_token=on_token)
+        final_answer = self._synthesize(run, query, results, on_token=on_token)
 
         self._emit_status("Answer ready", "completed", status_fn)
 
@@ -622,7 +630,7 @@ class Conductor:
         # ── Rollbar: no teardown needed (context is per-request in rollbar) ─
 
         # (#14) Store successful decomposition for future reuse
-        dag_summary = self.dag.get_execution_summary()
+        dag_summary = run.dag.get_execution_summary()
         self.dag_cache.store(query, subtasks, execution_summary=dag_summary)
 
         # Step 6: Generate companion Jupyter notebook
@@ -633,42 +641,44 @@ class Conductor:
                 results=results,
                 dag_summary=dag_summary,
             )
-            self._notebook = notebook_dict
+            run.notebook = notebook_dict
         except Exception as nb_err:
             logger.warning("Notebook generation failed: %s", nb_err)
-            self._notebook = None
+            run.notebook = None
 
         # Don't re-emit via on_token — streaming synthesis already did that
-        return final_answer
+        return final_answer, run
 
     async def _execute_dag_with_events(
         self,
+        run,
         on_event: Optional[Callable] = None,
         on_status: Optional[Callable] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute the full DAG, emitting Perplexity-style parallel group events."""
-        total = len(self.dag.nodes)
+        total = len(run.dag.nodes)
         round_num = 0
 
         for _round in range(20):
-            ready = self.dag.get_ready_tasks()
+            ready = run.dag.get_ready_tasks()
             if not ready:
-                pending = [n for n in self.dag.nodes.values() if n.status == TaskStatus.PENDING]
+                pending = [n for n in run.dag.nodes.values() if n.status == TaskStatus.PENDING]
                 if not pending:
                     break
                 # Propagate actual predecessor errors instead of a generic message
                 for p in pending:
                     failed_deps = [
-                        (dep_id, self.dag.nodes[dep_id].error or "unknown error")
+                        (dep_id, run.dag.nodes[dep_id].error or "unknown error")
                         for dep_id in p.depends_on
-                        if dep_id in self.dag.nodes
-                        and self.dag.nodes[dep_id].status == TaskStatus.FAILED
+                        if dep_id in run.dag.nodes
+                        and run.dag.nodes[dep_id].status == TaskStatus.FAILED
                     ]
                     if failed_deps:
                         cause = "; ".join(f"{did}: {err[:100]}" for did, err in failed_deps)
-                        self.dag.mark_failed(p.id, f"Predecessor failed — {cause}")
+                        run.dag.mark_failed(p.id, f"Predecessor failed — {cause}")
                     else:
-                        self.dag.mark_failed(p.id, "Unmet dependencies — predecessor did not complete")
+                        run.dag.mark_failed(p.id, "Unmet dependencies — predecessor did not complete")
                     self._emit_task_update(p, "error", f"Blocked: predecessor failed", f"g{round_num}", on_event)
                 break
 
@@ -688,13 +698,18 @@ class Conductor:
 
             # Execute all ready tasks in parallel
             async def _run_one(node: TaskNode):
-                self.dag.mark_running(node.id)
+                run.dag.mark_running(node.id)
+                # C13: _trace_id was a local of orchestrate(), not visible here —
+                # both Rollbar calls below raised NameError inside their
+                # try/except-pass and ALL DAG telemetry was silently dropped.
+                # Recompute the identical id (same formula as orchestrate's).
+                _trace_id = f"conductor-{id(run.dag)}"
 
                 # ── Langfuse: create a child span for this DAG node ──
                 lf_span = None
-                if getattr(self, '_lf_trace', None):
+                if run.lf_trace:
                     try:
-                        lf_span = self._lf_trace.span(
+                        lf_span = run.lf_trace.span(
                             name=f"{node.id} ({node.agent_type})",
                             metadata={
                                 "agent_type": node.agent_type,
@@ -721,6 +736,9 @@ class Conductor:
                         pass
 
                 try:
+                    async def _execute_scoped(task_node: TaskNode) -> Any:
+                        return await self._execute_node(run, task_node, user_id=user_id)
+
                     # Build dependency context summary for the RecoveryEngine.
                     # This lets _replan() and _reassign() see what predecessors
                     # returned, enabling root-cause analysis.
@@ -728,7 +746,7 @@ class Conductor:
                     if node.depends_on:
                         dep_parts = []
                         for dep_id in node.depends_on:
-                            dep_node = self.dag.nodes.get(dep_id)
+                            dep_node = run.dag.nodes.get(dep_id)
                             if dep_node:
                                 if dep_node.status == TaskStatus.COMPLETED:
                                     summary = self._summarize_result(dep_node.result)
@@ -748,18 +766,18 @@ class Conductor:
                     if self.recovery:
                         result = await self.recovery.execute_with_recovery(
                             node,
-                            self._execute_node,
+                            _execute_scoped,
                             on_status=on_status,
                             dep_context=dep_context,
                         )
                     else:
                         result = await asyncio.wait_for(
-                            self._execute_node(node),
+                            self._execute_node(run, node, user_id=user_id),
                             timeout=node.sla_seconds,
                         )
 
                     # (#7) Write result to WorkflowMemory immediately
-                    self.workflow_memory.write(
+                    run.workflow_memory.write(
                         node.agent_type, node.id, result, task_id=node.id
                     )
 
@@ -773,7 +791,7 @@ class Conductor:
 
                     if is_soft_failure:
                         detail = self._summarize_result(result)
-                        self.dag.mark_completed(node.id, result)
+                        run.dag.mark_completed(node.id, result)
                         self._emit_task_update(node, "error", detail, group_id, on_event)
                         # ── Langfuse: end span with soft-failure marker ──
                         if lf_span:
@@ -782,7 +800,7 @@ class Conductor:
                             except Exception:
                                 pass
                     else:
-                        self.dag.mark_completed(node.id, result)
+                        run.dag.mark_completed(node.id, result)
                         detail = self._summarize_result(result)
                         self._emit_task_update(node, "completed", detail, group_id, on_event)
                         # ── Langfuse: end span with success ──
@@ -793,7 +811,7 @@ class Conductor:
                                 pass
 
                 except asyncio.TimeoutError:
-                    self.dag.mark_failed(node.id, f"Timeout after {node.sla_seconds}s")
+                    run.dag.mark_failed(node.id, f"Timeout after {node.sla_seconds}s")
                     self._emit_task_update(node, "error", f"Timed out after {node.sla_seconds}s", group_id, on_event)
                     # ── Langfuse: record timeout on span ──
                     if lf_span:
@@ -802,7 +820,7 @@ class Conductor:
                         except Exception:
                             pass
                 except Exception as e:
-                    self.dag.mark_failed(node.id, str(e))
+                    run.dag.mark_failed(node.id, str(e))
                     self._emit_task_update(node, "error", str(e)[:100], group_id, on_event)
                     # ── Rollbar: report actual failure with task context ──
                     if _ROLLBAR_AVAILABLE:
@@ -833,14 +851,14 @@ class Conductor:
 
             await asyncio.gather(*[_run_one(node) for node in ready])
 
-            completed = sum(1 for n in self.dag.nodes.values() if n.status == TaskStatus.COMPLETED)
+            completed = sum(1 for n in run.dag.nodes.values() if n.status == TaskStatus.COMPLETED)
             errored = sum(
-                1 for n in self.dag.nodes.values()
+                1 for n in run.dag.nodes.values()
                 if n.status == TaskStatus.COMPLETED and isinstance(n.result, dict)
                 and (n.result.get("success") is False or "error" in n.result)
             )
             true_ok = completed - errored
-            failed_hard = sum(1 for n in self.dag.nodes.values() if n.status == TaskStatus.FAILED)
+            failed_hard = sum(1 for n in run.dag.nodes.values() if n.status == TaskStatus.FAILED)
             self._emit_status(
                 f"Completed {true_ok}/{total} tasks"
                 + (f" ({errored + failed_hard} errors)" if errored + failed_hard else ""),
@@ -850,7 +868,7 @@ class Conductor:
         # Collect results
         return {
             tid: node.result
-            for tid, node in self.dag.nodes.items()
+            for tid, node in run.dag.nodes.items()
             if node.status == TaskStatus.COMPLETED
         }
 
@@ -872,7 +890,9 @@ class Conductor:
 
     # ── Node Execution ─────────────────────────────────────────────────────
 
-    async def _execute_node(self, node: TaskNode) -> Any:
+    async def _execute_node(
+        self, run, node: TaskNode, *, user_id: Optional[str] = None
+    ) -> Any:
         """
         Execute a single task node.
 
@@ -902,13 +922,13 @@ class Conductor:
         node.model_used = subtask_model
 
         # (#7) Gather context from WorkflowMemory (structured) instead of raw JSON
-        dep_context = self.workflow_memory.get_dependency_context(
+        dep_context = run.workflow_memory.get_dependency_context(
             node.depends_on, max_chars=8000
         )
         # Fallback: if WorkflowMemory is empty, use raw node results
         if not dep_context:
             for dep_id in node.depends_on:
-                dep_node = self.dag.nodes.get(dep_id)
+                dep_node = run.dag.nodes.get(dep_id)
                 if dep_node and dep_node.result:
                     result_str = json.dumps(dep_node.result, default=str)[:6000]
                     dep_context += f"\n[Result from {dep_id}]: {result_str}"
@@ -922,11 +942,22 @@ class Conductor:
         if node.agent_type == "compute" and self.sandbox_executor:
             try:
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, self.sandbox_executor.run,
-                    full_task,  # query
-                    dep_context or "",  # context
-                )
+                if user_id is None:
+                    result = await loop.run_in_executor(
+                        None,
+                        self.sandbox_executor.run,
+                        full_task,
+                        dep_context or "",
+                    )
+                else:
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: self.sandbox_executor.run(
+                            full_task,
+                            dep_context or "",
+                            user_id=user_id,
+                        ),
+                    )
                 if result:
                     return result
             except Exception as e:
@@ -943,8 +974,13 @@ class Conductor:
                 loop = asyncio.get_event_loop()
                 # Pass subtask_model as 3rd arg so the executor uses the
                 # routed model instead of the default conductor_model.
+                executor_args = (full_task, dep_context, subtask_model)
+                if user_id is not None:
+                    executor_args += (user_id,)
                 result = await loop.run_in_executor(
-                    None, self.tool_executor, full_task, dep_context, subtask_model
+                    None,
+                    self.tool_executor,
+                    *executor_args,
                 )
                 if result:
                     return result
@@ -1062,7 +1098,7 @@ class Conductor:
             return current_subtasks  # Fall back to current plan on failure
 
     def _synthesize(
-        self, query: str, results: Dict[str, Any],
+        self, run, query: str, results: Dict[str, Any],
         on_token: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
@@ -1073,12 +1109,12 @@ class Conductor:
         """
         results_parts = []
         for task_id, result in results.items():
-            node = self.dag.nodes.get(task_id)
+            node = run.dag.nodes.get(task_id)
             desc = node.description if node else task_id
             result_str = json.dumps(result, default=str)[:2000]
             results_parts.append(f"### {task_id}: {desc}\n{result_str}")
 
-        for node in self.dag.nodes.values():
+        for node in run.dag.nodes.values():
             if node.status == TaskStatus.FAILED:
                 results_parts.append(
                     f"### {node.id}: {node.description}\n⚠️ FAILED: {node.error}"
@@ -1173,7 +1209,3 @@ class Conductor:
             except Exception:
                 logger.debug("Sources appendix token callback failed", exc_info=True)
         return answer + block
-
-    def get_execution_summary(self) -> Dict[str, Any]:
-        """Return DAG execution metrics for observability."""
-        return self.dag.get_execution_summary()

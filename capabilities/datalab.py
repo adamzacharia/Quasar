@@ -72,6 +72,12 @@ def _query_summary(sql: str) -> str:
     return compact[:700] + ("..." if len(compact) > 700 else "")
 
 
+# Public alias: non-datalab agent tools (MMU/external-catalog table summaries)
+# reuse the same row-fitting logic. One implementation — the agent's private
+# `_datalab_fit_rows` copy was retired in its favor. (docs/v2 P1)
+fit_rows = _fit_rows
+
+
 def datalab_error(error: Exception) -> ToolResult:
     """Map an exception to a typed-error ToolResult (never fabricates data)."""
     payload: Dict[str, Any] = {"success": False, "error": str(error)}
@@ -110,17 +116,51 @@ def execute_datalab_sql(
     tool_name: str,
     source: str = "builder",
     ctx: CallContext,
+    async_submit: Any = False,
 ) -> ToolResult:
     """Validate → execute → store → summarize. Byte-parity with the legacy
-    ``QuasarAgent._execute_datalab_sql``."""
+    ``QuasarAgent._execute_datalab_sql``.
+
+    With ``async_submit`` truthy the validated query is submitted as a job and
+    the job_id is returned UP FRONT (not only on sync timeout): a real
+    server-side Data Lab job when a login token is configured, else a local
+    threaded run (the anonymous token gets HTTP 401 from the server job API).
+    Poll with datalab_job_status / fetch with datalab_job_results."""
     try:
         # Fetch client/store INSIDE the try so a missing/None client or store is
         # mapped through datalab_error (matching the legacy in-try acquisition),
         # not raised as a bare KeyError. (P1 review C)
         client = ctx.service("datalab_client")
         store = ctx.result_store
+        # Fail BEFORE issuing the remote query if the result store is missing.
+        # The agent's context provider wraps service getters in a `_lazy` guard
+        # (a failing constructor for an unrelated service yields None instead of
+        # aborting the whole call); without this check a None store would let
+        # `client.query()` fire and only then crash at `store.put()` — an
+        # unnecessary remote query past the legacy fail-before-query boundary,
+        # which built the store eagerly at context construction. (guard verify)
+        if store is None:
+            raise RuntimeError(
+                "Data Lab result store is unavailable; cannot persist the query "
+                "result_id. Not issuing the remote query."
+            )
+        # Nightly-cache driver for the live TAP schema the governor grounds
+        # column names on: non-blocking (daemon thread), throttled, never raises.
+        datalab_registry.ensure_tap_schema_fresh(client)
         validated = datalab_sql_policy.validate(sql, source=source, meta=meta)
+        if async_submit:
+            # Must return BEFORE client.query: with async_=True the client
+            # returns a plain jobid string, not a DatalabResult.
+            return _submit_async_query(validated, tool_name=tool_name, source=source, ctx=ctx, client=client)
         result = client.query(sql=validated.sql, fmt="pandas")
+        # A result that exactly filled its LIMIT is a spatially-biased,
+        # storage-order slice (live P7/P9) — warn the model and stamp the
+        # provenance so downstream plot tools can refuse to present it as a
+        # sky distribution.
+        row_limit = validated.meta.get("row_limit") if isinstance(validated.meta, dict) else None
+        trunc_warning = datalab_sql_policy.limit_truncation_warning(len(result.dataframe), row_limit)
+        if trunc_warning:
+            validated.warnings.append(trunc_warning)
         store_meta = {
             **validated.meta,
             "tool_name": tool_name,
@@ -131,6 +171,11 @@ def execute_datalab_sql(
                 "query": validated.sql,
                 "tool_name": tool_name,
                 "policy_source": source,
+                **(
+                    {"row_limit": int(row_limit), "limit_truncated": True}
+                    if trunc_warning
+                    else {}
+                ),
                 **(
                     {"healpix": validated.meta["healpix"]}
                     if isinstance(validated.meta, dict) and validated.meta.get("healpix")
@@ -167,6 +212,8 @@ def execute_datalab_sql(
                 else "Preview shows the first rows; fetch up to 5000 rows with datalab_get_result(result_id)."
             ),
         }
+        if trunc_warning:
+            summary["limit_truncated"] = True
         if "row_count" in result.dataframe.columns and not result.dataframe.empty:
             summary["reported_count"] = int(result.dataframe.iloc[0]["row_count"])
         return ToolResult(
@@ -183,7 +230,146 @@ def execute_datalab_sql(
             native=summary,
         )
     except Exception as e:
+        # A sync-timeout fallback can leave a REAL server job running (or
+        # errored) — register it so datalab_job_status/results resolve for this
+        # user instead of "Unknown Data Lab job" (live P14: the error message
+        # pointed at a jobid the job tools could not see).
+        fallback_jobid = getattr(e, "jobid", None)
+        if fallback_jobid:
+            try:
+                ctx.service("datalab_job_service").register_external(
+                    str(fallback_jobid),
+                    kind="server_query",
+                    params={"tool_name": tool_name, "sql": sql, "policy_source": source},
+                    status="running",
+                    **_job_owner_kwargs(ctx),
+                )
+            except Exception:  # noqa: BLE001 - registration is best-effort
+                pass
         return datalab_error(e)
+
+
+def _job_owner_kwargs(ctx: CallContext) -> Dict[str, str]:
+    user_id = str(ctx.user_id or "").strip()
+    return {"owner_id": user_id} if user_id else {}
+
+
+def _store_user_kwargs(ctx: CallContext) -> Dict[str, str]:
+    user_id = str(ctx.user_id or "").strip()
+    return {"user_id": user_id} if user_id else {}
+
+
+def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallContext, client) -> ToolResult:
+    """First-class async submit: return a job_id up front for a governed query.
+
+    Real server-side Data Lab job when the client carries a login token;
+    otherwise a local threaded run (live-verified: /status and /results reject
+    the anonymous token with HTTP 401, so submitting anon server jobs would
+    strand them unpollable)."""
+    from integrations.datalab_client import ANON_TOKEN
+
+    job_service = ctx.service("datalab_job_service")
+    params = {
+        "tool_name": tool_name,
+        "sql": validated.sql,
+        "policy_source": source,
+        "catalog": validated.meta.get("catalog"),
+        "table": validated.meta.get("table"),
+    }
+    poll_note = (
+        "Poll ONCE with datalab_job_status(job_id) if the user is waiting, then end the "
+        "turn; fetch rows later with datalab_job_results(job_id)."
+    )
+    if getattr(client, "token", None) and client.token != ANON_TOKEN:
+        job_id = client.submit(sql=validated.sql)
+        job_service.register_external(
+            job_id,
+            kind="server_query",
+            params=params,
+            **_job_owner_kwargs(ctx),
+        )
+        native = {
+            "success": True,
+            "job_id": str(job_id),
+            "job_kind": "server",
+            "status": "submitted",
+            "tool_name": tool_name,
+            "warnings": validated.warnings,
+            "note": "Query submitted as a server-side Data Lab job (survives restarts). " + poll_note,
+        }
+        return ToolResult(success=True, warnings=list(validated.warnings or []), native=native)
+
+    # Anonymous token → local threaded runner. Capture plain locals (the client
+    # and store are long-lived singletons), never ctx — the closure runs on the
+    # job service worker after this request's CallContext is gone.
+    sql_text = validated.sql
+    store = ctx.result_store
+    store_meta = {
+        **validated.meta,
+        "tool_name": tool_name,
+        "validated_sql": sql_text,
+        "warnings": validated.warnings,
+    }
+
+    def _job(cancel_check):
+        result = client.query(sql=sql_text, fmt="pandas", async_fallback=False)
+        result_id = store.put(result.dataframe, {
+            **store_meta,
+            "provenance": {**result.provenance, "query": sql_text, "tool_name": tool_name, "policy_source": source},
+        })
+        return {
+            "result_id": result_id,
+            "rowcount": int(len(result.dataframe)),
+            "columns": [str(col) for col in result.dataframe.columns][:30],
+            "note": "Fetch rows with datalab_get_result(result_id).",
+        }
+
+    job_id = job_service.start(
+        "async_query",
+        _job,
+        params=params,
+        **_job_owner_kwargs(ctx),
+    )
+    native = {
+        "success": True,
+        "job_id": job_id,
+        "job_kind": "local",
+        "status": "queued",
+        "tool_name": tool_name,
+        "warnings": validated.warnings,
+        "note": (
+            "No DATALAB_TOKEN configured, so the query runs as a LOCAL background job "
+            "(server-side jobs need a Data Lab login). " + poll_note
+        ),
+    }
+    return ToolResult(success=True, warnings=list(validated.warnings or []), native=native)
+
+
+# Server job states → the local job-status vocabulary the model already knows.
+_SERVER_STATE_MAP = {
+    "QUEUED": "queued",
+    "SUBMITTED": "queued",
+    "EXECUTING": "running",
+    "RUNNING": "running",
+    "COMPLETED": "succeeded",
+    "ERROR": "failed",
+    "ABORTED": "canceled",
+    "ABORT": "canceled",
+}
+
+
+def _require_server_job_client(ctx: CallContext):
+    """Client for a server-side job id, with a typed error for the anon token."""
+    from integrations.datalab_client import ANON_TOKEN
+
+    client = ctx.service("datalab_client")
+    if getattr(client, "token", None) == ANON_TOKEN:
+        raise RuntimeError(
+            "This is a server-side Data Lab job id, and the /status //results job API "
+            "rejects the anonymous token (HTTP 401). Set DATALAB_TOKEN to a real Data "
+            "Lab login token, or rerun the query without async_submit."
+        )
+    return client
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,7 +398,9 @@ class ConeCountInput(_In):
 
 class SelectCatalogRowsInput(_In):
     catalog: str
-    table: str
+    # Optional like the diagram tools: defaults to the catalog's primary table
+    # (live P6 burned a round on a pydantic "Field required" for `table`).
+    table: Optional[str] = None
     ra: float
     dec: float
     radius_deg: float
@@ -221,6 +409,10 @@ class SelectCatalogRowsInput(_In):
     value_cuts: Optional[List[Dict[str, Any]]] = None
     color_cut: Optional[Dict[str, Any]] = None
     morphology: Optional[Dict[str, Any]] = None
+    # `Any` (not bool) — downstream is a bare truthiness check, and stringified
+    # "true"/"false" from gpt-oss/deepseek must keep legacy truthiness (same
+    # hazard/fix as SqlQueryInput.expert_ack below).
+    async_submit: Any = False
 
 
 class Q3cCrossmatchInput(_In):
@@ -246,6 +438,7 @@ class SqlQueryInput(_In):
     # truthy values that gpt-oss/deepseek emit. Parity preserved. (P1 review A)
     expert_ack: Any = False
     reason: str = ""
+    async_submit: Any = False  # `Any`, not bool — see expert_ack above
 
 
 class GetResultInput(_In):
@@ -280,6 +473,8 @@ class DensityAggregateInput(_In):
     value_cuts: Optional[List[Dict[str, Any]]] = None
     morphology: Optional[Dict[str, Any]] = None
     limit: Optional[int] = 5000
+    async_submit: Any = False  # `Any`, not bool — see all_sky above
+    confirm: Any = False  # `Any`, not bool — see all_sky above (HITL wide-area gate)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,19 +537,28 @@ class SelectCatalogRows(BaseCapability):
 
     def run(self, inp, ctx) -> ToolResult:
         try:
+            table = inp.table or datalab_registry.default_table(inp.catalog)
+            # Registry default quality cuts (DESI zwarn/survey/main_primary, DES
+            # flags, SDSS zwarning) apply unless the caller cuts the same column
+            # (live P11: unfiltered LRG counts were 11-27% inflated per z-bin).
+            merged_cuts, quality_note = datalab_registry.merge_default_quality_cuts(
+                inp.catalog, table, inp.value_cuts
+            )
             predicates = None
-            if inp.value_cuts or inp.color_cut or inp.morphology:
+            if merged_cuts or inp.color_cut or inp.morphology:
                 predicates = datalab_query_builders.build_catalog_predicates(
-                    inp.catalog, inp.table,
-                    color_cut=inp.color_cut, value_cuts=inp.value_cuts, morphology=inp.morphology,
+                    inp.catalog, table,
+                    color_cut=inp.color_cut, value_cuts=merged_cuts, morphology=inp.morphology,
                 )
             sql, meta = datalab_query_builders.build_cone_select(
-                inp.catalog, inp.table, ra=inp.ra, dec=inp.dec, radius_deg=inp.radius_deg,
+                inp.catalog, table, ra=inp.ra, dec=inp.dec, radius_deg=inp.radius_deg,
                 columns=inp.columns, limit=inp.limit, predicates=predicates,
             )
+            if quality_note:
+                meta.setdefault("warnings", []).append(quality_note)
         except Exception as e:
             return datalab_error(e)
-        return execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+        return execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx, async_submit=inp.async_submit)
 
 
 class Q3cCrossmatch(BaseCapability):
@@ -397,7 +601,8 @@ class SqlQuery(BaseCapability):
             meta = {"source": "expert", "builder": "raw_sql", "expert_reason": str(inp.reason).strip()}
         except Exception as e:
             return datalab_error(e)
-        return execute_datalab_sql(inp.sql, meta, tool_name=self.name, source="expert", ctx=ctx)
+        return execute_datalab_sql(inp.sql, meta, tool_name=self.name, source="expert", ctx=ctx,
+                                   async_submit=inp.async_submit)
 
 
 class GetResult(BaseCapability):
@@ -436,9 +641,11 @@ class DensityAggregate(BaseCapability):
     name = "datalab_density_aggregate"
     description = (
         "Aggregate Data Lab source density by RA/Dec grid or registered HEALPix column over a cone "
-        "region; returns a stable result_id. Requires a cone (ra/dec/radius_deg) unless all_sky=true "
-        "is set explicitly. Wide cones that exceed the 60s sync window are automatically tiled into "
-        "sub-cones and merged — do NOT hand-tile the region yourself; call once with the full cone."
+        "region; returns a stable result_id. Requires a cone (ra/dec/radius_deg), OR an "
+        "indexed-equality value_cut (e.g. SMASH fieldid = 169 — maps the WHOLE survey field, no "
+        "cone guessing), OR an explicit all_sky=true. Wide cones that exceed the 60s sync window "
+        "are automatically tiled into sub-cones and merged — do NOT hand-tile the region yourself; "
+        "call once with the full cone."
     )
     category = "datalab"
     InputModel = DensityAggregateInput
@@ -446,16 +653,57 @@ class DensityAggregate(BaseCapability):
 
     def run(self, inp, ctx) -> ToolResult:
         try:
+            # HITL wide-area gate (live P15: a 30° "quick look" ≈ 2,800 deg² of
+            # server-side aggregation died in async ERROR with no confirmation
+            # step; same pattern as datalab_tiled_search's confirm).
+            if (
+                inp.ra is not None and inp.dec is not None and inp.radius_deg is not None
+                and not inp.confirm
+            ):
+                decision = datalab_orchestration.confirm_cone_area(
+                    float(inp.ra), float(inp.dec), float(inp.radius_deg)
+                )
+                if decision.get("needs_confirmation"):
+                    return ToolResult(success=False, error=decision.get("message"), native={
+                        "success": False,
+                        "needs_confirmation": True,
+                        **decision,
+                        "hint": "Re-call datalab_density_aggregate with confirm=true only if the "
+                                "user explicitly asked for a region this large.",
+                    })
+            merged_cuts, quality_note = datalab_registry.merge_default_quality_cuts(
+                inp.catalog, inp.table, inp.value_cuts
+            )
             predicates = datalab_query_builders.build_catalog_predicates(
-                inp.catalog, inp.table, color_cut=inp.color_cut, value_cuts=inp.value_cuts,
+                inp.catalog, inp.table, color_cut=inp.color_cut, value_cuts=merged_cuts,
                 morphology=inp.morphology,
+            )
+            # An equality cut on a registry-indexed column (SMASH fieldid = 169)
+            # bounds the aggregate on its own — the canonical way to map a whole
+            # survey field without guessing a cone center (live P7).
+            try:
+                idx_cols = set(datalab_registry.indexed_bound_columns(inp.catalog, inp.table))
+            except Exception:
+                idx_cols = set()
+            field_bound = any(
+                str(vc.get("op", "")).strip() in ("=", "==")
+                and str(vc.get("column", "")).strip().lower() in idx_cols
+                for vc in (inp.value_cuts or [])
             )
             sql, meta = datalab_query_builders.build_density_aggregate(
                 inp.catalog, inp.table, mode=inp.mode, step_deg=inp.step_deg,
                 healpix_column=inp.healpix_column, ra=inp.ra, dec=inp.dec,
                 radius_deg=inp.radius_deg, all_sky=inp.all_sky, predicates=predicates,
-                limit=inp.limit,
+                limit=inp.limit, field_bound=field_bound,
             )
+            if quality_note:
+                meta.setdefault("warnings", []).append(quality_note)
+            if inp.async_submit:
+                # First-class job path: hand back a job_id up front; skips the
+                # sync attempt AND the tiling fallback entirely.
+                return execute_datalab_sql(
+                    sql, meta, tool_name="datalab_density_aggregate", ctx=ctx, async_submit=True
+                )
             has_cone = inp.ra is not None and inp.dec is not None and inp.radius_deg is not None
             # Once one aggregate on this table has sync-timed-out this turn,
             # go straight to tiling for further wide cones — the doomed 60s
@@ -629,7 +877,13 @@ class PeriodFoldInput(_In):
 
 class PeriodFold(BaseCapability):
     name = "datalab_period_fold"
-    description = "Lomb-Scargle period search + phase-fold of a stored Data Lab result_id."
+    description = (
+        "Lomb-Scargle period search + phase-fold of a stored Data Lab result_id. "
+        "Default search window is periods 0.1-1.0 d (min/max_frequency 1-10 per day) — "
+        "widen it for longer periods. Output includes period_significant and warnings: "
+        "when it says no_significant_period, report exactly that. Mixed-band light "
+        "curves auto-fold only the best-sampled band."
+    )
     category = "datalab"
     InputModel = PeriodFoldInput
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
@@ -640,14 +894,27 @@ class PeriodFold(BaseCapability):
 
 class SedPlotInput(_In):
     result_id: str
-    row_index: int = 0
+    # None (not 0) so the service can tell "no selector" from "row 0": with no
+    # selector at all, multi-row results render the sample overlay (two live
+    # P10 runs proved the model won't pass sample_n on its own). Models also
+    # send explicit "row_index": null alongside sample_n — must stay accepted.
+    row_index: Optional[int] = None
+    row_indices: Optional[List[int]] = None
+    sample_n: Optional[int] = None
     filter_columns: Optional[Dict[str, str]] = None
     title: str = "Data Lab SED"
 
 
 class SedPlot(BaseCapability):
     name = "datalab_sed_plot"
-    description = "Render an SED from a stored Data Lab result_id using SVO FPS wavelengths."
+    description = (
+        "Render SED(s) from a stored Data Lab result_id using SVO FPS wavelengths. "
+        "This tool IS multi-object: with no row selector it overlays up to 300 "
+        "objects as faint lines with the per-band median highlighted (sample_n=N "
+        "or row_indices control the sample). For SEDs of a sample, call it ONCE "
+        'like {"result_id": "dlr_..."} or {"result_id": "dlr_...", "sample_n": 300} '
+        "— never loop per row. Pass row_index=N only for ONE specific object."
+    )
     category = "datalab"
     InputModel = SedPlotInput
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
@@ -816,6 +1083,115 @@ class CutoutGrid(BaseCapability):
             return datalab_error(e)
 
 
+class SiaSearchInput(_In):
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    target_name: Optional[str] = None
+    fov_deg: float = 0.1
+    band: Optional[str] = None
+    catalog: Optional[str] = None
+    endpoint: Optional[str] = None
+    limit: int = 100
+
+
+# Preferred inventory columns, shown in preview order when present. The full
+# SIA row set (incl. access_url) is kept in the stored result.
+_SIA_DISPLAY_COLUMNS = [
+    "obs_bandpass", "exptime", "proctype", "prodtype",
+    "instrument", "telescope", "mjd_obs", "date_obs", "survey",
+]
+
+
+class SiaSearch(BaseCapability):
+    """Surface the Data Lab SIA image INVENTORY (Data Lab parity 2026-07):
+    the search that previously ran only as an internal step of the cutout /
+    color-image tools, now returned as a browsable table so a user can see
+    what imaging exists at a position (bands, depths, epochs) and pick a
+    specific row before pulling a cutout."""
+
+    name = "datalab_sia_search"
+    description = (
+        "List the Data Lab SIA image inventory covering a position: bands, exposure "
+        "times, proc/prod types, and access URLs, stored under a result_id. Use this to "
+        "see what imaging exists (and how deep) BEFORE datalab_image_cutout / "
+        "datalab_color_image; fetch rows with datalab_get_result."
+    )
+    category = "datalab"
+    InputModel = SiaSearchInput
+    annotations = {"read_only": True, "cost": "moderate"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        service = ctx.service("datalab_image_service")
+        try:
+            import pandas as pd
+
+            store = ctx.result_store
+            if store is None:
+                raise RuntimeError(
+                    "Data Lab result store is unavailable; cannot persist the SIA "
+                    "inventory result_id. Not issuing the remote query."
+                )
+            ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
+            result = service.search(
+                ra_f, dec_f, float(inp.fov_deg),
+                catalog=inp.catalog, endpoint=inp.endpoint,
+            )
+            rows = list(result.get("rows") or [])
+            warnings: List[str] = []
+            if inp.band:
+                want = str(inp.band).strip().lower()
+                rows = [
+                    row for row in rows
+                    if str(row.get("obs_bandpass") or "").strip().lower().startswith(want)
+                ]
+            limit = max(1, min(int(inp.limit or 100), 1000))
+            if len(rows) > limit:
+                warnings.append(f"SIA returned {len(rows)} rows; keeping the first {limit}.")
+                rows = rows[:limit]
+            frame = pd.DataFrame(rows)
+            result_id = store.put(frame, {
+                "tool_name": self.name,
+                "provenance": result.get("provenance") or {},
+                "warnings": warnings,
+            })
+            display_cols = [c for c in _SIA_DISPLAY_COLUMNS if c in frame.columns]
+            preview_rows, preview_more = _fit_rows(
+                frame[display_cols] if display_cols else frame, 10, char_budget=3000
+            )
+            summary: Dict[str, Any] = {
+                "success": True,
+                "tool_name": self.name,
+                "result_id": result_id,
+                "rowcount": int(len(frame)),
+                "coverage_gap": bool(result.get("coverage_gap")),
+                "used_endpoint": result.get("used_endpoint"),
+                "position": {"ra": ra_f, "dec": dec_f, "label": label, "fov_deg": float(inp.fov_deg)},
+                "columns": [str(c) for c in frame.columns][:30],
+                "preview": preview_rows,
+                "preview_truncated": preview_more,
+                "warnings": warnings,
+                "note": (
+                    "Inventory preview only (access URLs are in the stored rows); fetch up to "
+                    "5000 rows with datalab_get_result(result_id), then render a chosen band/"
+                    "position with datalab_image_cutout."
+                ),
+            }
+            return ToolResult(
+                success=True,
+                result_id=result_id,
+                warnings=warnings,
+                provenance=Provenance(
+                    service="datalab",
+                    endpoint=str(result.get("used_endpoint") or ""),
+                    tool_name=self.name,
+                    rowcount=int(len(frame)),
+                ),
+                native=summary,
+            )
+        except Exception as e:
+            return datalab_error(e)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Orchestration capabilities (one-shot color diagrams; sky-area guard; jobs)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -859,11 +1235,17 @@ class ColorColorDiagramInput(_In):
     point_sources: bool = False
     morphology: Optional[Dict[str, Any]] = None
     value_cuts: Optional[List[Dict[str, Any]]] = None
+    x_expr: Optional[str] = None
+    y_expr: Optional[str] = None
 
 
 class ColorColorDiagram(BaseCapability):
     name = "datalab_color_color_diagram"
-    description = "One-shot color-color diagram for a Data Lab catalog cone (with morphology split)."
+    description = (
+        "One-shot color-color diagram for a Data Lab catalog cone (with morphology split). "
+        "x_expr/y_expr switch both axes to derived expressions of real columns "
+        "(single panel; e.g. x_expr='bp_rp')."
+    )
     category = "datalab"
     InputModel = ColorColorDiagramInput
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
@@ -882,7 +1264,7 @@ class ColorColorDiagram(BaseCapability):
                 split_col=inp.split_col, split_threshold=split_threshold, limit=limit,
                 title=inp.title or f"{inp.catalog} color-color: {label}",
                 point_sources=bool(inp.point_sources), morphology=inp.morphology,
-                value_cuts=inp.value_cuts,
+                value_cuts=inp.value_cuts, x_expr=inp.x_expr, y_expr=inp.y_expr,
             )
             if isinstance(out, dict):
                 out["_caption"] = inp.title or f"Color-color diagram: {label}"
@@ -906,11 +1288,18 @@ class ColorMagnitudeDiagramInput(_In):
     point_sources: bool = False
     morphology: Optional[Dict[str, Any]] = None
     value_cuts: Optional[List[Dict[str, Any]]] = None
+    x_expr: Optional[str] = None
+    y_expr: Optional[str] = None
 
 
 class ColorMagnitudeDiagram(BaseCapability):
     name = "datalab_color_magnitude_diagram"
-    description = "One-shot color-magnitude (CMD/HR) diagram for a Data Lab catalog cone."
+    description = (
+        "One-shot color-magnitude (CMD/HR) diagram for a Data Lab catalog cone. "
+        "For derived axes (e.g. a Gaia HR diagram) pass BOTH x_expr and y_expr — "
+        "x_expr='bp_rp', y_expr='phot_g_mean_mag + 5*log10(parallax) - 10' — "
+        "instead of band names; the y axis is rendered inverted."
+    )
     category = "datalab"
     InputModel = ColorMagnitudeDiagramInput
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
@@ -928,7 +1317,7 @@ class ColorMagnitudeDiagram(BaseCapability):
                 blue_band=blue_band, red_band=red_band, mag_band=inp.mag_band, limit=limit,
                 title=inp.title or f"{inp.catalog} CMD: {label}",
                 point_sources=bool(inp.point_sources), morphology=inp.morphology,
-                value_cuts=inp.value_cuts,
+                value_cuts=inp.value_cuts, x_expr=inp.x_expr, y_expr=inp.y_expr,
             )
             if isinstance(out, dict):
                 out["_caption"] = inp.title or f"Color-magnitude diagram: {label}"
@@ -943,14 +1332,61 @@ class JobIdInput(_In):
 
 class JobStatus(BaseCapability):
     name = "datalab_job_status"
-    description = "Poll the status of a Data Lab background job (e.g. a tiled search)."
+    description = (
+        "Poll the status of a Data Lab background job — local 'dlj_' ids (tiled "
+        "search, local async queries) and real server-side job ids from async_submit."
+    )
     category = "datalab"
     InputModel = JobIdInput
     annotations = {"read_only": True, "cost": "cheap"}
 
     def run(self, inp, ctx) -> ToolResult:
         try:
-            out = {"success": True, **ctx.service("datalab_job_service").status(inp.job_id)}
+            job_id = str(inp.job_id).strip()
+            if job_id.startswith("dlj_"):
+                out = {
+                    "success": True,
+                    **ctx.service("datalab_job_service").status(
+                        job_id, **_job_owner_kwargs(ctx)
+                    ),
+                }
+            else:
+                # Server-side job (jobid minted by the Data Lab query manager;
+                # also reachable from a sync-timeout fallback error message).
+                if ctx.user_id:
+                    try:
+                        ctx.service("datalab_job_service").status(
+                            job_id, **_job_owner_kwargs(ctx)
+                        )
+                    except KeyError:
+                        # A fallback job the local service never saw (pre-fix
+                        # runs, other workers). Server jobids are unguessable
+                        # tokens; fall through to the live server status.
+                        pass
+                client = _require_server_job_client(ctx)
+                state = str(client.status(job_id)).strip().upper()
+                out = {
+                    "success": True,
+                    "job_id": job_id,
+                    "kind": "server_query",
+                    "status": _SERVER_STATE_MAP.get(state, state.lower() or "unknown"),
+                    "server_status": state,
+                }
+                if out["status"] == "succeeded":
+                    out["note"] = "Fetch the rows with datalab_job_results(job_id)."
+                elif out["status"] == "failed":
+                    # Attach the server's actual error text so the model can
+                    # adapt instead of guessing (live P15: bare "ERROR").
+                    try:
+                        out["error"] = str(client.error(job_id))[:400]
+                    except Exception:  # noqa: BLE001 - reason fetch best-effort
+                        pass
+                try:
+                    ctx.service("datalab_job_service").update_external(
+                        job_id, status=out["status"], **_job_owner_kwargs(ctx)
+                    )
+                except Exception:
+                    pass  # panel sync is best-effort; the live status is the answer
             # Job-aware turn ending (live DS-P15: the model polled a slow tiled
             # scan 18x until it silently hit HARD_MAX_ITERATIONS with no closing
             # message). After a few polls of a still-running job, tell the model
@@ -978,37 +1414,649 @@ class JobStatus(BaseCapability):
 
 class JobResults(BaseCapability):
     name = "datalab_job_results"
-    description = "Fetch the results of a background Data Lab job."
+    description = (
+        "Fetch the results of a background Data Lab job (local 'dlj_' or server-side "
+        "id). Server-job rows are stored and returned as a result_id + preview."
+    )
     category = "datalab"
     InputModel = JobIdInput
     annotations = {"read_only": True, "cost": "cheap"}
 
     def run(self, inp, ctx) -> ToolResult:
         try:
-            native = {"success": True, **ctx.service("datalab_job_service").results(inp.job_id)}
-            return ToolResult(success=True, native=native)
+            job_id = str(inp.job_id).strip()
+            if job_id.startswith("dlj_"):
+                record = ctx.service("datalab_job_service").results(
+                    job_id, **_job_owner_kwargs(ctx)
+                )
+                # A failed job's results are not a success — the model must see
+                # the failure, not a success wrapper around it. (guard CX-08)
+                ok = str(record.get("status", "")).lower() != "failed"
+                native = {"success": ok, **record}
+                return ToolResult(
+                    success=ok,
+                    error=(None if ok else str(record.get("error") or "Data Lab job failed")),
+                    native=native,
+                )
+            if ctx.user_id:
+                ctx.service("datalab_job_service").status(
+                    job_id, **_job_owner_kwargs(ctx)
+                )
+            client = _require_server_job_client(ctx)
+            store = ctx.result_store
+            if store is None:
+                raise RuntimeError(
+                    "Data Lab result store is unavailable; cannot persist the job rows."
+                )
+            result = client.results(job_id)
+            result_id = store.put(result.dataframe, {
+                "tool_name": self.name,
+                "provenance": {**result.provenance, "jobid": job_id},
+            })
+            rows, truncated = _fit_rows(result.dataframe, 10, char_budget=4000)
+            native = {
+                "success": True,
+                "job_id": job_id,
+                "kind": "server_query",
+                "status": "succeeded",
+                "result_id": result_id,
+                "rowcount": int(len(result.dataframe)),
+                "columns": result.columns[:30],
+                "preview": rows,
+                "preview_truncated": truncated,
+                "note": "Fetch up to 5000 rows with datalab_get_result(result_id).",
+            }
+            try:
+                ctx.service("datalab_job_service").update_external(
+                    job_id,
+                    status="succeeded",
+                    result={"result_id": result_id, "rowcount": native["rowcount"]},
+                    **_job_owner_kwargs(ctx),
+                )
+            except Exception:
+                pass
+            return ToolResult(success=True, result_id=result_id, native=native)
         except Exception as e:
             return datalab_error(e)
 
 
 class JobCancel(BaseCapability):
     name = "datalab_job_cancel"
-    description = "Cancel a running background Data Lab job."
+    description = "Cancel a running background Data Lab job (local 'dlj_' or server-side id)."
     category = "datalab"
     InputModel = JobIdInput
     annotations = {"read_only": False, "cost": "cheap"}
 
     def run(self, inp, ctx) -> ToolResult:
         try:
-            native = {"success": True, **ctx.service("datalab_job_service").cancel(inp.job_id)}
+            job_id = str(inp.job_id).strip()
+            if job_id.startswith("dlj_"):
+                native = {
+                    "success": True,
+                    **ctx.service("datalab_job_service").cancel(
+                        job_id, **_job_owner_kwargs(ctx)
+                    ),
+                }
+                return ToolResult(success=True, native=native)
+            if ctx.user_id:
+                ctx.service("datalab_job_service").status(
+                    job_id, **_job_owner_kwargs(ctx)
+                )
+            client = _require_server_job_client(ctx)
+            client.abort(job_id)
+            native = {"success": True, "job_id": job_id, "kind": "server_query", "status": "canceled"}
+            try:
+                ctx.service("datalab_job_service").update_external(
+                    job_id, status="canceled", **_job_owner_kwargs(ctx)
+                )
+            except Exception:
+                pass
             return ToolResult(success=True, native=native)
         except Exception as e:
             return datalab_error(e)
 
 
-# The migrated Data Lab sub-family. SQL/catalog core (incl. the auto-tiling
-# density aggregate) + result_id plot tools + SIA imaging + orchestration/jobs.
-# Still inline in core/agent.py: density_vetting, tiled_search, export_notebook.
+# ─────────────────────────────────────────────────────────────────────────────
+# CDS X-Match: user list (or stored result) vs VizieR catalogs / SIMBAD
+# ─────────────────────────────────────────────────────────────────────────────
+class XmatchUserListInput(_In):
+    catalog: str
+    objects: Optional[List[Dict[str, Any]]] = None
+    result_id: Optional[str] = None
+    ra_column: str = "ra"
+    dec_column: str = "dec"
+    radius_arcsec: float = 5.0
+    selection: str = "best"
+
+
+class XmatchUserList(BaseCapability):
+    name = "xmatch_user_list"
+    description = (
+        "Crossmatch a user object list (ra/dec dicts) OR a stored Data Lab result_id "
+        "against a VizieR catalog or SIMBAD via the CDS X-Match service; returns a "
+        "result_id with every uploaded column plus the match columns (angDist arcsec)."
+    )
+    category = "datalab"
+    InputModel = XmatchUserListInput
+    annotations = {"read_only": True, "cost": "moderate"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            from services import cds_xmatch
+
+            store = ctx.result_store
+            if store is None:
+                raise RuntimeError("Data Lab result store is unavailable; cannot persist the match table.")
+            if bool(inp.objects) == bool(str(inp.result_id or "").strip()):
+                raise ValueError("Provide exactly one of objects (list of {ra,dec,...}) or result_id.")
+            if inp.objects:
+                frame = cds_xmatch.objects_to_dataframe(inp.objects)
+            else:
+                frame = store.get(str(inp.result_id).strip()).dataframe
+            out = cds_xmatch.xmatch_dataframe(
+                frame,
+                catalog=inp.catalog,
+                ra_column=inp.ra_column,
+                dec_column=inp.dec_column,
+                radius_arcsec=inp.radius_arcsec,
+                selection=inp.selection,
+            )
+            matches = out.pop("dataframe")
+            result_id = store.put(matches, {
+                "tool_name": self.name,
+                "provenance": {
+                    "service": "cds_xmatch",
+                    "endpoint": out["endpoint"],
+                    "cat2": out["cat2"],
+                    "radius_arcsec": out["radius_arcsec"],
+                    "selection": out["selection"],
+                    "uploaded_rows": out["uploaded_rows"],
+                    **({"source_result_id": str(inp.result_id).strip()} if inp.result_id else {}),
+                },
+            })
+            rows, truncated = _fit_rows(matches, 10, char_budget=4000)
+            native = {
+                "success": True,
+                "result_id": result_id,
+                "matched_rows": out["matched_rows"],
+                "uploaded_rows": out["uploaded_rows"],
+                "upload_truncated": out["upload_truncated"],
+                "catalog": out["cat2"],
+                "radius_arcsec": out["radius_arcsec"],
+                "selection": out["selection"],
+                "columns": [str(col) for col in matches.columns][:30],
+                "preview": rows,
+                "preview_truncated": truncated,
+                "note": (
+                    "angDist is the match separation in arcsec. Fetch up to 5000 rows with "
+                    "datalab_get_result(result_id); save keepers with datalab_save_result."
+                ),
+                "citation": "Crossmatch by the CDS X-Match service (CDS, Strasbourg).",
+            }
+            return ToolResult(success=True, result_id=result_id, native=native)
+        except Exception as e:
+            return datalab_error(e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# My-tables (MyDB-lite): durable named tables on the result store
+# ─────────────────────────────────────────────────────────────────────────────
+class SaveResultInput(_In):
+    result_id: str
+    name: str
+    description: Optional[str] = None
+
+
+class MyTableNameInput(_In):
+    name: str
+
+
+class ListMyTablesInput(_In):
+    pass
+
+
+class SaveResult(BaseCapability):
+    name = "datalab_save_result"
+    description = (
+        "Save a Data Lab result_id as a durable named table (MyDB-lite): unlike "
+        "result_ids (1-hour TTL), saved tables survive restarts. Reload with "
+        "datalab_load_my_table(name)."
+    )
+    category = "datalab"
+    InputModel = SaveResultInput
+    annotations = {"read_only": False, "cost": "cheap"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            store = ctx.result_store
+            if store is None:
+                raise RuntimeError("Data Lab result store is unavailable; cannot save the table.")
+            entry = store.save_result(
+                inp.result_id,
+                inp.name,
+                description=inp.description,
+                **_store_user_kwargs(ctx),
+            )
+            native = {
+                "success": True,
+                "my_table": entry,
+                "note": f"Saved as '{entry['name']}'. Reload anytime with datalab_load_my_table.",
+            }
+            return ToolResult(success=True, native=native)
+        except Exception as e:
+            return datalab_error(e)
+
+
+class ListMyTables(BaseCapability):
+    name = "datalab_list_my_tables"
+    description = "List the user's saved Data Lab tables (names, row counts, provenance)."
+    category = "datalab"
+    InputModel = ListMyTablesInput
+    annotations = {"read_only": True, "cost": "cheap"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            store = ctx.result_store
+            if store is None:
+                raise RuntimeError("Data Lab result store is unavailable.")
+            tables = store.list_my_tables(**_store_user_kwargs(ctx))
+            native = {"success": True, "my_tables": tables, "count": len(tables)}
+            return ToolResult(success=True, native=native)
+        except Exception as e:
+            return datalab_error(e)
+
+
+class LoadMyTable(BaseCapability):
+    name = "datalab_load_my_table"
+    description = (
+        "Load a saved Data Lab table by name into a fresh result_id usable by every "
+        "result_id-consuming tool (plots, crossmatch, get_result)."
+    )
+    category = "datalab"
+    InputModel = MyTableNameInput
+    annotations = {"read_only": True, "cost": "cheap"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            store = ctx.result_store
+            if store is None:
+                raise RuntimeError("Data Lab result store is unavailable.")
+            result = store.load_my_table(inp.name, **_store_user_kwargs(ctx))
+            result_id = store.put(result.dataframe, {
+                "tool_name": self.name,
+                "provenance": dict(result.provenance),
+            })
+            rows, truncated = _fit_rows(result.dataframe, 10, char_budget=4000)
+            native = {
+                "success": True,
+                "name": str(inp.name).strip().lower(),
+                "result_id": result_id,
+                "rowcount": int(len(result.dataframe)),
+                "columns": result.columns[:30],
+                "provenance": result.provenance,
+                "preview": rows,
+                "preview_truncated": truncated,
+                "note": "Fetch up to 5000 rows with datalab_get_result(result_id).",
+            }
+            return ToolResult(success=True, result_id=result_id, native=native)
+        except Exception as e:
+            return datalab_error(e)
+
+
+class DensityVettingInput(_In):
+    # `radius_deg` is REQUIRED-but-nullable: the legacy signature took it as a
+    # required positional (missing key → error) while the body null-coerced an
+    # explicit JSON null to the documented 0.5 default. `Optional[float]` with
+    # NO default mirrors that exactly. The other optionals carry the legacy
+    # defaults and are null-coerced in run(), line-for-line with the inline
+    # method. (docs/v2 P1)
+    catalog: str
+    table: str
+    radius_deg: Optional[float]
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    target_name: Optional[str] = None
+    step_deg: Optional[float] = 0.05
+    color_cut: Optional[Dict[str, Any]] = None
+    value_cuts: Optional[List[Dict[str, Any]]] = None
+    morphology: Optional[Dict[str, Any]] = None
+    top_n: Optional[int] = 5
+    fov_deg: Optional[float] = 0.05
+    band: Optional[str] = "g"
+    confirm: Any = False  # `Any`, not bool — HITL wide-area gate (see all_sky notes)
+
+
+class DensityVetting(BaseCapability):
+    name = "datalab_density_vetting"
+    description = (
+        "P12: find the densest catalog cells within a cone (with optional "
+        "color/magnitude/morphology cuts) and pull a SIA cutout grid of the "
+        "top-N densest locations to eyeball."
+    )
+    category = "datalab"
+    InputModel = DensityVettingInput
+    annotations = {"read_only": True, "cost": "expensive", "produces": "image"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            # Null-coerce optional numerics: models sometimes send explicit
+            # "step_deg": null / "fov_deg": null / "top_n": null, which would
+            # crash on float(None)/int(None). Fall back to the documented defaults
+            # (mirrors the color-magnitude/color-color handlers).
+            radius_deg = 0.5 if inp.radius_deg is None else float(inp.radius_deg)
+            step_deg = 0.05 if inp.step_deg is None else float(inp.step_deg)
+            top_n = 5 if inp.top_n is None else int(inp.top_n)
+            fov_deg = 0.05 if inp.fov_deg is None else float(inp.fov_deg)
+            band = inp.band or "g"
+            ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
+            # HITL wide-area gate: density_vetting accepted radius 30° (~2,800
+            # deg²) with no confirmation and burned three async-ERROR scans
+            # (live P15).
+            if not inp.confirm:
+                decision = datalab_orchestration.confirm_cone_area(ra_f, dec_f, radius_deg)
+                if decision.get("needs_confirmation"):
+                    return ToolResult(success=False, error=decision.get("message"), native={
+                        "success": False,
+                        "needs_confirmation": True,
+                        **decision,
+                        "hint": "Re-call datalab_density_vetting with confirm=true only if the "
+                                "user explicitly asked for a region this large; otherwise shrink "
+                                "the radius (≤2.5°) or ask the user.",
+                    })
+            out = datalab_orchestration.density_then_cutouts(
+                inp.catalog, inp.table, ra_f, dec_f, radius_deg, step_deg=step_deg,
+                color_cut=inp.color_cut, value_cuts=inp.value_cuts, morphology=inp.morphology,
+                top_n=top_n, fov_deg=fov_deg, band=band,
+                client=ctx.service("datalab_client"),
+                result_store=ctx.result_store,
+                image_service=ctx.service("datalab_image_service"),
+            )
+            out["target"] = label
+            # The cutout grid must reach the UI as an image card (2026-07-04 live
+            # test: the base64 grid stayed buried in the tool output, the chat
+            # showed nothing, and the answer still told the user to "eyeball the
+            # cutouts above"). The image here is NESTED in out["cutout_grid"],
+            # not the top-level result, so the capability only MARKS the grid
+            # with the computed private _caption — under exactly the legacy
+            # attach condition — and the agent's image wrapper
+            # (_datalab_image_tool_fn(..., nested_key="cutout_grid")) pops the
+            # mark, sets the UI card, and strips the base64. Transport stays at
+            # the adapter boundary. (docs/v2 P1)
+            grid = out.get("cutout_grid")
+            if isinstance(grid, dict) and (grid.get("image_base64") or grid.get("path")):
+                grid = dict(grid)
+                grid.setdefault("success", True)
+                grid["_caption"] = f"Density-peak cutout grid: {label} (top {int(top_n)})"
+                out["cutout_grid"] = grid
+            return ToolResult(success=bool(out.get("success")), native=out)
+        except Exception as e:
+            return datalab_error(e)
+
+
+class TiledSearchInput(_In):
+    catalog: str
+    table: str
+    ra_min: float
+    ra_max: float
+    dec_min: float
+    dec_max: float
+    # Optionals carry the legacy defaults but stay nullable: an explicit JSON
+    # null flows into the same float()/int() conversions the inline method ran
+    # inside its try, so a null maps to the identical typed error (via
+    # datalab_error), not a differently-worded pydantic one. (docs/v2 P1)
+    tile_radius_deg: Optional[float] = 2.0
+    step_deg: Optional[float] = 0.05
+    color_cut: Optional[Dict[str, Any]] = None
+    value_cuts: Optional[List[Dict[str, Any]]] = None
+    morphology: Optional[Dict[str, Any]] = None
+    peak_threshold: Optional[float] = 3.0
+    max_tiles: Optional[int] = 64
+    candidate_budget: Optional[int] = 50
+    # `Any` (not bool): the legacy HITL gate is a bare truthiness check
+    # (`decision["needs_confirmation"] and not confirm`), so a stringified
+    # "false"/"0" from the model counted as CONFIRMED and ran the scan. A bool
+    # field would coerce those to False and bounce the scan back for
+    # confirmation. Same hazard, same fix as SqlQueryInput.expert_ack and
+    # DensityAggregateInput.all_sky above. Parity preserved. (docs/v2 P1)
+    confirm: Any = False
+
+
+class TiledSearch(BaseCapability):
+    name = "datalab_tiled_search"
+    description = (
+        "P15: tiled region-bounded overdensity search over a footprint. Runs a "
+        "server-side density aggregate per q3c cone tile, finds matched-filter "
+        "peaks, and ranks candidates. Executes as a background job; for a large "
+        "area it returns needs_confirmation first — re-call with confirm=true "
+        "after confirming the sky area with the user."
+    )
+    category = "datalab"
+    InputModel = TiledSearchInput
+    annotations = {"read_only": True, "cost": "expensive"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            fp = {"ra_min": inp.ra_min, "ra_max": inp.ra_max, "dec_min": inp.dec_min, "dec_max": inp.dec_max}
+            decision = datalab_orchestration.confirm_sky_area(
+                fp, float(inp.tile_radius_deg), max_tiles=int(inp.max_tiles)
+            )
+            # HITL gate: don't start a wide scan until the user confirms the area.
+            if decision["needs_confirmation"] and not inp.confirm:
+                native = {"success": False, "needs_confirmation": True, **decision,
+                          "hint": "Re-call datalab_tiled_search with confirm=true to run the scan over this area."}
+                return ToolResult(success=False, native=native)
+
+            # Plain locals so the closure is self-contained, exactly like the
+            # legacy inline closure (it runs later on the job service's worker
+            # thread, long after this request's CallContext is gone). The scan
+            # resolves its own default client/result store at execution time,
+            # verbatim with the legacy job body.
+            catalog, table = inp.catalog, inp.table
+            tile_radius_deg, step_deg = inp.tile_radius_deg, inp.step_deg
+            color_cut, value_cuts, morphology = inp.color_cut, inp.value_cuts, inp.morphology
+            peak_threshold, max_tiles, candidate_budget = inp.peak_threshold, inp.max_tiles, inp.candidate_budget
+
+            def _job(cancel_check):
+                return datalab_orchestration.tiled_sky_scan(
+                    catalog, table, fp, tile_radius_deg=float(tile_radius_deg), step_deg=float(step_deg),
+                    color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
+                    peak_threshold=float(peak_threshold), max_tiles=int(max_tiles),
+                    candidate_budget=int(candidate_budget), confirm=True, cancel_check=cancel_check,
+                )
+
+            job_id = ctx.service("datalab_job_service").start(
+                "tiled_sky_scan",
+                _job,
+                params={"catalog": catalog, "table": table, **fp},
+                **_job_owner_kwargs(ctx),
+            )
+            native = {"success": True, "job_id": job_id, "status": "queued", **decision,
+                      "note": "Tiled scan started; poll with datalab_job_status / datalab_job_results."}
+            return ToolResult(success=True, native=native)
+        except Exception as e:
+            return datalab_error(e)
+
+
+class ExportNotebookInput(_In):
+    # All-optional (the legacy schema has required=[]). `title`/`sia_fov_deg`
+    # carry the legacy defaults but stay nullable: an explicit JSON null is
+    # forwarded verbatim — the inline method applied no null-coercion here.
+    title: Optional[str] = "NOIRLab Data Lab analysis"
+    sql: Optional[str] = None
+    catalog: Optional[str] = None
+    table: Optional[str] = None
+    sia_ra: Optional[float] = None
+    sia_dec: Optional[float] = None
+    sia_fov_deg: Optional[float] = 0.1
+    sia_endpoint: Optional[str] = None
+    svo_filters: Optional[List[str]] = None
+
+
+class ExportNotebook(BaseCapability):
+    name = "datalab_export_notebook"
+    description = (
+        "Export a reproducible Jupyter notebook for a Data Lab analysis: the "
+        "governed TAP SQL (qc.query(sql=...)), an optional SIA cutout recipe, an "
+        "optional SVO filter-wavelength lookup, and a data-citation cell."
+    )
+    category = "datalab"
+    InputModel = ExportNotebookInput
+    annotations = {"read_only": True, "cost": "cheap"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        # NB: the injected notebook generator (the agent's bound
+        # _generate_notebook) sets last_run_result to the notebook card — the
+        # deliverable — so this tool registers with clear_card=False and the
+        # generator arrives as a service instead of being reimplemented here.
+        # The card write happens inside the agent-owned callable, never in this
+        # capability. (docs/v2 P1)
+        try:
+            from services.notebook_gen import datalab_notebook_steps
+            citation = None
+            if inp.catalog:
+                try:
+                    citation = datalab_registry.citation(inp.catalog)
+                except Exception:
+                    citation = None
+            sia = None
+            if inp.sia_ra is not None and inp.sia_dec is not None:
+                sia = {"ra": inp.sia_ra, "dec": inp.sia_dec, "fov_deg": inp.sia_fov_deg, "endpoint": inp.sia_endpoint}
+            steps = datalab_notebook_steps(
+                sql=inp.sql, catalog=inp.catalog, table=inp.table, sia=sia,
+                svo_filters=inp.svo_filters, citation=citation,
+            )
+            out = ctx.service("generate_notebook")(inp.title, steps)
+            return ToolResult(
+                success=bool(isinstance(out, dict) and out.get("success")),
+                error=(out.get("error") if isinstance(out, dict) and not out.get("success") else None),
+                native=out,
+            )
+        except Exception as e:
+            return datalab_error(e)
+
+
+class VariableCandidatesInput(_In):
+    catalog: str = "smash_dr1"
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    target_name: Optional[str] = None
+    radius_deg: float = 0.2
+    band: Optional[str] = None
+    min_epochs: int = 10
+    limit: int = 100
+
+
+class VariableCandidates(BaseCapability):
+    """The blog's 'select high-variability stars' step (Data Lab parity 2026-07):
+    a per-object variability aggregate over a multi-epoch cone, ranked by the
+    scatter-to-error significance ratio. Chains into datalab_star_lightcurve /
+    datalab_period_fold."""
+
+    name = "datalab_variable_candidates"
+    description = (
+        "Rank variable-star candidates in a multi-epoch catalog cone (SMASH source "
+        "tables): per-object epoch count, mean magnitude, magnitude scatter, amplitude, "
+        "and scatter/error significance, most-variable first. Each row carries "
+        "dist_arcsec from the cone center and the output includes nearest_candidate — "
+        "when the user gave an exact target position, analyze the NEAREST candidate, "
+        "not the top-ranked one. Feed a candidate's id into datalab_star_lightcurve, "
+        "then datalab_period_fold."
+    )
+    category = "datalab"
+    InputModel = VariableCandidatesInput
+    annotations = {"read_only": True, "cost": "moderate"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            ra, dec = inp.ra, inp.dec
+            if (ra is None or dec is None) and inp.target_name:
+                ra, dec, _label = _resolve_coords(inp.target_name, ra, dec, ctx)
+            if ra is None or dec is None:
+                raise ValueError("Provide ra/dec or a resolvable target_name.")
+            sql, meta = datalab_query_builders.build_variability_rank(
+                inp.catalog, ra=float(ra), dec=float(dec), radius_deg=inp.radius_deg,
+                band=inp.band, min_epochs=inp.min_epochs, limit=inp.limit,
+            )
+        except Exception as e:
+            return datalab_error(e)
+        out = execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+        # Rows are ranked by variability significance, and the preview shows only
+        # the head — the star AT the user's position can be invisible to the
+        # model (live P14: it folded the top-ranked variable 2.2' away instead of
+        # the target, whose modest var_snr didn't even make the row cap). Surface
+        # the nearest candidate explicitly; when nothing ranked lies within a few
+        # arcsec, probe a 5" cone at the exact center so the target star always
+        # appears.
+        native = getattr(out, "native", None)
+        if isinstance(native, dict) and native.get("success") and native.get("result_id"):
+            try:
+                frame = ctx.result_store.get(native["result_id"]).dataframe
+                nearest_row = None
+                if frame is not None and len(frame) and "dist_arcsec" in frame.columns:
+                    nearest_row = frame.loc[[frame["dist_arcsec"].idxmin()]]
+                    if float(nearest_row["dist_arcsec"].iloc[0]) > 5.0:
+                        nearest_row = None
+                if nearest_row is None and inp.radius_deg > 5.0 / 3600.0:
+                    probe_sql, probe_meta = datalab_query_builders.build_variability_rank(
+                        inp.catalog, ra=float(ra), dec=float(dec), radius_deg=5.0 / 3600.0,
+                        band=inp.band, min_epochs=min(inp.min_epochs, 10), limit=1,
+                    )
+                    validated = datalab_sql_policy.validate(probe_sql, source="builder", meta=probe_meta)
+                    probe = ctx.service("datalab_client").query(sql=validated.sql).dataframe
+                    if probe is not None and len(probe):
+                        nearest_row = probe.head(1)
+                if nearest_row is not None:
+                    nearest, _ = _fit_rows(nearest_row, 1)
+                    if nearest:
+                        native["nearest_candidate"] = nearest[0]
+                        native["note"] = (
+                            str(native.get("note") or "")
+                            + " Rows are ranked most-variable first; nearest_candidate is the "
+                            "variable closest to the query position — use ITS id when the "
+                            "user asked about a specific star at these coordinates."
+                        ).strip()
+            except Exception:
+                pass
+        return out
+
+
+class StarLightcurveInput(_In):
+    catalog: str = "smash_dr1"
+    source_id: Optional[str] = None
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    limit: int = 500
+
+
+class StarLightcurve(BaseCapability):
+    """Multi-epoch light-curve retrieval for ONE star (wires the previously
+    unregistered build_variable_star_select builder; Data Lab parity 2026-07)."""
+
+    name = "datalab_star_lightcurve"
+    description = (
+        "Fetch the multi-epoch light curve (mjd, filter, cmag, cerr) of one star from a "
+        "SMASH source table by source id or exact position; returns a result_id ready for "
+        "datalab_period_fold. Use datalab_variable_candidates first to find good targets."
+    )
+    category = "datalab"
+    InputModel = StarLightcurveInput
+    annotations = {"read_only": True, "cost": "moderate"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            sql, meta = datalab_query_builders.build_variable_star_select(
+                catalog=inp.catalog, source_id=inp.source_id,
+                ra=inp.ra, dec=inp.dec, limit=inp.limit,
+            )
+        except Exception as e:
+            return datalab_error(e)
+        return execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+
+
+# The migrated Data Lab family — complete. SQL/catalog core (incl. the
+# auto-tiling density aggregate) + result_id plot tools + SIA imaging +
+# orchestration/jobs + density vetting + tiled search + notebook export.
+# No Data Lab tool remains inline in core/agent.py.
 SQL_CAPABILITIES: List[BaseCapability] = [
     ListCatalogs(),
     DescribeTable(),
@@ -1018,6 +2066,8 @@ SQL_CAPABILITIES: List[BaseCapability] = [
     SqlQuery(),
     GetResult(),
     DensityAggregate(),
+    VariableCandidates(),
+    StarLightcurve(),
 ]
 
 # Image-producing capabilities — registered via the agent's IMAGE wrapper
@@ -1034,15 +2084,26 @@ PLOT_CAPABILITIES: List[BaseCapability] = [
     CutoutGrid(),
     ColorColorDiagram(),
     ColorMagnitudeDiagram(),
+    # Nested image: the grid card lives in out["cutout_grid"], so the agent
+    # registers this one with nested_key="cutout_grid".
+    DensityVetting(),
 ]
 
 # Non-image orchestration/job capabilities — registered via the plain
 # _datalab_tool_fn wrapper (no image transport).
 MISC_CAPABILITIES: List[BaseCapability] = [
     ConfirmSkyArea(),
+    SiaSearch(),
     JobStatus(),
     JobResults(),
     JobCancel(),
+    TiledSearch(),
+    SaveResult(),
+    ListMyTables(),
+    LoadMyTable(),
+    XmatchUserList(),
+    # Registered with clear_card=False: its notebook card is the deliverable.
+    ExportNotebook(),
 ]
 
 CAPABILITIES: List[BaseCapability] = SQL_CAPABILITIES + PLOT_CAPABILITIES + MISC_CAPABILITIES
@@ -1051,10 +2112,14 @@ __all__ = [
     "CAPABILITIES", "SQL_CAPABILITIES", "PLOT_CAPABILITIES", "MISC_CAPABILITIES",
     "execute_datalab_sql",
     "datalab_error",
+    "fit_rows",
     "ListCatalogs", "DescribeTable", "ConeCount", "SelectCatalogRows",
     "Q3cCrossmatch", "SqlQuery", "GetResult", "DensityAggregate",
+    "VariableCandidates", "StarLightcurve",
     "CatalogScatter", "SkyDensityMap", "PeriodFold", "SedPlot", "LssWedge",
     "ImageCutout", "ColorImage", "CutoutGrid",
     "ColorColorDiagram", "ColorMagnitudeDiagram",
-    "ConfirmSkyArea", "JobStatus", "JobResults", "JobCancel",
+    "ConfirmSkyArea", "SiaSearch", "JobStatus", "JobResults", "JobCancel",
+    "SaveResult", "ListMyTables", "LoadMyTable", "XmatchUserList",
+    "DensityVetting", "TiledSearch", "ExportNotebook",
 ]

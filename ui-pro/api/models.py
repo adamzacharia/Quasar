@@ -99,6 +99,9 @@ class SpectralTargetResolveRequest(BaseModel):
     redshift: Optional[float] = None
     ra_deg: Optional[float] = None
     dec_deg: Optional[float] = None
+    # Also probe NOIRLab SPARCL for optical spectra at the resolved position
+    # (drives the "optical spectrum available" chip on /spectral-lines).
+    include_sparcl: bool = False
 
 
 class SpectralLineJobRequest(BaseModel):

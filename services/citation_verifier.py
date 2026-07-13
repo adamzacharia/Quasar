@@ -11,7 +11,12 @@ from urllib.parse import unquote
 logger = logging.getLogger(__name__)
 
 BIBCODE_RE = re.compile(r"\b\d{4}[A-Za-z.&]{5}[\w.&]{9}[A-Z]\b")
-DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()+/:A-Za-z0-9]+")
+# Unicode dash variants (U+2010..U+2014, U+2212) are included because LLM output
+# typography routinely swaps them for ASCII hyphens — without them a DOI like
+# 10.1051/0004‑6361/202243940 truncates to '10.1051/0004' (live P6) and the
+# verifier then flags a mangled identifier instead of the real one.
+_DASH_VARIANTS = "‐‑‒–—−"
+DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()+/:A-Za-z0-9" + _DASH_VARIANTS + r"]+")
 
 
 def extract_citations(text: str) -> Dict[str, List[str]]:
@@ -319,6 +324,9 @@ def _paper_title(paper: Dict[str, Any]) -> Optional[str]:
 
 def _normalize_doi(value: str) -> str:
     doi = str(value or "").strip()
+    # Unicode dash typography → ASCII hyphen, so a real DOI typed with U+2011
+    # etc. still resolves against ADS instead of being flagged unverified.
+    doi = doi.translate({ord(ch): "-" for ch in _DASH_VARIANTS})
     doi = doi.rstrip(".,;")
     while doi.endswith(")") and doi.count(")") > doi.count("("):
         doi = doi[:-1].rstrip(".,;")

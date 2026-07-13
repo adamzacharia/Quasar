@@ -1047,6 +1047,7 @@ def _stream_chat_response(
                     response_text = f"An error occurred: {payload}"
                     _snapshot_all = []
                     _snapshot_last = None
+                    yield f"data: {json.dumps({'type': 'error', 'code': run_error_code, 'content': run_error_message, 'run_id': run_id})}\n\n"
                     break
                 if msg_type == "token":
                     provider_chunk_count += 1
@@ -1289,6 +1290,9 @@ def _stream_chat_response(
                         "provider": provider,
                         "conversation_id": conv_id or request.conversation_id or "",
                     }
+                    if run_status == "failed":
+                        rich_meta["runMeta"]["status"] = "failed"
+                        rich_meta["runMeta"]["errorCode"] = run_error_code
                     conversation_service.save_message(
                         conv_id, "assistant", response_text or "",
                         metadata=rich_meta if rich_meta else None,
@@ -1371,6 +1375,10 @@ def _stream_chat_response(
                     "inputTokens": usage_totals["input"],
                     "outputTokens": usage_totals["output"],
                     "totalTokens": _tokens_total,
+                    # Authoritative backend compute time for the thought chip —
+                    # the frontend's own clock measures stream LIFETIME, which
+                    # drip throttling inflated to 15+ minutes (live P15).
+                    "durationMs": int((_time.perf_counter() - run_started_at) * 1000),
                 })
                 yield f"data: {usage_event}\n\n"
 

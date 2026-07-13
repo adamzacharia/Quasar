@@ -39,17 +39,22 @@ function imageDimension(value, fallback) {
     return Math.max(1, Math.round(parsed));
 }
 
+const HIPS2FITS_FORMATS = new Set(["png", "fits", "jpg"]);
+
 /**
- * @param {{ra?: number|string, dec?: number|string, fovDeg?: number|string, survey?: string, width?: number|string, height?: number|string}} [options]
+ * @param {{ra?: number|string, dec?: number|string, fovDeg?: number|string, survey?: string, width?: number|string, height?: number|string, format?: string}} [options]
  * @returns {string | null}
  */
-export function hips2fitsUrl({ ra, dec, fovDeg, survey, width = HIPS_DEFAULT_SIZE, height = HIPS_DEFAULT_SIZE } = {}) {
+export function hips2fitsUrl({ ra, dec, fovDeg, survey, width = HIPS_DEFAULT_SIZE, height = HIPS_DEFAULT_SIZE, format = "png" } = {}) {
     const raNum = Number(ra);
     const decNum = Number(dec);
     if (!validSkyPosition(raNum, decNum)) return null;
 
     const surveyId = hips2fitsSurveyId(survey);
     if (!surveyId) return null;
+
+    const fmt = String(format || "png").toLowerCase();
+    const outFormat = HIPS2FITS_FORMATS.has(fmt) ? fmt : "png";
 
     const url = new URL(HIPS2FITS_BASE_URL);
     url.searchParams.set("hips", surveyId);
@@ -59,13 +64,16 @@ export function hips2fitsUrl({ ra, dec, fovDeg, survey, width = HIPS_DEFAULT_SIZ
     url.searchParams.set("width", String(imageDimension(width, HIPS_DEFAULT_SIZE)));
     url.searchParams.set("height", String(imageDimension(height, HIPS_DEFAULT_SIZE)));
     url.searchParams.set("projection", "TAN");
-    url.searchParams.set("format", "png");
+    url.searchParams.set("format", outFormat);
     return url.toString();
 }
 
 /**
  * @param {unknown} meta
- * @returns {{kind?: string, ra?: number, dec?: number, fovDeg?: number, survey?: string} | undefined}
+ * @returns {{kind?: string, ra?: number, dec?: number, fovDeg?: number, survey?: string,
+ *            fitsUrl?: string,
+ *            mocs?: {id: string, name?: string, color?: string, order?: number,
+ *                    mocJson: Record<string, number[]>}[]} | undefined}
  */
 export function normalizeHipsImageMeta(meta) {
     if (!meta || typeof meta !== "object") return undefined;
@@ -84,6 +92,32 @@ export function normalizeHipsImageMeta(meta) {
 
     const survey = normalizeHipsSurveyId(meta.survey);
     if (survey) out.survey = survey;
+
+    // Raw FITS download URL (T7.1): single-band SIA cutouts carry the selected
+    // tile's Data Lab access URL. HiPS cards omit it and build their own
+    // hips2fits format=fits URL client-side from ra/dec/fov/survey instead.
+    const fitsUrl = meta.fitsUrl ?? meta.fits_url;
+    if (typeof fitsUrl === "string" && /^https?:\/\//i.test(fitsUrl)) {
+        out.fitsUrl = fitsUrl;
+    }
+
+    // Survey footprint overlays (MOC geometry) for the interactive view.
+    if (Array.isArray(meta.mocs)) {
+        const mocs = [];
+        for (const m of meta.mocs) {
+            if (!m || typeof m !== "object") continue;
+            const id = String(m.id || "").trim();
+            const mocJson = m.mocJson ?? m.moc_json;
+            if (!id || !mocJson || typeof mocJson !== "object" || Array.isArray(mocJson)) continue;
+            const entry = { id, mocJson };
+            if (m.name) entry.name = String(m.name);
+            if (m.color) entry.color = String(m.color);
+            const order = Number(m.order);
+            if (Number.isFinite(order)) entry.order = order;
+            mocs.push(entry);
+        }
+        if (mocs.length) out.mocs = mocs;
+    }
 
     return out;
 }

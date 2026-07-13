@@ -61,7 +61,9 @@ def _install_agent_import_stubs():
         "core.logger": _stub_module(
             "core.logger",
             logger=_DummyLogger(),
-            log_tool=lambda *args, **kwargs: None,
+            # Identity decorator: the real log_tool wraps and RETURNS the
+            # function; _alma_tool_fn(log_name=...) applies it at registration.
+            log_tool=lambda fn: fn,
         ),
         "core.memory": _stub_module("core.memory", ConversationMemory=dummy("ConversationMemory")),
         "core.prompts": prompts_module,
@@ -335,7 +337,10 @@ class AgentArchiveToolTests(unittest.TestCase):
 
     def test_generic_cross_archive_match_sets_data_result(self):
         agent = self._make_agent()
-        source = self.agent_module.PERSEUS_PROTOSTARS[0]
+        # PERSEUS_PROTOSTARS moved with the ALMA family (docs/v2 P1): the agent
+        # no longer imports it; the canonical home is the service module.
+        from services.cross_archive_matcher import PERSEUS_PROTOSTARS
+        source = PERSEUS_PROTOSTARS[0]
         alma_df = pd.DataFrame([
             {
                 "target_name": source["source_name"],
@@ -355,7 +360,9 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent.search_service = _FakeSearchService(alma_df)
         agent.mast_client = _PositionalMASTClient(mast_df)
 
-        result = agent._match_cross_archive_sources(max_sources=1)
+        # The inline method moved to capabilities/alma.py (docs/v2 P1) —
+        # dispatch through the capability-backed registration path.
+        result = agent._alma_tool_fn("match_cross_archive_sources")(max_sources=1)
 
         self.assertTrue(result["success"])
         self.assertEqual(result["matched_sources"], 1)
@@ -384,7 +391,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent.search_service = _FakeSearchService(alma_df)
         agent.mast_client = _PositionalMASTClient(mast_df)
 
-        result = agent._match_cross_archive_sources(
+        result = agent._alma_tool_fn("match_cross_archive_sources")(
             catalog_name="inline",
             sources=[source],
             archives=["ALMA", "HST"],
@@ -411,7 +418,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent.search_service = _FailingSearchService()
         agent.mast_client = _PositionalMASTClient(mast_df)
 
-        result = agent._match_cross_archive_sources(
+        result = agent._alma_tool_fn("match_cross_archive_sources")(
             catalog_name="inline",
             sources=[source],
             archives=["ALMA", "HST"],
@@ -435,7 +442,7 @@ class AgentArchiveToolTests(unittest.TestCase):
             }
         ]))
 
-        result = agent._query_alma_science_archive(
+        result = agent._alma_tool_fn("query_alma_science_archive")(
             query_type="redshifted_line_projects",
             redshift_min=1,
             redshift_max=2,
@@ -450,10 +457,10 @@ class AgentArchiveToolTests(unittest.TestCase):
         self.assertIn("SELECT TOP", result["provenance"]["adql"])
 
     def test_overlay_region_coordinates_accept_arbitrary_coordinates(self):
-        agent = self._make_agent()
+        from capabilities.viz import overlay_region_coordinates
 
-        explicit = agent._overlay_region_coordinates("Custom field", ra_deg=150.1, dec_deg=2.3)
-        parsed = agent._overlay_region_coordinates("150.1, 2.3")
+        explicit = overlay_region_coordinates("Custom field", ra_deg=150.1, dec_deg=2.3)
+        parsed = overlay_region_coordinates("150.1, 2.3")
 
         self.assertEqual(explicit, (150.1, 2.3, "Custom field"))
         self.assertEqual(parsed, (150.1, 2.3, "150.1, 2.3"))
@@ -472,7 +479,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent = self._make_agent()
         agent.mast_client = _StubMASTClient(search_df=df)
 
-        result = agent._search_mast(target_name="Carina Nebula", mission="JWST")
+        result = agent._archives_tool_fn("search_mast")(target_name="Carina Nebula", mission="JWST")
 
         self.assertTrue(result["success"])
         self.assertEqual(result["total_results"], 1)
@@ -493,7 +500,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent = self._make_agent()
         agent.mast_client = _StubMASTClient(criteria_df=df)
 
-        result = agent._search_mast_by_criteria(
+        result = agent._archives_tool_fn("search_mast_by_criteria")(
             mission="JWST",
             filters="F200W",
             target_name="Carina Nebula",
@@ -509,7 +516,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent.last_search_results = pd.DataFrame([{"target_name": "M87"}])
         agent.mast_client = _StubMASTClient()
 
-        result = agent._get_mast_products()
+        result = agent._archives_tool_fn("get_mast_products")()
 
         self.assertFalse(result["success"])
         self.assertIn("not MAST observation results", result["error"])
@@ -538,7 +545,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent.last_search_results = observation_df
         agent.mast_client = _StubMASTClient(product_df=product_df)
 
-        result = agent._get_mast_products(product_type="SCIENCE")
+        result = agent._archives_tool_fn("get_mast_products")(product_type="SCIENCE")
 
         self.assertTrue(result["success"])
         self.assertEqual(result["total_products"], 1)
@@ -558,7 +565,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent = self._make_agent()
         agent.eso_client = _StubESOClient(df)
 
-        result = agent._search_eso(target_name="NGC 1068", instrument="MUSE")
+        result = agent._archives_tool_fn("search_eso_archive")(target_name="NGC 1068", instrument="MUSE")
 
         self.assertTrue(result["success"])
         self.assertEqual(result["total_results"], 1)
@@ -578,7 +585,7 @@ class AgentArchiveToolTests(unittest.TestCase):
         agent = self._make_agent()
         agent.irsa_client = _StubIRSAClient(df)
 
-        result = agent._search_irsa(target_name="M31", catalog="allwise")
+        result = agent._archives_tool_fn("search_irsa")(target_name="M31", catalog="allwise")
 
         self.assertTrue(result["success"])
         self.assertEqual(result["total_results"], 1)

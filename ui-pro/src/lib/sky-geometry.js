@@ -7,7 +7,9 @@
 
 const DEG = Math.PI / 180;
 
-/** Keep only finite coords with |dec| <= 90, normalizing RA into [0, 360). */
+/** Keep only finite coords with |dec| <= 90, normalizing RA into [0, 360).
+ * Extra properties (e.g. the row index `i` and `label` used by
+ * click-to-inspect) are preserved on each output coord. */
 export function normalizeSkyCoords(coords) {
     const out = [];
     for (const c of coords || []) {
@@ -16,7 +18,7 @@ export function normalizeSkyCoords(coords) {
         const dec = Number(c.dec);
         if (!Number.isFinite(ra) || !Number.isFinite(dec)) continue;
         if (dec < -90 || dec > 90) continue;
-        out.push({ ra: ((ra % 360) + 360) % 360, dec });
+        out.push({ ...c, ra: ((ra % 360) + 360) % 360, dec });
     }
     return out;
 }
@@ -30,11 +32,11 @@ export function normalizeSkyCoords(coords) {
  * spreads) or a very wide max separation is reported as `allSky`, which the
  * caller should treat as "use the all-sky canvas instead".
  *
- * @param {{ra:number, dec:number}[]} coords
+ * @param {{ra:number, dec:number, i?:number, label?:string}[]} coords
  * @param {{maxMarkers?: number}} [opts]
  * @returns {{ok:boolean, allSky:boolean, raCenter:number, decCenter:number,
- *            fovDeg:number, markers:{ra:number,dec:number}[], truncated:boolean,
- *            count:number}}
+ *            fovDeg:number, markers:{ra:number,dec:number,i?:number,label?:string}[],
+ *            truncated:boolean, count:number}}
  */
 export function skyViewGeometry(coords, opts) {
     const maxMarkers = Math.max(1, (opts && opts.maxMarkers) || 2000);

@@ -2,16 +2,18 @@
 """
 Search Service — Facade over the archive clients for all archive searches.
 
-CALLED BY: core/agent.py (tool execution: search_by_target, search_by_position, etc.)
+CALLED BY: capabilities/alma.py (the migrated search_by_target /
+           search_by_position / ... capabilities; injected as the
+           "search_service" CallContext service by core/agent.py)
 CALLS:     integrations/alminer_client.py (ALminerClient)  — ALMA (default)
            integrations/tap.py (NRAOTapClient)             — VLA/VLBA/GBT
 
 DATA FLOW:
-    agent._search_by_target(name) → SearchService.search_by_target(name)
+    SearchByTarget.run(...) → SearchService.search_by_target(name)
     → ALminerClient.search_by_target(name) → alminer.target(name)
     → Returns pd.DataFrame of matching observations
 
-    agent._search_by_target(name, facility="VLA")
+    SearchByTarget.run(..., facility="VLA")
     → NRAOTapClient.search_vla_vlba(name, instruments=["VLA", "EVLA", "JVLA"])
     → Returns pd.DataFrame of matching NRAO archive observations
 

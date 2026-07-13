@@ -22,31 +22,18 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
     
-# ── Cached SIMBAD resolution ──────────────────────────────────────────────
-# Avoids redundant HTTP round-trips when the same target is queried multiple
-# times in a session.  256 entries ≈ 18 KB — negligible RAM.
-from functools import lru_cache
+# ── Cached SIMBAD resolution (canonical impl: integrations/simbad_resolver.py) ──
+from integrations.simbad_resolver import _resolve_simbad_cached
 
-@lru_cache(maxsize=256)
-def _resolve_simbad_cached(target_name: str):
-    """Resolve target name → (ra_deg, dec_deg) via SIMBAD, with LRU cache."""
-    from astroquery.simbad import Simbad
-    from astropy.coordinates import SkyCoord
-    import astropy.units as u
 
-    result = Simbad.query_object(target_name)
-    if result is None or len(result) == 0:
-        return (None, None)
-
-    colnames = set(result.colnames)
-    if {"ra", "dec"} <= colnames:
-        return (float(result["ra"][0]), float(result["dec"][0]))
-    if {"RA_d", "DEC_d"} <= colnames:
-        return (float(result["RA_d"][0]), float(result["DEC_d"][0]))
-    if {"RA", "DEC"} <= colnames:
-        coord = SkyCoord(result["RA"][0], result["DEC"][0], unit=(u.hourangle, u.deg))
-        return (coord.ra.deg, coord.dec.deg)
-    return (None, None)
+# Canonical ALMA result columns — guaranteed present on BOTH the TAP and
+# ALminer paths by _standardize_columns so downstream code sees a deterministic
+# schema regardless of which source answered. (C14)
+_CANONICAL_ALMA_COLUMNS = [
+    "s_ra", "s_dec", "t_exptime", "Band", "resolution", "sensitivity",
+    "bandwidth", "freq_min", "freq_max", "freq_min_ghz", "freq_max_ghz",
+    "telescope", "instrument_name", "access_url",
+]
 
 
 class ALminerClient:
@@ -69,7 +56,14 @@ class ALminerClient:
         """Get or create a cached pyvo TAPService instance."""
         if self._tap_service is None:
             import pyvo
-            self._tap_service = pyvo.dal.TAPService('https://almascience.nrao.edu/tap')
+            from integrations.tap import _TimeoutHTTPSession
+            session = _TimeoutHTTPSession(timeout=30.0)
+            try:
+                self._tap_service = pyvo.dal.TAPService(
+                    'https://almascience.nrao.edu/tap', session=session)
+            except TypeError:
+                # Older pyvo without session support
+                self._tap_service = pyvo.dal.TAPService('https://almascience.nrao.edu/tap')
         return self._tap_service
             
     def search_by_target(self, target_name: str, public: bool = True) -> pd.DataFrame:
@@ -97,61 +91,50 @@ class ALminerClient:
     
     def _parallel_search(self, ra: float, dec: float, radius: float = 0.05, target_name: str = "") -> pd.DataFrame:
         """
-        Run TAP and ALminer searches in parallel.
-        Returns whichever succeeds first with results.
+        Primary-plus-fallback cone search: try TAP, then ALminer, SEQUENTIALLY.
+        Each source is bounded by a per-source timeout on a daemon thread, so
+        there is no two-thread race and no stranded in-flight search (C14).
+        Returns one canonical column schema via _standardize_columns.
         """
         import threading
-        import queue
-        
-        result_queue = queue.Queue()
-        
+
+        def _run_bounded(fn, timeout):
+            box = {}
+
+            def _target():
+                try:
+                    box["df"] = fn()
+                except Exception as exc:  # ImportError, network, parse — all "no result"
+                    box["err"] = exc
+
+            t = threading.Thread(target=_target, daemon=True)
+            t.start()
+            t.join(timeout)
+            return box.get("df")
+
         def tap_search():
-            try:
-                print("[ALMA] TAP search starting...")
-                service = self._get_tap_service()
-                query = f'''
-                SELECT *
-                FROM ivoa.obscore 
-                WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1
-                '''
-                res = service.search(query)
-                df = res.to_table().to_pandas()
-                if not df.empty:
-                    print(f"[ALMA] TAP found {len(df)} results - WINNING!")
-                    result_queue.put(("TAP", df))
-            except ImportError:
-                print("[ALMA] pyVO not available")
-            except Exception as e:
-                print(f"[ALMA] TAP failed: {e}")
-        
+            print("[ALMA] TAP search starting...")
+            service = self._get_tap_service()
+            query = f'''
+            SELECT *
+            FROM ivoa.obscore
+            WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1
+            '''
+            res = service.search(query)
+            return res.to_table().to_pandas()
+
         def alminer_search():
-            try:
-                import alminer
-                print("[ALMA] ALminer search starting...")
-                df = alminer.conesearch(ra, dec, search_radius=radius, print_targets=False)
-                if df is not None and not df.empty:
-                    print(f"[ALMA] ALminer found {len(df)} results - WINNING!")
-                    result_queue.put(("ALminer", df))
-            except ImportError:
-                print("[ALMA] ALminer not available")
-            except Exception as e:
-                print(f"[ALMA] ALminer failed: {e}")
-        
-        # Start both threads (daemon so they die if main thread exits)
-        tap_thread = threading.Thread(target=tap_search, daemon=True)
-        alminer_thread = threading.Thread(target=alminer_search, daemon=True)
-        
-        tap_thread.start()
-        alminer_thread.start()
-        
-        # Wait for first result (max 2 minutes)
-        try:
-            winner, df = result_queue.get(timeout=120)
-            print(f"[ALMA] Winner: {winner} with {len(df)} results")
-            return self._standardize_columns(df)
-        except queue.Empty:
-            print("[ALMA] Both TAP and ALminer timed out!")
-            return pd.DataFrame()
+            import alminer
+            print("[ALMA] ALminer search starting...")
+            return alminer.conesearch(ra, dec, search_radius=radius, print_targets=False)
+
+        for name, fn in (("TAP", tap_search), ("ALminer", alminer_search)):
+            df = _run_bounded(fn, 60)
+            if df is not None and not df.empty:
+                print(f"[ALMA] {name} found {len(df)} results")
+                return self._standardize_columns(df)
+        print("[ALMA] Both TAP and ALminer returned no results (or timed out)")
+        return pd.DataFrame()
 
     def search_by_position(self, ra: float, dec: float, radius: float = 0.016, public: bool = True) -> pd.DataFrame:
         """
@@ -438,6 +421,11 @@ class ALminerClient:
             )
         elif 'obs_publisher_did' in df.columns:
              pass
+
+        # C14: guarantee a stable canonical column set on BOTH source paths.
+        for _col in _CANONICAL_ALMA_COLUMNS:
+            if _col not in df.columns:
+                df[_col] = pd.NA
 
         return df
 

@@ -31,7 +31,7 @@ export interface StreamCallbacks {
     onPapers?: (papers: Record<string, unknown>[]) => void;
     onNotebook?: (notebook: Record<string, unknown>) => void;
     onImage?: (image: { url: string; caption: string; meta?: unknown }) => void;
-    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string }) => void;
+    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string; meta?: Record<string, unknown> }) => void;
     onStatus?: (step: string, state: string) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
@@ -55,7 +55,7 @@ export interface StreamCallbacks {
     }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
     onRunMeta?: (meta: ChatRunMeta) => void;
-    onUsage?: (usage: { inputTokens: number; outputTokens: number; totalTokens: number }) => void;
+    onUsage?: (usage: { inputTokens: number; outputTokens: number; totalTokens: number; durationMs?: number }) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null; eta_seconds?: number | null; phase?: string }) => void;
     onComplete: (fullResponse: string) => void;
     onError: (error: string, status?: number) => void;
@@ -146,9 +146,17 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
         let totalLimitMs = 380_000;
         let watchdogError = "";
 
+        // Total visual-pacing budget per message. The drip used to run
+        // unbounded INSIDE the read loop: hidden-tab timer throttling stretched
+        // the 8ms waits to 1s+ (after 5 min, ~1/min), so a fully-arrived answer
+        // took many minutes to "render" and the total-runtime watchdog then
+        // printed "exceeded the maximum chat runtime" over a finished, persisted
+        // answer (live P15: backend done in 253s, error shown at 1,149s).
+        let dripBudgetMs = 5_000;
+
         const emitToken = async (content: string) => {
             fullText += content;
-            if (provider === "tacc" && content.length > 80) {
+            if (provider === "tacc" && content.length > 80 && dripBudgetMs > 0 && !document.hidden) {
                 const pieces = splitProviderChunk(provider, content);
                 for (const piece of pieces) {
                     callbacks.onToken(piece);
@@ -157,7 +165,14 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                     // waits stretch to 1s+ and the watchdog would otherwise cancel
                     // a stream whose payload has already fully arrived.
                     lastMeaningfulEventAt = Date.now();
+                    if (dripBudgetMs <= 0 || document.hidden) {
+                        // Budget exhausted (or tab hidden) mid-chunk: flush the
+                        // rest instantly instead of pacing it.
+                        continue;
+                    }
+                    const waitStarted = Date.now();
                     await new Promise(resolve => setTimeout(resolve, 8));
+                    dripBudgetMs -= Date.now() - waitStarted;
                 }
                 return;
             }
@@ -168,7 +183,16 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             const now = Date.now();
             if (now - lastMeaningfulEventAt > inactivityLimitMs) {
                 watchdogError = "The model stopped sending progress. The request was ended so the chat would not remain stuck.";
-            } else if (now - streamStartedAt > totalLimitMs) {
+            } else if (
+                now - streamStartedAt > totalLimitMs &&
+                now - lastMeaningfulEventAt > 30_000 &&
+                !document.hidden
+            ) {
+                // Only declare a runtime overrun when the stream has ALSO gone
+                // quiet: while events still flow the backend is alive and owns
+                // its own turn deadline. Skipping hidden tabs avoids cancelling
+                // work the user simply isn't watching (throttled timers made
+                // this check fire minutes late anyway).
                 watchdogError = "The model exceeded the maximum chat runtime.";
             }
             if (watchdogError) {
@@ -256,7 +280,14 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             window.clearInterval(watchdog);
         }
         if (watchdogError) {
-            callbacks.onError(watchdogError);
+            // Self-heal: if real answer text already arrived, complete with it
+            // (the backend persisted the message anyway) instead of replacing a
+            // finished answer with an error bubble (live P15).
+            if (fullText.trim()) {
+                callbacks.onComplete(fullText);
+            } else {
+                callbacks.onError(watchdogError);
+            }
             return;
         }
         callbacks.onComplete(fullText);
@@ -448,6 +479,8 @@ export async function resolveSpectralTarget(
         redshift?: number;
         ra_deg?: number;
         dec_deg?: number;
+        /** Probe NOIRLab SPARCL for optical spectra at the resolved position. */
+        include_sparcl?: boolean;
     },
     token?: string | null,
 ): Promise<Record<string, unknown>> {
@@ -1020,4 +1053,57 @@ export async function deleteConversationApi(conversationId: string, token?: stri
     }
     console.error(`[Quasar] Failed to delete conversation ${conversationId} after 3 attempts`);
     return false;
+}
+
+/* ────────────────────────────────────────────
+   DATA LAB: Jobs panel + My-tables (MyDB-lite)
+   ──────────────────────────────────────────── */
+export interface DatalabJobRecord {
+    job_id: string;
+    kind: string;
+    status: "queued" | "running" | "succeeded" | "failed" | "canceled" | "submitted" | string;
+    result?: { result_id?: string; rowcount?: number; note?: string; candidates_found?: number; available?: boolean } | null;
+    error?: string | null;
+    external?: boolean;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface MyTableEntry {
+    name: string;
+    rowcount: number;
+    columns: string[];
+    saved_at: number;
+    saved_from?: string;
+    description?: string | null;
+    catalog?: string | null;
+    table?: string | null;
+}
+
+export async function listDatalabJobs(): Promise<DatalabJobRecord[]> {
+    const res = await fetch(`${API_BASE}/api/datalab/jobs`, { credentials: "include" });
+    const data = await parseJsonResponse<{ jobs: DatalabJobRecord[] }>(res);
+    return data.jobs || [];
+}
+
+export async function cancelDatalabJob(jobId: string): Promise<DatalabJobRecord> {
+    const res = await fetch(`${API_BASE}/api/datalab/jobs/${encodeURIComponent(jobId)}`, {
+        credentials: "include",
+        method: "DELETE",
+    });
+    return parseJsonResponse<DatalabJobRecord>(res);
+}
+
+export async function listMyTables(): Promise<MyTableEntry[]> {
+    const res = await fetch(`${API_BASE}/api/datalab/mytables`, { credentials: "include" });
+    const data = await parseJsonResponse<{ my_tables: MyTableEntry[] }>(res);
+    return data.my_tables || [];
+}
+
+export async function deleteMyTable(name: string): Promise<boolean> {
+    const res = await fetch(`${API_BASE}/api/datalab/mytables/${encodeURIComponent(name)}`, {
+        credentials: "include",
+        method: "DELETE",
+    });
+    return res.ok;
 }

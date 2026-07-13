@@ -16,9 +16,10 @@ import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
 import { normalizeEvidenceQuality } from "../lib/evidence-quality";
 import { normalizeHipsImageMeta } from "../lib/hips-imagery";
+import { PREFILL_PROMPT_EVENT } from "../lib/prompt-dispatch";
 import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
 import { buildObservationPaperGraph } from "../lib/research-graph";
-import { useAuthStore } from "../lib/auth-store";
+import { useAuthStore, verifyAuth } from "../lib/auth-store";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
 
@@ -59,6 +60,35 @@ export function ChatArea() {
             .catch(() => {/* silent: timeout or network error */})
             .finally(() => clearTimeout(timeout));
         return () => { controller.abort(); clearTimeout(timeout); };
+    }, []);
+    // Prompt handoff from other pages (/gallery recipes, SLE chips): /?prompt=…
+    // prefills the composer WITHOUT sending, then strips the param so a reload
+    // doesn't re-prefill. window.location (not useSearchParams) keeps ChatArea
+    // free of a Suspense-boundary requirement.
+    useEffect(() => {
+        try {
+            const params = new URLSearchParams(window.location.search);
+            const prompt = params.get("prompt");
+            if (prompt && prompt.trim()) {
+                setInputValue(prompt);
+                params.delete("prompt");
+                const rest = params.toString();
+                window.history.replaceState(null, "", window.location.pathname + (rest ? `?${rest}` : ""));
+            }
+        } catch { /* URL parsing is best-effort */ }
+    }, []);
+    // Same-page prompt handoff (T7.3): in-page cards (e.g. the sky-map
+    // "Cross-match here" button) dispatch a window event to prefill the composer
+    // without a navigation — the /?prompt= effect above only fires on mount.
+    // ChatInput re-syncs + focuses on the changed value; no auto-send.
+    useEffect(() => {
+        const onPrefill = (event: Event) => {
+            const detail = (event as CustomEvent<{ prompt?: string }>).detail;
+            const prompt = detail?.prompt?.trim();
+            if (prompt) setInputValue(prompt);
+        };
+        window.addEventListener(PREFILL_PROMPT_EVENT, onPrefill);
+        return () => window.removeEventListener(PREFILL_PROMPT_EVENT, onPrefill);
     }, []);
     const abortControllerRef = useRef<AbortController | null>(null);
     const [downloadProgress, setDownloadProgress] = useState<{
@@ -528,6 +558,7 @@ export function ChatArea() {
                                 plotlySpec: spec,
                                 plotlyTitle: plot.title || "",
                                 plotlyPngFallback: pngFallback,
+                                plotlyMeta: plot.meta && typeof plot.meta === "object" ? plot.meta : undefined,
                             });
                         },
                         onTaskGroup: (group) => handleTaskGroup(group),
@@ -594,7 +625,7 @@ export function ChatArea() {
                             updateLastAssistantRunMeta(meta);
                         },
                         onUsage: (usage) => {
-                            if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens);
+                            if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens, usage.durationMs);
                         },
                         onComplete: () => {
                             attachThinkingToLastMessage();
@@ -613,11 +644,26 @@ export function ChatArea() {
                         onError: (error: string, status?: number) => {
                             attachThinkingToLastMessage();
                             if (status === 401) {
-                                // CX-05: a runtime 401 means the cookie expired —
-                                // drop local auth state (and scrub session data)
-                                // instead of leaving isAuthenticated=true.
-                                clearAuth();
-                                updateLastAssistantMessage("Your session expired — please sign in again.");
+                                // CX-05: a runtime 401 means the cookie expired.
+                                // But transient/cold-start 401s (backend just
+                                // restarted) used to log the user out instantly
+                                // and scrub the session (live F-12b: ≥3
+                                // spontaneous logouts in one campaign night).
+                                // Probe /me ONCE; only clear auth if it also
+                                // rejects.
+                                void (async () => {
+                                    try {
+                                        await verifyAuth();
+                                    } catch { /* network blip — treat as unverified */ }
+                                    if (!useAuthStore.getState().isAuthenticated) {
+                                        clearAuth();
+                                        updateLastAssistantMessage("Your session expired — please sign in again.");
+                                    } else {
+                                        updateLastAssistantMessage(
+                                            "That request hit a transient authorization error — your session is still active, please retry."
+                                        );
+                                    }
+                                })();
                             } else {
                                 updateLastAssistantMessage(`Error: ${error}`);
                             }

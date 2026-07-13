@@ -111,17 +111,101 @@ else:  # pragma: no cover - only on interpreters without the private hook
 
 
 class _TursoCursor:
-    """Minimal cursor-like wrapper around libsql_client result sets."""
+    """Cursor wrapper: reads/DDL execute immediately; DML is buffered on the
+    parent connection and flushed atomically by _TursoConnection.commit().
+    A connection opened with autocommit=True keeps the legacy behavior:
+    every statement (DML included) executes immediately."""
 
-    def __init__(self, client):
-        self._client = client
+    _WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE")
+
+    @staticmethod
+    def _top_level_sql_words(sql: str):
+        """Yield unquoted SQL words outside parenthesized expressions."""
+        i = 0
+        depth = 0
+        while i < len(sql):
+            ch = sql[i]
+            if ch.isspace():
+                i += 1
+            elif sql.startswith("--", i):
+                i += 2
+                while i < len(sql) and sql[i] not in "\r\n":
+                    i += 1
+            elif sql.startswith("/*", i):
+                end = sql.find("*/", i + 2)
+                if end < 0:
+                    return
+                i = end + 2
+            elif ch in "'\"`":
+                quote = ch
+                i += 1
+                while i < len(sql):
+                    if sql[i] == quote:
+                        if i + 1 < len(sql) and sql[i + 1] == quote:
+                            i += 2
+                        else:
+                            i += 1
+                            break
+                    else:
+                        i += 1
+            elif ch == "[":
+                end = sql.find("]", i + 1)
+                if end < 0:
+                    return
+                i = end + 1
+            elif ch == "(":
+                depth += 1
+                i += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+            elif ch.isalpha() or ch == "_":
+                start = i
+                i += 1
+                while i < len(sql) and (sql[i].isalnum() or sql[i] in "_$"):
+                    i += 1
+                if depth == 0:
+                    yield sql[start:i].upper()
+            else:
+                i += 1
+
+    @classmethod
+    def _is_write_statement(cls, sql: str) -> bool:
+        words = iter(cls._top_level_sql_words(sql))
+        first = next(words, None)
+        if first in cls._WRITE_PREFIXES:
+            return True
+        if first != "WITH":
+            return False
+
+        # CTE bodies are parenthesized, so the next statement keyword at the
+        # top level distinguishes writable WITH statements from SELECT/VALUES.
+        for word in words:
+            if word in cls._WRITE_PREFIXES:
+                return True
+            if word in {"SELECT", "VALUES"}:
+                return False
+        return False
+
+    def __init__(self, connection):
+        self._conn = connection
+        self._client = connection._client
         self._rows: list = []
         self._description = None
         self.lastrowid: Optional[int] = None
         self.rowcount: int = -1
 
     def execute(self, sql: str, params: tuple = ()) -> "_TursoCursor":
-        # libsql_client expects list params
+        if self._is_write_statement(sql) and not self._conn._autocommit:
+            # Buffer DML; flushed as one atomic batch on commit().
+            self._conn._pending.append((sql, tuple(params)))
+            self._conn._last_write_cursor = self
+            self._rows = []
+            self._description = None
+            self.lastrowid = None
+            self.rowcount = -1
+            return self
+        # Reads and DDL run immediately (matches prior behavior).
         rs = self._client.execute(sql, list(params))
         self._rows = list(rs.rows) if rs.rows else []
         self._description = rs.columns if hasattr(rs, "columns") else None
@@ -131,8 +215,7 @@ class _TursoCursor:
 
     def fetchone(self) -> Optional[tuple]:
         if self._rows:
-            row = self._rows.pop(0)
-            return tuple(row)
+            return tuple(self._rows.pop(0))
         return None
 
     def fetchall(self) -> List[tuple]:
@@ -145,34 +228,53 @@ class _TursoCursor:
 
 
 class _TursoConnection:
-    """Minimal connection-like wrapper around the libsql_client sync client."""
+    """Connection wrapper with real atomic commit() via libsql batch().
+    autocommit=True opts out of DML buffering (legacy immediate-execute) for
+    callers that read per-statement cursor state before commit."""
 
-    def __init__(self):
+    def __init__(self, autocommit: bool = False):
         import libsql_client
 
         url, auth_token = _turso_credentials()
-        # Convert libsql:// to https:// for HTTP transport
-        # (wss transport can fail with 505 on some platforms)
         if url.startswith("libsql://"):
             url = url.replace("libsql://", "https://", 1)
-        self._client = libsql_client.create_client_sync(
-            url=url,
-            auth_token=auth_token,
-        )
+        self._client = libsql_client.create_client_sync(url=url, auth_token=auth_token)
+        self._autocommit = bool(autocommit)
+        self._pending: list = []
+        self._last_write_cursor: Optional["_TursoCursor"] = None
         with _open_connections_lock:
             _open_connections.add(self)
 
     def cursor(self) -> _TursoCursor:
-        return _TursoCursor(self._client)
+        return _TursoCursor(self)
 
     def execute(self, sql: str, params: tuple = ()):
-        return _TursoCursor(self._client).execute(sql, params)
+        return _TursoCursor(self).execute(sql, params)
 
     def commit(self):
-        # Turso auto-commits each statement executed over HTTP
-        pass
+        # Flush buffered DML as ONE atomic batch (BEGIN…COMMIT…ROLLBACK).
+        # HTTP transport has no interactive transaction(); batch() is the only
+        # atomic primitive. Reads/DDL already executed immediately.
+        if not self._pending:
+            return
+        stmts = [(sql, list(params)) for sql, params in self._pending]
+        results = self._client.batch(stmts)
+        self._pending = []
+        if results and self._last_write_cursor is not None:
+            last = results[-1]
+            self._last_write_cursor.lastrowid = getattr(last, "last_insert_rowid", None)
+            self._last_write_cursor.rowcount = getattr(last, "rows_affected", -1)
+        self._last_write_cursor = None
+
+    def rollback(self):
+        # Discard buffered-but-unflushed DML (nothing was sent to the server).
+        self._pending = []
+        self._last_write_cursor = None
 
     def close(self):
+        # Unflushed writes are discarded (implicit rollback).
+        self._pending = []
+        self._last_write_cursor = None
         with _open_connections_lock:
             _open_connections.discard(self)
         try:
@@ -192,7 +294,7 @@ class _TursoConnection:
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_connection(local_db_path: str = None) -> Any:
+def get_connection(local_db_path: str = None, autocommit: bool = False) -> Any:
     """
     Return a database connection.
 
@@ -202,13 +304,14 @@ def get_connection(local_db_path: str = None) -> Any:
     NOTE: *local_db_path* is the local-fallback location, NOT an override —
     when Turso is configured every caller shares the one cloud database, and
     the path is ignored. Set QUASAR_FORCE_LOCAL_DB=1 to pin the SQLite branch.
+    autocommit=True keeps legacy per-statement auto-commit on the Turso path.
 
     The returned object quacks like a sqlite3.Connection: it has
     .cursor(), .execute(), .commit(), .close(), and works as a
     context manager.
     """
     if _use_turso():
-        return _TursoConnection()
+        return _TursoConnection(autocommit=autocommit)
     else:
         # Local SQLite fallback for development
         if local_db_path is None:
