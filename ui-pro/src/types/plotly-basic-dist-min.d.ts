@@ -10,6 +10,11 @@ declare module "plotly.js-basic-dist-min" {
             config?: Record<string, unknown>,
         ): Promise<unknown>;
         purge(root: HTMLElement): void;
+        restyle(
+            root: HTMLElement,
+            update: Record<string, unknown>,
+            traceIndices?: number[],
+        ): Promise<unknown>;
         toImage(
             root: HTMLElement,
             options?: {

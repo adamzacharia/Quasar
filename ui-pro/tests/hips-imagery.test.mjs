@@ -71,3 +71,29 @@ test("drops a non-http fits_url", () => {
     const meta = normalizeHipsImageMeta({ kind: "hips", ra: 42, dec: -5, fits_url: "/plots/local.fits" });
     assert.equal(meta.fitsUrl, undefined);
 });
+
+test("normalizes blink frames and drops invalid entries (CX-32)", () => {
+    const meta = normalizeHipsImageMeta({
+        kind: "blink",
+        ra: 187.7,
+        dec: 12.4,
+        frames: [
+            { url: "/plots/vlass_epoch_a.png", label: "VLASS1.2 (2019)" },
+            { url: "/plots/vlass_epoch_b.png" },
+            { label: "no url — dropped" },
+            { url: "" },
+            "not an object",
+        ],
+    });
+    assert.equal(meta.kind, "blink");
+    assert.equal(meta.frames.length, 2);
+    assert.equal(meta.frames[0].url, "/plots/vlass_epoch_a.png");
+    assert.equal(meta.frames[0].label, "VLASS1.2 (2019)");
+    assert.equal(meta.frames[1].url, "/plots/vlass_epoch_b.png");
+    assert.equal(meta.frames[1].label, undefined);
+});
+
+test("omits frames entirely when none are valid", () => {
+    const meta = normalizeHipsImageMeta({ kind: "blink", ra: 1, dec: 2, frames: [{ label: "x" }, {}] });
+    assert.equal(meta.frames, undefined);
+});

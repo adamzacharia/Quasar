@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Download, Maximize2, Minus, Plus, RefreshCw, X } from "lucide-react";
 import { AladinSkyView, SURVEYS } from "./AladinSkyView";
+import { BlinkCard } from "./BlinkCard";
 import { ImageLightbox } from "./ImageLightbox";
 import type { HipsImageMeta } from "../lib/types";
 import { clampHipsFov, hips2fitsUrl, normalizeHipsSurveyId } from "../lib/hips-imagery";
@@ -144,6 +145,12 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
         setDisplayedUrl(retry ? cacheBusted(nextUrl) : nextUrl);
     }, [ra, dec]);
 
+    // Blink comparator (kind "blink"): matched-geometry frames (e.g. VLASS
+    // epochs) played in place; the static panel rides along as the summary.
+    if (kind === "blink" && (imageMeta?.frames?.length ?? 0) >= 2) {
+        return <BlinkCard frames={imageMeta!.frames!} caption={caption} summaryUrl={imageUrl} />;
+    }
+
     if (!canSwitchSurvey && !canInteract) {
         return <PlainImageCard imageUrl={imageUrl} caption={caption} fitsHref={fitsHref} />;
     }
@@ -280,6 +287,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
                                 coords={[{ ra, dec }]}
                                 sourceName={caption || "HiPS image"}
                                 survey={selectedSurvey}
+                                fovDeg={fovDeg}
                                 mocs={imageMeta?.mocs}
                                 onFallback={() => setInteractiveOpen(false)}
                             />

@@ -528,6 +528,48 @@ function SourceInspectPanel({
         dispatchPrefillPrompt(crossMatchPrompt);
         onCrossMatch?.();
     };
+    // Coordinate-stamped launchpads into the tool surface: each prefills a
+    // prompt (never auto-sends, same T7.3 pattern as cross-match) so a clicked
+    // marker becomes a starting point for imaging/analysis, not a dead end.
+    const raText = selection.ra.toFixed(5);
+    const decText = selection.dec.toFixed(5);
+    const atText = `at RA ${raText}, Dec ${decText}${selection.label ? ` (${selection.label})` : ""}`;
+    const quickActions: { label: string; title: string; prompt: string }[] = [
+        {
+            label: "Cutout",
+            title: "Fetch a multiwavelength image cutout here",
+            prompt: `Show me an optical cutout ${atText} with a 0.1 deg field of view.`,
+        },
+        {
+            label: "Radio contours",
+            title: "Overlay VLASS radio contours on optical imagery here",
+            prompt: `Overlay VLASS radio contours on a DSS2 optical image ${atText}.`,
+        },
+        {
+            label: "Measure",
+            title: "Detect and measure sources in a cutout here",
+            prompt: `Detect sources and measure their photometry in a 0.1 deg optical cutout ${atText}.`,
+        },
+        {
+            label: "ZTF alerts",
+            title: "Search ZTF/ALeRCE transients near this position",
+            prompt: `Search ZTF alerts within 60 arcsec ${atText}.`,
+        },
+        {
+            label: "VLASS epochs",
+            title: "Compare VLASS radio epochs for variability here",
+            prompt: `Compare the VLASS epochs ${atText} and check for radio variability.`,
+        },
+        {
+            label: "Finding chart",
+            title: "Generate an observing finding chart here",
+            prompt: `Generate a finding chart ${atText} with a 5 arcmin field.`,
+        },
+    ];
+    const runQuickAction = (prompt: string) => {
+        dispatchPrefillPrompt(prompt);
+        onCrossMatch?.();
+    };
     return (
         <div className="absolute inset-y-0 right-0 z-20 flex w-64 flex-col border-l border-slate-700/50 bg-slate-950/90 backdrop-blur">
             <div className="flex items-start justify-between gap-2 border-b border-slate-700/50 px-3 py-2.5">
@@ -592,6 +634,18 @@ function SourceInspectPanel({
                             Show in table
                         </button>
                     )}
+                    <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                        {quickActions.map((action) => (
+                            <button
+                                key={action.label}
+                                onClick={() => runQuickAction(action.prompt)}
+                                title={action.title}
+                                className="rounded-md border border-slate-700/70 px-1.5 py-1 text-[10px] font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-cyan-200"
+                            >
+                                {action.label}
+                            </button>
+                        ))}
+                    </div>
                 </div>
             )}
         </div>

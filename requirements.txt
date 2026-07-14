@@ -19,6 +19,13 @@ reproject
 spectral-cube
 pyvo
 alminer
+# Quantitative image analysis (services/image_analysis.py) + cube PV slices
+# (services/fits_service.pv_slice) + MOC algebra (services/moc_coverage.py).
+photutils>=2.0
+regions>=0.9
+pvextractor>=0.4
+mocpy>=0.15
+radio-beam>=0.3
 # NOIRLab Astro Data Lab: the connector (integrations/datalab_client.py) talks to
 # the query-manager REST API directly via `requests` (already a dependency), so it
 # runs on Python 3.13. The official `astro-datalab` client is OPTIONAL and only

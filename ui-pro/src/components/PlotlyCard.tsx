@@ -1,9 +1,8 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import Link from "next/link";
-import { Download, Loader2, Waves } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Download, Loader2, RotateCcw } from "lucide-react";
 import type { PlotlyModule } from "plotly.js-basic-dist-min";
 import type { PlotlyFigureSpec, PlotlyCardMeta } from "../lib/types";
 import { ImageLightbox } from "./ImageLightbox";
@@ -72,6 +71,44 @@ function fileSlug(title?: string): string {
     return slug || "quasar_plot";
 }
 
+type PeriodFoldMeta = {
+    time: number[];
+    value: number[];
+    bestPeriod: number;
+    valueKind: string;
+};
+
+/** Raw fold arrays embedded by the backend (layout.meta.kind === "period_fold")
+ *  so the phase diagram can be re-folded client-side at any trial period. */
+function periodFoldMeta(spec?: PlotlyFigureSpec): PeriodFoldMeta | null {
+    const meta = asRecord(asRecord(spec?.layout).meta);
+    if (meta.kind !== "period_fold") return null;
+    const time = Array.isArray(meta.time_days) ? (meta.time_days as unknown[]).map(Number) : [];
+    const value = Array.isArray(meta.value) ? (meta.value as unknown[]).map(Number) : [];
+    const bestPeriod = Number(meta.best_period_d);
+    if (!time.length || time.length !== value.length || !Number.isFinite(bestPeriod) || bestPeriod <= 0) {
+        return null;
+    }
+    return { time, value, bestPeriod, valueKind: String(meta.value_kind || "") };
+}
+
+/** Common Lomb-Scargle alias periods worth one click: harmonics and the
+ *  1-day sampling beats that ground-based cadences produce. */
+function aliasPeriods(period: number): { label: string; value: number }[] {
+    const aliases: { label: string; value: number }[] = [
+        { label: "2P", value: period * 2 },
+        { label: "P/2", value: period / 2 },
+    ];
+    for (const [label, sign] of [["1d beat −", -1], ["1d beat +", 1]] as const) {
+        const beatFreq = 1 / period + sign;
+        if (beatFreq > 0) {
+            const beat = 1 / beatFreq;
+            if (Number.isFinite(beat) && beat > 0) aliases.push({ label, value: beat });
+        }
+    }
+    return aliases;
+}
+
 /**
  * Interactive Plotly figure card for "plotly" SSE events. Loads the
  * lightweight basic bundle client-side only (dynamic import in useEffect,
@@ -86,6 +123,27 @@ export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) 
     );
     const [downloading, setDownloading] = useState(false);
     const [lightboxOpen, setLightboxOpen] = useState(false);
+
+    const foldMeta = useMemo(() => periodFoldMeta(spec), [spec]);
+    const [foldPeriod, setFoldPeriod] = useState<number | null>(null);
+    const activePeriod = foldPeriod ?? foldMeta?.bestPeriod ?? null;
+
+    // Re-fold the phase trace at a trial period entirely client-side:
+    // phase = ((t - t0) mod P) / P, plotted twice for continuity.
+    const applyFold = useCallback((period: number) => {
+        const Plotly = plotlyRef.current;
+        const el = plotRef.current;
+        if (!Plotly || !el || !foldMeta || !Number.isFinite(period) || period <= 0) return;
+        const t0 = Math.min(...foldMeta.time);
+        const phase = foldMeta.time.map((t) => ((t - t0) / period) % 1.0);
+        const x = [...phase, ...phase.map((p) => p + 1.0)];
+        const y = [...foldMeta.value, ...foldMeta.value];
+        const traces = Array.isArray(spec?.data) ? (spec!.data as Record<string, unknown>[]) : [];
+        let foldIndex = traces.findIndex((trace) => asRecord(trace).xaxis === "x2");
+        if (foldIndex < 0) foldIndex = traces.length > 1 ? 1 : 0;
+        void Plotly.restyle(el, { x: [x], y: [y] }, [foldIndex]);
+        setFoldPeriod(period);
+    }, [foldMeta, spec]);
 
     const layoutHeight = typeof spec?.layout?.height === "number" ? (spec.layout.height as number) : 420;
 
@@ -198,19 +256,50 @@ export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) 
                         </div>
                     )}
                 </div>
+                {foldMeta && activePeriod !== null && (
+                    <div className="px-4 py-2 border-t border-slate-700/50 flex flex-wrap items-center gap-2.5">
+                        <span className="text-[11px] font-semibold text-indigo-200">
+                            Fold P = {activePeriod.toPrecision(6)} d
+                        </span>
+                        <input
+                            aria-label="Trial fold period"
+                            type="range"
+                            min={Math.log10(foldMeta.bestPeriod / 1.5)}
+                            max={Math.log10(foldMeta.bestPeriod * 1.5)}
+                            step={0.0002}
+                            value={Math.log10(activePeriod)}
+                            onChange={(event) => applyFold(10 ** Number(event.target.value))}
+                            disabled={status !== "ready"}
+                            className="h-1 w-40 accent-indigo-400 disabled:opacity-40"
+                            title="Slide to re-fold at a nearby trial period"
+                        />
+                        {aliasPeriods(foldMeta.bestPeriod).map((alias) => (
+                            <button
+                                key={alias.label}
+                                type="button"
+                                onClick={() => applyFold(alias.value)}
+                                disabled={status !== "ready"}
+                                className="rounded-md border border-slate-700/70 bg-slate-950/60 px-1.5 py-0.5 text-[10px] font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-indigo-200 disabled:opacity-40"
+                                title={`Re-fold at the ${alias.label} alias (${alias.value.toPrecision(5)} d)`}
+                            >
+                                {alias.label}
+                            </button>
+                        ))}
+                        <button
+                            type="button"
+                            onClick={() => applyFold(foldMeta.bestPeriod)}
+                            disabled={status !== "ready" || activePeriod === foldMeta.bestPeriod}
+                            className="inline-flex items-center gap-1 rounded-md border border-slate-700/70 bg-slate-950/60 px-1.5 py-0.5 text-[10px] font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-indigo-200 disabled:opacity-40"
+                            title="Back to the Lomb-Scargle best period"
+                        >
+                            <RotateCcw className="h-3 w-3" />
+                            best
+                        </button>
+                    </div>
+                )}
                 <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between gap-3">
                     <span className="min-w-0 truncate text-xs text-slate-400">{title || "Interactive plot"}</span>
                     <div className="flex shrink-0 items-center gap-1.5">
-                        {meta?.line_explorer_url && (
-                            <Link
-                                href={meta.line_explorer_url}
-                                className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/15"
-                                title={`Open in Spectral Line Explorer (target + z prefilled${typeof meta.redshift === "number" ? `, z=${meta.redshift.toPrecision(4)}` : ""})`}
-                            >
-                                <Waves className="h-3.5 w-3.5" />
-                                Line Explorer
-                            </Link>
-                        )}
                         <button
                             type="button"
                             onClick={downloadPng}

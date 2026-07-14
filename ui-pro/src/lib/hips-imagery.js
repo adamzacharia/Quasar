@@ -72,6 +72,7 @@ export function hips2fitsUrl({ ra, dec, fovDeg, survey, width = HIPS_DEFAULT_SIZ
  * @param {unknown} meta
  * @returns {{kind?: string, ra?: number, dec?: number, fovDeg?: number, survey?: string,
  *            fitsUrl?: string,
+ *            frames?: {url: string, label?: string}[],
  *            mocs?: {id: string, name?: string, color?: string, order?: number,
  *                    mocJson: Record<string, number[]>}[]} | undefined}
  */
@@ -99,6 +100,21 @@ export function normalizeHipsImageMeta(meta) {
     const fitsUrl = meta.fitsUrl ?? meta.fits_url;
     if (typeof fitsUrl === "string" && /^https?:\/\//i.test(fitsUrl)) {
         out.fitsUrl = fitsUrl;
+    }
+
+    // Ordered frames for the blink comparator card (kind "blink"): each is a
+    // served PNG at matched geometry (e.g. per-epoch VLASS cutouts).
+    if (Array.isArray(meta.frames)) {
+        const frames = [];
+        for (const f of meta.frames) {
+            if (!f || typeof f !== "object") continue;
+            const frameUrl = String(f.url || "").trim();
+            if (!frameUrl) continue;
+            const entry = { url: frameUrl };
+            if (f.label) entry.label = String(f.label);
+            frames.push(entry);
+        }
+        if (frames.length) out.frames = frames;
     }
 
     // Survey footprint overlays (MOC geometry) for the interactive view.

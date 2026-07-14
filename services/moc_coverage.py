@@ -185,6 +185,178 @@ class MocCoverageService:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    def moc_operation(
+        self,
+        ids: Any,
+        operation: str = "intersection",
+        order: Any = 8,
+        ra_list: Optional[List[Any]] = None,
+        dec_list: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        """MOC boolean algebra over MOCServer dataset ids (mocpy-backed).
+
+        operation: 'intersection' | 'union' | 'difference' (first minus the
+        union of the rest). Returns the derived MOC in Aladin JSON format with
+        its sky area in deg². When ra_list/dec_list are given, each position is
+        additionally flagged as inside/outside the derived MOC.
+        """
+        try:
+            op = str(operation or "intersection").strip().lower()
+            if op not in {"intersection", "union", "difference"}:
+                return {"success": False,
+                        "error": "operation must be one of intersection, union, difference."}
+            id_list = [str(i).strip() for i in (ids or []) if str(i).strip()]
+            if len(id_list) > MAX_MOC_IDS:
+                # Silent truncation would corrupt the algebra ("first minus the
+                # union of the REST"), so an oversized request is an error.
+                return {"success": False,
+                        "error": f"moc_operation accepts at most {MAX_MOC_IDS} survey_ids per call; "
+                                 f"got {len(id_list)}. Split the request or pre-combine with union."}
+            geometry = self.moc_geometry(id_list, order=order)
+            if not geometry.get("success"):
+                return geometry
+            fetched = geometry.get("mocs") or []
+            warnings = list(geometry.get("warnings") or [])
+
+            def _target_flags(moc_or_none) -> Dict[str, Any]:
+                """inside/outside flags against the derived MOC (all-False when empty)."""
+                extra: Dict[str, Any] = {}
+                if ra_list and dec_list and len(ra_list) == len(dec_list):
+                    import astropy.units as u
+                    import numpy as np
+
+                    if moc_or_none is None:
+                        flags = [False] * len(ra_list)
+                    else:
+                        lon = np.asarray([float(v) for v in ra_list], dtype=float) * u.deg
+                        lat = np.asarray([float(v) for v in dec_list], dtype=float) * u.deg
+                        try:
+                            inside = moc_or_none.contains_lonlat(lon, lat)
+                        except AttributeError:  # older mocpy API
+                            inside = moc_or_none.contains(lon, lat)
+                        flags = [bool(f) for f in np.asarray(inside).ravel()]
+                    extra["targets_inside"] = flags
+                    extra["n_targets_inside"] = int(sum(flags))
+                    extra["n_targets"] = len(flags)
+                elif ra_list or dec_list:
+                    warnings.append("ra_list/dec_list ignored: lengths differ or one is missing.")
+                return extra
+
+            def _empty_result(note: str) -> Dict[str, Any]:
+                out = {
+                    "success": True,
+                    "operation": op,
+                    "ids": id_list,
+                    "empty": True,
+                    "area_deg2": 0.0,
+                    "sky_fraction": 0.0,
+                    "note": note,
+                    "warnings": warnings,
+                }
+                out.update(_target_flags(None))
+                return out
+
+            # An id MOCServer returned nothing for is an EMPTY operand — it
+            # must participate in the algebra, not silently vanish (CX-02):
+            # intersection with empty is empty; difference from empty is empty;
+            # an empty subtrahend / union operand is a no-op.
+            fetched_ids = {m["id"] for m in fetched}
+            missing = [i for i in id_list if i not in fetched_ids]
+            if missing:
+                if op == "intersection":
+                    return _empty_result(
+                        f"No MOC coverage found for {', '.join(missing)} — an intersection "
+                        "with an empty footprint is empty."
+                    )
+                if op == "difference" and id_list and id_list[0] in missing:
+                    return _empty_result(
+                        f"No MOC coverage found for the first operand {id_list[0]!r} — "
+                        "the difference of an empty footprint is empty."
+                    )
+                warnings.append(
+                    f"Empty/unresolvable operand(s) treated as empty sky: {', '.join(missing)}."
+                )
+            if op in {"intersection", "difference"} and len(id_list) < 2:
+                return {"success": False,
+                        "error": f"{op} needs at least two survey_ids; got {len(id_list)}."}
+            if not fetched:
+                # Every operand resolved empty. That is a well-defined result —
+                # the union (or any op) of empty footprints is empty sky, not an
+                # error (CX-21).
+                return _empty_result(
+                    f"No MOC coverage found for any of {', '.join(id_list)} — result is empty sky."
+                )
+
+            from mocpy import MOC
+
+            by_id = {m["id"]: MOC.from_json(m["moc_json"]) for m in fetched}
+            present = [by_id[i] for i in id_list if i in by_id]
+            if op == "union":
+                combined = present[0]
+                for m in present[1:]:
+                    combined = combined.union(m)
+            elif op == "intersection":
+                combined = present[0]
+                for m in present[1:]:
+                    combined = combined.intersection(m)
+            else:
+                combined = by_id[id_list[0]]
+                rest_mocs = [by_id[i] for i in id_list[1:] if i in by_id]
+                if rest_mocs:
+                    rest = rest_mocs[0]
+                    for m in rest_mocs[1:]:
+                        rest = rest.union(m)
+                    combined = combined.difference(rest)
+
+            if combined.empty():
+                return _empty_result(
+                    "The derived MOC is empty — the footprints do not "
+                    + ("overlap." if op == "intersection" else "leave any residual sky.")
+                )
+
+            serialized = combined.serialize(format="json")
+            n_cells = _moc_cell_count(serialized)
+            # Keep the overlay payload bounded like moc_geometry does.
+            local = combined
+            while n_cells > 25000:
+                max_order = max(int(k) for k in serialized.keys())
+                if max_order <= MIN_MOC_ORDER:
+                    break
+                local = local.degrade_to_order(max_order - 1)
+                serialized = local.serialize(format="json")
+                n_cells = _moc_cell_count(serialized)
+                warnings.append(f"Derived MOC downsampled to order {max_order - 1} for display.")
+
+            sky_fraction = float(combined.sky_fraction)
+            input_order = geometry.get("provenance", {}).get("order")
+            result: Dict[str, Any] = {
+                "success": True,
+                "operation": op,
+                "ids": id_list,
+                "empty": False,
+                "moc_json": serialized,
+                "n_cells": n_cells,
+                "sky_fraction": round(sky_fraction, 8),
+                "area_deg2": round(sky_fraction * 41252.9612, 3),
+                # Inputs are fetched at a capped HEALPix order, so the algebra
+                # (area, membership) is exact only to that cell size.
+                "area_precision_note": (
+                    f"Computed from order-{input_order} input MOCs "
+                    f"(cell ≈ {41252.9612 / (12 * 4 ** int(input_order or 8)):.4g} deg²); "
+                    "boundaries finer than this are smoothed."
+                ),
+                "warnings": warnings,
+                "provenance": {
+                    "service": "CDS MOCServer + mocpy",
+                    "endpoint": self.base_url,
+                    "order": input_order,
+                },
+            }
+            result.update(_target_flags(combined))
+            return result
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
     def _get_json_dict(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Like _get_json but for endpoints whose payload is a JSON object
         (MOC geometry responses are dicts, not record lists)."""

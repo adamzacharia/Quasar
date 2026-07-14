@@ -524,7 +524,15 @@ export function ChatArea() {
                         onImage: (img) => {
                             // Resolve relative URL to absolute backend URL
                             const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-                            const imageUrl = img.url.startsWith("http") || img.url.startsWith("data:") ? img.url : `${apiBase}${img.url}`;
+                            const toAbsolute = (u: string) =>
+                                u.startsWith("http") || u.startsWith("data:") ? u : `${apiBase}${u}`;
+                            const imageUrl = toAbsolute(img.url);
+                            // Blink frames are also server-relative /plots URLs — resolve them
+                            // to the backend origin too, or a split UI/API deploy 404s them.
+                            const meta = normalizeHipsImageMeta(img.meta);
+                            if (meta?.frames?.length) {
+                                meta.frames = meta.frames.map((f) => ({ ...f, url: toAbsolute(f.url) }));
+                            }
                             addMessage({
                                 id: generateId(),
                                 role: "assistant",
@@ -533,7 +541,7 @@ export function ChatArea() {
                                 timestamp: new Date(),
                                 imageUrl: imageUrl,
                                 imageCaption: img.caption || "",
-                                imageMeta: normalizeHipsImageMeta(img.meta),
+                                imageMeta: meta,
                             });
                         },
                         onPlotly: (plot) => {

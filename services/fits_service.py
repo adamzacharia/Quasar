@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────
 MAX_DOWNLOAD_MB = 150              # Reject files larger than this
 DOWNLOAD_TIMEOUT_S = 180           # Timeout for HTTP download
+HIPS2FITS_TIMEOUT_S = 45           # Shorter cap for hips2fits cutout URLs
 RENDERED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "rendered_images")
 os.makedirs(RENDERED_DIR, exist_ok=True)
 
@@ -55,7 +56,10 @@ def _download_fits(url: str, label: str = "FITS") -> str:
         shutil.copyfile(src, tmp.name)
         return tmp.name
 
-    resp = http_requests.get(url, timeout=DOWNLOAD_TIMEOUT_S, stream=True)
+    # hips2fits cutout URLs get the shorter 45 s cap (they return in seconds);
+    # arbitrary archive FITS keep the generous 180 s. (CX-28)
+    timeout_s = HIPS2FITS_TIMEOUT_S if "hips2fits" in url.lower() else DOWNLOAD_TIMEOUT_S
+    resp = http_requests.get(url, timeout=timeout_s, stream=True)
     resp.raise_for_status()
 
     # Check content-length if available
@@ -170,9 +174,12 @@ def render_fits_image(
         return {"success": False, "error": str(e)}
 
     finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
         if fits_path and os.path.exists(fits_path):
-            os.unlink(fits_path)
-        gc.collect()
+            try:
+                os.unlink(fits_path)
+            except PermissionError:
+                logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
 
 
 def overlay_fits_images(
@@ -276,6 +283,139 @@ def overlay_fits_images(
 
     finally:
         for p in (base_path, contour_path):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except PermissionError:
+                    logger.warning(f"[FITS] Could not remove temp file still in use: {p}")
+        gc.collect()
+
+
+def difference_image(
+    url_a: str,
+    url_b: str,
+    label_a: str = "Image A",
+    label_b: str = "Image B",
+    scale_match: bool = True,
+    title: str = "",
+) -> Dict[str, Any]:
+    """Reproject image B onto image A's WCS and render A, aligned B, and A−B.
+
+    With ``scale_match`` (default) B is background- and gain-matched to A via
+    sigma-clipped statistics before subtracting, so epoch-to-epoch transient
+    checks aren't swamped by calibration offsets. Returns residual statistics
+    (MAD RMS, max |residual|, fraction of |residual| > 5σ pixels).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.stats import mad_std, sigma_clipped_stats
+    from astropy.visualization import ImageNormalize, SqrtStretch, ZScaleInterval
+    from astropy.wcs import WCS
+
+    path_a = None
+    path_b = None
+    try:
+        from reproject import reproject_interp  # hard requirement for alignment
+
+        from astropy.io import fits as afits
+
+        path_a = _download_fits(url_a, f"{label_a}")
+        path_b = _download_fits(url_b, f"{label_b}")
+
+        with afits.open(path_a, memmap=False) as hdul_a, \
+             afits.open(path_b, memmap=False) as hdul_b:
+            data_a, idx_a = _pick_science_hdu(hdul_a)
+            data_b, idx_b = _pick_science_hdu(hdul_b)
+            data_a = np.asarray(data_a, dtype=float)
+            data_b = np.asarray(data_b, dtype=float)
+            wcs_a = WCS(hdul_a[idx_a].header, naxis=2)
+            wcs_b = WCS(hdul_b[idx_b].header, naxis=2)
+            bunit = str(hdul_a[idx_a].header.get("BUNIT", "") or "").strip()
+
+        for name, arr in ((label_a, data_a), (label_b, data_b)):
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0 or float(np.max(finite)) == float(np.min(finite)):
+                return {"success": False,
+                        "error": f"{name} is blank (all-NaN or constant) — nothing to difference."}
+
+        data_b_aligned, footprint = reproject_interp((data_b, wcs_b), wcs_a, shape_out=data_a.shape)
+        overlap = np.isfinite(data_a) & np.isfinite(data_b_aligned) & (footprint > 0)
+        if overlap.sum() < 100:
+            return {"success": False,
+                    "error": "The two images do not overlap on the sky (fewer than 100 shared pixels)."}
+
+        warnings: List[str] = [] if scale_match else ["scale_match disabled: raw subtraction."]
+        b_matched = data_b_aligned
+        scale_applied = None
+        if scale_match:
+            _, med_a, std_a = sigma_clipped_stats(data_a[overlap], sigma=3.0, maxiters=5)
+            _, med_b, std_b = sigma_clipped_stats(data_b_aligned[overlap], sigma=3.0, maxiters=5)
+            gain = (std_a / std_b) if (std_b and math.isfinite(std_b) and std_b > 0) else 1.0
+            if not (0.05 <= gain <= 20.0):
+                warnings.append(
+                    f"Gain match {gain:.3g} is outside the sane range (0.05–20) — the images "
+                    "are probably in different units; applied offset-only matching instead."
+                )
+                gain = 1.0
+            b_matched = (data_b_aligned - med_b) * gain + med_a
+            scale_applied = {"offset_b": float(med_b), "gain": float(gain), "offset_a": float(med_a)}
+
+        diff = np.where(overlap, data_a - b_matched, np.nan)
+        diff_vals = diff[np.isfinite(diff)]
+        rms = float(mad_std(diff_vals))
+        max_abs = float(np.max(np.abs(diff_vals)))
+        sig_frac = float(np.mean(np.abs(diff_vals) > 5.0 * rms)) if rms > 0 else 0.0
+
+        norm = ImageNormalize(data_a[np.isfinite(data_a)], interval=ZScaleInterval(), stretch=SqrtStretch())
+        vmax = 5.0 * rms if rms > 0 else (max_abs or 1.0)
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4.8), facecolor="#0f172a",
+                                 subplot_kw={"projection": wcs_a})
+        panels = ((data_a, label_a, "inferno", norm, None),
+                  (b_matched, f"{label_b} (aligned)", "inferno", norm, None),
+                  (diff, f"{label_a} − {label_b}", "RdBu_r", None, vmax))
+        im = None
+        for ax, (img, label, cmap, pnorm, pvmax) in zip(axes, panels):
+            if pnorm is not None:
+                im0 = ax.imshow(img, origin="lower", cmap=cmap, norm=pnorm)
+            else:
+                im0 = ax.imshow(img, origin="lower", cmap=cmap, vmin=-pvmax, vmax=pvmax)
+                im = im0
+            ax.set_title(label, color="white", fontsize=10)
+            for coord in (0, 1):
+                ax.coords[coord].set_ticklabel(color="white", fontsize=6)
+                ax.coords[coord].set_axislabel(" ")
+            ax.set_facecolor("black")
+        if im is not None:
+            cbar = fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
+            cbar.set_label(f"Residual{f' ({bunit})' if bunit else ''}", color="white", fontsize=9)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white", fontsize=7)
+        full_title = f"{title} — Difference image" if title else f"Difference: {label_a} − {label_b}"
+        fig.suptitle(full_title, color="white", fontsize=13)
+
+        img_name = f"diff_{uuid.uuid4().hex[:10]}.png"
+        img_path = os.path.join(RENDERED_DIR, img_name)
+        fig.savefig(img_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+        return {
+            "success": True,
+            "image_path": f"/api/images/{img_name}",
+            "caption": full_title,
+            "residual_mad_rms": round(rms, 8),
+            "residual_max_abs": round(max_abs, 8),
+            "significant_pixel_fraction": round(sig_frac, 6),
+            "overlap_pixels": int(overlap.sum()),
+            "bunit": bunit or None,
+            "scale_match": scale_applied,
+            "warnings": warnings,
+        }
+    except Exception as e:
+        logger.error(f"[FITS] difference_image failed: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
+        for p in (path_a, path_b):
             if p and os.path.exists(p):
                 try:
                     os.unlink(p)
@@ -401,9 +541,12 @@ def compute_moment_map(
         return {"success": False, "error": str(e)}
 
     finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
         if fits_path and os.path.exists(fits_path):
-            os.unlink(fits_path)
-        gc.collect()
+            try:
+                os.unlink(fits_path)
+            except PermissionError:
+                logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
 
 
 def generate_channel_maps(
@@ -562,9 +705,163 @@ def generate_channel_maps(
         return {"success": False, "error": str(e)}
 
     finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
         if fits_path and os.path.exists(fits_path):
-            os.unlink(fits_path)
-        gc.collect()
+            try:
+                os.unlink(fits_path)
+            except PermissionError:
+                logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
+
+
+def pv_slice(
+    url: str,
+    ra_start: float = None,
+    dec_start: float = None,
+    ra_end: float = None,
+    dec_end: float = None,
+    width_arcsec: float = None,
+    title: str = "",
+) -> Dict[str, Any]:
+    """
+    Extract a position-velocity diagram along an arbitrary sky path using
+    pvextractor (the canonical rotation/outflow diagnostic for cubes).
+
+    The path runs from (ra_start, dec_start) to (ra_end, dec_end); an optional
+    width in arcsec averages perpendicular to the path. Unlike a fixed
+    pixel-row slice, this handles inclined disks, outflows, and filaments at
+    any position angle.
+
+    Returns:
+        {"success": True, "image_path": "/api/images/xxx.png", "caption": "...",
+         "path_length_arcsec": ..., "position_angle_deg": ...}
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+
+    fits_path = None
+    try:
+        for name, value in (("ra_start", ra_start), ("dec_start", dec_start),
+                            ("ra_end", ra_end), ("dec_end", dec_end)):
+            if value is None:
+                return {"success": False, "error": f"{name} is required (path endpoints in ICRS degrees)."}
+        if width_arcsec is not None and not (math.isfinite(float(width_arcsec)) and float(width_arcsec) > 0):
+            return {"success": False, "error": "width_arcsec must be a positive number of arcseconds."}
+
+        fits_path = _download_fits(url, title or "pv slice")
+        try:
+            from spectral_cube import SpectralCube
+            cube = SpectralCube.read(fits_path, memmap=True)
+        except Exception as e:
+            logger.error(f"[FITS] spectral-cube can't read file: {e}")
+            return {"success": False, "error": f"Not a spectral cube: {e}"}
+
+        warnings_list = []
+        # Prefer a velocity axis when the cube has a rest frequency
+        if cube.spectral_axis.unit.is_equivalent(u.Hz):
+            try:
+                cube = cube.with_spectral_unit(u.km / u.s, velocity_convention="radio")
+            except Exception as exc:
+                warnings_list.append(f"Could not convert to velocity ({exc}); using native spectral units.")
+
+        from pvextractor import Path as PvPath, extract_pv_slice
+
+        start = SkyCoord(ra=float(ra_start) * u.deg, dec=float(dec_start) * u.deg, frame="icrs")
+        end = SkyCoord(ra=float(ra_end) * u.deg, dec=float(dec_end) * u.deg, frame="icrs")
+        length_arcsec = float(start.separation(end).arcsec)
+        pa_deg = float(start.position_angle(end).deg)
+        if length_arcsec <= 0:
+            return {"success": False, "error": "Path endpoints coincide — pick two distinct positions."}
+
+        path_coords = SkyCoord([start, end])
+        if width_arcsec and float(width_arcsec) > 0:
+            path = PvPath(path_coords, width=float(width_arcsec) * u.arcsec)
+        else:
+            path = PvPath(path_coords)
+
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            pv = extract_pv_slice(cube, path)
+
+        data = np.asarray(pv.data, dtype=float)
+        if not np.isfinite(data).any():
+            return {"success": False, "error": "The PV slice contains no finite pixels — "
+                                               "check that the path crosses the cube's field."}
+
+        # Axis extents from the PV header (axis 1 = offset, axis 2 = spectral)
+        header = pv.header
+        ny, nx = data.shape
+        off0 = float(header.get("CRVAL1", 0.0)) + (1 - float(header.get("CRPIX1", 1))) * float(header.get("CDELT1", 1.0))
+        off1 = off0 + (nx - 1) * float(header.get("CDELT1", 1.0))
+        sp0 = float(header.get("CRVAL2", 0.0)) + (1 - float(header.get("CRPIX2", 1))) * float(header.get("CDELT2", 1.0))
+        sp1 = sp0 + (ny - 1) * float(header.get("CDELT2", 1.0))
+        cunit1 = str(header.get("CUNIT1", "deg") or "deg").strip().lower()
+        cunit2 = str(header.get("CUNIT2", "") or "").strip().lower()
+        if cunit1 in ("deg", "degree", "degrees"):
+            off0, off1 = off0 * 3600.0, off1 * 3600.0
+        elif cunit1 == "arcmin":
+            off0, off1 = off0 * 60.0, off1 * 60.0
+        if cunit2 in ("m/s", "m s-1", "m.s**-1"):
+            sp0, sp1, sp_label = sp0 / 1e3, sp1 / 1e3, "Velocity (km/s)"
+        elif cunit2 in ("km/s", "km s-1"):
+            sp_label = "Velocity (km/s)"
+        elif cunit2 in ("hz",):
+            sp0, sp1, sp_label = sp0 / 1e9, sp1 / 1e9, "Frequency (GHz)"
+        else:
+            sp_label = f"Spectral axis ({cunit2 or 'native'})"
+
+        from astropy.visualization import ZScaleInterval, ImageNormalize, SqrtStretch
+        norm = ImageNormalize(data[np.isfinite(data)], interval=ZScaleInterval(), stretch=SqrtStretch())
+
+        fig, ax = plt.subplots(figsize=(10.5, 6), facecolor="#0f172a")
+        ax.set_facecolor("black")
+        im = ax.imshow(data, origin="lower", cmap="inferno", norm=norm, aspect="auto",
+                       extent=[off0, off1, sp0, sp1])
+        ax.set_xlabel("Offset along path (arcsec)", color="white", fontsize=11)
+        ax.set_ylabel(sp_label, color="white", fontsize=11)
+        ax.tick_params(colors="white", labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.03)
+        cbar.set_label(str(cube.unit), color="white", fontsize=9)
+        cbar.ax.yaxis.set_tick_params(color="white")
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white", fontsize=8)
+        width_txt = f", width {float(width_arcsec):g}\"" if width_arcsec else ""
+        full_title = (f"{title} — PV slice (PA {pa_deg:.1f}°, {length_arcsec:.1f}\"{width_txt})"
+                      if title else f"PV slice (PA {pa_deg:.1f}°, {length_arcsec:.1f}\"{width_txt})")
+        ax.set_title(full_title, color="white", fontsize=12, pad=10)
+
+        img_name = f"pvslice_{uuid.uuid4().hex[:10]}.png"
+        img_path = os.path.join(RENDERED_DIR, img_name)
+        fig.savefig(img_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+        return {
+            "success": True,
+            "image_path": f"/api/images/{img_name}",
+            "caption": full_title,
+            "path_length_arcsec": round(length_arcsec, 2),
+            "position_angle_deg": round(pa_deg, 2),
+            "width_arcsec": (round(float(width_arcsec), 2) if width_arcsec else None),
+            "spectral_axis": sp_label,
+            "shape": [int(ny), int(nx)],
+            "warnings": warnings_list,
+        }
+
+    except Exception as e:
+        logger.error(f"[FITS] pv_slice failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
+        if fits_path and os.path.exists(fits_path):
+            try:
+                os.unlink(fits_path)
+            except PermissionError:
+                logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
 
 
 def extract_spectrum(
@@ -574,6 +871,7 @@ def extract_spectrum(
     x_pixel: int = None,
     y_pixel: int = None,
     title: str = "",
+    radius_arcsec: float = None,
 ) -> Dict[str, Any]:
     """
     Download a FITS spectral cube and extract a 1D spectrum at a given
@@ -581,6 +879,11 @@ def extract_spectrum(
 
     If no position is given, extracts the spectrum at the cube center
     (peak emission pixel of collapsed image).
+
+    With ``radius_arcsec`` the spectrum is APERTURE-INTEGRATED (summed over a
+    circular aperture); for Jy/beam cubes with a restoring beam the result is
+    converted to Jy. Single-pixel spectra underestimate the flux of anything
+    resolved — prefer an aperture for photometric statements.
 
     Returns:
         {"success": True, "image_path": "/api/images/xxx.png", "caption": "..."}
@@ -607,7 +910,9 @@ def extract_spectrum(
             from astropy.coordinates import SkyCoord
             coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
             try:
-                y_pix, x_pix = cube.wcs.celestial.world_to_pixel(coord)
+                # astropy world_to_pixel returns (x, y) — assigning it as
+                # (y, x) transposed every off-center RA/Dec position (CX-05).
+                x_pix, y_pix = cube.wcs.celestial.world_to_pixel(coord)
                 x_pixel = int(round(float(x_pix)))
                 y_pixel = int(round(float(y_pix)))
             except Exception:
@@ -631,8 +936,29 @@ def extract_spectrum(
         x_pixel = max(0, min(x_pixel, nx - 1))
         y_pixel = max(0, min(y_pixel, ny - 1))
 
-        # Extract 1D spectrum
-        spectrum = cube[:, y_pixel, x_pixel]
+        # Extract 1D spectrum: single pixel, or aperture-integrated
+        aperture_info = None
+        if radius_arcsec is not None and float(radius_arcsec) > 0:
+            from astropy.wcs.utils import proj_plane_pixel_scales
+
+            pix_deg = float(np.mean(np.abs(proj_plane_pixel_scales(cube.wcs.celestial))))
+            r_pix = float(radius_arcsec) / 3600.0 / pix_deg if pix_deg > 0 else 0.0
+            if r_pix < 1.0:
+                r_pix = 1.0
+            yy, xx = np.mgrid[0:ny, 0:nx]
+            mask2d = (xx - x_pixel) ** 2 + (yy - y_pixel) ** 2 <= r_pix ** 2
+            n_ap = int(mask2d.sum())
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                spectrum = cube.with_mask(mask2d[np.newaxis, :, :]).sum(axis=(1, 2))
+            aperture_info = {
+                "radius_arcsec": round(float(radius_arcsec), 3),
+                "radius_pix": round(r_pix, 2),
+                "n_pixels": n_ap,
+            }
+        else:
+            spectrum = cube[:, y_pixel, x_pixel]
         spec_axis = cube.spectral_axis
         flux = spectrum.value
 
@@ -651,6 +977,19 @@ def extract_spectrum(
             x_label = f"Spectral Axis ({spec_axis.unit})"
 
         flux_unit = str(spectrum.unit) if hasattr(spectrum, 'unit') else "Flux"
+        # Aperture sums of Jy/beam maps convert to Jy via the beam area
+        if aperture_info is not None and "jy" in flux_unit.lower() and "beam" in flux_unit.lower():
+            try:
+                beam = getattr(cube, "beam", None)
+                if beam is not None:
+                    pix_area_sr = ((pix_deg * u.deg) ** 2).to(u.sr)
+                    beam_pix = float((beam.sr / pix_area_sr).decompose().value)
+                    if beam_pix > 0:
+                        flux = flux / beam_pix
+                        flux_unit = "Jy"
+                        aperture_info["beam_area_pix"] = round(beam_pix, 3)
+            except Exception as beam_err:
+                logger.warning(f"[FITS] Jy/beam→Jy conversion skipped: {beam_err}")
 
         # Plot
         fig, ax = plt.subplots(figsize=(12, 5), facecolor="#0f172a")
@@ -668,6 +1007,8 @@ def extract_spectrum(
         pos_label = f"pixel ({x_pixel}, {y_pixel})"
         if ra_deg is not None:
             pos_label = f"RA={ra_deg:.4f}°, Dec={dec_deg:.4f}°"
+        if aperture_info is not None:
+            pos_label += f" (aperture r={aperture_info['radius_arcsec']:g}\")"
         full_title = f"{title} — Spectrum at {pos_label}" if title else f"Spectrum at {pos_label}"
         ax.set_title(full_title, color="white", fontsize=13, pad=10)
 
@@ -679,23 +1020,32 @@ def extract_spectrum(
                     facecolor=fig.get_facecolor())
         plt.close(fig)
 
-        return {
+        result = {
             "success": True,
             "image_path": f"/api/images/{img_name}",
             "caption": full_title,
             "pixel_position": {"x": x_pixel, "y": y_pixel},
             "n_channels": len(flux),
+            "flux_unit": flux_unit,
             "spectral_range": f"{x_data[0]:.4f} – {x_data[-1]:.4f} {x_label.split('(')[-1].rstrip(')')}",
         }
+        if aperture_info is not None:
+            result["aperture"] = aperture_info
+            result["note"] = ("Aperture-integrated spectrum"
+                              + (" converted to Jy via the beam area." if flux_unit == "Jy" else "."))
+        return result
 
     except Exception as e:
         logger.error(f"[FITS] extract_spectrum failed: {e}")
         return {"success": False, "error": str(e)}
 
     finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
         if fits_path and os.path.exists(fits_path):
-            os.unlink(fits_path)
-        gc.collect()
+            try:
+                os.unlink(fits_path)
+            except PermissionError:
+                logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
 
 
 def fit_spectral_line(
@@ -742,7 +1092,9 @@ def fit_spectral_line(
             from astropy.coordinates import SkyCoord
             coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
             try:
-                y_pix, x_pix = cube.wcs.celestial.world_to_pixel(coord)
+                # astropy world_to_pixel returns (x, y) — assigning it as
+                # (y, x) transposed every off-center RA/Dec position (CX-05).
+                x_pix, y_pix = cube.wcs.celestial.world_to_pixel(coord)
                 x_pixel = int(round(float(x_pix)))
                 y_pixel = int(round(float(y_pix)))
             except Exception:
@@ -916,6 +1268,9 @@ def fit_spectral_line(
         return {"success": False, "error": str(e)}
 
     finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
         if fits_path and os.path.exists(fits_path):
-            os.unlink(fits_path)
-        gc.collect()
+            try:
+                os.unlink(fits_path)
+            except PermissionError:
+                logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")

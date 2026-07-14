@@ -137,6 +137,7 @@ class AlerceClient:
                 "path": render.get("web_url"),
                 "png_path": render.get("png_path"),
                 "pdf_path": render.get("pdf_path"),
+                "plotly_spec": self._light_curve_plotly_spec(lc),
                 "oid": lc["oid"],
                 "n_detections": lc["n_detections"],
                 "n_non_detections": lc["n_non_detections"],
@@ -144,6 +145,78 @@ class AlerceClient:
             }
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def _light_curve_plotly_spec(lc: Dict[str, Any]) -> Dict[str, Any]:
+        """Interactive scatter spec (basic Plotly bundle) mirroring the PNG:
+        per-band detections with error bars, non-detection limits as
+        triangle-down markers, magnitude axis reversed. The TOTAL rendered
+        points (detections + limits across all bands) are capped at 5000 so the
+        SVG bundle stays light — the budget is split evenly across the bands and
+        between detections/limits (low-latency invariant)."""
+        TOTAL_CAP = 5000
+        n_bands = max(1, len(FID_STYLE))
+        det_cap = max(1, TOTAL_CAP // (n_bands * 2))
+        lim_cap = det_cap
+
+        def _cap(rows: List[Dict[str, Any]], cap: int) -> Tuple[List[Dict[str, Any]], bool]:
+            rows = sorted(rows, key=lambda r: _float_or_none(r.get("mjd")) or 0.0)
+            if len(rows) <= cap:
+                return rows, False
+            step = len(rows) / cap
+            return [rows[int(i * step)] for i in range(cap)], True
+
+        traces: List[Dict[str, Any]] = []
+        truncated = False
+        for fid, (label, color) in FID_STYLE.items():
+            dets = [row for row in lc.get("detections", [])
+                    if row.get("fid") == fid and row.get("mjd") is not None and row.get("magpsf") is not None]
+            dets, dtrunc = _cap(dets, det_cap)
+            truncated = truncated or dtrunc
+            if dets:
+                traces.append({
+                    "type": "scatter",
+                    "mode": "markers",
+                    "name": f"{label} detections",
+                    "x": [row["mjd"] for row in dets],
+                    "y": [row["magpsf"] for row in dets],
+                    "error_y": {
+                        "type": "data",
+                        "array": [row.get("sigmapsf") or 0 for row in dets],
+                        "visible": True,
+                        "thickness": 1,
+                    },
+                    "marker": {"color": color, "size": 6},
+                    "customdata": [str(row.get("candid") or "") for row in dets],
+                    "hovertemplate": ("MJD %{x:.3f}<br>" + label + " = %{y:.3f} mag"
+                                      "<br>candid %{customdata}<extra></extra>"),
+                })
+            nondets = [row for row in lc.get("non_detections", [])
+                       if row.get("fid") == fid and row.get("mjd") is not None and row.get("diffmaglim") is not None]
+            nondets, ntrunc = _cap(nondets, lim_cap)
+            truncated = truncated or ntrunc
+            if nondets:
+                traces.append({
+                    "type": "scatter",
+                    "mode": "markers",
+                    "name": f"{label} limits",
+                    "x": [row["mjd"] for row in nondets],
+                    "y": [row["diffmaglim"] for row in nondets],
+                    "marker": {"color": color, "size": 6, "symbol": "triangle-down", "opacity": 0.35},
+                    "hovertemplate": "MJD %{x:.3f}<br>" + label + " limit %{y:.3f} mag<extra></extra>",
+                })
+        title = str(lc.get("oid") or "ZTF light curve") + (" (subsampled)" if truncated else "")
+        return {
+            "data": traces,
+            "layout": {
+                "title": {"text": title},
+                "xaxis": {"title": {"text": "MJD"}},
+                "yaxis": {"title": {"text": "PSF magnitude"}, "autorange": "reversed"},
+                "height": 420,
+                "hovermode": "closest",
+                "legend": {"orientation": "h"},
+            },
+        }
 
     def stamp_triplet(self, oid: str, candid: Optional[Any] = None) -> Dict[str, Any]:
         try:

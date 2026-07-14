@@ -2535,8 +2535,10 @@ def register_tools(agent: "QuasarAgent") -> None:
         description=(
             "Download a FITS spectral cube and extract a 1D spectrum at a given "
             "sky position (RA/Dec) or pixel coordinate. If no position is given, "
-            "extracts at the peak emission pixel. The spectrum is plotted as "
-            "flux vs frequency/velocity and displayed inline."
+            "extracts at the peak emission pixel. Pass radius_arcsec for an "
+            "aperture-integrated spectrum (Jy/beam cubes convert to Jy) — "
+            "single-pixel spectra underestimate resolved sources. The spectrum "
+            "is plotted as flux vs frequency/velocity and displayed inline."
         ),
         function=agent._viz_tool_fn("extract_spectrum"),
         parameters={
@@ -2548,6 +2550,7 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "x_pixel": {"type": "integer", "description": "X pixel coordinate. Optional. Use if RA/Dec not available."},
                 "y_pixel": {"type": "integer", "description": "Y pixel coordinate. Optional."},
                 "title":   {"type": "string",  "description": "Title for the spectrum plot."},
+                "radius_arcsec": {"type": "number", "description": "Optional aperture radius in arcsec for an integrated spectrum instead of a single pixel."},
             },
             "required": ["url"]
         },
@@ -2578,6 +2581,286 @@ def register_tools(agent: "QuasarAgent") -> None:
             "required": ["url"]
         },
         category="analysis"
+    ))
+
+    # ── Quantitative image analysis + hips2fits FITS-mode products (2026-07) ──
+    _IMG_INPUT_PROPS = {
+        "url":         {"type": "string", "description": "Direct FITS URL (archive access_url, hips2fits FITS URL, SODA cutout). Preferred when available."},
+        "survey":      {"type": "string", "description": "HiPS survey alias or raw ID for a cutout when no url is given (optical/dss2, sdss, 2mass, wise, galex, xray, vlass/radio, ...)."},
+        "target_name": {"type": "string", "description": "Target to resolve to RA/Dec when no url/ra/dec is given."},
+        "ra":          {"type": "number", "description": "ICRS right ascension in degrees (with survey mode)."},
+        "dec":         {"type": "number", "description": "ICRS declination in degrees (with survey mode)."},
+        "fov_deg":     {"type": "number", "description": "Cutout field of view in degrees (survey mode). Default 0.25."},
+        "width":       {"type": "integer", "description": "Cutout width in pixels (survey mode, max 2048). Default 512."},
+        "title":       {"type": "string", "description": "Title for the rendered figure."},
+    }
+    agent.tool_registry.register(Tool(
+        name="image_statistics",
+        description=(
+            "Measure sigma-clipped statistics, robust MAD noise, a 5-sigma "
+            "point-source limit, coverage/blankness fractions, and a pixel-value "
+            "histogram for a FITS image (url) or any survey cutout (survey + "
+            "position). Use to answer 'is my source detectable in this survey' "
+            "or 'is this cutout blank' before deeper analysis."
+        ),
+        function=agent._viz_tool_fn("image_statistics"),
+        parameters={"type": "object", "properties": dict(_IMG_INPUT_PROPS), "required": []},
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="detect_sources",
+        description=(
+            "Detect sources in a FITS image or survey cutout (photutils "
+            "DAOStarFinder, segmentation fallback) and measure aperture "
+            "photometry with local background annuli. Returns an annotated "
+            "detection image plus a source list with RA/Dec, peak, aperture "
+            "flux, and SNR (integrated Jy for Jy/beam radio maps). Use for "
+            "'how many sources are in this field and how bright are they'."
+        ),
+        function=agent._viz_tool_fn("detect_sources"),
+        parameters={
+            "type": "object",
+            "properties": {
+                **_IMG_INPUT_PROPS,
+                "threshold_sigma": {"type": "number", "description": "Detection threshold in background sigma. Default 5."},
+                "fwhm_arcsec": {"type": "number", "description": "Expected source FWHM in arcsec (defaults to the beam, else 3 px)."},
+                "max_sources": {"type": "integer", "description": "Max sources returned, brightest first. Default 100, cap 500."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="measure_region",
+        description=(
+            "Measure statistics inside a sky region on a FITS image or survey "
+            "cutout: sum, mean/median, MAD RMS, area in arcsec^2, and integrated "
+            "flux in Jy for Jy/beam maps with a beam. Accepts a DS9 region "
+            "string (circle/ellipse/box/polygon — paste straight from DS9/CARTA) "
+            "or ra/dec + radius_arcsec. Renders the region on the image."
+        ),
+        function=agent._viz_tool_fn("measure_region"),
+        parameters={
+            "type": "object",
+            "properties": {
+                **_IMG_INPUT_PROPS,
+                "region": {"type": "string", "description": "DS9 region string in sky coords, e.g. 'circle(150.1d, 2.2d, 30\")'."},
+                "radius_arcsec": {"type": "number", "description": "Circular aperture radius in arcsec (with ra/dec) when no region string is given."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="fit_gaussian_source",
+        description=(
+            "Fit a 2D Gaussian to a source in a FITS image (CASA imfit "
+            "workflow): peak, integrated flux (Jy for Jy/beam maps), fitted "
+            "FWHM sizes/PA, and the beam-deconvolved size or a 'consistent "
+            "with point source' verdict when the header has a restoring beam. "
+            "Renders a data/model/residual panel. Defaults to the peak pixel."
+        ),
+        function=agent._viz_tool_fn("fit_gaussian_source"),
+        parameters={
+            "type": "object",
+            "properties": {
+                **_IMG_INPUT_PROPS,
+                "x_pixel": {"type": "number", "description": "X pixel position of the source (alternative to ra/dec)."},
+                "y_pixel": {"type": "number", "description": "Y pixel position of the source."},
+                "box_arcsec": {"type": "number", "description": "Fit box full width in arcsec (defaults to ~6 beam majors)."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="radial_profile",
+        description=(
+            "Azimuthally averaged radial profile + curve of growth at a "
+            "position in a FITS image or survey cutout: FWHM, half-light "
+            "radius, total flux with a convergence check, beam HWHM marked "
+            "for radio maps. The standard extended-vs-point-source and "
+            "asymptotic-flux diagnostic."
+        ),
+        function=agent._viz_tool_fn("radial_profile"),
+        parameters={
+            "type": "object",
+            "properties": {
+                **_IMG_INPUT_PROPS,
+                "x_pixel": {"type": "number", "description": "X pixel position (alternative to ra/dec)."},
+                "y_pixel": {"type": "number", "description": "Y pixel position."},
+                "max_radius_arcsec": {"type": "number", "description": "Outer profile radius in arcsec (default: quarter of the image)."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="hips_contour_overlay",
+        description=(
+            "Overlay one survey as CONTOURS on another survey's image at any "
+            "position using calibrated hips2fits FITS cutouts — e.g. VLASS "
+            "radio contours on DSS2 optical, WISE on SDSS. Works for any HiPS "
+            "survey alias or raw ID; no archive FITS products needed. The "
+            "classic multiwavelength counterpart/proposal figure."
+        ),
+        function=agent._viz_tool_fn("hips_contour_overlay"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "base_survey":    {"type": "string", "description": "Survey rendered as the color image. Default 'optical' (DSS2)."},
+                "contour_survey": {"type": "string", "description": "Survey rendered as contours. Default 'vlass'."},
+                "target_name":    {"type": "string"},
+                "ra":             {"type": "number"},
+                "dec":            {"type": "number"},
+                "fov_deg":        {"type": "number", "default": 0.25},
+                "width":          {"type": "integer", "default": 512},
+                "contour_levels": {"type": "integer", "default": 8},
+                "base_cmap":      {"type": "string", "default": "inferno"},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="image_difference",
+        description=(
+            "WCS-align two FITS images (reproject), background/gain match, "
+            "subtract, and render A, aligned B, and the A−B residual with "
+            "residual statistics. Accepts two FITS urls OR two survey aliases "
+            "+ one position. Use for epoch-to-epoch transient checks (e.g. "
+            "DSS1 vs DSS2, two VLASS epochs) and morphology comparisons."
+        ),
+        function=agent._viz_tool_fn("image_difference"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url_a":       {"type": "string", "description": "FITS URL for image A (the reference)."},
+                "url_b":       {"type": "string", "description": "FITS URL for image B (reprojected onto A)."},
+                "survey_a":    {"type": "string", "description": "Survey alias for A when using cutout mode."},
+                "survey_b":    {"type": "string", "description": "Survey alias for B when using cutout mode."},
+                "target_name": {"type": "string"},
+                "ra":          {"type": "number"},
+                "dec":         {"type": "number"},
+                "fov_deg":     {"type": "number", "default": 0.25},
+                "width":       {"type": "integer", "default": 512},
+                "label_a":     {"type": "string"},
+                "label_b":     {"type": "string"},
+                "scale_match": {"type": "boolean", "default": True, "description": "Background/gain match B to A before subtracting."},
+                "title":       {"type": "string"},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="hips_rgb_composite",
+        description=(
+            "Build a Lupton three-color RGB composite from any three "
+            "SINGLE-BAND HiPS surveys (R, G, B order) at a position. Use "
+            "single-band aliases — 2mass_j/2mass_h/2mass_k, sdss_g/r/i/z, "
+            "wise_w1..w4, galex_nuv/fuv, dss2_red/dss2_blue — or raw IDs like "
+            "'CDS/P/SDSS9/i'. Avoid the color aliases (wise/2mass/sdss/optical): "
+            "they are multi-plane and make poor channels. Channels arrive "
+            "pixel-aligned from hips2fits; blank layers are rejected. Default "
+            "is 2MASS K/H/J."
+        ),
+        function=agent._viz_tool_fn("hips_rgb_composite"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "surveys":     {"type": "array", "items": {"type": "string"}, "description": "Exactly three single-band surveys in R, G, B order."},
+                "target_name": {"type": "string"},
+                "ra":          {"type": "number"},
+                "dec":         {"type": "number"},
+                "fov_deg":     {"type": "number", "default": 0.25},
+                "width":       {"type": "integer", "default": 512},
+                "stretch":     {"type": "number", "default": 5.0, "description": "Lupton stretch parameter."},
+                "q":           {"type": "number", "default": 8.0, "description": "Lupton Q (softening) parameter."},
+                "title":       {"type": "string"},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="vlass_epoch_comparison",
+        description=(
+            "Compare VLASS 3 GHz epochs (2017→now) at a position for radio "
+            "variability/transient triage: per-epoch Quicklook cutouts from "
+            "CADC rendered as a shared-stretch panel with blinkable frames, "
+            "plus per-epoch peak flux, RMS, and a variability verdict that "
+            "folds in the ~15% Quicklook systematic. Dec > -40 only. "
+            "Complements vlass_cutout (median stack, no time axis)."
+        ),
+        function=agent._viz_tool_fn("vlass_epoch_comparison"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_name":   {"type": "string"},
+                "ra":            {"type": "number"},
+                "dec":           {"type": "number"},
+                "radius_arcsec": {"type": "number", "default": 60, "description": "Cutout radius per epoch (10–600 arcsec)."},
+                "max_epochs":    {"type": "integer", "default": 6},
+                "title":         {"type": "string"},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="moc_operations",
+        description=(
+            "MOC coverage algebra: intersection/union/difference of survey "
+            "footprints (MOCServer dataset IDs from survey_coverage), with "
+            "the resulting sky area in deg^2 and an interactive sky view of "
+            "the derived footprint. Optionally pass ra_list/dec_list to flag "
+            "which targets fall inside it. Answers 'where do these surveys "
+            "overlap?' and 'which of my candidates have joint coverage?'."
+        ),
+        function=agent._viz_tool_fn("moc_operations"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "survey_ids": {"type": "array", "items": {"type": "string"}, "description": "2+ MOCServer dataset IDs (e.g. 'CDS/P/DES-DR2/g'); difference = first minus the rest."},
+                "operation":  {"type": "string", "enum": ["intersection", "union", "difference"], "default": "intersection"},
+                "target_name": {"type": "string", "description": "Optional view center; defaults to a point inside the derived MOC."},
+                "ra":         {"type": "number"},
+                "dec":        {"type": "number"},
+                "fov_deg":    {"type": "number", "default": 20.0},
+                "survey":     {"type": "string", "default": "optical", "description": "Base imagery for the sky view."},
+                "order":      {"type": "integer", "default": 8, "description": "HEALPix MOC order (3-10)."},
+                "ra_list":    {"type": "array", "items": {"type": "number"}, "description": "Optional target RAs to test against the derived MOC."},
+                "dec_list":   {"type": "array", "items": {"type": "number"}, "description": "Optional target Decs (same length as ra_list)."},
+            },
+            "required": ["survey_ids"],
+        },
+        category="archive",
+    ))
+    agent.tool_registry.register(Tool(
+        name="pv_slice",
+        description=(
+            "Extract a position-velocity (PV) diagram from a FITS spectral "
+            "cube along an ARBITRARY sky path (pvextractor): two endpoints "
+            "in ICRS degrees (e.g. along a disk major axis from "
+            "fit_gaussian_source) plus an optional averaging width in arcsec. "
+            "The canonical rotation/outflow diagnostic for ALMA/VLA cubes."
+        ),
+        function=agent._viz_tool_fn("pv_slice"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url":          {"type": "string", "description": "Direct URL to the FITS spectral cube."},
+                "ra_start":     {"type": "number", "description": "Path start RA (ICRS degrees)."},
+                "dec_start":    {"type": "number", "description": "Path start Dec."},
+                "ra_end":       {"type": "number", "description": "Path end RA."},
+                "dec_end":      {"type": "number", "description": "Path end Dec."},
+                "width_arcsec": {"type": "number", "description": "Optional averaging width perpendicular to the path."},
+                "title":        {"type": "string"},
+            },
+            "required": ["url", "ra_start", "dec_start", "ra_end", "dec_end"],
+        },
+        category="analysis",
     ))
 
     # ── Astronomy Calculators (U9, U10, R6, R4) ───────────────

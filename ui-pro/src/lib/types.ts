@@ -42,6 +42,11 @@ export interface MocOverlay {
     mocJson: Record<string, number[]>;
 }
 
+export interface BlinkFrame {
+    url: string;
+    label?: string;
+}
+
 export interface HipsImageMeta {
     kind?: string;
     ra?: number;
@@ -52,6 +57,8 @@ export interface HipsImageMeta {
     fitsUrl?: string;
     /** Survey footprint overlays drawn on the interactive view. */
     mocs?: MocOverlay[];
+    /** Ordered, WCS-matched frames for the blink comparator (kind "blink"). */
+    frames?: BlinkFrame[];
 }
 
 export interface Message {

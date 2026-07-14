@@ -108,6 +108,7 @@ class LightCurveSuite:
             fig.tight_layout()
             render = self.plotting_service._save_and_encode(fig, f"space_lightcurve_{uuid.uuid4().hex[:10]}")
             return _image_result(render, {
+                "plotly_spec": _lightcurve_plotly_spec(time, flux, value_kind, f"{target_s} ({_meta_label(meta)})"),
                 "n_points": int(len(time)),
                 "time_span_days": _time_span(time),
                 "value_kind": value_kind,
@@ -181,6 +182,7 @@ class LightCurveSuite:
                 period["best_frequency_per_d"],
             )
             return _image_result(plot, {
+                "plotly_spec": _period_plotly_spec(period, value_kind, identifier_s),
                 "best_period_d": period["best_period_d"],
                 "best_frequency_per_d": period["best_frequency_per_d"],
                 "period_unc_d": period["period_unc_d"],
@@ -262,6 +264,130 @@ class LightCurveSuite:
         ax2.set_title(identifier)
         fig.tight_layout()
         return self.plotting_service._save_and_encode(fig, f"period_search_{uuid.uuid4().hex[:10]}")
+
+
+PLOTLY_POINT_CAP = 5000
+
+
+def _downsample_pair(time: Any, value: Any, cap: int = PLOTLY_POINT_CAP) -> Tuple[Any, Any, bool]:
+    """Uniform-stride subsample so interactive specs stay light (SVG scatter)."""
+    import numpy as np
+
+    t = np.asarray(time, dtype=float)
+    v = np.asarray(value, dtype=float)
+    if t.size <= cap:
+        return t, v, False
+    idx = np.linspace(0, t.size - 1, cap).round().astype(int)
+    return t[idx], v[idx], True
+
+
+def _lightcurve_plotly_spec(time: Any, value: Any, value_kind: str, title: str) -> Dict[str, Any]:
+    """Interactive light-curve spec (basic Plotly bundle: plain scatter)."""
+    t, v, truncated = _downsample_pair(time, value)
+    y_title = "Magnitude" if value_kind == "mag" else "Normalized flux"
+    layout: Dict[str, Any] = {
+        "title": {"text": title + (" (subsampled)" if truncated else "")},
+        "xaxis": {"title": {"text": "Time (days)"}},
+        "yaxis": {"title": {"text": y_title}},
+        "height": 420,
+        "hovermode": "closest",
+    }
+    if value_kind == "mag":
+        layout["yaxis"]["autorange"] = "reversed"
+    return {
+        "data": [{
+            "type": "scatter",
+            "mode": "markers",
+            "name": "light curve",
+            "x": [round(float(x), 6) for x in t],
+            "y": [round(float(y), 6) for y in v],
+            "marker": {"color": "#22d3ee", "size": 3, "opacity": 0.75},
+            "hovertemplate": "t = %{x:.4f} d<br>%{y:.5f}<extra></extra>",
+        }],
+        "layout": layout,
+    }
+
+
+def _period_plotly_spec(period: Dict[str, Any], value_kind: str, identifier: str) -> Dict[str, Any]:
+    """Periodogram + phase-fold as a two-panel interactive spec.
+
+    The raw (time, value) arrays, best period, and aliases ride in
+    ``layout.meta`` so the frontend can re-fold client-side without a server
+    round-trip (period-slider card).
+    """
+    import numpy as np
+
+    freq = np.asarray(period["frequency_per_d"], dtype=float)
+    power = np.asarray(period["power"], dtype=float)
+    # The fold trace is drawn twice (phase, phase+1) for wrap continuity, so
+    # cap the RAW observations at 2000 -> <=4000 rendered markers (CX-31).
+    t, v, truncated = _downsample_pair(period["time_days"], period["value"], cap=2000)
+    best_period = float(period["best_period_d"])
+    phase = ((t - np.nanmin(t)) / best_period) % 1.0
+
+    pf, pw, _ = _downsample_pair(freq, power, cap=4000)
+    y_title = "Magnitude" if value_kind == "mag" else "Normalized flux"
+    fold_yaxis: Dict[str, Any] = {"title": {"text": y_title}, "anchor": "x2"}
+    if value_kind == "mag":
+        fold_yaxis["autorange"] = "reversed"
+    fap = period.get("fap")
+    title_txt = f"{identifier}: best period {best_period:.5g} d"
+    if fap is not None:
+        title_txt += f" (FAP {fap:.2g})"
+    return {
+        "data": [
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": "periodogram",
+                "x": [round(float(x), 6) for x in pf],
+                "y": [round(float(y), 6) for y in pw],
+                "line": {"color": "#22d3ee", "width": 1.2},
+                "xaxis": "x",
+                "yaxis": "y",
+                "hovertemplate": "f = %{x:.5f} /d<br>power %{y:.4f}<extra></extra>",
+            },
+            {
+                "type": "scatter",
+                "mode": "markers",
+                "name": "phase fold",
+                "x": [round(float(x), 5) for x in np.concatenate([phase, phase + 1.0])],
+                "y": [round(float(y), 6) for y in np.concatenate([v, v])],
+                "marker": {"color": "#f59e0b", "size": 4, "opacity": 0.75},
+                "xaxis": "x2",
+                "yaxis": "y2",
+                "hovertemplate": "phase %{x:.3f}<br>%{y:.5f}<extra></extra>",
+            },
+        ],
+        "layout": {
+            "title": {"text": title_txt + (" (subsampled)" if truncated else "")},
+            "grid": {"rows": 1, "columns": 2, "pattern": "independent"},
+            "xaxis": {"title": {"text": "Frequency (1/day)"}},
+            "yaxis": {"title": {"text": "Lomb-Scargle power"}},
+            "xaxis2": {"title": {"text": "Phase"}},
+            "yaxis2": fold_yaxis,
+            "height": 400,
+            "showlegend": False,
+            "shapes": [{
+                "type": "line",
+                "xref": "x", "yref": "paper",
+                "x0": float(period["best_frequency_per_d"]), "x1": float(period["best_frequency_per_d"]),
+                "y0": 0, "y1": 1,
+                "line": {"color": "#f59e0b", "width": 1, "dash": "dash"},
+            }],
+            "meta": {
+                "kind": "period_fold",
+                "time_days": [round(float(x), 6) for x in t],
+                "value": [round(float(y), 6) for y in v],
+                "value_kind": value_kind,
+                "best_period_d": best_period,
+                "period_unc_d": period.get("period_unc_d"),
+                "fap": fap,
+                "top_periods": period.get("top_periods"),
+                "identifier": identifier,
+            },
+        },
+    }
 
 
 def _run_lomb_scargle(time: Any, value: Any, *, value_kind: str, min_period_d: float, max_period_d: float, warnings: List[str]) -> Dict[str, Any]:
