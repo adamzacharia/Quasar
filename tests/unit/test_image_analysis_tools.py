@@ -545,7 +545,6 @@ def test_vlass_epoch_target_pixel_blank_retries_next_subtile(monkeypatch, tmp_pa
                 return path
         return path_b
 
-    monkeypatch.setattr(ve, "_download_fits", fake_download)
     monkeypatch.setattr("services.fits_service._download_fits", fake_download)
     monkeypatch.setattr("services.plotting.PLOT_OUTPUT_DIR", str(tmp_path))
 
@@ -679,11 +678,19 @@ def test_rgb_composite_offline(monkeypatch, tmp_path):
         lambda self, survey_id, ra, dec, fov, width: next(layers),
     )
     out = HipsImageService(base_url="https://example.test/hips2fits").rgb_composite(
-        10.0, -2.0, ["wise", "2mass", "dss2_red"], width=32,
+        10.0, -2.0, ["wise_w1", "2mass_j", "dss2_red"], width=32,
     )
     assert out["success"] is True
     assert os.path.exists(out["png_path"])
-    assert out["channels"]["red"] == "wise"
+    assert out["channels"]["red"] == "wise_w1"
+
+
+def test_rgb_composite_rejects_color_alias_channel():
+    # Color (multi-plane) aliases are not valid single-band channels (CX-35).
+    svc = HipsImageService(base_url="https://example.test/hips2fits")
+    out = svc.rgb_composite(10.0, -2.0, ["wise", "2mass_j", "dss2_red"])
+    assert out["success"] is False
+    assert "single-band" in out["error"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
