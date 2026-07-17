@@ -11,6 +11,10 @@ python-dotenv
 rich
 humanize
 
+# Archive-profile golden-query validation (tests/unit/test_archive_profiles.py):
+# AST-parse SQL/ADQL golden examples — no regex fallback (duel task-81b3b73-2145 DX-13).
+sqlglot
+
 # Astronomy
 astropy>=6.1.0
 astroquery

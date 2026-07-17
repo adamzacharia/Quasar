@@ -6,6 +6,7 @@ import { Download, Maximize2, Minus, Plus, RefreshCw, X } from "lucide-react";
 import { AladinSkyView, SURVEYS } from "./AladinSkyView";
 import { BlinkCard } from "./BlinkCard";
 import { ImageLightbox } from "./ImageLightbox";
+import { QueryProvenance } from "./QueryProvenance";
 import type { HipsImageMeta } from "../lib/types";
 import { clampHipsFov, hips2fitsUrl, normalizeHipsSurveyId } from "../lib/hips-imagery";
 
@@ -13,6 +14,8 @@ type HipsImageCardProps = {
     imageUrl: string;
     caption?: string;
     imageMeta?: HipsImageMeta;
+    /** The exact request behind this image (Feature 1), when known. */
+    request?: import("../lib/api").ToolRequest;
 };
 
 function FullSizeLink({ href }: { href: string }) {
@@ -89,7 +92,7 @@ function cacheBusted(url: string) {
     }
 }
 
-export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCardProps) {
+export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: HipsImageCardProps) {
     const kind = imageMeta?.kind || "";
     const ra = Number(imageMeta?.ra);
     const dec = Number(imageMeta?.dec);
@@ -147,12 +150,24 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
 
     // Blink comparator (kind "blink"): matched-geometry frames (e.g. VLASS
     // epochs) played in place; the static panel rides along as the summary.
+    // NB: these supported variants return early — render the provenance block
+    // alongside them or they lose their request surface entirely (CX-15).
     if (kind === "blink" && (imageMeta?.frames?.length ?? 0) >= 2) {
-        return <BlinkCard frames={imageMeta!.frames!} caption={caption} summaryUrl={imageUrl} />;
+        return (
+            <>
+                <BlinkCard frames={imageMeta!.frames!} caption={caption} summaryUrl={imageUrl} />
+                <div className="pl-11"><QueryProvenance request={request} /></div>
+            </>
+        );
     }
 
     if (!canSwitchSurvey && !canInteract) {
-        return <PlainImageCard imageUrl={imageUrl} caption={caption} fitsHref={fitsHref} />;
+        return (
+            <>
+                <PlainImageCard imageUrl={imageUrl} caption={caption} fitsHref={fitsHref} />
+                <div className="pl-11"><QueryProvenance request={request} /></div>
+            </>
+        );
     }
 
     return (
@@ -256,6 +271,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta }: HipsImageCa
                         {fitsHref && <FitsDownloadLink href={fitsHref} />}
                         <FullSizeLink href={displayedUrl} />
                     </div>
+                    <QueryProvenance request={request} />
                 </div>
             </div>
 

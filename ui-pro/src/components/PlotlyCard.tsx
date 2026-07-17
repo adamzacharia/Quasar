@@ -2,16 +2,19 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, Loader2, RotateCcw } from "lucide-react";
+import { Download, Loader2, RotateCcw, Waves } from "lucide-react";
 import type { PlotlyModule } from "plotly.js-basic-dist-min";
 import type { PlotlyFigureSpec, PlotlyCardMeta } from "../lib/types";
 import { ImageLightbox } from "./ImageLightbox";
+import { QueryProvenance } from "./QueryProvenance";
 
 type PlotlyCardProps = {
     spec?: PlotlyFigureSpec;
     title?: string;
     pngFallback?: string;
     meta?: PlotlyCardMeta;
+    /** The exact request behind this figure (Feature 1), when known. */
+    request?: import("../lib/api").ToolRequest;
 };
 
 function isValidSpec(spec: PlotlyFigureSpec | undefined): spec is PlotlyFigureSpec & { data: unknown[] } {
@@ -115,7 +118,7 @@ function aliasPeriods(period: number): { label: string; value: number }[] {
  * never in the SSR bundle) and falls back to the PNG snapshot as a regular
  * image card if the bundle fails to load or the spec is invalid.
  */
-export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) {
+export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCardProps) {
     const plotRef = useRef<HTMLDivElement>(null);
     const plotlyRef = useRef<PlotlyModule | null>(null);
     const [status, setStatus] = useState<"loading" | "ready" | "fallback">(
@@ -206,10 +209,14 @@ export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) 
     // ── Fallback: static PNG image card (or a quiet note if none given) ──
     if (status === "fallback") {
         if (!pngFallback) {
+            // A render failure must not also cost the card its provenance (CX-16)
+            // — the query still ran, and is arguably MORE useful when the plot
+            // didn't draw.
             return (
                 <div className="pl-11">
                     <div className="mt-4 rounded-xl border border-slate-700/50 bg-slate-900/60 px-4 py-3 text-xs text-slate-400">
                         Interactive plot could not be rendered{title ? `: ${title}` : "."}
+                        <QueryProvenance request={request} />
                     </div>
                 </div>
             );
@@ -226,14 +233,29 @@ export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) 
                     />
                     <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between gap-3">
                         <span className="min-w-0 truncate text-xs text-slate-400">{title || "Plot"}</span>
-                        <a
-                            href={pngFallback}
-                            download
-                            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/15"
-                        >
-                            <Download className="h-3.5 w-3.5" />
-                            PNG
-                        </a>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                            {meta?.line_explorer_url && (
+                                <a
+                                    href={meta.line_explorer_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/15"
+                                    title="Open this spectrum in the Spectral Line Explorer"
+                                >
+                                    <Waves className="h-3.5 w-3.5" />
+                                    Line Explorer
+                                </a>
+                            )}
+                            <a
+                                href={pngFallback}
+                                download
+                                className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/15"
+                            >
+                                <Download className="h-3.5 w-3.5" />
+                                PNG
+                            </a>
+                        </div>
+                        <QueryProvenance request={request} />
                     </div>
                 </div>
                 {lightboxOpen && (
@@ -300,6 +322,18 @@ export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) 
                 <div className="px-4 py-2.5 border-t border-slate-700/50 flex items-center justify-between gap-3">
                     <span className="min-w-0 truncate text-xs text-slate-400">{title || "Interactive plot"}</span>
                     <div className="flex shrink-0 items-center gap-1.5">
+                        {meta?.line_explorer_url && (
+                            <a
+                                href={meta.line_explorer_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/15"
+                                title="Open this spectrum in the Spectral Line Explorer"
+                            >
+                                <Waves className="h-3.5 w-3.5" />
+                                Line Explorer
+                            </a>
+                        )}
                         <button
                             type="button"
                             onClick={downloadPng}
@@ -312,6 +346,7 @@ export function PlotlyCard({ spec, title, pngFallback, meta }: PlotlyCardProps) 
                         </button>
                     </div>
                 </div>
+                <QueryProvenance request={request} />
             </div>
         </div>
     );

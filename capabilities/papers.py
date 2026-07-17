@@ -54,20 +54,31 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from capabilities.base import BaseCapability, ToolResult
+from capabilities.base import BaseCapability, Provenance, ToolResult
 from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
 
 logger = logging.getLogger(__name__)
 
 
-def _native(out: Dict[str, Any]) -> ToolResult:
-    """Wrap a legacy output dict as a byte-parity ToolResult."""
+def _native(out: Dict[str, Any], *, ads_query: Optional[str] = None) -> ToolResult:
+    """Wrap a legacy output dict as a byte-parity ToolResult.
+
+    ``ads_query`` (the TRANSLATED ADS query string actually executed, not the
+    user's natural-language arguments) is carried as provenance so the query-
+    provenance surface shows the real request (Feature 1). It never enters the
+    model-facing dict — it rides the adapter sidecar.
+    """
     ok = bool(isinstance(out, dict) and out.get("success"))
     err = out.get("error") if isinstance(out, dict) else None
+    prov = None
+    if ads_query:
+        prov = Provenance(service="ads", query=str(ads_query),
+                          endpoint="https://api.adsabs.harvard.edu/v1/search/query")
     return ToolResult(
         success=ok,
         error=(str(err) if (err is not None and not ok) else None),
         native=out,
+        provenance=prov,
     )
 
 
@@ -215,7 +226,7 @@ class SearchPapers(BaseCapability):
                 "ads_query": ads_query,
                 "papers": papers_list,
                 "top_title": papers_list[0]["title"] if papers_list else "No results",
-            })
+            }, ads_query=ads_query)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 
@@ -330,7 +341,7 @@ class SearchPapersByObservationId(BaseCapability):
                 "ads_query": ads_query,
                 "papers": papers_list,
                 "top_title": papers_list[0]["title"] if papers_list else "No results",
-            })
+            }, ads_query=ads_query)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 

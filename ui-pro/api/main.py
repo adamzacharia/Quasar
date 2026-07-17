@@ -264,11 +264,13 @@ from api.routers import (  # noqa: E402
     provider_keys,
     spectral_lines,
     tools,
+    usage,
     workbench,
 )
 
 app.include_router(general.router)
 app.include_router(provider_keys.router)
+app.include_router(usage.router)
 app.include_router(tools.router)
 app.include_router(auth.router)
 app.include_router(fits.router)

@@ -57,8 +57,13 @@ def _download_fits(url: str, label: str = "FITS") -> str:
         return tmp.name
 
     # hips2fits cutout URLs get the shorter 45 s cap (they return in seconds);
-    # arbitrary archive FITS keep the generous 180 s. (CX-28)
-    timeout_s = HIPS2FITS_TIMEOUT_S if "hips2fits" in url.lower() else DOWNLOAD_TIMEOUT_S
+    # arbitrary archive FITS keep the generous 180 s. Match both the literal
+    # service name AND a configured proxy base so a HIPS2FITS_BASE_URL override
+    # is still recognized (CX-28).
+    _hips_base = os.getenv("HIPS2FITS_BASE_URL", "").strip().lower()
+    _low = url.lower()
+    is_hips = "hips2fits" in _low or (_hips_base and _low.startswith(_hips_base))
+    timeout_s = HIPS2FITS_TIMEOUT_S if is_hips else DOWNLOAD_TIMEOUT_S
     resp = http_requests.get(url, timeout=timeout_s, stream=True)
     resp.raise_for_status()
 

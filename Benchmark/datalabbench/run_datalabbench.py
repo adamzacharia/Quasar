@@ -853,6 +853,18 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
                         "input": int(event.get("inputTokens", 0)),
                         "output": int(event.get("outputTokens", 0)),
                         "total": int(event.get("totalTokens", 0)),
+                        # Backend-reported estimate, priced per LLM call (one
+                        # turn can span several models), so preferred over
+                        # re-deriving from the top-level model alone.
+                        "cost_usd": event.get("costUsd"),
+                        "unpriced_tokens": int(event.get("unpricedTokens", 0) or 0),
+                        # A cost-aware backend always carries the costUsd key
+                        # (possibly null = genuinely unpriced). Its absence means
+                        # an OLD server that predates cost accounting, which is
+                        # the only case _resolve_cost may derive a local price.
+                        # A cost-aware null must NOT be overridden with an
+                        # invented number.
+                        "cost_aware": "costUsd" in event,
                     }
                 elif etype == "error":
                     ev.errors.append(str(event.get("content", ""))[:500])
@@ -892,6 +904,55 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
 
 
 # ---------------------------------------------------------------------------
+# Cost
+# ---------------------------------------------------------------------------
+
+def _resolve_cost(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Ensure `usage` carries a cost estimate, deriving one if the backend
+    didn't send it.
+
+    Prefers the backend's per-call figure. Falls back to pricing the turn's
+    token total at `model`'s rate — an approximation, since auxiliary calls
+    (image pre-pass, embeddings) may run on other models; it is flagged
+    `cost_source: "derived"` so a reader can tell the two apart.
+
+    A None cost means the model has no known price (TACC / self-hosted), not
+    that the turn was free. Do not coerce it to 0.0 in the rollup.
+    """
+    if not usage:
+        return usage
+    total_tokens = int(usage.get("total", 0) or 0)
+    if usage.get("cost_aware") or usage.get("cost_usd") is not None:
+        # Trust a cost-aware backend verbatim — including an explicit null,
+        # which is an honest "this turn is unpriced", not a missing field to
+        # backfill. Deriving here would replace that honesty with an invented
+        # main-model price and reset unpriced_tokens to 0.
+        usage["cost_source"] = "backend"
+        usage.setdefault("unpriced_tokens", 0)
+        return usage
+
+    try:
+        # Imported lazily, matching LLMJudge's use of core.llm_client below —
+        # the bench must stay runnable without the full backend importable.
+        from core.llm_client import detect_provider
+        from services.model_pricing import estimate_cost
+
+        derived = estimate_cost(
+            detect_provider(model), model,
+            int(usage.get("input", 0)), int(usage.get("output", 0)),
+        )
+    except Exception:  # noqa: BLE001 — pricing must never fail a bench run
+        derived = None
+
+    usage["cost_usd"] = derived
+    usage["cost_source"] = "derived" if derived is not None else "unpriced"
+    # Derived path prices the whole turn at the main model's rate: if that model
+    # is priced, nothing is left unpriced; if not, every token is unpriced.
+    usage["unpriced_tokens"] = 0 if derived is not None else total_tokens
+    return usage
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -915,7 +976,7 @@ def run_question(q: Dict[str, Any], args, auth_token: Optional[str],
         print(f"[ERR] {e}")
 
     result.trace_source = ev.trace_source
-    result.usage = ev.usage
+    result.usage = _resolve_cost(ev.usage, args.model)
     result.n_tool_calls = len(ev.calls)
     result.n_images = len(ev.images)
 
@@ -1081,6 +1142,33 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
                     rollup: Dict[str, Any]):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full = rollup["full_pct"]
+
+    # Cost is an estimate (services/model_pricing.py). Questions whose model has
+    # no known price (TACC / self-hosted) contribute tokens but no cost, so the
+    # unpriced count is reported next to the total — a "$0.00" total over N
+    # unpriced questions means "not measurable", not "free".
+    priced = [r for r in results if (r.usage or {}).get("cost_usd") is not None]
+    unpriced_n = sum(1 for r in results if r.usage and r.usage.get("cost_usd") is None)
+    total_cost = sum((r.usage or {}).get("cost_usd") or 0.0 for r in priced)
+    # Token-level unpriced count: a question can have a non-null cost_usd AND
+    # still carry unpriced tokens (a priced main model plus, say, an unpriced
+    # auxiliary call), so this is not the same as `unpriced_n` above.
+    total_unpriced_tokens = sum(
+        int((r.usage or {}).get("unpriced_tokens", 0) or 0) for r in results
+    )
+    # Questions that sent no usage event at all (dropped/errored before any
+    # telemetry) — distinct from a known-unpriced model, since spend may be
+    # untracked. Reported separately so the cost coverage isn't overstated.
+    no_telemetry_n = sum(1 for r in results if not r.usage)
+    if priced:
+        cost_cell = f"${total_cost:.4f} (estimate)"
+        if unpriced_n:
+            cost_cell += f" — {unpriced_n} question(s) unpriced"
+        cost_per_q = f"${total_cost / len(priced):.4f}"
+    else:
+        cost_cell = "N/A (no priced model)"
+        cost_per_q = "N/A"
+
     lines = [
         f"# {BENCH_NAME} v{BENCH_VERSION} — Report",
         "",
@@ -1099,6 +1187,10 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
         f"| API errors | {sum(1 for r in results if r.error)} |",
         f"| Judge failures | {sum(1 for r in results if r.judge_error)} |",
         f"| Total tokens (Quasar side) | {sum(r.usage.get('total', 0) for r in results):,} |",
+        f"| Total cost (Quasar side) | {cost_cell} |",
+        f"| Cost per priced question | {cost_per_q} |",
+        f"| Unpriced tokens (excluded from cost) | {total_unpriced_tokens:,} |",
+        f"| Questions with no telemetry | {no_telemetry_n} |",
         "",
         "![scores](scores_by_question.png)",
         "![tiers](scores_by_tier.png)",
@@ -1112,6 +1204,30 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
     for t, info in rollup["per_tier"].items():
         fp = f"{info['full_pct']:.1f}%" if info["full_pct"] is not None else "—"
         lines.append(f"| T{t} | {info['label']} | {info['n']} | {fp} | {info['auto_pct']:.1f}% |")
+
+    # ── Per-question cost column (the required DataLabBench cost surface) ──
+    # cost is an estimate; a "—" cost with an "unpriced" source means the
+    # question ran on a model with no known price (TACC / self-hosted), so its
+    # tokens are real but its cost is not measurable — distinct from $0.
+    lines += ["", "## Cost per question", "",
+              "| Question | Tier | Tokens | Cost (est.) | Unpriced tokens | Source |",
+              "|---|---|---|---|---|---|"]
+    for r in results:
+        u = r.usage or {}
+        c = u.get("cost_usd")
+        cost_cell = f"${c:.4f}" if c is not None else "—"
+        # "no telemetry" (a dropped/errored turn that sent no usage event) is
+        # distinct from "unpriced" (a known model with no price): the former may
+        # have incurred untracked spend, the latter is a real $0-unknown.
+        if not u:
+            src = "no telemetry"
+        else:
+            src = u.get("cost_source", "backend" if c is not None else "unpriced")
+        unpriced = u.get("unpriced_tokens", 0)
+        lines.append(
+            f"| {r.id} | T{r.tier} | {u.get('total', 0):,} | {cost_cell} "
+            f"| {unpriced:,} | {src} |"
+        )
 
     # Improvement targets: weighted lost points, worst first.
     # Unjudged judge checkpoints (credit None, e.g. --skip-judge) are NOT
@@ -1145,6 +1261,18 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
             "",
             f"Response time {r.response_time_s:.0f}s · {r.n_tool_calls} tool calls "
             f"({r.trace_source}) · {r.n_images} images"
+            + (
+                " · no telemetry"
+                if not r.usage
+                else (
+                    f" · {r.usage.get('total', 0):,} tokens"
+                    + (
+                        f" · ≈${r.usage.get('cost_usd'):.4f} (est.)"
+                        if r.usage.get("cost_usd") is not None
+                        else " · cost unpriced"
+                    )
+                )
+            )
             + (f" · **API ERROR:** `{r.error}`" if r.error else "")
             + (f" · **JUDGE ERROR:** `{r.judge_error}`" if r.judge_error else ""),
             "",

@@ -189,6 +189,29 @@ def _pixel_to_sky(wcs: Any, x: float, y: float) -> Tuple[Optional[float], Option
         return None, None
 
 
+def _sky_position_angle(wcs: Any, x: float, y: float, major_angle_pix: float) -> Optional[float]:
+    """Position angle (deg East of North, 0-180) of a pixel-frame direction.
+
+    Steps a small amount along the major-axis direction in pixel space,
+    converts both endpoints to sky, and takes the bearing — correct for
+    rotated/skewed WCS, unlike assuming pixel-y == North (CX-10).
+    """
+    try:
+        from astropy.coordinates import SkyCoord
+
+        step = 2.0
+        x2 = x + step * math.cos(major_angle_pix)
+        y2 = y + step * math.sin(major_angle_pix)
+        c0 = wcs.pixel_to_world(float(x), float(y))
+        c1 = wcs.pixel_to_world(float(x2), float(y2))
+        if not isinstance(c0, SkyCoord) or not isinstance(c1, SkyCoord):
+            return None
+        pa = c0.position_angle(c1).to_value("deg")
+        return float(pa % 180.0)
+    except Exception:
+        return None
+
+
 def _resolve_position(
     data: np.ndarray,
     wcs: Any,
@@ -814,9 +837,21 @@ def fit_gaussian_source(
         xc, yc = float(g.x_mean.value), float(g.y_mean.value)
         offset = float(fitted[1].amplitude.value)
 
-        # Major/minor FWHM in pixels -> arcsec; PA measured E of N like BPA
+        # Major/minor FWHM in pixels -> arcsec.
         maj_pix, min_pix = (sx, sy) if sx >= sy else (sy, sx)
-        pa_deg = (math.degrees(theta) + (90.0 if sx >= sy else 0.0)) % 180.0
+        # Major-axis orientation in the PIXEL frame (radians).
+        major_angle_pix = theta + (0.0 if sx >= sy else math.pi / 2.0)
+        pa_pixel_deg = math.degrees(major_angle_pix) % 180.0
+        # Sky position angle (deg E of N): step a little along the major axis in
+        # pixel space, convert both ends to sky, and take the bearing — this is
+        # correct even for rotated/skewed WCS, not just unrotated TAN (CX-10).
+        pa_deg = pa_pixel_deg
+        pa_frame = "pixel"
+        if wcs is not None:
+            sky_pa = _sky_position_angle(wcs, xc, yc, major_angle_pix)
+            if sky_pa is not None:
+                pa_deg = sky_pa
+                pa_frame = "sky (E of N)"
         fit_out: Dict[str, Any] = {
             "peak": _round(amp),
             "peak_unit": bunit or "map units",
@@ -826,6 +861,7 @@ def fit_gaussian_source(
             "fwhm_major_pix": _round(maj_pix * FWHM, 3),
             "fwhm_minor_pix": _round(min_pix * FWHM, 3),
             "pa_deg": _round(pa_deg, 1),
+            "pa_frame": pa_frame,
             "snr": _round(amp / bkg_std, 1) if bkg_std > 0 else None,
         }
         if wcs is not None:

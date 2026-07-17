@@ -31,6 +31,7 @@ from services.evidence_quality import (
     rank_web_sources,
 )
 from services.content_safety import is_safe_web_image, is_safe_web_source
+from services.model_pricing import TurnCostAccumulator, estimate_cost
 
 from api import deps
 from api.deps import (
@@ -47,6 +48,7 @@ from api.deps import (
     _get_pers_db,
     _latest_traces,
     _make_quota_checker,
+    _make_quota_releaser,
     _make_usage_recorder,
     _plan_feedback_lock,
     _plan_feedback_queues,
@@ -199,6 +201,24 @@ def _merge_web_label(existing: str, incoming: Any) -> str:
     return f"{existing} + {label}"
 
 
+def _request_from_trace(trace: Any, tool_name: str) -> Optional[Dict[str, Any]]:
+    """The `request` recorded for the most recent call to ``tool_name``.
+
+    Fallback for cards whose result dict was not stamped by the runner (e.g. a
+    tool that set its card through a path the stamper does not see). Returns
+    None when the tool made no traced call. Feature 1.
+    """
+    if not isinstance(trace, list) or not tool_name:
+        return None
+    for call in reversed(trace):
+        if not isinstance(call, dict) or call.get("name") != tool_name:
+            continue
+        request = call.get("request")
+        if isinstance(request, dict) and request:
+            return request
+    return None
+
+
 def _sse_error_response(message: str) -> StreamingResponse:
     async def generate():
         yield f"data: {json.dumps({'type': 'error', 'content': redact_secrets(message)})}\n\n"
@@ -312,6 +332,7 @@ def _run_with_llm_context(
     usage_recorder,
     quota_checker,
     fn,
+    quota_releaser=None,
 ):
     with llm_request_context(
         provider_api_keys=llm_context["provider_api_keys"],
@@ -321,6 +342,7 @@ def _run_with_llm_context(
         user_email=user_email,
         usage_recorder=usage_recorder,
         quota_checker=quota_checker,
+        quota_releaser=quota_releaser,
     ):
         return fn()
 
@@ -377,20 +399,23 @@ def _stream_chat_response(
         raise HTTPException(status_code=400, detail=redact_secrets(exc))
 
     _quota_usage_recorder = _make_usage_recorder(current_user_id)
-    # Per-turn token accumulator: every LLM call in this request (main loop +
-    # auxiliary calls) reports here, and the total is emitted as a final SSE
-    # "usage" event so the UI can show tokens used per response.
-    usage_totals = {"input": 0, "output": 0}
+    # Per-turn accounting: every LLM call in this request (main loop + auxiliary
+    # calls) reports here. Tokens are emitted as a final SSE "usage" event so the
+    # UI can show what a response spent; cost is accumulated per CALL and
+    # attributed to the key source that paid for it — see TurnCostAccumulator for
+    # why the turn's selected model/route is not a safe proxy for either.
+    usage = TurnCostAccumulator()
 
-    def usage_recorder(provider: str, model: str, key_source: str, input_tokens: int, output_tokens: int):
-        usage_totals["input"] += int(input_tokens or 0)
-        usage_totals["output"] += int(output_tokens or 0)
+    def usage_recorder(provider: str, model: str, key_source: str, input_tokens: int,
+                       output_tokens: int, reservation_id: Optional[str] = None):
+        usage.record(provider, model, key_source, input_tokens, output_tokens)
         _quota_usage_recorder(
             provider=provider,
             model=model,
             key_source=key_source,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            reservation_id=reservation_id,
         )
 
     quota_checker = _make_quota_checker(
@@ -398,6 +423,7 @@ def _stream_chat_response(
         current_user_email,
         llm_context["byok_token_limits"],
     )
+    quota_releaser = _make_quota_releaser()
     selected_provider_api_key = llm_context["provider_api_keys"].get(provider)
     selected_provider_key_scope = ProviderFileService._key_scope(selected_provider_api_key)
 
@@ -500,6 +526,38 @@ def _stream_chat_response(
         first_token_ms: Optional[int] = None
         provider_chunk_count = 0
         run_finalized = False
+        usage_emitted = False
+
+        def usage_sse_line() -> Optional[str]:
+            """The `usage` SSE line for this turn, or None if no tokens spent.
+
+            Emitted on BOTH the normal and the error path: a question that
+            errors after one or more LLM calls has still spent tokens, and
+            DataLabBench learns per-turn cost only from this event — without it,
+            an expensive failed question is reported costless. Guarded by
+            `usage_emitted` so the two paths never double-emit.
+            """
+            nonlocal usage_emitted
+            tokens_total = usage.total_tokens
+            if usage_emitted or tokens_total <= 0:
+                return None
+            usage_emitted = True
+            return "data: " + json.dumps({
+                "type": "usage",
+                "inputTokens": usage.input_tokens,
+                "outputTokens": usage.output_tokens,
+                "totalTokens": tokens_total,
+                # null when nothing in the turn could be priced (TACC/local).
+                # unpricedTokens lets the UI say "≈$X, N tokens unpriced"
+                # instead of implying costUsd covers the whole turn.
+                "costUsd": usage.turn_cost_usd(),
+                "unpricedTokens": usage.unpriced_tokens,
+                "costIsEstimate": True,
+                # Authoritative backend compute time for the thought chip — the
+                # frontend's own clock measures stream LIFETIME, which drip
+                # throttling inflated to 15+ minutes (live P15).
+                "durationMs": int((_time.perf_counter() - run_started_at) * 1000),
+            }) + "\n\n"
 
         def finalize_run_record() -> None:
             nonlocal run_finalized
@@ -516,6 +574,20 @@ def _stream_chat_response(
                     error_message=run_error_message,
                     first_token_ms=first_token_ms,
                     provider_chunk_count=provider_chunk_count,
+                    # Per-turn usage. cost_usd covers only the priced portion of
+                    # the turn, so SUM(cost_usd) across chat_runs is priced spend,
+                    # not total spend — total_tokens is the complete figure, and
+                    # unpriced_tokens says how much of it cost_usd could not
+                    # cover (so a mixed TACC + priced-embedding turn is not
+                    # mistaken for fully priced).
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cost_usd=usage.turn_cost_usd(),
+                    # ...and cost_usd spans every key source this turn used, so
+                    # it is NOT Quasar's bill. platform_cost_usd is the subset
+                    # attributed per-call to the platform key (CX-28).
+                    platform_cost_usd=usage.platform_cost_usd(),
+                    unpriced_tokens=usage.unpriced_tokens,
                 )
                 run_finalized = True
             except Exception as run_err:
@@ -578,6 +650,7 @@ def _stream_chat_response(
                             image_prepass_images,
                             request.message,
                         ),
+                        quota_releaser=quota_releaser,
                     ),
                 )
             except Exception as e:
@@ -658,6 +731,40 @@ def _stream_chat_response(
                             else OpenAIEmbeddings()
                         )
                         query_vector = embeddings.embed_query(request.message)
+                        # This call is quota-CHECKED above but was never
+                        # RECORDED: it goes through langchain_openai, not
+                        # LLMClient, so it never reaches LLMClient._record_usage
+                        # and its tokens were missing from both the per-turn
+                        # total and the quota ledger. Count them here.
+                        #
+                        # cl100k_base is OpenAI's real tokenizer for the
+                        # text-embedding-* family, so this is the exact billed
+                        # prompt-token count, not an approximation. Embeddings
+                        # have no output tokens.
+                        try:
+                            import tiktoken
+
+                            _embed_tokens = len(
+                                tiktoken.get_encoding("cl100k_base").encode(
+                                    request.message or ""
+                                )
+                            )
+                            usage_recorder(
+                                provider="openai",
+                                model=getattr(
+                                    embeddings, "model", "text-embedding-ada-002"
+                                ),
+                                key_source=openai_key_source,
+                                input_tokens=_embed_tokens,
+                                output_tokens=0,
+                            )
+                        except Exception as _embed_usage_err:
+                            # Accounting must never break retrieval, but a
+                            # silent drop hides undercounted spend — log it so a
+                            # persistent recording failure is visible.
+                            logger.warning(
+                                f"[PERSONAL_RAG] embedding usage not recorded: {_embed_usage_err}"
+                            )
                         hits = search_vectors(collection_name, query_vector, limit=6)
                         print(f"[PERSONAL_RAG] User={user_id}, Query='{request.message[:60]}', Hits={len(hits)}")
                         if hits:
@@ -818,6 +925,7 @@ def _stream_chat_response(
                     usage_recorder,
                     quota_checker,
                     _run_agent,
+                    quota_releaser=quota_releaser,
                 ),
             )
 
@@ -828,6 +936,7 @@ def _stream_chat_response(
             _rich_data_tables = []  # list of data tables (multi-target support)
             _rich_data_table = None  # last data table (backward compat)
             _rich_papers = None
+            _rich_papers_request = None   # the ADS query behind the papers grid (Feature 1)
             _rich_notebook = None
             _rich_image = None
             _rich_images = []
@@ -843,13 +952,17 @@ def _stream_chat_response(
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
 
-            def _record_rich_image(img_url, caption, meta=None):
+            def _record_rich_image(img_url, caption, meta=None, request=None):
                 nonlocal _rich_image
                 if not img_url or img_url in _rich_image_urls:
                     return None
                 entry = {"url": img_url, "caption": caption}
                 if meta is not None:
                     entry["meta"] = meta
+                # The exact request behind this image/figure (Feature 1) — rides
+                # into messages.metadata so the card keeps it across a reload.
+                if isinstance(request, dict) and request:
+                    entry["request"] = request
                 _rich_image_urls.add(img_url)
                 _rich_images.append(entry)
                 _rich_image = entry
@@ -892,6 +1005,12 @@ def _stream_chat_response(
                         except Exception as clear_err:
                             logger.warning(f"[RUN] Failed to clear response state: {clear_err}")
                         agent_future.cancel()
+                        # Usage before the error event, so both the UI (which
+                        # stops at error) and the benchmark capture the tokens
+                        # spent before the timeout.
+                        _to_usage_line = usage_sse_line()
+                        if _to_usage_line:
+                            yield _to_usage_line
                         yield f"data: {json.dumps({'type': 'error', 'code': timeout_code, 'content': run_error_message, 'run_id': run_id})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -960,18 +1079,28 @@ def _stream_chat_response(
                                         plotly_spec = _eager_result.get("plotly_spec")
                                         if img_url and img_url not in _emitted_image_urls:
                                             _emitted_image_urls.add(img_url)
+                                            # Request stamped on the result by runner.py (the
+                                            # trace is thread-local and unreachable here).
+                                            _eimg_req = _eager_result.get("request")
+                                            _eimg_req = _eimg_req if isinstance(_eimg_req, dict) else None
                                             if plotly_spec:
-                                                yield f"data: {json.dumps({'type': 'plotly', 'spec': plotly_spec, 'title': caption, 'png_fallback': img_url, 'meta': meta})}\n\n"
+                                                yield f"data: {json.dumps({'type': 'plotly', 'spec': plotly_spec, 'title': caption, 'png_fallback': img_url, 'meta': meta, 'request': _eimg_req})}\n\n"
                                             else:
-                                                yield f"data: {json.dumps({'type': 'image', 'url': img_url, 'caption': caption, 'meta': meta})}\n\n"
-                                            _record_rich_image(img_url, caption, meta)
+                                                yield f"data: {json.dumps({'type': 'image', 'url': img_url, 'caption': caption, 'meta': meta, 'request': _eimg_req})}\n\n"
+                                            _record_rich_image(img_url, caption, meta, request=_eimg_req)
                                             print(f"[EAGER] Image emitted during streaming: {str(img_url)[:100]}")
                                     else:
                                         card = _build_data_card_event(_eager_result)
                                         if card:
                                             _event_str, _rich = card
                                             _tn = _eager_result.get("tool_name", "search_alma_archive")
-                                            yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results'})}\n\n"
+                                            # `request` = the exact call this card came from
+                                            # (Feature 1). The tool trace is thread-local to the
+                                            # agent worker, so on this eager path the request can
+                                            # only come from the result dict, where runner.py
+                                            # stamped it. Already redacted.
+                                            _eager_req = _eager_result.get("request")
+                                            yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results', 'request': _eager_req if isinstance(_eager_req, dict) else None})}\n\n"
                                             yield _event_str
                                             _rich_data_tables.append(_rich)
                                             _rich_data_table = _rich
@@ -1047,6 +1176,13 @@ def _stream_chat_response(
                     response_text = f"An error occurred: {payload}"
                     _snapshot_all = []
                     _snapshot_last = None
+                    # Emit usage BEFORE the error event: the web client stops
+                    # consuming at the error, so tokens spent before this
+                    # worker-reported failure must precede it (CX-07). Guarded by
+                    # usage_emitted, so the post-loop emission won't double-send.
+                    _werr_usage_line = usage_sse_line()
+                    if _werr_usage_line:
+                        yield _werr_usage_line
                     yield f"data: {json.dumps({'type': 'error', 'code': run_error_code, 'content': run_error_message, 'run_id': run_id})}\n\n"
                     break
                 if msg_type == "token":
@@ -1142,6 +1278,12 @@ def _stream_chat_response(
                 tool_display = tool_name_raw.replace("_", " ").title()
                 if tool_name_raw not in run_tools:
                     run_tools.append(tool_name_raw)
+                # The exact request behind this card (Feature 1): prefer the one
+                # runner.py stamped on the result, else match this tool's most
+                # recent trace record. Already secret-redacted at both sources.
+                _rr_request = _run_result.get("request")
+                if not isinstance(_rr_request, dict) or not _rr_request:
+                    _rr_request = _request_from_trace(_tool_trace, tool_name_raw)
                 tool_event = json.dumps({
                     "type": "tool_call",
                     "name": tool_name_raw,
@@ -1149,6 +1291,7 @@ def _stream_chat_response(
                     "status": "completed",
                     "input": _run_result.get("params", {}),
                     "output": "Found results",
+                    "request": _rr_request or None,
                 })
                 yield f"data: {tool_event}\n\n"
                 await asyncio.sleep(0.05)
@@ -1165,9 +1308,16 @@ def _stream_chat_response(
                 elif result_type == "papers":
                     papers = _run_result.get("papers", [])
                     if papers:
-                        papers_event = json.dumps({"type": "papers", "papers": papers})
+                        # The executed ADS query behind this result set (Feature 1).
+                        # ONE shared request for the whole grid — repeating the same
+                        # query on every paper card would be noise.
+                        papers_event = json.dumps({
+                            "type": "papers", "papers": papers,
+                            "request": _rr_request or None,
+                        })
                         yield f"data: {papers_event}\n\n"
                         _rich_papers = papers  # Capture for history
+                        _rich_papers_request = _rr_request or None
                         await asyncio.sleep(0.05)
 
                 elif result_type == "notebook":
@@ -1195,14 +1345,16 @@ def _stream_chat_response(
                             plotly_event = json.dumps({
                                 "type": "plotly", "spec": plotly_spec, "title": caption,
                                 "png_fallback": img_url, "meta": meta,
+                                "request": _rr_request or None,
                             })
                             yield f"data: {plotly_event}\n\n"
                         else:
                             image_event = json.dumps({
                                 "type": "image", "url": img_url, "caption": caption, "meta": meta,
+                                "request": _rr_request or None,
                             })
                             yield f"data: {image_event}\n\n"
-                        _record_rich_image(img_url, caption, meta)
+                        _record_rich_image(img_url, caption, meta, request=_rr_request)
                         await asyncio.sleep(0.05)
 
                 elif result_type == "conductor_result":
@@ -1260,6 +1412,8 @@ def _stream_chat_response(
                         rich_meta["dataTable"] = _rich_data_table
                     if _rich_papers:
                         rich_meta["papers"] = _rich_papers
+                        if _rich_papers_request:
+                            rich_meta["papersRequest"] = _rich_papers_request
                     if _rich_notebook:
                         rich_meta["notebook"] = _rich_notebook
                     if _rich_images:
@@ -1283,6 +1437,15 @@ def _stream_chat_response(
                         rich_meta["thinkingSteps"] = _rich_thinking
                     if _rich_thinking_text:
                         rich_meta["thinking"] = _rich_thinking_text
+                    # Raw request provenance (Feature 1). Without this the exact
+                    # queries are dropped on history replay. Persist a REDACTED,
+                    # reload-safe projection — never the raw arguments/output,
+                    # which can carry credential-bearing URLs into the DB (CX-01).
+                    if _tool_trace:
+                        from core.provenance import persistable_trace
+                        _persist_trace = persistable_trace(_tool_trace)
+                        if _persist_trace:
+                            rich_meta["toolTrace"] = _persist_trace
                     rich_meta["runMeta"] = {
                         "run_id": run_id,
                         "trace_id": trace_id,
@@ -1368,19 +1531,9 @@ def _stream_chat_response(
                 except Exception as _tt_err:
                     logger.warning(f"[CHAT] Failed to emit tool_trace event: {_tt_err}")
 
-            _tokens_total = usage_totals["input"] + usage_totals["output"]
-            if _tokens_total > 0:
-                usage_event = json.dumps({
-                    "type": "usage",
-                    "inputTokens": usage_totals["input"],
-                    "outputTokens": usage_totals["output"],
-                    "totalTokens": _tokens_total,
-                    # Authoritative backend compute time for the thought chip —
-                    # the frontend's own clock measures stream LIFETIME, which
-                    # drip throttling inflated to 15+ minutes (live P15).
-                    "durationMs": int((_time.perf_counter() - run_started_at) * 1000),
-                })
-                yield f"data: {usage_event}\n\n"
+            _usage_line = usage_sse_line()
+            if _usage_line:
+                yield _usage_line
 
             if run_status == "started":
                 run_status = "completed"
@@ -1406,6 +1559,13 @@ def _stream_chat_response(
             run_error_code = "chat_error"
             run_error_message = redact_secrets(e)
             print(f"Chat route error: {redact_secrets(e)}")
+            # Report tokens/cost already spent BEFORE the error event: the web
+            # client stops consuming the stream at the error event, so usage
+            # emitted after it would reach the benchmark (which drains to
+            # [DONE]) but never the UI. Emitting first covers both.
+            _err_usage_line = usage_sse_line()
+            if _err_usage_line:
+                yield _err_usage_line
             error_data = json.dumps({
                 "type": "error",
                 "code": run_error_code,

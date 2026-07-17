@@ -9,6 +9,7 @@ from api.deps import (
     get_current_user,
     is_admin_email,
     issue_report_service,
+    usage_quota_service,
 )
 from api.models import IssueReportUpdateRequest
 
@@ -133,3 +134,49 @@ async def admin_analytics_summary(current_user: dict = Depends(get_current_user)
     if not analytics_service.is_admin(user_email):
         raise HTTPException(status_code=403, detail="Admin access required")
     return analytics_service.get_summary()
+
+
+@router.get("/api/admin/usage")
+async def admin_usage_rollup(
+    since: str = "",
+    group_by: str = "provider",
+    source: str = "calls",
+    current_user: dict = Depends(get_current_user),
+):
+    """Token + cost rollup across all users. Admin-only.
+
+    Two sources:
+      - `calls` (default): the PER-CALL ledger (llm_usage_events). Attributes
+        each LLM call to the model/provider/key_source that actually ran it, so
+        an auxiliary call (e.g. a platform OpenAI embedding inside a BYOK turn)
+        is counted under its real route, not the turn's selected one. This is
+        the authoritative view for platform-vs-BYOK spend.
+        `group_by` ∈ provider | model | key_source | user.
+      - `turns`: the PER-TURN ledger (chat_runs), one row per turn keyed by the
+        selected route — useful for per-question cost-efficiency. Its groups are
+        keyed by the turn's MAIN route, so read the cost fields deliberately:
+        `cost_usd` is the turn's full cost whoever paid (including the user's
+        BYOK spend), while `platform_cost_usd` is the per-call-attributed subset
+        Quasar paid and is the one to bill against (CX-28).
+        `group_by` ∈ provider | model | key_source | user.
+
+    `since` is an ISO-8601 timestamp.
+    """
+    if not is_admin_email(_current_user_email(current_user)):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if source not in ("calls", "turns"):
+        # Allowlist: a typo must be a clear 400, not a silent fall-through to
+        # the per-call report (CX-16).
+        raise HTTPException(
+            status_code=400, detail="source must be 'calls' or 'turns'"
+        )
+    try:
+        if source == "turns":
+            return issue_report_service.usage_rollup(
+                since=since or None, group_by=group_by
+            )
+        return usage_quota_service.global_usage_rollup(
+            since=since or None, group_by=group_by
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

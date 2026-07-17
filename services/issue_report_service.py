@@ -134,13 +134,38 @@ class IssueReportService:
                 error_message TEXT,
                 client_ip TEXT,
                 first_token_ms INTEGER,
-                provider_chunk_count INTEGER
+                provider_chunk_count INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                cost_usd REAL,
+                platform_cost_usd REAL,
+                unpriced_tokens INTEGER
             )
             """
         )
         for migration in (
             "ALTER TABLE chat_runs ADD COLUMN first_token_ms INTEGER",
             "ALTER TABLE chat_runs ADD COLUMN provider_chunk_count INTEGER",
+            # Per-turn usage. cost_usd is a derived estimate (services/model_pricing.py)
+            # and stays NULL for models we cannot price — NULL means "unknown",
+            # not "free". unpriced_tokens records HOW MANY of this turn's tokens
+            # cost_usd could not cover, so a mixed turn (e.g. TACC main model +
+            # a priced OpenAI embedding) is not silently reported as fully
+            # priced just because cost_usd is non-null.
+            "ALTER TABLE chat_runs ADD COLUMN input_tokens INTEGER",
+            "ALTER TABLE chat_runs ADD COLUMN output_tokens INTEGER",
+            "ALTER TABLE chat_runs ADD COLUMN total_tokens INTEGER",
+            "ALTER TABLE chat_runs ADD COLUMN cost_usd REAL",
+            # cost_usd is the WHOLE turn's cost regardless of who paid, which is
+            # the right number for cost-efficiency (what did this answer cost to
+            # produce). It is the wrong number for "what does Quasar owe": one
+            # turn can mix routes, spending the user's BYOK key on the main loop
+            # and Quasar's platform key on an embedding. platform_cost_usd is
+            # the per-call-attributed subset paid by the platform, so admin
+            # totals can exclude user-paid BYOK spend (CX-28).
+            "ALTER TABLE chat_runs ADD COLUMN platform_cost_usd REAL",
+            "ALTER TABLE chat_runs ADD COLUMN unpriced_tokens INTEGER",
         ):
             try:
                 cur.execute(migration)
@@ -275,10 +300,28 @@ class IssueReportService:
         error_message: str = "",
         first_token_ms: Optional[int] = None,
         provider_chunk_count: int = 0,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        cost_usd: Optional[float] = None,
+        platform_cost_usd: Optional[float] = None,
+        unpriced_tokens: Optional[int] = None,
     ) -> None:
         if status not in RUN_STATUSES:
             raise ValueError(f"Unsupported run status: {status}")
         now = _utc_now()
+        # total_tokens is derived so callers cannot report a total that
+        # disagrees with its own parts.
+        safe_input = None if input_tokens is None else max(0, int(input_tokens))
+        safe_output = None if output_tokens is None else max(0, int(output_tokens))
+        if safe_input is None and safe_output is None:
+            total_tokens = None
+        else:
+            total_tokens = (safe_input or 0) + (safe_output or 0)
+        safe_cost = None if cost_usd is None else max(0.0, float(cost_usd))
+        safe_platform_cost = (
+            None if platform_cost_usd is None else max(0.0, float(platform_cost_usd))
+        )
+        safe_unpriced = None if unpriced_tokens is None else max(0, int(unpriced_tokens))
         conn = self._conn()
         try:
             conn.execute(
@@ -286,7 +329,9 @@ class IssueReportService:
                 UPDATE chat_runs
                 SET status = ?, updated_at = ?, completed_at = ?, duration_ms = ?,
                     tools_called = ?, last_status = ?, error_code = ?, error_message = ?,
-                    first_token_ms = ?, provider_chunk_count = ?
+                    first_token_ms = ?, provider_chunk_count = ?,
+                    input_tokens = ?, output_tokens = ?, total_tokens = ?, cost_usd = ?,
+                    platform_cost_usd = ?, unpriced_tokens = ?
                 WHERE id = ?
                 """,
                 (
@@ -300,6 +345,12 @@ class IssueReportService:
                     _clean_text(error_message),
                     first_token_ms,
                     max(0, int(provider_chunk_count)),
+                    safe_input,
+                    safe_output,
+                    total_tokens,
+                    safe_cost,
+                    safe_platform_cost,
+                    safe_unpriced,
                     run_id,
                 ),
             )
@@ -316,7 +367,9 @@ class IssueReportService:
                     SELECT id, user_id, conversation_id, trace_id, model, provider,
                            key_source, status, started_at, updated_at, completed_at,
                            duration_ms, tools_called, last_status, error_code,
-                           error_message, client_ip, first_token_ms, provider_chunk_count
+                           error_message, client_ip, first_token_ms, provider_chunk_count,
+                           input_tokens, output_tokens, total_tokens, cost_usd,
+                           platform_cost_usd, unpriced_tokens
                     FROM chat_runs WHERE id = ?
                     """,
                     (run_id,),
@@ -327,7 +380,9 @@ class IssueReportService:
                     SELECT id, user_id, conversation_id, trace_id, model, provider,
                            key_source, status, started_at, updated_at, completed_at,
                            duration_ms, tools_called, last_status, error_code,
-                           error_message, client_ip, first_token_ms, provider_chunk_count
+                           error_message, client_ip, first_token_ms, provider_chunk_count,
+                           input_tokens, output_tokens, total_tokens, cost_usd,
+                           platform_cost_usd, unpriced_tokens
                     FROM chat_runs WHERE id = ? AND user_id = ?
                     """,
                     (run_id, user_id),
@@ -341,6 +396,8 @@ class IssueReportService:
             "key_source", "status", "started_at", "updated_at", "completed_at",
             "duration_ms", "tools_called", "last_status", "error_code",
             "error_message", "client_ip", "first_token_ms", "provider_chunk_count",
+            "input_tokens", "output_tokens", "total_tokens", "cost_usd",
+            "platform_cost_usd", "unpriced_tokens",
         ]
         result = dict(zip(keys, row))
         try:
@@ -348,6 +405,114 @@ class IssueReportService:
         except (TypeError, json.JSONDecodeError):
             result["tools_called"] = []
         return result
+
+    def usage_rollup(
+        self,
+        *,
+        since: Optional[str] = None,
+        group_by: str = "model",
+    ) -> Dict[str, Any]:
+        """Aggregate per-turn tokens + cost across chat_runs, for admin cost
+        reporting and benchmark cost-efficiency numbers.
+
+        `cost_usd` covers only the priced portion, so the unpriced counters
+        must be read alongside it. `unpriced_tokens` (token-level) is the honest
+        measure: a turn can be partly priced (a TACC main model plus a priced
+        OpenAI embedding) and still carry unpriced tokens, so cost_usd being
+        non-zero does NOT mean the whole turn was priced. `unpriced_runs` counts
+        runs that carry any unpriced tokens — this both flags those mixed turns
+        and excludes zero-token failures (which spent nothing to price).
+
+        `cost_usd` is every turn's full cost regardless of who paid, so it
+        INCLUDES user-funded BYOK spend — do not read it as Quasar's bill.
+        `platform_cost_usd` is the per-call-attributed subset the platform paid
+        and is the number to bill against (CX-28). The two differ whenever a
+        turn used a BYOK key, and a single turn can contribute to both (a BYOK
+        main loop plus a platform embedding).
+        """
+        column = {
+            "model": "model",
+            "provider": "provider",
+            "user": "user_id",
+            "key_source": "key_source",
+        }.get(group_by)
+        if column is None:
+            raise ValueError(f"Unsupported group_by: {group_by}")
+
+        params: List[Any] = []
+        where = "WHERE total_tokens IS NOT NULL"
+        if since:
+            # started_at is stored as UTC isoformat, so the comparison string
+            # must also be UTC — a raw offset timestamp (e.g. "...-05:00")
+            # compared lexically would select the wrong rows. Parse, normalize
+            # to UTC, and reject malformed input instead of silently accepting
+            # it. A bare date/naive timestamp is treated as UTC.
+            try:
+                parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid ISO-8601 timestamp: {since!r}")
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            where += " AND started_at >= ?"
+            params.append(parsed.astimezone(timezone.utc).isoformat())
+
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT {column},
+                       COUNT(*),
+                       COALESCE(SUM(input_tokens), 0),
+                       COALESCE(SUM(output_tokens), 0),
+                       COALESCE(SUM(total_tokens), 0),
+                       COALESCE(SUM(cost_usd), 0),
+                       COALESCE(SUM(platform_cost_usd), 0),
+                       COALESCE(SUM(unpriced_tokens), 0),
+                       SUM(CASE WHEN COALESCE(unpriced_tokens, 0) > 0 THEN 1 ELSE 0 END)
+                FROM chat_runs
+                {where}
+                GROUP BY {column}
+                ORDER BY SUM(total_tokens) DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        # Keep each group's RAW cost for the total; round only per-group for
+        # display. Summing already-rounded groups would zero a total made of
+        # many sub-cent groups (CX-08) — e.g. 20 one-token turns across 20
+        # user groups each round to $0 but really total ~$0.000003.
+        raw_costs = [float(row[5] or 0.0) for row in rows or []]
+        raw_platform_costs = [float(row[6] or 0.0) for row in rows or []]
+        groups = [
+            {
+                group_by: row[0],
+                "runs": int(row[1] or 0),
+                "input_tokens": int(row[2] or 0),
+                "output_tokens": int(row[3] or 0),
+                "total_tokens": int(row[4] or 0),
+                "cost_usd": round(float(row[5] or 0.0), 6),
+                "platform_cost_usd": round(float(row[6] or 0.0), 6),
+                "unpriced_tokens": int(row[7] or 0),
+                "unpriced_runs": int(row[8] or 0),
+            }
+            for row in rows or []
+        ]
+        return {
+            "group_by": group_by,
+            "since": since or "",
+            "groups": groups,
+            "totals": {
+                "runs": sum(g["runs"] for g in groups),
+                "total_tokens": sum(g["total_tokens"] for g in groups),
+                "cost_usd": round(sum(raw_costs), 6),
+                "platform_cost_usd": round(sum(raw_platform_costs), 6),
+                "unpriced_tokens": sum(g["unpriced_tokens"] for g in groups),
+                "unpriced_runs": sum(g["unpriced_runs"] for g in groups),
+            },
+            "cost_is_estimate": True,
+        }
 
     def create_report(
         self,

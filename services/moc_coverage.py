@@ -212,11 +212,28 @@ class MocCoverageService:
                 return {"success": False,
                         "error": f"moc_operation accepts at most {MAX_MOC_IDS} survey_ids per call; "
                                  f"got {len(id_list)}. Split the request or pre-combine with union."}
+            # Arity is a property of the REQUEST, so it is checked before any
+            # operand is resolved (CX-34). Deciding it after the fetch made a
+            # one-id intersection/difference depend on whether that id happened
+            # to resolve: unresolved -> empty success, resolved -> arity error.
+            if op in {"intersection", "difference"} and len(id_list) < 2:
+                return {"success": False,
+                        "error": f"{op} needs at least two survey_ids; got {len(id_list)}."}
             geometry = self.moc_geometry(id_list, order=order)
-            if not geometry.get("success"):
-                return geometry
+            # moc_geometry fails when NOTHING resolves — but for algebra that is
+            # "all operands are empty sky", a valid empty result, not an error
+            # (CX-21). Only propagate a genuine failure that also carries no mocs
+            # AND looks like a transport error (not the benign no-coverage case).
+            geometry_ok = bool(geometry.get("success"))
             fetched = geometry.get("mocs") or []
             warnings = list(geometry.get("warnings") or [])
+            if not geometry_ok and not fetched:
+                err = str(geometry.get("error") or "")
+                if "could be fetched" in err or "empty" in err.lower():
+                    # Benign: MOCServer returned no coverage for any id.
+                    warnings.append(f"No MOC coverage resolved for any operand ({err}).")
+                else:
+                    return geometry  # real error (network / bad request)
 
             def _target_flags(moc_or_none) -> Dict[str, Any]:
                 """inside/outside flags against the derived MOC (all-False when empty)."""
@@ -276,9 +293,6 @@ class MocCoverageService:
                 warnings.append(
                     f"Empty/unresolvable operand(s) treated as empty sky: {', '.join(missing)}."
                 )
-            if op in {"intersection", "difference"} and len(id_list) < 2:
-                return {"success": False,
-                        "error": f"{op} needs at least two survey_ids; got {len(id_list)}."}
             if not fetched:
                 # Every operand resolved empty. That is a well-defined result —
                 # the union (or any op) of empty footprints is empty sky, not an

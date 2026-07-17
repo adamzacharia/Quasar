@@ -1252,6 +1252,742 @@ def dataframe_from_schema(rows: List[Mapping[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(list(rows))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Archive-profile authoring layer (Feature 3, docs/plans/2026-07-astrofetch-
+# provenance). Extends the registry with the fields DATALAB_CATALOGS lacks —
+# column-level dtype/unit/role, table purpose/grain, structured pitfalls and
+# golden tool invocations — WITHOUT touching the load-bearing "columns" lists.
+# ``to_profile()`` assembles everything into a plain dict;
+# ``services.archive_profiles.datalab`` validates it into an ArchiveProfile
+# (schema converged in codex-bridge duel task-81b3b73-2145).
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATALAB_TAP_ENDPOINT = "https://datalab.noirlab.edu/tap"
+
+# Per-column authoring, keyed by qualified table. Tuple = (dtype, unit, role, desc).
+#   unit: "mag"/"deg"/… = known unit (astropy-parseable); "1" = verified
+#   dimensionless; None on a NUMERIC column = not_applicable (identifiers,
+#   codes, bitmasks); ("?", "reason") = genuinely unknown, with the mandatory
+#   note. None on a non-numeric column simply means no unit fields apply.
+# Every column in a curated table's "columns" list MUST appear here and vice
+# versa — to_profile() fails loudly on any mismatch, and the unit test holds
+# the same line. Descriptions are canonical/common guidance, not exhaustive.
+TABLE_PROFILE_INFO: Dict[str, Dict[str, Any]] = {
+    "gaia_dr3.gaia_source": {
+        "purpose": "All-sky space astrometry + broadband photometry + radial velocities (Gaia DR3).",
+        "grain": "one row per Gaia source",
+        "columns": {
+            "source_id": ("integer", None, "identifier", "Unique Gaia DR3 source id (int64)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "parallax": ("float", "mas", "measurement", "Absolute parallax; can be negative, NaN when missing."),
+            "parallax_over_error": ("float", "1", "quality", "Parallax S/N; e.g. > 5 for reliable distances (guard NaN)."),
+            "pmra": ("float", "mas/yr", "measurement", "Proper motion in RA (mualpha* = mu_alpha cos delta)."),
+            "pmdec": ("float", "mas/yr", "measurement", "Proper motion in Dec."),
+            "pm": ("float", "mas/yr", "measurement", "Total proper motion."),
+            "ruwe": ("float", "1", "quality", "Renormalised unit weight error; <~1.4 = well-behaved astrometric fit."),
+            "ipd_frac_multi_peak": ("integer", "%", "quality", "Windows with multi-peak detections (blend indicator)."),
+            "astrometric_sigma5d_max": ("float", "mas", "quality", "Worst-direction 5D astrometric uncertainty."),
+            "phot_g_mean_mag": ("float", "mag", "measurement", "Mean G magnitude (Vega). Gaia bands are g|bp|rp."),
+            "phot_bp_mean_mag": ("float", "mag", "measurement", "Mean BP magnitude (Vega)."),
+            "phot_rp_mean_mag": ("float", "mag", "measurement", "Mean RP magnitude (Vega)."),
+            "bp_rp": ("float", "mag", "measurement", "BP-RP colour."),
+            "radial_velocity": ("float", "km/s", "measurement", "Spectroscopic RV (bright-star subset; NaN elsewhere)."),
+        },
+    },
+    "nsc_dr2.object": {
+        "purpose": "Mean-object photometry from ~35,000 deg2 of archival DECam/Bok/Mosaic imaging (NSC DR2).",
+        "grain": "one row per unique object (mean over epochs)",
+        "columns": {
+            "id": ("string", None, "identifier", "NSC object id (STRING — keep quoted)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "gmag": ("float", "mag", "measurement", "Mean g magnitude (AB). NSC uses <band>mag, NOT mag_auto_<band>."),
+            "rmag": ("float", "mag", "measurement", "Mean r magnitude (AB)."),
+            "imag": ("float", "mag", "measurement", "Mean i magnitude (AB)."),
+            "zmag": ("float", "mag", "measurement", "Mean z magnitude (AB)."),
+            "gerr": ("float", "mag", "uncertainty", "g magnitude uncertainty."),
+            "rerr": ("float", "mag", "uncertainty", "r magnitude uncertainty."),
+            "class_star": ("float", "1", "quality", "Stellarity: ~1 star-like, ~0 extended; point-source cut > 0.5."),
+            "fwhm": ("float", "arcsec", "measurement", "Mean source FWHM."),
+            "ring256": ("integer", None, "healpix", "HEALPix RING nside=256 (coarse; use for wide-area density)."),
+            "nest4096": ("integer", None, "healpix", "HEALPix NEST nside=4096 (fine)."),
+        },
+    },
+    "des_dr1.main": {
+        "purpose": "DES DR1 coadd photometry over ~5,000 deg2 of the southern high-latitude sky (grizY).",
+        "grain": "one row per coadd object",
+        "columns": {
+            "coadd_object_id": ("integer", None, "identifier", "Unique DES coadd object id."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "mag_auto_g": ("float", "mag", "measurement", "AUTO g magnitude (AB). PER-BAND — there is no bare mag_auto."),
+            "mag_auto_r": ("float", "mag", "measurement", "AUTO r magnitude (AB)."),
+            "mag_auto_i": ("float", "mag", "measurement", "AUTO i magnitude (AB)."),
+            "mag_auto_z": ("float", "mag", "measurement", "AUTO z magnitude (AB)."),
+            "mag_auto_g_dered": ("float", "mag", "measurement", "Dereddened AUTO g magnitude (SFD)."),
+            "mag_auto_r_dered": ("float", "mag", "measurement", "Dereddened AUTO r magnitude."),
+            "mag_auto_i_dered": ("float", "mag", "measurement", "Dereddened AUTO i magnitude."),
+            "mag_auto_z_dered": ("float", "mag", "measurement", "Dereddened AUTO z magnitude."),
+            "magerr_auto_g": ("float", "mag", "uncertainty", "AUTO g magnitude uncertainty."),
+            "magerr_auto_r": ("float", "mag", "uncertainty", "AUTO r magnitude uncertainty."),
+            "magerr_auto_i": ("float", "mag", "uncertainty", "AUTO i magnitude uncertainty."),
+            "magerr_auto_z": ("float", "mag", "uncertainty", "AUTO z magnitude uncertainty."),
+            "flags_g": ("integer", None, "quality", "SExtractor flags in g; flags_<b> = 0 selects clean photometry."),
+            "flags_r": ("integer", None, "quality", "SExtractor flags in r."),
+            "flags_i": ("integer", None, "quality", "SExtractor flags in i."),
+            "flags_z": ("integer", None, "quality", "SExtractor flags in z."),
+            "spread_model_g": ("float", "1", "quality", "Star/galaxy separator in g; ~0 point source, > 0.005 galaxy."),
+            "spread_model_r": ("float", "1", "quality", "Star/galaxy separator in r (canonical band for the cut)."),
+            "spread_model_i": ("float", "1", "quality", "Star/galaxy separator in i."),
+            "spread_model_z": ("float", "1", "quality", "Star/galaxy separator in z."),
+            "spreaderr_model_r": ("float", "1", "uncertainty", "Uncertainty on spread_model_r."),
+            "class_star_g": ("float", "1", "quality", "Stellarity in g (~1 star). PER-BAND — no bare class_star."),
+            "class_star_r": ("float", "1", "quality", "Stellarity in r."),
+            "class_star_i": ("float", "1", "quality", "Stellarity in i."),
+            "class_star_z": ("float", "1", "quality", "Stellarity in z."),
+        },
+    },
+    "smash_dr1.object": {
+        "purpose": "SMASH DR1 mean-object photometry of targeted Magellanic-system DECam fields.",
+        "grain": "one row per object (mean over epochs)",
+        "columns": {
+            "id": ("string", None, "identifier", "SMASH object id — a STRING like '169.429960'; never float-coerce."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "fieldid": ("integer", None, "identifier", "SMASH field number; indexed — bound whole-field queries with fieldid = N."),
+            "depthflag": ("integer", None, "quality", "Exposure-depth flag (>1 = deeper imaging)."),
+            "sharp": ("float", "1", "quality", "DAOPHOT sharpness; |sharp| < 0.5 ~ stellar."),
+            "chi": ("float", "1", "quality", "DAOPHOT chi of the PSF fit."),
+            "gmag": ("float", "mag", "measurement", "Mean g magnitude (AB)."),
+            "rmag": ("float", "mag", "measurement", "Mean r magnitude (AB)."),
+            "imag": ("float", "mag", "measurement", "Mean i magnitude (AB)."),
+            "zmag": ("float", "mag", "measurement", "Mean z magnitude (AB)."),
+            "gerr": ("float", "mag", "uncertainty", "g magnitude uncertainty."),
+            "rerr": ("float", "mag", "uncertainty", "r magnitude uncertainty."),
+        },
+    },
+    "smash_dr1.source": {
+        "purpose": "SMASH DR1 multi-epoch (per-exposure) photometry for variability/light curves.",
+        "grain": "one row per detection (object x epoch x band)",
+        "columns": {
+            "id": ("string", None, "identifier", "SMASH object id (STRING; joins to object.id)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "mjd": ("float", "d", "time", "Modified Julian Date of the epoch."),
+            "filter": ("string", None, "category", "Band letter (u/g/r/i/z)."),
+            "cmag": ("float", "mag", "measurement", "Calibrated per-epoch magnitude; error column is cerr."),
+            "cerr": ("float", "mag", "uncertainty", "Per-epoch magnitude uncertainty."),
+            "chi": ("float", "1", "quality", "PSF-fit chi."),
+            "sharp": ("float", "1", "quality", "Sharpness; |sharp| < 0.5 ~ stellar."),
+        },
+    },
+    "smash_dr2.object": {
+        "purpose": "SMASH DR2 mean-object photometry of targeted Magellanic-system DECam fields.",
+        "grain": "one row per object (mean over epochs)",
+        "columns": {
+            "id": ("string", None, "identifier", "SMASH object id — a STRING like '169.429960'; never float-coerce."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "fieldid": ("integer", None, "identifier", "SMASH field number; indexed — bound whole-field queries with fieldid = N."),
+            "depthflag": ("integer", None, "quality", "Exposure-depth flag (>1 = deeper imaging)."),
+            "sharp": ("float", "1", "quality", "DAOPHOT sharpness; |sharp| < 0.5 ~ stellar."),
+            "chi": ("float", "1", "quality", "DAOPHOT chi of the PSF fit."),
+            "gmag": ("float", "mag", "measurement", "Mean g magnitude (AB)."),
+            "rmag": ("float", "mag", "measurement", "Mean r magnitude (AB)."),
+            "imag": ("float", "mag", "measurement", "Mean i magnitude (AB)."),
+            "zmag": ("float", "mag", "measurement", "Mean z magnitude (AB)."),
+            "gerr": ("float", "mag", "uncertainty", "g magnitude uncertainty."),
+            "rerr": ("float", "mag", "uncertainty", "r magnitude uncertainty."),
+        },
+    },
+    "smash_dr2.source": {
+        "purpose": "SMASH DR2 multi-epoch (per-exposure) photometry for variability/light curves.",
+        "grain": "one row per detection (object x epoch x band)",
+        "columns": {
+            "id": ("string", None, "identifier", "SMASH object id (STRING; joins to object.id)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "mjd": ("float", "d", "time", "Modified Julian Date of the epoch."),
+            "filter": ("string", None, "category", "Band letter (u/g/r/i/z)."),
+            "cmag": ("float", "mag", "measurement", "Calibrated per-epoch magnitude; error column is cerr."),
+            "cerr": ("float", "mag", "uncertainty", "Per-epoch magnitude uncertainty."),
+            "chi": ("float", "1", "quality", "PSF-fit chi."),
+            "sharp": ("float", "1", "quality", "Sharpness; |sharp| < 0.5 ~ stellar."),
+        },
+    },
+    "delve_dr3.coadd_objects": {
+        "purpose": "DELVE DR3 coadd photometry over ~21,000 deg2 of the southern sky (griz).",
+        "grain": "one row per coadd object",
+        "columns": {
+            "quick_object_id": ("integer", None, "identifier", "Unique DELVE coadd object id."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "mag_auto_g": ("float", "mag", "measurement", "AUTO g magnitude (AB); per-band naming like DES."),
+            "magerr_auto_g": ("float", "mag", "uncertainty", "AUTO g magnitude uncertainty."),
+            "mag_auto_r": ("float", "mag", "measurement", "AUTO r magnitude (AB)."),
+            "magerr_auto_r": ("float", "mag", "uncertainty", "AUTO r magnitude uncertainty."),
+            "mag_auto_i": ("float", "mag", "measurement", "AUTO i magnitude (AB)."),
+            "ext_coadd": ("integer", None, "category", "Star/galaxy class: 0 hi-conf star, 1 candidate star, 2 mostly galaxy, 3 hi-conf galaxy, -9 no data."),
+            "hpix_1024": ("integer", None, "healpix", "HEALPix NEST nside=1024."),
+            "hpix_4096": ("integer", None, "healpix", "HEALPix NEST nside=4096."),
+            "hpix_16384": ("integer", None, "healpix", "HEALPix NEST nside=16384."),
+        },
+    },
+    "desi_dr1.zpix": {
+        "purpose": "DESI DR1 healpix-coadded spectroscopic redshift catalog.",
+        "grain": "one row per targetid per survey/program coadd",
+        "columns": {
+            "targetid": ("integer", None, "identifier", "Unique DESI target id (int64); indexed equality bound."),
+            "mean_fiber_ra": ("float", "deg", "ra", "Mean fiber RA — the coordinate columns here are NOT ra/dec."),
+            "mean_fiber_dec": ("float", "deg", "dec", "Mean fiber Dec."),
+            "z": ("float", "1", "measurement", "Spectroscopic redshift."),
+            "zerr": ("float", "1", "uncertainty", "Redshift uncertainty."),
+            "zwarn": ("integer", None, "quality", "Redshift warning bitmask; zwarn = 0 selects reliable redshifts."),
+            "spectype": ("string", None, "category", "Spectral class: GALAXY | QSO | STAR."),
+            "desi_target": ("integer", None, "category", "Targeting bitmask (LRG bit 0, ELG bit 1, QSO bit 2, BGS_ANY 60, MWS_ANY 61)."),
+            "survey": ("string", None, "category", "Survey phase; survey = 'main' for the main survey."),
+            "main_primary": ("boolean", None, "quality", "True for the primary main-survey spectrum of the target."),
+        },
+    },
+    "sdss_dr17.specobj": {
+        "purpose": "SDSS DR17 optical spectroscopic catalog (redshifts + classes).",
+        "grain": "one row per spectrum (specobjid)",
+        "columns": {
+            "specobjid": ("integer", None, "identifier", "Unique spectrum id (int64)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "z": ("float", "1", "measurement", "Spectroscopic redshift."),
+            "zerr": ("float", "1", "uncertainty", "Redshift uncertainty."),
+            "zwarning": ("integer", None, "quality", "Quality bitmask — SDSS uses zwarning (NOT zwarn); 0 = clean."),
+            "class": ("string", None, "category", "Spectral class: GALAXY | QSO | STAR."),
+            "subclass": ("string", None, "category", "Finer spectral subclass."),
+            "plate": ("integer", None, "identifier", "Plate number."),
+            "mjd": ("integer", "d", "time", "MJD of the observation."),
+            "fiberid": ("integer", None, "identifier", "Fiber number on the plate."),
+        },
+    },
+    "ls_dr9.tractor": {
+        "purpose": "Legacy Surveys DR9 Tractor model photometry (~19,700 deg2, g/r/z + forced unWISE W1/W2).",
+        "grain": "one row per Tractor model source",
+        "columns": {
+            "release": ("integer", None, "provenance", "LS release number of the brick reduction."),
+            "brickid": ("integer", None, "identifier", "Brick id; (brickid, objid) is unique."),
+            "objid": ("integer", None, "identifier", "Object id within the brick."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "type": ("string", None, "category", "Tractor morphological type; PSF = point source, others extended."),
+            "dered_mag_g": ("float", "mag", "measurement", "Dereddened model g magnitude (AB). LS DR9 has g/r/z — NO i band."),
+            "dered_mag_r": ("float", "mag", "measurement", "Dereddened model r magnitude (AB)."),
+            "dered_mag_z": ("float", "mag", "measurement", "Dereddened model z magnitude (AB)."),
+            "dered_mag_w1": ("float", "mag", "measurement", "Forced unWISE W1 magnitude (AB); W3/W4 are NOT available."),
+            "dered_mag_w2": ("float", "mag", "measurement", "Forced unWISE W2 magnitude (AB)."),
+            "snr_g": ("float", "1", "quality", "Flux S/N in g."),
+            "snr_r": ("float", "1", "quality", "Flux S/N in r."),
+            "snr_z": ("float", "1", "quality", "Flux S/N in z."),
+            "snr_w1": ("float", "1", "quality", "Flux S/N in W1."),
+            "snr_w2": ("float", "1", "quality", "Flux S/N in W2."),
+        },
+    },
+    "vhs_dr5.vhs_cat_v3": {
+        "purpose": "VISTA Hemisphere Survey DR5 near-IR JHKs photometry of the southern sky.",
+        "grain": "one row per merged source",
+        "columns": {
+            "sourceid": ("integer", None, "identifier", "Unique VSA source id."),
+            "ra2000": ("float", "deg", "ra", "ICRS right ascension — coordinates here are ra2000/dec2000, not ra/dec."),
+            "dec2000": ("float", "deg", "dec", "ICRS declination."),
+            "japermag3": ("float", "mag", "measurement", "J aperture-3 (2 arcsec) magnitude (Vega)."),
+            "japermag3err": ("float", "mag", "uncertainty", "J aperture-3 magnitude uncertainty."),
+            "hapermag3": ("float", "mag", "measurement", "H aperture-3 magnitude (Vega)."),
+            "hapermag3err": ("float", "mag", "uncertainty", "H aperture-3 magnitude uncertainty."),
+            "ksapermag3": ("float", "mag", "measurement", "Ks aperture-3 magnitude (Vega)."),
+            "ksapermag3err": ("float", "mag", "uncertainty", "Ks aperture-3 magnitude uncertainty."),
+            "mergedclass": ("integer", None, "category", "VSA morphology class: -1 star, -2 probable star, 1 galaxy."),
+            "pstar": ("float", "1", "quality", "Probability the source is point-like (0-1)."),
+            "ring256": ("integer", None, "healpix", "HEALPix RING nside=256."),
+            "nest4096": ("integer", None, "healpix", "HEALPix NEST nside=4096."),
+        },
+    },
+    "unwise_dr1.object": {
+        "purpose": "unWISE coadd catalog: deep all-sky WISE W1/W2 photometry (~2 billion sources).",
+        "grain": "one row per coadd source",
+        "columns": {
+            "unwise_objid": ("string", None, "identifier", "unWISE object id (STRING)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "mag_w1_vg": ("float", "mag", "measurement", "W1 magnitude (VEGA, precomputed; unWISE photometry is Vega)."),
+            "mag_w2_vg": ("float", "mag", "measurement", "W2 magnitude (Vega)."),
+            "w1_w2_vg": ("float", "mag", "measurement", "W1-W2 colour (Vega)."),
+            "flux_w1": ("float", "nmgy", "measurement", "W1 flux in Vega nanomaggies."),
+            "flux_w2": ("float", "nmgy", "measurement", "W2 flux in Vega nanomaggies."),
+            "dflux_w1": ("float", "nmgy", "uncertainty", "W1 flux uncertainty."),
+            "dflux_w2": ("float", "nmgy", "uncertainty", "W2 flux uncertainty."),
+            "qf_w1": ("float", "1", "quality", "Fraction of W1 frames unaffected by bad pixels (0-1)."),
+            "qf_w2": ("float", "1", "quality", "Fraction of W2 frames unaffected by bad pixels (0-1)."),
+            "rchi2_w1": ("float", "1", "quality", "Reduced chi2 of the W1 PSF fit."),
+            "rchi2_w2": ("float", "1", "quality", "Reduced chi2 of the W2 PSF fit."),
+            "fracflux_w1": ("float", "1", "quality", "Fraction of flux from this source (blending diagnostic; W1)."),
+            "fracflux_w2": ("float", "1", "quality", "Fraction of flux from this source (W2)."),
+            "fwhm_w1": ("float", "pix", "measurement", "PSF FWHM at source (unWISE coadd pixels, 2.75 arcsec/pix)."),
+            "fwhm_w2": ("float", "pix", "measurement", "PSF FWHM at source (W2)."),
+            "spread_model_w1": ("float", "1", "quality", "crowdsource spread_model in W1: ~0 point source, positive extended."),
+            "spread_model_w2": ("float", "1", "quality", "spread_model in W2."),
+            "flags_unwise_w1": ("integer", None, "quality", "unWISE coadd flags bitmask (W1); 0 = clean."),
+            "flags_unwise_w2": ("integer", None, "quality", "unWISE coadd flags bitmask (W2)."),
+            "flags_info_w1": ("integer", None, "quality", "Informational flags bitmask (W1)."),
+            "flags_info_w2": ("integer", None, "quality", "Informational flags bitmask (W2)."),
+            "coadd_id": ("string", None, "provenance", "Coadd tile id."),
+            "ring256": ("integer", None, "healpix", "HEALPix RING nside=256."),
+            "nest4096": ("integer", None, "healpix", "HEALPix NEST nside=4096."),
+        },
+    },
+    "twomass.psc": {
+        "purpose": "2MASS Point Source Catalog: all-sky near-IR J/H/Ks photometry (~471M sources).",
+        "grain": "one row per point source",
+        "columns": {
+            "designation": ("string", None, "identifier", "2MASS designation (STRING)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "j_m": ("float", "mag", "measurement", "J magnitude (Vega). Band prefix j/h/k; Ks column is k_m."),
+            "h_m": ("float", "mag", "measurement", "H magnitude (Vega)."),
+            "k_m": ("float", "mag", "measurement", "Ks magnitude (Vega) — named k_m, not ks_m."),
+            "j_cmsig": ("float", "mag", "uncertainty", "J corrected photometric uncertainty."),
+            "h_cmsig": ("float", "mag", "uncertainty", "H corrected photometric uncertainty."),
+            "k_cmsig": ("float", "mag", "uncertainty", "Ks corrected photometric uncertainty."),
+            "j_msigcom": ("float", "mag", "uncertainty", "J total (combined) uncertainty."),
+            "h_msigcom": ("float", "mag", "uncertainty", "H total uncertainty."),
+            "k_msigcom": ("float", "mag", "uncertainty", "Ks total uncertainty."),
+            "j_snr": ("float", "1", "quality", "J-band S/N."),
+            "h_snr": ("float", "1", "quality", "H-band S/N."),
+            "k_snr": ("float", "1", "quality", "Ks-band S/N."),
+            "ph_qual": ("string", None, "quality", "3-char photometric quality flags (JHKs; 'AAA' best)."),
+            "cc_flg": ("string", None, "quality", "Contamination/confusion flags ('000' clean)."),
+            "rd_flg": ("string", None, "quality", "Read flags (detection origin per band)."),
+            "bl_flg": ("string", None, "quality", "Blend flags (fit components per band)."),
+            "gal_contam": ("integer", None, "quality", "Extended-source contamination: 0 clean, 1/2 contaminated by XSC source."),
+            "mp_flg": ("integer", None, "quality", "Minor-planet association flag."),
+            "use_src": ("integer", None, "quality", "Use-source flag (1 = primary photometry)."),
+            "dup_src": ("integer", None, "quality", "Duplicate-source flag."),
+            "prox": ("float", "arcsec", "quality", "Distance to the nearest PSC neighbour."),
+            "jdate": ("float", "d", "time", "Julian Date of the observation."),
+            "ring256": ("integer", None, "healpix", "HEALPix RING nside=256."),
+            "nest256": ("integer", None, "healpix", "HEALPix NEST nside=256 — NOT nest4096 here."),
+        },
+    },
+    "allwise.source": {
+        "purpose": "AllWISE all-sky mid-IR W1-W4 source catalog (~748M sources).",
+        "grain": "one row per source",
+        "columns": {
+            "cntr": ("integer", None, "identifier", "Unique AllWISE counter id; indexed."),
+            "source_id": ("string", None, "identifier", "Source id (coadd id + sequence; STRING)."),
+            "designation": ("string", None, "identifier", "AllWISE designation (STRING; not indexed)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "w1mpro": ("float", "mag", "measurement", "W1 (3.4 um) profile-fit magnitude (Vega)."),
+            "w2mpro": ("float", "mag", "measurement", "W2 (4.6 um) profile-fit magnitude (Vega)."),
+            "w3mpro": ("float", "mag", "measurement", "W3 (12 um) profile-fit magnitude (Vega)."),
+            "w4mpro": ("float", "mag", "measurement", "W4 (22 um) profile-fit magnitude (Vega)."),
+            "w1sigmpro": ("float", "mag", "uncertainty", "W1 magnitude uncertainty."),
+            "w2sigmpro": ("float", "mag", "uncertainty", "W2 magnitude uncertainty."),
+            "w3sigmpro": ("float", "mag", "uncertainty", "W3 magnitude uncertainty."),
+            "w4sigmpro": ("float", "mag", "uncertainty", "W4 magnitude uncertainty."),
+            "w1snr": ("float", "1", "quality", "W1 S/N."),
+            "w2snr": ("float", "1", "quality", "W2 S/N."),
+            "w3snr": ("float", "1", "quality", "W3 S/N."),
+            "w4snr": ("float", "1", "quality", "W4 S/N."),
+            "w1rchi2": ("float", "1", "quality", "Reduced chi2 of W1 profile fit."),
+            "w2rchi2": ("float", "1", "quality", "Reduced chi2 of W2 profile fit."),
+            "cc_flags": ("string", None, "quality", "Contamination/confusion flags per band ('0000' clean)."),
+            "ext_flg": ("integer", None, "quality", "0 = PSF-consistent point source; >0 extended/XSC-associated."),
+            "var_flg": ("string", None, "quality", "Variability flag per band (0-9; higher = more likely variable)."),
+            "ph_qual": ("string", None, "quality", "Photometric quality per band (A best)."),
+            "moon_lev": ("string", None, "quality", "Moon contamination level per band."),
+            "pmra": ("integer", "mas/yr", "measurement", "AllWISE apparent motion in RA — includes parallax; NOT a Gaia-style proper motion."),
+            "pmdec": ("integer", "mas/yr", "measurement", "AllWISE apparent motion in Dec (same caveat as pmra)."),
+            "sigpmra": ("integer", "mas/yr", "uncertainty", "Uncertainty on pmra."),
+            "sigpmdec": ("integer", "mas/yr", "uncertainty", "Uncertainty on pmdec."),
+            "j_m_2mass": ("float", "mag", "measurement", "Associated 2MASS J magnitude (Vega)."),
+            "h_m_2mass": ("float", "mag", "measurement", "Associated 2MASS H magnitude (Vega)."),
+            "k_m_2mass": ("float", "mag", "measurement", "Associated 2MASS Ks magnitude (Vega)."),
+            "ring256": ("integer", None, "healpix", "HEALPix RING nside=256."),
+            "nest4096": ("integer", None, "healpix", "HEALPix NEST nside=4096."),
+        },
+    },
+    "splus_dr4.dual": {
+        "purpose": "S-PLUS DR4 12-band (5 broad + 7 narrow) southern photometry, dual-mode detection.",
+        "grain": "one row per dual-mode detection",
+        "columns": {
+            "id": ("string", None, "identifier", "S-PLUS object id (STRING)."),
+            "ra": ("float", "deg", "ra", "ICRS right ascension."),
+            "dec": ("float", "deg", "dec", "ICRS declination."),
+            "field": ("string", None, "provenance", "S-PLUS field name."),
+            "class_star": ("float", "1", "quality", "SExtractor CLASS_STAR: ~1 star-like; point-source cut > 0.9."),
+            "fwhm": ("float", ("?", "S-PLUS DR4 documentation is ambiguous between pixels and arcsec for this column; verify on splus.cloud before physical use."), "measurement", "Source FWHM."),
+            "ebv_sch": ("float", "mag", "measurement", "Schlegel E(B-V) at the source position."),
+            "u_auto": ("float", "mag", "measurement", "u AUTO magnitude (AB; Javalambre system)."),
+            "g_auto": ("float", "mag", "measurement", "g AUTO magnitude (AB)."),
+            "r_auto": ("float", "mag", "measurement", "r AUTO magnitude (AB)."),
+            "i_auto": ("float", "mag", "measurement", "i AUTO magnitude (AB)."),
+            "z_auto": ("float", "mag", "measurement", "z AUTO magnitude (AB)."),
+            "j0378_auto": ("float", "mag", "measurement", "J0378 narrow-band AUTO magnitude (AB)."),
+            "j0395_auto": ("float", "mag", "measurement", "J0395 narrow-band AUTO magnitude (AB)."),
+            "j0410_auto": ("float", "mag", "measurement", "J0410 narrow-band AUTO magnitude (AB)."),
+            "j0430_auto": ("float", "mag", "measurement", "J0430 narrow-band AUTO magnitude (AB)."),
+            "j0515_auto": ("float", "mag", "measurement", "J0515 narrow-band AUTO magnitude (AB)."),
+            "j0660_auto": ("float", "mag", "measurement", "J0660 narrow-band AUTO magnitude (AB)."),
+            "j0861_auto": ("float", "mag", "measurement", "J0861 narrow-band AUTO magnitude (AB)."),
+            "e_u_auto": ("float", "mag", "uncertainty", "u AUTO magnitude uncertainty."),
+            "e_g_auto": ("float", "mag", "uncertainty", "g AUTO magnitude uncertainty."),
+            "e_r_auto": ("float", "mag", "uncertainty", "r AUTO magnitude uncertainty."),
+            "e_i_auto": ("float", "mag", "uncertainty", "i AUTO magnitude uncertainty."),
+            "e_z_auto": ("float", "mag", "uncertainty", "z AUTO magnitude uncertainty."),
+            "e_j0378_auto": ("float", "mag", "uncertainty", "J0378 magnitude uncertainty."),
+            "e_j0395_auto": ("float", "mag", "uncertainty", "J0395 magnitude uncertainty."),
+            "e_j0410_auto": ("float", "mag", "uncertainty", "J0410 magnitude uncertainty."),
+            "e_j0430_auto": ("float", "mag", "uncertainty", "J0430 magnitude uncertainty."),
+            "e_j0515_auto": ("float", "mag", "uncertainty", "J0515 magnitude uncertainty."),
+            "e_j0660_auto": ("float", "mag", "uncertainty", "J0660 magnitude uncertainty."),
+            "e_j0861_auto": ("float", "mag", "uncertainty", "J0861 magnitude uncertainty."),
+            "ring256": ("integer", None, "healpix", "HEALPix RING nside=256."),
+            "nest4096": ("integer", None, "healpix", "HEALPix NEST nside=4096."),
+        },
+    },
+}
+
+
+# Archive-level profile authoring (plain dicts; validated by
+# services.archive_profiles.datalab into the pydantic ArchiveProfile).
+_PROFILE_DESCRIPTION = (
+    "NOIRLab Astro Data Lab survey catalogs (Gaia DR3, DES DR1, DESI DR1, NSC DR2, "
+    "SMASH DR1/2, DELVE DR3, Legacy Surveys DR9, SDSS DR17, VHS DR5, unWISE, 2MASS, "
+    "AllWISE, S-PLUS DR4) queried through governed TAP/SQL builder tools."
+)
+
+_PROFILE_ENDPOINTS = [
+    {
+        "id": "datalab_tap",
+        "description": "Data Lab TAP/SQL service (reached through the governed datalab_* tools).",
+        "url": DATALAB_TAP_ENDPOINT,
+        "protocol": "tap",
+    },
+    {
+        "id": "sia_coadd_all",
+        "description": "Data Lab SIA cutout service over the merged coadd collection.",
+        "url": "https://datalab.noirlab.edu/sia/coadd_all",
+        "protocol": "sia",
+    },
+    {
+        "id": "sia_delve_dr3",
+        "description": "Data Lab SIA cutout service for DELVE DR3 coadds.",
+        "url": "https://datalab.noirlab.edu/sia/delve_dr3",
+        "protocol": "sia",
+    },
+]
+
+_PROFILE_QUERY_SURFACES = [
+    {
+        "id": "discover",
+        "purpose": "List registered catalogs/tables with footprints before choosing where to query.",
+        "tool": "datalab_list_catalogs",
+        "request_kind": "structured_args",
+    },
+    {
+        "id": "describe",
+        "purpose": "Column names/region strategy/morphology hints for one catalog table — call before writing SQL.",
+        "tool": "datalab_describe_table",
+        "request_kind": "structured_args",
+    },
+    {
+        "id": "select_rows",
+        "purpose": "Governed cone selection with server-side cuts — the default row-fetch route.",
+        "tool": "datalab_select_catalog_rows",
+        "request_kind": "structured_args",
+        "parameters": [
+            {"name": "radius_deg", "json_type": "number", "unit": "deg",
+             "description": "Cone radius in DEGREES (not arcmin)."},
+            {"name": "value_cuts", "json_type": "array", "description":
+                "Structured cuts, e.g. [{'column':'parallax_over_error','op':'>','value':5}]; "
+                "the builder adds the NaN finiteness guard automatically — prefer over raw SQL."},
+            {"name": "limit", "json_type": "integer", "unit": "1",
+             "description": "Row cap; capped results are storage-order slices — never density-map them."},
+        ],
+        "endpoint_ids": ["datalab_tap"],
+    },
+    {
+        "id": "expert_sql",
+        "purpose": "Expert/debug raw SQL (governed): needs a q3c cone, indexed equality, approved BETWEEN box, or aggregate bound.",
+        "tool": "datalab_sql_query",
+        "request_kind": "sql",
+        "query_argument": "sql",
+        "parameters": [
+            {"name": "expert_ack", "json_type": "boolean",
+             "description": "Must be true — acknowledges expert raw-SQL mode."},
+            {"name": "reason", "json_type": "string",
+             "description": "Free-text justification (narrative; earns no benchmark trace credit)."},
+        ],
+        "endpoint_ids": ["datalab_tap"],
+    },
+    {
+        "id": "density",
+        "purpose": "Server-side density aggregation (grid or HEALPix) — the ONLY correct base for sky-density maps.",
+        "tool": "datalab_density_aggregate",
+        "request_kind": "structured_args",
+        "parameters": [
+            {"name": "step_deg", "json_type": "number", "unit": "deg",
+             "description": "Grid cell size in degrees (mode='grid')."},
+            {"name": "healpix_column", "json_type": "string",
+             "description": "Registered HEALPix column; use the COARSE one (e.g. ring256) for regions wider than a few degrees."},
+            {"name": "radius_deg", "json_type": "number", "unit": "deg",
+             "description": "Cone radius in degrees; wide cones auto-tile — call ONCE with the full cone."},
+        ],
+        "endpoint_ids": ["datalab_tap"],
+    },
+    {
+        "id": "cone_count",
+        "purpose": "Cheap server-side row count for a cone — size a query before fetching rows.",
+        "tool": "datalab_cone_count",
+        "request_kind": "structured_args",
+        "parameters": [
+            {"name": "radius_deg", "json_type": "number", "unit": "deg",
+             "description": "Cone radius in degrees."},
+        ],
+        "endpoint_ids": ["datalab_tap"],
+    },
+]
+
+_PROFILE_PITFALLS = [
+    {
+        "id": "nan_ordering",
+        "summary": "missing floats are NaN and sort ABOVE numbers — every one-sided cut (col > x) needs AND col < 'Infinity'",
+        "detail": (
+            "Data Lab tables store missing float values as NaN (not SQL NULL) and Postgres orders NaN above every "
+            "real number, so a bare col > x / col >= x / col != x silently ADMITS every missing-value row. Add "
+            "AND col < 'Infinity' to one-sided lower-bound cuts in raw SQL; structured value_cuts add the guard "
+            "automatically. Upper-bounded and BETWEEN cuts are already NaN-safe."
+        ),
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+        "prompt_rank": 1,
+    },
+    {
+        "id": "per_band_columns",
+        "summary": "column naming is per-survey: DES/DELVE per-band mag_auto_r/class_star_r (no bare mag_auto), NSC/SMASH gmag/rmag, Gaia phot_g_mean_mag (bands g|bp|rp)",
+        "detail": (
+            "There is no bare mag_auto, class_star or spread_model on des_dr1.main — use mag_auto_r, class_star_r, "
+            "spread_model_r etc. NSC/SMASH use gmag/rmag/...; Gaia uses phot_g_mean_mag/phot_bp_mean_mag/"
+            "phot_rp_mean_mag (bands g|bp|rp, so 'rmag' does not exist); LS DR9 uses dered_mag_g/r/z (+W1/W2, no i band)."
+        ),
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+        "prompt_rank": 2,
+    },
+    {
+        "id": "density_from_aggregates",
+        "summary": "never build sky-density/overdensity maps from row-capped pulls — use datalab_density_aggregate (coarse HEALPix, e.g. ring256, for wide areas)",
+        "applies_to": [{"kind": "surface", "ref": "density"}],
+    },
+    {
+        "id": "smash_fieldid",
+        "summary": "bound whole-field SMASH queries with the indexed fieldid = N (no cone); multi-epoch photometry lives in .source, mean objects in .object",
+        "applies_to": [
+            {"kind": "table", "ref": "smash_dr1.object"},
+            {"kind": "table", "ref": "smash_dr2.object"},
+        ],
+    },
+    {
+        "id": "desi_quality",
+        "summary": "DESI zpix reliability cuts: zwarn = 0 AND survey = 'main' AND main_primary; object class via spectype ('GALAXY'|'QSO'|'STAR')",
+        "applies_to": [{"kind": "table", "ref": "desi_dr1.zpix"}],
+    },
+    {
+        "id": "sdss_zwarning",
+        "summary": "the SDSS specobj quality flag is zwarning (not zwarn); class is GALAXY|QSO|STAR",
+        "applies_to": [{"kind": "table", "ref": "sdss_dr17.specobj"}],
+    },
+    {
+        "id": "vhs_naming",
+        "summary": "the VHS DR5 relation is vhs_dr5.vhs_cat_v3 with coordinates ra2000/dec2000 (not ra/dec); JHKs are Vega",
+        "applies_to": [{"kind": "table", "ref": "vhs_dr5.vhs_cat_v3"}],
+    },
+    {
+        "id": "expansion_live_schema",
+        "summary": "catalogs beyond the curated set (delve_dr2, catwise2020, ls_dr10, ...) resolve through the live TAP schema — describe them before querying",
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+    },
+]
+
+_PROFILE_GOLDEN_EXAMPLES = [
+    {
+        "id": "gaia_quality_cone",
+        "intent": "Well-measured Gaia sources with colours and proper motions around M13.",
+        "invocation": {
+            "tool": "datalab_select_catalog_rows",
+            "arguments": {
+                "catalog": "gaia_dr3",
+                "table": "gaia_source",
+                "ra": 250.423,
+                "dec": 36.46,
+                "radius_deg": 0.2,
+                "columns": ["ra", "dec", "phot_g_mean_mag", "bp_rp", "parallax", "pmra", "pmdec"],
+                "value_cuts": [{"column": "parallax_over_error", "op": ">", "value": 5}],
+                "limit": 1000,
+            },
+        },
+        "note": "Structured value_cuts add the NaN finiteness guard automatically — prefer them over raw SQL.",
+    },
+    {
+        "id": "des_per_band_cmd",
+        "intent": "Clean DES stellar photometry for a colour-magnitude selection (per-band columns).",
+        "invocation": {
+            "tool": "datalab_sql_query",
+            "arguments": {
+                "sql": (
+                    "SELECT ra, dec, mag_auto_g - mag_auto_r AS gr, mag_auto_r "
+                    "FROM des_dr1.main "
+                    "WHERE q3c_radial_query(ra, dec, 34.0, -5.0, 0.5) "
+                    "AND flags_r = 0 AND mag_auto_r < 24 AND spread_model_r < 0.005 "
+                    "LIMIT 5000"
+                ),
+                "expert_ack": True,
+                "reason": "CMD needs a computed colour column; per-band mag_auto_g/r with NaN-safe upper-bound cuts.",
+            },
+        },
+        "request": {"kind": "sql", "argument": "sql"},
+        "note": "mag_auto_r / spread_model_r / flags_r are PER-BAND; upper-bound cuts are NaN-safe as written.",
+    },
+    {
+        "id": "nsc_lmc_density",
+        "intent": "Wide-area stellar density of the LMC region without pulling rows.",
+        "invocation": {
+            "tool": "datalab_density_aggregate",
+            "arguments": {
+                "catalog": "nsc_dr2",
+                "table": "object",
+                "mode": "healpix",
+                "healpix_column": "ring256",
+                "ra": 81.28,
+                "dec": -69.78,
+                "radius_deg": 5.0,
+            },
+        },
+        "note": "Coarse ring256 for a 5-degree field; the aggregate counts EVERY row server-side.",
+    },
+    {
+        "id": "des_cone_count",
+        "intent": "Size a DES query before fetching rows.",
+        "invocation": {
+            "tool": "datalab_cone_count",
+            "arguments": {"catalog": "des_dr1", "table": "main", "ra": 34.0, "dec": -5.0, "radius_deg": 0.5},
+        },
+    },
+]
+
+_PROFILE_UNIT_CONVENTIONS = [
+    {
+        "id": "coords_icrs_deg",
+        "statement": "All coordinates are ICRS decimal degrees; all cone radii in datalab_* tools are DEGREES.",
+    },
+    {
+        "id": "mag_systems",
+        "statement": (
+            "Magnitudes are AB for the DECam-family surveys (DES, NSC, DELVE, LS DR9, SMASH, S-PLUS) and "
+            "Vega for Gaia, 2MASS, AllWISE, unWISE and VHS."
+        ),
+    },
+]
+
+
+def _column_spec_dict(name: str, info: tuple) -> Dict[str, Any]:
+    """Expand a compact (dtype, unit, role, desc) tuple into ColumnSpec kwargs."""
+    dtype, unit, role, desc = info
+    spec: Dict[str, Any] = {"name": name, "dtype": dtype, "description": desc}
+    if role is not None:
+        spec["role"] = role
+    numeric = dtype in ("integer", "float", "decimal")
+    if isinstance(unit, tuple):
+        spec["unit_state"] = "unknown"
+        spec["unit_note"] = unit[1]
+    elif isinstance(unit, str):
+        spec["unit"] = unit
+    elif numeric:
+        spec["unit_state"] = "not_applicable"
+    return spec
+
+
+def to_profile() -> Dict[str, Any]:
+    """Assemble the Data Lab ArchiveProfile as a PLAIN dict (adapter, not a
+    rewrite): tables come from the curated registry merged with
+    TABLE_PROFILE_INFO; pydantic validation happens in
+    ``services.archive_profiles.datalab`` so this module never imports the
+    profile package. Fails loudly if the authored column metadata and the
+    authoritative ``columns`` lists ever drift apart."""
+
+    sia_endpoint_ids = {e["url"]: e["id"] for e in _PROFILE_ENDPOINTS if e["protocol"] == "sia"}
+
+    citations: List[Dict[str, Any]] = []
+    tables: Dict[str, Any] = {}
+    for qualified in registered_qualified_tables():
+        catalog_key, table_key = qualified.split(".", 1)
+        entry = DATALAB_CATALOGS[catalog_key]
+        described = describe_table(catalog_key, table_key)
+        info = TABLE_PROFILE_INFO.get(qualified)
+        if info is None:
+            raise ValueError(f"TABLE_PROFILE_INFO is missing curated table {qualified!r}")
+        authored = info["columns"]
+        registry_cols = described["columns"]
+        missing = [c for c in registry_cols if c not in authored]
+        extra = [c for c in authored if c not in registry_cols]
+        if missing or extra:
+            raise ValueError(
+                f"{qualified}: column metadata drift (missing={missing}, extra={extra})"
+            )
+
+        citation_id = f"cite_{catalog_key}"
+        if not any(c["id"] == citation_id for c in citations):
+            cite = described.get("citation") or {}
+            citations.append(
+                {
+                    "id": citation_id,
+                    "text": cite.get("text") or catalog_key,
+                    "url": cite.get("url"),
+                    "doi": cite.get("doi"),
+                }
+            )
+
+        tables[qualified] = {
+            "purpose": info["purpose"],
+            "grain": info["grain"],
+            "columns": [_column_spec_dict(name, authored[name]) for name in registry_cols],
+            "ra_column": described["ra_column"],
+            "dec_column": described["dec_column"],
+            "hints": {
+                "footprint": described.get("footprint"),
+                "region_strategy": described.get("region_strategy"),
+                "healpix_columns": described.get("healpix_columns", []),
+                "morphology": described.get("morphology", {}),
+                "bitmasks": described.get("bitmasks", {}),
+                "aggregate_safe": described.get("aggregate_safe"),
+                "endpoint_ids": [
+                    sia_endpoint_ids[url]
+                    for url in entry.get("sia_endpoints", [])
+                    if url in sia_endpoint_ids
+                ],
+            },
+            "citation_ids": [citation_id],
+        }
+
+    return {
+        "archive": "datalab",
+        "aliases": ("noirlab", "astro data lab", "noao"),
+        "description": _PROFILE_DESCRIPTION,
+        "endpoints": _PROFILE_ENDPOINTS,
+        "query_surfaces": _PROFILE_QUERY_SURFACES,
+        "tables": tables,
+        "pitfalls": _PROFILE_PITFALLS,
+        "golden_examples": _PROFILE_GOLDEN_EXAMPLES,
+        "unit_conventions": _PROFILE_UNIT_CONVENTIONS,
+        "citations": citations,
+    }
+
+
 __all__ = [
     "DATALAB_CATALOGS",
     "EXPANSION_CATALOGS",
@@ -1271,4 +2007,7 @@ __all__ = [
     "region_strategy",
     "registered_qualified_tables",
     "tap_schema_ttl_seconds",
+    "to_profile",
+    "TABLE_PROFILE_INFO",
+    "DATALAB_TAP_ENDPOINT",
 ]

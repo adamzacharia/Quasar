@@ -58,6 +58,7 @@ interface ChatStore {
     updateLastAssistantMessage: (content: string) => void;
     updateLastAssistantThinking: (thinking: string) => void;
     updateLastAssistantRunMeta: (meta: import("./api").ChatRunMeta) => void;
+    updateLastAssistantToolTrace: (calls: import("./api").ToolTraceCall[]) => void;
     updateLastAssistantUsage: (totalTokens: number, durationMs?: number) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
@@ -194,6 +195,11 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     if (meta.runMeta && typeof meta.runMeta === "object") {
         base.runMeta = meta.runMeta as Message["runMeta"];
     }
+    // Raw request provenance (Feature 1) — without this the exact queries are
+    // dropped on history replay, which is the whole point of persisting them.
+    if (Array.isArray(meta.toolTrace) && meta.toolTrace.length > 0) {
+        base.toolTrace = meta.toolTrace as Message["toolTrace"];
+    }
 
     const messages: Message[] = [base];
 
@@ -249,6 +255,9 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
             type: "papers",
             timestamp: new Date(),
             papers: mappedPapers,
+            // The ADS query behind the grid (Feature 1) — persisted, so the
+            // provenance block survives a reload.
+            request: meta.papersRequest as Message["request"],
         });
     }
 
@@ -276,7 +285,7 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
         storedImages.forEach((rawImage, imageIndex) => {
             if (rawImage === null || rawImage === undefined) return;
             if (typeof rawImage === "object") {
-                const img = rawImage as { url?: string; caption?: string; meta?: unknown };
+                const img = rawImage as { url?: string; caption?: string; meta?: unknown; request?: Message["request"] };
                 const rawUrl = String(img.url || "").trim();
                 if (rawUrl === "" || seenImageUrls.has(rawUrl)) return;
                 seenImageUrls.add(rawUrl);
@@ -290,6 +299,7 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
                     imageUrl,
                     imageCaption: img.caption || "",
                     imageMeta: normalizeHipsImageMeta(img.meta),
+                    request: img.request,   // Feature 1: survives reload
                 });
             }
         });
@@ -493,6 +503,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const index = findLastAssistantTextIndex(messages);
         if (index < 0) return {};
         messages[index] = { ...messages[index], runMeta: meta };
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
+        };
+    }),
+
+    // Raw request provenance for the turn (Feature 1). Lands on the assistant
+    // text message; card messages carry their own `request` on the card payload.
+    updateLastAssistantToolTrace: (calls) => set((state) => {
+        if (!Array.isArray(calls) || calls.length === 0) return {};
+        const messages = [...state.messages];
+        const index = findLastAssistantTextIndex(messages);
+        if (index < 0) return {};
+        messages[index] = { ...messages[index], toolTrace: calls };
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),

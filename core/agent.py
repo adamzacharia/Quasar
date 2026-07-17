@@ -603,6 +603,22 @@ class QuasarAgent:
         self._tls.accumulated_run_results = value
 
     @property
+    def _alma_tap_provenance_state(self):
+        """The ADQL/TAP endpoint the CURRENT request executed against ALMA.
+
+        Request-scoped like _accumulated_tool_trace, and for the same reason:
+        the agent is a process-wide SINGLETON (ui-pro/api/deps.py::get_agent)
+        while concurrent chats run on separate executor threads. The legacy
+        plain instance attrs this replaced (_last_alma_tap_query/_url) were
+        instance-wide last-write-wins, so one request could report ANOTHER
+        request's query as its own provenance — harmless when nothing surfaced
+        it, a lie now that the query-provenance surface shows it to the user.
+        """
+        if not hasattr(self._tls, "alma_tap_provenance_state"):
+            self._tls.alma_tap_provenance_state = {"query": None, "url": None}
+        return self._tls.alma_tap_provenance_state
+
+    @property
     def _accumulated_tool_trace(self):
         # Request-scoped like _accumulated_run_results: concurrent chats must
         # never mix tool traces. Conductor subtask threads get their own
@@ -745,6 +761,21 @@ class QuasarAgent:
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the agent"""
+        # Feature 3: compact per-archive schema-grounding index. Tool-mediated
+        # by design — one pointer line per archive, detail stays behind the
+        # browse_schema tool. ONLY this injection is gated by
+        # QUASAR_SCHEMA_GROUNDING (default on) so the benchmark can A/B it;
+        # the tool itself is always registered.
+        schema_grounding_block = ""
+        if os.getenv("QUASAR_SCHEMA_GROUNDING", "1").strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                from services.archive_profiles import prompt_index_lines
+                schema_grounding_block = (
+                    "\nARCHIVE SCHEMA GROUNDING (canonical, not exhaustive):\n"
+                    + "\n".join(prompt_index_lines()) + "\n"
+                )
+            except Exception as e:
+                print(f"[SCHEMA GROUNDING] profile index unavailable: {e}")
         return f"""You are Quasar, an expert AI research assistant for astronomy — all wavelengths, all archives.
 
 You give science users natural-language access to major astronomical data services:
@@ -769,7 +800,7 @@ DOMAIN ROUTING (read first):
 - The documentation (RAG) context, when present, covers observatory/instrument manuals (mostly
   ALMA/radio). It is IRRELEVANT to survey-catalog data requests — if the user wants catalog data,
   call the data tools and ignore weak documentation snippets.
-
+{schema_grounding_block}
 ARTIFACT HONESTY (hard rule):
 - Only claim a plot/image/data card "is shown above" when a tool in THIS turn actually returned
   success with an attached visual (image_attached/path in its result). The UI renders visuals from
@@ -2416,10 +2447,50 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         if cap is None:  # pragma: no cover - registration wiring guard
             raise KeyError(f"No migrated ALMA capability named '{name}'")
         fn = build_tool(cap, self._alma_ctx_provider).function
+        fn = self._with_alma_tap_provenance(fn)
         if log_name:
             fn.__name__ = log_name
             fn = log_tool(fn)
         return fn
+
+    def _with_alma_tap_provenance(self, fn):
+        """Attach the ADQL/TAP endpoint THIS call executed as the provenance
+        sidecar (Feature 1).
+
+        capabilities/alma.py records its executed query into the request-scoped
+        ``alma_tap_provenance`` dict (injected via _alma_ctx_provider) instead of
+        onto ToolResult.provenance, so the generic native adapter cannot see it.
+
+        We CLEAR that dict before the call and attach whatever the call wrote —
+        rather than diffing before/after. Diffing can't distinguish "re-ran the
+        identical query" from "wrote nothing" (CX-08); clearing first makes any
+        write of this call's own query detectable, and the state is request-
+        scoped (agent._tls) so clearing never disturbs a concurrent request.
+        """
+        from capabilities.base import PROVENANCE_SIDECAR_KEY
+
+        def _wrapped(**kwargs):
+            state = getattr(self, "_alma_tap_provenance_state", None)
+            if isinstance(state, dict):
+                state["query"] = None
+                state["url"] = None
+            out = fn(**kwargs)
+            query = state.get("query") if isinstance(state, dict) else None
+            url = state.get("url") if isinstance(state, dict) else None
+            if query and isinstance(out, dict) and PROVENANCE_SIDECAR_KEY not in out:
+                out = {
+                    **out,
+                    PROVENANCE_SIDECAR_KEY: {
+                        "provenance": {
+                            "service": "alma",
+                            "query": query,
+                            "endpoint": url,
+                        }
+                    },
+                }
+            return out
+
+        return _wrapped
 
     def _alma_ctx_provider(self):
         """Build the per-call CallContext for the ALMA/archive-search capabilities.
@@ -2431,10 +2502,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         are bound closures over the agent's thread-local properties, so the
         request-scoped TLS semantics stay agent-side."""
         from capabilities.base import CallContext
-        if not hasattr(self, "_alma_tap_provenance_state"):
-            # Mirrors the legacy plain instance attrs _last_alma_tap_query/_url:
-            # instance-wide (NOT thread-local), last-write-wins across requests.
-            self._alma_tap_provenance_state = {"query": None, "url": None}
 
         def _get_lsr():
             return self.last_search_results
@@ -4416,6 +4483,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         if tool:
             try:
                 result = tool.execute(**kwargs)
+                # Sandbox user code sees the same dict the model does — the
+                # provenance sidecar is transport plumbing, not tool output.
+                result, _ = self._pop_provenance_sidecar(result)
                 return result
             except Exception as e:
                 return {"error": f"Tool '{tool_name}' execution failed: {e}"}
@@ -4653,15 +4723,35 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             self._accumulated_run_results = []
             import gc; gc.collect()
 
+    @staticmethod
+    def _pop_provenance_sidecar(result):
+        """Split a tool result into (model-facing result, provenance sidecar).
+
+        The native adapter attaches canonical provenance under
+        ``PROVENANCE_SIDECAR_KEY`` because ``ToolResult.to_native()`` cannot
+        carry it (see capabilities/base.py). It must come off before the result
+        is serialized to the model, so the LLM-facing payload — and the
+        benchmark's view of it — is byte-identical to before.
+        """
+        from capabilities.base import PROVENANCE_SIDECAR_KEY
+        if isinstance(result, dict) and PROVENANCE_SIDECAR_KEY in result:
+            clean = dict(result)
+            return clean, clean.pop(PROVENANCE_SIDECAR_KEY)
+        return result, None
+
     def _record_tool_trace(self, tool_name: str, args, result_str: str,
-                           result_obj=None) -> None:
+                           result_obj=None, provenance=None) -> None:
         """Append a compact record of one executed tool call to the per-request
         trace (surfaced as the SSE ``tool_trace`` event; consumed by the UI's
         debug view and by Benchmark/datalabbench). Never raises.
 
         ``result_obj`` is the untruncated result dict when the caller has it —
         structured fields are read from it so an 8000-char ``result_str``
-        slice can never cost the trace its SQL/rowcount."""
+        slice can never cost the trace its SQL/rowcount.
+
+        ``provenance`` is the adapter's provenance sidecar (see
+        :meth:`_pop_provenance_sidecar`); it carries the EXACT executed
+        query/endpoint, which the model-facing dict does not."""
         try:
             trace = self._accumulated_tool_trace
             if len(trace) >= 200:
@@ -4669,6 +4759,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             ok = True
             sql = ""
             rowcount = None
+            parsed = None
             try:
                 parsed = result_obj
                 if not isinstance(parsed, dict):
@@ -4691,6 +4782,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "output": (result_str or "")[:2000],
                 "ok": ok,
             }
+            # The uniform, redacted request surface (Feature 1). `sql` below is
+            # RETAINED for back-compat: Benchmark/datalabbench scores against it
+            # via trace_regex.
+            try:
+                from core.provenance import build_tool_request
+                record["request"] = build_tool_request(
+                    tool_name, args,
+                    result_obj=parsed if isinstance(parsed, dict) else result_obj,
+                    sidecar=provenance,
+                )
+            except Exception:
+                pass
             if sql:
                 record["sql"] = sql[:1500]
             if isinstance(rowcount, (int, float)):
@@ -4724,16 +4827,19 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         tool = self.tool_registry.get_tool(tool_name)
         result_obj = None
+        _sidecar = None
         if tool:
             try:
                 result = tool.execute(**args)
+                result, _sidecar = self._pop_provenance_sidecar(result)
                 result_obj = result if isinstance(result, dict) else None
                 result_str = _json.dumps(result, default=str)[:8000]
             except Exception as e:
                 result_str = _json.dumps({"error": str(e)})
         else:
             result_str = _json.dumps({"error": f"Unknown tool: {tool_name}"})
-        self._record_tool_trace(tool_name, args, result_str, result_obj=result_obj)
+        self._record_tool_trace(tool_name, args, result_str, result_obj=result_obj,
+                                provenance=_sidecar)
         return result_str
 
     # ==================================================================

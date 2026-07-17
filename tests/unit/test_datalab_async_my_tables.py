@@ -125,9 +125,11 @@ def test_density_aggregate_async_submit_skips_sync_and_tiling():
 
     client = _NeverSync()
     ctx, jobs, _ = _ctx(client)
+    # radius 3.0 > the 2.5-degree unconfirmed cap (F-7 HITL gate, which fires
+    # before the async_submit branch), so model a user-confirmed wide scan.
     out = dl.DensityAggregate().run(
         dl.DensityAggregateInput(catalog="gaia_dr3", table="gaia_source", ra=10.0, dec=10.0, radius_deg=3.0,
-                                 async_submit=True),
+                                 async_submit=True, confirm=True),
         ctx,
     ).to_native()
     # The job was queued; the sync attempt (which would raise) never ran on this thread.

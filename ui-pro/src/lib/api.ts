@@ -38,15 +38,43 @@ export interface ChatRunMeta {
     turn_timeout_seconds?: number;
 }
 
+/** The exact request one tool call made. `text` is the copyable literal for
+ *  every kind — the UI never needs per-archive rendering. Built (and secret-
+ *  redacted) server-side in core/provenance.py. */
+export interface ToolRequest {
+    kind: "adql" | "http" | "ads" | "params" | "args";
+    text: string;
+    service?: string;
+    endpoint?: string;
+    url?: string;
+    method?: string;
+    q?: string;
+    rows?: number;
+    snippet?: string;
+    params?: Record<string, unknown>;
+    args?: Record<string, unknown>;
+}
+
+/** One entry of the `tool_trace` event / persisted `rich_meta.toolTrace`. */
+export interface ToolTraceCall {
+    name: string;
+    ok?: boolean;
+    sql?: string;
+    rowcount?: number;
+    request?: ToolRequest;
+    arguments?: Record<string, unknown>;
+}
+
 export interface StreamCallbacks {
     onToken: (token: string) => void;
     onThought?: (thought: string) => void;
-    onToolCall?: (toolName: string, input: string) => void;
+    onToolCall?: (toolName: string, input: string, request?: ToolRequest) => void;
+    onToolTrace?: (calls: ToolTraceCall[]) => void;
     onData?: (data: Record<string, unknown>) => void;
-    onPapers?: (papers: Record<string, unknown>[]) => void;
+    onPapers?: (papers: Record<string, unknown>[], request?: ToolRequest) => void;
     onNotebook?: (notebook: Record<string, unknown>) => void;
-    onImage?: (image: { url: string; caption: string; meta?: unknown }) => void;
-    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string; meta?: Record<string, unknown> }) => void;
+    onImage?: (image: { url: string; caption: string; meta?: unknown; request?: ToolRequest }) => void;
+    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string; meta?: Record<string, unknown>; request?: ToolRequest }) => void;
     onStatus?: (step: string, state: string) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
@@ -70,7 +98,19 @@ export interface StreamCallbacks {
     }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
     onRunMeta?: (meta: ChatRunMeta) => void;
-    onUsage?: (usage: { inputTokens: number; outputTokens: number; totalTokens: number; durationMs?: number }) => void;
+    onUsage?: (usage: {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        durationMs?: number;
+        /** Estimated USD for this turn. null when nothing in the turn could be
+         *  priced (TACC / self-hosted) — that is "unknown", not "free", so do
+         *  not render null as $0.00. */
+        costUsd?: number | null;
+        /** Tokens excluded from costUsd because their model has no known price. */
+        unpricedTokens?: number;
+        costIsEstimate?: boolean;
+    }) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null; eta_seconds?: number | null; phase?: string }) => void;
     onComplete: (fullResponse: string) => void;
     onError: (error: string, status?: number) => void;
@@ -255,10 +295,19 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             if (callbacks.onStatus) {
                                 callbacks.onStatus(parsed.displayName || parsed.name, parsed.status || "completed");
                             }
+                            // NOTE: deliberately does NOT call onToolCall — that handler
+                            // spawns a separate message bubble per tool call, which this
+                            // UI intentionally renders as a thinking step instead. The
+                            // event's `request` reaches cards via the `data` payload and
+                            // the turn's `tool_trace`.
+                        } else if (parsed.type === "tool_trace" && callbacks.onToolTrace) {
+                            // The backend has always emitted this; nothing consumed it
+                            // until the query-provenance surface (Feature 1).
+                            callbacks.onToolTrace(Array.isArray(parsed.calls) ? parsed.calls : []);
                         } else if (parsed.type === "data" && callbacks.onData) {
                             callbacks.onData(parsed);
                         } else if (parsed.type === "papers" && callbacks.onPapers) {
-                            callbacks.onPapers(parsed.papers);
+                            callbacks.onPapers(parsed.papers, parsed.request || undefined);
                         } else if (parsed.type === "notebook" && callbacks.onNotebook) {
                             callbacks.onNotebook(parsed);
                         } else if (parsed.type === "image" && callbacks.onImage) {
@@ -336,6 +385,51 @@ export async function submitPlanFeedback(
         const errText = await res.text();
         throw new Error(`Plan feedback failed: ${errText}`);
     }
+    return res.json();
+}
+
+export interface UsageCostBreakdown {
+    cost_usd: number;
+    by_provider_usd: Record<string, number>;
+    total_tokens: number;
+    /** Tokens excluded from cost_usd because their model has no known price
+     *  (TACC / self-hosted). Surface alongside cost_usd — on its own, cost_usd
+     *  looks like the whole story when it may cover only part of the tokens. */
+    unpriced_tokens: number;
+}
+
+export interface UsageSummary {
+    platform: Record<string, { used_tokens: number; limit_tokens?: number | null; unlimited: boolean; exhausted: boolean }>;
+    byok: Record<string, { used_tokens: number; limit_tokens?: number | null; unlimited: boolean; exhausted: boolean }>;
+    is_admin: boolean;
+    is_quota_exempt?: boolean;
+    platform_quota_window_days?: number;
+    daily?: {
+        used_tokens: number;
+        limit_tokens?: number | null;
+        unlimited: boolean;
+        exhausted: boolean;
+        remaining_tokens?: number | null;
+        window_hours?: number;
+    };
+    cost?: {
+        platform_today: UsageCostBreakdown;
+        platform_week: UsageCostBreakdown;
+        byok_today: UsageCostBreakdown;
+        byok_week: UsageCostBreakdown;
+        is_estimate: boolean;
+        pricing_last_verified: string;
+    };
+}
+
+/** Per-user tokens + estimated cost (today / this week) and cap headroom.
+ *  Canonical endpoint; `/api/usage-quota` returns the same payload. */
+export async function getUsageSummary(token?: string | null): Promise<UsageSummary> {
+    const res = await fetch(`${API_BASE}/api/usage/summary`, {
+        credentials: "include",
+        headers: bearerOnlyHeaders(token),
+    });
+    if (!res.ok) throw new Error(await getErrorMessage(res));
     return res.json();
 }
 

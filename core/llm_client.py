@@ -64,6 +64,10 @@ class LLMRequestContext:
     user_email: str = ""
     usage_recorder: Optional[Callable[..., None]] = None
     quota_checker: Optional[Callable[..., None]] = None
+    # Frees a reservation taken by quota_checker when the call never records
+    # usage (it raised, or the provider reported none). Without it that call's
+    # reserved tokens would hold the user's own headroom until the TTL.
+    quota_releaser: Optional[Callable[..., None]] = None
     byok_token_limits: Dict[str, Optional[int]] = field(default_factory=dict)
 
 
@@ -76,6 +80,7 @@ def llm_request_context(
     user_email: str = "",
     usage_recorder: Optional[Callable[..., None]] = None,
     quota_checker: Optional[Callable[..., None]] = None,
+    quota_releaser: Optional[Callable[..., None]] = None,
     byok_token_limits: Optional[Dict[str, Optional[int]]] = None,
 ):
     """Install request-local LLM key routing and usage accounting."""
@@ -87,6 +92,7 @@ def llm_request_context(
         user_email=user_email or "",
         usage_recorder=usage_recorder,
         quota_checker=quota_checker,
+        quota_releaser=quota_releaser,
         byok_token_limits=dict(byok_token_limits or {}),
     )
     try:
@@ -342,14 +348,35 @@ class ResponsesShim:
             else:
                 self._history_cache.clear()
 
-    def _record_usage(self, provider: str, model: str, result: Any) -> None:
-        """Record provider-reported token usage, if a request recorder is installed."""
+    def _release_quota(self, reservation_id: Optional[str]) -> None:
+        """Hand a reservation back unused. Idempotent and never raises."""
+        if not reservation_id:
+            return
+        context = get_llm_request_context()
+        releaser = context.quota_releaser if context else None
+        if releaser is None:
+            return
+        try:
+            releaser(reservation_id)
+        except Exception as exc:
+            # The reservation expires on its own, so a failure here costs the
+            # user some headroom for the TTL but must not break their request.
+            logger.warning("[usage] Failed to release quota reservation: %s", redact_secrets(exc))
+
+    def _record_usage(
+        self, provider: str, model: str, result: Any, reservation_id: Optional[str] = None
+    ) -> None:
+        """Record provider-reported token usage, if a request recorder is installed.
+
+        Settles `reservation_id` in the same step. Every path out of here either
+        settles or releases it — a reservation that is silently dropped keeps
+        holding the caller's own headroom until it expires.
+        """
         context = get_llm_request_context()
         recorder = context.usage_recorder if context else None
-        if recorder is None:
-            return
         usage = getattr(result, "usage", None)
-        if usage is None:
+        if recorder is None or usage is None:
+            self._release_quota(reservation_id)
             return
         try:
             recorder(
@@ -358,11 +385,15 @@ class ResponsesShim:
                 key_source=self._llm._resolve_key_source(provider),
                 input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
                 output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                reservation_id=reservation_id,
             )
         except Exception as exc:
             logger.warning("[usage] Failed to record LLM usage: %s", redact_secrets(exc))
+            self._release_quota(reservation_id)
 
-    def _wrap_usage_stream(self, stream: Any, provider: str, model: str):
+    def _wrap_usage_stream(
+        self, stream: Any, provider: str, model: str, reservation_id: Optional[str] = None
+    ):
         """Wrap a stream and record usage from the completed response event."""
         last_response = None
         try:
@@ -372,8 +403,12 @@ class ResponsesShim:
                     last_response = response
                 yield event
         finally:
+            # Runs on exhaustion, on close(), and when the consumer throws, so a
+            # stream abandoned mid-flight still settles rather than leaking.
             if last_response is not None:
-                self._record_usage(provider, model, last_response)
+                self._record_usage(provider, model, last_response, reservation_id)
+            else:
+                self._release_quota(reservation_id)
 
     def create(self, **kwargs) -> Any:
         """
@@ -399,8 +434,12 @@ class ResponsesShim:
         user_id = kwargs.pop("user_id", None)
         session_id = kwargs.pop("session_id", None) or kwargs.pop("conversation_id", None)
         context = get_llm_request_context()
+        # Admission for THIS call. The checker may hold a reservation against the
+        # user's remaining allowance, which every path below must settle (via
+        # _record_usage) or release.
+        reservation_id = None
         if context and context.quota_checker:
-            context.quota_checker(
+            reservation_id = context.quota_checker(
                 provider=provider,
                 model=model,
                 key_source=self._llm._resolve_key_source(provider),
@@ -525,13 +564,18 @@ class ResponsesShim:
                     result = wrap_generator(result, lf_gen, t0)
 
             if stream:
-                result = self._wrap_usage_stream(result, provider, model)
+                # Ownership of the reservation passes to the generator, which
+                # settles or releases it in its finally once consumed.
+                result = self._wrap_usage_stream(result, provider, model, reservation_id)
             else:
-                self._record_usage(provider, model, result)
+                self._record_usage(provider, model, result, reservation_id)
 
             return result
 
         except Exception as e:
+            # The call never produced usage to settle against, so hand the
+            # reservation back rather than making the user wait out its TTL.
+            self._release_quota(reservation_id)
             # ── Langfuse: record the error on the generation ──
             if lf_gen:
                 try:

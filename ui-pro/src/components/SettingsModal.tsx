@@ -44,12 +44,42 @@ interface QuotaBucket {
     exhausted: boolean;
 }
 
+interface DailyBucket {
+    used_tokens: number;
+    limit_tokens?: number | null;
+    unlimited: boolean;
+    exhausted: boolean;
+    remaining_tokens?: number | null;
+    window_hours?: number;
+}
+
+interface CostBreakdown {
+    cost_usd: number;
+    by_provider_usd: Record<string, number>;
+    total_tokens: number;
+    /** Tokens excluded from cost_usd because the model has no known price
+     *  (TACC / self-hosted). Must be surfaced — otherwise cost_usd reads as
+     *  the whole story when it may cover a fraction of the tokens. */
+    unpriced_tokens: number;
+}
+
+interface UsageCost {
+    platform_today: CostBreakdown;
+    platform_week: CostBreakdown;
+    byok_today: CostBreakdown;
+    byok_week: CostBreakdown;
+    is_estimate: boolean;
+    pricing_last_verified: string;
+}
+
 interface UsageQuota {
     platform: Record<string, QuotaBucket>;
     byok: Record<string, QuotaBucket>;
     is_admin: boolean;
     is_quota_exempt?: boolean;
     platform_quota_window_days?: number;
+    daily?: DailyBucket;
+    cost?: UsageCost;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────
@@ -69,6 +99,15 @@ function formatTokens(value?: number | null) {
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
     if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}K`;
     return n.toLocaleString();
+}
+
+/** Cost is an estimate and often sub-cent, so show enough precision to avoid
+ *  rendering every small spend as "$0.00". */
+function formatUsd(value?: number | null) {
+    const n = Number(value || 0);
+    if (n === 0) return "$0.00";
+    if (n < 0.01) return `<$0.01`;
+    return `$${n.toFixed(2)}`;
 }
 
 // ── Personalization Panel ─────────────────────────────────────────────────
@@ -686,6 +725,74 @@ function ProviderKeysPanel() {
                 <div className={`flex items-start gap-2 text-xs rounded-lg px-3 py-2 border ${message.type === "success" ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300" : "bg-red-500/10 border-red-500/30 text-red-300"}`}>
                     {message.type === "success" ? <CheckCircle className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
                     <span>{message.text}</span>
+                </div>
+            )}
+
+            {quota?.cost && (
+                <div className="glass-control rounded-xl px-4 py-3 space-y-3">
+                    <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold text-slate-300">Usage</span>
+                        <span className="text-[10px] text-slate-500">
+                            Estimated · rates as of {quota.cost.pricing_last_verified}
+                        </span>
+                    </div>
+
+                    {quota.daily && !quota.daily.unlimited && (
+                        <div>
+                            <div className="flex items-center justify-between text-xs mb-2">
+                                <span className="text-slate-400">
+                                    Daily token limit (rolling {quota.daily.window_hours ?? 24}h)
+                                </span>
+                                <span className={quota.daily.exhausted ? "text-red-300" : "text-slate-400"}>
+                                    {formatTokens(quota.daily.used_tokens)} / {formatTokens(quota.daily.limit_tokens)}
+                                </span>
+                            </div>
+                            <div className="h-1.5 rounded-full bg-slate-700 overflow-hidden">
+                                <div
+                                    className={`h-full ${quota.daily.exhausted ? "bg-red-400" : "bg-primary"}`}
+                                    style={{
+                                        width: `${quota.daily.limit_tokens
+                                            ? Math.min(100, Math.round((quota.daily.used_tokens / quota.daily.limit_tokens) * 100))
+                                            : 0}%`,
+                                    }}
+                                />
+                            </div>
+                            {quota.daily.exhausted && (
+                                <p className="text-[11px] text-red-300 mt-2">
+                                    Daily limit reached. It resets on a rolling 24-hour basis, or add your own
+                                    provider key below to continue right away.
+                                </p>
+                            )}
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                        {([
+                            ["Today", quota.cost.platform_today, quota.cost.byok_today],
+                            ["This week", quota.cost.platform_week, quota.cost.byok_week],
+                        ] as const).map(([label, platformCost, byokCost]) => (
+                            <div key={label} className="space-y-1">
+                                <div className="text-[11px] text-slate-500">{label}</div>
+                                <div className="text-sm text-white">
+                                    {formatTokens(platformCost.total_tokens + byokCost.total_tokens)} tokens
+                                </div>
+                                <div className="text-[11px] text-slate-400">
+                                    ≈{formatUsd(platformCost.cost_usd)} on Quasar
+                                </div>
+                                {byokCost.total_tokens > 0 && (
+                                    <div className="text-[11px] text-slate-400">
+                                        ≈{formatUsd(byokCost.cost_usd)} on your key
+                                    </div>
+                                )}
+                                {platformCost.unpriced_tokens + byokCost.unpriced_tokens > 0 && (
+                                    <div className="text-[11px] text-slate-500">
+                                        {formatTokens(platformCost.unpriced_tokens + byokCost.unpriced_tokens)} tokens
+                                        not priced
+                                    </div>
+                                )}
+                            </div>
+                        ))}
+                    </div>
                 </div>
             )}
 

@@ -144,6 +144,40 @@ def _tap_obscore_dataframe(
     return df
 
 
+_ALMA_TAP_URL = "https://almascience.nrao.edu/tap"
+
+
+def _obscore_cone_adql(ra: float, dec: float, radius_deg: float) -> str:
+    """The obscore cone the ALMA client's TAP path executes for a positional/
+    target search (integrations/alminer_client.py `tap_search`).
+
+    This is byte-exact to the raw-TAP branch. The client also races
+    `alminer.conesearch`, whose internal ADQL is opaque (a third-party library);
+    this reproducible cone is the equivalent request, not a capture of alminer's
+    private query. Labeled that way for the user in the provenance surface.
+    """
+    return (
+        "SELECT * FROM ivoa.obscore "
+        f"WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
+        f"CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1"
+    )
+
+
+def _set_alma_cone_provenance(ctx: CallContext, ra, dec, radius_deg) -> None:
+    """Write the executed obscore cone ADQL into the REQUEST-SCOPED provenance
+    state (Feature 1). Built here from this request's own coordinates — no shared
+    client state, so concurrent ALMA requests never cross-attribute. Never raises.
+    """
+    try:
+        if ra is None or dec is None or radius_deg is None:
+            return
+        prov = ctx.service("alma_tap_provenance")
+        prov["query"] = _obscore_cone_adql(float(ra), float(dec), float(radius_deg))
+        prov["url"] = _ALMA_TAP_URL
+    except Exception:  # noqa: BLE001 - provenance never breaks a search
+        pass
+
+
 def _redshifted_line_where(
     rest_species: str,
     redshift_min: float,
@@ -222,6 +256,11 @@ class SearchByPosition(BaseCapability):
             results = search_service.cone_search(
                 ra, dec, radius, facility, max_results
             )
+            # Request-local: this capability owns ra/dec/radius, so the exact
+            # obscore cone is reconstructable without touching shared client
+            # state (avoids the singleton cross-request race, CX-36).
+            if facility_label == "ALMA":
+                _set_alma_cone_provenance(ctx, ra, dec, radius)
 
             # If the archive query failed, surface a typed error rather than
             # masking the outage as a confirmed empty result. (C3)
@@ -520,6 +559,11 @@ class SearchByTarget(BaseCapability):
                 results = search_service.search_by_target(
                     target_name, facility, date_range, max_results
                 )
+            # NB: target-NAME search resolves coordinates to a cone INSIDE the
+            # client (radius 0.05°); those coords are not exposed race-free, and
+            # re-resolving here would add a SIMBAD call per search. So name-search
+            # provenance is DEFERRED (falls back to kind:"args"); position/cone
+            # search below gets exact request-local ADQL. See reconciliation CX-07.
 
             if results.empty:
                 # ── Automatic positional fallback ─────────────────────
@@ -541,6 +585,7 @@ class SearchByTarget(BaseCapability):
                             _fb_ra, _fb_dec, radius=0.14,
                             facility=facility, max_results=max_results
                         )
+                        _set_alma_cone_provenance(ctx, _fb_ra, _fb_dec, 0.14)
                         if not results.empty:
                             _log(f"[FALLBACK] Cone search found {len(results)} results — continuing with filters")
                 except Exception as _fb_err:

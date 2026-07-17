@@ -229,7 +229,8 @@ def _build_llm_context_for_user(user_id: str) -> Dict[str, Any]:
 
 
 def _make_usage_recorder(user_id: str):
-    def _record_usage(provider: str, model: str, key_source: str, input_tokens: int, output_tokens: int):
+    def _record_usage(provider: str, model: str, key_source: str, input_tokens: int,
+                      output_tokens: int, reservation_id: Optional[str] = None):
         usage_quota_service.record_usage(
             UsageRecord(
                 user_id=user_id,
@@ -238,21 +239,32 @@ def _make_usage_recorder(user_id: str):
                 key_source=key_source,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-            )
+            ),
+            reservation_id=reservation_id,
         )
     return _record_usage
 
 
 def _make_quota_checker(user_id: str, user_email: str, byok_token_limits: Dict[str, Optional[int]]):
-    def _check_quota(provider: str, model: str, key_source: str):
-        usage_quota_service.ensure_allowed(
+    """Per-LLM-call admission. Reserves, because this is the check with a settle
+    point: the same call records its usage, so the tokens it holds are handed
+    back. Pre-flight callers with no settle point must not reserve."""
+    def _check_quota(provider: str, model: str, key_source: str) -> Optional[str]:
+        return usage_quota_service.ensure_allowed(
             user_id=user_id,
             user_email=user_email,
             provider=provider,
             key_source=key_source,
             byok_token_limit=byok_token_limits.get(provider),
+            reserve=True,
         )
     return _check_quota
+
+
+def _make_quota_releaser():
+    def _release_quota(reservation_id: str):
+        usage_quota_service.release_reservation(reservation_id)
+    return _release_quota
 
 
 # ── Lazy-load the Quasar agent ────────────────────────────────────────────────

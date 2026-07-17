@@ -115,11 +115,11 @@ class ALminerClient:
         def tap_search():
             print("[ALMA] TAP search starting...")
             service = self._get_tap_service()
-            query = f'''
-            SELECT *
-            FROM ivoa.obscore
-            WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1
-            '''
+            query = (
+                "SELECT * FROM ivoa.obscore "
+                f"WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
+                f"CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1"
+            )
             res = service.search(query)
             return res.to_table().to_pandas()
 

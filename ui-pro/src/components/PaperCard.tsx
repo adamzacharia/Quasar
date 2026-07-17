@@ -4,6 +4,7 @@ import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Bookmark, Awar
 import { useState } from "react";
 import type { Paper } from "../lib/types";
 import { useChatStore } from "../lib/store";
+import { QueryProvenance } from "./QueryProvenance";
 
 const TYPE_STYLES: Record<string, string> = {
     journal: "bg-emerald-500/10 text-emerald-400",
@@ -11,9 +12,15 @@ const TYPE_STYLES: Record<string, string> = {
     radio: "bg-primary/10 text-primary",
 };
 
-interface PaperCardProps { paper: Paper; }
+interface PaperCardProps {
+    paper: Paper;
+    /** The exact ADS query behind this paper (Feature 1), when known. The papers
+     *  grid renders ONE shared block for the search rather than repeating an
+     *  identical query on every card — see ChatMessage. */
+    request?: import("../lib/api").ToolRequest;
+}
 
-export function PaperCard({ paper }: PaperCardProps) {
+export function PaperCard({ paper, request }: PaperCardProps) {
     const [expanded, setExpanded] = useState(false);
     const { savedPapers, savePaper, removePaper } = useChatStore();
     const isSaved = savedPapers.some(p => p.id === paper.id);
@@ -167,6 +174,10 @@ export function PaperCard({ paper }: PaperCardProps) {
                     <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-1 transition-transform" />
                 )}
             </div>
+            {/* Only rendered if a caller passes a per-paper request. The papers
+                GRID renders one shared block instead (see ChatMessage), since
+                every card in it came from the same ADS query. */}
+            <QueryProvenance request={request} />
         </div>
     );
 }

@@ -20,6 +20,39 @@ from core.agent import _run_result_is_new, _unescape_tool_args
 from services.citation_verifier import append_citation_warning
 from services.content_safety import FILTER_NOTICE, is_explicit_query, safe_assistant_text
 
+
+def _stamp_request_on_results(agent, request: Dict[str, Any], tool_name: str,
+                              *, since: int, primary: Any = None) -> None:
+    """Attach one tool call's ``request`` to the run results it produced.
+
+    The per-request tool trace lives in a thread-local on the agent worker
+    thread, so the SSE generator (event-loop thread) can only see it via the
+    end-of-run snapshot — too late for eagerly-emitted cards. Carrying the
+    request on the result dict itself makes it available to BOTH paths, and it
+    rides into `messages.metadata` with the persisted card for free.
+
+    Only results this tool just produced are stamped (``since`` = the
+    accumulator length before the call), so a later tool never relabels an
+    earlier card. Never raises.
+    """
+    if not request:
+        return
+    try:
+        payload = {"request": request, "requestTool": str(tool_name or "")}
+
+        def _stamp(target: Any) -> None:
+            if isinstance(target, dict) and not target.get("request"):
+                target.update(payload)
+
+        accumulated = getattr(agent, "_accumulated_run_results", None) or []
+        for item in list(accumulated)[max(0, int(since)):]:
+            _stamp(item)
+        if primary is not None:
+            _stamp(primary)
+            _stamp(getattr(agent, "last_run_result", None))
+    except Exception:  # pragma: no cover - provenance never breaks a tool call
+        pass
+
 if TYPE_CHECKING:
     from core.agent import QuasarAgent
 
@@ -1335,6 +1368,7 @@ def stream_response_api(
                         on_status(step_label, "running")
 
                     _trace_result_obj = None
+                    _tool_sidecar = None
                     tool = agent.tool_registry.get_tool(tool_name)
                     if not tool:
                         # gpt-oss habitually typos tool names ("datlab_density_vetting")
@@ -1400,7 +1434,30 @@ def stream_response_api(
                                 finally:
                                     if on_status:
                                         on_status("Searching papers linked to observation", "completed")
+                            # Strip the adapter's provenance sidecar BEFORE the
+                            # result is serialized for the model, then stamp the
+                            # uniform request onto this tool's own run results so
+                            # every card can show the exact query that produced
+                            # it — on the eager path as well as the done path
+                            # (the trace itself is thread-local to this worker
+                            # and invisible to the SSE generator). Feature 1.
+                            result, _tool_sidecar = agent._pop_provenance_sidecar(result)
                             _trace_result_obj = result if isinstance(result, dict) else None
+                            try:
+                                from core.provenance import build_tool_request
+                                _tool_request = build_tool_request(
+                                    tool_name, args,
+                                    result_obj=_trace_result_obj,
+                                    sidecar=_tool_sidecar,
+                                )
+                            except Exception:
+                                _tool_request = None
+                            if _tool_request:
+                                _stamp_request_on_results(
+                                    agent, _tool_request, tool_name,
+                                    since=_acc_len_before,
+                                    primary=_primary_run_result,
+                                )
                             result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
                             _acc_len_after = len(agent._accumulated_run_results)
 
@@ -1491,7 +1548,8 @@ def stream_response_api(
                         on_status(step_label, "completed")
 
                     agent._record_tool_trace(tool_name, args, result_str,
-                                            result_obj=_trace_result_obj)
+                                            result_obj=_trace_result_obj,
+                                            provenance=_tool_sidecar)
                     tool_results.append({
                         "type": "function_call_output",
                         "call_id": fc["call_id"],

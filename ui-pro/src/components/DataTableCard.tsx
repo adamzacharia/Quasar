@@ -7,6 +7,7 @@ import { createWorkbenchSession } from "../lib/api";
 import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { AladinSkyView, type StcsFootprint } from "./AladinSkyView";
 import { buildCrossMatchPrompt, dispatchPrefillPrompt } from "../lib/prompt-dispatch";
+import { QueryProvenance } from "./QueryProvenance";
 
 interface DataTableCardProps { data: DataTableResult; }
 
@@ -1655,6 +1656,7 @@ export function DataTableCard({ data }: DataTableCardProps) {
                         </button>
                     </div>
                 </div>
+                <QueryProvenance request={data.request} toolName={data.toolName} className="px-4 pb-3" />
             </div>
         </>
     );

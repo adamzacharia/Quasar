@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Iterable
 
 from pydantic import ValidationError
 
-from capabilities.base import CallContext, ToolResult
+from capabilities.base import PROVENANCE_SIDECAR_KEY, CallContext, ToolResult
 from core.tools import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,16 @@ def build_tool(cap: Any, ctx_provider: ContextProvider) -> Tool:
         if not isinstance(result, ToolResult):  # defensive: capabilities must return ToolResult
             logger.error("%s returned %s, not ToolResult", cap.name, type(result))
             return {"success": False, "error": "internal: capability returned a non-ToolResult"}
-        return result.to_native()
+        native = result.to_native()
+        # Attach canonical provenance alongside (never inside) the frozen
+        # to_native() payload, so the agent can record the EXACT request it made
+        # without the model's view of the result changing. The agent pops this
+        # key before serializing the result. A copy keeps `native=` passthrough
+        # tools' own dicts unmutated.
+        sidecar = result.provenance_sidecar()
+        if sidecar is not None and isinstance(native, dict):
+            native = {**native, PROVENANCE_SIDECAR_KEY: sidecar}
+        return native
 
     return Tool(
         name=cap.name,

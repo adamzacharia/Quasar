@@ -344,6 +344,17 @@ def test_moc_operation_rejects_bad_operation():
     assert out["success"] is False
 
 
+@pytest.mark.parametrize("op", ["intersection", "difference"])
+@pytest.mark.parametrize("payload", [{"8": [1, 2, 3]}, {}], ids=["resolved", "unresolved"])
+def test_moc_operation_one_id_is_arity_error_regardless_of_resolution(op, payload):
+    # Arity is a property of the request, so a one-id intersection/difference
+    # must fail identically whether or not that id resolves — deciding it after
+    # the fetch turned the unresolved case into an empty success (CX-34).
+    out = _moc_service([payload]).moc_operation(["A/1"], operation=op)
+    assert out["success"] is False
+    assert "at least two survey_ids" in out["error"]
+
+
 def test_moc_operation_empty_input_operand_makes_intersection_empty():
     # Second operand resolves to an empty MOC (MOCServer returned {}): an
     # intersection that silently dropped it would wrongly return A (CX-02).
@@ -675,7 +686,7 @@ def test_rgb_composite_offline(monkeypatch, tmp_path):
     ])
     monkeypatch.setattr(
         HipsImageService, "_fetch_fits_layer",
-        lambda self, survey_id, ra, dec, fov, width: next(layers),
+        lambda self, survey_id, ra, dec, fov, width, **kw: next(layers),
     )
     out = HipsImageService(base_url="https://example.test/hips2fits").rgb_composite(
         10.0, -2.0, ["wise_w1", "2mass_j", "dss2_red"], width=32,

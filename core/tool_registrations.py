@@ -958,6 +958,17 @@ def register_tools(agent: "QuasarAgent") -> None:
         category="datalab",
     ))
 
+    # ── Cross-archive schema grounding (Feature 3) ────────────
+    # One uniform profile tool for every archive; for Data Lab it wraps the
+    # registry below, for ADS/SIA/VO/ALMA/Splatalogue it serves the curated
+    # ArchiveProfile. Stateless read — the CallContext needs no services.
+    from adapters.native import build_tool as _build_schema_tool
+    from capabilities.base import CallContext as _SchemaCallContext
+    from capabilities.schema import BrowseSchema as _BrowseSchema
+    agent.tool_registry.register(
+        _build_schema_tool(_BrowseSchema(), _SchemaCallContext)
+    )
+
     agent.tool_registry.register(Tool(
         name="datalab_describe_table",
         description="Describe a registered Data Lab catalog table, columns, region strategy, morphology hints, and citation.",

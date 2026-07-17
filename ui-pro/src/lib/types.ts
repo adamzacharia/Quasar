@@ -82,6 +82,13 @@ export interface Message {
     thinkingSteps?: ThoughtStep[];
     thinking?: string;
     thinkingDuration?: number;
+    /** Raw request provenance for this turn's tool calls (Feature 1). Threaded
+     *  from the live `tool_trace` SSE event AND rebuilt from the persisted
+     *  `rich_meta.toolTrace`, so it survives a page reload. */
+    toolTrace?: import("./api").ToolTraceCall[];
+    /** The exact request behind THIS card (Feature 1) — papers/plotly/image
+     *  messages. Data cards carry it on `dataTable.request` instead. */
+    request?: import("./api").ToolRequest;
     attachmentPreviews?: string[];  // base64 data URLs for images
     attachmentNames?: string[];     // names of attached documents
     webSources?: WebSource[];       // clickable source cards from web search
@@ -138,6 +145,10 @@ export interface DataTableResult {
     sourceName: string;
     warnings?: string[];
     partial?: boolean;
+    /** The exact request that produced this table (Feature 1). Persisted with
+     *  the card in messages.metadata, so it survives a reload. */
+    request?: import("./api").ToolRequest;
+    toolName?: string;
     tableKind?: string;   // e.g. "alma_products" or "alma_project_picker"
     archiveLink?: string;  // Footer link to full dataset on ALMA/ESO portal
     hasRowLinks?: boolean; // Whether rows include per-row _link field
@@ -200,6 +211,8 @@ export interface ToolCall {
     status: "running" | "completed" | "error";
     input?: Record<string, unknown>;
     output?: string;
+    /** The exact request this call made (Feature 1: query provenance). */
+    request?: import("./api").ToolRequest;
 }
 
 export interface AppSettings {

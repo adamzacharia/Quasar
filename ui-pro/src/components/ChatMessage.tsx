@@ -17,6 +17,7 @@ import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWid
 import { WebSourcesCard } from "./WebSourcesCard";
 import { HipsImageCard } from "./HipsImageCard";
 import { PlotlyCard } from "./PlotlyCard";
+import { QueryProvenance } from "./QueryProvenance";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
@@ -606,6 +607,9 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         All {message.papers.length} papers loaded
                     </p>
                 )}
+                {/* ONE shared ADS query for the whole grid — repeating the same
+                    query on each of N paper cards would be pure noise. */}
+                <QueryProvenance request={message.request} toolName="search_papers" />
             </div>
         );
     }
@@ -652,6 +656,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                 title={message.plotlyTitle}
                 pngFallback={message.plotlyPngFallback}
                 meta={message.plotlyMeta}
+                request={message.request}
             />
         );
     }
@@ -664,6 +669,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                 imageUrl={message.imageUrl}
                 caption={message.imageCaption || ""}
                 imageMeta={message.imageMeta}
+                request={message.request}
             />
         );
     }
@@ -680,8 +686,11 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         );
     }
 
-    // Skip empty assistant text messages (placeholder bubbles with no content and no thinking)
-    if (!hasContent && !hasThinking && !isStreaming) return null;
+    // Skip empty assistant text messages (placeholder bubbles with no content and no thinking).
+    // A tool-only / failed-final-answer turn still carries its query provenance, which is the
+    // only reload-visible surface for it — keep the bubble so it isn't lost (CX-20).
+    const hasToolTrace = Array.isArray(message.toolTrace) && message.toolTrace.length > 0;
+    if (!hasContent && !hasThinking && !isStreaming && !hasToolTrace) return null;
 
     // Assistant message — with integrated thinking process
     return (
@@ -813,6 +822,13 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     )}
 
                     {showAnswerBuffer && <AnswerBuffer />}
+
+                    {/* Raw request provenance for this turn's tool calls (Feature 1).
+                        Card-level blocks (e.g. DataTableCard) show their own single
+                        request; this is the turn-wide audit surface. */}
+                    {!isStreaming && (
+                        <QueryProvenance calls={message.toolTrace} label="Show query" />
+                    )}
 
                     {/* Live token estimate while the answer is still streaming */}
                     {hasContent && isStreaming && (

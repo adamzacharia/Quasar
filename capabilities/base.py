@@ -36,6 +36,16 @@ from pydantic import BaseModel, ConfigDict, Field
 # ─────────────────────────────────────────────────────────────────────────────
 # ToolResult — the canonical envelope
 # ─────────────────────────────────────────────────────────────────────────────
+# The key under which the native adapter smuggles canonical provenance past
+# `to_native()`. `to_native()` is a FROZEN byte-parity contract (migrated tools
+# return their legacy dict verbatim via `native`), so provenance/reproducible_
+# snippet cannot travel inside it — yet the agent's tool loop only ever sees
+# that dict. The adapter attaches this key; the agent pops it off BEFORE the
+# result is serialized to the model, so the LLM-facing payload is unchanged.
+# See core/provenance.py and adapters/native/__init__.py.
+PROVENANCE_SIDECAR_KEY = "__quasar_provenance__"
+
+
 class Provenance(BaseModel):
     """Where a result came from and how it was produced (for honest notebooks)."""
 
@@ -99,6 +109,22 @@ class ToolResult(BaseModel):
         # Structured extras are flattened last so a capability can shape the
         # exact top-level keys the agent/benchmark expect.
         out.update(self.meta)
+        return out
+
+    def provenance_sidecar(self) -> Optional[Dict[str, Any]]:
+        """The provenance :meth:`to_native` structurally cannot carry.
+
+        Returns ``None`` when the capability declared none, so the adapter adds
+        nothing to the result dict in that case. See
+        :data:`PROVENANCE_SIDECAR_KEY`.
+        """
+        if self.provenance is None and self.reproducible_snippet is None:
+            return None
+        out: Dict[str, Any] = {}
+        if self.provenance is not None:
+            out["provenance"] = self.provenance.model_dump(exclude_none=True)
+        if self.reproducible_snippet is not None:
+            out["reproducible_snippet"] = self.reproducible_snippet
         return out
 
     def to_mcp(self) -> Dict[str, Any]:

@@ -28,7 +28,7 @@ function generateId(): string { return Date.now().toString(36) + Math.random().t
 export function ChatArea() {
     const {
         messages, addMessage, mergeWebSourcesMessage, updateLastAssistantMessage, updateLastAssistantThinking,
-        updateLastAssistantRunMeta, updateLastAssistantUsage,
+        updateLastAssistantRunMeta, updateLastAssistantUsage, updateLastAssistantToolTrace,
         isStreaming, setStreaming,
         toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -472,7 +472,7 @@ export function ChatArea() {
                                 dataTable: tableData,
                             });
                         },
-                        onPapers: (rawPapers: Record<string, unknown>[]) => {
+                        onPapers: (rawPapers: Record<string, unknown>[], papersRequest?: import("../lib/api").ToolRequest) => {
                             // Map backend field names to frontend Paper interface
                             const papers: Paper[] = rawPapers.map((p, i) => ({
                                 id: (p.bibcode as string) || `paper-${i}`,
@@ -509,6 +509,7 @@ export function ChatArea() {
                                 type: "papers",
                                 timestamp: new Date(),
                                 papers,
+                                request: papersRequest,
                             });
                         },
                         onNotebook: (notebook: Record<string, unknown>) => {
@@ -542,6 +543,7 @@ export function ChatArea() {
                                 imageUrl: imageUrl,
                                 imageCaption: img.caption || "",
                                 imageMeta: meta,
+                                request: img.request,
                             });
                         },
                         onPlotly: (plot) => {
@@ -566,6 +568,7 @@ export function ChatArea() {
                                 plotlySpec: spec,
                                 plotlyTitle: plot.title || "",
                                 plotlyPngFallback: pngFallback,
+                                request: plot.request,
                                 plotlyMeta: plot.meta && typeof plot.meta === "object" ? plot.meta : undefined,
                             });
                         },
@@ -631,6 +634,9 @@ export function ChatArea() {
                         },
                         onRunMeta: (meta) => {
                             updateLastAssistantRunMeta(meta);
+                        },
+                        onToolTrace: (calls) => {
+                            updateLastAssistantToolTrace(calls);
                         },
                         onUsage: (usage) => {
                             if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens, usage.durationMs);
@@ -699,6 +705,7 @@ export function ChatArea() {
         updateLastAssistantThinking,
         updateLastAssistantRunMeta,
         updateLastAssistantUsage,
+        updateLastAssistantToolTrace,
         setStreaming,
         isStreaming,
         activeConversationId,

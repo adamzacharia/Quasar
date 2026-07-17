@@ -573,6 +573,13 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
             "tableKind": table_kind or None,
         }
+        # The exact request that produced this table (Feature 1). Stamped on the
+        # run result by core/runner.py; already secret-redacted. Rides into
+        # messages.metadata with the rest of the card, so it survives a reload.
+        _request = _run_result.get("request")
+        if isinstance(_request, dict) and _request:
+            table_payload["request"] = _request
+            table_payload["toolName"] = _run_result.get("requestTool") or _run_result.get("tool_name") or ""
         table_event_str = f"data: {json.dumps(table_payload)}\n\n"
         rich_dt = table_payload.copy()
         rich_dt.pop("type", None)

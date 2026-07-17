@@ -329,7 +329,7 @@ class HipsImageService:
                     )
                 survey_id = resolve_survey(band)
                 survey_ids.append(survey_id)
-                data = self._fetch_fits_layer(survey_id, ra_f, dec_f, fov, width_i)
+                data = self._fetch_fits_layer(survey_id, ra_f, dec_f, fov, width_i, reject_multiplane=True)
                 finite = data[np.isfinite(data)]
                 if finite.size == 0 or float(np.nanmax(data)) == float(np.nanmin(data)):
                     raise HipsImageError(
@@ -393,7 +393,8 @@ class HipsImageService:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    def _fetch_fits_layer(self, survey_id: str, ra: float, dec: float, fov_deg: float, width: int):
+    def _fetch_fits_layer(self, survey_id: str, ra: float, dec: float, fov_deg: float, width: int,
+                          reject_multiplane: bool = False):
         """Fetch one hips2fits layer as a 2D float array (format=fits)."""
         import io as _io
 
@@ -415,8 +416,20 @@ class HipsImageService:
         try:
             status = int(getattr(response, "status_code", 0) or 0)
             if status != 200:
-                text = str(getattr(response, "text", "") or "")[:200]
-                raise HipsImageError(f"hips2fits returned HTTP {status}: {text}")
+                # Read a bounded slice of the error body — never buffer a large
+                # error response via response.text on a streamed request (CX-27).
+                snippet = ""
+                try:
+                    raw_iter = response.iter_content(chunk_size=512) if hasattr(response, "iter_content") else None
+                    if raw_iter is not None:
+                        for piece in raw_iter:
+                            snippet = (piece or b"").decode("utf-8", "replace")[:200]
+                            break
+                    else:
+                        snippet = str(getattr(response, "text", "") or "")[:200]
+                except Exception:
+                    snippet = ""
+                raise HipsImageError(f"hips2fits returned HTTP {status}: {snippet}")
             clen = response.headers.get("Content-Length") if hasattr(response, "headers") else None
             if clen and int(clen) > max_bytes:
                 raise HipsImageError(f"hips2fits FITS layer is {int(clen) / 1e6:.0f} MB, exceeds {MAX_FITS_LAYER_MB} MB.")
@@ -445,7 +458,16 @@ class HipsImageService:
                 data = None
                 for hdu in hdul:
                     if hdu.data is not None and hdu.data.ndim >= 2:
-                        data = np.asarray(hdu.data, dtype=float)
+                        raw = np.asarray(hdu.data, dtype=float)
+                        # A color HiPS returns a 3/4-plane cube. Silently taking
+                        # plane 0 as a "band" is wrong — reject it for RGB use so
+                        # a raw color HiPS ID can't slip past the alias check (CX-35).
+                        if reject_multiplane and raw.ndim >= 3 and raw.shape[0] in (2, 3, 4):
+                            raise HipsImageError(
+                                f"Survey {survey_id!r} returned a {raw.shape[0]}-plane color image, "
+                                "not a single band — pick a single-band survey for this RGB channel."
+                            )
+                        data = raw
                         while data.ndim > 2:
                             data = data[0]
                         break
