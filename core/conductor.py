@@ -938,6 +938,22 @@ class Conductor:
         if dep_context:
             full_task += f"\n\nContext from prior steps:{dep_context}"
 
+        # A2 CX-01: run_in_executor threads never inherit the thread-local LLM
+        # accounting context (usage recorder + quota admission), so subtask and
+        # sandbox LLM calls went unmetered. Capture the context visible on THIS
+        # thread (reinstalled by the runner) and wrap every executor callable.
+        from core.llm_client import (
+            get_llm_request_context,
+            reinstall_llm_request_context,
+        )
+        _llm_ctx = get_llm_request_context()
+
+        def _with_request_ctx(fn):
+            def _wrapped(*a, **k):
+                with reinstall_llm_request_context(_llm_ctx):
+                    return fn(*a, **k)
+            return _wrapped
+
         # ── Route "compute" tasks to the sandbox executor ────────────────
         if node.agent_type == "compute" and self.sandbox_executor:
             try:
@@ -945,18 +961,18 @@ class Conductor:
                 if user_id is None:
                     result = await loop.run_in_executor(
                         None,
-                        self.sandbox_executor.run,
+                        _with_request_ctx(self.sandbox_executor.run),
                         full_task,
                         dep_context or "",
                     )
                 else:
                     result = await loop.run_in_executor(
                         None,
-                        lambda: self.sandbox_executor.run(
+                        _with_request_ctx(lambda: self.sandbox_executor.run(
                             full_task,
                             dep_context or "",
                             user_id=user_id,
-                        ),
+                        )),
                     )
                 if result:
                     return result
@@ -979,7 +995,7 @@ class Conductor:
                     executor_args += (user_id,)
                 result = await loop.run_in_executor(
                     None,
-                    self.tool_executor,
+                    _with_request_ctx(self.tool_executor),
                     *executor_args,
                 )
                 if result:
@@ -1014,6 +1030,38 @@ class Conductor:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_plan_json(text: str) -> dict:
+        """Parse a decomposition/replan response into a dict, tolerantly.
+
+        gpt-oss/TACC does not reliably honor json_object formatting: the text
+        can arrive fenced in ```json, prefixed with prose, or EMPTY when the
+        reasoning budget ate max_output_tokens — raw json.loads then dies with
+        "Expecting value: line 1 column 1" and the Conductor silently degrades
+        to single-agent for every complex query (found live 2026-07-18, L4).
+        Returns {} when no JSON object can be recovered.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return {}
+        if raw.startswith("```"):
+            # ```json\n...\n``` (or bare ```) — take the fenced body.
+            raw = raw.split("```", 2)[1] if raw.count("```") >= 2 else raw.lstrip("`")
+            raw = raw[4:].lstrip() if raw[:4].lower() == "json" else raw.lstrip()
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        start, end = raw.find("{"), raw.rfind("}")
+        if 0 <= start < end:
+            try:
+                data = json.loads(raw[start:end + 1])
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                pass
+        return {}
+
     def _decompose(self, query: str, context: str, max_subtasks: Optional[int] = None) -> List[dict]:
         """Decompose a query into structured subtasks with dependencies."""
         effective_max = max_subtasks or self.MAX_SUBTASKS
@@ -1031,14 +1079,30 @@ class Conductor:
             )
 
         try:
-            resp = self.client.responses.create(
-                model=self.conductor_model,
-                input=prompt,
-                temperature=0.1,
-                max_output_tokens=800,
-                text={"format": {"type": "json_object"}},
-            )
-            data = json.loads(resp.output_text)
+            # 2000 not 800: on reasoning models (gpt-oss) the reasoning stream
+            # bills against max_output_tokens BEFORE the JSON is emitted — 800
+            # returned an EMPTY output_text live and killed every Conductor
+            # activation (L4). One retry with an explicit ONLY-JSON nudge.
+            data: dict = {}
+            for attempt, extra in enumerate((
+                "",
+                "\n\nReturn ONLY the JSON object — no prose, no code fences.",
+            )):
+                resp = self.client.responses.create(
+                    model=self.conductor_model,
+                    input=prompt + extra,
+                    temperature=0.1,
+                    max_output_tokens=2000,
+                    text={"format": {"type": "json_object"}},
+                )
+                data = self._parse_plan_json(resp.output_text)
+                if data.get("subtasks"):
+                    break
+                logger.warning(
+                    "Conductor decomposition attempt %d yielded no subtasks "
+                    "(output_text len=%d)", attempt + 1,
+                    len(resp.output_text or ""),
+                )
             subtasks = data.get("subtasks", [])
 
             if self.verbose:
@@ -1082,16 +1146,16 @@ class Conductor:
                 model=self.conductor_model,
                 input=prompt,
                 temperature=0.1,
-                max_output_tokens=800,
+                max_output_tokens=2000,  # reasoning models eat the budget (L4)
                 text={"format": {"type": "json_object"}},
             )
-            data = json.loads(resp.output_text)
+            data = self._parse_plan_json(resp.output_text)  # tolerant (L4)
             subtasks = data.get("subtasks", [])
 
             reasoning = data.get("reasoning", "")
             logger.info("Re-plan reasoning: %s", reasoning)
 
-            return subtasks[:effective_max]
+            return subtasks[:effective_max] if subtasks else current_subtasks
 
         except Exception as e:
             logger.error("Conductor re-planning failed: %s", e)
@@ -1171,7 +1235,7 @@ class Conductor:
         on_token: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Post-process the synthesized answer: citation check + source ledger."""
-        answer = self._append_citation_warning(answer, on_token)
+        answer = self._append_citation_warning(answer, on_token, results=results)
         answer = self._append_sources(answer, results, on_token)
         return answer
 
@@ -1179,8 +1243,36 @@ class Conductor:
         self,
         answer: str,
         on_token: Optional[Callable[[str], None]] = None,
+        results: Optional[Dict[str, Any]] = None,
     ) -> str:
-        return append_citation_warning(answer, self.ads_client, on_token=on_token)
+        # R3: derive mechanical citation recall/precision from the same
+        # verification pass and stash them on the request-scoped LLM context
+        # (the SSE layer surfaces them in run_meta for eval mode). Sub-agent
+        # results are the numeric-evidence corpus. Never raises.
+        def _metrics_sink(verification):
+            import json as _json
+
+            from services.citation_metrics import (
+                compute_citation_metrics,
+                record_citation_metrics_on_request_context,
+            )
+
+            evidence_texts = []
+            if results:
+                try:
+                    evidence_texts.append(_json.dumps(results, default=str))
+                except Exception:
+                    evidence_texts.append(str(results))
+            metrics = compute_citation_metrics(
+                answer, verification, evidence_texts=evidence_texts
+            )
+            metrics["path"] = "conductor"
+            record_citation_metrics_on_request_context(metrics)
+
+        return append_citation_warning(
+            answer, self.ads_client, on_token=on_token,
+            verification_sink=_metrics_sink,
+        )
 
     def _append_sources(
         self,

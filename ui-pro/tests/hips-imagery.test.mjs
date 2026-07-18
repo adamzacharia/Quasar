@@ -97,3 +97,26 @@ test("omits frames entirely when none are valid", () => {
     const meta = normalizeHipsImageMeta({ kind: "blink", ra: 1, dec: 2, frames: [{ label: "x" }, {}] });
     assert.equal(meta.frames, undefined);
 });
+
+test("blink meta warnings survive the normalizer to the card (A3 CX-18/CX-32)", () => {
+    // The exact shape capabilities/viz.py emits for a low-overlap epoch: the
+    // normalizer used to strip `warnings`, killing the on-card amber caveat.
+    const meta = normalizeHipsImageMeta({
+        kind: "blink",
+        ra: 150.0,
+        dec: 2.0,
+        frames: [
+            { url: "/plots/e1.png", label: "VLASS1.1" },
+            { url: "/plots/e2.png", label: "VLASS2.1 — UNREGISTERED" },
+        ],
+        warnings: ["VLASS2.1: reprojection failed (stub); shown on its native grid."],
+    });
+    assert.ok(meta);
+    assert.deepEqual(meta.warnings, [
+        "VLASS2.1: reprojection failed (stub); shown on its native grid.",
+    ]);
+    assert.equal(meta.frames[1].label, "VLASS2.1 — UNREGISTERED");
+    // Junk shapes are dropped, not passed through.
+    const none = normalizeHipsImageMeta({ kind: "blink", frames: [{ url: "/p.png" }], warnings: ["", null, {}, 42, true] });
+    assert.equal(none.warnings, undefined);
+});

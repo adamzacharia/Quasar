@@ -83,6 +83,9 @@ class CubeWorkbenchService:
         max_workers = max(1, int(os.getenv("QUASAR_WORKBENCH_WORKERS", "2") or "2"))
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="quasar-workbench")
         self._active_jobs: Dict[str, Optional[Future]] = {}
+        # IMG-08: _active_jobs is keyed by job_id, so eviction guards need a
+        # session-level view — live job count per session_id.
+        self._active_session_jobs: Dict[str, int] = {}
         self._job_lock = threading.RLock()
 
     def shutdown(self) -> None:
@@ -170,12 +173,15 @@ class CubeWorkbenchService:
         return session
 
     def get_session(self, *, session_id: str, user_id: str) -> Dict[str, Any]:
-        session = self._read_session(session_id)
-        if session.get("user_id") != user_id:
-            raise CubeWorkbenchForbidden("Workbench session belongs to another user")
-        session["last_accessed_at"] = int(time.time())
-        self._write_session(session)
-        return session
+        # IMG-09: hold the lock across the whole read + last-accessed touch +
+        # write, or this touch write can clobber a concurrent job update.
+        with self._job_lock:
+            session = self._read_session(session_id)
+            if session.get("user_id") != user_id:
+                raise CubeWorkbenchForbidden("Workbench session belongs to another user")
+            session["last_accessed_at"] = int(time.time())
+            self._write_session(session)
+            return session
 
     def get_metadata(self, *, session_id: str, user_id: str) -> Dict[str, Any]:
         session = self.get_session(session_id=session_id, user_id=user_id)
@@ -226,28 +232,30 @@ class CubeWorkbenchService:
         if clean_operation not in WORKBENCH_JOB_OPERATIONS:
             raise ValueError(f"Unsupported workbench job operation: {operation}")
 
-        session = self.get_session(session_id=session_id, user_id=user_id)
-        now = int(time.time())
-        job = {
-            "job_id": uuid.uuid4().hex,
-            "operation": clean_operation,
-            "status": "queued",
-            "phase": "queued",
-            "progress": 0,
-            "created_at": now,
-            "started_at": None,
-            "finished_at": None,
-            "cancel_requested": False,
-            "request": dict(payload or {}),
-            "result": None,
-            "error": "",
-            "metrics": {},
-        }
-        session["jobs"] = self._append_job(session.get("jobs"), job)
-        self._write_session(session)
-
+        # IMG-09: append the job under the lock so the read-append-write can't
+        # clobber a concurrent job-state update on the same session.
         with self._job_lock:
+            session = self.get_session(session_id=session_id, user_id=user_id)
+            now = int(time.time())
+            job = {
+                "job_id": uuid.uuid4().hex,
+                "operation": clean_operation,
+                "status": "queued",
+                "phase": "queued",
+                "progress": 0,
+                "created_at": now,
+                "started_at": None,
+                "finished_at": None,
+                "cancel_requested": False,
+                "request": dict(payload or {}),
+                "result": None,
+                "error": "",
+                "metrics": {},
+            }
+            session["jobs"] = self._append_job(session.get("jobs"), job)
+            self._write_session(session)
             self._active_jobs[job["job_id"]] = None
+            self._track_session_job(session_id)  # IMG-08
         future = self._executor.submit(
             self._run_job,
             session_id,
@@ -293,34 +301,42 @@ class CubeWorkbenchService:
         }
 
     def cancel_job(self, *, session_id: str, user_id: str, job_id: str) -> Dict[str, Any]:
-        session = self.get_session(session_id=session_id, user_id=user_id)
-        job = self._find_job(session, job_id)
-        if not job:
-            raise CubeWorkbenchNotFound(f"Workbench job not found: {job_id}")
-        if job.get("status") in TERMINAL_JOB_STATUSES:
-            return {
-                "session_id": session_id,
-                "job": job,
-                "jobs": session.get("jobs", []),
-            }
-
-        canceled_now = False
+        # IMG-09: hold the lock across the whole read-check-update so a
+        # finishing worker cannot interleave between our read and our write —
+        # the unlocked version could persist a stale pre-completion snapshot
+        # and erase the worker's result or our own cancel_requested flag.
         with self._job_lock:
+            session = self.get_session(session_id=session_id, user_id=user_id)
+            job = self._find_job(session, job_id)
+            if not job:
+                raise CubeWorkbenchNotFound(f"Workbench job not found: {job_id}")
+            if job.get("status") in TERMINAL_JOB_STATUSES:
+                return {
+                    "session_id": session_id,
+                    "job": job,
+                    "jobs": session.get("jobs", []),
+                }
+
             future = self._active_jobs.get(job_id)
             canceled_now = bool(future and future.cancel())
+            if canceled_now:
+                # IMG-08: a future canceled before it ran never reaches
+                # _run_job's finally — release its bookkeeping here.
+                self._active_jobs.pop(job_id, None)
+                self._release_session_job(session_id)
 
-        job = self._update_job_state(
-            session_id=session_id,
-            user_id=user_id,
-            job_id=job_id,
-            status="canceled" if canceled_now else job.get("status", "running"),
-            phase="canceled" if canceled_now else "cancel requested",
-            progress=100 if canceled_now else job.get("progress", 0),
-            cancel_requested=True,
-            error="" if canceled_now else "Cancellation requested. The current step will stop at the next safe checkpoint.",
-            finished=canceled_now,
-        )
-        session = self.get_session(session_id=session_id, user_id=user_id)
+            job = self._update_job_state(
+                session_id=session_id,
+                user_id=user_id,
+                job_id=job_id,
+                status="canceled" if canceled_now else job.get("status", "running"),
+                phase="canceled" if canceled_now else "cancel requested",
+                progress=100 if canceled_now else job.get("progress", 0),
+                cancel_requested=True,
+                error="" if canceled_now else "Cancellation requested. The current step will stop at the next safe checkpoint.",
+                finished=canceled_now,
+            )
+            session = self.get_session(session_id=session_id, user_id=user_id)
         return {
             "session_id": session_id,
             "job": job,
@@ -698,20 +714,43 @@ class CubeWorkbenchService:
         metadata = session.get("metadata") or {}
         preset = self._line_preset(line_preset_key)
         z = float(redshift or 0.0)
+        frequency_basis = "preset"
         if preset:
             rest_frequency = float(preset["rest_frequency_ghz"])
             observed = rest_frequency / (1.0 + z)
-        else:
-            freq = observed_frequency_ghz or metadata.get("rest_freq_ghz")
-            if freq is None:
-                raise ValueError("observed_frequency_ghz is required when FITS metadata has no rest frequency")
-            observed = float(freq)
+        elif observed_frequency_ghz is not None:
+            frequency_basis = "user_observed"
+            observed = float(observed_frequency_ghz)
             rest_frequency = observed * (1.0 + z)
+        else:
+            header_rest = self._safe_float(metadata.get("rest_freq_ghz"))
+            if header_rest is None:
+                raise ValueError("observed_frequency_ghz is required when FITS metadata has no rest frequency")
+            # sle-line-overlays-restfrq-as-observed: a FITS RESTFRQ card is a
+            # REST-frame frequency, so observed = rest / (1 + z). The old
+            # fallback treated it as observed and multiplied by (1 + z) again,
+            # searching the catalog at the wrong rest frequency and drawing
+            # wrong-species overlays for any z != 0.
+            frequency_basis = "header_restfrq"
+            rest_frequency = header_rest
+            observed = rest_frequency / (1.0 + z)
         result = self.splatalogue.identify_spectral_line(
             frequency_ghz=rest_frequency,
             tolerance_ghz=float(tolerance_ghz or 0.01),
             top_n=max(1, min(int(top_n or 8), 25)),
         )
+        # sle-overlay-truncation-undisclosed: keep the catalog's pre-cap match
+        # count so a top_n-capped candidate list never masquerades as the
+        # complete in-window match set.
+        total_matches = self._safe_int(result.get("total_matches"))
+        catalog_returned = len(result.get("lines", []) or [])
+        overlay_warnings: List[str] = []
+        if total_matches is not None and total_matches > catalog_returned:
+            overlay_warnings.append(
+                f"Splatalogue matched {total_matches} transitions within "
+                f"±{float(tolerance_ghz or 0.01):g} GHz of the query frequency; "
+                f"only the top {catalog_returned} are shown."
+            )
         lines = []
         for line in result.get("lines", []):
             rest = self._safe_float(line.get("frequency_ghz"))
@@ -733,13 +772,34 @@ class CubeWorkbenchService:
                 "source": "Quasar preset",
             })
 
+        # Frequency-basis disclosure (sle-line-overlays-restfrq-as-observed):
+        # say exactly how the search frequency was derived, including the z=0
+        # assumption when the header RESTFRQ fallback ran without a redshift.
+        assumptions = [
+            "Candidates are ranked by absolute frequency offset and duplicate catalog entries are merged.",
+        ]
+        if frequency_basis == "user_observed":
+            assumptions.insert(0, "Line search converts observed frequency to rest frequency using nu_rest = nu_obs * (1 + z).")
+        elif frequency_basis == "header_restfrq":
+            assumptions.insert(0, (
+                "The FITS header RESTFRQ was used as the REST-frame search frequency; "
+                "observed = rest / (1 + z)"
+                + (" with the default z=0 — supply `redshift` if the source is redshifted."
+                   if z == 0 else f" at z={z:g}.")
+            ))
+        else:
+            assumptions.insert(0, "Preset rest frequency was searched; observed = rest / (1 + z).")
+
         line_state = {
             "query_observed_frequency_ghz": observed,
             "query_rest_frequency_ghz": rest_frequency,
+            "frequency_basis": frequency_basis,
             "redshift": z,
             "tolerance_ghz": float(tolerance_ghz or 0.01),
             "preset": preset,
             "lines": lines,
+            "total_matches": total_matches,  # sle-overlay-truncation-undisclosed
+            "warnings": overlay_warnings,
             "backend": result.get("backend"),
             "query_note": result.get("note"),
             "query_error": result.get("error"),
@@ -752,11 +812,14 @@ class CubeWorkbenchService:
             "session_id": session_id,
             "query_observed_frequency_ghz": observed,
             "query_rest_frequency_ghz": rest_frequency,
+            "frequency_basis": frequency_basis,
             "redshift": z,
             "tolerance_ghz": tolerance_ghz,
             "preset": preset,
             "presets": COMMON_LINE_PRESETS,
             "n_matches": len(lines),
+            "total_matches": total_matches,  # sle-overlay-truncation-undisclosed
+            "warnings": overlay_warnings,
             "lines": lines,
             "backend": result.get("backend"),
             "query_note": result.get("note"),
@@ -771,10 +834,8 @@ class CubeWorkbenchService:
                         else "Splatalogue via Astroquery"
                     )
                 ),
-                "assumptions": [
-                    "Line search converts observed frequency to rest frequency using nu_rest = nu_obs * (1 + z).",
-                    "Candidates are ranked by absolute frequency offset and duplicate catalog entries are merged.",
-                ],
+                "assumptions": assumptions,
+                "warnings": overlay_warnings,
                 "confidence": "medium" if lines else "low",
             },
         }
@@ -969,6 +1030,8 @@ class CubeWorkbenchService:
                     "x_pixel": spectrum_state.get("x_pixel"),
                     "y_pixel": spectrum_state.get("y_pixel"),
                     "aperture_radius_pixels": spectrum_state.get("aperture_radius_pixels", 3.0),
+                    # IMG-07: the CSV export honors an arcsec aperture too.
+                    "aperture_radius_arcsec": spectrum_state.get("aperture_radius_arcsec"),
                 },
                 max_points=int(spectrum_state.get("max_points") or 4096),
             )
@@ -1084,6 +1147,19 @@ class CubeWorkbenchService:
         finally:
             with self._job_lock:
                 self._active_jobs.pop(job_id, None)
+                self._release_session_job(session_id)  # IMG-08
+
+    def _track_session_job(self, session_id: str) -> None:
+        """Increment the live-job count for a session (call under _job_lock; IMG-08)."""
+        self._active_session_jobs[session_id] = self._active_session_jobs.get(session_id, 0) + 1
+
+    def _release_session_job(self, session_id: str) -> None:
+        """Decrement the live-job count for a session (call under _job_lock; IMG-08)."""
+        remaining = self._active_session_jobs.get(session_id, 0) - 1
+        if remaining > 0:
+            self._active_session_jobs[session_id] = remaining
+        else:
+            self._active_session_jobs.pop(session_id, None)
 
     def _execute_job_operation(
         self,
@@ -1249,31 +1325,35 @@ class CubeWorkbenchService:
         error: Optional[str] = None,
         metrics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        session = self.get_session(session_id=session_id, user_id=user_id)
-        job = self._find_job(session, job_id)
-        if not job:
-            raise CubeWorkbenchNotFound(f"Workbench job not found: {job_id}")
-        now = int(time.time())
-        if status:
-            job["status"] = status
-        if phase:
-            job["phase"] = phase
-        if progress is not None:
-            job["progress"] = max(0, min(100, int(progress)))
-        if cancel_requested is not None:
-            job["cancel_requested"] = bool(cancel_requested)
-        if started and not job.get("started_at"):
-            job["started_at"] = now
-        if finished:
-            job["finished_at"] = now
-        if result is not None:
-            job["result"] = result
-        if error is not None:
-            job["error"] = error
-        if metrics is not None:
-            job["metrics"] = metrics
-        self._write_session(session)
-        return dict(job)
+        # IMG-09: the read-modify-write must be atomic — without the lock a
+        # worker's in-flight update could overwrite a concurrent cancel_job
+        # write (losing cancel_requested) or vice versa.
+        with self._job_lock:
+            session = self.get_session(session_id=session_id, user_id=user_id)
+            job = self._find_job(session, job_id)
+            if not job:
+                raise CubeWorkbenchNotFound(f"Workbench job not found: {job_id}")
+            now = int(time.time())
+            if status:
+                job["status"] = status
+            if phase:
+                job["phase"] = phase
+            if progress is not None:
+                job["progress"] = max(0, min(100, int(progress)))
+            if cancel_requested is not None:
+                job["cancel_requested"] = bool(cancel_requested)
+            if started and not job.get("started_at"):
+                job["started_at"] = now
+            if finished:
+                job["finished_at"] = now
+            if result is not None:
+                job["result"] = result
+            if error is not None:
+                job["error"] = error
+            if metrics is not None:
+                job["metrics"] = metrics
+            self._write_session(session)
+            return dict(job)
 
     def _job_cancel_requested(self, *, session_id: str, user_id: str, job_id: str) -> bool:
         try:
@@ -1309,7 +1389,11 @@ class CubeWorkbenchService:
     def _write_session(self, session: Dict[str, Any]) -> None:
         path = self.session_dir / f"{session['session_id']}.json"
         with self._job_lock:
-            path.write_text(json.dumps(session, indent=2, sort_keys=True), encoding="utf-8")
+            # IMG-09: temp file + atomic replace so a crashed writer can never
+            # leave a torn session JSON on disk.
+            tmp_path = path.parent / (path.name + ".tmp")
+            tmp_path.write_text(json.dumps(session, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(tmp_path, path)
 
     def _cache_response(self, session: Dict[str, Any], cache: Dict[str, Any]) -> Dict[str, Any]:
         cache_payload = dict(cache or {})
@@ -1432,6 +1516,39 @@ class CubeWorkbenchService:
             }
 
     @staticmethod
+    def _spectral_axis_number(headers: Any) -> int:
+        """FITS axis number of the spectral axis (IMG-03).
+
+        CASA ``exportfits`` cubes put STOKES on axis 3 and FREQ on axis 4, so
+        never assume axis 3 — pick the axis whose CTYPE matches a spectral
+        type (FREQ/VRAD/VELO/VOPT/WAVE/AWAV/ZOPT), checking 3 then 4, and fall
+        back to the legacy axis-3 assumption only when neither matches.
+        """
+        for axis in (3, 4):
+            ctype = str(headers.get(f"CTYPE{axis}") or "").strip().upper()
+            if ctype.startswith(("FREQ", "VRAD", "VELO", "VOPT", "WAVE", "AWAV", "ZOPT")):
+                return axis
+        return 3
+
+    @staticmethod
+    def _pixel_scale_arcsec_from_header(header: Any) -> Optional[float]:
+        """Mean |CDELT1|,|CDELT2| pixel scale in arcsec/pixel, or None (IMG-07)."""
+        scales = []
+        for axis in (1, 2):
+            cdelt = CubeWorkbenchService._safe_float(header.get(f"CDELT{axis}"))
+            if cdelt is None:
+                return None
+            unit = str(header.get(f"CUNIT{axis}") or "deg").strip().lower()
+            factor = {"deg": 3600.0, "degree": 3600.0, "degrees": 3600.0,
+                      "arcmin": 60.0, "arcsec": 1.0}.get(unit)
+            if factor is None:
+                return None
+            scales.append(abs(cdelt) * factor)
+        if not scales or min(scales) <= 0:
+            return None
+        return float(sum(scales) / len(scales))
+
+    @staticmethod
     def _scale_preview_header(
         header: Any,
         *,
@@ -1439,7 +1556,11 @@ class CubeWorkbenchService:
         spatial_stride_y: int,
         spatial_stride_x: int,
     ) -> None:
-        for axis, stride in ((1, spatial_stride_x), (2, spatial_stride_y), (3, spectral_stride)):
+        # IMG-03: scale the ACTUAL spectral axis's CDELT/CRPIX — hardcoding
+        # axis 3 scaled the Stokes cards of CASA cubes (CTYPE3=STOKES,
+        # CTYPE4=FREQ) and corrupted the preview frequency metadata.
+        spectral_axis = CubeWorkbenchService._spectral_axis_number(header)
+        for axis, stride in ((1, spatial_stride_x), (2, spatial_stride_y), (spectral_axis, spectral_stride)):
             if stride <= 1:
                 continue
             cdelt_key = f"CDELT{axis}"
@@ -1617,7 +1738,11 @@ class CubeWorkbenchService:
         if not session_id:
             return None
         with self._job_lock:
-            if session_id in self._active_jobs:
+            # IMG-08: _active_jobs is keyed by job_id, so the old
+            # `session_id in self._active_jobs` guard never matched and staged
+            # FITS files of sessions with queued/running jobs could be evicted
+            # — check the per-session live-job count instead.
+            if self._active_session_jobs.get(session_id):
                 return None
         cache_path = record.get("cache_path")
         preview_path = record.get("preview_path")
@@ -1869,8 +1994,28 @@ class CubeWorkbenchService:
             y_idx = int(round(y if y is not None else ny / 2))
             x_idx = max(0, min(nx - 1, x_idx))
             y_idx = max(0, min(ny - 1, y_idx))
-            radius = max(0.5, float(extraction.get("aperture_radius_pixels") or 3.0))
-            radius = self._scale_radius_for_preview(radius, preview)
+            radius_arcsec = self._safe_float(extraction.get("aperture_radius_arcsec"))
+            radius_warning = None
+            if radius_arcsec is not None and radius_arcsec > 0:
+                # IMG-07: honor aperture_radius_arcsec — it was persisted but
+                # never applied, so arcsec apertures silently fell back to the
+                # 3-pixel default. hdu.header describes the product being
+                # indexed (preview headers carry stride-scaled CDELTs), so the
+                # converted radius needs no extra preview rescale.
+                pix_arcsec = self._pixel_scale_arcsec_from_header(hdu.header)
+                if pix_arcsec:
+                    radius = max(0.5, radius_arcsec / pix_arcsec)
+                else:
+                    radius = self._scale_radius_for_preview(
+                        max(0.5, float(extraction.get("aperture_radius_pixels") or 3.0)), preview)
+                    radius_warning = (
+                        "aperture_radius_arcsec was ignored: the FITS header has "
+                        "no usable celestial pixel scale — the pixel-radius "
+                        "aperture was used instead."
+                    )
+            else:
+                radius = max(0.5, float(extraction.get("aperture_radius_pixels") or 3.0))
+                radius = self._scale_radius_for_preview(radius, preview)
             r_int = int(math.ceil(radius))
             x0, x1 = max(0, x_idx - r_int), min(nx, x_idx + r_int + 1)
             y0, y1 = max(0, y_idx - r_int), min(ny, y_idx + r_int + 1)
@@ -1895,15 +2040,20 @@ class CubeWorkbenchService:
                 axis["label"] = "Channel"
                 axis["unit"] = "channel"
 
-            return axis, {
+            series: Dict[str, Any] = {
                 "x": axis["values"],
                 "y": [self._json_float(values[int(idx)]) for idx in indices],
                 "x_label": axis.get("label", "Channel"),
                 "y_label": str(hdu.header.get("BUNIT") or metadata.get("unit") or "Intensity"),
                 "data_status": "computed",
+                # IMG-07: report the aperture radius actually applied.
+                "aperture_radius_pixels_used": round(float(radius), 3),
                 "analysis_product": "preview" if preview else "full",
                 "preview": self._preview_summary(preview),
             }
+            if radius_warning:
+                series["warnings"] = [radius_warning]
+            return axis, series
 
     def _render_from_cache(
         self,
@@ -1925,6 +2075,8 @@ class CubeWorkbenchService:
             hdu = self._science_hdu(hdul)
             data = np.array(hdu.data, copy=True).squeeze()
             cube = self._cube_from_data(data)
+            bunit = str(hdu.header.get("BUNIT") or (session.get("metadata") or {}).get("unit") or "")
+            value_unit = bunit
             if cube is None:
                 image = np.asarray(data, dtype=float)
                 if image.ndim > 2:
@@ -1942,14 +2094,32 @@ class CubeWorkbenchService:
                     label = f"Channel {requested_channel}" if not preview else f"Channel {requested_channel} (preview {channel_index})"
                 elif selected_mode == "moment":
                     moment_order = int(moment if moment is not None else 0)
-                    image = self._moment_image(cube, moment_order)
-                    label = f"Moment {moment_order}"
+                    # IMG-04: compute moments over the real spectral axis so
+                    # moment 0 integrates over the channel width and moments
+                    # 1/2 are in axis units — and label the map with THAT unit
+                    # instead of the raw BUNIT (a moment-1 map is not Jy/beam).
+                    moment_meta = dict(session.get("metadata") or {})
+                    moment_meta["channel_count"] = nchan
+                    moment_axis = self._spectral_axis(dict(hdu.header), moment_meta, max_points=nchan)
+                    axis_vals = [self._safe_float(v) for v in (moment_axis.get("values") or [])]
+                    axis_unit = str(moment_axis.get("unit") or "channel")
+                    if (moment_axis.get("basis") != "wcs"
+                            or len(axis_vals) != nchan
+                            or any(v is None for v in axis_vals)):
+                        axis_vals = None
+                        axis_unit = "channel"
+                    image = self._moment_image(cube, moment_order, axis_values=axis_vals)
+                    if moment_order == 0:
+                        value_unit = f"{bunit}·{axis_unit}" if bunit else axis_unit
+                    else:
+                        value_unit = axis_unit
+                    label = f"Moment {moment_order} ({value_unit})" if value_unit else f"Moment {moment_order}"
                     channel_index = None
                 else:
                     channel_index = nchan // 2
                     image = np.asarray(cube[channel_index], dtype=float)
                     label = f"Image plane, channel {channel_index}"
-                line_labels = self._line_labels_for_render(
+                line_labels, line_label_warnings = self._line_labels_for_render(
                     session,
                     header=dict(hdu.header),
                     channel_index=channel_index,
@@ -1958,6 +2128,7 @@ class CubeWorkbenchService:
                 )
             if cube is None:
                 line_labels = []
+                line_label_warnings = []
 
             analysis_rms_region = self._scale_region_for_preview(rms_region, preview)
             rms, rms_payload = self._estimate_rms_with_region(image, analysis_rms_region)
@@ -1969,7 +2140,9 @@ class CubeWorkbenchService:
                 "min": self._json_float(np.nanmin(finite)) if finite.size else None,
                 "max": self._json_float(np.nanmax(finite)) if finite.size else None,
                 "mean": self._json_float(np.nanmean(finite)) if finite.size else None,
-                "unit": str(hdu.header.get("BUNIT") or (session.get("metadata") or {}).get("unit") or ""),
+                # IMG-04: moment maps report the moment's unit (axis units for
+                # moments 1/2, BUNIT x axis-unit for moment 0), not raw BUNIT.
+                "unit": value_unit,
                 "shape": list(image.shape),
                 "analysis_product": "preview" if preview else "full",
                 "preview": self._preview_summary(preview),
@@ -1987,6 +2160,8 @@ class CubeWorkbenchService:
             )
             image_payload["channel"] = channel_index
             image_payload["line_labels"] = line_labels
+            # sle-overlay-labels-velocity-axis: disclose skipped line matching.
+            image_payload["line_label_warnings"] = line_label_warnings
             image_payload["data_status"] = "computed"
             image_payload["analysis_product"] = "preview" if preview else "full"
             image_payload["preview"] = self._preview_summary(preview)
@@ -1997,13 +2172,28 @@ class CubeWorkbenchService:
             }
 
     @staticmethod
-    def _moment_image(cube: Any, moment_order: int):
+    def _moment_image(cube: Any, moment_order: int, axis_values: Optional[List[float]] = None):
+        """Moment map over the spectral axis.
+
+        IMG-04: with ``axis_values`` (per-channel spectral coordinates in the
+        axis unit, e.g. GHz), moment 0 integrates over the channel width
+        (BUNIT × axis-unit) and moments 1/2 are in axis units; without them the
+        legacy channel-index moments are returned (and must be labeled
+        'channel', never BUNIT).
+        """
         import numpy as np
 
         arr = np.asarray(cube, dtype=float)
+        channel_width = 1.0
+        if axis_values is not None and len(axis_values) == arr.shape[0]:
+            coords = np.asarray(axis_values, dtype=float)[:, None, None]
+            steps = np.abs(np.diff(np.asarray(axis_values, dtype=float)))
+            if steps.size and float(np.median(steps)) > 0:
+                channel_width = float(np.median(steps))
+        else:
+            coords = np.arange(arr.shape[0], dtype=float)[:, None, None]
         if moment_order == 0:
-            return np.nansum(arr, axis=0)
-        coords = np.arange(arr.shape[0], dtype=float)[:, None, None]
+            return np.nansum(arr, axis=0) * channel_width
         weights = np.where(np.isfinite(arr), arr, 0.0)
         denom = np.nansum(weights, axis=0)
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -2038,17 +2228,31 @@ class CubeWorkbenchService:
         channel_index: Optional[int],
         nchan: int,
         mode: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        """Return (labels, warnings) for line overlays on a rendered plane."""
         state = session.get("state") if isinstance(session.get("state"), dict) else {}
         overlay = state.get("line_overlays") if isinstance(state.get("line_overlays"), dict) else {}
         lines = overlay.get("lines") if isinstance(overlay.get("lines"), list) else []
         if not lines:
-            return []
+            return [], []
 
         tolerance = self._safe_float(overlay.get("tolerance_ghz")) or 0.01
         metadata = dict(session.get("metadata") or {})
         metadata["channel_count"] = nchan
         axis = self._spectral_axis(header, metadata, max_points=max(nchan, 512))
+        axis_ctype = str(axis.get("ctype") or "").strip().upper()
+        if (axis.get("basis") != "wcs"
+                or str(axis.get("unit") or "") != "GHz"
+                or not axis_ctype.startswith("FREQ")):
+            # sle-overlay-labels-velocity-axis: line frequencies in GHz must
+            # only be compared against a genuine frequency axis — VRAD/VELO
+            # velocity values (or the constant-RESTFRQ fallback axis) would
+            # match spuriously or silently never match. Skip with disclosure.
+            return [], [
+                "Line overlays skipped: the cube's spectral axis is "
+                f"'{axis.get('label')}', not a frequency axis in GHz, so "
+                "frequency-based line matching is not meaningful here."
+            ]
         axis_values = axis.get("values") if isinstance(axis.get("values"), list) else []
         axis_indices = axis.get("indices") if isinstance(axis.get("indices"), list) else []
         index_to_freq = {
@@ -2097,7 +2301,7 @@ class CubeWorkbenchService:
                 "redshift": self._json_float(line.get("redshift")),
                 "source": str(line.get("source") or "Splatalogue"),
             })
-        return labels[:4]
+        return labels[:4], []
 
     @staticmethod
     def _estimate_rms_with_region(image: Any, region: Optional[Dict[str, float]]) -> tuple[float, Dict[str, Any]]:
@@ -2502,7 +2706,11 @@ class CubeWorkbenchService:
             result["raw_shape"] = shape
             if len(shape) >= 3:
                 result["cube_shape"] = shape
-                result["channel_count"] = shape[-3]
+                # IMG-03: take the channel count from the spectral axis, not a
+                # blind shape[-3] (== STOKES for CASA 4-axis cubes).
+                spec_axis = CubeWorkbenchService._spectral_axis_number(header)
+                spec_len = CubeWorkbenchService._safe_int(header.get(f"NAXIS{spec_axis}"))
+                result["channel_count"] = spec_len if spec_len else shape[-3]
         result["unit"] = str(header.get("BUNIT") or result.get("bunit") or "")
         result["header_hdu_type"] = str(header.get("XTENSION") or "PRIMARY")
         return result
@@ -2667,13 +2875,23 @@ class CubeWorkbenchService:
         *,
         max_points: int = 512,
     ) -> Dict[str, Any]:
-        nchan = self._safe_int(headers.get("NAXIS3")) or self._safe_int(metadata.get("channel_count"))
+        # IMG-03: locate the spectral axis by CTYPE instead of hardcoding
+        # FITS axis 3 (CASA cubes carry STOKES on 3 and FREQ on 4).
+        axis_num = self._spectral_axis_number(headers)
+        header_nchan = self._safe_int(headers.get(f"NAXIS{axis_num}"))
+        meta_nchan = self._safe_int(metadata.get("channel_count"))
+        if header_nchan and meta_nchan and header_nchan != meta_nchan:
+            # The (squeezed) cube's real channel count wins over a degenerate
+            # NAXIS entry when they disagree (IMG-03).
+            nchan = meta_nchan
+        else:
+            nchan = header_nchan or meta_nchan
         rest_freq = self._safe_float(metadata.get("rest_freq_ghz"))
-        ctype = str(headers.get("CTYPE3") or "Channel")
-        cunit = str(headers.get("CUNIT3") or "")
-        crval = self._safe_float(headers.get("CRVAL3"))
-        cdelt = self._safe_float(headers.get("CDELT3"))
-        crpix = self._safe_float(headers.get("CRPIX3")) or 1.0
+        ctype = str(headers.get(f"CTYPE{axis_num}") or "Channel")
+        cunit = str(headers.get(f"CUNIT{axis_num}") or "")
+        crval = self._safe_float(headers.get(f"CRVAL{axis_num}"))
+        cdelt = self._safe_float(headers.get(f"CDELT{axis_num}"))
+        crpix = self._safe_float(headers.get(f"CRPIX{axis_num}")) or 1.0
 
         if not nchan:
             shape = self._shape_from_metadata(metadata, headers)
@@ -2700,19 +2918,26 @@ class CubeWorkbenchService:
         if crval is not None and cdelt is not None:
             values = [round((crval + (idx + 1 - crpix) * cdelt) * scale, 9) for idx in indices]
             label = f"{ctype} ({unit})" if unit else ctype
+            basis = "wcs"
         elif rest_freq is not None:
             values = [rest_freq for _ in indices]
             label = "RESTFRQ (GHz)"
             unit = "GHz"
+            basis = "restfrq_constant"
         else:
             values = [float(idx) for idx in indices]
             label = "Channel"
             unit = "channel"
+            basis = "channel_index"
 
         return {
             "label": label,
             "unit": unit,
             "ctype": ctype,
+            "axis": axis_num,
+            # How the values were derived: "wcs" (real CRVAL/CDELT axis),
+            # "restfrq_constant" (every channel = RESTFRQ), or "channel_index".
+            "basis": basis,
             "channel_count": int(nchan),
             "downsample_step": step,
             "values": values,

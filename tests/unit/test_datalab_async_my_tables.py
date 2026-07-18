@@ -138,6 +138,36 @@ def test_density_aggregate_async_submit_skips_sync_and_tiling():
     assert rec["status"] == "failed"  # the worker hit the _NeverSync guard — expected here
 
 
+def test_local_async_job_keeps_healpix_meta_and_truncation_stamp():
+    """dl-async-healpix-scheme-lost (local path): the threaded runner must
+    store the builder's healpix {column, nside, scheme} in provenance — the
+    sync path already does — and stamp limit_truncated when the frame filled
+    its row cap, so async results can't render mis-schemed or masquerade as
+    complete."""
+    client = _FakeClient()  # anon token → local threaded job; serves 1 row
+    ctx, jobs, store = _ctx(client)
+    out = dl.DensityAggregate().run(
+        dl.DensityAggregateInput(
+            catalog="nsc_dr2", table="object", mode="healpix",
+            healpix_column="ring256", ra=10.0, dec=10.0, radius_deg=1.0,
+            limit=1,  # the 1-row fake frame exactly fills it → truncated
+            async_submit=True,
+        ),
+        ctx,
+    ).to_native()
+    assert out["success"] is True and out["job_kind"] == "local"
+    rec = _wait_terminal(jobs, out["job_id"])
+    assert rec["status"] == "succeeded"
+    # The submit-time record carries the healpix meta for the server-path
+    # JobResults re-attach too.
+    assert rec["params"]["healpix"]["column"] == "ring256"
+    result_id = rec["result"]["result_id"]
+    prov = store.get(result_id).provenance
+    assert prov["healpix"] == {"column": "ring256", "nside": 256, "scheme": "RING"}
+    assert prov["limit_truncated"] is True and prov["row_limit"] == 1
+    assert any("row cap" in w for w in rec["result"].get("warnings", []))
+
+
 # ── async_submit: server-side path (real token) ───────────────────────────────
 def test_async_submit_server_job_with_real_token():
     client = _FakeClient(token="real.login.token")
@@ -258,6 +288,26 @@ def test_my_table_survives_result_ttl_expiry():
     with pytest.raises(KeyError):
         store.get(result_id)
     assert int(len(store.load_my_table("keeper").dataframe)) == 2
+
+
+def test_dlt_payloads_are_exempt_from_ttl_in_get_and_lookup():
+    """dl-mytable-ttl-expiry / dlt-lookup-ttl-data-loss: the dlr_ TTL must never
+    apply to durable dlt_ my-table payloads. With the disk cache OFF, expiring
+    them out of memory destroyed a saved table permanently."""
+    store = DatalabResultStore(enable_disk_cache=False, ttl_seconds=3600)
+    result_id = _stored_result(store)
+    store.save_result(result_id, "durable")
+    # Backdate the dlt_ payload well past the dlr TTL.
+    store._memory["dlt_durable"]["created_at"] -= 7200
+
+    frame, meta, status = store.lookup("dlt_durable")
+    assert status == "ok" and int(len(frame)) == 2
+    assert int(len(store.get("dlt_durable").dataframe)) == 2
+    # And it must NOT have been evicted by the probe.
+    assert "dlt_durable" in store._memory
+    # Repeated lookups keep working (no one-shot pop).
+    assert store.lookup("dlt_durable")[2] == "ok"
+    assert int(len(store.load_my_table("durable").dataframe)) == 2
 
 
 def test_my_table_durable_across_store_restart(tmp_path):

@@ -65,13 +65,19 @@ def _resolve_input_url(
     )
 
 
-def _load_fits_image(fits_path: str) -> Tuple[np.ndarray, Any, Any]:
-    """Open a downloaded FITS file -> (2D float array, WCS-or-None, header)."""
+def _load_fits_image(fits_path: str) -> Tuple[np.ndarray, Any, Any, Optional[str]]:
+    """Open a downloaded FITS file -> (2D float array, WCS-or-None, header,
+    cube-slice disclosure note or None).
+
+    The note is set when the input was a 3D+ cube collapsed to one plane
+    (IMG-11) — callers must surface it in their warnings so a single channel
+    is never silently presented as "the image".
+    """
     from astropy.io import fits as afits
     from astropy.wcs import WCS
 
     with afits.open(fits_path, memmap=True) as hdul:
-        data_2d, hdu_idx = _pick_science_hdu(hdul)
+        data_2d, hdu_idx, slice_info = _pick_science_hdu(hdul, return_slice_info=True)
         header = hdul[hdu_idx].header.copy()
         try:
             wcs = WCS(header, naxis=2)
@@ -80,7 +86,7 @@ def _load_fits_image(fits_path: str) -> Tuple[np.ndarray, Any, Any]:
         except Exception:
             wcs = None
         data = np.asarray(data_2d, dtype=float)
-    return data, wcs, header
+    return data, wcs, header, (slice_info["note"] if slice_info else None)
 
 
 def _pixel_scale_arcsec(wcs: Any) -> Optional[float]:
@@ -111,8 +117,9 @@ def _pixel_area_arcsec2(wcs: Any, pix_arcsec: Optional[float]) -> Optional[float
 
 
 def _nonsquare_pixel_warning(wcs: Any) -> Optional[str]:
-    """Warn when the two axis scales differ enough that a single mean scale
-    (used for areas, beam conversions, FWHM) is a poor approximation (CX-10).
+    """Warn when the two axis scales differ enough that the single mean scale
+    still used for aperture radii and radial profiles is a poor approximation
+    (CX-10; fitted FWHM/PA are now measured on-sky and are exempt).
 
     hips2fits TAN cutouts are square by construction; this only fires for
     arbitrary archive FITS with anisotropic pixels.
@@ -128,7 +135,8 @@ def _nonsquare_pixel_warning(wcs: Any) -> Optional[str]:
         ratio = float(scales.max() / scales.min())
         if ratio > 1.02:
             return (f"Pixel scales differ by {(ratio - 1) * 100:.0f}% between axes; "
-                    "arcsec-based areas/sizes use their mean and are approximate for this image.")
+                    "fitted FWHM/PA are measured on-sky, but aperture radii and "
+                    "radial profiles use the mean scale and are approximate for this image.")
     except Exception:
         return None
     return None
@@ -208,6 +216,32 @@ def _sky_position_angle(wcs: Any, x: float, y: float, major_angle_pix: float) ->
             return None
         pa = c0.position_angle(c1).to_value("deg")
         return float(pa % 180.0)
+    except Exception:
+        return None
+
+
+def _sky_length_arcsec(wcs: Any, x: float, y: float, angle_pix: float,
+                       length_pix: float) -> Optional[float]:
+    """On-sky length (arcsec) of a pixel-frame segment centred on (x, y).
+
+    Steps ±length_pix/2 along ``angle_pix`` in pixel space, converts both
+    endpoints to sky, and returns their separation — exact for anisotropic,
+    rotated, or skewed WCS, where multiplying by ONE mean pixel scale
+    mis-reports any size along an axis whose scale differs from the mean
+    (CX-10: a source elongated along a 2″/pix axis of a 1″×2″ image had its
+    FWHM under-reported by 25% by the mean scale).
+    """
+    try:
+        if not (math.isfinite(length_pix) and length_pix > 0):
+            return None
+        dx = 0.5 * length_pix * math.cos(angle_pix)
+        dy = 0.5 * length_pix * math.sin(angle_pix)
+        c0 = wcs.pixel_to_world(float(x - dx), float(y - dy))
+        c1 = wcs.pixel_to_world(float(x + dx), float(y + dy))
+        sep = float(c0.separation(c1).to_value("arcsec"))
+        if not math.isfinite(sep) or sep <= 0:
+            return None
+        return sep
     except Exception:
         return None
 
@@ -323,9 +357,11 @@ def image_statistics(
     try:
         resolved = _resolve_input_url(url, survey, ra, dec, fov_deg, width)
         fits_path = _download_fits(resolved, title or "statistics")
-        data, wcs, header = _load_fits_image(fits_path)
+        data, wcs, header, cube_note = _load_fits_image(fits_path)
 
         blank, warnings = _blankness(data)
+        if cube_note:
+            warnings.append(cube_note)  # IMG-11: disclose the collapsed plane
         finite = data[np.isfinite(data)]
         if finite.size == 0:
             return {"success": False, "error": "Image contains no finite pixels (blank tile).",
@@ -428,9 +464,7 @@ def detect_and_measure_sources(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from astropy.stats import sigma_clipped_stats
-    from photutils.aperture import (
-        ApertureStats, CircularAnnulus, CircularAperture, aperture_photometry,
-    )
+    from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture
     from photutils.detection import DAOStarFinder
     from photutils.segmentation import SourceCatalog, detect_sources as seg_detect
 
@@ -441,9 +475,11 @@ def detect_and_measure_sources(
 
         resolved = _resolve_input_url(url, survey, ra, dec, fov_deg, width)
         fits_path = _download_fits(resolved, title or "source detection")
-        data, wcs, header = _load_fits_image(fits_path)
+        data, wcs, header, cube_note = _load_fits_image(fits_path)
 
         blank, warnings = _blankness(data)
+        if cube_note:
+            warnings.append(cube_note)  # IMG-11: disclose the collapsed plane
         if blank:
             return {"success": False, "blank": True,
                     "error": "Image looks blank (all-NaN or constant) — cannot detect sources.",
@@ -511,14 +547,23 @@ def detect_and_measure_sources(
         r_ap = max(2.0, 1.5 * fwhm_pix)
         annulus = CircularAnnulus(positions, r_in=2.0 * r_ap, r_out=3.0 * r_ap)
         apertures = CircularAperture(positions, r=r_ap)
-        ap_stats = ApertureStats(data, annulus, sigma_clip=None)
+        nonfinite_mask = ~np.isfinite(data)
+        ap_stats = ApertureStats(data, annulus, mask=nonfinite_mask, sigma_clip=None)
         local_bkg = np.nan_to_num(ap_stats.median, nan=bkg_median)
-        phot = aperture_photometry(np.nan_to_num(data, nan=0.0), apertures)
-        ap_area = apertures.area
+        # IMG-06: the sum and the background-subtraction area must cover the
+        # SAME pixels. nan_to_num summed NaN pixels as 0 while local_bkg was
+        # subtracted over the full geometric aperture area, biasing net fluxes
+        # low near coverage gaps — mask non-finite pixels so both the sum and
+        # the effective area exclude them.
+        src_stats = ApertureStats(data, apertures, mask=nonfinite_mask, sigma_clip=None)
+        ap_sums = np.nan_to_num(np.atleast_1d(np.asarray(src_stats.sum, dtype=float)), nan=0.0)
+        eff_areas = np.atleast_1d(np.asarray(src_stats.sum_aper_area.value, dtype=float))
+        geom_area = float(apertures.area)
 
         sources: List[Dict[str, Any]] = []
         for i, (x, y) in enumerate(positions):
-            net = float(phot["aperture_sum"][i]) - float(local_bkg[i]) * ap_area
+            eff_area = float(eff_areas[i]) if math.isfinite(float(eff_areas[i])) else 0.0
+            net = float(ap_sums[i]) - float(local_bkg[i]) * eff_area
             # peaks[] were measured on the background-subtracted `work` array,
             # so they are already net peaks — do not subtract the median again.
             snr = peaks[i] / bkg_std
@@ -530,6 +575,11 @@ def detect_and_measure_sources(
                 "aperture_sum": _round(net),
                 "snr": _round(snr, 2),
             }
+            if eff_area < geom_area - 1e-6:
+                # IMG-06: per-source coverage flag when NaN/out-of-image
+                # pixels were excluded from the aperture.
+                entry["aperture_clipped"] = True
+                entry["aperture_effective_area_pix"] = _round(eff_area, 2)
             if wcs is not None:
                 sra, sdec = _pixel_to_sky(wcs, x, y)
                 entry["ra"] = _round(sra, 6)
@@ -537,6 +587,13 @@ def detect_and_measure_sources(
             if jy_per_beam:
                 entry["flux_jy"] = _round(net / beam["beam_area_pix"])
             sources.append(entry)
+
+        if any(src.get("aperture_clipped") for src in sources):
+            warnings.append(
+                "Some apertures include non-finite or out-of-image pixels; "
+                "their photometry uses only the finite pixels and is flagged "
+                "aperture_clipped (IMG-06)."
+            )
 
         sources.sort(key=lambda s: (s.get("aperture_sum") if s.get("aperture_sum") is not None else -np.inf), reverse=True)
         truncated = len(sources) > max_sources
@@ -620,7 +677,7 @@ def measure_region(
     try:
         resolved = _resolve_input_url(url, survey, ra, dec, fov_deg, width)
         fits_path = _download_fits(resolved, title or "region statistics")
-        data, wcs, header = _load_fits_image(fits_path)
+        data, wcs, header, cube_note = _load_fits_image(fits_path)
 
         pix_arcsec = _pixel_scale_arcsec(wcs)
         pixel_area_arcsec2 = _pixel_area_arcsec2(wcs, pix_arcsec)
@@ -680,7 +737,11 @@ def measure_region(
             region_label = f"circle RA={float(ra):.5f}, Dec={float(dec):.5f}, r={float(radius_arcsec):g}\""
 
         mask = pixel_region.to_mask(mode="center")
-        cutout = mask.cutout(data)
+        # IMG-01: the default cutout fill is 0.0, so a region overlapping the
+        # image edge gained fabricated zero-valued pixels that pass the
+        # isfinite filter and pollute every statistic — fill with NaN so
+        # out-of-image pixels are excluded instead.
+        cutout = mask.cutout(data, fill_value=np.nan)
         if cutout is None:
             raise ImageAnalysisError("The region does not overlap the image.")
         values = cutout[np.asarray(mask.data, dtype=bool)]
@@ -688,9 +749,23 @@ def measure_region(
         if values.size == 0:
             raise ImageAnalysisError("The region contains no finite pixels.")
 
+        region_clipped = False
+        bbox = getattr(mask, "bbox", None)
+        if bbox is not None:
+            ny_img, nx_img = data.shape
+            region_clipped = (bbox.ixmin < 0 or bbox.iymin < 0
+                              or bbox.ixmax > nx_img or bbox.iymax > ny_img)
+
         warnings: List[str] = []
+        if cube_note:
+            warnings.append(cube_note)  # IMG-11: disclose the collapsed plane
         if _region_geom_warn:
             warnings.append(_region_geom_warn)
+        if region_clipped:
+            warnings.append(
+                "Region extends past the image boundary; statistics cover "
+                "only the in-image pixels (IMG-01)."
+            )
         if region and "\n" in str(region).strip():
             warnings.append("Multiple regions supplied; only the first was measured.")
 
@@ -781,9 +856,11 @@ def fit_gaussian_source(
     try:
         resolved = _resolve_input_url(url, survey, ra, dec, fov_deg, width)
         fits_path = _download_fits(resolved, title or "gaussian fit")
-        data, wcs, header = _load_fits_image(fits_path)
+        data, wcs, header, cube_note = _load_fits_image(fits_path)
 
         blank, warnings = _blankness(data)
+        if cube_note:
+            warnings.append(cube_note)  # IMG-11: disclose the collapsed plane
         if blank:
             return {"success": False, "blank": True,
                     "error": "Image looks blank — nothing to fit.", "warnings": warnings}
@@ -868,9 +945,30 @@ def fit_gaussian_source(
             fra, fdec = _pixel_to_sky(wcs, xc, yc)
             fit_out["ra"] = _round(fra, 6)
             fit_out["dec"] = _round(fdec, 6)
+        # Sky-true FWHM (CX-10): measure each axis on the sky along its own
+        # direction instead of scaling pixels by the single MEAN pixel scale,
+        # which mis-sizes anisotropic/rotated WCS images. Falls back to the
+        # mean-scale product when the WCS conversion fails.
+        fwhm_major_arcsec: Optional[float] = None
+        fwhm_minor_arcsec: Optional[float] = None
         if pix_arcsec:
-            fit_out["fwhm_major_arcsec"] = _round(maj_pix * FWHM * pix_arcsec, 3)
-            fit_out["fwhm_minor_arcsec"] = _round(min_pix * FWHM * pix_arcsec, 3)
+            if wcs is not None:
+                fwhm_major_arcsec = _sky_length_arcsec(
+                    wcs, xc, yc, major_angle_pix, maj_pix * FWHM)
+                fwhm_minor_arcsec = _sky_length_arcsec(
+                    wcs, xc, yc, major_angle_pix + math.pi / 2.0, min_pix * FWHM)
+            if fwhm_major_arcsec is None:
+                fwhm_major_arcsec = maj_pix * FWHM * pix_arcsec
+            if fwhm_minor_arcsec is None:
+                fwhm_minor_arcsec = min_pix * FWHM * pix_arcsec
+            fit_out["fwhm_major_arcsec"] = _round(fwhm_major_arcsec, 3)
+            fit_out["fwhm_minor_arcsec"] = _round(fwhm_minor_arcsec, 3)
+        # Effective arcsec/pix along each fitted axis — used so the error bars
+        # and the deconvolution beam stay consistent with the sky-true sizes.
+        _scale_maj = (fwhm_major_arcsec / (maj_pix * FWHM)
+                      if (fwhm_major_arcsec and maj_pix > 0) else pix_arcsec)
+        _scale_min = (fwhm_minor_arcsec / (min_pix * FWHM)
+                      if (fwhm_minor_arcsec and min_pix > 0) else pix_arcsec)
 
         # Parameter uncertainties when the fitter produced a covariance matrix:
         # peak, FWHM major/minor (σ_err × FWHM factor, in pix and arcsec), and PA.
@@ -888,12 +986,12 @@ def fit_gaussian_source(
                 maj_err, min_err = (sx_err, sy_err) if sx >= sy else (sy_err, sx_err)
                 if math.isfinite(maj_err):
                     fit_out["fwhm_major_pix_err"] = _round(maj_err * FWHM, 3)
-                    if pix_arcsec:
-                        fit_out["fwhm_major_arcsec_err"] = _round(maj_err * FWHM * pix_arcsec, 3)
+                    if _scale_maj:
+                        fit_out["fwhm_major_arcsec_err"] = _round(maj_err * FWHM * _scale_maj, 3)
                 if math.isfinite(min_err):
                     fit_out["fwhm_minor_pix_err"] = _round(min_err * FWHM, 3)
-                    if pix_arcsec:
-                        fit_out["fwhm_minor_arcsec_err"] = _round(min_err * FWHM * pix_arcsec, 3)
+                    if _scale_min:
+                        fit_out["fwhm_minor_arcsec_err"] = _round(min_err * FWHM * _scale_min, 3)
                 if "theta_0" in err_map and math.isfinite(err_map["theta_0"]):
                     fit_out["pa_deg_err"] = _round(math.degrees(float(err_map["theta_0"])), 1)
             except Exception:
@@ -915,8 +1013,10 @@ def fit_gaussian_source(
                 from radio_beam import Beam
 
                 fitted_beam = Beam(
-                    major=maj_pix * FWHM * pix_arcsec * u.arcsec,
-                    minor=min_pix * FWHM * pix_arcsec * u.arcsec,
+                    # Sky-true sizes (CX-10) — consistent with BPA/BMAJ/BMIN,
+                    # which are sky quantities.
+                    major=(fwhm_major_arcsec or maj_pix * FWHM * pix_arcsec) * u.arcsec,
+                    minor=(fwhm_minor_arcsec or min_pix * FWHM * pix_arcsec) * u.arcsec,
                     pa=pa_deg * u.deg,
                 )
                 restoring = Beam(
@@ -1015,9 +1115,11 @@ def radial_profile(
     try:
         resolved = _resolve_input_url(url, survey, ra, dec, fov_deg, width)
         fits_path = _download_fits(resolved, title or "radial profile")
-        data, wcs, header = _load_fits_image(fits_path)
+        data, wcs, header, cube_note = _load_fits_image(fits_path)
 
         blank, warnings = _blankness(data)
+        if cube_note:
+            warnings.append(cube_note)  # IMG-11: disclose the collapsed plane
         if blank:
             return {"success": False, "blank": True,
                     "error": "Image looks blank — no profile to measure.", "warnings": warnings}

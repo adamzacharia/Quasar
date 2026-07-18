@@ -174,6 +174,19 @@ async def google_login(req: GoogleLoginRequest, response: Response):
         if not email:
             raise HTTPException(status_code=400, detail="Google account has no email")
 
+        # UIAPI-10: accounts are linked/created purely by email string, and
+        # is_admin_email() gates the admin panel on it too — accepting a token
+        # whose email Google has NOT verified is the classic unverified-email
+        # OAuth account takeover. Google emits email_verified=false for some
+        # account types (e.g. Workspace-created users who never confirmed the
+        # address); reject those outright. Accept the JSON boolean and its
+        # string form — some IdP serializations use "true".
+        if idinfo.get("email_verified") not in (True, "true"):
+            raise HTTPException(
+                status_code=401,
+                detail="Google reports this account's email address as unverified. Verify it with Google, then sign in again.",
+            )
+
         success, user_id, msg, token = auth_service.register_or_login_google_user(email, name, picture)
 
         if not success:

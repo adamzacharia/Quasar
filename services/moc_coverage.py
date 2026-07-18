@@ -23,6 +23,11 @@ MAX_MOC_ORDER = 10
 MIN_MOC_ORDER = 3
 MAX_MOC_IDS = 4
 MAX_MOC_CELLS = 20000
+# MOC algebra operands get a 10× finer cell budget than the display payload:
+# degrading INPUTS before intersection/difference distorts the computed area
+# (measured ~12× inflation on a thin-overlap case at the display cap, CX-24).
+# Bounded (not uncapped) so a deep all-sky MOC cannot exhaust memory.
+ALGEBRA_MAX_MOC_CELLS = 200_000
 
 
 class MocCoverageService:
@@ -124,7 +129,8 @@ class MocCoverageService:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    def moc_geometry(self, ids: Any, order: Any = 8) -> Dict[str, Any]:
+    def moc_geometry(self, ids: Any, order: Any = 8,
+                     max_cells: Optional[int] = None) -> Dict[str, Any]:
         """Fetch MOC geometry (HEALPix cell maps) for survey/dataset IDs.
 
         Returns, per id, the exact JSON format Aladin Lite's ``A.MOCFromJSON``
@@ -143,6 +149,9 @@ class MocCoverageService:
             except (TypeError, ValueError):
                 order_i = 8
             order_i = max(MIN_MOC_ORDER, min(order_i, MAX_MOC_ORDER))
+            # Display payloads keep the tight default; algebra callers pass a
+            # larger budget so operand degradation doesn't distort areas (CX-24).
+            cell_cap = MAX_MOC_CELLS if max_cells is None else max(1, int(max_cells))
 
             mocs: List[Dict[str, Any]] = []
             for moc_id in id_list:
@@ -151,7 +160,7 @@ class MocCoverageService:
                     {"ID": moc_id, "get": "moc", "fmt": "json", "order": local_order}
                 )
                 n_cells = _moc_cell_count(geometry)
-                while n_cells > MAX_MOC_CELLS and local_order > MIN_MOC_ORDER:
+                while n_cells > cell_cap and local_order > MIN_MOC_ORDER:
                     local_order -= 1
                     geometry = self._get_json_dict(
                         {"ID": moc_id, "get": "moc", "fmt": "json", "order": local_order}
@@ -180,6 +189,13 @@ class MocCoverageService:
                     "service": "CDS MOCServer",
                     "endpoint": self.base_url,
                     "order": order_i,
+                    # One GET per ID, each possibly at its OWN downsampled
+                    # order (CX-05): describe the request family truthfully
+                    # instead of baking a single synthetic multi-ID URL.
+                    "request_pattern": "GET ?ID=<id>&get=moc&fmt=json&order=<order>",
+                    "fetched": ", ".join(
+                        f"{m['id']}@order{m['order']}" for m in mocs
+                    ),
                 },
             }
         except Exception as exc:
@@ -219,7 +235,8 @@ class MocCoverageService:
             if op in {"intersection", "difference"} and len(id_list) < 2:
                 return {"success": False,
                         "error": f"{op} needs at least two survey_ids; got {len(id_list)}."}
-            geometry = self.moc_geometry(id_list, order=order)
+            geometry = self.moc_geometry(id_list, order=order,
+                                         max_cells=ALGEBRA_MAX_MOC_CELLS)
             # moc_geometry fails when NOTHING resolves — but for algebra that is
             # "all operands are empty sky", a valid empty result, not an error
             # (CX-21). Only propagate a genuine failure that also carries no mocs
@@ -342,7 +359,13 @@ class MocCoverageService:
                 warnings.append(f"Derived MOC downsampled to order {max_order - 1} for display.")
 
             sky_fraction = float(combined.sky_fraction)
-            input_order = geometry.get("provenance", {}).get("order")
+            # The ACTUAL order the operands were fetched at (they may have been
+            # downsampled below the requested order) — the precision note must
+            # not overstate the resolution the algebra really had (CX-24).
+            input_order = min(
+                (m.get("order") for m in fetched if m.get("order") is not None),
+                default=geometry.get("provenance", {}).get("order"),
+            )
             result: Dict[str, Any] = {
                 "success": True,
                 "operation": op,

@@ -59,7 +59,82 @@ illustrative per the PDF; rubric tolerances account for that.
 """
 
 BENCH_NAME = "DataLabBench"
-BENCH_VERSION = "1.0"
+# v1.1 (2026-07-17): retroactively acknowledges the rubric hardening that
+# landed between 2026-07-02 and 2026-07-13 under an unchanged "1.0" tag
+# (any_regex→trace_regex conversions, lenient alternatives removed, GP-02
+# rewritten to sql_flat_q3c_join) — scores from runs before/after that window
+# are NOT comparable. v1.1 additionally: claim-shaped GP-00 gate (honest
+# outage reports no longer dock 20), same-statement scoping for the DLB-10
+# C4 / DLB-12+13 C7 row-cap checks, per-statement GP-02 splitting, penalty
+# scaling in auto-only scores, and fallback-trace ok derivation (harness).
+#
+# v1.2 (2026-07-18, R6/R3): ADDITIVE reporting axes only — per-question
+# scores are computed exactly as in v1.1 (same checkpoints, same points,
+# same penalties). New: (a) every checkpoint maps to a ReplicationBench-style
+# axis — "faithfulness" (did the agent follow the task/approach as asked) or
+# "correctness" (is the produced content/number right) — via
+# axis_for_checkpoint(); (b) a fabrication axis aggregating GP-00 hits and
+# zero-credit on fabrication-guarded judge checkpoints; (c) the harness
+# records the backend's mechanical citation recall/precision metrics
+# (citation_metrics SSE event, R3) as informational per-question fields.
+# v1.1 and v1.2 total scores remain directly comparable; the axes are new
+# columns, not a rescoring.
+BENCH_VERSION = "1.2"
+
+# ---------------------------------------------------------------------------
+# v1.2 axis mapping (R6)
+# ---------------------------------------------------------------------------
+# Default rule: auto checkpoints verify PROCESS (right tools, right query
+# shape, right region) → faithfulness; judge checkpoints grade CONTENT
+# (correct science, correct numbers, correct plots) → correctness.
+# AXIS_OVERRIDES lists the judge checkpoints that actually grade
+# task/approach compliance (answer form, region choice, strategy design,
+# execution-model awareness) rather than content.
+CHECKPOINT_AXES = ("faithfulness", "correctness")
+DEFAULT_AXIS_BY_TYPE = {"auto": "faithfulness", "judge": "correctness"}
+AXIS_OVERRIDES = {
+    "DLB-02": {"C5": "faithfulness"},   # answer-form compliance (a plain count)
+    "DLB-04": {"C5": "faithfulness"},   # explicit FOV reasoning (approach)
+    "DLB-05": {"C7": "faithfulness"},   # quality cuts applied (methodology)
+    "DLB-07": {"C6": "faithfulness"},   # method explained (binning/kernel)
+    "DLB-08": {"C4": "faithfulness"},   # bounded-region task compliance
+    "DLB-09": {"C7": "faithfulness"},   # q3c execution-model awareness
+    "DLB-11": {"C7": "faithfulness"},   # bitmask semantics explained
+    "DLB-12": {"C7": "faithfulness"},   # vetting guidance / honest coverage
+    "DLB-13": {"C3": "faithfulness"},   # region-choice task compliance
+    "DLB-14": {"C8": "faithfulness"},   # coherent end-to-end narrative
+    "DLB-15": {"C1": "faithfulness"},   # strategy designed before executing
+}
+
+# Judge checkpoints whose guidance makes fabrication a zero — derived
+# mechanically from the guidance text so the list can never drift from the
+# rubric wording.
+_FABRICATION_GUARD_RE = None  # compiled lazily below (re imported at module use)
+
+
+def axis_for_checkpoint(question_id: str, checkpoint: dict) -> str:
+    """Return the v1.2 reporting axis for one checkpoint (additive, R6)."""
+    override = AXIS_OVERRIDES.get(question_id, {}).get(checkpoint.get("id"))
+    if override:
+        return override
+    return DEFAULT_AXIS_BY_TYPE.get(checkpoint.get("type", "auto"), "faithfulness")
+
+
+def fabrication_guard_ids(question: dict) -> list:
+    """Checkpoint ids whose guidance zeroes fabricated content."""
+    import re as _re
+    global _FABRICATION_GUARD_RE
+    if _FABRICATION_GUARD_RE is None:
+        _FABRICATION_GUARD_RE = _re.compile(
+            r"fabricat|invented|not appear in any tool output|"
+            r"consistent with the tool output",
+            _re.IGNORECASE,
+        )
+    return [
+        cp["id"] for cp in question.get("checkpoints", [])
+        if cp.get("type") == "judge"
+        and _FABRICATION_GUARD_RE.search(cp.get("guidance") or "")
+    ]
 
 # Tier → weight used in the overall roll-up (higher tiers count more).
 TIER_WEIGHTS = {1: 1.0, 2: 1.2, 3: 1.4, 4: 1.6, 5: 1.8, 6: 2.0, 7: 2.4}
@@ -100,7 +175,17 @@ GLOBAL_PENALTIES = [
         "points": 20,
         # Triggers when NO datalab tool succeeded. The scorer negates tool_ok.
         "detect": {"kind": "not", "of": {"kind": "tool_ok", "tools": DATALAB_QUERY_TOOLS}},
-        "only_if_text": r"\d",  # only meaningful if the answer contains numbers/claims
+        # v1.1: gate on CLAIM-shaped numbers, not any digit — an honest
+        # "Data Lab is unreachable (HTTP 503), could not run the cone at
+        # RA 229.02" echoes digits without presenting results, and docking it
+        # -20 punished exactly the honest degradation the bench rewards.
+        "only_if_text": (
+            r"(?i)(?:there\s+are|found|returned|retrieved|yields?|contains?|"
+            r"total(?:s|ing)?\s*(?:of|:|=)?|count(?:s)?\s*(?:of|:|=|is))\s*[\d,]+"
+            r"|\b[\d,]{1,12}\s+(?:sources?|objects?|rows?|stars?|galaxies|"
+            r"quasars?|candidates?|matches|detections?|entries|spectra)\b"
+            r"|\|\s*-?[\d.,eE+]+\s*\|"  # a numeric markdown-table cell
+        ),
     },
     {
         "id": "GP-01",
@@ -844,10 +929,18 @@ QUESTIONS = [
             {
                 "id": "C4", "type": "auto", "points": 10,
                 "desc": "Sample capped to 'a few hundred' (LIMIT / limit arg <= 1000)",
+                # v1.1: scoped to the ROW-PULL tools / same-statement SQL — an
+                # unrelated tool's limit arg (datalab_list_catalogs limit=50)
+                # used to satisfy this while the actual pull was uncapped.
                 "checks": [
                     {"kind": "any", "of": [
-                        {"kind": "tool_arg", "tools": [], "arg": "limit", "max": 1000},
-                        {"kind": "sql_regex", "pattern": r"LIMIT\s+\d{1,4}\b"},
+                        {"kind": "tool_arg",
+                         "tools": ["datalab_select_catalog_rows", "datalab_sql_query"],
+                         "arg": "limit", "max": 1000},
+                        {"kind": "tool_arg", "tools": ["datalab_sed_plot"],
+                         "arg": "sample_n", "max": 1000},
+                        {"kind": "sql_regex",
+                         "pattern": r"(?is)FROM\s+\S+[^;]*LIMIT\s+\d{1,4}\b"},
                     ]},
                 ],
             },
@@ -1111,11 +1204,18 @@ QUESTIONS = [
             {
                 "id": "C7", "type": "auto", "points": 10,
                 "desc": "Pull is bounded (region + z cuts and/or LIMIT / tool row cap)",
+                # v1.1: bound must live in the SAME statement as the row-level
+                # FROM (a BETWEEN in an earlier COUNT probe used to launder an
+                # unbounded full-table pull), and the tool_arg is scoped to the
+                # row-pull tools.
                 "checks": [
                     {"kind": "any", "of": [
-                        {"kind": "sql_regex", "pattern": r"LIMIT\s+\d+"},
-                        {"kind": "tool_arg", "tools": [], "arg": "limit", "max": 100000},
-                        {"kind": "sql_regex", "pattern": r"BETWEEN"},
+                        {"kind": "sql_regex",
+                         "pattern": r"(?is)FROM\s+\S+[^;]*(LIMIT\s+\d+|BETWEEN)"},
+                        {"kind": "tool_arg",
+                         "tools": ["datalab_select_catalog_rows", "datalab_sql_query",
+                                   "datalab_lss_wedge"],
+                         "arg": "limit", "max": 100000},
                     ]},
                 ],
             },
@@ -1355,6 +1455,25 @@ def validate_dataset():
         walk(pen["detect"], f"GLOBAL.{pen['id']}")
     if len(QUESTIONS) != 15:
         errors.append(f"expected 15 questions, found {len(QUESTIONS)}")
+
+    # v1.2 axis mapping (R6): overrides must reference real question and
+    # checkpoint ids with valid axes, and every checkpoint must resolve.
+    by_id = {q["id"]: q for q in QUESTIONS}
+    for qid, overrides in AXIS_OVERRIDES.items():
+        q = by_id.get(qid)
+        if q is None:
+            errors.append(f"AXIS_OVERRIDES: unknown question {qid}")
+            continue
+        cp_ids = {cp["id"] for cp in q["checkpoints"]}
+        for cid, axis in overrides.items():
+            if cid not in cp_ids:
+                errors.append(f"AXIS_OVERRIDES: {qid}.{cid} does not exist")
+            if axis not in CHECKPOINT_AXES:
+                errors.append(f"AXIS_OVERRIDES: {qid}.{cid} has invalid axis {axis!r}")
+    for q in QUESTIONS:
+        for cp in q["checkpoints"]:
+            if axis_for_checkpoint(q["id"], cp) not in CHECKPOINT_AXES:
+                errors.append(f"{q['id']}.{cp['id']}: unresolvable axis")
     return errors
 
 

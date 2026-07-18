@@ -83,16 +83,43 @@ def normalize_target_alias(target: str) -> str:
     return clean
 
 
+# alma-cycle-prefix-wrong-pre-cycle8: the cycle→proposal-year relation is NOT
+# linear below Cycle 8, so an explicit lookup is required. Irregularities:
+# Cycle 0 was the 2011 Early Science call (project codes 2011.0.*, suffix .0.);
+# Cycle 2 spanned longer than a year, so there was NO 2014 proposal call
+# (Cycle 3 jumps to 2015); the 2020 call was cancelled because of COVID, so
+# Cycle 8 became the 2021 call (no 2020 proposal year). year = cycle + 2013
+# holds only from Cycle 8 onward.
+_CYCLE_TO_PROPOSAL_YEAR: Dict[int, int] = {
+    0: 2011,
+    1: 2012,
+    2: 2013,
+    3: 2015,
+    4: 2016,
+    5: 2017,
+    6: 2018,
+    7: 2019,
+    8: 2021,
+    9: 2022,
+    10: 2023,
+    11: 2024,
+}
+
+
 def cycle_to_project_prefix(cycle: int) -> str:
     """Return the public project-code prefix for an ALMA cycle.
 
-    ALMA project codes use the proposal-call year as their first component.
-    Cycle 10 corresponds to 2023.1.*, Cycle 9 to 2022.1.*, etc.
+    ALMA project codes use the proposal-call year as their first component
+    (Cycle 10 → 2023.1.*, Cycle 0 → 2011.0.*). The mapping is tabulated for
+    Cycles 0-11 and extrapolated as ``year = cycle + 2013`` only for later
+    cycles (valid from Cycle 8 onward; see _CYCLE_TO_PROPOSAL_YEAR).
     """
     cycle_int = int(cycle)
     if cycle_int < 0 or cycle_int > 30:
         raise ValueError("ALMA cycle must be between 0 and 30")
-    return f"{cycle_int + 2013}.1."
+    year = _CYCLE_TO_PROPOSAL_YEAR.get(cycle_int, cycle_int + 2013)
+    suffix = "0" if cycle_int == 0 else "1"
+    return f"{year}.{suffix}."
 
 
 def project_prefix_where(cycle: int) -> str:
@@ -322,7 +349,11 @@ def line_names_for_input(lines: Sequence[str]) -> List[str]:
             "C18O": "C18O(2-1)",
             "CO": "CO(2-1)",
         }
-        name = aliases.get(compact, raw.replace(" ", ""))
+        # line-name-case-sensitive-silent-drop: fall back to the UPPERCASED
+        # compact token, not the original-case string, so lower/mixed-case
+        # inputs with an explicit transition (e.g. 'co(1-0)') still resolve
+        # against the all-uppercase LINE_REST_FREQ_GHZ keys.
+        name = aliases.get(compact, compact)
         if name not in LINE_REST_FREQ_GHZ and f"{name}(2-1)" in LINE_REST_FREQ_GHZ:
             name = f"{name}(2-1)"
         if name in LINE_REST_FREQ_GHZ and name not in output:
@@ -482,6 +513,213 @@ def summarize_projects(df: pd.DataFrame) -> pd.DataFrame:
             "obs_release_date": first_nonempty(group["obs_release_date"].tolist()) if "obs_release_date" in group.columns else "",
         })
     return pd.DataFrame(rows).sort_values(["observations", "proposal_id"], ascending=[False, True])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R2 — sensitivity-driven discovery + archive↔literature ObsCore joins.
+# Column availability live-verified against the ALMA TAP 2026-07-18 (73 obscore
+# columns incl. sensitivity_10kms [mJy/beam], cont_sensitivity_bandwidth
+# [mJy/beam], bib_reference, pub_title, publication_year, first_author).
+# bib_reference is a SPACE-SEPARATED bibcode list per row; pub_title and
+# first_author are concatenated blobs without a per-publication delimiter, so
+# bibcodes are the only mechanically joinable key.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Standard 19-character ADS bibcode: YYYYJJJJJVVVVMPPPPA.
+_BIBCODE_RE = re.compile(r"^[12]\d{3}[A-Za-z][A-Za-z0-9&.]{13}[A-Za-z.]$")
+
+_PROJECT_CODE_RE = re.compile(r"^\d{4}\.[0-9A-Za-z]\.\d{5}\.[A-Z]$")
+
+
+def looks_like_bibcode(value: Any) -> bool:
+    return bool(_BIBCODE_RE.match(as_text(value)))
+
+
+def split_bibcodes(value: Any) -> List[str]:
+    """Split an obscore ``bib_reference`` blob into individual bibcodes."""
+    tokens = as_text(value).split()
+    seen: set = set()
+    out: List[str] = []
+    for token in tokens:
+        if looks_like_bibcode(token) and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def band_token_where(band: Any) -> str:
+    """Exact-token match on the space-delimited band_list column.
+
+    A bare substring LIKE would make band=1 also match Band 10 (the
+    line_set_projects CAP-06 lesson) — match the token in every position.
+    """
+    token = escape_adql(str(band).strip())
+    return (
+        "("
+        f"band_list = '{token}' OR band_list LIKE '{token} %' "
+        f"OR band_list LIKE '% {token}' OR band_list LIKE '% {token} %'"
+        ")"
+    )
+
+
+def sensitivity_where(
+    sensitivity_mjy: float,
+    *,
+    continuum: bool = False,
+    band: Any = None,
+    science_category: str = "",
+) -> Tuple[str, str]:
+    """WHERE clause for sensitivity-driven archival discovery.
+
+    Returns ``(where_clause, sensitivity_column)``. A row qualifies when its
+    achieved sensitivity is at or below the requested rms (deeper == smaller
+    mJy/beam). ``sensitivity_10kms`` is the line sensitivity per 10 km/s
+    channel; ``cont_sensitivity_bandwidth`` is the aggregated-continuum
+    sensitivity over the full bandwidth.
+    """
+    threshold = float(sensitivity_mjy)
+    if not (threshold > 0):
+        raise ValueError("sensitivity_mjy must be a positive rms in mJy/beam")
+    column = "cont_sensitivity_bandwidth" if continuum else "sensitivity_10kms"
+    parts = [f"{column} > 0", f"{column} <= {threshold:g}"]
+    if band is not None and str(band).strip():
+        parts.append(band_token_where(band))
+    category = as_text(science_category)
+    if category:
+        parts.append(
+            f"LOWER(scientific_category) LIKE '%{escape_adql(category).lower()}%'"
+        )
+    return " AND ".join(parts), column
+
+
+def publication_join_where(identifier: str) -> Tuple[str, str]:
+    """WHERE clause joining ObsCore rows to publications for one identifier.
+
+    Recognizes ALMA project codes (``2019.1.00123.S``), MOUS UIDs
+    (``uid://...``), and ADS bibcodes (reverse direction: which archived data
+    did this paper use). Returns ``(where_clause, identifier_kind)``.
+    """
+    text = as_text(identifier)
+    if not text:
+        raise ValueError("identifier is required")
+    safe = escape_adql(text)
+    if text.lower().startswith("uid://"):
+        return f"member_ous_uid = '{safe}'", "mous_uid"
+    if _PROJECT_CODE_RE.match(text):
+        return f"proposal_id = '{safe}'", "project_code"
+    if looks_like_bibcode(text):
+        # bib_reference is a space-separated list — LIKE with the exact
+        # bibcode; bibcodes never contain spaces so no token ambiguity.
+        return f"bib_reference LIKE '%{safe}%'", "bibcode"
+    raise ValueError(
+        f"Unrecognized identifier '{text}': expected an ALMA project code "
+        "(2019.1.00123.S), a MOUS UID (uid://...), or an ADS bibcode."
+    )
+
+
+_PUBLICATION_COLUMNS = (
+    "bib_reference", "pub_title", "publication_year", "first_author",
+)
+_SENSITIVITY_COLUMNS = ("sensitivity_10kms", "cont_sensitivity_bandwidth")
+
+
+def select_obscore_query_extended(
+    where_clause: str,
+    *,
+    extra_columns: Sequence[str] = (),
+    top: int = 5000,
+    order_by: str = "proposal_id",
+) -> str:
+    """The standard obscore SELECT plus extra columns (R2 templates)."""
+    top = max(1, min(int(top or 5000), 20000))
+    base_columns = (
+        "target_name, proposal_id, member_ous_uid, obs_publisher_did,\n"
+        "       frequency, bandwidth, frequency_support, band_list,\n"
+        "       antenna_arrays, dataproduct_type, calib_level,\n"
+        "       scientific_category, science_keyword, obs_title, pi_name,\n"
+        "       s_ra, s_dec, t_exptime, s_resolution, spatial_resolution,\n"
+        "       obs_release_date"
+    )
+    if extra_columns:
+        base_columns += ",\n       " + ", ".join(extra_columns)
+    return f"""
+SELECT TOP {top}
+       {base_columns}
+FROM ivoa.obscore
+WHERE {where_clause}
+ORDER BY {order_by}
+"""
+
+
+def summarize_sensitivity(df: pd.DataFrame, sensitivity_column: str) -> pd.DataFrame:
+    """Per-project summary with the best (smallest) achieved sensitivity."""
+    summary = summarize_projects(df)
+    if summary is None or summary.empty or df is None or df.empty:
+        return summary
+    if sensitivity_column not in df.columns or "proposal_id" not in summary.columns:
+        return summary
+    values = pd.to_numeric(df[sensitivity_column], errors="coerce")
+    project_col = col(df, ["proposal_id", "project_code"])
+    best = (
+        df.assign(_sens=values)[values > 0]
+        .groupby(project_col)["_sens"]
+        .min()
+        .rename(f"best_{sensitivity_column}_mjy_beam")
+    )
+    summary = summary.merge(best, left_on="proposal_id", right_index=True, how="left")
+    sens_col = f"best_{sensitivity_column}_mjy_beam"
+    return summary.sort_values([sens_col, "proposal_id"], na_position="last")
+
+
+def summarize_publication_links(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-project publication join: deduped bibcodes + observation counts."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    project_col = col(df, ["proposal_id", "project_code"])
+    if not project_col:
+        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    for project, group in df.groupby(project_col, dropna=True):
+        bibcodes: List[str] = []
+        for value in group.get("bib_reference", pd.Series(dtype=str)).tolist():
+            for code in split_bibcodes(value):
+                if code not in bibcodes:
+                    bibcodes.append(code)
+        mous_uids = (
+            group["member_ous_uid"].dropna().astype(str).unique().tolist()
+            if "member_ous_uid" in group.columns else []
+        )
+        rows.append({
+            "proposal_id": as_text(project),
+            "n_publications": len(bibcodes),
+            "bibcodes": " ".join(bibcodes),
+            "observations": int(len(group)),
+            "member_ous_uids": " ".join(mous_uids[:20]),
+            "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
+            "band_list": first_nonempty(group["band_list"].tolist()) if "band_list" in group.columns else "",
+            "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group.columns else "",
+            "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group.columns else "",
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["n_publications", "observations", "proposal_id"], ascending=[False, False, True]
+    )
+
+
+def collect_publications(df: pd.DataFrame) -> List[Dict[str, str]]:
+    """Flat, deduped publication list for the observation↔paper graph."""
+    if df is None or df.empty or "bib_reference" not in df.columns:
+        return []
+    seen: set = set()
+    publications: List[Dict[str, str]] = []
+    for value in df["bib_reference"].tolist():
+        for code in split_bibcodes(value):
+            if code not in seen:
+                seen.add(code)
+                publications.append({
+                    "bibcode": code,
+                    "ads_url": f"https://ui.adsabs.harvard.edu/abs/{code}",
+                })
+    return publications
 
 
 def bandwidth_switching_candidates(df: pd.DataFrame) -> pd.DataFrame:

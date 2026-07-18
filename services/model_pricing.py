@@ -212,6 +212,12 @@ class TurnCostAccumulator:
         self.unpriced_tokens = 0
         # key_source -> {"usd", "priced_tokens", "unpriced_tokens"}
         self.by_source: Dict[str, Dict[str, float]] = {}
+        # Set by freeze(): the turn's usage event / chat_runs snapshot has been
+        # taken, so LATE calls (conductor executor threads surviving a timeout)
+        # must not mutate these totals afterwards — the per-call
+        # llm_usage_events ledger remains their authoritative record (CX-17).
+        self._frozen = False
+        self.late_calls_dropped = 0
 
     @property
     def total_tokens(self) -> int:
@@ -237,6 +243,12 @@ class TurnCostAccumulator:
 
         source = (key_source or "platform").strip().lower() or "platform"
         with self._lock:
+            if self._frozen:
+                # Post-snapshot arrival: keep the persisted turn totals
+                # self-consistent; the call is still fully accounted in the
+                # per-call ledger by the recorder that priced it (CX-17).
+                self.late_calls_dropped += 1
+                return call_cost
             self.input_tokens += tokens_in
             self.output_tokens += tokens_out
             bucket = self.by_source.setdefault(
@@ -251,6 +263,18 @@ class TurnCostAccumulator:
                 bucket["usd"] += call_cost
                 bucket["priced_tokens"] += tokens_in + tokens_out
         return call_cost
+
+    def freeze(self) -> None:
+        """Close the accumulator at snapshot time (CX-17).
+
+        Called just before the turn's usage event / chat_runs persistence is
+        built, so a conductor executor thread that outlives a timeout cannot
+        change the totals AFTER they were reported — reads and the snapshot
+        stay consistent, and late spend stays visible in the authoritative
+        per-call ledger (plus ``late_calls_dropped`` for observability).
+        """
+        with self._lock:
+            self._frozen = True
 
     def turn_cost_usd(self) -> Optional[float]:
         """Estimated $ to produce this turn, whoever paid — the

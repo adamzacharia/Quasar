@@ -261,3 +261,89 @@ def test_search_diagnostics_use_final_min_score_filtered_docs(monkeypatch):
     assert [doc.metadata["doc_year"] for doc in docs] == [2024]
     assert diagnostics["year_conflict"] is None
     assert "_year_conflict" not in docs[0].metadata
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R4 — citation weighting + query-conditional intent multipliers
+# ─────────────────────────────────────────────────────────────────────────────
+def _cdoc(citations=_MISSING, *, year=_MISSING, score=0.9, text="ALMA documentation chunk"):
+    metadata = {"_semantic_score": score}
+    if citations is not _MISSING:
+        metadata["doc_citations"] = citations
+    if year is not _MISSING:
+        metadata["doc_year"] = year
+    return Document(page_content=text, metadata=metadata)
+
+
+def test_build_citation_rank_orders_and_missing_last():
+    docs = [_cdoc(10), _cdoc(500), _cdoc(), _cdoc(500)]
+    ranks = rag_service._build_citation_rank(docs)
+    assert ranks[1] == 0 and ranks[3] == 0        # most-cited first, ties share rank
+    assert ranks[0] == 1
+    assert ranks[2] == 2                           # missing last
+
+
+def test_build_citation_rank_all_missing_is_flat():
+    ranks = rag_service._build_citation_rank([_cdoc(), _cdoc()])
+    assert ranks == {0: 0, 1: 0}
+
+
+def test_build_citation_rank_ignores_garbage_values():
+    ranks = rag_service._build_citation_rank([_cdoc("not-a-number"), _cdoc(3)])
+    assert ranks[1] == 0 and ranks[0] == 1
+
+
+def test_ranking_intent_multipliers():
+    assert rag_service._ranking_intent_multipliers("plain question") == (1.0, 1.0)
+    rec, cit = rag_service._ranking_intent_multipliers("latest ALMA results")
+    assert rec > 1.0 and cit == 1.0
+    rec, cit = rag_service._ranking_intent_multipliers("seminal highly cited work")
+    assert rec == 1.0 and cit > 1.0
+
+
+def test_hybrid_rerank_citations_break_near_semantic_tie():
+    low_cited = _cdoc(5, score=0.9000)
+    high_cited = _cdoc(4000, score=0.8999)
+    ranked = RAGService._hybrid_rerank("query", [low_cited, high_cited], k=2)
+    assert ranked[0].metadata["doc_citations"] == 4000
+
+
+def test_hybrid_rerank_citations_cannot_override_clear_relevance_gap():
+    strong = _cdoc(0, score=0.95)
+    weak_but_famous = _cdoc(99999, score=0.60)
+    ranked = RAGService._hybrid_rerank("query", [strong, weak_but_famous], k=2)
+    assert ranked[0].metadata["_semantic_score"] == 0.95
+
+
+def test_hybrid_rerank_intent_boost_stays_bounded():
+    # Even with both intents triggered, a real relevance gap must survive.
+    strong = _cdoc(0, year=2010, score=0.95)
+    weak = _cdoc(88888, year=2026, score=0.60)
+    ranked = RAGService._hybrid_rerank(
+        "latest seminal highly cited results", [strong, weak], k=2)
+    assert ranked[0].metadata["_semantic_score"] == 0.95
+
+
+def test_hybrid_rerank_defaults_unchanged_without_citation_metadata():
+    # Old recency behavior is preserved when no chunk carries doc_citations.
+    older = _doc(2018, score=0.9000)
+    newer = _doc(2025, score=0.8999)
+    ranked = RAGService._hybrid_rerank("query", [older, newer], k=2)
+    assert ranked[0].metadata["doc_year"] == 2025
+
+
+def test_extract_doi_from_content():
+    pages = ["Title page", "See https://doi.org/10.3847/1538-4357/abc123 for details."]
+    assert rag_service._extract_doi_from_content(pages) == "10.3847/1538-4357/abc123"
+    assert rag_service._extract_doi_from_content(["no doi here"]) is None
+    # Trailing punctuation is stripped.
+    assert rag_service._extract_doi_from_content(["(doi: 10.1051/0004-6361/12345)."]) == \
+        "10.1051/0004-6361/12345"
+
+
+def test_extract_document_metadata_includes_doi(tmp_path):
+    f = tmp_path / "paper_2024.txt"
+    f.write_text("some text")
+    meta = rag_service.extract_document_metadata(
+        str(f), pages_text=["doi:10.3847/1538-4357/xyz789 abstract"])
+    assert meta["doc_doi"] == "10.3847/1538-4357/xyz789"

@@ -1117,3 +1117,194 @@ def test_result_store_sweeps_expired_on_put(tmp_path):
     store._memory[stale]["created_at"] = time.time() - 7200
     fresh = store.put(pd.DataFrame({"x": [2.0]}), {})
     assert stale not in store._memory and fresh in store._memory
+
+
+def test_result_store_ttl_zero_still_persists_to_disk(tmp_path):
+    """ttl0-diskcache-immediate-expiry: TTL<=0 means 'no expiry' in memory, but
+    DiskCache treats expire=0 as 'already expired' — put() must translate it to
+    expire=None or every disk copy is dead on arrival (results then vanish
+    across workers/restarts in exactly the config that promises permanence)."""
+    from services.datalab_result_store import DatalabResultStore
+
+    pytest.importorskip("diskcache")
+    first = DatalabResultStore(cache_dir=tmp_path / "dl-ttl0", ttl_seconds=0)
+    rid = first.put(pd.DataFrame({"x": [1.0]}), {"catalog": "gaia_dr3"})
+    # A second store over the same cache dir stands in for another worker /
+    # a post-restart process: the id must resolve from disk.
+    second = DatalabResultStore(cache_dir=tmp_path / "dl-ttl0", ttl_seconds=0)
+    frame, _meta, status = second.lookup(rid)
+    assert status == "ok" and int(len(frame)) == 1
+
+
+# ── Scan-campaign regressions (2026-07-17) ────────────────────────────────────
+def test_nan_guard_skips_compound_arithmetic_cuts():
+    """dl-nan-guard-corrupts-arithmetic-cuts: 'a - b > x' must NOT be rewritten
+    into 'a - (b > x AND b < Infinity)' (numeric minus boolean — Postgres
+    rejects it), so every expert color/difference cut 400'd. The guard skips
+    comparisons that are operands of surrounding arithmetic and falls back to
+    the advisory warning."""
+    from services import datalab_sql_policy as P
+
+    sql = (
+        "SELECT ra, dec FROM des_dr1.main "
+        "WHERE q3c_radial_query(ra, dec, 34.0, -5.0, 0.5) "
+        "AND mag_auto_g - mag_auto_r > 0.5 LIMIT 100"
+    )
+    out = P.validate(sql, source="expert")
+    assert "mag_auto_g - mag_auto_r > 0.5" in out.sql
+    assert "mag_auto_g - (" not in out.sql
+    # The advisory NaN warning still fires for the skipped column.
+    assert any("NaN-unsafe" in w for w in out.warnings)
+
+    # Standalone cuts in the SAME query still get the auto-guard.
+    sql2 = (
+        "SELECT source_id FROM gaia_dr3.gaia_source "
+        "WHERE q3c_radial_query(ra, dec, 60, -50, 1.0) "
+        "AND bp_rp - phot_g_mean_mag > 0.2 AND pmra > 150 LIMIT 50"
+    )
+    out2 = P.validate(sql2, source="expert")
+    assert "(pmra > 150 AND pmra < 'Infinity'::float8)" in out2.sql
+    assert "bp_rp - phot_g_mean_mag > 0.2" in out2.sql
+    assert "- (phot_g_mean_mag" not in out2.sql
+
+    # Arithmetic on the RIGHT of the literal is skipped too ('a > 0.5 - b'
+    # would otherwise become '(a > 0.5 AND ...) - b').
+    sql3 = (
+        "SELECT source_id FROM gaia_dr3.gaia_source "
+        "WHERE q3c_radial_query(ra, dec, 60, -50, 1.0) "
+        "AND parallax_over_error > 5 - ruwe LIMIT 50"
+    )
+    out3 = P.validate(sql3, source="expert")
+    assert "parallax_over_error > 5 - ruwe" in out3.sql
+    assert "::float8" not in out3.sql
+
+
+def test_ccd_split_ext_coadd_is_categorical():
+    """delve-ccd-split-misclass: delve_dr3 ext_coadd is CATEGORICAL (-9 no
+    data, 0 hi-conf star, 1 candidate star, 2 candidate galaxy, 3 hi-conf
+    galaxy). The spread_model-style 0.005 threshold filed candidate stars under
+    'galaxies' and no-data rows under 'stars'."""
+    from services import datalab_orchestration as orch
+
+    s = pd.Series([-9, 0, 1, 2, 3, 0], dtype=float)
+    finite = pd.Series([True] * 6)
+    groups, note = orch._split_groups("ext_coadd", s, finite, 0.005)
+    (label_s, stars), (label_g, gals) = groups
+    assert label_s == "stars" and int(stars.sum()) == 3       # ext_coadd 0, 1, 0
+    assert label_g == "galaxies" and int(gals.sum()) == 2     # ext_coadd 2, 3
+    # -9 (no data) is excluded from BOTH panels and reported.
+    assert not bool(stars.iloc[0]) and not bool(gals.iloc[0])
+    assert note is not None and "no-data" in note
+
+    # spread_model-style continuous columns keep the threshold split.
+    sm = pd.Series([0.001, 0.02, -0.001])
+    groups2, note2 = orch._split_groups("spread_model_r", sm, pd.Series([True] * 3), 0.005)
+    assert int(groups2[0][1].sum()) == 2 and int(groups2[1][1].sum()) == 1
+    assert note2 is None
+    # The registry's own point-source convention agrees: stars are IN (0, 1).
+    from services import datalab_registry as reg
+    cut = reg.point_source_cut("delve_dr3", "coadd_objects")
+    assert cut == {"column": "ext_coadd", "between": [0, 1]}
+
+
+class _FakeCappedClient:
+    """Returns exactly `rows` grid cells for every tile query (row-cap repro)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = 0
+
+    def query(self, *, sql=None, adql=None, fmt="pandas", **kwargs):
+        self.calls += 1
+        rows = [
+            {"ra_bin": 10.0 + i * 0.01, "dec_bin": 0.0, "source_count": 500 - i}
+            for i in range(self.rows)
+        ]
+        return DatalabResult.from_dataframe(
+            pd.DataFrame(rows), {"catalog": "x", "table": "y", "query": sql}
+        )
+
+
+def test_tiled_density_aggregate_stamps_per_tile_truncation():
+    """dl-tiled-agg-silent-cell-drop / tiled-agg-silent-cell-truncation: a tile
+    that filled its ORDER BY source_count DESC LIMIT silently dropped its
+    sparsest cells; the merged map must carry limit_truncated provenance +
+    a warning so the plot layer stamps the figure."""
+    from services import datalab_orchestration as orch
+    from services.datalab_analysis import _truncation_warnings
+    from services.datalab_result_store import DatalabResultStore
+
+    store = DatalabResultStore(enable_disk_cache=False)
+    out = orch.tiled_density_aggregate(
+        "nsc_dr2", "object", mode="grid", step_deg=0.1, ra=10.0, dec=0.0,
+        radius_deg=1.0, limit=25, client=_FakeCappedClient(25),
+        result_store=store, owner_id="alice",
+    )
+    assert out["success"] is True
+    assert any("row cap" in w for w in out["warnings"])
+    frame, meta, status = store.lookup(out["result_id"])
+    assert status == "ok"
+    prov = meta["provenance"]
+    assert prov["limit_truncated"] is True and prov["row_limit"] == 25
+    assert prov["tiles_truncated"] >= 1
+    # The analysis layer's stamp logic picks it up (sky map gets the caption).
+    assert _truncation_warnings(prov)
+    # Owner rides along for the export route's guard (dl-export-owner-gap).
+    assert meta["owner_id"] == "alice"
+
+    # Control: tiles below the cap carry no truncation stamp.
+    out2 = orch.tiled_density_aggregate(
+        "nsc_dr2", "object", mode="grid", step_deg=0.1, ra=10.0, dec=0.0,
+        radius_deg=1.0, limit=25, client=_FakeCappedClient(10), result_store=store,
+    )
+    _f2, meta2, _s2 = store.lookup(out2["result_id"])
+    assert "limit_truncated" not in meta2["provenance"]
+    assert not any("row cap" in w for w in out2["warnings"])
+
+
+def test_tiled_sky_scan_disables_async_fallback_and_respects_budget():
+    """dl-tiled-scan-no-budget-async-fallback-storm: per-tile queries must run
+    with async_fallback=False (no orphan server jobs) and the scan must stop at
+    a wall-clock budget instead of retrying for hours."""
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+
+    seen = []
+
+    class _Client(_FakeTiledClient):
+        def query(self, *, sql=None, adql=None, fmt="pandas", **kwargs):
+            seen.append(kwargs.get("async_fallback"))
+            return super().query(sql=sql, adql=adql, fmt=fmt, **kwargs)
+
+    fp = {"ra_min": 149.0, "ra_max": 150.0, "dec_min": 1.0, "dec_max": 2.0}
+    out = orch.tiled_sky_scan(
+        "nsc_dr2", "object", fp, tile_radius_deg=1.0, step_deg=0.2,
+        client=_Client(), result_store=DatalabResultStore(enable_disk_cache=False),
+        analysis=_FakeAnalysis(), max_tiles=64, confirm=True,
+    )
+    assert out["success"] is True and out["budget_stop"] is False
+    assert seen and all(v is False for v in seen)
+
+    # An exhausted budget stops the scan and says so (unscanned != empty).
+    out2 = orch.tiled_sky_scan(
+        "nsc_dr2", "object", fp, tile_radius_deg=1.0, step_deg=0.2,
+        client=_FakeTiledClient(), result_store=DatalabResultStore(enable_disk_cache=False),
+        analysis=_FakeAnalysis(), max_tiles=64, confirm=True, max_seconds=-1.0,
+    )
+    assert out2["budget_stop"] is True and out2["tiles_scanned"] == 0
+    assert any("budget" in n for n in out2["notes"])
+
+
+def test_tile_footprint_and_area_wrap_through_ra_zero():
+    """ra-wrap-rect-footprint-unsupported: a footprint with ra_min > ra_max
+    wraps through RA=0/360 — tiles cover the 4° wrapped span (emitted mod 360)
+    and the area is the wrapped span, not the 356° complement."""
+    from services import datalab_orchestration as orch
+
+    fp = {"ra_min": 358.0, "ra_max": 2.0, "dec_min": -1.0, "dec_max": 1.0}
+    tiles = orch.tile_footprint(fp, 1.0)
+    assert tiles
+    assert all(0.0 <= ra < 360.0 for ra, _dec in tiles)
+    assert any(ra >= 358.0 for ra, _dec in tiles)
+    area = orch.footprint_area_deg2(fp)
+    assert 7.0 < area < 8.1  # 4 x 2 deg at low dec

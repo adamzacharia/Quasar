@@ -36,6 +36,14 @@ export interface ChatRunMeta {
     conversation_id: string;
     inactivity_timeout_seconds?: number;
     turn_timeout_seconds?: number;
+    /** Stable id of this turn's text block (Feature 4). The assistant message
+     *  is created before any SSE arrives, so run_meta is where it learns its
+     *  identity. Also persisted in rich_meta.runMeta, so replay agrees. */
+    text_block_id?: string;
+    /** Set when the turn ended in an infrastructure error — such turns are
+     *  exempt from the eval-mode rating gate. */
+    status?: string;
+    errorCode?: string;
 }
 
 /** The exact request one tool call made. `text` is the copyable literal for
@@ -71,10 +79,12 @@ export interface StreamCallbacks {
     onToolCall?: (toolName: string, input: string, request?: ToolRequest) => void;
     onToolTrace?: (calls: ToolTraceCall[]) => void;
     onData?: (data: Record<string, unknown>) => void;
-    onPapers?: (papers: Record<string, unknown>[], request?: ToolRequest) => void;
+    /** `blockId` is the card's stable identity (Feature 4) — the store uses it
+     *  as the message id so a reload rehydrates the same rating. */
+    onPapers?: (papers: Record<string, unknown>[], request?: ToolRequest, blockId?: string) => void;
     onNotebook?: (notebook: Record<string, unknown>) => void;
-    onImage?: (image: { url: string; caption: string; meta?: unknown; request?: ToolRequest }) => void;
-    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string; meta?: Record<string, unknown>; request?: ToolRequest }) => void;
+    onImage?: (image: { url: string; caption: string; meta?: unknown; request?: ToolRequest; blockId?: string }) => void;
+    onPlotly?: (plot: { spec?: { data?: unknown[]; layout?: Record<string, unknown> } | null; title?: string; png_fallback?: string; meta?: Record<string, unknown>; request?: ToolRequest; blockId?: string }) => void;
     onStatus?: (step: string, state: string) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
@@ -113,6 +123,10 @@ export interface StreamCallbacks {
     }) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null; eta_seconds?: number | null; phase?: string }) => void;
     onComplete: (fullResponse: string) => void;
+    /** UI-03: the stream ended WITHOUT [DONE] or an error event (backend
+     *  crash, proxy cut). The partial text is passed so the caller can keep
+     *  it but must mark the turn degraded, never render it as complete. */
+    onIncomplete?: (partialResponse: string) => void;
     onError: (error: string, status?: number) => void;
 }
 
@@ -307,7 +321,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                         } else if (parsed.type === "data" && callbacks.onData) {
                             callbacks.onData(parsed);
                         } else if (parsed.type === "papers" && callbacks.onPapers) {
-                            callbacks.onPapers(parsed.papers, parsed.request || undefined);
+                            callbacks.onPapers(parsed.papers, parsed.request || undefined, parsed.blockId || undefined);
                         } else if (parsed.type === "notebook" && callbacks.onNotebook) {
                             callbacks.onNotebook(parsed);
                         } else if (parsed.type === "image" && callbacks.onImage) {
@@ -356,7 +370,16 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             }
             return;
         }
-        callbacks.onComplete(fullText);
+        // UI-03: reaching here means the reader drained WITHOUT [DONE] or an
+        // explicit error event — the [DONE] sentinel exists precisely to
+        // distinguish clean termination, so its absence is a truncated stream
+        // (backend crash, proxy timeout), never a completion. Historical
+        // pattern: "truncated data masquerading as complete".
+        if (callbacks.onIncomplete) {
+            callbacks.onIncomplete(fullText);
+        } else {
+            callbacks.onError("The response stream ended unexpectedly — the answer may be incomplete.");
+        }
     } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return; // user cancelled
         callbacks.onError(error instanceof Error ? error.message : "Request failed.");
@@ -368,6 +391,7 @@ export async function submitPlanFeedback(
     approve: boolean,
     feedback: string = "",
     token?: string,
+    runId?: string,
 ): Promise<{ status: string; action: string }> {
     const headers: Record<string, string> = { "Content-Type": "application/json", ...bearerOnlyHeaders(token) };
 
@@ -378,6 +402,9 @@ export async function submitPlanFeedback(
             conversation_id: conversationId,
             approve,
             feedback,
+            // UIAPI-08: address THIS run's queue — two concurrent runs in one
+            // conversation each have their own registration server-side.
+            run_id: runId || "",
         }),
     });
 
@@ -1128,6 +1155,59 @@ export async function fetchConversationMessages(conversationId: string, token?: 
     }
 }
 
+/** This user's block ratings for one conversation (Feature 4) — used to
+ *  re-light the stars after a reload. */
+export async function fetchBlockRatings(conversationId: string, token?: string): Promise<Record<string, number>> {
+    try {
+        const res = await fetch(
+            `${API_BASE}/api/block-feedback?conversation_id=${encodeURIComponent(conversationId)}`,
+            { credentials: "include", headers: authHeaders(token) },
+        );
+        if (!res.ok) return {};
+        const data = await res.json();
+        const out: Record<string, number> = {};
+        for (const [blockId, row] of Object.entries(data.ratings || {})) {
+            const rating = (row as { rating?: number })?.rating;
+            if (typeof rating === "number") out[blockId] = rating;
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+/** Persist a 1-5 star rating on one block. Returns false on failure so the
+ *  caller can roll the optimistic star back instead of showing a lie. */
+export async function submitBlockRating(payload: {
+    blockId: string;
+    rating: number;
+    blockKind?: string;
+    runId?: string;
+    conversationId?: string;
+    model?: string;
+    comment?: string;
+}, token?: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${API_BASE}/api/block-feedback`, {
+            method: "POST",
+            credentials: "include",
+            headers: authHeaders(token),
+            body: JSON.stringify({
+                block_id: payload.blockId,
+                rating: payload.rating,
+                block_kind: payload.blockKind || "",
+                run_id: payload.runId || "",
+                conversation_id: payload.conversationId || "",
+                model: payload.model || "",
+                comment: payload.comment || "",
+            }),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
 export async function deleteConversationApi(conversationId: string, token?: string): Promise<boolean> {
     // Retry up to 3 times — Render cold starts can cause transient failures
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1204,4 +1284,22 @@ export async function deleteMyTable(name: string): Promise<boolean> {
         headers: bearerOnlyHeaders(),
     });
     return res.ok;
+}
+
+/* ────────────────────────────────────────────
+   FULL-RESULT EXPORT (Feature 2)
+   ──────────────────────────────────────────── */
+
+/** Stream the COMPLETE stored result as CSV (f2-CX-09).
+ *
+ *  Returns the raw Response rather than a parsed blob: the caller must read
+ *  the status AND the X-Quasar-Truncated / X-Quasar-Rowcount /
+ *  X-Quasar-Total-Rows headers (lib/export-decision.js::interpretExportResponse)
+ *  so an expired result fails loudly and a ceiling-clipped export can never be
+ *  delivered silently as full. */
+export async function exportResultCsv(resultId: string, token?: string | null): Promise<Response> {
+    return fetch(`${API_BASE}/api/results/${encodeURIComponent(resultId)}/export.csv`, {
+        credentials: "include",
+        headers: bearerOnlyHeaders(token),
+    });
 }

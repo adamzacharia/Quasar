@@ -702,6 +702,19 @@ _MAG_TEMPLATES = {
     "twomass.psc": "{band}_m",             # band = j|h|k (k = Ks)
     "allwise.source": "{band}mpro",        # band = w1..w4 (Vega)
     "splus_dr4.dual": "{band}_auto",       # band = u|g|r|i|z|j0378..j0861 (AB)
+    # VISTA/VSA aperture mags — without this the '{band}mag' fallback emitted
+    # nonexistent jmag/hmag/kmag and every VHS CMD/CCD 400'd at the server
+    # (vhs-mag-template-missing). Ks is spelled 'ks' (japermag3/hapermag3/
+    # ksapermag3); the common 'k' spelling is aliased below.
+    "vhs_dr5.vhs_cat_v3": "{band}apermag3",
+}
+
+
+# Band-token aliases applied AFTER the valid-band check, so surveys whose
+# column spelling differs from the conventional band letter still resolve
+# (vhs-mag-template-missing: VHS band k -> ks -> ksapermag3).
+_MAG_BAND_ALIASES = {
+    "vhs_dr5.vhs_cat_v3": {"k": "ks"},
 }
 
 
@@ -713,6 +726,9 @@ _MAG_TEMPLATE_BANDS = {
     "unwise_dr1.object": {"w1", "w2"},
     "twomass.psc": {"j", "h", "k"},
     "allwise.source": {"w1", "w2", "w3", "w4"},
+    # vhs-mag-template-missing: near-IR only — a default g/r request must fail
+    # locally instead of burning a server round.
+    "vhs_dr5.vhs_cat_v3": {"j", "h", "k", "ks"},
 }
 
 
@@ -727,6 +743,7 @@ def mag_column(catalog: str, table: str, band: str) -> str:
             f"{qualified} has no {band_key!r} band; valid bands: {'|'.join(sorted(allowed))}. "
             "For derived axes (e.g. absolute magnitude) pass x_expr/y_expr instead."
         )
+    band_key = _MAG_BAND_ALIASES.get(qualified, {}).get(band_key, band_key)
     template = _MAG_TEMPLATES.get(qualified, "{band}mag")
     return template.format(band=band_key)
 

@@ -111,6 +111,34 @@ def test_constant_only_expression_rejected():
         _eval_expression(frame, "5 + 3")
 
 
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "dec + 9**9**9**9",       # chained constant Pow (right-assoc bigint bomb)
+        "g + 10**10**10",         # the dossier's literal repro
+        "g + 2**1000",            # single huge constant exponent
+        "g + ((9**64)**64)**64",  # exponent-capped but base-nested explosion
+    ],
+)
+def test_constant_pow_bomb_rejected_before_compile(expr):
+    """expr-const-pow-dos / dl-expr-pow-bigint-dos: constant ** chains must be
+    rejected during AST validation — compile()'s constant folding would
+    otherwise build an astronomically large exact integer and hang the worker."""
+    frame = pd.DataFrame({"g": [1.0], "dec": [2.0]})
+    with pytest.raises(ValueError, match="[Uu]nsafe|exponent"):
+        _eval_expression(frame, expr)
+
+
+def test_reasonable_pow_still_allowed():
+    frame = pd.DataFrame({"g": [2.0, 3.0], "flux": [100.0, 1000.0]})
+    assert np.allclose(_eval_expression(frame, "g**2"), [4.0, 9.0])
+    assert np.allclose(_eval_expression(frame, "g + 10**2"), [102.0, 103.0])
+    # Data-driven exponents evaluate in numpy floats — no bigint path.
+    assert np.allclose(_eval_expression(frame, "2**g"), [4.0, 8.0])
+    # Scientific-notation-style constants stay usable (10**38 is finite).
+    assert np.isfinite(_eval_expression(frame, "flux / 10**8")).all()
+
+
 @pytest.mark.parametrize("expr", ["minimum(g)", "arctan2(g)", "log10()"])
 def test_wrong_function_arity_raises_valueerror_with_grammar_note(expr):
     # Arity errors surface as numpy TypeErrors inside eval; they must come back

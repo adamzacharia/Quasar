@@ -51,18 +51,30 @@ def _default_image_service():
     return DatalabImageService()
 
 
-def _run_builder_sql(sql: str, meta: Mapping[str, Any], *, client, result_store):
+def _run_builder_sql(
+    sql: str,
+    meta: Mapping[str, Any],
+    *,
+    client,
+    result_store,
+    owner_id: Optional[str] = None,
+    async_fallback: bool = True,
+):
     """Validate builder SQL through the governor, run it, and store the frame -> result_id."""
     from services import datalab_registry as registry
     registry.ensure_tap_schema_fresh(client)
     validated = policy.validate(sql, source="builder", meta=meta)
-    result = client.query(sql=validated.sql, fmt="pandas")
+    result = client.query(sql=validated.sql, fmt="pandas", async_fallback=async_fallback)
     trunc_warning = policy.limit_truncation_warning(
         len(result.dataframe), (validated.meta or {}).get("row_limit")
     )
     store_meta = {
         **dict(meta or {}),
         "validated_sql": validated.sql,
+        # Scope the stored result to its requesting user when known, so the
+        # export route's owner guard is not vacuously skipped for results
+        # minted here (dl-export-owner-gap / UIAPI-05).
+        **({"owner_id": str(owner_id)} if owner_id else {}),
         "provenance": {
             **(getattr(result, "provenance", {}) or {}),
             "validated_sql": validated.sql,
@@ -83,28 +95,40 @@ def _cosd(dec_deg: float) -> float:
     return max(math.cos(math.radians(float(dec_deg))), 0.02)
 
 
+def _ra_span_deg(ra_min: float, ra_max: float) -> float:
+    """RA extent in degrees; ra_min > ra_max means the box wraps through 0/360
+    (ra-wrap-rect-footprint-unsupported)."""
+    span = float(ra_max) - float(ra_min)
+    return span if span >= 0 else span + 360.0
+
+
 def footprint_area_deg2(footprint: Mapping[str, float]) -> float:
     """Proper rectangular sky area in deg² (accounts for cos(dec) convergence)."""
-    dra = math.radians(float(footprint["ra_max"]) - float(footprint["ra_min"]))
+    dra = math.radians(_ra_span_deg(float(footprint["ra_min"]), float(footprint["ra_max"])))
     dsin = math.sin(math.radians(float(footprint["dec_max"]))) - math.sin(math.radians(float(footprint["dec_min"])))
     steradians = abs(dra * dsin)
     return steradians * (180.0 / math.pi) ** 2
 
 
 def tile_footprint(footprint: Mapping[str, float], tile_radius_deg: float) -> List[tuple]:
-    """Cover a rectangular footprint with cone-tile centers; RA spacing widens by 1/cos(dec)."""
+    """Cover a rectangular footprint with cone-tile centers; RA spacing widens by 1/cos(dec).
+
+    ra_min > ra_max is a footprint wrapping through RA=0/360 (e.g. 358°→2°):
+    tiles walk the wrapped span and centers are emitted mod 360
+    (ra-wrap-rect-footprint-unsupported)."""
     ra_min, ra_max = float(footprint["ra_min"]), float(footprint["ra_max"])
     dec_min, dec_max = float(footprint["dec_min"]), float(footprint["dec_max"])
-    if ra_min > ra_max or dec_min > dec_max:
-        raise ValueError("footprint must satisfy ra_min<=ra_max and dec_min<=dec_max")
+    if dec_min > dec_max:
+        raise ValueError("footprint must satisfy dec_min<=dec_max")
+    ra_end = ra_min + _ra_span_deg(ra_min, ra_max)
     step = max(1e-3, float(tile_radius_deg))
     tiles: List[tuple] = []
     dec = dec_min
     while dec <= dec_max + 1e-9:
         ra_step = step / _cosd(dec)
         ra = ra_min
-        while ra <= ra_max + 1e-9:
-            tiles.append((round(ra, 6), round(dec, 6)))
+        while ra <= ra_end + 1e-9:
+            tiles.append((round(ra % 360.0, 6), round(dec, 6)))
             ra += ra_step
         dec += step
     return tiles
@@ -231,10 +255,12 @@ def tiled_sky_scan(
     max_tiles: int = MAX_TILES,
     candidate_budget: int = DEFAULT_CANDIDATE_BUDGET,
     confirm: bool = False,
+    max_seconds: Optional[float] = None,
     client: Any = None,
     result_store: Any = None,
     analysis: Any = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    owner_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """P15: tile a footprint, run a server-side density aggregate per q3c cone tile, find
     matched-filter peaks, accumulate and rank. Gates wide scans behind confirm=True."""
@@ -260,18 +286,32 @@ def tiled_sky_scan(
     from services import datalab_registry as registry
     merged_cuts, quality_note = registry.merge_default_quality_cuts(catalog, table, list(value_cuts or []))
     predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=merged_cuts, morphology=morphology)
+    # Wall-clock budget + no per-tile async fallback: with the fallback ON, a
+    # crowded field turned a 64-tile scan into an hours-long retry storm — each
+    # slow tile burned the sync window AND (with a real token) spawned+polled an
+    # orphan server-side job (dl-tiled-scan-no-budget-async-fallback-storm).
+    if max_seconds is None:
+        max_seconds = float(os.getenv("DATALAB_TILED_SCAN_MAX_SECONDS", "210"))
+    started = time.monotonic()
+    budget_stop = False
     candidates: List[Dict[str, Any]] = []
     tiles_scanned = 0
     tile_errors = 0
     for idx, (ra, dec) in enumerate(tiles):
         if cancel_check and cancel_check():
             break
+        if time.monotonic() - started > max_seconds:
+            budget_stop = True
+            break
         try:
             sql, meta = builders.build_density_aggregate(
                 catalog, table, mode="grid", step_deg=step_deg,
                 ra=ra, dec=dec, radius_deg=tile_radius_deg, predicates=predicates,
             )
-            _rid, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
+            _rid, result = _run_builder_sql(
+                sql, meta, client=client, result_store=result_store,
+                owner_id=owner_id, async_fallback=False,
+            )
         except Exception:  # noqa: BLE001 - one bad tile must not kill the scan
             tile_errors += 1
             continue
@@ -317,6 +357,12 @@ def tiled_sky_scan(
         )
     if tile_errors:
         notes.append(f"{tile_errors} tile queries failed and were skipped.")
+    if budget_stop:
+        notes.append(
+            f"Stopped at the {max_seconds:.0f}s scan budget: {tiles_scanned} of "
+            f"{len(tiles)} tiles were scanned — the remaining footprint is UNSCANNED, "
+            "not empty. Narrow the footprint or enlarge the tiles and re-run."
+        )
     return {
         "success": True,
         "catalog": catalog,
@@ -325,6 +371,7 @@ def tiled_sky_scan(
         "tiles_total": total_tiles,
         "tiles_scanned": tiles_scanned,
         "dropped_tiles": dropped_tiles,
+        "budget_stop": budget_stop,
         "candidates_found": len(candidates),
         "candidate_budget": int(candidate_budget),
         "candidates": ranked,
@@ -349,6 +396,7 @@ def density_then_cutouts(
     client: Any = None,
     result_store: Any = None,
     image_service: Any = None,
+    owner_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """P12: densest stellar cells within a cone -> SIA cutout grid of the top-N cells."""
     client = client or _default_client()
@@ -364,7 +412,9 @@ def density_then_cutouts(
         ra=ra, dec=dec, radius_deg=radius_deg, predicates=predicates,
         limit=max(top_n * 4, 50),
     )
-    result_id, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
+    result_id, result = _run_builder_sql(
+        sql, meta, client=client, result_store=result_store, owner_id=owner_id
+    )
     df = result.dataframe
     # The aggregate is ORDER BY source_count DESC. Greedily skip cells adjacent
     # to an already-accepted peak (2 of live P12's 5 "candidates" were neighbor
@@ -446,6 +496,7 @@ def tiled_density_aggregate(
     max_seconds: Optional[float] = None,
     client: Any = None,
     result_store: Any = None,
+    owner_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """P8 fallback: a wide density aggregate that beats the Data Lab 60s sync window
     by tiling the parent cone into overlapping sub-cones, each ALSO bounded by the
@@ -488,7 +539,16 @@ def tiled_density_aggregate(
         tile_r *= 1.5
         centers = _tile_cone_centers(radius_deg, tile_r, cell_margin)
 
+    # Per-tile LIMIT truncation: each tile is ORDER BY source_count DESC, so a
+    # tile that filled its row cap silently dropped its SPARSEST cells and the
+    # merged map read them as "no data" with no stamp — the repo's row-capped-
+    # as-complete bug pattern (dl-tiled-agg-silent-cell-drop /
+    # tiled-agg-silent-cell-truncation). Track it and stamp the provenance.
+    tiles_truncated = 0
+    effective_limit: Optional[int] = None
+
     def _run_tile(dx: float, dy: float, r: float) -> Optional[Any]:
+        nonlocal tiles_truncated, effective_limit
         tdec = max(-89.5, min(89.5, float(dec) + dy))
         tra = (float(ra) + dx / _cosd(tdec)) % 360.0
         sql, meta = builders.build_density_aggregate(
@@ -496,7 +556,12 @@ def tiled_density_aggregate(
             ra=tra, dec=tdec, radius_deg=r, predicates=base_predicates, limit=limit,
         )
         validated = policy.validate(sql, source="builder", meta=meta)
-        return client.query(sql=validated.sql, fmt="pandas", async_fallback=False)
+        result = client.query(sql=validated.sql, fmt="pandas", async_fallback=False)
+        row_limit = (validated.meta or {}).get("row_limit")
+        if policy.limit_truncation_warning(len(result.dataframe), row_limit):
+            tiles_truncated += 1
+            effective_limit = int(row_limit)
+        return result
 
     frames: List[Any] = []
     tiles_run = 0
@@ -576,6 +641,17 @@ def tiled_density_aggregate(
         )
     if tile_errors:
         warnings.append(f"{tile_errors} tile queries failed and were skipped (partial coverage).")
+    if tiles_truncated:
+        # dl-tiled-agg-silent-cell-drop: a truncated map must never masquerade
+        # as complete — this warning + the limit_truncated provenance stamp
+        # below make datalab_sky_density_map render the TRUNCATED caption.
+        warnings.append(
+            f"{tiles_truncated} tile quer{'y' if tiles_truncated == 1 else 'ies'} hit the "
+            f"per-tile row cap (LIMIT {effective_limit}): the SPARSEST cells in those tiles "
+            "were dropped, so low-density regions of the merged map are INCOMPLETE — do not "
+            "read empty cells there as 'no data'. Re-run with a coarser step_deg (fewer "
+            "cells per tile) or a higher limit."
+        )
 
     hp_meta = None
     if mode_key == "healpix":
@@ -590,6 +666,8 @@ def tiled_density_aggregate(
         "table": info["table"],
         "tool_name": "datalab_density_aggregate",
         "warnings": warnings,
+        # dl-export-owner-gap: scope the stored result to its requester.
+        **({"owner_id": str(owner_id)} if owner_id else {}),
         "provenance": {
             "catalog": info["catalog"],
             "table": info["table"],
@@ -600,6 +678,17 @@ def tiled_density_aggregate(
             "tiles_failed": tile_errors,
             "tiles_subdivided": subdivided,
             "sync_timeout_fallback": True,
+            # dl-tiled-agg-silent-cell-drop: propagate the row-cap stamp so the
+            # plot layer's _truncation_warnings marks the rendered map.
+            **(
+                {
+                    "limit_truncated": True,
+                    "row_limit": effective_limit,
+                    "tiles_truncated": tiles_truncated,
+                }
+                if tiles_truncated
+                else {}
+            ),
             **({"healpix": hp_meta} if hp_meta else {}),
         },
     }
@@ -634,7 +723,7 @@ def tiled_density_aggregate(
 
 
 def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store,
-                       point_sources=False, morphology=None, extra_value_cuts=None):
+                       point_sources=False, morphology=None, extra_value_cuts=None, owner_id=None):
     """Cone-select the magnitude (+extra) columns for a diagram and return (result_id, df, magcols)."""
     from services import datalab_registry as reg
     magcols = {b: reg.mag_column(catalog, table, b) for b in bands}
@@ -663,7 +752,9 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     predicates = builders.build_catalog_predicates(catalog, table, value_cuts=value_cuts, morphology=morph_cut)
     sql, meta = builders.build_cone_select(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
                                            columns=cols, limit=limit, predicates=predicates)
-    result_id, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
+    result_id, result = _run_builder_sql(
+        sql, meta, client=client, result_store=result_store, owner_id=owner_id
+    )
     meta = dict(meta or {})
     meta["point_source_cut_applied"] = ps_applied
     meta["morphology"] = morph_cut
@@ -705,7 +796,8 @@ def _expr_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_expr, y_expr, invert_y, prefix, limit, title,
     point_sources=False, morphology=None, value_cuts=None,
-    client, result_store, plotting,
+    overlay_locus=None,
+    client, result_store, plotting, owner_id=None,
 ):
     """One-shot diagram with derived axes (e.g. a Gaia HR diagram:
     x = bp_rp, y = phot_g_mean_mag + 5*log10(parallax) - 10).
@@ -736,7 +828,9 @@ def _expr_diagram(
         catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
         columns=select_cols, limit=limit, predicates=predicates,
     )
-    rid, result = _run_builder_sql(sql, meta, client=client, result_store=result_store)
+    rid, result = _run_builder_sql(
+        sql, meta, client=client, result_store=result_store, owner_id=owner_id
+    )
     df = result.dataframe
     x = analysis._eval_expression(df, x_expr)
     y = analysis._eval_expression(df, y_expr)
@@ -752,6 +846,14 @@ def _expr_diagram(
     plt = plotting._apply_style(dark=False)
     fig, ax = plt.subplots(figsize=(5.0, 5.0))
     ax.scatter(x[finite], y[finite], s=6, alpha=0.4, edgecolors="none")
+    # WD-locus overlay + side-of-line counts (B3): the agent prompt rule steers
+    # models to pass overlay_locus='wd' on derived-axis HR diagrams and quote
+    # the returned n_wd_candidates. This path used to DROP the argument (only
+    # catalog_scatter honored it), so the model had nothing to quote and
+    # eyeballed the diagram (found live 2026-07-18).
+    _locus_info = None
+    if overlay_locus:
+        _locus_info = analysis._overlay_locus(ax, str(overlay_locus), x[finite], y[finite])
     ax.set_xlabel(x_expr)
     ax.set_ylabel(y_expr)
     if invert_y:
@@ -764,12 +866,15 @@ def _expr_diagram(
         [("selected", x[finite].tolist(), y[finite].tolist())],
         x_label=x_expr, y_label=y_expr, title=plot_title, invert_y=invert_y,
     )
+    _extra = {"rowcount": int(len(df)), "x": x_expr, "y": y_expr,
+              "points": int(finite.sum()), "morphology": morph_cut,
+              "warnings": warnings,
+              "plotly_spec": plotly_spec}
+    if _locus_info:
+        _extra.update(_locus_info)
     return _render_diagram(plotting, fig, prefix, rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
-                           {"rowcount": int(len(df)), "x": x_expr, "y": y_expr,
-                            "points": int(finite.sum()), "morphology": morph_cut,
-                            "warnings": warnings,
-                            "plotly_spec": plotly_spec})
+                           _extra)
 
 
 def _valid_mag_mask(*series):
@@ -842,13 +947,40 @@ def _render_diagram(plotting, fig, prefix, result_id, provenance, extra):
     return out
 
 
+def _split_groups(split_col, s, finite, split_threshold):
+    """Star/galaxy masks for a morphology split column -> (groups, note).
+
+    delve_dr3's ext_coadd is CATEGORICAL (-9 no data, 0 hi-conf star,
+    1 candidate star, 2 candidate galaxy, 3 hi-conf galaxy): the
+    spread_model-style |threshold| split filed candidate stars under
+    'galaxies' and no-data rows under 'stars'
+    (delve-ccd-split-misclass / dl-delve-ccd-split-misclassifies).
+    Categorical columns use set membership (stars IN (0,1), galaxies IN (2,3),
+    -9 excluded from both panels); the numeric threshold applies only to
+    spread_model-style continuous columns."""
+    if str(split_col).strip().lower() == "ext_coadd":
+        groups = [("stars", finite & s.isin([0, 1])), ("galaxies", finite & s.isin([2, 3]))]
+        n_no_data = int((finite & (s == -9)).sum())
+        note = (
+            f"ext_coadd split: stars = ext_coadd IN (0,1), galaxies = ext_coadd IN (2,3); "
+            f"{n_no_data} no-data (ext_coadd = -9) source(s) excluded from both panels."
+            if n_no_data
+            else None
+        )
+        return groups, note
+    return (
+        [("stars", finite & (s <= split_threshold)), ("galaxies", finite & (s > split_threshold))],
+        None,
+    )
+
+
 def color_color_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_bands=("g", "r"), y_bands=("r", "i"),
     split_col=None, split_threshold=0.005, limit=3000, title=None,
     point_sources=False, morphology=None, value_cuts=None,
     x_expr=None, y_expr=None,
-    client=None, result_store=None, plotting_service=None,
+    client=None, result_store=None, plotting_service=None, owner_id=None,
 ):
     """P5: one-shot color-color diagram. Queries the cone, optionally splits into stars/galaxies
     by a morphology column (auto-detected from the registry, e.g. DES spread_model_r), and renders
@@ -869,6 +1001,7 @@ def color_color_diagram(
             x_expr=str(x_expr), y_expr=str(y_expr), invert_y=False, prefix="datalab_ccd",
             limit=limit, title=title, point_sources=point_sources, morphology=morphology,
             value_cuts=value_cuts, client=client, result_store=result_store, plotting=plotting,
+            owner_id=owner_id,
         )
     # A morphology-selected sample is one population — don't auto-split it into stars/galaxies.
     if split_col is None and not point_sources and not morphology:
@@ -879,6 +1012,7 @@ def color_color_diagram(
         catalog, table, ra, dec, radius_deg, bands=bands,
         extra_cols=[split_col] if split_col else [], limit=limit, client=client, result_store=result_store,
         point_sources=point_sources, morphology=morphology, extra_value_cuts=value_cuts,
+        owner_id=owner_id,
     )
     df = result.dataframe
     _ps_applied = bool(_meta.get("point_source_cut_applied"))
@@ -892,9 +1026,10 @@ def color_color_diagram(
     plt = plotting._apply_style(dark=False)
     populations = []
     panels = []
+    split_note = None
     if split_col and split_col in df.columns:
         s = pd.to_numeric(df[split_col], errors="coerce")
-        groups = [("stars", finite & (s <= split_threshold)), ("galaxies", finite & (s > split_threshold))]
+        groups, split_note = _split_groups(split_col, s, finite, split_threshold)
         fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
         for ax, (label, mask) in zip(axes, groups):
             ax.scatter(x[mask], y[mask], s=6, alpha=0.4, edgecolors="none")
@@ -919,7 +1054,8 @@ def color_color_diagram(
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col,
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "populations": populations,
-                            "warnings": list(_meta.get("warnings") or []),
+                            "warnings": list(_meta.get("warnings") or [])
+                            + ([split_note] if split_note else []),
                             "excluded_invalid_mags": int(len(df) - int(finite.sum())),
                             "plotly_spec": plotly_spec})
 
@@ -928,8 +1064,8 @@ def color_magnitude_diagram(
     catalog, table, ra, dec, radius_deg, *,
     blue_band="g", red_band="r", mag_band=None, limit=5000, title=None,
     point_sources=False, morphology=None, value_cuts=None,
-    x_expr=None, y_expr=None,
-    client=None, result_store=None, plotting_service=None,
+    x_expr=None, y_expr=None, overlay_locus=None,
+    client=None, result_store=None, plotting_service=None, owner_id=None,
 ):
     """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted.
     Sentinel magnitudes are excluded server- and client-side; point_sources=True applies the
@@ -949,14 +1085,16 @@ def color_magnitude_diagram(
             catalog, table, ra, dec, radius_deg,
             x_expr=str(x_expr), y_expr=str(y_expr), invert_y=True, prefix="datalab_cmd",
             limit=limit, title=title, point_sources=point_sources, morphology=morphology,
-            value_cuts=value_cuts, client=client, result_store=result_store, plotting=plotting,
+            value_cuts=value_cuts, overlay_locus=overlay_locus,
+            client=client, result_store=result_store, plotting=plotting,
+            owner_id=owner_id,
         )
     mag_band = mag_band or blue_band
     bands = list(dict.fromkeys([blue_band, red_band, mag_band]))
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands, extra_cols=[], limit=limit,
         client=client, result_store=result_store, point_sources=point_sources,
-        morphology=morphology, extra_value_cuts=value_cuts,
+        morphology=morphology, extra_value_cuts=value_cuts, owner_id=owner_id,
     )
     df = result.dataframe
     valid = _valid_mag_mask(*[df[magcols[b]] for b in dict.fromkeys([blue_band, red_band, mag_band])])

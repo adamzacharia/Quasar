@@ -7,8 +7,10 @@ import { AladinSkyView, SURVEYS } from "./AladinSkyView";
 import { BlinkCard } from "./BlinkCard";
 import { ImageLightbox } from "./ImageLightbox";
 import { QueryProvenance } from "./QueryProvenance";
+import { IllustrativeBadge } from "./IllustrativeBadge";
 import type { HipsImageMeta } from "../lib/types";
 import { clampHipsFov, hips2fitsUrl, normalizeHipsSurveyId } from "../lib/hips-imagery";
+import { previewBadgeFacts } from "../lib/export-decision";
 
 type HipsImageCardProps = {
     imageUrl: string;
@@ -94,6 +96,10 @@ function cacheBusted(url: string) {
 
 export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: HipsImageCardProps) {
     const kind = imageMeta?.kind || "";
+    // Escalate the badge when meta marks the image preview-derived (f2-CX-11).
+    // No HiPS/SIA producer stamps these fields today (cutouts render sky pixels,
+    // not table rows) — this is the client half, live the moment one does.
+    const badgeFacts = previewBadgeFacts(imageMeta as Record<string, unknown> | undefined);
     const ra = Number(imageMeta?.ra);
     const dec = Number(imageMeta?.dec);
     const hasCoords = Number.isFinite(ra) && Number.isFinite(dec);
@@ -155,8 +161,8 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
     if (kind === "blink" && (imageMeta?.frames?.length ?? 0) >= 2) {
         return (
             <>
-                <BlinkCard frames={imageMeta!.frames!} caption={caption} summaryUrl={imageUrl} />
-                <div className="pl-11"><QueryProvenance request={request} /></div>
+                <BlinkCard frames={imageMeta!.frames!} caption={caption} summaryUrl={imageUrl} warnings={imageMeta?.warnings} />
+                <div className="pl-11"><IllustrativeBadge className="mt-2" {...badgeFacts} /><QueryProvenance request={request} /></div>
             </>
         );
     }
@@ -165,7 +171,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
         return (
             <>
                 <PlainImageCard imageUrl={imageUrl} caption={caption} fitsHref={fitsHref} />
-                <div className="pl-11"><QueryProvenance request={request} /></div>
+                <div className="pl-11"><IllustrativeBadge className="mt-2" {...badgeFacts} /><QueryProvenance request={request} /></div>
             </>
         );
     }
@@ -235,6 +241,11 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
                                         title="Zoom out"
                                         onClick={() => {
                                             const nextFov = clampHipsFov(fovDeg * 2);
+                                            // UI-05: at the FOV clamp bound the URL is
+                                            // unchanged, so the img fires no load/error
+                                            // event and the Loading... overlay would
+                                            // cover the card forever. No-op instead.
+                                            if (nextFov === fovDeg) return;
                                             setFovDeg(nextFov);
                                             applyClientImage(selectedSurvey, nextFov);
                                         }}
@@ -248,6 +259,8 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
                                         title="Zoom in"
                                         onClick={() => {
                                             const nextFov = clampHipsFov(fovDeg / 2);
+                                            // UI-05: same clamp-bound guard as zoom out.
+                                            if (nextFov === fovDeg) return;
                                             setFovDeg(nextFov);
                                             applyClientImage(selectedSurvey, nextFov);
                                         }}
@@ -271,6 +284,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
                         {fitsHref && <FitsDownloadLink href={fitsHref} />}
                         <FullSizeLink href={displayedUrl} />
                     </div>
+                    <IllustrativeBadge className="mt-2" {...badgeFacts} />
                     <QueryProvenance request={request} />
                 </div>
             </div>

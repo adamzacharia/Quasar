@@ -63,6 +63,7 @@ from capabilities.base import BaseCapability, CallContext, ToolResult
 from services.alma_science_queries import (
     LINE_REST_FREQ_GHZ,
     bandwidth_switching_candidates,
+    collect_publications,
     filter_band as science_filter_band,
     filter_resolution as science_filter_resolution,
     line_names_for_species,
@@ -70,9 +71,14 @@ from services.alma_science_queries import (
     projects_covering_all_lines,
     projects_with_array_combo,
     project_prefix_where,
+    publication_join_where,
     redshifted_line_projects,
     select_obscore_query,
+    select_obscore_query_extended,
+    sensitivity_where,
     summarize_projects,
+    summarize_publication_links,
+    summarize_sensitivity,
 )
 from services.cross_archive_matcher import (
     alma_bulk_cone_adql,
@@ -129,9 +135,15 @@ def _tap_obscore_dataframe(
     *,
     max_results: int = 5000,
     order_by: str = "proposal_id",
+    extra_columns: Tuple[str, ...] = (),
     ctx: CallContext,
 ) -> pd.DataFrame:
-    query = select_obscore_query(where_clause, top=max_results, order_by=order_by)
+    if extra_columns:
+        query = select_obscore_query_extended(
+            where_clause, extra_columns=extra_columns, top=max_results, order_by=order_by
+        )
+    else:
+        query = select_obscore_query(where_clause, top=max_results, order_by=order_by)
     prov = ctx.service("alma_tap_provenance")
     prov["query"] = query
     prov["url"] = "https://almascience.nrao.edu/tap"
@@ -147,23 +159,28 @@ def _tap_obscore_dataframe(
 _ALMA_TAP_URL = "https://almascience.nrao.edu/tap"
 
 
-def _obscore_cone_adql(ra: float, dec: float, radius_deg: float) -> str:
-    """The obscore cone the ALMA client's TAP path executes for a positional/
-    target search (integrations/alminer_client.py `tap_search`).
+def _obscore_cone_adql(ra: float, dec: float, radius_deg: float, public: bool = True) -> str:
+    """The obscore cone equivalent to what the ALMA client executes for a
+    positional/target search (integrations/alminer_client.py).
 
-    This is byte-exact to the raw-TAP branch. The client also races
-    `alminer.conesearch`, whose internal ADQL is opaque (a third-party library);
-    this reproducible cone is the equivalent request, not a capture of alminer's
-    private query. Labeled that way for the user in the provenance surface.
+    The executed path is `alminer.conesearch(..., public=public)` (public
+    defaults True end-to-end, services/search.py). alminer's internal ADQL is
+    opaque third-party code, so this is the reproducible EQUIVALENT request,
+    including the public-data constraint the real call applies (CX-38) — a user
+    replaying it gets the same population, not proprietary rows the executed
+    call excluded.
     """
-    return (
+    adql = (
         "SELECT * FROM ivoa.obscore "
         f"WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
         f"CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1"
     )
+    if public:
+        adql += " AND data_rights = 'Public'"
+    return adql
 
 
-def _set_alma_cone_provenance(ctx: CallContext, ra, dec, radius_deg) -> None:
+def _set_alma_cone_provenance(ctx: CallContext, ra, dec, radius_deg, public: bool = True) -> None:
     """Write the executed obscore cone ADQL into the REQUEST-SCOPED provenance
     state (Feature 1). Built here from this request's own coordinates — no shared
     client state, so concurrent ALMA requests never cross-attribute. Never raises.
@@ -172,8 +189,16 @@ def _set_alma_cone_provenance(ctx: CallContext, ra, dec, radius_deg) -> None:
         if ra is None or dec is None or radius_deg is None:
             return
         prov = ctx.service("alma_tap_provenance")
-        prov["query"] = _obscore_cone_adql(float(ra), float(dec), float(radius_deg))
+        prov["query"] = _obscore_cone_adql(float(ra), float(dec), float(radius_deg), public=public)
         prov["url"] = _ALMA_TAP_URL
+        # Surfaced WITH the query (CX-38): the executed call is
+        # alminer.conesearch, whose internal ADQL is opaque third-party code —
+        # the user must see that this is the reproducible equivalent, not a
+        # byte capture. Rides request.snippet via the provenance sidecar.
+        prov["note"] = (
+            "-- Reproducible equivalent of the executed alminer.conesearch"
+            f"(public={public}) call; alminer's internal ADQL is not captured byte-exactly."
+        )
     except Exception:  # noqa: BLE001 - provenance never breaks a search
         pass
 
@@ -788,6 +813,21 @@ class SearchByFrequency(BaseCapability):
             results = search_service.search_by_frequency(
                 min_freq_ghz, max_freq_ghz, facility, max_results
             )
+            # Outage vs. genuinely-empty (C3 / scan CAP-03): search.py tags a
+            # failed archive query via df.attrs — never report "0 results"
+            # when the archive was simply unavailable.
+            _freq_err = results.attrs.get("quasar_error") if hasattr(results, "attrs") else None
+            if results.empty and _freq_err:
+                return _native({
+                    "success": False,
+                    "error": _freq_err,
+                    "min_freq_ghz": min_freq_ghz, "max_freq_ghz": max_freq_ghz,
+                    "note": (
+                        "The archive query did not complete, so it is unknown whether "
+                        "data exist in this frequency range — this is an archive/service "
+                        "error, not a confirmed 'no data' result."
+                    ),
+                })
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({"type": "data", "data": results,
                                                 "source": facility_label,
@@ -834,21 +874,40 @@ class SearchCadc(BaseCapability):
                     from astroquery.simbad import Simbad
                     result = Simbad.query_object(target_name)
                     if result is not None and len(result) > 0:
-                        ra = float(result["RA"][0].replace(" ", ":").split(":")[0]) * 15 + \
-                             float(result["RA"][0].replace(" ", ":").split(":")[1]) * 15/60 + \
-                             float(result["RA"][0].replace(" ", ":").split(":")[2]) * 15/3600
-                        dec_parts = result["DEC"][0].replace(" ", ":").split(":")
-                        dec_sign = -1 if dec_parts[0].startswith("-") else 1
-                        dec = dec_sign * (abs(float(dec_parts[0])) + float(dec_parts[1])/60 + float(dec_parts[2])/3600)
+                        # astroquery >=0.4.8 returns lowercase 'ra'/'dec' as
+                        # float DEGREES; older releases returned uppercase
+                        # sexagesimal strings. The uppercase-only parse made
+                        # every CADC name search KeyError (CAP-01) — resolve
+                        # case-insensitively and try degrees first.
+                        cols = {str(c).lower(): c for c in result.colnames}
+                        ra_val = result[cols["ra"]][0]
+                        dec_val = result[cols["dec"]][0]
+                        try:
+                            ra = float(ra_val)
+                            dec = float(dec_val)
+                        except (TypeError, ValueError):
+                            ra_parts = str(ra_val).replace(" ", ":").split(":")
+                            ra = (float(ra_parts[0]) * 15
+                                  + float(ra_parts[1]) * 15 / 60
+                                  + float(ra_parts[2]) * 15 / 3600)
+                            dec_parts = str(dec_val).replace(" ", ":").split(":")
+                            dec_sign = -1 if dec_parts[0].startswith("-") else 1
+                            dec = dec_sign * (abs(float(dec_parts[0]))
+                                              + float(dec_parts[1]) / 60
+                                              + float(dec_parts[2]) / 3600)
                     else:
                         return _native({"success": False, "error": f"Could not resolve target '{target_name}' via SIMBAD."})
                 except Exception as e:
                     # Fallback: try using our existing resolve_target
                     try:
                         resolved = ctx.service("resolve_target")(target_name)
-                        if resolved.get("success") and resolved.get("ra") is not None:
-                            ra = resolved["ra"]
-                            dec = resolved["dec"]
+                        # resolve_target returns ra_deg/dec_deg (CAP-01: the
+                        # old 'ra' key never existed, so this gate never passed).
+                        _fb_ra = resolved.get("ra_deg", resolved.get("ra"))
+                        _fb_dec = resolved.get("dec_deg", resolved.get("dec"))
+                        if resolved.get("success") and _fb_ra is not None:
+                            ra = _fb_ra
+                            dec = _fb_dec
                         else:
                             return _native({"success": False, "error": f"Could not resolve '{target_name}': {e}"})
                     except Exception:
@@ -1024,6 +1083,19 @@ class SearchAlmaWithKeywords(BaseCapability):
                 keywords = json.loads(keywords)
 
             results = ctx.service("search_service").search_alma_with_keywords(keywords)
+            # Outage vs. genuinely-empty (C3 / scan CAP-03).
+            _kw_err = results.attrs.get("quasar_error") if hasattr(results, "attrs") else None
+            if results.empty and _kw_err:
+                return _native({
+                    "success": False,
+                    "error": _kw_err,
+                    "keywords": keywords,
+                    "note": (
+                        "The archive query did not complete, so it is unknown whether "
+                        "data match these keywords — this is an archive/service error, "
+                        "not a confirmed 'no data' result."
+                    ),
+                })
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({"type": "data", "data": results, "source": f"Keywords: {keywords}"})
 
@@ -1093,6 +1165,18 @@ class AdvancedSearch(BaseCapability):
                     ),
                 })
             results = ctx.service("search_service").advanced_search(query)
+            # Outage vs. genuinely-empty (C3 / scan CAP-03).
+            _adv_err = results.attrs.get("quasar_error") if hasattr(results, "attrs") else None
+            if results.empty and _adv_err:
+                return _native({
+                    "success": False,
+                    "error": _adv_err,
+                    "note": (
+                        "The archive query did not complete, so it is unknown whether "
+                        "rows match this ADQL — this is an archive/service error, not a "
+                        "confirmed 'no data' result."
+                    ),
+                })
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({"type": "data", "data": results, "source": f"SQL: {query}"})
 
@@ -1134,6 +1218,10 @@ class SearchAlmaCoInRedshiftRange(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         z_min, z_max = inp.z_min, inp.z_max
         science_category, max_results = inp.science_category, inp.max_results
+        # Swapped bounds invert every per-transition frequency window and the
+        # containment condition silently matches nothing (scan CAP-07).
+        if z_min is not None and z_max is not None and z_min > z_max:
+            z_min, z_max = z_max, z_min
 
         # CO rotational transitions: (J_upper, rest_freq_GHz)
         CO_TRANSITIONS = [
@@ -1195,6 +1283,14 @@ ORDER BY target_name
         try:
             import pyvo
             tap_url = "https://almascience.eso.org/tap"
+            # Surface the exact executed ADQL (CX-07): the query is built
+            # request-locally above, so this stamp is race-free.
+            try:
+                prov = ctx.service("alma_tap_provenance")
+                prov["query"] = adql_query.strip()
+                prov["url"] = tap_url
+            except Exception:  # noqa: BLE001 - provenance never breaks a search
+                pass
             service = pyvo.dal.TAPService(tap_url)
             res = service.search(adql_query)
             df = res.to_table().to_pandas()
@@ -1293,6 +1389,10 @@ class QueryAlmaScienceArchiveInput(_In):
     require_same_project: Any = True
     include_adql: Any = True
     max_results: Optional[int] = 5000
+    # R2 — sensitivity-driven discovery + archive↔literature joins.
+    sensitivity_mjy: Optional[float] = None
+    continuum: Any = False
+    identifier: Optional[str] = ""
 
 
 class QueryAlmaScienceArchive(BaseCapability):
@@ -1301,8 +1401,10 @@ class QueryAlmaScienceArchive(BaseCapability):
         "Run deterministic ALMA Science Archive query templates for hard archive-science questions. "
         "Use this instead of raw ADQL for: Cycle N project counts, Sun/solar projects, projects using "
         "12m+7m+total-power arrays, high-resolution Band N continuum candidates for a target, projects "
-        "covering a required molecular line set such as 12CO/13CO/C18O in the same project, and "
-        "bandwidth-switching calibration diagnostics."
+        "covering a required molecular line set such as 12CO/13CO/C18O in the same project, "
+        "bandwidth-switching calibration diagnostics, archival data sensitive enough to reach a given "
+        "rms (sensitivity_search with sensitivity_mjy), and publication joins (data_publications: "
+        "publications that used a project/MOUS, or the archived data behind an ADS bibcode)."
     )
     category = "archive"
     InputModel = QueryAlmaScienceArchiveInput
@@ -1328,6 +1430,7 @@ class QueryAlmaScienceArchive(BaseCapability):
         prov_state["url"] = None
         warnings: List[str] = []
         query_summary = ""
+        publications: Optional[List[Dict[str, str]]] = None
         try:
             if query_type == "cycle_solar_projects":
                 if cycle is None:
@@ -1381,7 +1484,16 @@ class QueryAlmaScienceArchive(BaseCapability):
                 required_lines = lines or ["12CO", "13CO", "C18O"]
                 requested_band = band or 6
                 topic = str(topic_filter or "").strip()
-                where_parts = [f"(band_list LIKE '%{requested_band}%')"]
+                # band_list is a space-delimited token list ("3 6 7"); a bare
+                # substring LIKE made band=1 also match Band 10 (scan CAP-06) —
+                # match the exact token in every list position instead.
+                _b = str(requested_band).strip()
+                where_parts = [
+                    "("
+                    f"band_list = '{_b}' OR band_list LIKE '{_b} %' "
+                    f"OR band_list LIKE '% {_b}' OR band_list LIKE '% {_b} %'"
+                    ")"
+                ]
                 if topic:
                     safe_topic = topic.replace("'", "''").lower()
                     where_parts.append(
@@ -1425,6 +1537,72 @@ class QueryAlmaScienceArchive(BaseCapability):
                 warnings.append("Bandwidth Switching likelihood is inferred from public spectral setup metadata; it is not proof of calibration intent.")
                 query_summary = "Projects scored by spectral-window count, bandwidth diversity, tuning diversity, and calibration-like metadata."
 
+            elif query_type == "sensitivity_search":
+                if inp.sensitivity_mjy is None:
+                    return _native({
+                        "success": False,
+                        "error": "sensitivity_mjy is required (target rms in mJy/beam)",
+                    })
+                try:
+                    where, sens_col = sensitivity_where(
+                        float(inp.sensitivity_mjy),
+                        continuum=bool(inp.continuum),
+                        band=band,
+                        science_category=str(science_category or ""),
+                    )
+                except ValueError as ve:
+                    return _native({"success": False, "error": str(ve)})
+                df = _tap_obscore_dataframe(
+                    where, max_results=max_results, order_by=sens_col,
+                    extra_columns=("sensitivity_10kms", "cont_sensitivity_bandwidth"),
+                    ctx=ctx,
+                )
+                result_df = summarize_sensitivity(df, sens_col)
+                kind = "continuum" if bool(inp.continuum) else "line (per 10 km/s)"
+                source = f"ALMA archival data with {kind} sensitivity <= {float(inp.sensitivity_mjy):g} mJy/beam"
+                mode = "sensitivity_search"
+                warnings.append(
+                    "Sensitivity columns are the archive's estimated achieved rms per observation; "
+                    "verify against the delivered products before science use."
+                )
+                query_summary = (
+                    f"ObsCore rows with {sens_col} <= {float(inp.sensitivity_mjy):g} mJy/beam"
+                    + (f", Band {band}" if band is not None and str(band).strip() else "")
+                    + (f", category ~ {science_category}" if science_category else "")
+                    + "; grouped by proposal_id with the best per-project sensitivity."
+                )
+
+            elif query_type == "data_publications":
+                join_id = str(inp.identifier or "").strip() or str(target or "").strip()
+                if not join_id:
+                    return _native({
+                        "success": False,
+                        "error": "identifier is required (ALMA project code, MOUS uid://..., or ADS bibcode)",
+                    })
+                try:
+                    where, id_kind = publication_join_where(join_id)
+                except ValueError as ve:
+                    return _native({"success": False, "error": str(ve)})
+                df = _tap_obscore_dataframe(
+                    where, max_results=max_results,
+                    extra_columns=("bib_reference", "pub_title",
+                                   "publication_year", "first_author"),
+                    ctx=ctx,
+                )
+                result_df = summarize_publication_links(df)
+                publications = collect_publications(df)
+                direction = (
+                    "archived data used by publication" if id_kind == "bibcode"
+                    else "publications that used the archived data"
+                )
+                source = f"ALMA {direction}: {join_id}"
+                mode = "data_publications"
+                query_summary = (
+                    f"ObsCore publication join for {id_kind} {join_id}: bib_reference/pub_title "
+                    "columns grouped by proposal_id; bibcodes are the joinable key "
+                    "(pub_title/first_author are concatenated display blobs)."
+                )
+
             else:
                 return _native({"success": False, "error": f"Unknown query_type: {query_type}"})
 
@@ -1445,7 +1623,7 @@ class QueryAlmaScienceArchive(BaseCapability):
                 "tool_name": "query_alma_science_archive",
             })
             unique_projects = int(result_df["proposal_id"].nunique()) if "proposal_id" in result_df.columns else len(result_df)
-            return _native({
+            out = {
                 "success": True,
                 "mode": mode,
                 "count": len(result_df),
@@ -1456,7 +1634,13 @@ class QueryAlmaScienceArchive(BaseCapability):
                 "warnings": warnings,
                 "provenance": provenance,
                 "note": "Full result table is shown in the UI data card.",
-            })
+            }
+            if publications is not None:
+                # R2 data_publications: deduped bibcode list feeding the
+                # observation↔paper graph alongside the per-project table.
+                out["publications"] = publications
+                out["n_publications"] = len(publications)
+            return _native(out)
         except Exception as e:
             import traceback
             logger.error("ALMA science query failed: %s\n%s", e, traceback.format_exc())
@@ -1539,6 +1723,23 @@ def _match_cross_archive_sources_impl(
         sorted(requested_archives),
         require_all_archives=bool(require_all_archives),
     )
+    # Outage honesty (scan CAP-04): when archives errored AND nothing matched,
+    # "0 matches, success" would let an outage masquerade as a real empty
+    # cross-match. Fail loudly instead; partial results stay success+partial.
+    if archive_errors and len(summary) == 0:
+        return {
+            "success": False,
+            "mode": "cross_archive_source_match",
+            "catalog_name": catalog_label,
+            "archives": sorted(requested_archives),
+            "sources_tested": len(source_catalog),
+            "archive_errors": archive_errors,
+            "error": (
+                "Every archive query failed before any match could be made — this is "
+                "an archive/service outage, not a confirmed 'no counterparts' result: "
+                + "; ".join(archive_errors[:3])
+            ),
+        }
     ctx.service("set_last_search_results")(summary)
     ctx.service("set_last_run_result")({
         "type": "data",

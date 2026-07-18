@@ -3,15 +3,22 @@
 import { useState, useRef, useEffect } from "react";
 import { Download, Eye, ExternalLink, Link2, Loader2, X, Telescope, BarChart3, Map, AlertTriangle, Activity, Layers, FileCode, Radio, Copy, Check } from "lucide-react";
 import type { DataTableResult } from "../lib/types";
-import { createWorkbenchSession } from "../lib/api";
+import { createWorkbenchSession, exportResultCsv } from "../lib/api";
 import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { AladinSkyView, type StcsFootprint } from "./AladinSkyView";
 import { buildCrossMatchPrompt, dispatchPrefillPrompt } from "../lib/prompt-dispatch";
 import { QueryProvenance } from "./QueryProvenance";
+// Pure export-honesty logic lives in lib/export-decision.js so the node test
+// harness can exercise it without a React harness (f2-CX-15).
+import { exportPlan, interpretExportResponse, localCsvText } from "../lib/export-decision";
 
 interface DataTableCardProps { data: DataTableResult; }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Hard-disable the in-browser CSV built from preview rows, even when that
+// preview is provably the complete result. For deployments that want every
+// download to come from the server's authoritative copy or not at all.
+const STRICT_EXPORT = process.env.NEXT_PUBLIC_STRICT_EXPORT === "1";
 
 function optionalCellText(value: unknown): string | undefined {
     const text = String(value ?? "").trim();
@@ -1275,6 +1282,11 @@ export function DataTableCard({ data }: DataTableCardProps) {
     const [previewLoadingRow, setPreviewLoadingRow] = useState<number | null>(null);
     const [workbenchLoadingRow, setWorkbenchLoadingRow] = useState<number | null>(null);
     const [previewError, setPreviewError] = useState<string | null>(null);
+    const [downloadingCsv, setDownloadingCsv] = useState(false);
+    const [downloadError, setDownloadError] = useState<string | null>(null);
+    // Persistent amber disclosure when the server clipped an export at its
+    // configured row ceiling (f2-CX-05). Cleared only by the next attempt.
+    const [exportWarning, setExportWarning] = useState<string | null>(null);
 
     const skyCoords = data.demographics?.skyCoords;
     const skyFootprints = data.demographics?.skyFootprints;
@@ -1286,19 +1298,92 @@ export function DataTableCard({ data }: DataTableCardProps) {
         (skyCoords && skyCoords.length > 0)
     );
 
-    // Download CSV helper
-    const handleDownloadCSV = () => {
-        const header = columns.join(",");
-        const body = rows.map(row =>
-            columns.map(col => `"${String(row[col] ?? "").replace(/"/g, '""')}"`).join(",")
-        ).join("\n");
-        const blob = new Blob([header + "\n" + body], { type: "text/csv" });
-        const url = URL.createObjectURL(blob);
+    // ── CSV download: complete, or a loud error. Never a silent partial. ──────
+    //
+    // `rows` is the PREVIEW the card renders: capped at 10k rows, display
+    // columns only, floats clipped for legibility. Serving that as "the CSV" is
+    // the silent-partial bug this replaces. The decision itself — tri-state
+    // completeness so a replayed pre-Feature-2 card can't default to "complete"
+    // (f2-CX-03), display-table labeling for the local fallback (f2-CX-04), and
+    // the "Preview only" disclosure (f2-CX-08) — lives in
+    // lib/export-decision.js, pure and node-tested.
+    const plan = exportPlan({
+        totalRows: data.totalRows,
+        truncated: data.truncated,
+        resultId: data.resultId,
+        shownRowCount: rows.length,
+        strictExport: STRICT_EXPORT,
+        // Upstream-partial (f2-CX-21): the stored frame is itself a truncated
+        // slice of the remote result — nothing may read as complete.
+        upstreamPartial: data.upstreamPartial === true,
+        upstreamTotal: data.upstreamTotal ?? null,
+    });
+
+    const triggerBrowserDownload = (blobUrl: string, filename: string) => {
         const a = document.createElement("a");
-        a.href = url;
-        a.download = `${data.sourceName || "alma"}_results.csv`;
+        a.href = blobUrl;
+        a.download = filename;
         a.click();
+    };
+
+    const downloadLocalCSV = () => {
+        // Shared escaping for headers AND values — a column name with a comma
+        // or quote must not shear the header row (f2-CX-06).
+        const blob = new Blob([localCsvText(columns, rows)], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        triggerBrowserDownload(url, `${data.sourceName || "alma"}_displayed_table.csv`);
         URL.revokeObjectURL(url);
+    };
+
+    const handleDownloadCSV = async () => {
+        setDownloadError(null);
+        setExportWarning(null);
+        if (!plan.canExportFull) {
+            // Local path: the displayed table only, and only when the plan
+            // allows it; the button is disabled otherwise.
+            if (plan.localAllowed) downloadLocalCSV();
+            return;
+        }
+        setDownloadingCsv(true);
+        try {
+            const response = await exportResultCsv(data.resultId!);  // (f2-CX-09)
+            let detail = "";
+            if (!response.ok) {
+                try {
+                    detail = (await response.json())?.detail || "";
+                } catch { /* body may not be JSON */ }
+            }
+            const verdict = interpretExportResponse({
+                ok: response.ok,
+                status: response.status,
+                detail,
+                truncatedHeader: response.headers.get("X-Quasar-Truncated"),
+                rowcountHeader: response.headers.get("X-Quasar-Rowcount"),
+                totalRowsHeader: response.headers.get("X-Quasar-Total-Rows"),
+            });
+            if (verdict.kind === "error") {
+                // Fail loud. Falling back to `rows` here would hand the user a
+                // truncated file they'd reasonably believe was complete.
+                throw new Error(verdict.errorMessage || "Full export failed.");
+            }
+            if (verdict.kind === "partial") {
+                // A configured export ceiling clipped the stream: deliver the
+                // file, but with a persistent on-card warning and a PARTIAL_
+                // filename prefix — never silently as full (f2-CX-05).
+                setExportWarning(verdict.warning || "Server export ceiling applied — this download is a partial export.");
+            }
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const disposition = response.headers.get("Content-Disposition") || "";
+            const match = /filename="([^"]+)"/.exec(disposition);
+            const baseName = match?.[1] || `${data.sourceName || "results"}.csv`;
+            triggerBrowserDownload(url, `${verdict.filenamePrefix || ""}${baseName}`);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            setDownloadError(error instanceof Error ? error.message : "Full export failed.");
+        } finally {
+            setDownloadingCsv(false);
+        }
     };
 
     const handlePreviewFits = async (row: Record<string, string | number>, rowIndex: number) => {
@@ -1639,7 +1724,12 @@ export function DataTableCard({ data }: DataTableCardProps) {
                 {/* ── Footer ── */}
                 <div className="flex items-center justify-between gap-3 px-4 py-3 border-t flex-wrap" style={{ background: 'var(--q-surface)', borderColor: 'var(--q-border)' }}>
                     <span className="text-xs text-slate-500">
-                        {rows.length} row{rows.length !== 1 ? "s" : ""} · {columns.length} col{columns.length !== 1 ? "s" : ""}
+                        {/* "Preview only" disclosure for truncated cards, and an honest
+                            strip for pre-Feature-2 cards of unknown completeness (f2-CX-08) */}
+                        {plan.footerTone === "warning"
+                            ? <span className="text-amber-400 font-semibold">{plan.footerText}</span>
+                            : plan.footerText
+                        } · {columns.length} col{columns.length !== 1 ? "s" : ""}
                         {data.hasPreview && " · Sky previews"}
                         {data.fitsEstimate && data.fitsEstimate > 0 && (
                             data.tableKind === "alma_products"
@@ -1650,12 +1740,42 @@ export function DataTableCard({ data }: DataTableCardProps) {
                     <div className="flex gap-2 flex-wrap justify-end">
                         <button
                             onClick={handleDownloadCSV}
-                            className="flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-700 rounded-lg transition-colors"
+                            disabled={plan.disabled || downloadingCsv}
+                            title={plan.tooltip}
+                            aria-label={plan.tooltip}
+                            className={`flex items-center gap-2 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                                plan.disabled
+                                    ? "text-slate-500 cursor-not-allowed opacity-60"
+                                    : "text-slate-300 hover:bg-slate-700"
+                            }`}
                         >
-                            <Download className="w-3.5 h-3.5" />Download CSV
+                            {downloadingCsv
+                                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                : <Download className="w-3.5 h-3.5" />}
+                            {downloadingCsv ? "Exporting…" : plan.buttonLabel}
                         </button>
                     </div>
                 </div>
+                {/* Persistent partial-export disclosure — a ceiling-clipped file
+                    was delivered, and the card must keep saying so (f2-CX-05) */}
+                {exportWarning && (
+                    <div
+                        role="alert"
+                        className="flex items-start gap-2 mx-4 mb-3 px-3 py-2 text-xs rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300"
+                    >
+                        <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                        <span>{exportWarning}</span>
+                    </div>
+                )}
+                {downloadError && (
+                    <div
+                        role="alert"
+                        className="flex items-start gap-2 mx-4 mb-3 px-3 py-2 text-xs rounded-lg border border-red-500/40 bg-red-500/10 text-red-300"
+                    >
+                        <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                        <span>{downloadError}</span>
+                    </div>
+                )}
                 <QueryProvenance request={data.request} toolName={data.toolName} className="px-4 pb-3" />
             </div>
         </>

@@ -3,6 +3,9 @@
 import { Check, ChevronDown, ChevronRight, Copy, Terminal, X } from "lucide-react";
 import { useState } from "react";
 import type { ToolRequest, ToolTraceCall } from "../lib/api";
+// Pure selection logic lives in lib/provenance.js so the node test harness can
+// exercise the SSE/reload consumption contract without a React renderer (CX-24).
+import { requestsFrom as requestsFromLib } from "../lib/provenance";
 
 /** Feature 1 — the raw-query provenance surface.
  *
@@ -37,11 +40,38 @@ function requestsFrom(
     calls?: ToolTraceCall[],
     toolName?: string,
 ): { name: string; request: ToolRequest }[] {
-    if (request?.text) return [{ name: toolName || "", request }];
-    if (!calls?.length) return [];
-    return calls
-        .filter((c) => c.request?.text && (!toolName || c.name === toolName))
-        .map((c) => ({ name: c.name, request: c.request as ToolRequest }));
+    return requestsFromLib(request, calls, toolName) as { name: string; request: ToolRequest }[];
+}
+
+/** The request's structured params as renderable [key, line] pairs: scalars
+ *  verbatim, objects/arrays compact JSON. Empty → no block. Real requests
+ *  carry context beyond `text` here (MOC request_pattern + per-ID orders,
+ *  VLASS soda_url, SIA endpoint) that was previously invisible and never
+ *  copied. (A1 CX-05 sliver) */
+function paramEntries(request: ToolRequest): [string, string][] {
+    const params = request.params;
+    if (!params || typeof params !== "object") return [];
+    return Object.entries(params).map(([key, value]) => {
+        let text: string;
+        if (value !== null && typeof value === "object") {
+            try {
+                text = JSON.stringify(value);
+            } catch {
+                text = String(value);
+            }
+        } else {
+            text = String(value);
+        }
+        return [key, text];
+    });
+}
+
+/** Copy payload = the request text plus its params lines, so a paste
+ *  reproduces everything the block shows. (A1 CX-05 sliver) */
+function copyPayload(request: ToolRequest): string {
+    const params = paramEntries(request);
+    if (params.length === 0) return request.text;
+    return `${request.text}\n${params.map(([k, v]) => `${k}: ${v}`).join("\n")}`;
 }
 
 interface QueryProvenanceProps {
@@ -64,18 +94,21 @@ export function QueryProvenance({ request, calls, toolName, label, className }: 
     if (entries.length === 0) return null;
 
     const execCommandCopy = (text: string): boolean => {
+        // The textarea must come off the DOM on EVERY path — an execCommand
+        // throw used to leave it attached (CX-40).
+        let ta: HTMLTextAreaElement | null = null;
         try {
-            const ta = document.createElement("textarea");
+            ta = document.createElement("textarea");
             ta.value = text;
             ta.style.position = "fixed";
             ta.style.opacity = "0";
             document.body.appendChild(ta);
             ta.select();
-            const ok = document.execCommand("copy");
-            document.body.removeChild(ta);
-            return ok;
+            return document.execCommand("copy");
         } catch {
             return false;
+        } finally {
+            if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
         }
     };
 
@@ -141,7 +174,7 @@ export function QueryProvenance({ request, calls, toolName, label, className }: 
                                     )}
                                 </div>
                                 <button
-                                    onClick={() => copy(entry.request.text, index)}
+                                    onClick={() => copy(copyPayload(entry.request), index)}
                                     title={copyError === index ? "Copy failed — select and copy manually" : "Copy request"}
                                     className="p-1 text-muted-foreground hover:text-foreground transition-colors shrink-0"
                                 >
@@ -157,6 +190,16 @@ export function QueryProvenance({ request, calls, toolName, label, className }: 
                             <pre className="px-3 py-2 text-[11px] font-mono whitespace-pre-wrap break-words overflow-x-auto max-h-64 text-foreground/90">
                                 {entry.request.text}
                             </pre>
+                            {paramEntries(entry.request).length > 0 && (
+                                <div className="px-3 py-2 border-t border-border/60 space-y-0.5 overflow-x-auto max-h-40">
+                                    {paramEntries(entry.request).map(([key, value]) => (
+                                        <div key={key} className="text-[11px] font-mono whitespace-pre-wrap break-words">
+                                            <span className="text-muted-foreground">{key}:</span>{" "}
+                                            <span className="text-foreground/90">{value}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
                             {entry.request.snippet && (
                                 <pre className="px-3 py-2 text-[11px] font-mono whitespace-pre-wrap break-words border-t border-border/60 text-muted-foreground">
                                     {entry.request.snippet}

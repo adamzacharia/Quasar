@@ -122,7 +122,13 @@ def apply_frequency_frame(
     line: Mapping[str, Any], redshift: Optional[float]
 ) -> Dict[str, Any]:
     result = dict(line)
+    # Accept the explicit rest_frequency_ghz alias too — API callers (and any
+    # line dict not minted by our own search) reasonably use it, and dropping
+    # it silently made a no-redshift confusion job hard-fail on "requires an
+    # observed frequency" (confusion-no-redshift-always-fails residual).
     rest = _finite_float(result.get("frequency_ghz"))
+    if rest is None:
+        rest = _finite_float(result.get("rest_frequency_ghz"))
     if rest is not None and redshift is not None:
         if redshift <= -1:
             raise ValueError("redshift must be greater than -1")
@@ -130,6 +136,23 @@ def apply_frequency_frame(
         result["redshift"] = redshift
     elif rest is not None and result.get("observed_frequency_ghz") is None:
         result["observed_frequency_ghz"] = rest
+    # alma-bands-stale-after-frame-shift: _normalize_row computes the ALMA band
+    # fields from the REST frequency whenever the Splatalogue display carried no
+    # redshifted value (SLAP fallback, display parse failure). Recompute them
+    # here from the FINAL observed frequency so the UI never badges a
+    # redshifted-out-of-band line with a rest-frame band.
+    observed = _finite_float(result.get("observed_frequency_ghz"))
+    if observed is not None and (
+        "alma_bands" in result or "alma_preferred_band" in result
+    ):
+        bands = SplatalogueTool._alma_bands_for_frequency(observed)
+        result["alma_bands"] = bands
+        result["alma_preferred_band"] = SplatalogueTool._preferred_alma_band(
+            observed, bands
+        )
+        result["alma_band_edge_warning"] = SplatalogueTool._band_edge_warning(
+            observed
+        )
     return result
 
 
@@ -1138,15 +1161,21 @@ WHERE {where}
                     "observations": list(observations),
                 }
             )
+        # project-ranking-falsy-zero-inversion: compare with `is None`, never
+        # `or`, so a legitimate 0.0 (exactly-on-target separation, zero edge
+        # margin) ranks best instead of being swapped for the worst sentinel.
+        def _rank(value: Any, missing: float) -> float:
+            return float(value) if value is not None else missing
+
         projects.sort(
             key=lambda item: (
                 0 if item["all_lines_usable"] else 1,
                 0 if item["all_lines_full"] else 1,
                 0 if item["covers_all_lines"] else 1,
-                -float(item["minimum_edge_margin_mhz"] or -1e12),
-                float(item["angular_separation_arcsec"] or 1e12),
-                float(item["best_angular_resolution_arcsec"] or 1e12),
-                -float(item["total_exposure_seconds"] or 0),
+                -_rank(item["minimum_edge_margin_mhz"], -1e12),
+                _rank(item["angular_separation_arcsec"], 1e12),
+                _rank(item["best_angular_resolution_arcsec"], 1e12),
+                -_rank(item["total_exposure_seconds"], 0.0),
             )
         )
         return projects
@@ -1231,8 +1260,12 @@ def confusion_score(
     return {
         "score": score,
         "classification": classification,
+        # confusion-velocity-offset-sign: optical convention on the spectrum's
+        # velocity axis, v = c * (f_target - f_cand) / f_target. A candidate at
+        # HIGHER observed frequency is BLUESHIFTED relative to the target, so
+        # velocity_offset_kms is NEGATIVE for f_cand > f_target.
         "velocity_offset_kms": (
-            (frequency - target_frequency_ghz)
+            (target_frequency_ghz - frequency)
             / target_frequency_ghz
             * SPEED_OF_LIGHT_KMS
             if frequency is not None
@@ -1405,8 +1438,6 @@ class SpectralLineJobService:
     ) -> Dict[str, Any]:
         if operation not in {"catalog_search", "alma_coverage", "confusion"}:
             raise ValueError("Unsupported spectral-line operation")
-        if self._active_jobs_for_user(user_id) >= 2:
-            raise ValueError("At most two spectral-line jobs may run concurrently per user")
         job_id = uuid.uuid4().hex
         job = {
             "job_id": job_id,
@@ -1425,7 +1456,16 @@ class SpectralLineJobService:
             "cancel_requested": False,
         }
         event = threading.Event()
+        # sle-double-submit-check-then-act: the per-user limit check and the
+        # initial save happen atomically under the lock so two concurrent
+        # create_job calls cannot both pass the count and exceed the advertised
+        # concurrent_jobs_per_user limit. (Single-process guard: a multi-worker
+        # deployment sharing this DiskCache would need a cross-process guard.)
         with self._lock:
+            if self._active_jobs_for_user(user_id) >= 2:
+                raise ValueError(
+                    "At most two spectral-line jobs may run concurrently per user"
+                )
             self._events[job_id] = event
             self._save(job)
         self.executor.submit(self._run_job, job_id)
@@ -1468,15 +1508,22 @@ class SpectralLineJobService:
         return public
 
     def cancel_job(self, *, user_id: str, job_id: str) -> Dict[str, Any]:
-        job = self._owned_job(user_id, job_id)
-        if job["status"] in TERMINAL_JOB_STATUSES:
-            return self._public_job(job)
-        job["cancel_requested"] = True
-        job["updated_at"] = utc_now_iso()
+        # sle-cancel-clobbers-completed-job: the read-modify-write happens under
+        # self._lock, re-reading the record inside the critical section, so a
+        # stale pre-completion snapshot can never overwrite a job the worker
+        # thread just finished (which would strand it 'running' forever and
+        # discard the computed result). Terminal statuses are never downgraded.
+        self._owned_job(user_id, job_id)  # ownership / existence check
         event = self._events.get(job_id)
         if event:
             event.set()
-        self._save(job)
+        with self._lock:
+            job = self._owned_job(user_id, job_id)
+            if job["status"] in TERMINAL_JOB_STATUSES:
+                return self._public_job(job)
+            job["cancel_requested"] = True
+            job["updated_at"] = utc_now_iso()
+            self._save(job)
         return self._public_job(job)
 
     def export(
@@ -1751,6 +1798,12 @@ class SpectralLineJobService:
             edge_channels=float(payload.get("edge_channels") or 0),
             edge_margin_ghz=float(payload.get("edge_margin_ghz") or 0),
             max_channel_width_khz=_finite_float(payload.get("max_channel_width_khz")),
+            # coverage-doppler-frame-param-dropped: forward the accepted
+            # doppler_frame parameter instead of silently applying the LSRK
+            # default to callers who requested TOPO/barycentric.
+            doppler_frame=str(
+                payload.get("doppler_frame") or "observed (source frame)"
+            ),
         )
         coverage.update(
             {
@@ -1771,18 +1824,33 @@ class SpectralLineJobService:
         selected = payload.get("selected_line")
         if not isinstance(selected, Mapping):
             raise ValueError("selected_line is required for confusion analysis")
-        selected = apply_frequency_frame(selected, _finite_float(payload.get("redshift")))
+        # The z=0 assumption must apply BEFORE the observed-frequency
+        # derivation, not only to the query below: a rest-frequency-only
+        # selected_line with no redshift otherwise hard-fails on "requires an
+        # observed frequency" even though observed == rest at z=0 — the exact
+        # failure the fallback exists to prevent
+        # (confusion-no-redshift-always-fails residual, found live 2026-07-18).
+        redshift = _finite_float(payload.get("redshift"))
+        assumed_rest_frame = redshift is None
+        if assumed_rest_frame:
+            redshift = 0.0
+        selected = apply_frequency_frame(selected, redshift)
         center = _finite_float(selected.get("observed_frequency_ghz"))
         if center is None:
             raise ValueError("selected_line requires an observed frequency")
         if payload.get("window_mhz") not in (None, ""):
             window_mhz = float(payload["window_mhz"])
         elif payload.get("velocity_width_kms") not in (None, ""):
+            # confusion-velocity-width-doubled: velocity_width_kms is the FULL
+            # velocity width of the window, so the half-width used to search
+            # center ± window_mhz is (Δv/2)/c · f — matching
+            # ALMACoverageService._requested_interval for the same input.
             window_mhz = (
                 center
                 * float(payload["velocity_width_kms"])
                 / SPEED_OF_LIGHT_KMS
                 * 1000
+                / 2
             )
         else:
             window_mhz = 10.0
@@ -1794,8 +1862,14 @@ class SpectralLineJobService:
                 "unit": "GHz",
             }
         ]
+        # confusion-no-redshift-always-fails: an observed-frame query with
+        # redshift=None hard-fails in SpectralLineQuery.rest_windows(), so a
+        # confusion search on a zero-redshift (Galactic) source would always
+        # error. Observed == rest at z=0, so run the search at z=0 (defaulted
+        # above, before the frequency-frame derivation) and disclose the
+        # assumption in the result payload below.
         query_payload["frame"] = "observed"
-        query_payload["redshift"] = _finite_float(payload.get("redshift"))
+        query_payload["redshift"] = redshift
         query_payload["output_mode"] = "merged"
         catalog = self._run_catalog_search(
             {
@@ -1812,11 +1886,19 @@ class SpectralLineJobService:
             catalog["lines"],
             window_mhz=window_mhz,
         )
+        warnings = list(catalog["warnings"])
+        if assumed_rest_frame:
+            warnings.append(
+                "No redshift was supplied, so the confusion search assumed z=0 "
+                "(rest frame == observed frame). Supply a redshift for "
+                "extragalactic targets."
+            )
         result.update(
             {
                 "backend": catalog["backend"],
                 "degraded": catalog["degraded"],
-                "warnings": catalog["warnings"],
+                "warnings": warnings,
+                "assumed_redshift_zero": assumed_rest_frame,
                 "query_provenance": catalog["query_provenance"],
             }
         )
@@ -1878,9 +1960,17 @@ class SpectralLineJobService:
         self.cache.set(job["job_id"], job, expire=self.ttl_seconds)
 
     def _update(self, job: Dict[str, Any], **changes: Any) -> None:
-        job.update(changes)
-        job["updated_at"] = utc_now_iso()
-        self._save(job)
+        # sle-cancel-clobbers-completed-job: worker-thread writes take the same
+        # lock as cancel_job so the two read-modify-write paths serialize; a
+        # concurrently persisted cancel_requested flag is merged rather than
+        # clobbered by the worker's local snapshot.
+        with self._lock:
+            stored = self.cache.get(job["job_id"])
+            if isinstance(stored, Mapping) and stored.get("cancel_requested"):
+                job["cancel_requested"] = True
+            job.update(changes)
+            job["updated_at"] = utc_now_iso()
+            self._save(job)
 
     @staticmethod
     def _public_job(job: Mapping[str, Any]) -> Dict[str, Any]:

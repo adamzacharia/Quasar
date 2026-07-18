@@ -111,6 +111,39 @@ class AnalyticsService:
                 ON response_feedback(created_at DESC)
             """)
 
+            # Per-block 1-5 star ratings (Feature 4). Separate from
+            # response_feedback: that one is a binary like/dislike keyed on the
+            # whole message and stays in service for the thumbs bar.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS block_feedback (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    block_id         TEXT NOT NULL,
+                    run_id           TEXT,
+                    conversation_id  TEXT,
+                    message_db_id    TEXT,
+                    user_id          TEXT,
+                    block_kind       TEXT,
+                    rating           INTEGER NOT NULL,
+                    comment          TEXT,
+                    model            TEXT,
+                    created_at       TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_block_feedback_block
+                ON block_feedback(block_id)
+            """)
+            # One rating per user per block; re-rating replaces (delete+insert,
+            # same idiom as log_feedback).
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_block_feedback_user_block
+                ON block_feedback(user_id, block_id)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_block_feedback_run
+                ON block_feedback(run_id)
+            """)
+
             conn.commit()
         finally:
             conn.close()
@@ -367,6 +400,112 @@ class AnalyticsService:
             return {"likes": likes, "dislikes": dislikes, "total": likes + dislikes}
         except Exception:
             return {"likes": 0, "dislikes": 0, "total": 0}
+
+    # ── per-block star ratings (Feature 4) ───────────────────────
+
+    def log_block_feedback(
+        self,
+        block_id: str,
+        rating: int,
+        run_id: str = "",
+        conversation_id: str = "",
+        message_db_id: str = "",
+        user_id: str = "anonymous",
+        block_kind: str = "",
+        comment: str = "",
+        model: str = "",
+    ) -> None:
+        """Persist a 1-5 star rating on one block. Re-rating replaces.
+
+        Raises ValueError on an out-of-range rating so a bad client can't
+        poison the label set with a 0 or an 11.
+        """
+        # Strict: int() would quietly coerce 4.9 -> 4 and JSON true -> 1, both of
+        # which land in the label set as a real human judgement that nobody made.
+        # bool is an int subclass, hence the explicit exclusion.
+        if isinstance(rating, bool) or not isinstance(rating, int):
+            raise ValueError("rating must be an integer 1-5")
+        safe_rating = rating
+        if not 1 <= safe_rating <= 5:
+            raise ValueError("rating must be between 1 and 5")
+        if not block_id:
+            raise ValueError("block_id is required")
+
+        now = datetime.utcnow().isoformat()
+        conn = self._conn()
+        try:
+            # Upsert: same user re-rating the same block overwrites their vote.
+            conn.execute(
+                "DELETE FROM block_feedback WHERE block_id = ? AND user_id = ?",
+                (block_id, user_id),
+            )
+            conn.execute(
+                """INSERT INTO block_feedback
+                   (block_id, run_id, conversation_id, message_db_id, user_id,
+                    block_kind, rating, comment, model, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    block_id,
+                    run_id or "",
+                    conversation_id or "",
+                    message_db_id or "",
+                    user_id,
+                    block_kind or "",
+                    safe_rating,
+                    (comment or "")[:2000],
+                    model or "",
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def export_block_feedback(self, user_id: Optional[str] = None) -> List[Dict]:
+        """Return block ratings, newest first. `user_id` scopes to one rater."""
+        conn = self._conn()
+        try:
+            sql = (
+                """SELECT created_at, block_id, run_id, conversation_id,
+                          message_db_id, user_id, block_kind, rating, comment, model
+                   FROM block_feedback"""
+            )
+            params: tuple = ()
+            if user_id:
+                sql += " WHERE user_id = ?"
+                params = (user_id,)
+            sql += " ORDER BY created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        keys = [
+            "timestamp", "block_id", "run_id", "conversation_id",
+            "message_db_id", "user_id", "block_kind", "rating", "comment", "model",
+        ]
+        return [dict(zip(keys, r)) for r in rows]
+
+    def get_block_ratings(self, conversation_id: str, user_id: str) -> Dict[str, Dict]:
+        """block_id -> this user's rating, for one whole conversation.
+
+        Conversation-scoped rather than run-scoped because that is what a reload
+        needs: the client rehydrates every turn at once and has to re-light the
+        stars on all of them.
+        """
+        if not conversation_id:
+            return {}
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                """SELECT block_id, rating, comment, block_kind
+                   FROM block_feedback WHERE conversation_id = ? AND user_id = ?""",
+                (conversation_id, user_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            r[0]: {"block_id": r[0], "rating": r[1], "comment": r[2], "block_kind": r[3]}
+            for r in rows
+        }
 
     def export_feedback_json(self) -> List[Dict]:
         """Return all feedback entries as a list of dicts."""

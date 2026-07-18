@@ -17,6 +17,7 @@ This is the heart of Quasar. The QuasarAgent class:
 import os
 import json
 import re
+import time
 import uuid
 import threading
 import pandas as pd
@@ -290,7 +291,10 @@ class QuasarAgent:
 
         # Initialize components
         print("DEBUG: Init Memory")
-        self.memory = ConversationMemory(max_turns=self.config.max_memory_turns)
+        # NOTE: conversation memory is a REQUEST-SCOPED thread-local property
+        # (see the Thread-local properties section) — no eager instance here.
+        # A single shared ConversationMemory let one user's synced history be
+        # read into ANOTHER user's LLM prompt mid-run (scan UIAPI-02).
         print("DEBUG: Init ToolRegistry")
         self.tool_registry = ToolRegistry()
         # TAP Client removed for ALMA-only scope
@@ -464,6 +468,10 @@ class QuasarAgent:
             # We must maintain sessions for the lifetime of the agent.
             if not hasattr(self, "_mcp_exit_stacks"):
                 self._mcp_exit_stacks = []
+            if not hasattr(self, "_mcp_shutdown_events"):
+                # (loop, Event) pairs; shutdown_mcp_servers() sets each event
+                # so the bridge coroutine can close its session and exit.
+                self._mcp_shutdown_events = []
                 
             def _start_mcp_bridge(config):
                 loop = asyncio.new_event_loop()
@@ -517,12 +525,15 @@ class QuasarAgent:
                             print(f"[MCPServers] Registered bridged tool: {t_name}")
                             
                         self._mcp_exit_stacks.append(stack)
-                        
-                        # We must keep the event loop alive so the stdio pipes don't close.
-                        # This is a bit of a hack: just sleep forever in this thread.
-                        while True:
-                            await asyncio.sleep(3600)
-                            
+
+                        # Keep the event loop alive so the stdio pipes stay open,
+                        # but wait on a shutdown event instead of sleeping forever
+                        # so the bridge thread can exit cleanly.
+                        _shutdown = asyncio.Event()
+                        self._mcp_shutdown_events.append((loop, _shutdown))
+                        await _shutdown.wait()
+                        print(f"[MCPServers] Bridge for {config['name']} shutting down")
+
                     except Exception as e:
                         print(f"[MCPServers] Failed to bridge {config['name']}: {e}")
                     finally:
@@ -573,6 +584,23 @@ class QuasarAgent:
 
         except Exception as e:
             print(f"[MCPServers] Failed to set up MCP clients: {e}")
+
+    def shutdown_mcp_servers(self) -> None:
+        """Signal every MCP bridge thread to close its session and exit.
+
+        Safe to call multiple times and when no bridges are running. Each
+        bridge coroutine is parked on an asyncio.Event (see _load_mcp_servers);
+        setting it lets the coroutine fall through to its finally block, close
+        the AsyncExitStack (terminating the child process / SSE connection),
+        and stop its loop so the daemon thread can finish its teardown.
+        """
+        for loop, event in getattr(self, "_mcp_shutdown_events", []):
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass  # loop already closed
+        if getattr(self, "_mcp_shutdown_events", None):
+            self._mcp_shutdown_events = []
 
     # ── Token helpers ──────────────────────────────────────────────────────
 
@@ -639,6 +667,26 @@ class QuasarAgent:
     @last_search_results.setter
     def last_search_results(self, value):
         self._tls.last_search_results = value
+
+    @property
+    def memory(self):
+        """REQUEST-SCOPED conversation memory (scan UIAPI-02).
+
+        The agent is a process-wide singleton while concurrent chats run on
+        separate worker threads; a single shared ConversationMemory meant one
+        user's synced history could be read into ANOTHER user's LLM prompt
+        mid-run — a cross-user privacy leak. Each request thread gets its own
+        instance; sse.py clears + syncs it per request (worker threads are
+        pooled, so stale history must never survive a request boundary).
+        """
+        if not hasattr(self._tls, 'memory'):
+            from core.memory import ConversationMemory
+            self._tls.memory = ConversationMemory(max_turns=self.config.max_memory_turns)
+        return self._tls.memory
+
+    @memory.setter
+    def memory(self, value):
+        self._tls.memory = value
 
     # ── Per-conversation response ID helpers ────────────────────────
 
@@ -894,6 +942,7 @@ GUIDELINES:
   `datalab_image_cutout` / `datalab_color_image` / `datalab_cutout_grid` (survey imagery),
   `datalab_tiled_search` + `datalab_confirm_sky_area` (wide-area candidate searches — ALWAYS confirm the sky area with the user before scanning more than ~100 deg²).
   Chain datalab_select_catalog_rows→plotting only when no one-shot tool fits.
+- **WHITE DWARF / HR-DIAGRAM SELECTION**: For white-dwarf candidate searches or any "which of these are white dwarfs" HR-diagram question, build the absolute-magnitude CMD with `datalab_color_magnitude_diagram` using x_expr='bp_rp', y_expr='phot_g_mean_mag + 5*log10(parallax) - 10', point_sources=true, AND pass `overlay_locus='wd'` — it draws the WD locus and the result reports `n_wd_candidates` (finite points on the faint side of the locus) plus a `wd_locus_note`. Quote those tool-computed counts in your answer; NEVER eyeball the diagram, never call the lower main sequence a "WD cooling track", and never answer WD counts from memory. Include astrometric quality cuts (e.g. parallax_over_error > 5 with its NaN finiteness guard) in the selection before quoting candidate counts.
 - **DATA LAB EXPERT SQL**: datalab_sql_query requires a bound: a q3c cone (q3c_radial_query), an indexed equality (e.g. SMASH `fieldid = 169`, `id = '169.429960'`, DESI `targetid = N`), a registry-approved BETWEEN box, or a GROUP BY aggregate on an aggregate-safe table. All-sky ROW-level pulls are rejected — use aggregates for footprints/histograms. Wide `datalab_density_aggregate` cones that exceed the sync window auto-tile into sub-cones and merge — call it ONCE with the full cone rather than hand-tiling. If a query returns a jobid, poll datalab_job_status a FEW times only; when the result says stop_polling, end the turn and tell the user the job is still running.
 - **DATA LAB NaN CONVENTION (CRITICAL for correctness)**: Data Lab tables store missing float values as NaN (not SQL NULL), and Postgres orders NaN ABOVE every real number — so a bare `col > x`, `col >= x`, or `col != x` cut silently ADMITS every missing-value row (e.g. `parallax_over_error > 5` alone returns thousands of rows that have NO astrometry). In datalab_sql_query, every one-sided lower-bound or not-equal cut on a nullable float column (parallax, pm, pmra, pmdec, parallax_over_error, mags, colors, snr_*, chi2, …) MUST carry a finiteness guard: `AND col < 'Infinity'` — e.g. `WHERE parallax_over_error > 5 AND parallax_over_error < 'Infinity' AND pm > 150 AND pm < 'Infinity'`. Cuts with an upper bound (`<`, `<=`, BETWEEN, two-sided ranges) are already NaN-safe. The structured value_cuts on datalab tools add this guard automatically — prefer them when possible.
 - **SURVEY COVERAGE CLAIMS**: Before claiming a catalog contains (or lacks) a target/region, check the `footprint` field returned by datalab_list_catalogs / datalab_describe_table, or call survey_covers_position for the exact position. NEVER list every catalog as covering a target — curate by footprint (e.g. the LMC is NOT covered by SDSS, DESI, LS DR9, or DES).
@@ -1899,6 +1948,209 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             label += f' ("{", ".join(hint_parts)[:80]}")'
         return label
 
+    # ── Tool wall-clock budget (slow-archive guard) ────────────────────
+    # One stuck external service must not hold a whole turn hostage (live
+    # 2026-07-18: a single CADC TAP search ran 477 s while the UI showed
+    # "Generating answer"). Tools run on a worker thread; when the budget
+    # expires the turn reclaims control and hands the model a structured
+    # timeout error it can answer around. Set QUASAR_TOOL_TIMEOUT_SECONDS=0
+    # to disable the guard entirely (legacy inline execution).
+    _TOOL_TIMEOUT_DEFAULT_SECONDS = 150.0
+    # Tools that legitimately run long (multi-step research, bulk downloads).
+    _TOOL_TIMEOUT_OVERRIDES: Dict[str, float] = {
+        "web_research": 420.0,
+        "download_alma_data": 600.0,
+    }
+
+    @classmethod
+    def _tool_timeout_seconds(cls, tool_name: str) -> Optional[float]:
+        """Resolve the wall-clock budget for one tool; None = no budget."""
+        raw = os.getenv("QUASAR_TOOL_TIMEOUT_SECONDS", "").strip()
+        try:
+            default = float(raw) if raw else cls._TOOL_TIMEOUT_DEFAULT_SECONDS
+        except ValueError:
+            default = cls._TOOL_TIMEOUT_DEFAULT_SECONDS
+        if default <= 0:
+            return None
+        budget = cls._TOOL_TIMEOUT_OVERRIDES.get(tool_name, default)
+        # Per-tool env override: QUASAR_TOOL_TIMEOUT_OVERRIDES="web_research=600,search_cadc=90"
+        for pair in os.getenv("QUASAR_TOOL_TIMEOUT_OVERRIDES", "").split(","):
+            name, sep, secs = pair.partition("=")
+            if sep and name.strip() == tool_name:
+                try:
+                    val = float(secs)
+                except ValueError:
+                    continue
+                budget = val if val > 0 else None
+        return budget
+
+    def _execute_tool_guarded(
+        self,
+        tool,
+        args: Dict[str, Any],
+        *,
+        tool_name: str,
+        step_label: Optional[str] = None,
+        on_status=None,
+        heartbeat_seconds: Optional[float] = None,
+        timeout_seconds: Optional[float] = None,
+    ):
+        """Execute a tool with liveness heartbeats and a wall-clock budget.
+
+        With a budget, the tool runs on a fresh daemon thread so this thread
+        can give up waiting. The worker re-installs the request-scoped LLM
+        context (BYOK/quota accounting — same A2 CX-01 mechanism the
+        Conductor uses) and, because the agent's run-result state is
+        thread-local, hands its TLS deltas back for the parent to merge.
+        A worker that finishes AFTER the deadline is abandoned: its deltas
+        are discarded so a stale archive result can never leak into a later
+        round or another request.
+        """
+        budget = (
+            timeout_seconds if timeout_seconds is not None
+            else self._tool_timeout_seconds(tool_name)
+        )
+
+        interval: Optional[float] = None
+        if on_status is not None:
+            interval = (
+                float(heartbeat_seconds)
+                if heartbeat_seconds is not None
+                else float(os.getenv("TOOL_PROGRESS_HEARTBEAT_SECONDS", "15"))
+            )
+            interval = max(1.0 if heartbeat_seconds is None else 0.001, interval)
+
+        if budget is None:
+            # Guard disabled — legacy inline execution (heartbeats aside).
+            if on_status is None:
+                return tool.execute(**args)
+            stopped = threading.Event()
+
+            def emit_heartbeats():
+                while not stopped.wait(interval):
+                    try:
+                        on_status(
+                            f"__tool_heartbeat__{tool_name}::{step_label or tool_name}",
+                            "meta",
+                        )
+                    except Exception:
+                        pass
+
+            heartbeat = threading.Thread(
+                target=emit_heartbeats,
+                name=f"quasar-tool-heartbeat-{tool_name[:32]}",
+                daemon=True,
+            )
+            heartbeat.start()
+            try:
+                return tool.execute(**args)
+            finally:
+                stopped.set()
+                heartbeat.join(timeout=min(1.0, interval))
+
+        from core.llm_client import (
+            get_langfuse_parent,
+            get_llm_request_context,
+            reinstall_llm_request_context,
+            set_langfuse_parent,
+        )
+
+        parent_llm_ctx = get_llm_request_context()
+        parent_lf = get_langfuse_parent()
+
+        lock = threading.Lock()
+        done = threading.Event()
+        outcome: Dict[str, Any] = {}
+
+        def run_tool():
+            set_langfuse_parent(parent_lf)
+            local: Dict[str, Any] = {}
+            try:
+                with reinstall_llm_request_context(parent_llm_ctx):
+                    local["result"] = tool.execute(**args)
+            except BaseException as exc:  # re-raised on the parent thread
+                local["exc"] = exc
+            # This thread's TLS started empty, so its state IS this call's delta.
+            local["acc"] = list(self._accumulated_run_results)
+            local["trace"] = list(self._accumulated_tool_trace)
+            local["last_run_result"] = self.last_run_result
+            local["last_search_results"] = self.last_search_results
+            local["alma"] = dict(self._alma_tap_provenance_state)
+            with lock:
+                if not outcome.get("abandoned"):
+                    outcome.update(local)
+                done.set()
+
+        worker = threading.Thread(
+            target=run_tool,
+            name=f"quasar-tool-{tool_name[:32]}",
+            daemon=True,
+        )
+        start = time.monotonic()
+        worker.start()
+        next_beat = (start + interval) if interval is not None else None
+        while True:
+            now = time.monotonic()
+            remaining = budget - (now - start)
+            if remaining <= 0:
+                break
+            wait_for = remaining
+            if next_beat is not None:
+                wait_for = min(wait_for, next_beat - now)
+            if done.wait(timeout=max(0.05, wait_for)):
+                break
+            if next_beat is not None and time.monotonic() >= next_beat:
+                try:
+                    on_status(
+                        f"__tool_heartbeat__{tool_name}::{step_label or tool_name}",
+                        "meta",
+                    )
+                except Exception:
+                    pass
+                next_beat += interval
+
+        with lock:
+            finished = done.is_set()
+            if not finished:
+                outcome["abandoned"] = True
+
+        if finished:
+            self._accumulated_run_results.extend(outcome.get("acc") or [])
+            self._accumulated_tool_trace.extend(outcome.get("trace") or [])
+            if outcome.get("last_run_result") is not None:
+                self.last_run_result = outcome["last_run_result"]
+            if outcome.get("last_search_results") is not None:
+                self.last_search_results = outcome["last_search_results"]
+            alma = outcome.get("alma") or {}
+            if alma.get("query") is not None or alma.get("url") is not None:
+                self._alma_tap_provenance_state.update(alma)
+            if "exc" in outcome:
+                raise outcome["exc"]
+            return outcome.get("result")
+
+        logger.warning(
+            f"[TOOL ⏱] {tool_name} exceeded its {budget:.0f}s budget — "
+            "abandoned (the worker keeps running detached; its result is discarded)"
+        )
+        if on_status is not None and step_label:
+            try:
+                on_status(
+                    f"{step_label} timed out after {int(budget)}s — continuing with available data",
+                    "completed",
+                )
+            except Exception:
+                pass
+        return {
+            "success": False,
+            "timeout": True,
+            "error": (
+                f"TIMEOUT: '{tool_name}' did not finish within its "
+                f"{int(budget)}-second budget. The external service is responding "
+                "slowly right now. Do NOT retry this exact call; answer with the "
+                "data you already have, or try a different or narrower query."
+            ),
+        }
+
     def _execute_tool_with_progress(
         self,
         tool,
@@ -1910,38 +2162,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         heartbeat_seconds: Optional[float] = None,
     ):
         """Execute a synchronous tool while emitting hidden liveness events."""
-        if on_status is None:
-            return tool.execute(**args)
-
-        interval = (
-            float(heartbeat_seconds)
-            if heartbeat_seconds is not None
-            else float(os.getenv("TOOL_PROGRESS_HEARTBEAT_SECONDS", "15"))
+        return self._execute_tool_guarded(
+            tool,
+            args,
+            tool_name=tool_name,
+            step_label=step_label,
+            on_status=on_status,
+            heartbeat_seconds=heartbeat_seconds,
         )
-        interval = max(1.0 if heartbeat_seconds is None else 0.001, interval)
-        stopped = threading.Event()
-
-        def emit_heartbeats():
-            while not stopped.wait(interval):
-                try:
-                    on_status(
-                        f"__tool_heartbeat__{tool_name}::{step_label}",
-                        "meta",
-                    )
-                except Exception:
-                    pass
-
-        heartbeat = threading.Thread(
-            target=emit_heartbeats,
-            name=f"quasar-tool-heartbeat-{tool_name[:32]}",
-            daemon=True,
-        )
-        heartbeat.start()
-        try:
-            return tool.execute(**args)
-        finally:
-            stopped.set()
-            heartbeat.join(timeout=min(1.0, interval))
 
     def _build_web_sources_event(self, web_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize web-tool outputs into the frontend source-card event."""
@@ -2474,20 +2702,24 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             if isinstance(state, dict):
                 state["query"] = None
                 state["url"] = None
+                state["note"] = None
             out = fn(**kwargs)
             query = state.get("query") if isinstance(state, dict) else None
             url = state.get("url") if isinstance(state, dict) else None
+            note = state.get("note") if isinstance(state, dict) else None
             if query and isinstance(out, dict) and PROVENANCE_SIDECAR_KEY not in out:
-                out = {
-                    **out,
-                    PROVENANCE_SIDECAR_KEY: {
-                        "provenance": {
-                            "service": "alma",
-                            "query": query,
-                            "endpoint": url,
-                        }
-                    },
+                sidecar = {
+                    "provenance": {
+                        "service": "alma",
+                        "query": query,
+                        "endpoint": url,
+                    }
                 }
+                if note:
+                    # Equivalence disclosure (CX-38): renders as the request
+                    # snippet under the copyable query.
+                    sidecar["reproducible_snippet"] = note
+                out = {**out, PROVENANCE_SIDECAR_KEY: sidecar}
             return out
 
         return _wrapped
@@ -3204,10 +3436,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         allowed = {"ra_col", "dec_col", "color_by", "title", "dark_mode"}
         result_id = str(kw.pop("result_id", "") or "").strip()
         clean = {k: v for k, v in kw.items() if k in allowed}
+        _trunc_warnings: List[str] = []
         if result_id:
+            from services.datalab_analysis import _truncation_warnings
             from services.datalab_result_store import default_result_store
 
-            frame = default_result_store().get(result_id).dataframe
+            res = default_result_store().get(result_id)
+            frame = res.dataframe
+            # A LIMIT-capped source is a storage-order, spatially clustered
+            # slice — plotting it as "the on-sky distribution" is the exact
+            # C1/P9 failure (map excluded Pal 5 itself). Surface the source's
+            # own truncation verdict on the tool output AND the card, so the
+            # model must disclose or rebuild via a server-side aggregate.
+            # (scan-L3 / C1 reopen, live 2026-07-18)
+            _trunc_warnings = _truncation_warnings(res.provenance)
             records = frame.to_dict("records")
             # Data Lab rows use ra/dec, not the archive default s_ra/s_dec.
             clean.setdefault("ra_col", "ra" if "ra" in frame.columns else "s_ra")
@@ -3221,6 +3463,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         out = self.plotting_service.plot_sky_map(data_records=records, **clean)
         if not isinstance(out, dict) or not out.get("success"):
             return out
+        if _trunc_warnings:
+            out["warnings"] = list(out.get("warnings") or []) + _trunc_warnings  # (scan-L3)
         # Attach the image card ourselves: display must not depend on the model
         # pasting the right URL (live P11 re-run: it embedded the WINDOWS FILE
         # PATH from png_path, so a successful map never appeared in chat).
@@ -3288,9 +3532,23 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         tool_name: str,
         warnings: Optional[List[str]] = None,
         provenance: Optional[Dict[str, Any]] = None,
+        upstream_total: Optional[int] = None,
     ) -> Dict[str, Any]:
         df = pd.DataFrame(rows, columns=columns)
         warnings_list = list(warnings or [])
+        # Upstream-partial (f2-CX-22): when the caller KNOWS the remote service
+        # had more rows than it returned (e.g. lightkurve's total_available),
+        # stamp it structurally so the card cannot offer the capped slice as a
+        # complete dataset. Warnings alone never flip the export verdict.
+        _upstream_flags: Dict[str, Any] = {}
+        try:
+            if upstream_total is not None and int(upstream_total) > len(df):
+                _upstream_flags = {
+                    "upstream_truncated": True,
+                    "upstream_total": int(upstream_total),
+                }
+        except (TypeError, ValueError):
+            _upstream_flags = {}
         self.last_run_result = {
             "type": "data",
             "data": df,
@@ -3300,6 +3558,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "table_kind": "external_catalog",
             "warnings": warnings_list,
             "partial": bool(warnings_list),
+            **_upstream_flags,
         }
         preview_rows, _ = datalab_fit_rows(compact_preview_frame(df), 10, char_budget=4000)
         return {
@@ -3483,6 +3742,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 tool_name="survey_coverage",
                 warnings=result.get("warnings", []),
                 provenance=result.get("provenance", {}),
+                # MOCServer reports the remote total it capped from (f2-CX-22).
+                upstream_total=result.get("total_matches"),
             )
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -3820,6 +4081,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 tool_name="search_space_lightcurves",
                 warnings=result.get("warnings", []),
                 provenance=result.get("provenance", {}),
+                # The suite reports the remote total it capped from (f2-CX-22).
+                upstream_total=result.get("total_available"),
             )
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -3896,6 +4159,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 tool_name="search_pulsars",
                 warnings=result.get("warnings", []),
                 provenance=result.get("provenance", {}),
+                # ATNF reports the remote total it capped from (f2-CX-22).
+                upstream_total=result.get("total_matches"),
             )
             table_result["target"] = label
             if self.last_run_result is not None:
@@ -4485,10 +4750,32 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 result = tool.execute(**kwargs)
                 # Sandbox user code sees the same dict the model does — the
                 # provenance sidecar is transport plumbing, not tool output.
-                result, _ = self._pop_provenance_sidecar(result)
+                result, _sidecar = self._pop_provenance_sidecar(result)
+                # A data call made from sandbox code is still a data call the
+                # user can audit (CX-12): record it into the per-request trace
+                # with its exact request. On the request thread this reaches
+                # the live trace directly; on conductor executor threads
+                # (compute-node sandbox runs included) _record_tool_trace
+                # routes it into the request-scoped collector (CX-11).
+                self._record_tool_trace(
+                    tool_name,
+                    kwargs if isinstance(kwargs, dict) else {},
+                    "",
+                    result_obj=result if isinstance(result, dict) else None,
+                    provenance=_sidecar,
+                )
                 return result
             except Exception as e:
-                return {"error": f"Tool '{tool_name}' execution failed: {e}"}
+                # A FAILED nested call is auditable too (CX-12) — record it
+                # before mapping to the sandbox-facing error dict.
+                err_payload = {"error": f"Tool '{tool_name}' execution failed: {e}"}
+                self._record_tool_trace(
+                    tool_name,
+                    kwargs if isinstance(kwargs, dict) else {},
+                    "",
+                    result_obj=err_payload,
+                )
+                return err_payload
         return {"error": f"Unknown tool: '{tool_name}'. Available: {[t.name for t in self.tool_registry.list_tools()]}"}
 
     def process_query(self, query: str, user_id: str = "user") -> Tuple[Optional[Any], str, str]:
@@ -4561,6 +4848,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     ) -> str:
         """
         Execute a sub-task using a mini Responses API call with full tool access.
+
+        Tool-call tracing on this (pooled executor) thread routes through the
+        request-scoped conductor collector — see _record_tool_trace (CX-11) —
+        so sub-agent calls reach the parent request's provenance surface.
 
         This is the callback passed to Conductor so each DAG node can use
         all 28+ registered tools (ALMA search, ADS, Splatalogue, etc.).
@@ -4667,12 +4958,25 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     )
                     if isinstance(_conductor_image_result, dict) and _conductor_image_result.get("type") == "image":
                         if hasattr(self, '_conductor_images'):
+                            _img_entry = _conductor_image_result.copy()
+                            # The producing tool's name rides with the image
+                            # (CX-14): sse.py's fallback derives the per-card
+                            # request from the conductor trace BY tool name, so
+                            # an entry without one had no provenance surface.
+                            _img_entry.setdefault("tool_name", fn_name)
+                            # ...and the producing call's exact trace id, so
+                            # two conductor calls to the SAME tool resolve
+                            # their OWN requests, not both the latest by
+                            # name. (A1 CX-14 sliver)
+                            _tc_id = getattr(self._tls, "last_trace_call_id", None)
+                            if _tc_id:
+                                _img_entry.setdefault("trace_call_id", _tc_id)
                             lock = getattr(self, '_conductor_images_lock', None)
                             if lock:
                                 with lock:
-                                    self._conductor_images.append(_conductor_image_result.copy())
+                                    self._conductor_images.append(_img_entry)
                             else:
-                                self._conductor_images.append(_conductor_image_result.copy())
+                                self._conductor_images.append(_img_entry)
                         img_url = _conductor_image_result.get("image_url", "")
                         caption = _conductor_image_result.get("caption", "")
                         tool_summaries.append(
@@ -4754,6 +5058,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         query/endpoint, which the model-facing dict does not."""
         try:
             trace = self._accumulated_tool_trace
+            # Reset BEFORE the cap check so a call that records nothing can
+            # never leave a stale id for the conductor image capture to pick
+            # up as its own. (A1 CX-14 sliver)
+            self._tls.last_trace_call_id = None
             if len(trace) >= 200:
                 return
             ok = True
@@ -4781,7 +5089,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "arguments": args if isinstance(args, dict) else {},
                 "output": (result_str or "")[:2000],
                 "ok": ok,
+                # Unique per-call identity: two calls to the SAME tool must
+                # each resolve their OWN request downstream, never latest-by-
+                # name (sse._request_from_trace). (A1 CX-14 sliver)
+                "call_id": uuid.uuid4().hex[:12],
             }
+            # Published thread-locally so the conductor image capture (which
+            # runs right after _dispatch_tool_call on this same thread) can
+            # stamp the producing call's id onto its image dict.
+            self._tls.last_trace_call_id = record["call_id"]
             # The uniform, redacted request surface (Feature 1). `sql` below is
             # RETAINED for back-compat: Benchmark/datalabbench scores against it
             # via trace_regex.
@@ -4798,6 +5114,26 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 record["sql"] = sql[:1500]
             if isinstance(rowcount, (int, float)):
                 record["rowcount"] = int(rowcount)
+            # Conductor/sandbox executor threads: their thread-local trace is
+            # invisible to the request, so route the record into the REQUEST-
+            # scoped collector riding the accounting context (CX-11/CX-39).
+            # The owner check keeps the request thread's own records in its
+            # live TLS trace, and the context object is per-request, so
+            # concurrent turns can never cross-append (unlike the previous
+            # singleton-attribute collector).
+            try:
+                import threading as _threading
+
+                from core.llm_client import get_llm_request_context
+
+                _ctx = get_llm_request_context()
+                _coll = getattr(_ctx, "tool_trace_collector", None) if _ctx else None
+                if _coll and _coll.get("owner") != _threading.get_ident():
+                    with _coll["lock"]:
+                        _coll["calls"].append(record)
+                    return
+            except Exception:
+                pass
             trace.append(record)
         except Exception:
             pass
@@ -4830,7 +5166,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         _sidecar = None
         if tool:
             try:
-                result = tool.execute(**args)
+                result = self._execute_tool_guarded(tool, args, tool_name=tool_name)
                 result, _sidecar = self._pop_provenance_sidecar(result)
                 result_obj = result if isinstance(result, dict) else None
                 result_str = _json.dumps(result, default=str)[:8000]

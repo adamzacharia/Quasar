@@ -73,6 +73,7 @@ export function hips2fitsUrl({ ra, dec, fovDeg, survey, width = HIPS_DEFAULT_SIZ
  * @returns {{kind?: string, ra?: number, dec?: number, fovDeg?: number, survey?: string,
  *            fitsUrl?: string,
  *            frames?: {url: string, label?: string}[],
+ *            warnings?: string[],
  *            mocs?: {id: string, name?: string, color?: string, order?: number,
  *                    mocJson: Record<string, number[]>}[]} | undefined}
  */
@@ -115,6 +116,20 @@ export function normalizeHipsImageMeta(meta) {
             frames.push(entry);
         }
         if (frames.length) out.frames = frames;
+    }
+
+    // Registration/coverage caveats from the epoch service (A3 CX-18): the
+    // normalizer used to strip this field, so the on-card amber warning never
+    // rendered and an unregistered epoch could read as a real transient.
+    if (Array.isArray(meta.warnings)) {
+        // Strings only (CX-36): coercing objects/numbers through String()
+        // rendered "[object Object]" garbage on the card.
+        const warnings = meta.warnings
+            .filter((w) => typeof w === "string")
+            .map((w) => w.trim())
+            .filter(Boolean)
+            .slice(0, 10);
+        if (warnings.length) out.warnings = warnings;
     }
 
     // Survey footprint overlays (MOC geometry) for the interactive view.

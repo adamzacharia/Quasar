@@ -11,7 +11,13 @@ _SECRET_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}\b"),
-    re.compile(r"(?i)(api[_-]?key|authorization|x-api-key|bearer)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{12,})"),
+    # The canonical HTTP header form has NO ':'/'=' between the scheme and the
+    # token ("Authorization: Bearer eyJ...") — the key[:=]value pattern below
+    # missed it entirely, so live JWTs survived into user-visible errors and
+    # admin exports (scan SR-01). Value class includes +/=/. so standard-base64
+    # and JWT segments redact fully (SR-02).
+    re.compile(r"(?i)\bbearer\s+([A-Za-z0-9_\-\.+/=]{12,})"),
+    re.compile(r"(?i)(api[_-]?key|authorization|x-api-key|bearer)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.+/=]{12,})"),
 ]
 
 

@@ -54,6 +54,11 @@ def _store_rows(ctx, rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Option
     try:
         import pandas as pd
 
+        # Scope the stored rows to their requesting user so the export
+        # route's owner guard can serve them (f2-CX-01 / dl-export-owner-gap).
+        user_id = getattr(ctx, "user_id", None)
+        if user_id:
+            meta = {**meta, "owner_id": str(user_id)}
         return store.put(pd.DataFrame(rows), meta=meta)
     except Exception:
         logger.debug("SPARCL result-store put failed", exc_info=True)

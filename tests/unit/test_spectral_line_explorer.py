@@ -351,6 +351,255 @@ def test_confusion_scoring_boundaries_and_exclusion():
     assert result["candidates"][0]["line_id"] == "other"
 
 
+def test_confusion_velocity_offset_sign_is_optical_convention():
+    # confusion-velocity-offset-sign: a candidate at HIGHER observed frequency
+    # is BLUESHIFTED relative to the target -> NEGATIVE velocity offset.
+    higher = confusion_score(
+        {"observed_frequency_ghz": 100.010},
+        target_frequency_ghz=100.0,
+        window_mhz=20,
+    )
+    assert higher["velocity_offset_kms"] == pytest.approx(-29.979, abs=0.01)
+    lower = confusion_score(
+        {"observed_frequency_ghz": 99.990},
+        target_frequency_ghz=100.0,
+        window_mhz=20,
+    )
+    assert lower["velocity_offset_kms"] == pytest.approx(29.979, abs=0.01)
+
+
+def test_project_ranking_zero_separation_and_zero_margin_not_penalized():
+    # project-ranking-falsy-zero-inversion: 0.0 separation must rank the
+    # on-target project first, not be treated as "missing".
+    line = {
+        "line_id": "L",
+        "species": "CO",
+        "transition": "2-1",
+        "observed_frequency_ghz": 100.0,
+    }
+
+    def row(project, separation):
+        return {
+            "proposal_id": project,
+            "angular_separation_arcsec": separation,
+            "t_exptime": 100,
+            "s_resolution": 1.0,
+            "matching_lines": [
+                {
+                    "line": dict(line),
+                    "best_classification": "full",
+                    "usable": True,
+                    "spws": [
+                        {
+                            "classification": "full",
+                            "usable": True,
+                            "edge_margin_mhz": 5.0,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    projects = ALMACoverageService._group_projects(
+        [row("OFFSET-45", 45.0), row("ON-TARGET", 0.0)],
+        [dict(line)],
+        "any",
+    )
+    assert [item["proposal_id"] for item in projects] == ["ON-TARGET", "OFFSET-45"]
+
+
+def _make_confusion_service(tmp_path, monkeypatch, captured):
+    service = SpectralLineJobService(
+        cache_dir=tmp_path / "jobs",
+        ttl_seconds=60,
+        max_workers=1,
+        max_rows=10,
+    )
+
+    def fake_query_catalog(query, cancel_event=None):
+        captured.append(query)
+        lines = [
+            {
+                "line_id": "cand",
+                "raw_line_ids": ["cand"],
+                "species": "HCN",
+                "transition": "3-2",
+                "frequency_ghz": 100.010,
+                "catalogs": ["CDMS"],
+            }
+        ]
+        return {
+            "lines": [dict(item) for item in lines],
+            "raw_lines": [dict(item) for item in lines],
+            "backend": "test",
+            "degraded": False,
+            "warnings": [],
+            "query_provenance": {"backend": "test"},
+        }
+
+    monkeypatch.setattr(service.splatalogue, "query_catalog", fake_query_catalog)
+    return service
+
+
+def _wait_terminal(service, job):
+    deadline = time.time() + 3
+    current = job
+    while current["status"] not in {"succeeded", "partial", "failed"} and time.time() < deadline:
+        time.sleep(0.02)
+        current = service.get_job(user_id="u1", job_id=job["job_id"])
+    return current
+
+
+def test_confusion_without_redshift_runs_at_z0_and_discloses(tmp_path, monkeypatch):
+    # confusion-no-redshift-always-fails + confusion-velocity-width-doubled
+    captured = []
+    service = _make_confusion_service(tmp_path, monkeypatch, captured)
+    try:
+        job = service.create_job(
+            user_id="u1",
+            operation="confusion",
+            payload={
+                "selected_line": {
+                    "line_id": "sel",
+                    "raw_line_ids": ["sel"],
+                    "species": "CO",
+                    "transition": "1-0",
+                    "frequency_ghz": 100.0,
+                },
+                "velocity_width_kms": 100,
+            },
+        )
+        current = _wait_terminal(service, job)
+        assert current["status"] == "partial"  # disclosure warning present
+        context = current["result_context"]
+        assert context["assumed_redshift_zero"] is True
+        assert any("assumed z=0" in warning for warning in current["warnings"])
+        # FULL velocity width: half-width = (dv/2)/c * f = 16.678 MHz at 100 GHz
+        assert context["window_mhz"] == pytest.approx(16.678, abs=0.01)
+        query = captured[0]
+        assert query.redshift == pytest.approx(0.0)
+        assert query.windows[0].minimum_ghz == pytest.approx(100.0 - 0.016678, abs=1e-5)
+        assert query.windows[0].maximum_ghz == pytest.approx(100.0 + 0.016678, abs=1e-5)
+        # Candidate at higher observed frequency reports a negative
+        # (blueshifted) velocity offset in the returned rows.
+        assert current["rows"][0]["velocity_offset_kms"] == pytest.approx(
+            -29.979, abs=0.01
+        )
+    finally:
+        service.shutdown()
+
+
+def test_confusion_rest_only_line_without_redshift_derives_observed_at_z0(
+    tmp_path, monkeypatch
+):
+    # confusion-no-redshift-always-fails RESIDUAL (found live 2026-07-18): a
+    # selected_line carrying ONLY rest_frequency_ghz with no redshift used to
+    # die on "selected_line requires an observed frequency" because the z=0
+    # default was applied AFTER the frequency-frame derivation. Observed ==
+    # rest at z=0, so this must run and disclose, like any other no-redshift
+    # confusion search.
+    captured = []
+    service = _make_confusion_service(tmp_path, monkeypatch, captured)
+    try:
+        job = service.create_job(
+            user_id="u1",
+            operation="confusion",
+            payload={
+                "selected_line": {
+                    "line_id": "sel",
+                    "raw_line_ids": ["sel"],
+                    "species": "CO",
+                    "transition": "1-0",
+                    "rest_frequency_ghz": 100.0,
+                },
+                "window_mhz": 50,
+            },
+        )
+        current = _wait_terminal(service, job)
+        assert current["status"] == "partial"  # ran + disclosure, not an error
+        assert current.get("error") is None
+        context = current["result_context"]
+        assert context["assumed_redshift_zero"] is True
+        assert any("assumed z=0" in warning for warning in current["warnings"])
+        query = captured[0]
+        assert query.redshift == pytest.approx(0.0)
+        # Window centered on rest==observed at z=0.
+        assert query.windows[0].minimum_ghz == pytest.approx(100.0 - 0.05, abs=1e-6)
+        assert query.windows[0].maximum_ghz == pytest.approx(100.0 + 0.05, abs=1e-6)
+    finally:
+        service.shutdown()
+
+
+def test_cancel_never_downgrades_terminal_job_and_flag_survives_worker_write(
+    tmp_path,
+):
+    # sle-cancel-clobbers-completed-job: locked read-modify-write on both sides.
+    service = SpectralLineJobService(
+        cache_dir=tmp_path / "jobs",
+        ttl_seconds=60,
+        max_workers=1,
+        max_rows=10,
+    )
+    try:
+        running = {
+            "job_id": "job-1",
+            "user_id": "u1",
+            "operation": "catalog_search",
+            "status": "running",
+            "phase": "querying",
+            "progress": 50,
+            "payload": {},
+            "created_at": "now",
+            "updated_at": "now",
+            "warnings": [],
+            "summary": {},
+            "result": None,
+            "error": None,
+            "cancel_requested": False,
+        }
+        service._save(dict(running))
+        # User cancels while the job is running.
+        public = service.cancel_job(user_id="u1", job_id="job-1")
+        assert public["cancel_requested"] is True
+        # Worker then finishes from its STALE local snapshot: the persisted
+        # cancel flag must be merged, not clobbered, and the result kept.
+        stale_worker_copy = dict(running)
+        service._update(
+            stale_worker_copy,
+            status="succeeded",
+            result={"lines": [{"line_id": "1"}]},
+        )
+        stored = service.cache.get("job-1")
+        assert stored["status"] == "succeeded"
+        assert stored["result"] == {"lines": [{"line_id": "1"}]}
+        assert stored["cancel_requested"] is True
+        # A late cancel against the terminal record must not downgrade it.
+        public = service.cancel_job(user_id="u1", job_id="job-1")
+        assert public["status"] == "succeeded"
+        stored = service.cache.get("job-1")
+        assert stored["status"] == "succeeded"
+        assert stored["result"] == {"lines": [{"line_id": "1"}]}
+    finally:
+        service.shutdown()
+
+
+def test_create_job_enforces_per_user_limit_under_lock(tmp_path, monkeypatch):
+    # sle-double-submit-check-then-act: the limit check still rejects a third
+    # job (now performed atomically with the initial save under self._lock).
+    service = SpectralLineJobService(
+        cache_dir=tmp_path / "jobs",
+        ttl_seconds=60,
+        max_workers=1,
+        max_rows=10,
+    )
+    try:
+        monkeypatch.setattr(service, "_active_jobs_for_user", lambda user_id: 2)
+        with pytest.raises(ValueError, match="two spectral-line jobs"):
+            service.create_job(user_id="u1", operation="catalog_search", payload={})
+    finally:
+        service.shutdown()
+
+
 def test_job_pagination_cancellation_and_complete_export(tmp_path, monkeypatch):
     service = SpectralLineJobService(
         cache_dir=tmp_path / "jobs",

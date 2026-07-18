@@ -126,7 +126,15 @@ class DatalabResultStore:
             self._enforce_memory_bounds_locked()
         if self._cache is not None:
             try:
-                self._cache.set(result_id, payload, expire=self.ttl_seconds)
+                # TTL<=0 means "no expiry" here (_is_expired), but DiskCache
+                # treats expire=0 as "already expired" — pass None so the disk
+                # tier matches the documented in-memory semantics instead of
+                # silently storing nothing (ttl0-diskcache-immediate-expiry).
+                self._cache.set(
+                    result_id,
+                    payload,
+                    expire=self.ttl_seconds if self.ttl_seconds > 0 else None,
+                )
             except Exception:
                 pass
         return result_id
@@ -165,7 +173,11 @@ class DatalabResultStore:
         payload = None
         with self._lock:
             payload = self._memory.get(key)
-            if payload is not None and self._is_expired(payload):
+            # Only ephemeral dlr_ results carry the TTL: dlt_ my-table payloads
+            # are durable and must never be "expired" or evicted here — doing so
+            # destroyed saved tables outright when the disk cache was down
+            # (dl-mytable-ttl-expiry / dlt-lookup-ttl-data-loss).
+            if payload is not None and key.startswith("dlr_") and self._is_expired(payload):
                 # Evict expired in-memory results so long-running servers don't
                 # retain DataFrames past their TTL.
                 self._memory.pop(key, None)
@@ -177,6 +189,18 @@ class DatalabResultStore:
                 payload = self._cache.get(key)
             except Exception:
                 payload = None
+            # Same TTL discipline as lookup(): a disk hit past its TTL is not a
+            # live result — purge and fail like any unknown id. (f2-CX-18)
+            if (
+                isinstance(payload, Mapping)
+                and key.startswith("dlr_")
+                and self._is_expired(payload)
+            ):
+                try:
+                    self._cache.delete(key)
+                except Exception:  # noqa: BLE001 - purge is best-effort
+                    pass
+                payload = None
         if not isinstance(payload, Mapping):
             raise KeyError(f"Unknown Data Lab result_id: {result_id}")
         frame = payload.get("dataframe")
@@ -186,6 +210,12 @@ class DatalabResultStore:
         provenance = dict(meta.get("provenance") or meta)
         provenance.setdefault("result_id", key)
         provenance.setdefault("rowcount", int(len(frame)))
+        # Upstream truncation is part of the result's identity — every consumer
+        # of the stored frame must see it, or a capped slice re-fetched via
+        # datalab_get_result masquerades as a complete dataset (f2-CX-21).
+        for _key in ("upstream_truncated", "upstream_total"):
+            if _key in meta:
+                provenance.setdefault(_key, meta[_key])
         return DatalabResult.from_dataframe(frame, provenance)
 
     def _is_expired(self, payload: Mapping[str, Any]) -> bool:
@@ -193,6 +223,110 @@ class DatalabResultStore:
             return False
         created = float(payload.get("created_at") or 0.0)
         return (time.time() - created) > self.ttl_seconds
+
+    def lookup(self, result_id: str) -> tuple[Optional[pd.DataFrame], Dict[str, Any], str]:
+        """Resolve an id to ``(frame, meta, status)`` without raising.
+
+        ``status`` is ``ok``, ``expired`` (payload was still in memory but past
+        TTL — definitive), ``unknown`` (id is not a store id at all), or
+        ``gone`` (well-formed id with no payload anywhere: either it aged out
+        of both tiers or it belongs to another worker's memory, which we cannot
+        tell apart). Callers must treat ``gone`` as a hard failure — never as
+        "fall back to whatever partial data is at hand".
+        """
+        key = str(result_id or "").strip()
+        if not key or not (key.startswith("dlr_") or key.startswith("dlt_")):
+            return None, {}, "unknown"
+        with self._lock:
+            payload = self._memory.get(key)
+            # dlt_ my-tables are durable (no TTL) — expiry applies to dlr_ only
+            # (dl-mytable-ttl-expiry).
+            if payload is not None and key.startswith("dlr_") and self._is_expired(payload):
+                self._memory.pop(key, None)
+                return None, {}, "expired"
+            if payload is not None:
+                payload["last_used"] = time.time()
+        if payload is None and self._cache is not None:
+            try:
+                payload = self._cache.get(key)
+            except Exception:  # noqa: BLE001 - disk cache is best-effort
+                payload = None
+            # A disk hit must honor the same TTL as memory: DiskCache normally
+            # expires entries itself, but a payload written without an expire
+            # (legacy) or re-injected out-of-band can outlive that — never
+            # serve an aged dlr_ result as live. Purge the stale copy so it
+            # cannot resurrect again. (f2-CX-18)
+            if (
+                isinstance(payload, Mapping)
+                and key.startswith("dlr_")
+                and self._is_expired(payload)
+            ):
+                try:
+                    self._cache.delete(key)
+                except Exception:  # noqa: BLE001 - purge is best-effort
+                    pass
+                return None, {}, "expired"
+        if not isinstance(payload, Mapping):
+            return None, {}, "gone"
+        frame = payload.get("dataframe")
+        if not isinstance(frame, pd.DataFrame):
+            return None, {}, "gone"
+        meta = dict(payload.get("meta") or {})
+        # Expose the payload's creation time under a reserved key so /meta can
+        # report expiry without a second store round-trip. Underscore-prefixed
+        # so it can never shadow a producer-written meta field. (f2-CX-10)
+        meta["_created_at"] = float(payload.get("created_at") or 0.0)
+        return frame, meta, "ok"
+
+    def stamp_owner(self, result_id: str, owner_id: str) -> bool:
+        """Adopt an ownerless dlr_ result for ``owner_id``. (f2-CX-01)
+
+        Capability-minted results can reach the card serializer without an
+        ``owner_id`` in their meta; the export route refuses ownerless ids, so
+        the serializer stamps the requesting user here at reuse time. Returns
+        True when the payload now carries ``owner_id`` (including the
+        idempotent already-owned-by-them case); False when the id cannot be
+        resolved, is a dlt_ key, or already belongs to a DIFFERENT owner —
+        stamping never reassigns.
+        """
+        key = str(result_id or "").strip()
+        owner = str(owner_id or "").strip()
+        # dlt_ my-table keys are owner-scoped by namespace, never by meta.
+        if not owner or not key.startswith("dlr_"):
+            return False
+        with self._lock:
+            payload = self._memory.get(key)
+            if payload is None and self._cache is not None:
+                try:
+                    disk = self._cache.get(key)
+                except Exception:  # noqa: BLE001 - disk cache is best-effort
+                    disk = None
+                if isinstance(disk, Mapping):
+                    payload = dict(disk)
+            if not isinstance(payload, Mapping) or self._is_expired(payload):
+                return False
+            meta = dict(payload.get("meta") or {})
+            existing = str(meta.get("owner_id") or "").strip()
+            if existing:
+                return existing == owner
+            meta["owner_id"] = owner
+            payload = dict(payload)
+            payload["meta"] = meta
+            payload["last_used"] = time.time()
+            self._memory[key] = payload
+            self._enforce_memory_bounds_locked()
+            if self._cache is not None:
+                try:
+                    # Write-through PRESERVING the remaining TTL: stamping an
+                    # owner must not extend a result's life.
+                    expire = None
+                    if self.ttl_seconds > 0:
+                        age = time.time() - float(payload.get("created_at") or 0.0)
+                        expire = max(1.0, self.ttl_seconds - age)
+                    self._cache.set(key, payload, expire=expire)
+                except Exception:  # noqa: BLE001 - disk cache is best-effort
+                    pass
+        return True
 
     # ── My-tables (MyDB-lite): durable named tables, no TTL ────────────────────
     def save_result(
@@ -389,12 +523,18 @@ class DatalabResultStore:
         return dict(index) if isinstance(index, Mapping) else {}
 
 _DEFAULT_STORE: Optional[DatalabResultStore] = None
+# Guards first-time construction: two concurrent first serializations would
+# otherwise race to build competing stores, and a result put into the losing
+# store becomes unreachable — an immediate 410 on export. (f2-CX-02)
+_DEFAULT_STORE_LOCK = threading.Lock()
 
 
 def default_result_store() -> DatalabResultStore:
     global _DEFAULT_STORE
     if _DEFAULT_STORE is None:
-        _DEFAULT_STORE = DatalabResultStore()
+        with _DEFAULT_STORE_LOCK:  # double-checked locking (f2-CX-02)
+            if _DEFAULT_STORE is None:
+                _DEFAULT_STORE = DatalabResultStore()
     return _DEFAULT_STORE
 
 

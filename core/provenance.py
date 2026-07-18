@@ -100,6 +100,31 @@ def build_tool_request(
         endpoint = _clean(prov.get("endpoint"))
         query = _clean(prov.get("query"))
 
+        # Bespoke provenance shapes (CX-05): services predating the uniform
+        # contract carry their resolved endpoint/query under other names
+        # (HiPS `base_url`, VLASS `tap_url`, DataLink `soda_url`, VO `adql`) —
+        # honor them rather than falling through to the raw tool arguments.
+        # Remember WHICH key became the endpoint: the others (VLASS carries
+        # both tap_url and soda_url) must survive as request params, not drop.
+        endpoint_key = "endpoint" if endpoint else None
+        if not endpoint:
+            for _url_key in ("base_url", "tap_url", "soda_url"):
+                _url_val = _clean(prov.get(_url_key))
+                if _url_val:
+                    endpoint = _url_val
+                    endpoint_key = _url_key
+                    break
+        if not query:
+            query = _clean(prov.get("adql"))
+
+        # Explicit wire parameters (CX-06): when the service reports the literal
+        # query-string params it sent (HiPS base_url + params), the copyable
+        # line must include them or it cannot reproduce the request.
+        wire_params: Optional[Dict[str, Any]] = None
+        raw_params = prov.get("params") or prov.get("attempted_params")
+        if isinstance(raw_params, dict) and raw_params:
+            wire_params = _redact_mapping(raw_params)
+
         # Legacy fallbacks: pre-capability tools flatten the executed SQL onto
         # the result dict; the model's own `sql` argument is the last resort.
         if not query and isinstance(result_obj, dict):
@@ -114,6 +139,16 @@ def build_tool_request(
             request = {"kind": "adql", "text": redact_secrets(query)}
             if endpoint:
                 request["endpoint"] = redact_url(endpoint)
+            # A service can execute against MORE than one endpoint (VLASS:
+            # TAP for the plane search + SODA for the cutouts) — the unused
+            # url keys must survive as context, not drop (CX-05).
+            leftover_urls = {
+                k: redact_url(_clean(prov.get(k)))
+                for k in ("base_url", "tap_url", "soda_url")
+                if _clean(prov.get(k)) and k != endpoint_key
+            }
+            if leftover_urls:
+                request["params"] = _cap_struct(leftover_urls)
         elif service == "ads":
             q = query or _clean(args_dict.get("query")) or _clean(args_dict.get("q"))
             request = {"kind": "ads", "text": redact_secrets(q), "q": redact_secrets(q)}
@@ -134,6 +169,40 @@ def build_tool_request(
                 "url": url,
                 "text": url,
             }
+            if wire_params:
+                # Bake the executed params into the copy line (CX-06). Nested
+                # values can't ride a query string; they stay in `params`.
+                flat = {
+                    k: v for k, v in wire_params.items()
+                    if isinstance(v, (str, int, float, bool))
+                }
+                try:
+                    from urllib.parse import urlencode
+
+                    qs = urlencode(flat)
+                except Exception:  # pragma: no cover - defensive
+                    qs = ""
+                request["params"] = _cap_struct(wire_params)
+                if qs:
+                    request["text"] = url + ("&" if "?" in url else "?") + qs
+            else:
+                # No explicit wire params: surface the service's residual
+                # descriptive scalars (SIA catalog/ra/dec/fov…) for context —
+                # NOT baked into the copy line, since they are provenance
+                # metadata, not literal wire parameters.
+                residual = {
+                    k: v
+                    for k, v in prov.items()
+                    if k
+                    not in {
+                        "service", "endpoint", endpoint_key,
+                        "method", "query", "adql", "params", "attempted_params",
+                        "retrieved_at", "tool_name", "rowcount", "note",
+                    }
+                    and isinstance(v, (str, int, float, bool))
+                }
+                if residual:
+                    request["params"] = _cap_struct(_redact_mapping(residual))
         elif query:
             # Provenance-declared but neither SQL nor a URL: a parameterized
             # service call (Splatalogue / Spectral Line Explorer).
@@ -143,7 +212,26 @@ def build_tool_request(
                 "params": _cap_struct(_redact_mapping(args_dict)),
             }
         elif service:
-            params = _cap_struct(_redact_mapping(args_dict))
+            # Prefer the service's own executed-request payload over the raw
+            # tool args (CX-05): SparCL carries its literal search constraints
+            # and cone under `constraints`/scalars; raw args may differ from
+            # what actually ran (defaults, normalization, added query boxes).
+            executed = None
+            for key in ("constraints", "params", "criteria"):
+                if isinstance(prov.get(key), dict) and prov.get(key):
+                    executed = _redact_mapping(prov[key])
+                    break
+            if executed is not None:
+                residual = {
+                    k: v
+                    for k, v in prov.items()
+                    if k not in {"service", "constraints", "params", "criteria",
+                                 "retrieved_at", "tool_name", "rowcount"}
+                    and isinstance(v, (str, int, float, bool, list))
+                }
+                params = _cap_struct({**_redact_mapping(residual), **executed})
+            else:
+                params = _cap_struct(_redact_mapping(args_dict))
             request = {"kind": "params", "text": _dumps(params), "params": params}
         else:
             # No provenance at all (legacy tool): the arguments ARE the request.
@@ -156,7 +244,9 @@ def build_tool_request(
             # query string too, not just key-shaped tokens (CX-02).
             request["service"] = redact_url(service) if "://" in service else redact_secrets(service)
         if snippet:
-            request["snippet"] = _cap(redact_secrets(snippet))
+            # Snippets are code TEXT that can embed URLs ("curl https://x?TOKEN=…");
+            # redact_secrets alone misses query-string tokens inside them (CX-02).
+            request["snippet"] = _cap(_redact_urls_in_text(redact_secrets(snippet)))
         request["text"] = _cap(request.get("text") or "")
         return request
     except Exception:  # pragma: no cover - provenance must never break a call
@@ -167,6 +257,17 @@ def build_tool_request(
 # the browser AND get persisted, so a token in the query string must never
 # survive. `redact_url` is a no-op on non-URL text, so it is safe to run widely.
 _URLISH = re.compile(r"^\s*https?://", re.IGNORECASE)
+
+# URLs EMBEDDED in prose/code text (snippets): each one gets the query-param
+# redaction individually (CX-02 — `redact_url` only handles whole-string URLs).
+_EMBEDDED_URL = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+
+
+def _redact_urls_in_text(text: str) -> str:
+    try:
+        return _EMBEDDED_URL.sub(lambda m: redact_url(m.group(0)), text or "")
+    except Exception:  # pragma: no cover - redaction must never raise
+        return text or ""
 
 
 def _redact_value(val: Any, depth: int = 0) -> Any:

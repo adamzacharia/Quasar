@@ -167,6 +167,10 @@ class VlassEpochService:
             f"AND p.productID LIKE '%.quicklook' "
             f"AND CONTAINS(POINT('ICRS', {ra:.8f}, {dec:.8f}), p.position_bounds)=1"
         )
+        # Provenance capture (CX-05): the service is constructed per call, so
+        # this is request-local; epoch_comparison surfaces it as the executed
+        # plane-search query.
+        self.last_search_adql = adql
         return self._tap_csv(adql)
 
     def _query_science_artifacts(self, observation_ids: List[str]) -> Dict[str, str]:
@@ -233,12 +237,16 @@ class VlassEpochService:
                             f"{label}: reprojection onto the reference grid barely overlaps "
                             f"({overlap_frac * 100:.0f}%); shown on its native grid instead."
                         )
-                        out.append((label, data, header))
+                        # The label marker travels into the BlinkCard frame
+                        # badge/tooltips (CX-18): an unregistered frame must be
+                        # visually distinguishable, or a fixed source can appear
+                        # to move between epochs and read as a transient.
+                        out.append((f"{label} — UNREGISTERED", data, header))
                     else:
                         out.append((label, reprojected, ref_header))
                 except Exception as exc:
                     warnings.append(f"{label}: reprojection failed ({exc}); shown on its native grid.")
-                    out.append((label, data, header))
+                    out.append((f"{label} — UNREGISTERED", data, header))
             return out
         except Exception as exc:
             warnings.append(f"Epoch co-registration skipped ({exc}).")
@@ -458,6 +466,9 @@ class VlassEpochService:
                 "warnings": warnings,
                 "provenance": {
                     "service": "CADC TAP (argus) + SODA cutouts, collection=VLASS Quicklook",
+                    # The executed plane-search ADQL (CX-05) — the SODA cutout
+                    # sub-requests are per-artifact and ride the frames.
+                    "query": getattr(self, "last_search_adql", None),
                     "tap_url": self.tap_url,
                     "soda_url": self.soda_url,
                 },

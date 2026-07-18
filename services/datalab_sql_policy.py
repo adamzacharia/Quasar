@@ -273,11 +273,31 @@ def _add_nan_guards(query: str, clean: str, warnings: List[str]) -> tuple[str, s
     """
     if any(tok in query for tok in ("'", '"', "--", "/*")):
         return query, clean
+
+    def _adjacent_arithmetic(start: int, end: int) -> bool:
+        """True when the matched comparison is an operand of surrounding
+        arithmetic — e.g. the 'b > 0.5' inside 'a - b > 0.5' or the 'a > 0.5'
+        inside 'a > 0.5 - b'. Wrapping such a match in a boolean paren produced
+        invalid SQL ('numeric - boolean'), 400-ing every expert color/difference
+        cut (dl-nan-guard-corrupts-arithmetic-cuts). These fall through to the
+        advisory _warn_nan_unsafe_cuts path instead."""
+        i = start - 1
+        while i >= 0 and query[i].isspace():
+            i -= 1
+        if i >= 0 and query[i] in "+-*/":
+            return True
+        j = end
+        while j < len(query) and query[j].isspace():
+            j += 1
+        return j < len(query) and query[j] in "+-*/"
+
     guarded: List[str] = []
 
     def _sub(match: "re.Match[str]") -> str:
         full, col, op, num = match.group(1), match.group(2), match.group(3), match.group(4)
         if col.lower() in _NAN_EXEMPT_COLUMNS:
+            return match.group(0)
+        if _adjacent_arithmetic(match.start(), match.end()):
             return match.group(0)
         # An existing upper bound on the same column already excludes NaN.
         if re.search(rf"\b{re.escape(col)}\s*(?:<=?|BETWEEN)\s", clean, re.IGNORECASE):

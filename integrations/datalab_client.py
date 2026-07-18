@@ -282,7 +282,21 @@ class DatalabClient:
         while _time.monotonic() < deadline:
             state = self.status(str(jobid)).upper()
             if state == "COMPLETED":
-                result = self.results(str(jobid), query_text=query_text)
+                try:
+                    result = self.results(str(jobid), query_text=query_text)
+                except DatalabClientError as exc:
+                    # A results download that blows the wall clock must still
+                    # carry the jobid: the job COMPLETED server-side and the
+                    # caller registers exc.jobid so datalab_job_results can
+                    # fetch it later — otherwise the finished result is
+                    # unreachable (dl-results-download-timeout-loses-jobid).
+                    if getattr(exc, "jobid", None):
+                        raise
+                    raise DatalabClientError(
+                        f"{exc} — async fallback job {jobid} COMPLETED server-side; "
+                        f"fetch the rows with datalab_job_results using jobid={jobid}.",
+                        jobid=str(jobid),
+                    ) from exc
                 catalog, table = self._first_table(query_text)
                 # results() pre-fills catalog/table with None, so overwrite
                 # explicitly — setdefault would keep the Nones.

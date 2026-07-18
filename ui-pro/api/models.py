@@ -148,6 +148,10 @@ class PlanFeedbackRequest(BaseModel):
     conversation_id: str
     approve: bool = False
     feedback: str = ""
+    # UIAPI-08: addresses ONE run's pending plan review. Optional for back
+    # compat — without it the endpoint falls back to the conversation's most
+    # recently registered queue.
+    run_id: str = ""
 
 
 class UserToolRequest(BaseModel):

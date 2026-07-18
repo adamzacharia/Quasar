@@ -347,3 +347,46 @@ def test_list_tables_slow_service_fails_fast_not_hangs():
     assert out["success"] is False
     assert "slow" in out["error"].lower()
     assert elapsed < 3.0  # fails fast; never waits out the 5 s worker
+
+
+def test_list_tables_retries_case_sensitive_when_service_rejects_lower(monkeypatch):
+    """scan-L7 (live 2026-07-18): TAPVizieR's ADQL parser rejects LOWER()
+    ('Encountered "("...'), which used to dump every VizieR listing onto the
+    full-tableset download and die in pyvo's VOSI parse. The TAP_SCHEMA path
+    must retry case-SENSITIVE and disclose it."""
+    import services.vo_registry as vr
+
+    class _Result:
+        def __iter__(self):
+            return iter([])
+
+        def to_table(self):
+            import astropy.table
+            return astropy.table.Table(
+                rows=[("ivoa.demo", "A demo table")],
+                names=("table_name", "description"),
+            )
+
+    class _Svc:
+        def __init__(self):
+            self.queries = []
+
+        def run_sync(self, adql, maxrec=None):
+            self.queries.append(adql)
+            if "LOWER(" in adql:
+                raise vr.requests.RequestException(
+                    'Incorrect ADQL query:  Encountered "(". Was expecting one of: "."'
+                )
+            return _Result()
+
+    svc = _Svc()
+    service = vr.VoRegistryService()
+    monkeypatch.setattr(service, "_tap_service", lambda url: svc)
+
+    out = service.list_tables("https://example.org/tap", keyword="gaia", max_tables=5)
+
+    assert out["success"] is True
+    assert len(svc.queries) == 2  # LOWER() attempt, then the case-sensitive retry
+    assert "LOWER(" not in svc.queries[1]
+    assert any("case-sensitive" in w for w in out["warnings"])
+    assert out["rows"][0]["table_name"] == "ivoa.demo"

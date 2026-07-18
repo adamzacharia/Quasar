@@ -24,6 +24,7 @@ Scoring model (summary — full docs in RUBRIC.md):
 import os
 import sys
 import json
+import math
 import time
 import re
 import argparse
@@ -56,6 +57,7 @@ except ImportError:
 from dlb_dataset_v1 import (  # noqa: E402
     BENCH_NAME, BENCH_VERSION, TIER_WEIGHTS, TIER_LABELS,
     QUESTIONS, GLOBAL_PENALTIES, validate_dataset,
+    CHECKPOINT_AXES, axis_for_checkpoint, fabrication_guard_ids,
 )
 
 # ---------------------------------------------------------------------------
@@ -89,6 +91,9 @@ class Evidence:
     usage: Dict[str, int] = field(default_factory=dict)
     trace_source: str = "none"     # tool_trace | fallback | none
     raw_event_counts: Dict[str, int] = field(default_factory=dict)
+    # v1.2 (R3): the backend's mechanical citation recall/precision for the
+    # turn (citation_metrics SSE event). Informational only — never scored.
+    citation_metrics: Optional[Dict[str, Any]] = None
 
     # -- derived text blobs (cached) --
     _args_blob: Optional[str] = None
@@ -251,9 +256,15 @@ def safe_number(expr: str) -> Optional[float]:
     expr = (expr or "").strip()
     if not expr or len(expr) > 40 or not _NUM_EXPR_RE.match(expr):
         return None
+    # '**' passes the charset and eval('9**9**9') is a ~370-million-digit
+    # bignum that wedges the scorer — exponentiation is never a legitimate
+    # cone parameter, so reject it outright.
+    if "**" in expr:
+        return None
     try:
         val = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - charset-restricted
-        return float(val)
+        val = float(val)
+        return val if math.isfinite(val) and abs(val) < 1e12 else None
     except Exception:
         return None
 
@@ -420,9 +431,14 @@ def _sql_between_rowscan(sql: str) -> bool:
 def _sql_flat_q3c_join(sql: str) -> bool:
     """The PDF anti-example: a q3c_join in a statement that does not
     MATERIALIZE the reduced small side. Evaluated PER STATEMENT so a good
-    CTE elsewhere cannot mask a bad flat join."""
-    s = sql.upper()
-    return "Q3C_JOIN" in s and "MATERIALIZED" not in s
+    CTE elsewhere cannot mask a bad flat join — a multi-statement blob is
+    split on semicolons first (v1.1: previously a MATERIALIZED anywhere in
+    the blob masked a flat join in a later statement)."""
+    for statement in sql.split(";"):
+        s = statement.upper()
+        if "Q3C_JOIN" in s and "MATERIALIZED" not in s:
+            return True
+    return False
 
 
 def eval_check(check: Dict[str, Any], ev: Evidence) -> CheckResult:
@@ -557,12 +573,21 @@ class QuestionResult:
     response_time_s: float = 0.0
     error: Optional[str] = None
     judge_error: Optional[str] = None
+    # Backend 'error' SSE events seen mid-stream (v1.1): the turn completed
+    # enough to score, but the cell must NEVER read as a clean pass — the
+    # report flags it and the runner prints a retry hint.
+    stream_errors: List[str] = field(default_factory=list)
     trace_source: str = "none"
     checkpoints: List[CheckpointScore] = field(default_factory=list)
     penalties: List[PenaltyHit] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
     n_tool_calls: int = 0
     n_images: int = 0
+    # v1.2 (R6): additive faithfulness/correctness/fabrication axis rollup —
+    # reporting-only, never feeds percentage/auto_percentage.
+    axes: Dict[str, Any] = field(default_factory=dict)
+    # v1.2 (R3): backend citation recall/precision, informational only.
+    citation_metrics: Optional[Dict[str, Any]] = None
 
     # ---- derived ----
     @property
@@ -598,7 +623,12 @@ class QuestionResult:
     def auto_percentage(self) -> float:
         if self.auto_max == 0:
             return 0.0
-        return max(0.0, (self.auto_earned - self.penalty_points)) / self.auto_max * 100.0
+        # Penalties are defined on the 100-pt scale; scale them to the
+        # auto-only scale before subtracting (v1.1 — subtracting the full
+        # penalty from auto-only earned amplified it by 100/auto_max and
+        # skewed the --skip-judge improvement loop).
+        scaled_penalty = self.penalty_points * (self.auto_max / 100.0)
+        return max(0.0, (self.auto_earned - scaled_penalty)) / self.auto_max * 100.0
 
     @property
     def grade(self) -> str:
@@ -629,6 +659,49 @@ def score_auto_checkpoints(question: Dict[str, Any], ev: Evidence) -> List[Check
             detail=[("PASS " if r.passed else "MISS ") + r.note for r in results],
         ))
     return out
+
+
+def compute_axis_rollup(question: Dict[str, Any], result: "QuestionResult") -> Dict[str, Any]:
+    """v1.2 (R6): additive faithfulness/correctness/fabrication axes.
+
+    Sums the SAME per-checkpoint points/earned values the v1.1 score uses,
+    grouped by axis — no rescoring. Penalties are not subtracted from the two
+    quality axes (they are defined on the 100-pt total); GP-00 is attributed
+    to the fabrication axis instead.
+    """
+    axes: Dict[str, Any] = {
+        a: {"possible": 0.0, "earned": 0.0, "judged": True} for a in CHECKPOINT_AXES
+    }
+    cp_by_id = {cp["id"]: cp for cp in question.get("checkpoints", [])}
+    for cs in result.checkpoints:
+        cp = cp_by_id.get(cs.id, {"id": cs.id, "type": cs.type})
+        axis = axis_for_checkpoint(question["id"], cp)
+        bucket = axes[axis]
+        bucket["possible"] += cs.points
+        if cs.earned is None:
+            bucket["judged"] = False
+        else:
+            bucket["earned"] += cs.earned
+    for bucket in axes.values():
+        bucket["earned"] = round(bucket["earned"], 2)
+        bucket["pct"] = (
+            round(bucket["earned"] / bucket["possible"] * 100.0, 1)
+            if bucket["possible"] and bucket["judged"] else None
+        )
+
+    guard_ids = set(fabrication_guard_ids(question))
+    guard_zeroed = [
+        cs.id for cs in result.checkpoints
+        if cs.id in guard_ids and cs.credit == 0.0
+    ]
+    gp00 = next((p for p in result.penalties if p.id == "GP-00"), None)
+    axes["fabrication"] = {
+        "gp00_applied": bool(gp00),
+        "points_docked": gp00.points if gp00 else 0,
+        "guard_checkpoints_zeroed": guard_zeroed,
+        "signal": bool(gp00) or bool(guard_zeroed),
+    }
+    return axes
 
 
 def apply_penalties(question: Dict[str, Any], ev: Evidence) -> List[PenaltyHit]:
@@ -866,6 +939,11 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
                         # invented number.
                         "cost_aware": "costUsd" in event,
                     }
+                elif etype == "citation_metrics":
+                    # v1.2 (R3): informational — recorded, never scored.
+                    metrics = event.get("metrics")
+                    if isinstance(metrics, dict):
+                        ev.citation_metrics = metrics
                 elif etype == "error":
                     ev.errors.append(str(event.get("content", ""))[:500])
 
@@ -880,9 +958,26 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
                 if key in seen:
                     continue
                 seen.add(key)
+                out_text = str(event.get("output", ""))[:4000]
+                # v1.1: the fallback path used to default ok=True for EVERY
+                # call, granting execution credit (and suppressing GP-00) for
+                # failed calls. Derive ok from the event when possible.
+                ok = True
+                if event.get("ok") is False or event.get("success") is False:
+                    ok = False
+                else:
+                    try:
+                        parsed_out = json.loads(out_text) if out_text.lstrip().startswith("{") else None
+                        if isinstance(parsed_out, dict) and (
+                            parsed_out.get("success") is False or parsed_out.get("error")
+                        ):
+                            ok = False
+                    except Exception:
+                        pass
                 ev.calls.append(ToolCall(name=event["name"],
                                          arguments=event.get("input") or {},
-                                         output=str(event.get("output", ""))[:4000]))
+                                         output=out_text,
+                                         ok=ok))
             elif event.get("type") == "run_progress" and event.get("tool"):
                 if (event["tool"], "{}") not in seen:
                     seen.add((event["tool"], "{}"))
@@ -975,6 +1070,18 @@ def run_question(q: Dict[str, Any], args, auth_token: Optional[str],
         result.error = str(e)
         print(f"[ERR] {e}")
 
+    # A backend 'error' SSE event means the turn was degraded/truncated
+    # (v1.1). An empty response with stream errors is an infra failure, not a
+    # model answer — mark the cell invalid like a transport error; a partial
+    # response still scores but carries the flag into the report.
+    if ev.errors and not result.error:
+        result.stream_errors = list(ev.errors)
+        if not (ev.response_text or "").strip():
+            result.error = f"backend stream error (empty response): {ev.errors[0][:200]}"
+            print(f"    [STREAM-ERR] {ev.errors[0][:120]} — cell marked invalid, rerun this question")
+        else:
+            print(f"    [STREAM-ERR] turn degraded mid-stream ({len(ev.errors)} error event(s)) — flagged in report")
+
     result.trace_source = ev.trace_source
     result.usage = _resolve_cost(ev.usage, args.model)
     result.n_tool_calls = len(ev.calls)
@@ -1001,6 +1108,10 @@ def run_question(q: Dict[str, Any], args, auth_token: Optional[str],
             result.judge_error = str(e)
             print(f"[ERR] {e}")
 
+    # ── v1.2 additive axes + informational citation metrics ──
+    result.axes = compute_axis_rollup(q, result)
+    result.citation_metrics = ev.citation_metrics
+
     # ── persist per-question artifacts ──
     (qdir / "response.md").write_text(ev.response_text or "(empty)", encoding="utf-8")
     with (qdir / "events.jsonl").open("w", encoding="utf-8") as f:
@@ -1018,6 +1129,8 @@ def run_question(q: Dict[str, Any], args, auth_token: Optional[str],
         "penalties": [asdict(p) for p in result.penalties],
         "auto_percentage": result.auto_percentage,
         "percentage": result.percentage,
+        "axes": result.axes,
+        "citation_metrics": result.citation_metrics,
     }, indent=2), encoding="utf-8")
 
     return result
@@ -1044,8 +1157,23 @@ def overall_rollup(results: List[QuestionResult]) -> Dict[str, Any]:
             "auto_pct": sum(r.auto_percentage for r in tier_rs) / len(tier_rs),
             "n": len(tier_rs),
         }
+    # v1.2 (R6): mean axis percentages over fully-judged questions +
+    # fabrication-signal count over all questions. Reporting-only.
+    axis_means: Dict[str, Any] = {}
+    for axis in CHECKPOINT_AXES:
+        vals = [
+            r.axes.get(axis, {}).get("pct")
+            for r in judged if isinstance(r.axes, dict)
+        ]
+        vals = [v for v in vals if v is not None]
+        axis_means[axis] = round(sum(vals) / len(vals), 1) if vals else None
+    fabrication_signals = sum(
+        1 for r in results
+        if isinstance(r.axes, dict) and r.axes.get("fabrication", {}).get("signal")
+    )
     return {"full_pct": full, "auto_pct": auto, "per_tier": per_tier,
-            "judged": len(judged), "total": len(results)}
+            "judged": len(judged), "total": len(results),
+            "axes": {**axis_means, "fabrication_signals": fabrication_signals}}
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1313,7 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
         f"| **Overall score (tier-weighted)** | **{f'{full:.1f} / 100' if full is not None else 'N/A (judge skipped/failed)'}** |",
         f"| Deterministic (auto-only) score | {rollup['auto_pct']:.1f} / 100 |",
         f"| API errors | {sum(1 for r in results if r.error)} |",
+        f"| Stream-degraded cells (scored but flagged) | {sum(1 for r in results if r.stream_errors)} |",
         f"| Judge failures | {sum(1 for r in results if r.judge_error)} |",
         f"| Total tokens (Quasar side) | {sum(r.usage.get('total', 0) for r in results):,} |",
         f"| Total cost (Quasar side) | {cost_cell} |",
@@ -1274,6 +1403,7 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
                 )
             )
             + (f" · **API ERROR:** `{r.error}`" if r.error else "")
+            + (f" · ⚠ **STREAM DEGRADED** ({len(r.stream_errors)} error event(s) mid-turn — score is a lower bound; rerun to confirm)" if r.stream_errors else "")
             + (f" · **JUDGE ERROR:** `{r.judge_error}`" if r.judge_error else ""),
             "",
             "| Checkpoint | Type | Points | Credit | Earned | Notes |",

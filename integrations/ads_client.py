@@ -1,4 +1,19 @@
-"""NASA ADS Integration Service used by Quasar."""
+"""NASA ADS / SciX Integration Service used by Quasar.
+
+Provider abstraction (R8, 2026-07-18): astronomy is transitioning from ADS to
+SciX (scixplorer.org) through 2026. Both hosts run the same API software —
+live-probed 2026-07-18: ``https://api.scixplorer.org/v1/search/query`` and
+``https://api.adsabs.harvard.edu/v1/search/query`` return byte-identical
+``401 {"message": "Missing \"Authorization\" in headers."}`` without a token,
+same endpoint layout, same Bearer auth. Selection order for the base URL:
+
+1. ``NASA_ADS_BASE_URL`` — explicit override, always wins.
+2. ``ADS_API_PROVIDER`` = ``ads`` (default) | ``scix`` — picks the host.
+
+API keys: ``NASA_ADS_API_KEY`` first, then ``SCIX_API_KEY`` as a fallback
+(SciX issues its own tokens; either works on both hosts today, but that may
+diverge post-transition — hence the split env vars).
+"""
 
 from __future__ import annotations
 
@@ -17,6 +32,39 @@ except ImportError:  # pragma: no cover - optional dependency
     OpenAI = None
 
 logger = logging.getLogger(__name__)
+
+
+# Known API hosts. Both serve the identical API surface (verified live
+# 2026-07-18 — see module docstring); "scix" exists so deployments can flip
+# the default host by env without a code change when the ADS domain sunsets.
+_API_PROVIDER_BASE_URLS = {
+    "ads": "https://api.adsabs.harvard.edu/v1",
+    "scix": "https://api.scixplorer.org/v1",
+}
+
+
+def resolve_ads_base_url() -> str:
+    """Resolve the ADS/SciX API base URL from the environment.
+
+    ``NASA_ADS_BASE_URL`` (explicit URL) beats ``ADS_API_PROVIDER``
+    (named provider: ``ads`` | ``scix``); unknown provider names fall back
+    to classic ADS with a warning rather than failing the whole service.
+    """
+    explicit = os.getenv("NASA_ADS_BASE_URL", "").strip()
+    if explicit:
+        return explicit
+    provider = os.getenv("ADS_API_PROVIDER", "ads").strip().lower()
+    if provider not in _API_PROVIDER_BASE_URLS:
+        logger.warning(
+            "Unknown ADS_API_PROVIDER=%r — falling back to classic ADS", provider
+        )
+        provider = "ads"
+    return _API_PROVIDER_BASE_URLS[provider]
+
+
+def resolve_ads_api_key() -> str:
+    """Resolve the API token: NASA_ADS_API_KEY first, then SCIX_API_KEY."""
+    return os.getenv("NASA_ADS_API_KEY", "") or os.getenv("SCIX_API_KEY", "")
 
 
 class ADSServiceError(Exception):
@@ -55,10 +103,8 @@ class ADSService:
         session: Optional[requests.Session] = None,
         user_agent: Optional[str] = None,
     ) -> None:
-        self.api_key = api_key or os.getenv("NASA_ADS_API_KEY", "")
-        self.base_url = base_url or os.getenv(
-            "NASA_ADS_BASE_URL", "https://api.adsabs.harvard.edu/v1"
-        )
+        self.api_key = api_key or resolve_ads_api_key()
+        self.base_url = base_url or resolve_ads_base_url()
         self.timeout = timeout
         self.retry_attempts = max(1, retry_attempts)
         self.session = session or requests.Session()
@@ -303,6 +349,9 @@ class ADSService:
             return "dataset_id"
         if text.lower().startswith("asdm"):
             return "asdm_uid"
+        # Standard 19-char ADS bibcode (R2 reverse direction: paper → data).
+        if re.match(r"^[12]\d{3}[A-Za-z][A-Za-z0-9&.]{13}[A-Za-z.]$", text):
+            return "bibcode"
         return "identifier"
 
     @staticmethod

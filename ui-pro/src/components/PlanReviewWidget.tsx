@@ -124,6 +124,9 @@ function AgentIcon({ agentType, className = "" }: { agentType: string; className
 
 export interface PlanReviewData {
     conversationId: string;
+    /** The run this plan review belongs to (UIAPI-08) — lets the feedback
+     *  POST address the run-scoped queue when two runs share a conversation. */
+    runId?: string;
     title: string;
     subtasks: {
         id: string;

@@ -5,6 +5,7 @@ matplotlib rendering lives in ``api.serializers.fits``.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from api.deps import get_current_user
 from api.models import FitsPreviewRequest
@@ -26,7 +27,13 @@ async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get
         raise HTTPException(status_code=400, detail="Only HTTPS ALMA data product URLs can be previewed.")
 
     max_bytes = 50 * 1024 * 1024
-    try:
+
+    def _download() -> bytes:
+        # UIAPI-03: this synchronous streaming download can block for up to 90s
+        # on a slow link / degraded almascience — it must run on a worker
+        # thread, never on the event loop, where it would stall every other
+        # request and starve the SSE keepalives that keep other users' chat
+        # streams alive behind Render's ~30s idle proxy cutoff.
         with requests.get(req.url, stream=True, timeout=90) as response:
             response.raise_for_status()
             length = response.headers.get("content-length")
@@ -42,7 +49,10 @@ async def preview_fits(req: FitsPreviewRequest, current_user: dict = Depends(get
                 if total > max_bytes:
                     raise HTTPException(status_code=413, detail="This FITS file is too large for in-browser preview. Open or download it from ALMA instead.")
                 chunks.append(chunk)
-        fits_bytes = b"".join(chunks)
+        return b"".join(chunks)
+
+    try:
+        fits_bytes = await run_in_threadpool(_download)
     except HTTPException:
         raise
     except Exception as exc:

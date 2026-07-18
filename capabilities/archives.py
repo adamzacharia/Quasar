@@ -29,19 +29,36 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from capabilities.base import BaseCapability, ToolResult
+from capabilities.base import BaseCapability, Provenance, ToolResult
 
 logger = logging.getLogger(__name__)
 
 
-def _native(out: Dict[str, Any]) -> ToolResult:
+def _native(out: Dict[str, Any], provenance: Optional[Provenance] = None) -> ToolResult:
     """Wrap a legacy output dict as a byte-parity ToolResult."""
     ok = bool(isinstance(out, dict) and out.get("success"))
     err = out.get("error") if isinstance(out, dict) else None
     return ToolResult(
         success=ok,
         error=(str(err) if (err is not None and not ok) else None),
+        provenance=provenance,
         native=out,
+    )
+
+
+def _archive_provenance(service: str, tool_name: str, **criteria: Any) -> Provenance:
+    """Provenance for an astroquery-backed archive call (CX-10).
+
+    astroquery hides its wire requests, so the exact request we CAN honestly
+    surface is the concrete criteria set the client executed — rendered as a
+    stable ``key=value`` line (the provenance surface shows it as the
+    parameterized request for this service).
+    """
+    parts = [f"{key}={value}" for key, value in criteria.items() if value is not None]
+    return Provenance(
+        service=service,
+        tool_name=tool_name,
+        query=f"{service}: {', '.join(parts) or '(no criteria)'}",
     )
 
 
@@ -78,6 +95,13 @@ class SearchMast(BaseCapability):
         set_lrr = ctx.service("set_last_run_result")
         target_name, mission, instrument = inp.target_name, inp.mission, inp.instrument
         radius, ra, dec = inp.radius, inp.ra, inp.dec
+        # Built BEFORE the client call so failure paths carry the attempted
+        # request too (CX-10) — a failed call is when the user most wants it.
+        prov = _archive_provenance(
+            "mast", "search_mast",
+            target=target_name, ra=ra, dec=dec,
+            mission=mission, instrument=instrument, radius=radius,
+        )
         try:
             mast_client = ctx.services.get("mast_client")
             if target_name:
@@ -103,7 +127,7 @@ class SearchMast(BaseCapability):
                 if instrument:
                     note += f" [{instrument}]"
                 set_lrr({"type": "data", "data": df, "source": "MAST", "tool_name": "search_mast"})
-                return _native({"success": True, "total_results": 0, "note": note})
+                return _native({"success": True, "total_results": 0, "note": note}, provenance=prov)
 
             # Build source label
             filter_label = "MAST"
@@ -137,9 +161,10 @@ class SearchMast(BaseCapability):
                     f"Missions: {', '.join(f'{m} ({c})' for m, c in mission_summary.items())}. "
                     f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
                 )
-            })
+            }, provenance=prov)
         except Exception as e:
-            return _native({"success": False, "error": f"MAST search failed: {str(e)}"})
+            return _native({"success": False, "error": f"MAST search failed: {str(e)}"},
+                           provenance=prov)
 
 
 class SearchMastByCriteriaInput(_In):
@@ -171,11 +196,18 @@ class SearchMastByCriteria(BaseCapability):
         mission, instrument, proposal_id = inp.mission, inp.instrument, inp.proposal_id
         filters, target_name = inp.filters, inp.target_name
         dataproduct_type, start_date, end_date = inp.dataproduct_type, inp.start_date, inp.end_date
+        date_range = None
+        if start_date and end_date:
+            date_range = (start_date, end_date)
+        # Built pre-call so failure paths carry the attempted request (CX-10).
+        prov = _archive_provenance(
+            "mast", "search_mast_by_criteria",
+            mission=mission, instrument=instrument, proposal_id=proposal_id,
+            filters=filters, target=target_name,
+            dataproduct_type=dataproduct_type,
+            date_range=(f"{start_date}..{end_date}" if date_range else None),
+        )
         try:
-            date_range = None
-            if start_date and end_date:
-                date_range = (start_date, end_date)
-
             mast_client = ctx.services.get("mast_client")
             df = mast_client.search_by_criteria(
                 mission=mission, instrument=instrument,
@@ -193,7 +225,7 @@ class SearchMastByCriteria(BaseCapability):
                 if filters: criteria_parts.append(f"filter={filters}")
                 note = f"No MAST observations found for criteria: {', '.join(criteria_parts) or 'unspecified'}"
                 set_lrr({"type": "data", "data": df, "source": "MAST", "tool_name": "search_mast_by_criteria"})
-                return _native({"success": True, "total_results": 0, "note": note})
+                return _native({"success": True, "total_results": 0, "note": note}, provenance=prov)
 
             # Build label
             filter_label = "MAST Criteria"
@@ -224,9 +256,10 @@ class SearchMastByCriteria(BaseCapability):
                     f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
                     f"Full data shown in UI table."
                 )
-            })
+            }, provenance=prov)
         except Exception as e:
-            return _native({"success": False, "error": f"MAST criteria search failed: {str(e)}"})
+            return _native({"success": False, "error": f"MAST criteria search failed: {str(e)}"},
+                           provenance=prov)
 
 
 class GetMastProductsInput(_In):
@@ -250,6 +283,7 @@ class GetMastProducts(BaseCapability):
         set_lsr = ctx.service("set_last_search_results")
         set_lrr = ctx.service("set_last_run_result")
         product_type, extension = inp.product_type, inp.extension
+        prov = None  # populated pre-call; failure paths carry it (CX-10)
         try:
             last_search_results = get_lsr()
             if last_search_results is None or last_search_results.empty:
@@ -263,6 +297,12 @@ class GetMastProducts(BaseCapability):
                     "error": "Last cached results are not MAST observation results. Run search_mast or search_mast_by_criteria first.",
                 })
 
+            # Built pre-call so failure paths carry the attempted request (CX-10).
+            prov = _archive_provenance(
+                "mast", "get_mast_products",
+                n_observations=len(last_search_results),
+                product_type=product_type, extension=extension,
+            )
             # Fetched branch-lazily AFTER the service-free early returns (CX-04).
             mast_client = ctx.services.get("mast_client")
             df = mast_client.get_product_list(
@@ -272,7 +312,8 @@ class GetMastProducts(BaseCapability):
             )
 
             if df.empty:
-                return _native({"success": True, "total_products": 0, "note": "No data products found."})
+                return _native({"success": True, "total_products": 0, "note": "No data products found."},
+                               provenance=prov)
 
             set_lsr(df)
             set_lrr({
@@ -292,9 +333,10 @@ class GetMastProducts(BaseCapability):
                     f"Found {len(df)} data products. "
                     f"Types: {', '.join(f'{t} ({c})' for t, c in type_summary.items())}."
                 )
-            })
+            }, provenance=prov)
         except Exception as e:
-            return _native({"success": False, "error": f"MAST product listing failed: {str(e)}"})
+            return _native({"success": False, "error": f"MAST product listing failed: {str(e)}"},
+                           provenance=prov)
 
 
 class DownloadMastDataInput(_In):
@@ -317,11 +359,17 @@ class DownloadMastData(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         get_lsr = ctx.service("get_last_search_results")
         product_type, extension, max_files = inp.product_type, inp.extension, inp.max_files
+        prov = None  # populated pre-call; failure paths carry it (CX-10)
         try:
             last_search_results = get_lsr()
             if last_search_results is None or last_search_results.empty:
                 return _native({"success": False, "error": "No search results. Run search_mast first."})
 
+            prov = _archive_provenance(
+                "mast", "download_mast_data",
+                n_observations=len(last_search_results),
+                product_type=product_type, extension=extension, max_files=max_files,
+            )
             # Fetched branch-lazily AFTER the service-free early return (CX-04).
             mast_client = ctx.services.get("mast_client")
             result = mast_client.download_products(
@@ -331,9 +379,10 @@ class DownloadMastData(BaseCapability):
                 max_files=max_files
             )
 
-            return _native(result)
+            return _native(result, provenance=prov)
         except Exception as e:
-            return _native({"success": False, "error": f"MAST download failed: {str(e)}"})
+            return _native({"success": False, "error": f"MAST download failed: {str(e)}"},
+                           provenance=prov)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,6 +413,12 @@ class SearchEso(BaseCapability):
         set_lrr = ctx.service("set_last_run_result")
         target_name, instrument = inp.target_name, inp.instrument
         ra, dec, radius_arcmin = inp.ra, inp.dec, inp.radius_arcmin
+        # Built pre-call so failure paths carry the attempted request (CX-10).
+        prov = _archive_provenance(
+            "eso", "search_eso_archive",
+            target=target_name, ra=ra, dec=dec,
+            instrument=instrument, radius_arcmin=radius_arcmin,
+        )
         try:
             eso_client = ctx.services.get("eso_client")
             if target_name:
@@ -386,7 +441,7 @@ class SearchEso(BaseCapability):
                 if instrument:
                     note += f" [{instrument}]"
                 set_lrr({"type": "data", "data": df, "source": "ESO", "tool_name": "search_eso_archive"})
-                return _native({"success": True, "total_results": 0, "note": note})
+                return _native({"success": True, "total_results": 0, "note": note}, provenance=prov)
 
             # Build source label
             filter_label = "ESO"
@@ -415,9 +470,10 @@ class SearchEso(BaseCapability):
                     f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
                     f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
                 )
-            })
+            }, provenance=prov)
         except Exception as e:
-            return _native({"success": False, "error": f"ESO archive search failed: {str(e)}"})
+            return _native({"success": False, "error": f"ESO archive search failed: {str(e)}"},
+                           provenance=prov)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,9 +503,14 @@ class SearchIrsa(BaseCapability):
         set_lrr = ctx.service("set_last_run_result")
         target_name, catalog = inp.target_name, inp.catalog
         radius_arcsec, ra, dec = inp.radius_arcsec, inp.ra, inp.dec
+        catalog = catalog or "allwise"
+        # Built pre-call so failure paths carry the attempted request (CX-10).
+        prov = _archive_provenance(
+            "irsa", "search_irsa",
+            target=target_name, ra=ra, dec=dec,
+            catalog=catalog, radius_arcsec=radius_arcsec,
+        )
         try:
-            catalog = catalog or "allwise"
-
             irsa_client = ctx.services.get("irsa_client")
             if target_name:
                 df = irsa_client.search_by_target(
@@ -470,7 +531,7 @@ class SearchIrsa(BaseCapability):
                     note += f" for '{target_name}'"
                 note += f" in catalog '{catalog}'"
                 set_lrr({"type": "data", "data": df, "source": "IRSA", "tool_name": "search_irsa"})
-                return _native({"success": True, "total_results": 0, "note": note})
+                return _native({"success": True, "total_results": 0, "note": note}, provenance=prov)
 
             filter_label = f"IRSA › {catalog.upper()}"
             if target_name:
@@ -492,9 +553,10 @@ class SearchIrsa(BaseCapability):
                     f"Found {len(df)} sources in IRSA {catalog.upper()} catalog. "
                     f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
                 )
-            })
+            }, provenance=prov)
         except Exception as e:
-            return _native({"success": False, "error": f"IRSA search failed: {str(e)}"})
+            return _native({"success": False, "error": f"IRSA search failed: {str(e)}"},
+                           provenance=prov)
 
 
 CAPABILITIES: List[BaseCapability] = [

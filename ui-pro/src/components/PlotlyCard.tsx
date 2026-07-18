@@ -7,6 +7,8 @@ import type { PlotlyModule } from "plotly.js-basic-dist-min";
 import type { PlotlyFigureSpec, PlotlyCardMeta } from "../lib/types";
 import { ImageLightbox } from "./ImageLightbox";
 import { QueryProvenance } from "./QueryProvenance";
+import { IllustrativeBadge } from "./IllustrativeBadge";
+import { previewBadgeFacts } from "../lib/export-decision";
 
 type PlotlyCardProps = {
     spec?: PlotlyFigureSpec;
@@ -127,6 +129,13 @@ export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCa
     const [downloading, setDownloading] = useState(false);
     const [lightboxOpen, setLightboxOpen] = useState(false);
 
+    // Escalate the badge when the meta says this figure came from a truncated
+    // preview (f2-CX-11). Today's Data Lab plot tools draw from the FULL stored
+    // frame (result_store) and stamp any source truncation on the figure itself,
+    // so no producer sets these fields yet — this is the client half, live the
+    // moment a producer stamps preview_derived/shown_rows/total_rows on meta.
+    const badgeFacts = previewBadgeFacts(meta);
+
     const foldMeta = useMemo(() => periodFoldMeta(spec), [spec]);
     const [foldPeriod, setFoldPeriod] = useState<number | null>(null);
     const activePeriod = foldPeriod ?? foldMeta?.bestPeriod ?? null;
@@ -216,6 +225,7 @@ export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCa
                 <div className="pl-11">
                     <div className="mt-4 rounded-xl border border-slate-700/50 bg-slate-900/60 px-4 py-3 text-xs text-slate-400">
                         Interactive plot could not be rendered{title ? `: ${title}` : "."}
+                        <IllustrativeBadge className="mt-2" {...badgeFacts} />
                         <QueryProvenance request={request} />
                     </div>
                 </div>
@@ -255,6 +265,7 @@ export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCa
                                 PNG
                             </a>
                         </div>
+                        <IllustrativeBadge className="mt-2" {...badgeFacts} />
                         <QueryProvenance request={request} />
                     </div>
                 </div>
@@ -346,6 +357,7 @@ export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCa
                         </button>
                     </div>
                 </div>
+                <IllustrativeBadge className="mt-2" {...badgeFacts} />
                 <QueryProvenance request={request} />
             </div>
         </div>

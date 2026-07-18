@@ -137,8 +137,14 @@ def append_citation_warning(
     max_lookups: int = 25,
     cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     deadline_seconds: Optional[float] = 8.0,
+    verification_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
-    """Append and optionally stream the citation warning; never raises."""
+    """Append and optionally stream the citation warning; never raises.
+
+    ``verification_sink`` (R3) receives the raw ``verify_citations`` result so
+    callers can derive citation recall/precision metrics without a second
+    round of ADS lookups. Sink failures never affect the answer.
+    """
 
     if not text or "Unverified citations:" in text:
         return text
@@ -151,6 +157,11 @@ def append_citation_warning(
             cache=cache,
             deadline_seconds=deadline_seconds,
         )
+        if verification_sink is not None:
+            try:
+                verification_sink(verification)
+            except Exception:
+                logger.debug("Citation verification sink failed", exc_info=True)
         warning = format_unverified_citation_warning(verification)
     except Exception:
         logger.warning("Citation verification failed; continuing without warning", exc_info=True)

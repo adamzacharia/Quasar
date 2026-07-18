@@ -152,19 +152,37 @@ def build_rectangular_region_select(
     select_cols = _select_columns(info, columns)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     warnings: List[str] = []
-    if info["region_strategy"] == "box_ok":
-        where = (
-            f"{ra_col} BETWEEN {_num(ra_min)} AND {_num(ra_max)} "
-            f"AND {dec_col} BETWEEN {_num(dec_min)} AND {_num(dec_max)}"
+    # ra_min > ra_max: the box wraps through RA=0/360 — split it into the two
+    # non-wrapping sub-boxes [ra_min,360)∪[0,ra_max] OR'd together
+    # (ra-wrap-rect-footprint-unsupported).
+    wraps = float(ra_min) > float(ra_max)
+    ra_ranges = [(ra_min, 360.0), (0.0, ra_max)] if wraps else [(ra_min, ra_max)]
+    if wraps:
+        warnings.append(
+            f"RA bounds wrap through 0/360: interpreted as [{_num(ra_min)}°, 360°) ∪ "
+            f"[0°, {_num(ra_max)}°] ({_num((360.0 - float(ra_min)) + float(ra_max))}° span), "
+            "queried as two OR'd sub-boxes. Swap the bounds if you meant the "
+            "complementary band."
         )
+    if info["region_strategy"] == "box_ok":
+        boxes = [
+            f"{ra_col} BETWEEN {_num(lo)} AND {_num(hi)} "
+            f"AND {dec_col} BETWEEN {_num(dec_min)} AND {_num(dec_max)}"
+            for lo, hi in ra_ranges
+        ]
+        where = boxes[0] if len(boxes) == 1 else "(" + ") OR (".join(boxes) + ")"
         warnings.append("Used registry-approved RA/Dec BETWEEN box for this table.")
         spatial = "box"
     else:
-        where = (
-            f"q3c_poly_query({ra_col}, {dec_col}, "
-            f"ARRAY[{_num(ra_min)}, {_num(ra_max)}, {_num(ra_max)}, {_num(ra_min)}], "
-            f"ARRAY[{_num(dec_min)}, {_num(dec_min)}, {_num(dec_max)}, {_num(dec_max)}])"
-        )
+        polys = [
+            (
+                f"q3c_poly_query({ra_col}, {dec_col}, "
+                f"ARRAY[{_num(lo)}, {_num(hi)}, {_num(hi)}, {_num(lo)}], "
+                f"ARRAY[{_num(dec_min)}, {_num(dec_min)}, {_num(dec_max)}, {_num(dec_max)}])"
+            )
+            for lo, hi in ra_ranges
+        ]
+        where = polys[0] if len(polys) == 1 else "(" + " OR ".join(polys) + ")"
         spatial = "q3c_poly_query"
     sql = f"SELECT {select_cols}\nFROM {info['qualified_name']}\nWHERE {where}\nLIMIT {row_limit}"
     meta = _meta("rectangular_region_select", info, spatial_bound=True, row_limit=row_limit)
@@ -515,14 +533,21 @@ def build_variability_rank(
     band_clause = _band_predicate(band)
     group_by_filter = not bool(band_clause)
     filter_column = "       filter,\n" if group_by_filter else ""
+    # Wrap-safe per-object mean RA: plain AVG(ra) across the RA=0/360 seam
+    # averages epochs at 359.999° and 0.001° to ~180°, so the reported position
+    # and dist_arcsec were nonsense and nearest-candidate selection rejected
+    # the true target (variability-avg-ra-wrap). Circular mean of the unit
+    # vectors; CASE re-ranges atan2's (-180,180] output to [0,360).
+    mean_ra = "degrees(atan2(AVG(sin(radians(ra))), AVG(cos(radians(ra)))))"
+    mean_ra = f"CASE WHEN {mean_ra} < 0 THEN {mean_ra} + 360.0 ELSE {mean_ra} END"
     sql = (
         f"SELECT id,\n"
         f"{filter_column}"
-        f"       AVG(ra) AS ra, AVG(dec) AS dec,\n"
+        f"       {mean_ra} AS ra, AVG(dec) AS dec,\n"
         # Distance from the cone center: when the user gave an exact target
         # position, the right star is the NEAREST candidate, not the most
         # variable one (live P14: the model folded a variable 2.2' away).
-        f"       q3c_dist(AVG(ra), AVG(dec), {_num(float(ra))}, {_num(float(dec))}) * 3600.0 AS dist_arcsec,\n"
+        f"       q3c_dist({mean_ra}, AVG(dec), {_num(float(ra))}, {_num(float(dec))}) * 3600.0 AS dist_arcsec,\n"
         f"       COUNT(*) AS nepochs,\n"
         f"       AVG(cmag) AS mean_mag,\n"
         f"       STDDEV(cmag) AS mag_rms,\n"
@@ -672,8 +697,14 @@ def _validate_sky(ra: float, dec: float, radius_deg: float) -> None:
 def _validate_rect(ra_min: float, ra_max: float, dec_min: float, dec_max: float) -> None:
     for name, value in (("ra_min", ra_min), ("ra_max", ra_max), ("dec_min", dec_min), ("dec_max", dec_max)):
         _finite(value, name)
-    if not 0.0 <= float(ra_min) < 360.0 or not 0.0 <= float(ra_max) <= 360.0 or float(ra_min) >= float(ra_max):
-        raise ValueError("RA bounds must satisfy 0 <= ra_min < ra_max <= 360")
+    # ra_min > ra_max is a legal box wrapping through RA=0/360 (e.g. 358°→2°,
+    # ra-wrap-rect-footprint-unsupported); only a degenerate zero-width box is
+    # rejected.
+    if not 0.0 <= float(ra_min) < 360.0 or not 0.0 <= float(ra_max) <= 360.0 or float(ra_min) == float(ra_max):
+        raise ValueError(
+            "RA bounds must satisfy 0 <= ra_min, ra_max <= 360 with ra_min != ra_max "
+            "(ra_min > ra_max means the box wraps through RA=0/360)"
+        )
     if not -90.0 <= float(dec_min) < float(dec_max) <= 90.0:
         raise ValueError("Dec bounds must satisfy -90 <= dec_min < dec_max <= 90")
 

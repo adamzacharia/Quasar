@@ -21,7 +21,8 @@ astroquery
 astropy-healpix
 reproject
 spectral-cube
-pyvo
+# >=1.8 required: services/vo_registry.py uses pyvo.registry.Freetext (absent in 1.2.x)
+pyvo>=1.8
 alminer
 # Quantitative image analysis (services/image_analysis.py) + cube PV slices
 # (services/fits_service.pv_slice) + MOC algebra (services/moc_coverage.py).
@@ -99,4 +100,5 @@ lsdb==0.9.2
 huggingface_hub
 
 # NOIRLab SparCL spectra; lazy-imported by services/sparcl_spectra.py.
-sparclclient
+# Pinned: this dep silently went missing from the runtime env once (2026-07).
+sparclclient>=1.3

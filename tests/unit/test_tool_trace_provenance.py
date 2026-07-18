@@ -278,6 +278,25 @@ def test_trace_record_keeps_sql_for_the_benchmark_and_adds_request():
     assert record["request"]["text"] == sql
 
 
+def test_trace_records_carry_unique_per_call_ids():  # A1 CX-14 sliver
+    """Every record gets its own ``call_id`` (and publishes it thread-locally
+    for the conductor image capture) so downstream consumers can resolve a
+    card to its EXACT producing call, not just the latest by tool name."""
+    from core.agent import QuasarAgent
+
+    agent = _FakeAgent()
+    for sql in ("SELECT 1", "SELECT 2"):
+        QuasarAgent._record_tool_trace(
+            agent, "datalab_sql_query", {"sql": sql},
+            json.dumps({"success": True}), result_obj={"success": True},
+        )
+    first, second = agent._accumulated_tool_trace
+    assert first["call_id"] and second["call_id"]
+    assert first["call_id"] != second["call_id"]
+    # The just-recorded id is what the conductor image capture stamps.
+    assert agent._tls.last_trace_call_id == second["call_id"]
+
+
 def test_trace_record_has_a_request_for_a_tool_with_no_provenance():
     record = _record("web_search", {"query": "ngc 253"}, {"success": True})
     assert record["request"]["kind"] == "args"
@@ -372,8 +391,12 @@ def test_alma_cone_provenance_is_built_request_local_and_exact():  # CX-07, CX-3
     adql = _obscore_cone_adql(250.42, 36.46, 0.05)
     assert adql == (
         "SELECT * FROM ivoa.obscore WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
-        "CIRCLE('ICRS', 250.42, 36.46, 0.05)) = 1"
+        "CIRCLE('ICRS', 250.42, 36.46, 0.05)) = 1 AND data_rights = 'Public'"
     )
+    # The executed call is alminer.conesearch(public=True) — the surfaced
+    # equivalent must carry the same public-data constraint (CX-38), and drop
+    # it only when a caller explicitly searches proprietary data too.
+    assert "data_rights" not in _obscore_cone_adql(250.42, 36.46, 0.05, public=False)
 
     # Two "concurrent" requests with their OWN injected state can't cross-attribute.
     a, b = {"query": None, "url": None}, {"query": None, "url": None}
@@ -564,3 +587,246 @@ def test_data_card_without_a_request_omits_the_key():
         "type": "data", "data": df, "source": "Data Lab", "tool_name": "x",
     })
     assert "request" not in rich
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sse._request_from_trace — per-call identity beats latest-by-name
+# (A1 CX-14 sliver: two conductor calls to the SAME image tool used to get the
+# LATEST call's request on BOTH cards)
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_api_sse():
+    pytest.importorskip("fastapi")
+    import sys
+    ui_pro = str(Path(__file__).resolve().parents[2] / "ui-pro")
+    if ui_pro not in sys.path:
+        sys.path.append(ui_pro)
+    import api.sse as sse_mod
+    return sse_mod
+
+
+_TWO_CALL_TRACE = [
+    {"name": "render_fits_image", "call_id": "call-first",
+     "request": {"kind": "http", "text": "https://x/first.fits"}},
+    {"name": "render_fits_image", "call_id": "call-second",
+     "request": {"kind": "http", "text": "https://x/second.fits"}},
+]
+
+
+def test_conductor_images_resolve_their_own_request_by_call_id():
+    """Two traced calls to the SAME tool + two conductor image dicts carrying
+    their respective trace_call_ids → each card gets ITS OWN request."""
+    sse = _load_api_sse()
+    img_a = {"image_url": "/plots/a.png", "tool_name": "render_fits_image",
+             "trace_call_id": "call-first"}
+    img_b = {"image_url": "/plots/b.png", "tool_name": "render_fits_image",
+             "trace_call_id": "call-second"}
+
+    req_a = sse._request_from_trace(
+        _TWO_CALL_TRACE, str(img_a["tool_name"]), call_id=img_a.get("trace_call_id"))
+    req_b = sse._request_from_trace(
+        _TWO_CALL_TRACE, str(img_b["tool_name"]), call_id=img_b.get("trace_call_id"))
+
+    assert req_a["text"] == "https://x/first.fits"   # NOT the latest call's
+    assert req_b["text"] == "https://x/second.fits"
+
+
+def test_image_without_trace_call_id_falls_back_to_latest_by_name():
+    sse = _load_api_sse()
+    img = {"image_url": "/plots/c.png", "tool_name": "render_fits_image"}
+    req = sse._request_from_trace(
+        _TWO_CALL_TRACE, str(img["tool_name"]), call_id=img.get("trace_call_id"))
+    assert req["text"] == "https://x/second.fits"    # pre-sliver behavior kept
+
+    # An UNMATCHED id (e.g. the record fell past the 200-entry cap) also
+    # falls back to latest-by-name rather than dropping provenance.
+    req = sse._request_from_trace(
+        _TWO_CALL_TRACE, "render_fits_image", call_id="call-evicted")
+    assert req["text"] == "https://x/second.fits"
+
+
+def test_matched_call_without_a_request_never_substitutes_anothers():
+    """When the producing call is KNOWN but recorded no request, the card shows
+    none — latest-by-name here would relabel it with a different call's query."""
+    sse = _load_api_sse()
+    trace = _TWO_CALL_TRACE + [
+        {"name": "render_fits_image", "call_id": "call-bare"},  # no request
+    ]
+    assert sse._request_from_trace(trace, "render_fits_image", call_id="call-bare") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real service shapes → request kinds (CX-23)
+# These drive the PRODUCTION services (stubbed at the network seam) and feed
+# the exact provenance each emits to build_tool_request, so a provenance-shape
+# drift in any family breaks a test — unlike the fabricated-sidecar cases.
+# ─────────────────────────────────────────────────────────────────────────────
+import types as _types
+
+
+def test_vo_run_adql_real_provenance_renders_full_adql():  # CX-04 / CX-23
+    from astropy.table import Table
+
+    from services.vo_registry import VoRegistryService
+
+    svc = VoRegistryService()
+    # >500 chars so the legacy truncated `adql` field could NOT represent it.
+    long_query = "SELECT TOP 5 ra, dec FROM ivoa.obscore WHERE " + " OR ".join(
+        f"obs_id = 'chunk{i:04d}'" for i in range(40)
+    )
+    assert len(long_query) > 500
+    fake_service = _types.SimpleNamespace(
+        run_sync=lambda q, maxrec=None: Table({"ra": [1.0], "dec": [2.0]})
+    )
+    svc._tap_service = lambda url: fake_service
+    out = svc.run_adql("https://tap.example/tap", long_query, max_rows=5)
+    assert out["success"] is True
+
+    req = build_tool_request(
+        "vo_adql_query", {"access_url": "https://tap.example/tap"}, result_obj=out
+    )
+    assert req["kind"] == "adql"
+    assert req["text"].startswith("SELECT TOP 5")
+    assert "chunk0039" in req["text"]  # the FULL executed ADQL, not a 500-char cap
+    assert req["endpoint"] == "https://tap.example/tap"
+
+
+def test_hips_cutout_real_provenance_renders_http_with_params(monkeypatch, tmp_path):  # CX-05/CX-06/CX-23
+    import services.hips_images as hips_mod
+    from services.hips_images import HipsImageService
+
+    monkeypatch.setattr(hips_mod.plotting, "PLOT_OUTPUT_DIR", str(tmp_path))
+    svc = HipsImageService(base_url="https://alasky.example/hips2fits")
+    monkeypatch.setattr(
+        HipsImageService, "_fetch_png", lambda self, *a, **k: b"\x89PNG\r\n\x1a\nfake"
+    )
+    out = svc.cutout(187.7059, 12.3911, fov_deg=0.2, survey="optical", width=64)
+    assert out["success"] is True
+
+    req = build_tool_request("hips_cutout", {"target_name": "M87"}, result_obj=out)
+    assert req["kind"] == "http"
+    assert req["url"] == "https://alasky.example/hips2fits"
+    # The copy line reproduces the executed call: base URL + wire params.
+    assert "ra=187.7" in req["text"] and "hips=" in req["text"]
+    assert req["params"]["width"] == 64
+
+
+def test_datalab_sia_real_provenance_renders_http_with_context():  # CX-06 / CX-23
+    from integrations.datalab_sia_client import DatalabSiaClient
+
+    client = DatalabSiaClient(catalog="des_dr2")
+    client._search_endpoint = lambda ep, ra, dec, size: [{"access_url": "https://x/fits"}]
+    client._candidate_endpoints = lambda **kw: ["https://datalab.example/sia/des_dr2"]
+    out = client.search(150.0, 2.0, 0.1, catalog="des_dr2")
+    assert out["success"] is True
+
+    req = build_tool_request("datalab_image_cutout", {}, result_obj=out)
+    assert req["kind"] == "http"
+    assert req["url"] == "https://datalab.example/sia/des_dr2"
+    # The client now reports its literal SIA wire params (CX-06), so the copy
+    # line reproduces the executed call: endpoint + POS/SIZE query string.
+    assert "POS=150.0%2C2.0" in req["text"] or "POS=150.0,2.0" in req["text"]
+    assert "SIZE=" in req["text"]
+    assert req["text"].startswith("https://datalab.example/sia/des_dr2?")
+    assert "POS" in req["params"]
+
+
+def test_sparcl_search_real_provenance_renders_executed_constraints():  # CX-05 / CX-23
+    from services.sparcl_spectra import SparclSpectraService
+
+    svc = SparclSpectraService()
+    svc._client = _types.SimpleNamespace(
+        find=lambda **kw: _types.SimpleNamespace(records=[])
+    )
+    out = svc.search_spectra(
+        spectype="GALAXY", redshift_min=0.1, redshift_max=0.4, limit=25
+    )
+    assert out["success"] is True
+
+    req = build_tool_request("sparcl_find_spectra", {"spectype": "GALAXY"}, result_obj=out)
+    assert req["kind"] == "params"
+    # The EXECUTED constraint dict (with normalized lists and ranges) wins over
+    # the raw tool args — that is what client.find actually received.
+    assert req["params"]["spectype"] == ["GALAXY"]
+    assert req["params"]["redshift"] == [0.1, 0.4]
+    assert req["params"]["limit"] == 25
+
+
+def test_sandbox_bridge_pops_sidecar_and_records_the_nested_call():  # CX-22 / CX-12
+    """Real sandbox consumer: call_tool from sandbox code must see a
+    sidecar-free dict while the nested call still lands in the trace with its
+    exact request — and a FAILING nested call is recorded too."""
+    from adapters.native import build_tool
+    from capabilities.base import CallContext
+    from core.agent import QuasarAgent
+    from core.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(build_tool(_ProvCap(), lambda: CallContext()))
+
+    class _Agent:
+        _tls = threading.local()
+        tool_registry = registry
+        _pop_provenance_sidecar = staticmethod(QuasarAgent._pop_provenance_sidecar)
+        _record_tool_trace = QuasarAgent._record_tool_trace
+        _sandbox_tool_bridge = QuasarAgent._sandbox_tool_bridge
+
+        @property
+        def _accumulated_tool_trace(self):
+            if not hasattr(self._tls, "t"):
+                self._tls.t = []
+            return self._tls.t
+
+    agent = _Agent()
+    result = agent._sandbox_tool_bridge("prov_tool", {"sql": "SELECT 7"})
+
+    assert isinstance(result, dict)
+    assert PROVENANCE_SIDECAR_KEY not in result       # sandbox sees clean output
+    rec = agent._accumulated_tool_trace[0]
+    assert rec["name"] == "prov_tool"
+    assert rec["request"]["kind"] == "adql" and rec["request"]["text"] == "SELECT 7"
+
+    # Unknown tool → error dict, no crash, nothing recorded for it.
+    err = agent._sandbox_tool_bridge("no_such_tool", {})
+    assert "error" in err
+
+
+def test_archives_capability_real_provenance_renders_the_criteria():  # CX-10 / CX-23
+    """Drive the PRODUCTION SearchMast capability with a stubbed client and
+    assert its sidecar renders the executed criteria — including the FAILURE
+    path, which must carry the attempted request too."""
+    from capabilities.archives import SearchMast
+    from capabilities.base import CallContext
+
+    class _FakeMast:
+        def search_by_target(self, **kw):
+            return pd.DataFrame([{"telescope": "JWST", "target_name": "M87",
+                                  "instrument_name": "NIRCam", "project_code": "P1"}])
+
+    ctx = CallContext(services={
+        "set_last_search_results": lambda v: None,
+        "set_last_run_result": lambda v: None,
+        "mast_client": _FakeMast(),
+    })
+    cap = SearchMast()
+    tr = cap.run(cap.InputModel(target_name="M87", mission="JWST"), ctx)
+    sidecar = tr.provenance_sidecar()
+    req = build_tool_request("search_mast", {"target_name": "M87"},
+                             result_obj=tr.to_native(), sidecar=sidecar)
+    assert req["kind"] == "params"
+    assert "target=M87" in req["text"] and "mission=JWST" in req["text"]
+
+    class _BrokenMast:
+        def search_by_target(self, **kw):
+            raise RuntimeError("MAST is down")
+
+    ctx_broken = CallContext(services={
+        "set_last_search_results": lambda v: None,
+        "set_last_run_result": lambda v: None,
+        "mast_client": _BrokenMast(),
+    })
+    tr_fail = cap.run(cap.InputModel(target_name="M87", mission="JWST"), ctx_broken)
+    assert tr_fail.success is False
+    sidecar_fail = tr_fail.provenance_sidecar()
+    req_fail = build_tool_request("search_mast", {"target_name": "M87"},
+                                  result_obj=tr_fail.to_native(), sidecar=sidecar_fail)
+    assert "target=M87" in req_fail["text"]   # the attempted request survives failure

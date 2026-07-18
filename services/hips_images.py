@@ -1,4 +1,4 @@
-﻿"""HiPS/hips2fits image cutouts for Quasar live imagery tools."""
+"""HiPS/hips2fits image cutouts for Quasar live imagery tools."""
 
 from __future__ import annotations
 

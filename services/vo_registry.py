@@ -254,7 +254,25 @@ class VoRegistryService:
                  f"OR LOWER(description) LIKE '%{safe_kw}%'") if kw else ""
         adql = (f"SELECT TOP {cap + 1} table_name, description "
                 f"FROM TAP_SCHEMA.tables{where}")
-        result = svc.run_sync(adql, maxrec=cap + 1)
+        try:
+            result = svc.run_sync(adql, maxrec=cap + 1)
+        except Exception as lower_err:
+            # LOWER() is optional in ADQL 2.0 and TAPVizieR's parser rejects it
+            # outright ('Encountered "("...', live 2026-07-18, scan-L7) — which
+            # used to dump every VizieR listing onto the tableset-download
+            # fallback and die in pyvo's VOSI parse. Retry the same query
+            # case-SENSITIVE and say so, rather than losing TAP_SCHEMA at all.
+            if not kw or "(" not in str(lower_err):
+                raise
+            where_cs = (f" WHERE table_name LIKE '%{safe_kw}%' "
+                        f"OR description LIKE '%{safe_kw}%'")
+            adql = (f"SELECT TOP {cap + 1} table_name, description "
+                    f"FROM TAP_SCHEMA.tables{where_cs}")
+            result = svc.run_sync(adql, maxrec=cap + 1)
+            warnings.append(
+                "This service rejected LOWER() in ADQL, so the keyword match is "
+                "case-sensitive here — try exact-case variants if a table seems missing."
+            )
         raw_rows, _ = _normalize_dal_result(result)
         if not raw_rows and not kw:
             raise ValueError("TAP_SCHEMA.tables returned no rows")
@@ -282,10 +300,25 @@ class VoRegistryService:
                 adql = (f"SELECT TOP {MAX_COLUMNS + 1} column_name, datatype, unit, ucd, "
                         f"description FROM TAP_SCHEMA.columns "
                         f"WHERE LOWER(table_name) = LOWER('{safe}')")
-                result = _run_with_deadline(
-                    lambda: svc.run_sync(adql, maxrec=MAX_COLUMNS + 1),
-                    self.timeout, f"TAP_SCHEMA columns on {url}",
-                )
+                try:
+                    result = _run_with_deadline(
+                        lambda: svc.run_sync(adql, maxrec=MAX_COLUMNS + 1),
+                        self.timeout, f"TAP_SCHEMA columns on {url}",
+                    )
+                except _DeadlineExceeded:
+                    raise
+                except Exception as lower_err:
+                    # TAPVizieR rejects LOWER() (scan-L7) — retry exact-case
+                    # rather than falling into the full-tableset download.
+                    if "(" not in str(lower_err):
+                        raise
+                    adql_cs = (f"SELECT TOP {MAX_COLUMNS + 1} column_name, datatype, unit, "
+                               f"ucd, description FROM TAP_SCHEMA.columns "
+                               f"WHERE table_name = '{safe}'")
+                    result = _run_with_deadline(
+                        lambda: svc.run_sync(adql_cs, maxrec=MAX_COLUMNS + 1),
+                        self.timeout, f"TAP_SCHEMA columns on {url}",
+                    )
                 raw_rows, _ = _normalize_dal_result(result)
                 if raw_rows:
                     warnings: List[str] = []
@@ -345,9 +378,10 @@ class VoRegistryService:
 
     # ── 3. guarded ADQL ─────────────────────────────────────────────────────
     def run_adql(self, access_url: Any, adql: Any, max_rows: Any = 200) -> Dict[str, Any]:
+        url = str(access_url or "")
+        query = str(adql or "")
         try:
             url = _require_url(access_url)
-            query = str(adql or "")
             stripped = _strip_adql_comments(query).strip()
             if not stripped.upper().startswith("SELECT"):
                 return {"success": False,
@@ -368,12 +402,18 @@ class VoRegistryService:
                 warnings.append(f"Result hit the row cap ({maxrec}); it may be truncated.")
             return {"success": True, "rows": rows, "count": len(rows),
                     "columns": columns, "truncated": truncated, "warnings": warnings,
-                    "provenance": {"service": f"TAP: {url}", "adql": _trunc(query, 500),
+                    # `query` is the FULL executed ADQL (CX-04): the provenance
+                    # request surface reads it and renders kind:"adql"; the
+                    # truncated `adql` stays for the model-facing summary.
+                    "provenance": {"service": "vo_tap", "endpoint": url,
+                                   "query": query, "adql": _trunc(query, 500),
                                    "maxrec": maxrec}}
         except Exception as exc:
             # DALQueryError text contains the server's ADQL complaint — that is
             # exactly what the model needs to fix its query. Preserve it.
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc),
+                    "provenance": {"service": "vo_tap", "endpoint": url,
+                                   "query": query}}
 
     # ── 4. cone search ──────────────────────────────────────────────────────
     def cone_search(self, access_url: Any, ra: Any, dec: Any,

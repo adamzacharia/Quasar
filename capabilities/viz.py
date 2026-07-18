@@ -1075,6 +1075,11 @@ class VlassEpochComparison(BaseCapability):
                 frames = result.get("frames") or []
                 if len(frames) >= 2:
                     card["meta"] = {"kind": "blink", "ra": ra, "dec": dec, "frames": frames}
+                    # Registration/coverage caveats must reach the CARD, not
+                    # just the LLM-facing payload (CX-18): an unregistered
+                    # frame with no on-card note reads as a real transient.
+                    if result.get("warnings"):
+                        card["meta"]["warnings"] = list(result["warnings"])
                 set_lrr(card)
                 result = {k: v for k, v in result.items() if k not in ("path", "png_path")}
                 result["image_attached"] = True

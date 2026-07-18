@@ -6,12 +6,14 @@ from fastapi.responses import StreamingResponse
 from api.deps import (
     _current_user_email,
     analytics_service,
+    conversation_service,
     get_current_user,
     is_admin_email,
     issue_report_service,
     usage_quota_service,
 )
 from api.models import IssueReportUpdateRequest
+from services.eval_export_service import build_eval_export, to_jsonl
 
 router = APIRouter()
 
@@ -103,6 +105,39 @@ async def admin_feedback_export(current_user: dict = Depends(get_current_user)):
     if not analytics_service.is_admin(user_email):
         raise HTTPException(status_code=403, detail="Admin access required")
     return analytics_service.export_feedback_json()
+
+
+@router.get("/api/admin/eval/export")
+async def admin_eval_export(
+    format: str = "jsonl",
+    user_id: str = "",
+    current_user: dict = Depends(get_current_user),
+):
+    """Labeled eval dataset: block ratings joined to prompt/query/tokens/cost.
+
+    A human-label sidecar for DataLabBench — each row scores one block of one
+    real turn, so an automated rubric run can be measured against human
+    judgement. Admin-only. `user_id` scopes to one rater.
+    """
+    user_email = current_user.get("email", "")
+    if not analytics_service.is_admin(user_email):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    rows = build_eval_export(
+        analytics_service,
+        conversation_service,
+        issue_report_service,
+        user_id=user_id or None,
+    )
+
+    if format == "json":
+        return rows
+
+    return StreamingResponse(
+        iter([to_jsonl(rows)]),
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": "attachment; filename=quasar_eval_labels.jsonl"},
+    )
 
 
 @router.get("/api/admin/analytics/export")

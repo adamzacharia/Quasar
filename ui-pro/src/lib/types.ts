@@ -5,6 +5,13 @@ export type MessageRole = "user" | "assistant" | "system";
 
 export type MessageType = "text" | "data" | "papers" | "tool_call" | "image" | "plotly" | "critique" | "notebook" | "web_sources";
 
+/** Card kinds that carry a 1-5 star rating (Feature 4). `web_sources` is
+ *  deliberately excluded — it is a provider-attribution strip, not a science
+ *  block, so the eval-mode gate must not demand a star on it. Mirrors
+ *  services/block_identity.py::RATEABLE_BLOCK_KINDS. */
+export type BlockKind = "text" | "data" | "plotly" | "image" | "papers" | "notebook";
+export const RATEABLE_BLOCK_KINDS: readonly BlockKind[] = ["text", "data", "plotly", "image", "papers", "notebook"];
+
 /** Standard Plotly figure JSON (traces + layout) from "plotly" SSE events. */
 export interface PlotlyFigureSpec {
     data: unknown[];
@@ -59,6 +66,9 @@ export interface HipsImageMeta {
     mocs?: MocOverlay[];
     /** Ordered, WCS-matched frames for the blink comparator (kind "blink"). */
     frames?: BlinkFrame[];
+    /** Registration/coverage caveats from the epoch service (CX-18) — shown
+     *  on the card so an unregistered frame can't read as a real transient. */
+    warnings?: string[];
 }
 
 export interface Message {
@@ -89,6 +99,14 @@ export interface Message {
     /** The exact request behind THIS card (Feature 1) — papers/plotly/image
      *  messages. Data cards carry it on `dataTable.request` instead. */
     request?: import("./api").ToolRequest;
+    /** Stable identity for this block/card (Feature 4). Minted by the backend
+     *  at emission and persisted in rich_meta, so the id a rating was keyed to
+     *  survives a reload. Absent on turns that predate stable ids, and on
+     *  client-only messages (the user's own prompt). */
+    blockId?: string;
+    /** Which rateable card this is — mirrors `type`, but only for the kinds the
+     *  eval gate counts (text/data/plotly/image/papers/notebook). */
+    blockKind?: BlockKind;
     attachmentPreviews?: string[];  // base64 data URLs for images
     attachmentNames?: string[];     // names of attached documents
     webSources?: WebSource[];       // clickable source cards from web search
@@ -145,6 +163,24 @@ export interface DataTableResult {
     sourceName: string;
     warnings?: string[];
     partial?: boolean;
+    /** Full-result integrity (Feature 2). `rows` is a PREVIEW — capped at 10k,
+     *  display columns only, values clipped. These say what the preview is a
+     *  preview OF, so the UI never passes it off as the complete dataset. */
+    /** Result-store id addressing the full frame; feeds /api/results/{id}/export.csv.
+     *  Absent = no server-side export is possible for this card. */
+    resultId?: string;
+    /** Row count of the FULL result, not of `rows`. */
+    totalRows?: number;
+    /** Row count actually present in `rows`. */
+    displayedRows?: number;
+    /** True when totalRows > displayedRows — `rows` is missing data. */
+    truncated?: boolean;
+    /** True when the STORED frame is itself a truncated slice of the remote
+     *  result (e.g. SIA capped rows before storage) — the export contains
+     *  every stored row but not every matching row (f2-CX-21). */
+    upstreamPartial?: boolean;
+    /** Remote row count before the upstream cap, when the producer knows it. */
+    upstreamTotal?: number;
     /** The exact request that produced this table (Feature 1). Persisted with
      *  the card in messages.metadata, so it survives a reload. */
     request?: import("./api").ToolRequest;

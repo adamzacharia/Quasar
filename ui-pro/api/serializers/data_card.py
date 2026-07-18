@@ -19,7 +19,7 @@ separate, benchmark-gated fix.)
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from api import bootstrap  # noqa: F401  (sys.path + shims for the utils import below)
 
@@ -260,12 +260,78 @@ def _default_archive_source(df, source_hint: str = "", filter_label: str = "") -
     return "Archive"
 
 
-def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
+def _resolve_export_result_id(
+    _run_result: dict, df, source: str, owner_id: Optional[str] = None
+) -> Optional[str]:
+    """Return a result-store id addressing the FULL frame behind this card.
+
+    Data Lab tools already stash their frame and stamp ``result_id``; every
+    other archive (ALMA/CADC/VO/MMU/external) does not. Rather than patch each
+    of those call sites — and miss the next one someone adds — every data card
+    funnels through here, so we mint an id for any frame that lacks one. That
+    id is what ``/api/results/{id}/export.csv`` streams in full.
+
+    Best-effort: if the store is unavailable we return None, and the client
+    degrades to a disabled/"preview only" button rather than a silent partial.
+    """
+    existing = _run_result.get("result_id")
+    if isinstance(existing, str) and existing.strip():
+        existing = existing.strip()
+        # Adopt capability-minted ids at the one seam every card passes
+        # through: this card is being serialized for exactly the requesting
+        # user, and the export route now refuses ownerless ids, so stamping
+        # here is what makes those ids exportable at all. stamp_owner never
+        # reassigns an id that already belongs to someone else. (f2-CX-01)
+        if owner_id:
+            try:
+                from services.datalab_result_store import default_result_store
+
+                default_result_store().stamp_owner(existing, str(owner_id))
+            except Exception:  # noqa: BLE001 - stamping is best-effort
+                pass
+        return existing
+    if not owner_id:
+        # An ownerless minted id would be un-exportable under the route's
+        # owner guard — return None so the button degrades honestly instead
+        # of advertising a download that can only 404. (f2-CX-01)
+        return None
+    try:
+        from services.datalab_result_store import default_result_store
+
+        meta = {
+            "source": source,
+            "tool_name": _run_result.get("tool_name") or "",
+            "request": _run_result.get("request"),
+            "rowcount": int(len(df)),
+            # Stamp the owner so the export route can refuse a cross-user
+            # read; the route rejects ownerless ids outright. (f2-CX-01)
+            "owner_id": str(owner_id),
+        }
+        return default_result_store().put(df, meta)
+    except Exception as exc:  # noqa: BLE001 - export id is an enhancement
+        print(f"[WARN] Could not store result for export: {exc}")
+        return None
+
+
+def _build_data_card_event(
+    _run_result: dict,
+    owner_id: Optional[str] = None,
+    block_id_factory: Optional[Callable[[], str]] = None,
+) -> Optional[tuple]:
     """Build a data card SSE event from a run_result dict.
 
     Returns (sse_event_str, rich_dt_dict) or None if the result can't be serialized.
     This is extracted so it can be called both during streaming (eager)
     and after streaming (fallback), avoiding the 2-4s delay.
+
+    ``owner_id`` scopes any result-store id minted here to the requesting user.
+
+    ``block_id_factory`` mints this card's stable identity (Feature 4). It is a
+    factory, not a value, because this function can bail out before emitting:
+    calling it only at the stamp site keeps a card that never renders from
+    consuming an ordinal that a later card would then be numbered around. The
+    id is stamped onto both the SSE payload and the persisted rich dict, so a
+    reloaded card resolves to the same rating row.
     """
     import math
     import pandas as pd
@@ -558,6 +624,26 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
         )
 
         warnings = list(_run_result.get("warnings") or [])
+        # Full-result integrity (Feature 2). `rows` above is the PREVIEW: capped
+        # at _MAX_TABLE_ROWS, display columns only, values _fmt-clipped. These
+        # fields let the client tell a complete table from a partial one instead
+        # of silently handing back the preview as if it were the dataset.
+        _total_rows = int(len(df))
+        _displayed_rows = int(len(rows))
+        _result_id = _resolve_export_result_id(_run_result, df, _detected_source, owner_id)
+        # Upstream-partial (f2-CX-21): a frame can be a truncated slice BEFORE
+        # it was stored (e.g. SIA caps remote rows), which stored-vs-displayed
+        # row math can never detect. Producers stamp it STRUCTURALLY — on the
+        # run result or on the stored provenance. Bare warning strings
+        # deliberately do NOT trigger this: they stay a visible card caveat,
+        # not an export-completeness verdict.
+        _prov = _run_result.get("provenance")
+        _prov = _prov if isinstance(_prov, dict) else {}
+        _upstream_partial = bool(
+            _run_result.get("upstream_truncated") is True
+            or _prov.get("upstream_truncated") is True
+        )
+        _upstream_total = _run_result.get("upstream_total") or _prov.get("upstream_total")
         table_payload = {
             "type": "data",
             "metrics": metrics,
@@ -566,6 +652,16 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             "sourceName": _detected_source,
             "warnings": warnings,
             "partial": bool(_run_result.get("partial") or warnings),
+            "resultId": _result_id,
+            "totalRows": _total_rows,
+            "displayedRows": _displayed_rows,
+            "truncated": bool(_total_rows > _displayed_rows),
+            "upstreamPartial": _upstream_partial,  # (f2-CX-21)
+            "upstreamTotal": (
+                int(_upstream_total)
+                if isinstance(_upstream_total, (int, float)) and _upstream_total
+                else None
+            ),
             "archiveLink": archive_link,
             "hasRowLinks": any(bool(r.get("_link")) for r in rows),
             "hasPreview": has_preview,
@@ -573,6 +669,12 @@ def _build_data_card_event(_run_result: dict) -> Optional[tuple]:
             "fitsEstimate": fits_estimate if fits_estimate > 0 else None,
             "tableKind": table_kind or None,
         }
+        # Stable per-block identity (Feature 4). Minted here — the last point
+        # at which this card is certain to be emitted — and copied into rich_dt
+        # below, so the reloaded card keys to the same rating row.
+        if block_id_factory is not None:
+            table_payload["blockId"] = block_id_factory()
+            table_payload["blockKind"] = "data"
         # The exact request that produced this table (Feature 1). Stamped on the
         # run result by core/runner.py; already secret-redacted. Rides into
         # messages.metadata with the rest of the card, so it survives a reload.

@@ -3,6 +3,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 from services import plotting
 from services.sparcl_spectra import SparclSpectraService
@@ -99,6 +100,113 @@ def test_plot_spectrum_with_model_and_without_redshift(monkeypatch):
     out2 = svc.plot_spectrum("without-model", mark_lines=True)
     assert out2["success"] is True
     assert out2["redshift"] is None
+
+
+def test_plot_spectrum_masks_bad_ivar_before_smoothing(monkeypatch):
+    # sparcl-smooth-before-ivar-mask: a spike at an ivar=0 pixel must not
+    # contaminate the smoothed values of its (good) neighbors.
+    monkeypatch.setattr(plotting, "PLOT_OUTPUT_DIR", _plot_dir("sparcl"))
+    wave = np.linspace(3600.0, 9800.0, 100)
+    flux = np.ones(100)
+    flux[50] = 1.0e6  # cosmic-ray spike
+    ivar = np.ones(100)
+    ivar[50] = 0.0  # masked pixel
+
+    class FakeClient:
+        def retrieve(self, uuid_list=None, include=None):
+            return FakeResult(
+                [{"wavelength": wave, "flux": flux, "ivar": ivar, "spectype": "GALAXY"}]
+            )
+
+    install_fake_sparcl(monkeypatch, FakeClient)
+    out = SparclSpectraService().plot_spectrum("spiked", smooth=5)
+
+    assert out["success"] is True
+    y = out["plotly_spec"]["data"][0]["y"]
+    assert y[50] is None  # masked pixel stays blanked
+    # Neighbors are smoothed over good pixels only: all 1.0, not ~2e5.
+    for index in (48, 49, 51, 52):
+        assert y[index] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_find_spectra_warns_when_remote_box_hits_limit(monkeypatch):
+    # sparcl-box-limit-silent-truncation: a capped box query must disclose
+    # possible truncation before the cone cut.
+    class FakeClient:
+        def find(self, outfields=None, constraints=None, limit=None):
+            return FakeResult(
+                [
+                    {"sparcl_id": f"s{i}", "ra": 10.0 + i * 1e-4, "dec": 60.0,
+                     "redshift": 0.1, "spectype": "GALAXY", "data_release": "DESI-DR1"}
+                    for i in range(limit)
+                ]
+            )
+
+    install_fake_sparcl(monkeypatch, FakeClient)
+    out = SparclSpectraService().find_spectra(10.0, 60.0, radius_arcsec=60, limit=3)
+
+    assert out["success"] is True
+    assert any("row cap" in warning for warning in out["warnings"])
+
+
+def test_find_spectra_no_truncation_warning_below_limit(monkeypatch):
+    class FakeClient:
+        def find(self, outfields=None, constraints=None, limit=None):
+            return FakeResult(
+                [{"sparcl_id": "only", "ra": 10.0, "dec": 60.0, "redshift": 0.1,
+                  "spectype": "GALAXY", "data_release": "DESI-DR1"}]
+            )
+
+    install_fake_sparcl(monkeypatch, FakeClient)
+    out = SparclSpectraService().find_spectra(10.0, 60.0, radius_arcsec=60, limit=10)
+
+    assert out["success"] is True
+    assert not any("row cap" in warning for warning in out["warnings"])
+
+
+def test_search_spectra_cone_warns_when_remote_box_hits_limit(monkeypatch):
+    class FakeClient:
+        def find(self, outfields=None, constraints=None, limit=None):
+            return FakeResult(
+                [
+                    {"sparcl_id": f"s{i}", "ra": 10.0 + i * 1e-4, "dec": 60.0,
+                     "redshift": 0.1, "spectype": "GALAXY", "data_release": "DESI-DR1"}
+                    for i in range(limit)
+                ]
+            )
+
+    install_fake_sparcl(monkeypatch, FakeClient)
+    out = SparclSpectraService().search_spectra(
+        spectype="GALAXY", ra=10.0, dec=60.0, radius_arcsec=60, limit=3
+    )
+
+    assert out["success"] is True
+    assert any("row cap" in warning for warning in out["warnings"])
+
+
+def test_plot_spectrum_downsampling_is_annotated(monkeypatch):
+    # plotly-downsample-unannotated: stride decimation must be disclosed in
+    # the interactive figure and in the card warnings.
+    monkeypatch.setattr(plotting, "PLOT_OUTPUT_DIR", _plot_dir("sparcl"))
+    n = 9000  # stride 3 above the 4000-point cap
+    wave = np.linspace(3600.0, 9800.0, n)
+    flux = np.ones(n)
+
+    class FakeClient:
+        def retrieve(self, uuid_list=None, include=None):
+            return FakeResult([{"wavelength": wave, "flux": flux, "spectype": "QSO"}])
+
+    install_fake_sparcl(monkeypatch, FakeClient)
+    out = SparclSpectraService().plot_spectrum("big")
+
+    assert out["success"] is True
+    layout = out["plotly_spec"]["layout"]
+    downsample = layout["meta"]["downsample"]
+    assert downsample["stride"] == 3
+    assert downsample["points_total"] == n
+    assert downsample["points_shown"] == len(out["plotly_spec"]["data"][0]["x"])
+    assert any("downsampled" in a["text"].lower() for a in layout["annotations"])
+    assert any("downsampled" in warning.lower() for warning in out["warnings"])
 
 
 def test_search_spectra_constraint_mode(monkeypatch):

@@ -44,7 +44,14 @@ class SiaSearchResult:
 
 
 class _TimeoutSession:
-    """Small requests.Session wrapper that gives PyVO calls a default timeout."""
+    """Small requests.Session wrapper that gives PyVO calls a default timeout.
+
+    get/post MUST be overridden here, not just request(): pyvo calls
+    ``session.get(...)``, and __getattr__ hands back the REAL session's bound
+    method — whose internal ``self.request`` is the real session's too — so a
+    request()-only override never ran and the timeout was dead config
+    (dl-sia-timeout-never-applied).
+    """
 
     def __init__(self, timeout: float):
         import requests
@@ -58,6 +65,14 @@ class _TimeoutSession:
     def request(self, method: str, url: str, **kwargs: Any):
         kwargs.setdefault("timeout", self.timeout)
         return self._session.request(method, url, **kwargs)
+
+    def get(self, url: str, **kwargs: Any):
+        kwargs.setdefault("timeout", self.timeout)
+        return self._session.get(url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any):
+        kwargs.setdefault("timeout", self.timeout)
+        return self._session.post(url, **kwargs)
 
 
 class DatalabSiaClient:
@@ -124,6 +139,14 @@ class DatalabSiaClient:
                     "ra": ra_f,
                     "dec": dec_f,
                     "fov_deg": fov_f,
+                    # Exact wire parameters of the SIA query, so the provenance
+                    # surface can render a reproducible request line (CX-06):
+                    # the descriptive scalars above are not what went over the
+                    # wire (SIZE is cos(dec)-stretched).
+                    "params": {
+                        "POS": f"{ra_f},{dec_f}",
+                        "SIZE": f"{size[0]},{size[1]}",
+                    },
                     "retrieved_at": datetime.now(timezone.utc).isoformat(),
                 },
             )

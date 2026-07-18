@@ -559,6 +559,7 @@ class SplatalogueClient:
         query: SpectralLineQuery,
         *,
         cancel_event: Optional[threading.Event] = None,
+        allow_slap_fallback: bool = True,
     ) -> Dict[str, Any]:
         query.validate()
         warnings: List[str] = []
@@ -592,6 +593,15 @@ class SplatalogueClient:
             except Exception as exc:
                 errors.append(f"non-threaded advanced: {exc}")
 
+        if not allow_slap_fallback:
+            # slap-fallback-masquerades-as-advanced: callers that label results
+            # by backend themselves (SplatalogueTool._query_astroquery) must not
+            # receive raw SLAP rows dressed up as an Advanced result — raise so
+            # the caller's own SLAP path applies its post-filters and degraded
+            # labeling.
+            raise RuntimeError(
+                "Splatalogue Advanced query failed: " + " | ".join(errors)
+            )
         unsupported = self._slap_unsupported_filters(query)
         if unsupported:
             raise RuntimeError(
@@ -1342,7 +1352,12 @@ class SplatalogueTool:
             only_nrao_recommended=only_nrao_recommended,
             output_mode="raw",
         )
-        return SplatalogueClient().query(query)["rows"]
+        # slap-fallback-masquerades-as-advanced: forbid the client's internal
+        # SLAP fallback — if Advanced is down this must raise so the caller's
+        # except path runs _query_slap with _filter_slap_results and the
+        # degraded/backend='slap' labeling, instead of returning unfiltered
+        # SLAP rows labeled backend='astroquery', degraded=False.
+        return SplatalogueClient().query(query, allow_slap_fallback=False)["rows"]
 
     @staticmethod
     def _query_slap(freq_min_ghz: float, freq_max_ghz: float) -> Iterable[Any]:

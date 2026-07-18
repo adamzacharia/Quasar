@@ -1,4 +1,4 @@
-﻿"""ALeRCE/ZTF alert broker client and plotting helpers."""
+"""ALeRCE/ZTF alert broker client and plotting helpers."""
 
 from __future__ import annotations
 

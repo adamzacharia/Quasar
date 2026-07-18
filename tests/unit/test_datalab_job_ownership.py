@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from capabilities import datalab as datalab_capability
 from capabilities.base import CallContext
-from integrations.datalab_client import ANON_TOKEN
+from integrations.datalab_client import ANON_TOKEN, DatalabResult
 import integrations.datalab_client as datalab_client_module
 import services.datalab_job_service as job_service_module
 import services.datalab_result_store as result_store_module
@@ -223,3 +223,111 @@ def test_mytables_routes_isolate_users_and_return_strict_json(monkeypatch):
     assert asyncio.run(
         datalab_router.get_my_table("shared", current_user={"sub": "bob"})
     )["rows"] == [{"value": 2.0}]
+
+
+# ── Scan-campaign regressions (2026-07-17) ────────────────────────────────────
+class _ServerJobClient:
+    """Real-token client fake: the job exists server-side regardless of the
+    local in-memory registry (which a backend restart wipes)."""
+
+    token = "real-token"
+
+    def __init__(self):
+        self.aborted = []
+
+    def status(self, job_id):
+        return "COMPLETED"
+
+    def results(self, job_id):
+        return DatalabResult.from_dataframe(
+            pd.DataFrame({"ra": [1.0], "dec": [2.0]}),
+            {"catalog": None, "table": None, "query": None, "jobid": str(job_id)},
+        )
+
+    def abort(self, job_id):
+        self.aborted.append(str(job_id))
+        return "OK"
+
+
+def test_job_results_and_cancel_fall_through_after_registry_restart():
+    """CAP-02: JobResults and JobCancel must apply the same KeyError
+    fall-through JobStatus has — after a restart the in-memory registry is
+    empty while the job still exists server-side; erroring with 'Unknown Data
+    Lab job' stranded completed rows. The id is re-registered for the owner
+    (dl-server-job-registry-restart-orphan)."""
+    service = DatalabJobService(max_workers=1)  # empty: simulates the restart
+    store = DatalabResultStore(enable_disk_cache=False)
+    client = _ServerJobClient()
+    ctx = CallContext(
+        services={"datalab_job_service": service, "datalab_client": client},
+        result_store=store,
+        user_id="alice",
+    )
+
+    out = datalab_capability.JobResults().run(
+        datalab_capability.JobIdInput(job_id="server-job-1"), ctx
+    ).to_native()
+    assert out["success"] is True and out["result_id"].startswith("dlr_")
+    assert int(len(store.get(out["result_id"]).dataframe)) == 1
+    # Re-registered + synced for this owner: the Jobs panel sees it again.
+    assert service.status("server-job-1", owner_id="alice")["status"] == "succeeded"
+    # The stored rows are owner-scoped for the export route.
+    _frame, meta, status = store.lookup(out["result_id"])
+    assert status == "ok" and meta["owner_id"] == "alice"
+
+    out2 = datalab_capability.JobCancel().run(
+        datalab_capability.JobIdInput(job_id="server-job-2"), ctx
+    ).to_native()
+    assert out2["success"] is True and out2["status"] == "canceled"
+    assert client.aborted == ["server-job-2"]
+    assert service.status("server-job-2", owner_id="alice")["status"] == "canceled"
+
+
+def test_ensure_external_never_clobbers_another_owner():
+    """dl-server-job-registry-restart-orphan: re-registration must only create
+    truly-absent records — an id registered under another owner is left
+    untouched (no ownership flip)."""
+    service = DatalabJobService(max_workers=1)
+    service.register_external("shared-id", owner_id="alice")
+    assert service.ensure_external("shared-id", owner_id="bob") is False
+    with pytest.raises(KeyError):
+        service.status("shared-id", owner_id="bob")
+    assert service.status("shared-id", owner_id="alice")["status"] == "submitted"
+    # A genuinely absent id IS created.
+    assert service.ensure_external("fresh-id", owner_id="bob") is True
+    assert service.status("fresh-id", owner_id="bob")["status"] == "running"
+
+
+def test_job_results_reattaches_submit_time_healpix_meta():
+    """dl-async-healpix-scheme-lost (server path): client.results() provenance
+    has catalog/table/query all None and no healpix — JobResults must re-attach
+    the submit-time record's params so sky_density_map decodes the pixels with
+    the right scheme/nside instead of guessing."""
+    service = DatalabJobService(max_workers=1)
+    hp = {"column": "ring256", "nside": 256, "scheme": "ring"}
+    service.register_external(
+        "server-hp-1",
+        owner_id="alice",
+        params={
+            "tool_name": "datalab_density_aggregate",
+            "sql": "SELECT ring256 AS healpix, COUNT(*) AS source_count FROM nsc_dr2.object GROUP BY 1",
+            "catalog": "nsc_dr2",
+            "table": "object",
+            "healpix": hp,
+        },
+    )
+    store = DatalabResultStore(enable_disk_cache=False)
+    ctx = CallContext(
+        services={"datalab_job_service": service, "datalab_client": _ServerJobClient()},
+        result_store=store,
+        user_id="alice",
+    )
+    out = datalab_capability.JobResults().run(
+        datalab_capability.JobIdInput(job_id="server-hp-1"), ctx
+    ).to_native()
+    assert out["success"] is True
+    prov = store.get(out["result_id"]).provenance
+    assert prov["healpix"] == hp
+    assert prov["catalog"] == "nsc_dr2" and prov["table"] == "object"
+    assert prov["query"].startswith("SELECT ring256")
+    assert prov["jobid"] == "server-hp-1"

@@ -246,3 +246,65 @@ def test_unknown_capability_name_raises():
     agent = _wiring_agent()
     with pytest.raises(KeyError):
         agent._vo_tool_fn("not_a_tool")
+
+
+def test_external_catalog_table_result_stamps_upstream_total():
+    """f2-CX-22: a caller that KNOWS the remote total (lightkurve's
+    total_available) stamps upstream_truncated/upstream_total structurally on
+    the card run-result; an equal or unknown total stamps nothing."""
+    agent = _wiring_agent()
+    rows = [{"index": i, "mission": "TESS"} for i in range(3)]
+
+    agent._external_catalog_table_result(
+        rows, columns=["index", "mission"], source="S", filter_label="F",
+        tool_name="search_space_lightcurves", upstream_total=50,
+    )
+    assert agent.last_run_result["upstream_truncated"] is True
+    assert agent.last_run_result["upstream_total"] == 50
+
+    agent._external_catalog_table_result(
+        rows, columns=["index", "mission"], source="S", filter_label="F",
+        tool_name="search_space_lightcurves", upstream_total=3,
+    )
+    assert "upstream_truncated" not in agent.last_run_result
+
+    agent._external_catalog_table_result(
+        rows, columns=["index", "mission"], source="S", filter_label="F",
+        tool_name="search_space_lightcurves",
+    )
+    assert "upstream_truncated" not in agent.last_run_result
+
+
+def test_capped_producers_wire_remote_totals_into_the_seam(monkeypatch):
+    """f2-CX-22 sweep: every producer that KNOWS its remote total passes it to
+    _external_catalog_table_result — MOCServer (total_matches) and ATNF
+    (total_matches), alongside lightkurve (total_available)."""
+    agent = _wiring_agent()
+    agent._live_imagery_coordinates = lambda **k: (10.0, 20.0, "X")
+
+    class _MocSvc:
+        def coverage_at(self, *a, **k):
+            return {"success": True,
+                    "rows": [{"id": "a", "title": "T", "dataproduct_type": "image"}],
+                    "count": 1, "total_matches": 40, "warnings": [],
+                    "provenance": {"radius_deg": 0.5}}
+
+    class _PsrSvc:
+        def search_pulsars(self, *a, **k):
+            return {"success": True,
+                    "rows": [{"jname": "J0000+0000", "p0_s": 1.0, "sep_arcmin": 3.0}],
+                    "count": 1, "total_matches": 12, "warnings": [],
+                    "provenance": {"radius_deg": 1.0}}
+
+    agent._get_moc_coverage_service = lambda: _MocSvc()
+    agent._get_pulsar_catalog_service = lambda: _PsrSvc()
+
+    out = agent._survey_coverage(ra=10.0, dec=20.0)
+    assert out["success"] is True
+    assert agent.last_run_result["upstream_truncated"] is True
+    assert agent.last_run_result["upstream_total"] == 40
+
+    out = agent._search_pulsars(ra=10.0, dec=20.0)
+    assert out["success"] is True
+    assert agent.last_run_result["upstream_truncated"] is True
+    assert agent.last_run_result["upstream_total"] == 12

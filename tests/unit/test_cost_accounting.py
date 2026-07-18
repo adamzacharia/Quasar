@@ -1169,3 +1169,175 @@ def test_concurrent_mixed_byok_and_platform_calls_attribute_separately(
     # Each call is booked to the source that actually paid for it.
     assert quota_store.get_used_tokens("u1", "openai", "byok") == 800
     assert quota_store.get_used_tokens("u1", "openai", "platform") == 999 + 100
+
+
+# ---------------------------------------------------------------------------
+# Conductor-path accounting (A2 CX-01 / CX-13): executor threads must carry
+# the request's usage/quota context.
+# ---------------------------------------------------------------------------
+def test_conductor_executor_threads_carry_the_usage_context():
+    """Drive the REAL _execute_node submission path with a spy tool executor.
+
+    The accounting context lives in a threading.local; run_in_executor threads
+    never inherit it, so before the fix every conductor subtask's LLM spend
+    was unrecorded and unmetered. This asserts the context (and its
+    usage_recorder) is visible inside the executor thread — written to fail
+    on the pre-fix code.
+    """
+    import asyncio
+
+    from core.conductor import Conductor, OrchestrationRun
+    from core.llm_client import get_llm_request_context, llm_request_context
+    from core.task_dag import TaskDAG
+    from core.workflow_memory import WorkflowMemory
+
+    recorded = []
+    seen = {}
+
+    def spy_tool_executor(task_description, dep_context="", subtask_model="", user_id=""):
+        ctx = get_llm_request_context()
+        seen["ctx_visible"] = ctx is not None
+        if ctx is not None and ctx.usage_recorder:
+            ctx.usage_recorder(model="fake-model", input_tokens=3, output_tokens=5)
+        return "subtask done"
+
+    conductor = Conductor(client=object(), tool_executor=spy_tool_executor)
+    conductor.model_router = None
+    conductor.sandbox_executor = None
+    conductor.recovery = None
+
+    dag = TaskDAG()
+    dag.build_from_subtasks(
+        [{"id": "t1", "description": "measure", "agent_type": "general", "depends_on": []}]
+    )
+    run = OrchestrationRun(dag=dag, workflow_memory=WorkflowMemory())
+    node = dag.nodes["t1"]
+
+    with llm_request_context(
+        user_id="u-conductor",
+        usage_recorder=lambda **kw: recorded.append(kw),
+    ):
+        result = asyncio.run(conductor._execute_node(run, node, user_id="u-conductor"))
+
+    assert result == "subtask done"
+    assert seen["ctx_visible"], (
+        "conductor executor thread did not see the request's LLM accounting "
+        "context — subtask LLM calls would go unrecorded and unmetered"
+    )
+    assert recorded and recorded[0]["model"] == "fake-model"
+
+
+def test_reinstall_llm_request_context_propagates_to_a_bare_thread():
+    """The runner's conductor thread is a bare threading.Thread (runner.py):
+    the captured context must survive the hop and restore cleanly after."""
+    import threading
+
+    from core.llm_client import (
+        get_llm_request_context,
+        llm_request_context,
+        reinstall_llm_request_context,
+    )
+
+    calls = []
+    with llm_request_context(user_id="u2", usage_recorder=lambda **kw: calls.append(kw)):
+        captured = get_llm_request_context()
+        inner_seen = {}
+
+        def worker():
+            inner_seen["before"] = get_llm_request_context()
+            with reinstall_llm_request_context(captured):
+                ctx = get_llm_request_context()
+                inner_seen["inside"] = ctx
+                ctx.usage_recorder(model="m", input_tokens=1, output_tokens=1)
+            inner_seen["after"] = get_llm_request_context()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+    assert inner_seen["before"] is None          # threads do NOT inherit — the bug
+    assert inner_seen["inside"] is captured      # reinstall carries it across
+    assert inner_seen["after"] is None           # and restores cleanly
+    assert calls and calls[0]["model"] == "m"
+
+
+def test_llm_client_create_records_usage_and_settles_reservation():  # A2 CX-13
+    """Drive the REAL LLMClient.responses.create path — provider transport
+    stubbed at the _call_openai seam, everything else real: admission through
+    the context quota_checker, _record_usage reading the provider-reported
+    usage block, the reservation settled INTO the recorder, and the failure
+    path releasing it. This is the standard-path accounting flow end-to-end
+    minus only the wire."""
+    import types
+
+    from core.llm_client import LLMClient, llm_request_context
+
+    client = LLMClient(model="gpt-4o-mini")
+    shim = client.responses
+
+    fake_result = types.SimpleNamespace(
+        usage=types.SimpleNamespace(input_tokens=11, output_tokens=7),
+        output_text="ok",
+    )
+    shim._call_openai = lambda kwargs, attachments=None: fake_result
+
+    recorded = []
+    granted = []
+    released = []
+
+    def quota_checker(**kw):
+        granted.append(kw)
+        return f"res-{len(granted)}"
+
+    with llm_request_context(
+        user_id="u-e2e",
+        usage_recorder=lambda **kw: recorded.append(kw),
+        quota_checker=quota_checker,
+        quota_releaser=lambda rid: released.append(rid),
+    ):
+        out = shim.create(model="gpt-4o-mini", input="hi", stream=False)
+
+    assert out is fake_result
+    assert granted and granted[0]["provider"] == "openai"
+    assert recorded, "the real create() path never reached the usage recorder"
+    assert recorded[0]["input_tokens"] == 11 and recorded[0]["output_tokens"] == 7
+    assert recorded[0]["reservation_id"] == "res-1"   # settled, not leaked
+    assert released == []                              # success path releases nothing
+
+    # Failure path: the call never produced usage → the reservation is RELEASED.
+    def _boom(kwargs, attachments=None):
+        raise RuntimeError("provider down")
+
+    shim._call_openai = _boom
+    with llm_request_context(
+        user_id="u-e2e",
+        usage_recorder=lambda **kw: recorded.append(kw),
+        quota_checker=quota_checker,
+        quota_releaser=lambda rid: released.append(rid),
+    ):
+        try:
+            shim.create(model="gpt-4o-mini", input="hi", stream=False)
+        except RuntimeError:
+            pass
+
+    assert released == ["res-2"]
+
+
+def test_turn_accumulator_freeze_drops_late_calls():  # A2 CX-17
+    """Late conductor-thread calls arriving AFTER the usage snapshot must not
+    mutate the reported turn totals; they stay counted in the per-call ledger
+    and are surfaced via late_calls_dropped."""
+    from services.model_pricing import TurnCostAccumulator
+
+    acc = TurnCostAccumulator()
+    acc.record("openai", "gpt-4o-mini", "platform", 100, 50)
+    before_total = acc.total_tokens
+    before_cost = acc.turn_cost_usd()
+
+    acc.freeze()
+    late_cost = acc.record("openai", "gpt-4o-mini", "platform", 999, 999)
+
+    assert acc.total_tokens == before_total          # snapshot unchanged
+    assert acc.turn_cost_usd() == before_cost
+    assert acc.late_calls_dropped == 1
+    assert late_cost is not None                     # the CALL was still priced

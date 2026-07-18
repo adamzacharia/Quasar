@@ -16,7 +16,13 @@ from core.llm_client import detect_provider
 from core.logger import logger
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
-from core.agent import _run_result_is_new, _unescape_tool_args
+# DUAL_SOURCE_SCAFFOLD: referenced at the RAG-context branch — its absence
+# made every documentation-grounded query NameError into a misleading
+# provider-error message (scan CAR-2). Conductor: its absence made the whole
+# multi-agent branch dead code, silently swallowed by the complexity-detection
+# except (scan CAR-1). Both were dropped in the S14 extraction from agent.py.
+from core.agent import DUAL_SOURCE_SCAFFOLD, _run_result_is_new, _unescape_tool_args
+from core.conductor import Conductor
 from services.citation_verifier import append_citation_warning
 from services.content_safety import FILTER_NOTICE, is_explicit_query, safe_assistant_text
 
@@ -377,6 +383,16 @@ def stream_response_api(
         _is_imagery_request = bool(re.search(
             r'\b(?:show|display|make|create|generate|render|get|give)\b.*'
             r'\b(?:image|images|imagery|cutouts?|postage\s*stamps?|picture|pictures)\b',
+            _query_lower,
+        ))
+
+        # Radio SED / spectral-index questions must run the radio_sed tool —
+        # unforced, gpt-oss answers spectral indices from parametric memory
+        # (T4.1: 2/2 live failures). The prompt rule alone is ignored; force
+        # the round-0 tool call like the other data-fetch classes.
+        _is_radio_sed_query = bool(re.search(
+            r'\bspectral\s+ind(?:ex|ices)\b'
+            r'|\bradio\s+(?:sed|spectrum|spectra|spectral\s+energy)\b',
             _query_lower,
         ))
 
@@ -918,14 +934,41 @@ def stream_response_api(
                 agent._conductor_images_lock = threading.Lock()  # Thread-safe — subtasks run in parallel
                 _done = threading.Event()
 
+                # A2 CX-01: the usage/quota accounting context lives in a
+                # threading.local installed on THIS worker thread (sse.py).
+                # The conductor thread and its executor threads never inherit
+                # it, so every conductor-path LLM call went unrecorded and
+                # unmetered. Capture it here; reinstall inside the thread.
+                from core.llm_client import (
+                    get_llm_request_context,
+                    reinstall_llm_request_context,
+                )
+                _parent_llm_ctx = get_llm_request_context()
+
+                # CX-11/CX-39: sub-agent threads collect their tool-call trace
+                # into a collector that rides the REQUEST-scoped accounting
+                # context (never a singleton agent attribute — two concurrent
+                # conductor turns must not share or clobber collectors).
+                # Without a context (no accounting installed, e.g. bare bot
+                # channels) conductor traces stay untracked, as before.
+                _conductor_trace_collector = None
+                if _parent_llm_ctx is not None:
+                    _conductor_trace_collector = {
+                        "calls": [],
+                        "lock": threading.Lock(),
+                        "owner": threading.get_ident(),
+                    }
+                    _parent_llm_ctx.tool_trace_collector = _conductor_trace_collector
+
                 def _run_conductor():
                     nonlocal conductor_answer, conductor_run, conductor_exc
                     try:
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         try:
-                            conductor_answer, conductor_run = loop.run_until_complete(
-                                agent.conductor.orchestrate(
+                            with reinstall_llm_request_context(_parent_llm_ctx):
+                                conductor_answer, conductor_run = loop.run_until_complete(
+                                    agent.conductor.orchestrate(
                                     _user_query,
                                     context=rag_context,
                                     max_subtasks=_tier_max,
@@ -948,6 +991,21 @@ def stream_response_api(
                 t = threading.Thread(target=_run_conductor, daemon=True)
                 t.start()
                 _done.wait(timeout=300)   # wait up to 5 min for complex queries
+
+                # CX-11: merge sub-agent tool calls into this request's trace
+                # (even on failure/timeout — those calls really executed).
+                # Copy under the lock: on timeout, executor threads may still
+                # be appending. No detach is needed — the collector rides this
+                # request's context object, so a later turn can never see it
+                # (CX-39); post-timeout stragglers append harmlessly to a
+                # collector nobody reads again.
+                if _conductor_trace_collector is not None:
+                    with _conductor_trace_collector["lock"]:
+                        _collected = list(_conductor_trace_collector["calls"])
+                    _parent_trace = agent._accumulated_tool_trace
+                    _room = 200 - len(_parent_trace)
+                    if _collected and _room > 0:
+                        _parent_trace.extend(_collected[:_room])
 
                 if conductor_exc:
                     print(f"[WARNING] Conductor orchestration failed: {conductor_exc}. Falling back to standard path.")
@@ -1016,13 +1074,23 @@ def stream_response_api(
                                     on_event(web_event)
                     # Re-emit accumulated images via last_run_result so the SSE
                     # loop in main.py can emit them as inline image events.
-                    if hasattr(self, '_conductor_images') and agent._conductor_images:
+                    # `self` was the pre-extraction receiver — a latent NameError
+                    # inside the conductor block (scan CAR-3).
+                    if hasattr(agent, '_conductor_images') and agent._conductor_images:
                         agent.last_run_result = {
                             "type": "conductor_result",
                             "images": agent._conductor_images,
                         }
 
                     # Companion notebook attachment has been disabled for Conductor tasks as per requirements.
+
+                    # NO IMAGE URLS rule applies here too — this return bypasses
+                    # the standard-path 7c-pre guard below (T6.2 Conductor hole).
+                    if conductor_answer and "![" in conductor_answer:
+                        _n_imgs = len(re.findall(r"!\[[^\]]*\]\([^)]*\)", conductor_answer))
+                        if _n_imgs:
+                            conductor_answer = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", conductor_answer)
+                            print(f"[GUARD] Stripped {_n_imgs} inline markdown image(s) from the Conductor answer")
 
                     return safe_assistant_text(conductor_answer)
                 # Conductor returned None → not complex enough, fall through to standard path
@@ -1102,7 +1170,7 @@ def stream_response_api(
                 if _round == 0 and (
                     _is_archive_fetch or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
-                    or _is_imagery_request
+                    or _is_imagery_request or _is_radio_sed_query
                 ):
                     request_kwargs["tool_choice"] = "required"
 
@@ -1722,10 +1790,38 @@ def stream_response_api(
 
             # 8. Update long-term memory — only for authenticated users
             output_text = safe_assistant_text(output_text)
+
+            # R3: derive mechanical citation recall/precision from the same
+            # verification pass; the SSE layer surfaces them in run_meta for
+            # eval mode. Tool results are the numeric-evidence corpus.
+            def _citation_metrics_sink(verification, _answer_ref=None):
+                from services.citation_metrics import (
+                    compute_citation_metrics,
+                    record_citation_metrics_on_request_context,
+                )
+
+                evidence_texts = []
+                try:
+                    if _all_tool_results:
+                        evidence_texts.append(json.dumps(_all_tool_results, default=str))
+                except Exception:
+                    pass
+                try:
+                    if rag_context:
+                        evidence_texts.append(str(rag_context))
+                except Exception:
+                    pass
+                metrics = compute_citation_metrics(
+                    output_text, verification, evidence_texts=evidence_texts
+                )
+                metrics["path"] = "simple"
+                record_citation_metrics_on_request_context(metrics)
+
             output_text = append_citation_warning(
                 output_text,
                 agent.ads_client,
                 on_token=on_token,
+                verification_sink=_citation_metrics_sink,
             )
             output_text = safe_assistant_text(output_text)
             if agent.long_term_memory and not _is_anonymous:

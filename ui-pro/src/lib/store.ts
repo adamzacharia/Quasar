@@ -6,6 +6,7 @@ import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 import {
     fetchConversations as apiFetchConversations,
     fetchConversationMessages as apiFetchMessages,
+    fetchBlockRatings as apiFetchBlockRatings,
     deleteConversationApi,
     type ServerConversation,
     type ServerMessage,
@@ -40,13 +41,28 @@ interface ChatStore {
     taskChecklist: TaskChecklist | null;
     taskExecutionActive: boolean;
     savedPapers: Paper[];
+    // Eval mode (Feature 4) — per-user client state, admin-gated at the toggle.
+    evalMode: boolean;
+    /** blockId -> this user's CONFIRMED 1-5 rating (the server stored it).
+     *  The gate reads only this — see pendingRatings. */
+    blockRatings: Record<string, number>;
+    /** blockId -> a rating whose POST is still in flight. Shown optimistically,
+     *  but deliberately NOT counted by the gate. */
+    pendingRatings: Record<string, number>;
+    /** blockId -> mount count of its rating widget. The gate may only demand a
+     *  star on a block that is actually on screen; see registerBlock. */
+    visibleBlocks: Record<string, number>;
     // Conversation history loading state
     _loadedConversationIds: Set<string>;
     _conversationsLoaded: boolean;
     _pendingDeletes: Set<string>;
 
     setActiveConversation: (id: string | null) => void;
-    addMessage: (message: Message) => void;
+    /* UI-01: every stream-fed action takes an optional ownerConversationId —
+       when the stream's owner is no longer the active conversation, the update
+       is routed into the owner's stored messages instead of the live list
+       (the same CX-18 owner routing updateLastAssistantToolTrace pioneered). */
+    addMessage: (message: Message, ownerConversationId?: string | null) => void;
     mergeWebSourcesMessage: (payload: {
         sources?: WebSource[];
         images?: WebImage[];
@@ -54,12 +70,13 @@ interface ChatStore {
         imageProvider?: string;
         searchType?: string;
         query?: string;
-    }) => void;
-    updateLastAssistantMessage: (content: string) => void;
-    updateLastAssistantThinking: (thinking: string) => void;
-    updateLastAssistantRunMeta: (meta: import("./api").ChatRunMeta) => void;
-    updateLastAssistantToolTrace: (calls: import("./api").ToolTraceCall[]) => void;
-    updateLastAssistantUsage: (totalTokens: number, durationMs?: number) => void;
+    }, ownerConversationId?: string | null) => void;
+    updateLastAssistantMessage: (content: string, ownerConversationId?: string | null) => void;
+    updateLastAssistantThinking: (thinking: string, ownerConversationId?: string | null) => void;
+    updateLastAssistantRunMeta: (meta: import("./api").ChatRunMeta, ownerConversationId?: string | null) => void;
+    markLastAssistantRunFailed: (errorCode?: string, ownerConversationId?: string | null) => void;
+    updateLastAssistantToolTrace: (calls: import("./api").ToolTraceCall[], ownerConversationId?: string | null) => void;
+    updateLastAssistantUsage: (totalTokens: number, durationMs?: number, ownerConversationId?: string | null) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -79,6 +96,14 @@ interface ChatStore {
     clearTaskExecution: () => void;
     savePaper: (paper: Paper) => void;
     removePaper: (paperId: string) => void;
+    // Eval mode actions
+    setEvalMode: (on: boolean) => void;
+    setBlockRating: (blockId: string, rating: number) => void;
+    beginRating: (blockId: string, rating: number) => void;
+    resolveRating: (blockId: string, rating: number | null) => void;
+    loadBlockRatings: (conversationId: string) => Promise<void>;
+    registerBlock: (blockId: string) => void;
+    unregisterBlock: (blockId: string) => void;
     // Server-sync actions (auth rides the httpOnly cookie; token is legacy-optional)
     loadConversations: (token?: string) => Promise<void>;
     loadConversationMessages: (conversationId: string, token?: string) => Promise<void>;
@@ -170,13 +195,202 @@ function syncActiveConversationMessages(state: ChatStore, messages: Message[]): 
     );
 }
 
+/* UI-01: true when a stream update must be routed into its OWNER conversation's
+   stored messages instead of the live list — i.e. the stream outlived a
+   conversation switch. Mirrors the CX-18 guard that used to live only in
+   updateLastAssistantToolTrace; every stream-fed store action shares it now, so
+   a mid-stream switch can no longer cross-contaminate conversations. */
+function isOwnerRouted(
+    state: ChatStore,
+    ownerConversationId?: string | null,
+): ownerConversationId is string {
+    return Boolean(ownerConversationId && ownerConversationId !== state.activeConversationId);
+}
+
+/* UI-01: apply `patch` to the owner conversation's STORED message list.
+   setActiveConversation snapshots the live messages into the conversation
+   before switching, so the partial turn is there to patch; the persisted
+   server copy re-asserts the same content on reload. A `null` patch result
+   means "nothing to change". */
+function patchOwnerConversation(
+    state: ChatStore,
+    ownerConversationId: string,
+    patch: (messages: Message[]) => Message[] | null,
+): Partial<ChatStore> {
+    const conversations = state.conversations.map((conversation) => {
+        if (conversation.id !== ownerConversationId) return conversation;
+        const patched = patch(conversation.messages || []);
+        if (!patched) return conversation;
+        return { ...conversation, messages: patched, updatedAt: new Date() };
+    });
+    return { conversations };
+}
+
+/* UI-01: the web-sources merge, extracted pure so the live path and the
+   owner-routed path run identical logic. Returns null when there is nothing
+   to merge. */
+function mergeWebSourcesIntoMessages(
+    messages: Message[],
+    payload: {
+        sources?: WebSource[];
+        images?: WebImage[];
+        provider?: string;
+        imageProvider?: string;
+        searchType?: string;
+        query?: string;
+    },
+): Message[] | null {
+    const incomingSources = payload.sources || [];
+    const incomingImages = payload.images || [];
+    if (incomingSources.length === 0 && incomingImages.length === 0) return null;
+
+    const next = [...messages];
+    let lastUserIdx = -1;
+    for (let i = next.length - 1; i >= 0; i--) {
+        if (next[i].role === "user") {
+            lastUserIdx = i;
+            break;
+        }
+    }
+
+    let existingIdx = -1;
+    for (let i = next.length - 1; i > lastUserIdx; i--) {
+        if (next[i].role === "assistant" && next[i].type === "web_sources") {
+            existingIdx = i;
+            break;
+        }
+    }
+
+    if (existingIdx >= 0) {
+        const existing = next[existingIdx];
+        next[existingIdx] = {
+            ...existing,
+            webSources: mergeWebSources(existing.webSources || [], incomingSources),
+            webImages: mergeWebImages(existing.webImages || [], incomingImages),
+            webProvider: mergeLabel(existing.webProvider, payload.provider),
+            webImageProvider: mergeLabel(existing.webImageProvider, payload.imageProvider),
+            webSearchType: mergeLabel(existing.webSearchType, payload.searchType),
+            webQuery: existing.webQuery || payload.query,
+        };
+    } else {
+        next.push({
+            id: `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+            role: "assistant",
+            content: "",
+            type: "web_sources",
+            timestamp: new Date(),
+            webSources: mergeWebSources([], incomingSources),
+            webImages: mergeWebImages([], incomingImages),
+            webProvider: payload.provider,
+            webImageProvider: payload.imageProvider,
+            webSearchType: payload.searchType,
+            webQuery: payload.query,
+        });
+    }
+
+    return next;
+}
+
+/* Eval mode is per-user client state (same idiom as theme-store). The flag
+   gates the composer, so it must survive a reload — a half-labeled session
+   silently un-gating itself would let unrated turns into the label set. */
+const EVAL_MODE_KEY = "quasar_eval_mode";
+
+function getInitialEvalMode(): boolean {
+    if (typeof window === "undefined") return false;
+    try {
+        return localStorage.getItem(EVAL_MODE_KEY) === "1";
+    } catch {
+        return false;
+    }
+}
+
+function persistEvalMode(on: boolean) {
+    if (typeof window === "undefined") return;
+    try {
+        localStorage.setItem(EVAL_MODE_KEY, on ? "1" : "0");
+    } catch {
+        // Private mode / storage disabled — the flag just won't survive reload.
+    }
+}
+
+/* Block ids come from the server, minted once at emission and persisted in
+   rich_meta. We never recompute them here: sse.py's card ordering depends on
+   eager-vs-done emission and dedup, so a client-side recomputation could drift
+   and orphan a rating that is already keyed to the stored id.
+
+   `fallback` is for turns that predate stable ids (their rich_meta has none).
+   It must still be reload-stable, which the old `Date.now()` ids were not —
+   hence index-derived, not clock-derived. Such blocks are unrateable; the star
+   widget hides itself when `blockId` is absent. */
+function blockIdOr(persisted: unknown, fallback: string): string {
+    return typeof persisted === "string" && persisted ? persisted : fallback;
+}
+
+/* One papers grid -> one "papers" message. Extracted so a turn that searched
+   twice can rebuild BOTH grids: rich_meta.papersGroups holds every grid, while
+   papers/papersRequest/papersBlockId are only the back-compat primary. */
+function buildPapersMessage(
+    rawPapers: Record<string, unknown>[],
+    opts: { id: string; blockId?: string; request?: Message["request"]; runMeta?: Message["runMeta"] },
+): Message {
+    const mappedPapers: Paper[] = rawPapers.map((p, i) => ({
+        id: (p.bibcode as string) || (p.id as string) || `paper-${i}`,
+        title: (p.title as string) || "Untitled",
+        authors: (p.authors as string) || "Unknown",
+        year: Number(p.year) || 0,
+        journal: (p.journal as string) || (p.pub as string) || "",
+        citationCount: Number(p.citations ?? p.citationCount ?? p.citation_count ?? 0),
+        type: (p.type as Paper["type"]) || "radio",
+        bibcode: (p.bibcode as string) || undefined,
+        doi: (p.doi as string) || undefined,
+        abstract: (p.abstract as string) || undefined,
+        // OpenAlex enrichment
+        fwci: p.fwci != null ? Number(p.fwci) : null,
+        citationPercentile: p.citation_percentile != null ? Number(p.citation_percentile) : null,
+        isTop1Percent: Boolean(p.is_top_1_percent || p.isTop1Percent),
+        isTop10Percent: Boolean(p.is_top_10_percent || p.isTop10Percent),
+        funders: Array.isArray(p.funders) ? (p.funders as { name: string; id: string }[]) : undefined,
+        oaPdfUrl: (p.oa_pdf_url as string) || (p.oaPdfUrl as string) || undefined,
+        observationLinks: Array.isArray(p.observation_links)
+            ? (p.observation_links as Record<string, unknown>[]).map((link) => ({
+                identifier: String(link.identifier || ""),
+                identifierType: String(link.identifier_type || link.identifierType || ""),
+                relation: String(link.relation || ""),
+                confidence: String(link.confidence || ""),
+                adsQuery: String(link.ads_query || link.adsQuery || ""),
+            })).filter((link) => link.identifier)
+            : Array.isArray(p.observationLinks)
+                ? p.observationLinks as Paper["observationLinks"]
+                : undefined,
+    }));
+    return {
+        id: opts.id,
+        role: "assistant",
+        content: "Here are the relevant papers I found:",
+        type: "papers",
+        timestamp: new Date(),
+        papers: mappedPapers,
+        // The ADS query behind the grid (Feature 1) — persisted, so the
+        // provenance block survives a reload.
+        request: opts.request,
+        runMeta: opts.runMeta,
+        blockId: opts.blockId,
+        blockKind: "papers",
+    };
+}
+
 function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
+    const meta0 = msg.metadata || {};
+    const runMeta0 = (meta0.runMeta as { text_block_id?: string } | undefined) || undefined;
     const base: Message = {
-        id: `srv-${index}-${Date.now().toString(36)}`,
+        id: blockIdOr(runMeta0?.text_block_id, `srv-${index}`),
         role: msg.role as Message["role"],
         content: msg.role === "assistant" ? sanitizeAssistantContent(msg.content || "") : msg.content || "",
         type: (msg.type || "text") as Message["type"],
         timestamp: new Date(),
+        blockId: typeof runMeta0?.text_block_id === "string" ? runMeta0.text_block_id : undefined,
+        blockKind: msg.role === "assistant" ? "text" : undefined,
     };
 
     // Restore thinking steps from metadata (shown in "Thinking" widget)
@@ -202,77 +416,78 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     }
 
     const messages: Message[] = [base];
+    // Every card of this turn shares the turn's run — the rating POST needs
+    // run_id to join to chat_runs (model/tokens/cost) in the eval export, and
+    // rich_meta only stores runMeta once, on the message as a whole.
+    const turnRunMeta = base.runMeta;
 
-    // Restore DataTableCard as a separate "data" message (same as live SSE)
-    if (meta.dataTable) {
+    // Restore DataTableCard(s) as separate "data" messages (same as live SSE).
+    // Prefer `dataTables` — sse.py persists the full list for multi-target
+    // turns and `dataTable` is only its back-compat first element, so reading
+    // `dataTable` alone silently dropped every table after the first on reload
+    // (and with it, any rating those tables had earned).
+    const storedTables = Array.isArray(meta.dataTables) && meta.dataTables.length > 0
+        ? (meta.dataTables as Record<string, unknown>[])
+        : meta.dataTable
+            ? [meta.dataTable as Record<string, unknown>]
+            : [];
+    storedTables.forEach((table, tableIndex) => {
+        if (!table) return;
         messages.push({
-            id: `srv-${index}-dt-${Date.now().toString(36)}`,
+            id: blockIdOr(table.blockId, `srv-${index}-dt-${tableIndex}`),
             role: "assistant",
             content: "",
             type: "data",
             timestamp: new Date(),
-            dataTable: meta.dataTable as Message["dataTable"],
+            dataTable: table as unknown as Message["dataTable"],
+            runMeta: turnRunMeta,
+            blockId: typeof table.blockId === "string" ? table.blockId : undefined,
+            blockKind: "data",
         });
-    }
+    });
 
-    // Restore Paper cards as a separate "papers" message
-    if (meta.papers && Array.isArray(meta.papers) && meta.papers.length > 0) {
-        // Map backend field names to frontend Paper interface
-        const mappedPapers: Paper[] = (meta.papers as Record<string, unknown>[]).map((p, i) => ({
-            id: (p.bibcode as string) || (p.id as string) || `paper-${i}`,
-            title: (p.title as string) || "Untitled",
-            authors: (p.authors as string) || "Unknown",
-            year: Number(p.year) || 0,
-            journal: (p.journal as string) || (p.pub as string) || "",
-            citationCount: Number(p.citations ?? p.citationCount ?? p.citation_count ?? 0),
-            type: (p.type as Paper["type"]) || "radio",
-            bibcode: (p.bibcode as string) || undefined,
-            doi: (p.doi as string) || undefined,
-            abstract: (p.abstract as string) || undefined,
-            // OpenAlex enrichment
-            fwci: p.fwci != null ? Number(p.fwci) : null,
-            citationPercentile: p.citation_percentile != null ? Number(p.citation_percentile) : null,
-            isTop1Percent: Boolean(p.is_top_1_percent || p.isTop1Percent),
-            isTop10Percent: Boolean(p.is_top_10_percent || p.isTop10Percent),
-            funders: Array.isArray(p.funders) ? (p.funders as { name: string; id: string }[]) : undefined,
-            oaPdfUrl: (p.oa_pdf_url as string) || (p.oaPdfUrl as string) || undefined,
-            observationLinks: Array.isArray(p.observation_links)
-                ? (p.observation_links as Record<string, unknown>[]).map((link) => ({
-                    identifier: String(link.identifier || ""),
-                    identifierType: String(link.identifier_type || link.identifierType || ""),
-                    relation: String(link.relation || ""),
-                    confidence: String(link.confidence || ""),
-                    adsQuery: String(link.ads_query || link.adsQuery || ""),
-                })).filter((link) => link.identifier)
-                : Array.isArray(p.observationLinks)
-                    ? p.observationLinks as Paper["observationLinks"]
-                    : undefined,
+    // Restore Paper cards as separate "papers" messages. papersGroups carries
+    // every grid of a multi-search turn (papers/papersBlockId are only the
+    // back-compat primary), so a rating on the first grid isn't orphaned.
+    const paperGroups: { papers: unknown[]; request?: unknown; blockId?: string }[] =
+        Array.isArray(meta.papersGroups) && meta.papersGroups.length > 0
+            ? (meta.papersGroups as { papers: unknown[]; request?: unknown; blockId?: string }[])
+            : (meta.papers && Array.isArray(meta.papers) && meta.papers.length > 0
+                ? [{ papers: meta.papers as unknown[], request: meta.papersRequest, blockId: meta.papersBlockId as string | undefined }]
+                : []);
+    paperGroups.forEach((group, groupIndex) => {
+        const rawPapers = Array.isArray(group?.papers) ? group.papers : [];
+        if (rawPapers.length === 0) return;
+        messages.push(buildPapersMessage(rawPapers as Record<string, unknown>[], {
+            id: blockIdOr(group.blockId, `srv-${index}-pp-${groupIndex}`),
+            blockId: typeof group.blockId === "string" ? group.blockId : undefined,
+            request: group.request as Message["request"],
+            runMeta: turnRunMeta,
         }));
-        messages.push({
-            id: `srv-${index}-pp-${Date.now().toString(36)}`,
-            role: "assistant",
-            content: "Here are the relevant papers I found:",
-            type: "papers",
-            timestamp: new Date(),
-            papers: mappedPapers,
-            // The ADS query behind the grid (Feature 1) — persisted, so the
-            // provenance block survives a reload.
-            request: meta.papersRequest as Message["request"],
-        });
-    }
+    });
 
-    // Restore Notebook as a separate "notebook" message
-    if (meta.notebook) {
-        const nb = meta.notebook as Record<string, unknown>;
+    // Restore Notebook(s). `notebooks` carries every notebook of a turn that
+    // produced more than one (Conductor emits its own alongside the normal
+    // path); `notebook` is only the back-compat last one.
+    const storedNotebooks = Array.isArray(meta.notebooks) && meta.notebooks.length > 0
+        ? (meta.notebooks as Record<string, unknown>[])
+        : meta.notebook
+            ? [meta.notebook as Record<string, unknown>]
+            : [];
+    storedNotebooks.forEach((nb, nbIndex) => {
+        if (!nb) return;
         messages.push({
-            id: `srv-${index}-nb-${Date.now().toString(36)}`,
+            id: blockIdOr(nb.blockId, `srv-${index}-nb-${nbIndex}`),
             role: "assistant",
             content: `I've generated a Jupyter Notebook for your analysis: **${nb.title || "Dynamic Notebook"}**`,
             type: "notebook",
             timestamp: new Date(),
             notebookData: nb as unknown as Message["notebookData"],
+            runMeta: turnRunMeta,
+            blockId: typeof nb.blockId === "string" ? nb.blockId : undefined,
+            blockKind: "notebook",
         });
-    }
+    });
     // Restore rendered images as separate "image" messages.
     const storedImages = Array.isArray(meta.images) && meta.images.length > 0
         ? meta.images
@@ -285,13 +500,16 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
         storedImages.forEach((rawImage, imageIndex) => {
             if (rawImage === null || rawImage === undefined) return;
             if (typeof rawImage === "object") {
-                const img = rawImage as { url?: string; caption?: string; meta?: unknown; request?: Message["request"] };
+                const img = rawImage as {
+                    url?: string; caption?: string; meta?: unknown;
+                    request?: Message["request"]; blockId?: string; blockKind?: string;
+                };
                 const rawUrl = String(img.url || "").trim();
                 if (rawUrl === "" || seenImageUrls.has(rawUrl)) return;
                 seenImageUrls.add(rawUrl);
                 const imageUrl = rawUrl.startsWith("http") || rawUrl.startsWith("data:") ? rawUrl : apiBase + rawUrl;
                 messages.push({
-                    id: "srv-" + index + "-img-" + imageIndex + "-" + Date.now().toString(36),
+                    id: blockIdOr(img.blockId, "srv-" + index + "-img-" + imageIndex),
                     role: "assistant",
                     content: img.caption || "",
                     type: "image",
@@ -300,6 +518,11 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
                     imageCaption: img.caption || "",
                     imageMeta: normalizeHipsImageMeta(img.meta),
                     request: img.request,   // Feature 1: survives reload
+                    runMeta: turnRunMeta,
+                    blockId: typeof img.blockId === "string" ? img.blockId : undefined,
+                    // A plotly figure persists into `images` with its PNG; the
+                    // stored kind is what decides which star row it re-lights.
+                    blockKind: img.blockKind === "plotly" ? "plotly" : "image",
                 });
             }
         });
@@ -355,6 +578,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     taskChecklist: null,
     taskExecutionActive: false,
     savedPapers: [],
+    evalMode: getInitialEvalMode(),
+    blockRatings: {},
+    pendingRatings: {},
+    visibleBlocks: {},
     _loadedConversationIds: new Set(),
     _conversationsLoaded: false,
     _pendingDeletes: new Set(),
@@ -392,7 +619,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         };
     }),
 
-    addMessage: (message) => set((state) => {
+    addMessage: (message, ownerConversationId) => set((state) => {
+        // UI-01: a card/tool bubble from a stream whose conversation was
+        // switched away must append to the OWNER's stored messages — not the
+        // newly active conversation's transcript.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, (msgs) => [...msgs, message]);
+        }
         const newMessages = [...state.messages, message];
 
         let updatedConversations = [...state.conversations];
@@ -432,77 +665,101 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         return { messages: newMessages, conversations: updatedConversations };
     }),
 
-    mergeWebSourcesMessage: (payload) => set((state) => {
-        const incomingSources = payload.sources || [];
-        const incomingImages = payload.images || [];
-        if (incomingSources.length === 0 && incomingImages.length === 0) return {};
-
-        const messages = [...state.messages];
-        let lastUserIdx = -1;
-        for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i].role === "user") {
-                lastUserIdx = i;
-                break;
-            }
+    mergeWebSourcesMessage: (payload, ownerConversationId) => set((state) => {
+        // UI-01: web sources retrieved for a switched-away stream belong to
+        // the owner conversation's transcript.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, (msgs) =>
+                mergeWebSourcesIntoMessages(msgs, payload));
         }
-
-        let existingIdx = -1;
-        for (let i = messages.length - 1; i > lastUserIdx; i--) {
-            if (messages[i].role === "assistant" && messages[i].type === "web_sources") {
-                existingIdx = i;
-                break;
-            }
-        }
-
-        if (existingIdx >= 0) {
-            const existing = messages[existingIdx];
-            messages[existingIdx] = {
-                ...existing,
-                webSources: mergeWebSources(existing.webSources || [], incomingSources),
-                webImages: mergeWebImages(existing.webImages || [], incomingImages),
-                webProvider: mergeLabel(existing.webProvider, payload.provider),
-                webImageProvider: mergeLabel(existing.webImageProvider, payload.imageProvider),
-                webSearchType: mergeLabel(existing.webSearchType, payload.searchType),
-                webQuery: existing.webQuery || payload.query,
-            };
-        } else {
-            messages.push({
-                id: `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
-                role: "assistant",
-                content: "",
-                type: "web_sources",
-                timestamp: new Date(),
-                webSources: mergeWebSources([], incomingSources),
-                webImages: mergeWebImages([], incomingImages),
-                webProvider: payload.provider,
-                webImageProvider: payload.imageProvider,
-                webSearchType: payload.searchType,
-                webQuery: payload.query,
-            });
-        }
-
+        const messages = mergeWebSourcesIntoMessages(state.messages, payload);
+        if (!messages) return {};
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),
         };
     }),
 
-    updateLastAssistantMessage: (content) => set((state) => {
+    updateLastAssistantMessage: (content, ownerConversationId) => set((state) => {
+        // UI-01: after a mid-stream switch, tokens must patch the OWNER's last
+        // assistant text message — writing into the live list overwrote the
+        // newly opened conversation's previous answer with the old stream's.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, (msgs) =>
+                updateLastAssistantContent(msgs, content));
+        }
         return { messages: updateLastAssistantContent(state.messages, content) };
     }),
 
-    updateLastAssistantThinking: (thinking) => set((state) => {
+    updateLastAssistantThinking: (thinking, ownerConversationId) => set((state) => {
+        // UI-01: owner-routed thinking never touches the global thinkingStatus,
+        // which belongs to whatever conversation is on screen.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, (msgs) =>
+                updateAssistantThinking(msgs, thinking));
+        }
         return {
             messages: updateAssistantThinking(state.messages, thinking),
             thinkingStatus: "running",
         };
     }),
 
-    updateLastAssistantRunMeta: (meta) => set((state) => {
-        const messages = [...state.messages];
-        const index = findLastAssistantTextIndex(messages);
-        if (index < 0) return {};
-        messages[index] = { ...messages[index], runMeta: meta };
+    updateLastAssistantRunMeta: (meta, ownerConversationId) => set((state) => {
+        const stamp = (messages: Message[]): Message[] | null => {
+            const index = findLastAssistantTextIndex(messages);
+            if (index < 0) return null;
+            const next = [...messages];
+            // run_meta is where the text block learns its identity (Feature 4):
+            // the assistant message is created optimistically in handleSend,
+            // before any event arrives, so it has no id of its own until now.
+            // The message id is left alone — React is already keyed on it and
+            // remounting the live bubble mid-stream would drop the streamed text.
+            next[index] = {
+                ...next[index],
+                runMeta: meta,
+                blockId: meta.text_block_id || next[index].blockId,
+                blockKind: "text",
+            };
+            return next;
+        };
+        // UI-01: run identity follows the stream's owner conversation.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, stamp);
+        }
+        const messages = stamp(state.messages);
+        if (!messages) return {};
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
+        };
+    }),
+
+    /* Mark this turn as an infrastructure failure (Feature 4).
+
+       run_meta arrives at the START of a turn, when the status is necessarily
+       unknown, and the persisted rich_meta only learns "failed" at the end — so
+       WITHOUT this the live session has no failed marker at all, and the eval
+       gate would demand a rating for an answer the backend never produced.
+       Mirrors what sse.py writes into rich_meta.runMeta, so the live turn and
+       the reloaded one agree. */
+    markLastAssistantRunFailed: (errorCode, ownerConversationId) => set((state) => {
+        const stamp = (messages: Message[]): Message[] | null => {
+            const index = findLastAssistantTextIndex(messages);
+            if (index < 0) return null;
+            const next = [...messages];
+            const existing = next[index].runMeta;
+            next[index] = {
+                ...next[index],
+                runMeta: { ...(existing || {}), status: "failed", errorCode } as Message["runMeta"],
+            };
+            return next;
+        };
+        // UI-01: a failure on a switched-away stream marks the OWNER's turn.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, stamp);
+        }
+        const messages = stamp(state.messages);
+        if (!messages) return {};
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),
@@ -511,31 +768,54 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     // Raw request provenance for the turn (Feature 1). Lands on the assistant
     // text message; card messages carry their own `request` on the card payload.
-    updateLastAssistantToolTrace: (calls) => set((state) => {
+    updateLastAssistantToolTrace: (calls, ownerConversationId) => set((state) => {
         if (!Array.isArray(calls) || calls.length === 0) return {};
-        const messages = [...state.messages];
-        const index = findLastAssistantTextIndex(messages);
-        if (index < 0) return {};
-        messages[index] = { ...messages[index], toolTrace: calls };
+        const stamp = (messages: Message[]): Message[] | null => {
+            const index = findLastAssistantTextIndex(messages);
+            if (index < 0) return null;
+            const next = [...messages];
+            next[index] = { ...next[index], toolTrace: calls };
+            return next;
+        };
+        // Route to the conversation that OWNS the stream (CX-18 / UI-01): a
+        // terminal trace can arrive after the user switched conversations
+        // mid-stream, and attaching it to the newly ACTIVE conversation would
+        // pin one run's provenance onto another conversation's last answer.
+        // When the owner is no longer active, patch the owner's stored copy
+        // (the persisted rich_meta.toolTrace re-asserts it on reload too).
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, stamp);
+        }
+        const messages = stamp(state.messages);
+        if (!messages) return {};
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),
         };
     }),
 
-    updateLastAssistantUsage: (totalTokens, durationMs) => set((state) => {
-        const messages = [...state.messages];
-        const index = findLastAssistantTextIndex(messages);
-        if (index < 0) return {};
-        messages[index] = {
-            ...messages[index],
-            usageTokens: totalTokens,
-            // Backend compute time wins over the frontend stream-lifetime clock
-            // (drip throttling inflates the latter — live P15's "Thought 1149s").
-            ...(durationMs && durationMs > 0
-                ? { thinkingDuration: Math.max(1, Math.round(durationMs / 1000)) }
-                : {}),
+    updateLastAssistantUsage: (totalTokens, durationMs, ownerConversationId) => set((state) => {
+        const stamp = (messages: Message[]): Message[] | null => {
+            const index = findLastAssistantTextIndex(messages);
+            if (index < 0) return null;
+            const next = [...messages];
+            next[index] = {
+                ...next[index],
+                usageTokens: totalTokens,
+                // Backend compute time wins over the frontend stream-lifetime clock
+                // (drip throttling inflates the latter — live P15's "Thought 1149s").
+                ...(durationMs && durationMs > 0
+                    ? { thinkingDuration: Math.max(1, Math.round(durationMs / 1000)) }
+                    : {}),
+            };
+            return next;
         };
+        // UI-01: a switched-away stream's usage stamps the OWNER's turn.
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, stamp);
+        }
+        const messages = stamp(state.messages);
+        if (!messages) return {};
         return {
             messages,
             conversations: syncActiveConversationMessages(state, messages),
@@ -685,6 +965,77 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         savedPapers: s.savedPapers.filter(p => p.id !== paperId),
     })),
 
+    // ── Eval mode (Feature 4) ───────────────────────────────────────────────
+
+    setEvalMode: (on) => {
+        persistEvalMode(on);
+        set({ evalMode: on });
+    },
+
+    setBlockRating: (blockId, rating) => set((s) => ({
+        blockRatings: { ...s.blockRatings, [blockId]: rating },
+    })),
+
+    /* A rating whose POST is in flight: lights the star at once, but does NOT
+       count toward the gate.
+
+       Optimism and the gate are different questions. If an in-flight rating
+       satisfied the gate, the user could star a block and send the next prompt
+       before the POST landed — and if it then failed, the turn is gone and the
+       label set has a hole exactly where the gate was supposed to guarantee one
+       could not exist. On a slow network that window is seconds wide, not
+       milliseconds. So the star is optimistic and the gate is not. */
+    beginRating: (blockId, rating) => set((s) => ({
+        pendingRatings: { ...s.pendingRatings, [blockId]: rating },
+    })),
+
+    /* Settle an in-flight rating: `rating` on success, null when the POST failed.
+       A failure simply drops the pending value — the confirmed map was never
+       touched, so there is no phantom star to roll back. */
+    resolveRating: (blockId, rating) => set((s) => {
+        const pending = { ...s.pendingRatings };
+        delete pending[blockId];
+        if (rating === null) return { pendingRatings: pending };
+        return { pendingRatings: pending, blockRatings: { ...s.blockRatings, [blockId]: rating } };
+    }),
+
+    /* The gate may only demand a rating for a block the user can actually see,
+       and the ONLY thing that knows that is the rating widget itself: a block
+       can carry a stable id and still render nothing (a 0-row data card is
+       suppressed; a papers grid is swallowed by the ObservationPaperGraph).
+       Mirroring those conditions in the gate would work until someone adds the
+       next suppression rule to ChatMessage and silently wedges the composer —
+       an unrateable-but-required block blocks sending with no way out. So the
+       mounted widgets are the source of truth, and the gate follows automatically.
+
+       Refcounted rather than a Set: React StrictMode double-mounts in dev, and
+       a plain delete on the first cleanup would unregister a live widget. */
+    registerBlock: (blockId) => set((s) => {
+        if (!blockId) return {};
+        return { visibleBlocks: { ...s.visibleBlocks, [blockId]: (s.visibleBlocks[blockId] || 0) + 1 } };
+    }),
+
+    unregisterBlock: (blockId) => set((s) => {
+        if (!blockId || !s.visibleBlocks[blockId]) return {};
+        const next = { ...s.visibleBlocks };
+        const count = next[blockId] - 1;
+        if (count > 0) next[blockId] = count;
+        else delete next[blockId];
+        return { visibleBlocks: next };
+    }),
+
+    loadBlockRatings: async (conversationId) => {
+        if (!conversationId) return;
+        try {
+            const ratings = await apiFetchBlockRatings(conversationId);
+            // Merge rather than replace: a rating cast while this was in flight
+            // must not be clobbered by a response that predates it.
+            set((s) => ({ blockRatings: { ...ratings, ...s.blockRatings } }));
+        } catch {
+            // Non-critical — an unreachable ratings endpoint must not break chat.
+        }
+    },
+
     // ── Server-sync Actions ─────────────────────────────────────────────────
 
     loadConversations: async (token?: string) => {
@@ -737,6 +1088,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             }
             return updates as ChatStore;
         });
+
+        // Re-light the stars this user already earned on these blocks. Fired
+        // after the messages land so the ids exist to key against; awaited so a
+        // reload can't briefly show an unrated turn and trip the gate.
+        await get().loadBlockRatings(conversationId);
     },
 
     deleteConversation: async (conversationId: string, token?: string) => {

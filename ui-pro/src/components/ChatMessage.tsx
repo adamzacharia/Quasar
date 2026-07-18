@@ -18,11 +18,13 @@ import { WebSourcesCard } from "./WebSourcesCard";
 import { HipsImageCard } from "./HipsImageCard";
 import { PlotlyCard } from "./PlotlyCard";
 import { QueryProvenance } from "./QueryProvenance";
+import { BlockRating } from "./BlockRating";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
 import { canSubmitIssueReport, shouldOpenIssueReport } from "../lib/feedback-report";
 import { safeAssistantWebText } from "../lib/content-safety";
+import { latestRunningPhase } from "../lib/active-phase";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -417,11 +419,24 @@ function StreamingThinking({ text }: { text: string }) {
     );
 }
 
-function AnswerBuffer() {
+function AnswerBuffer({ phase }: { phase?: string }) {
+    // Elapsed time in the CURRENT phase — resets when the backend moves on to
+    // a different tool. Slow archives show minutes here; the counter is the
+    // difference between "frozen" and "still working on X".
+    const [elapsed, setElapsed] = useState(0);
+    useEffect(() => {
+        setElapsed(0);
+        const interval = setInterval(() => setElapsed((e) => e + 1), 1000);
+        return () => clearInterval(interval);
+    }, [phase]);
+
     return (
         <div className="flex max-w-2xl items-center gap-2 px-1 text-xs text-slate-500">
             <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-            <span>Generating answer</span>
+            <span>{phase || "Generating answer"}</span>
+            {elapsed >= 5 && (
+                <span className="font-mono text-slate-600">{elapsed}s</span>
+            )}
         </div>
     );
 }
@@ -469,6 +484,10 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     const hasThinking = hasThinkingSteps || !!message.thinking;
     const thinkingIsRunning = thinkingStatus === "running" && !hasContent;
     const showAnswerBuffer = Boolean(isStreaming && hasContent);
+    // Name the phase actually running behind the spinner (a mid-answer archive
+    // query, web search, …) instead of the misleading generic "Generating
+    // answer" — slow external services used to hide behind that label.
+    const answerBufferPhase = showAnswerBuffer ? latestRunningPhase(thinkingSteps) : undefined;
     // Show immediate waiting indicator when streaming but nothing has arrived yet
     const showInitialWaiting = Boolean(isStreaming && !hasContent && !hasThinking && !taskExecutionState);
 
@@ -580,6 +599,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
             <>
                 <div className="pl-11">
                     <DataTableCard data={message.dataTable} />
+                    <BlockRating blockId={message.blockId} blockKind={message.blockKind}
+                        runId={message.runMeta?.run_id} model={message.runMeta?.model} />
                 </div>
                 {observationGraph && (
                     <div className="mt-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
@@ -610,6 +631,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                 {/* ONE shared ADS query for the whole grid — repeating the same
                     query on each of N paper cards would be pure noise. */}
                 <QueryProvenance request={message.request} toolName="search_papers" />
+                <BlockRating blockId={message.blockId} blockKind={message.blockKind}
+                    runId={message.runMeta?.run_id} model={message.runMeta?.model} />
             </div>
         );
     }
@@ -643,6 +666,8 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
                     {title} · {cellCount} cells
                 </button>
+                <BlockRating blockId={message.blockId} blockKind={message.blockKind}
+                    runId={message.runMeta?.run_id} model={message.runMeta?.model} />
             </div>
         );
     }
@@ -650,27 +675,39 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     // ── Interactive Plotly figure (falls back to PNG image card) ──
     if (message.type === "plotly" && (message.plotlySpec || message.plotlyPngFallback)) {
         return (
-            <PlotlyCard
-                key={message.id}
-                spec={message.plotlySpec}
-                title={message.plotlyTitle}
-                pngFallback={message.plotlyPngFallback}
-                meta={message.plotlyMeta}
-                request={message.request}
-            />
+            <>
+                <PlotlyCard
+                    key={message.id}
+                    spec={message.plotlySpec}
+                    title={message.plotlyTitle}
+                    pngFallback={message.plotlyPngFallback}
+                    meta={message.plotlyMeta}
+                    request={message.request}
+                />
+                <div className="pl-11">
+                    <BlockRating blockId={message.blockId} blockKind={message.blockKind}
+                    runId={message.runMeta?.run_id} model={message.runMeta?.model} />
+                </div>
+            </>
         );
     }
 
     // ── Rendered FITS Image ──────────────────────────────────────
     if (message.type === "image" && message.imageUrl) {
         return (
-            <HipsImageCard
-                key={message.imageUrl}
-                imageUrl={message.imageUrl}
-                caption={message.imageCaption || ""}
-                imageMeta={message.imageMeta}
-                request={message.request}
-            />
+            <>
+                <HipsImageCard
+                    key={message.imageUrl}
+                    imageUrl={message.imageUrl}
+                    caption={message.imageCaption || ""}
+                    imageMeta={message.imageMeta}
+                    request={message.request}
+                />
+                <div className="pl-11">
+                    <BlockRating blockId={message.blockId} blockKind={message.blockKind}
+                    runId={message.runMeta?.run_id} model={message.runMeta?.model} />
+                </div>
+            </>
         );
     }
 
@@ -821,7 +858,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         </div>
                     )}
 
-                    {showAnswerBuffer && <AnswerBuffer />}
+                    {showAnswerBuffer && <AnswerBuffer phase={answerBufferPhase} />}
 
                     {/* Raw request provenance for this turn's tool calls (Feature 1).
                         Card-level blocks (e.g. DataTableCard) show their own single
@@ -843,6 +880,15 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             message={{ ...message, content: displayContent }}
                             reportPrompt={reportPrompt}
                         />
+                    )}
+                    {/* Eval-mode star rating for the prose block — augments the
+                        bar above rather than replacing it, so like/dislike and
+                        the issue-report flow are untouched. Gated on
+                        !isStreaming for the same reason as MessageActions: an
+                        in-flight answer isn't rateable yet. */}
+                    {hasContent && !isStreaming && (
+                        <BlockRating blockId={message.blockId} blockKind="text"
+                            runId={message.runMeta?.run_id} model={message.runMeta?.model} />
                     )}
                 </div>
             </div>

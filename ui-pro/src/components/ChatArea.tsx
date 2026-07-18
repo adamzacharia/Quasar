@@ -20,6 +20,8 @@ import { PREFILL_PROMPT_EVENT } from "../lib/prompt-dispatch";
 import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
 import { buildObservationPaperGraph } from "../lib/research-graph";
 import { useAuthStore, verifyAuth } from "../lib/auth-store";
+import { shouldBlockSend, unratedBlocks, nudgeText } from "../lib/eval-mode";
+import { useEvalModeActive } from "../lib/use-eval-mode";
 
 interface AttachedFile { file: File; preview?: string; type: "image" | "document"; }
 
@@ -39,12 +41,28 @@ export function ChatArea() {
         taskGroups, taskItems, taskChecklist, taskExecutionActive,
         handleTaskGroup, handleTaskUpdate, handleTaskList, clearTaskExecution,
         setActiveConversationId, loadConversations,
+        blockRatings, visibleBlocks, markLastAssistantRunFailed,
     } = useChatStore();
+
+    // Admin + build-flag aware; the raw store flag alone is per-browser and
+    // would gate a non-admin who inherited an admin's localStorage.
+    const evalMode = useEvalModeActive();
 
     const { isAuthenticated, clearAuth } = useAuthStore();
     const isMobile = useIsMobile();
 
     const [inputValue, setInputValue] = useState("");
+    // Inline nudge shown when the eval-mode gate refuses a send (Feature 4).
+    const [evalNudge, setEvalNudge] = useState("");
+    // Retract the nudge the moment the last star lands, rather than making the
+    // user press send again to discover they're unblocked.
+    const pendingEvalBlocks = useMemo(
+        () => (evalMode ? unratedBlocks(messages, blockRatings, visibleBlocks) : []),
+        [evalMode, messages, blockRatings, visibleBlocks],
+    );
+    useEffect(() => {
+        if (pendingEvalBlocks.length === 0) setEvalNudge("");
+    }, [pendingEvalBlocks.length]);
     // Composer options + visit counter live here (not in ChatInput) so they
     // persist across the hero→docked switch and the hit endpoint fires once.
     const [grounded, setGrounded] = useState(false);
@@ -115,15 +133,29 @@ export function ChatArea() {
         let currentTurnDataMessageIds: string[] = [];
         let currentTurnMessageIds: string[] = [];
 
+        // UI-06: data messages RENDER the graph inline (ChatMessage's data
+        // branch), so only the LAST data card of the turn carries it — a
+        // multi-table turn used to stack the identical graph once per table.
+        // Non-data ids still carry it: the papers grid keys its
+        // self-suppression off having a graph for its own message id.
+        const assignTurnGraph = (
+            turnMessages: Message[],
+            turnMessageIds: string[],
+            dataMessageIds: string[],
+        ) => {
+            const graph = buildObservationPaperGraph(turnMessages) as ResearchGraph | null;
+            if (!graph) return;
+            const anchorDataId = dataMessageIds[dataMessageIds.length - 1];
+            for (const id of turnMessageIds) {
+                if (dataMessageIds.includes(id) && id !== anchorDataId) continue;
+                graphs[id] = graph;
+            }
+        };
+
         for (const msg of messages) {
             if (msg.role === "user") {
                 if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
-                    const graph = buildObservationPaperGraph(currentTurnMessages) as ResearchGraph | null;
-                    if (graph) {
-                        for (const id of currentTurnMessageIds) {
-                            graphs[id] = graph;
-                        }
-                    }
+                    assignTurnGraph(currentTurnMessages, currentTurnMessageIds, currentTurnDataMessageIds);
                 }
                 currentTurnMessages = [];
                 currentTurnDataMessageIds = [];
@@ -137,12 +169,7 @@ export function ChatArea() {
         }
 
         if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
-            const graph = buildObservationPaperGraph(currentTurnMessages) as ResearchGraph | null;
-            if (graph) {
-                for (const id of currentTurnMessageIds) {
-                    graphs[id] = graph;
-                }
-            }
+            assignTurnGraph(currentTurnMessages, currentTurnMessageIds, currentTurnDataMessageIds);
         }
 
         return graphs;
@@ -337,6 +364,23 @@ export function ChatArea() {
         const hasContent = text.trim() || (attachments && attachments.length > 0);
         if (!hasContent || isStreaming) return;
 
+        // ── Eval-mode gate (Feature 4) ──────────────────────────
+        // Every rateable block of the last turn must be scored before the next
+        // prompt, so the label set has no holes. Turns that died on an
+        // infrastructure error are exempt (see eval-mode.js::isFailedTurn) —
+        // there is nothing to judge, and gating one would wedge the composer.
+        const pending = unratedBlocks(messages, blockRatings, visibleBlocks);
+        if (shouldBlockSend(evalMode, messages, blockRatings, visibleBlocks)) {
+            setEvalNudge(nudgeText(pending));
+            // Hand the prompt back. ChatInput clears its own box the moment it
+            // calls onSend (ChatInput.tsx handleSubmit), so a refusal would
+            // otherwise silently eat what the user typed; its initialValue
+            // effect re-fills and refocuses the composer.
+            setInputValue(text);
+            return;
+        }
+        setEvalNudge("");
+
         // Create a new AbortController for this request
         const controller = new AbortController();
         abortControllerRef.current = controller;
@@ -373,6 +417,26 @@ export function ChatArea() {
 
         let accumulated = "";
         let accumulatedThought = "";
+        // run_meta lands before any card event, so every card of this turn can
+        // carry its run — the rating POST needs run_id to join to chat_runs
+        // (model/tokens/cost) in the eval export.
+        let turnRunMeta: import("../lib/api").ChatRunMeta | undefined;
+        // The conversation THIS stream belongs to (CX-18 / UI-02). NOT the
+        // live conversationIdRef: that ref is re-pointed to whatever
+        // conversation becomes active, so reading it at trace time after a
+        // mid-stream switch identified the WRONG conversation. Seeded from
+        // the send-time active id; upgraded to the server UUID at meta time.
+        let streamOwnerConversationId: string | null =
+            useChatStore.getState().activeConversationId ?? null;
+        // UI-01: every stream callback routes through these. While the owner
+        // is still the active conversation the callbacks patch the live
+        // message list as before; after a mid-stream switch they hand the
+        // owner id to the store, which patches the owner's STORED messages
+        // instead (mirroring updateLastAssistantToolTrace's CX-18 routing) —
+        // tokens/cards from chat A must never land in chat B's transcript.
+        const ownerIsActive = () =>
+            useChatStore.getState().activeConversationId === streamOwnerConversationId;
+        const ownerFor = () => (ownerIsActive() ? undefined : streamOwnerConversationId);
 
         // Build message with file context
         let messageWithContext = text.trim();
@@ -391,21 +455,27 @@ export function ChatArea() {
             if (isReviewRequest && firstPdf) {
                 // RED TEAM TAC Workflow
                 await reviewProposal(firstPdf, {
+                    // UI-01: same owner routing as the standard workflow below.
                     onToken: (token: string) => {
                         accumulated += token;
-                        updateLastAssistantMessage(accumulated);
+                        updateLastAssistantMessage(accumulated, ownerFor());
                     },
                     onStatus: (step: string, state: string) => {
-                        addThinkingStep(step, state as "running" | "completed");
+                        if (ownerIsActive()) addThinkingStep(step, state as "running" | "completed");
                     },
                     onComplete: () => {
-                        attachThinkingToLastMessage();
-                        setStreaming(false);
+                        if (ownerIsActive()) {
+                            attachThinkingToLastMessage();
+                            setStreaming(false);
+                        }
                     },
                     onError: (error: string) => {
-                        attachThinkingToLastMessage();
-                        updateLastAssistantMessage(`Error: ${error}`);
-                        setStreaming(false);
+                        if (ownerIsActive()) attachThinkingToLastMessage();
+                        updateLastAssistantMessage(`Error: ${error}`, ownerFor());
+                        // Feature 4: an infrastructure failure is exempt from the
+                        // eval gate — there is no answer to judge.
+                        markLastAssistantRunFailed("stream_error", ownerFor());
+                        if (ownerIsActive()) setStreaming(false);
                     }
                 }, controller.signal);  // S5 auth rides the httpOnly cookie (credentials: "include")
             } else {
@@ -432,15 +502,17 @@ export function ChatArea() {
                     {
                         onToken: (token: string) => {
                             accumulated += token;
-                            updateLastAssistantMessage(accumulated);
+                            updateLastAssistantMessage(accumulated, ownerFor());
                         },
                         onThought: (thought: string) => {
                             accumulatedThought += thought;
-                            updateLastAssistantThinking(accumulatedThought);
+                            updateLastAssistantThinking(accumulatedThought, ownerFor());
                         },
                         onToolCall: (toolName: string, input: string) => {
                             const displayName = toolName.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-                            addThinkingStep(`Calling tool: ${displayName}`, "completed");
+                            // UI-01: the global thinking rail belongs to the ACTIVE
+                            // conversation; a switched-away stream must not write to it.
+                            if (ownerIsActive()) addThinkingStep(`Calling tool: ${displayName}`, "completed");
                             const toolCall: ToolCall = {
                                 id: generateId(),
                                 name: toolName,
@@ -456,23 +528,32 @@ export function ChatArea() {
                                 type: "tool_call",
                                 timestamp: new Date(),
                                 toolCall,
-                            });
+                            }, ownerFor());
                         },
                         onStatus: (step: string, state: string) => {
-                            addThinkingStep(step, state as "running" | "completed");
+                            // UI-01: same global-rail guard as onToolCall.
+                            if (ownerIsActive()) addThinkingStep(step, state as "running" | "completed");
                         },
                         onData: (data: Record<string, unknown>) => {
                             const tableData = data as unknown as DataTableResult;
+                            // The server-minted block id doubles as the message id
+                            // (Feature 4), so the card the user just rated keeps
+                            // that identity through a reload. generateId() is the
+                            // fallback for a backend that didn't send one.
+                            const blockId = typeof data.blockId === "string" ? data.blockId : undefined;
                             addMessage({
-                                id: generateId(),
+                                id: blockId || generateId(),
                                 role: "assistant",
                                 content: "",
                                 type: "data",
                                 timestamp: new Date(),
                                 dataTable: tableData,
-                            });
+                                runMeta: turnRunMeta,
+                                blockId,
+                                blockKind: "data",
+                            }, ownerFor());  // UI-01
                         },
-                        onPapers: (rawPapers: Record<string, unknown>[], papersRequest?: import("../lib/api").ToolRequest) => {
+                        onPapers: (rawPapers: Record<string, unknown>[], papersRequest?: import("../lib/api").ToolRequest, papersBlockId?: string) => {
                             // Map backend field names to frontend Paper interface
                             const papers: Paper[] = rawPapers.map((p, i) => ({
                                 id: (p.bibcode as string) || `paper-${i}`,
@@ -503,24 +584,31 @@ export function ChatArea() {
                                     : undefined,
                             }));
                             addMessage({
-                                id: generateId(),
+                                id: papersBlockId || generateId(),
                                 role: "assistant",
                                 content: "Here are the relevant papers I found:",
                                 type: "papers",
                                 timestamp: new Date(),
                                 papers,
                                 request: papersRequest,
-                            });
+                                runMeta: turnRunMeta,
+                                blockId: papersBlockId,
+                                blockKind: "papers",
+                            }, ownerFor());  // UI-01
                         },
                         onNotebook: (notebook: Record<string, unknown>) => {
+                            const blockId = typeof notebook.blockId === "string" ? notebook.blockId : undefined;
                             addMessage({
-                                id: generateId(),
+                                id: blockId || generateId(),
                                 role: "assistant",
                                 content: `I've generated a Jupyter Notebook for your analysis: **${notebook.title || 'Dynamic Notebook'}**`,
                                 type: "notebook",
                                 timestamp: new Date(),
                                 notebookData: notebook as unknown as NotebookData,
-                            });
+                                runMeta: turnRunMeta,
+                                blockId,
+                                blockKind: "notebook",
+                            }, ownerFor());  // UI-01
                         },
                         onImage: (img) => {
                             // Resolve relative URL to absolute backend URL
@@ -535,7 +623,7 @@ export function ChatArea() {
                                 meta.frames = meta.frames.map((f) => ({ ...f, url: toAbsolute(f.url) }));
                             }
                             addMessage({
-                                id: generateId(),
+                                id: img.blockId || generateId(),
                                 role: "assistant",
                                 content: img.caption || "",
                                 type: "image",
@@ -544,7 +632,10 @@ export function ChatArea() {
                                 imageCaption: img.caption || "",
                                 imageMeta: meta,
                                 request: img.request,
-                            });
+                                runMeta: turnRunMeta,
+                                blockId: img.blockId,
+                                blockKind: "image",
+                            }, ownerFor());  // UI-01
                         },
                         onPlotly: (plot) => {
                             // Interactive Plotly figure — same flow as images (ephemeral,
@@ -560,7 +651,7 @@ export function ChatArea() {
                                 : undefined;
                             if (!spec && !pngFallback) return; // nothing renderable
                             addMessage({
-                                id: generateId(),
+                                id: plot.blockId || generateId(),
                                 role: "assistant",
                                 content: plot.title || "",
                                 type: "plotly",
@@ -570,14 +661,23 @@ export function ChatArea() {
                                 plotlyPngFallback: pngFallback,
                                 request: plot.request,
                                 plotlyMeta: plot.meta && typeof plot.meta === "object" ? plot.meta : undefined,
-                            });
+                                runMeta: turnRunMeta,
+                                blockId: plot.blockId,
+                                blockKind: "plotly",
+                            }, ownerFor());  // UI-01
                         },
                         onTaskGroup: (group) => handleTaskGroup(group),
                         onTaskUpdate: (update) => handleTaskUpdate(update),
                         onTaskList: (list) => handleTaskList(list),
                         onPlanReview: (plan) => {
                             setPendingPlan({
-                                conversationId: conversationIdRef.current || plan.conversationId || "",
+                                // The stream's OWNER, not the live ref — a review from a
+                                // switched-away stream must still address its own
+                                // conversation (UI-02 sibling of the tool-trace fix).
+                                conversationId: streamOwnerConversationId || plan.conversationId || "",
+                                // UIAPI-08: this turn's run id addresses the run-scoped
+                                // plan-feedback queue server-side.
+                                runId: turnRunMeta?.run_id,
                                 title: plan.title,
                                 subtasks: plan.subtasks,
                                 reasoning: plan.reasoning,
@@ -618,45 +718,94 @@ export function ChatArea() {
                         onConversationMeta: (meta) => {
                             // Server assigned a conversation ID — adopt it and migrate the local entry
                             if (meta.conversation_id) {
-                                const oldId = useChatStore.getState().activeConversationId;
-                                // Migrate the local conversation entry from client ID to server UUID
-                                if (oldId && oldId !== meta.conversation_id) {
+                                const wasActive = ownerIsActive();
+                                const prevOwner = streamOwnerConversationId;
+                                // Migrate the local conversation entry from client ID to
+                                // server UUID. UI-01: keyed on the stream's OWNER, not the
+                                // active id — after a mid-stream switch the active
+                                // conversation is someone else's and renaming IT to this
+                                // stream's server UUID would corrupt both threads.
+                                if (prevOwner && prevOwner !== meta.conversation_id) {
                                     useChatStore.setState((state) => ({
                                         conversations: state.conversations.map(c =>
-                                            c.id === oldId ? { ...c, id: meta.conversation_id } : c
+                                            c.id === prevOwner ? { ...c, id: meta.conversation_id } : c
                                         ),
                                     }));
                                 }
-                                setActiveConversationId(meta.conversation_id);
-                                // Update the ref immediately so plan feedback uses correct ID
-                                conversationIdRef.current = meta.conversation_id;
+                                // The server UUID is this stream's true owner (CX-18).
+                                streamOwnerConversationId = meta.conversation_id;
+                                // UI-01: only re-point the ACTIVE conversation while this
+                                // stream still owns it — the meta of a switched-away
+                                // stream must not yank the user back.
+                                if (wasActive) {
+                                    setActiveConversationId(meta.conversation_id);
+                                    // Update the ref immediately so plan feedback uses correct ID
+                                    conversationIdRef.current = meta.conversation_id;
+                                }
                             }
                         },
                         onRunMeta: (meta) => {
-                            updateLastAssistantRunMeta(meta);
+                            turnRunMeta = meta;
+                            updateLastAssistantRunMeta(meta, ownerFor());  // UI-01
                         },
                         onToolTrace: (calls) => {
-                            updateLastAssistantToolTrace(calls);
+                            // Pass the stream's OWNING conversation (captured at
+                            // send time, upgraded at meta time) — the live ref
+                            // tracks the ACTIVE conversation and misroutes after
+                            // a mid-stream switch (CX-18 / UI-02).
+                            updateLastAssistantToolTrace(calls, streamOwnerConversationId);
                         },
                         onUsage: (usage) => {
-                            if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens, usage.durationMs);
+                            if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens, usage.durationMs, ownerFor());  // UI-01
                         },
                         onComplete: () => {
-                            attachThinkingToLastMessage();
-                            
+                            // UI-01: the thinking rail + global streaming flag belong to
+                            // the ACTIVE conversation. After a switch the rail was reset
+                            // and isStreaming (if set) describes the new conversation's
+                            // stream — a finished background stream must touch neither.
+                            if (ownerIsActive()) attachThinkingToLastMessage();
+
                             // Merge web sources now that text generation is complete
                             if (accumulatedWebSources) {
-                                mergeWebSourcesMessage(accumulatedWebSources);
+                                mergeWebSourcesMessage(accumulatedWebSources, ownerFor());
                             }
-                            
-                            setStreaming(false);
+
+                            if (ownerIsActive()) setStreaming(false);
                             // Reload conversation list from server so new/updated chats appear in sidebar
                             if (isAuthenticated) {
                                 loadConversations();
                             }
                         },
+                        // UI-03: the stream drained without [DONE] or an error event —
+                        // keep whatever streamed, but mark the turn degraded instead of
+                        // presenting the truncated text as a clean completion.
+                        onIncomplete: (partialText: string) => {
+                            if (ownerIsActive()) attachThinkingToLastMessage();
+                            if (accumulatedWebSources) {
+                                mergeWebSourcesMessage(accumulatedWebSources, ownerFor());
+                            }
+                            updateLastAssistantMessage(
+                                (partialText.trim() ? partialText + "\n\n" : "") +
+                                "⚠️ *The response ended unexpectedly — this answer may be incomplete.*",
+                                ownerFor(),
+                            );
+                            // Reuses the Feature-4 failed/degraded machinery: the eval
+                            // gate exempts the turn, matching how the backend marks
+                            // timed-out turns in persisted runMeta.
+                            markLastAssistantRunFailed("stream_truncated", ownerFor());
+                            if (ownerIsActive()) setStreaming(false);
+                            if (isAuthenticated) {
+                                loadConversations();
+                            }
+                        },
                         onError: (error: string, status?: number) => {
-                            attachThinkingToLastMessage();
+                            if (ownerIsActive()) attachThinkingToLastMessage();  // UI-01
+                            // Feature 4: mark the turn failed so the eval gate
+                            // exempts it. run_meta arrives before the outcome is
+                            // known and rich_meta only learns "failed" at persist
+                            // time, so without this the LIVE turn would demand a
+                            // rating for an answer the backend never produced.
+                            markLastAssistantRunFailed(status ? `http_${status}` : "stream_error", ownerFor());
                             if (status === 401) {
                                 // CX-05: a runtime 401 means the cookie expired.
                                 // But transient/cold-start 401s (backend just
@@ -671,23 +820,24 @@ export function ChatArea() {
                                     } catch { /* network blip — treat as unverified */ }
                                     if (!useAuthStore.getState().isAuthenticated) {
                                         clearAuth();
-                                        updateLastAssistantMessage("Your session expired — please sign in again.");
+                                        updateLastAssistantMessage("Your session expired — please sign in again.", ownerFor());
                                     } else {
                                         updateLastAssistantMessage(
-                                            "That request hit a transient authorization error — your session is still active, please retry."
+                                            "That request hit a transient authorization error — your session is still active, please retry.",
+                                            ownerFor(),
                                         );
                                     }
                                 })();
                             } else {
-                                updateLastAssistantMessage(`Error: ${error}`);
+                                updateLastAssistantMessage(`Error: ${error}`, ownerFor());
                             }
-                            
+
                             // Merge web sources on error too if they were retrieved
                             if (accumulatedWebSources) {
-                                mergeWebSourcesMessage(accumulatedWebSources);
+                                mergeWebSourcesMessage(accumulatedWebSources, ownerFor());
                             }
-                            
-                            setStreaming(false);
+
+                            if (ownerIsActive()) setStreaming(false);  // UI-01
                         },
                     },
                     controller.signal,
@@ -695,8 +845,8 @@ export function ChatArea() {
             } // end if-else
         } catch (err) {
             const message = err instanceof Error ? err.message : "Request failed.";
-            updateLastAssistantMessage(`Error: ${message}`);
-            setStreaming(false);
+            updateLastAssistantMessage(`Error: ${message}`, ownerFor());  // UI-01
+            if (ownerIsActive()) setStreaming(false);
         }
     }, [
         addMessage,
@@ -711,6 +861,13 @@ export function ChatArea() {
         activeConversationId,
         setActiveConversation,
         selectedModel,
+        // Eval gate reads live message/rating state — stale closures here would
+        // let an unrated turn through, or block an already-rated one.
+        evalMode,
+        blockRatings,
+        visibleBlocks,
+        markLastAssistantRunFailed,
+        messages,
         addThinkingStep,
         clearThinking,
         attachThinkingToLastMessage,
@@ -727,11 +884,14 @@ export function ChatArea() {
 
     // ── Plan review handlers ────────────────────────────────────
     const handlePlanApprove = useCallback(async () => {
-        const cid = conversationIdRef.current || pendingPlan?.conversationId;
+        // The plan carries its own conversation (the stream owner's) — prefer
+        // it over the active-conversation ref, which a mid-stream switch
+        // re-points (UI-02).
+        const cid = pendingPlan?.conversationId || conversationIdRef.current;
         if (!cid || !pendingPlan) return;
         setPlanSubmitting(true);
         try {
-            await submitPlanFeedback(cid, true, "");
+            await submitPlanFeedback(cid, true, "", undefined, pendingPlan.runId);  // UIAPI-08
             setPendingPlan(null);
         } catch (err) {
             console.error("Plan approval failed:", err);
@@ -745,11 +905,11 @@ export function ChatArea() {
     }, [pendingPlan, updateLastAssistantMessage]);
 
     const handlePlanFeedback = useCallback(async (feedback: string) => {
-        const cid = conversationIdRef.current || pendingPlan?.conversationId;
+        const cid = pendingPlan?.conversationId || conversationIdRef.current;
         if (!cid || !pendingPlan) return;
         setPlanSubmitting(true);
         try {
-            await submitPlanFeedback(cid, false, feedback);
+            await submitPlanFeedback(cid, false, feedback, undefined, pendingPlan.runId);  // UIAPI-08
             // Don't clear pendingPlan — the Conductor will emit a new plan_review event
         } catch (err) {
             console.error("Plan feedback failed:", err);
@@ -882,6 +1042,17 @@ export function ChatArea() {
                 {downloadProgress && (
                     <div className="px-4 md:px-8 max-w-[var(--q-chat-content-width)] mx-auto w-full">
                         <DownloadProgress data={downloadProgress} />
+                    </div>
+                )}
+
+                {/* Eval-mode gate nudge (Feature 4). Only reachable in a
+                    conversation — the hero composer has no prior turn to rate. */}
+                {evalNudge && (
+                    <div className="px-4 md:px-8 max-w-[var(--q-chat-content-width)] mx-auto w-full">
+                        <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                            <Star className="h-3.5 w-3.5 shrink-0" />
+                            <span>{evalNudge}</span>
+                        </div>
                     </div>
                 )}
 

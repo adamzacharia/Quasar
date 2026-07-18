@@ -1253,3 +1253,101 @@ def test_export_notebook_minimal_provider_has_only_generator():
     ctx = agent._datalab_notebook_ctx_provider()
     assert set(ctx.services) == {"generate_notebook"}
     assert ctx.result_store is None
+
+
+def test_sia_search_stamps_authenticated_owner_on_stored_rows():
+    """f2-CX-01 / f2-CX-19: the SIA producer stamps ctx.user_id as owner_id so
+    the export route can enforce ownership; an anonymous ctx stays ownerless."""
+    class _SvcInv:
+        def search(self, ra, dec, fov, catalog=None, endpoint=None):
+            return {
+                "success": True, "coverage_gap": False,
+                "used_endpoint": "https://datalab.noirlab.edu/sia/ls_dr9",
+                "provenance": {"service": "NOIRLab Astro Data Lab SIA"},
+                "rows": [{"obs_bandpass": "g DECam", "access_url": "https://x/1"}],
+            }
+
+    def _ctx_for(user_id):
+        store = DatalabResultStore(enable_disk_cache=False)
+        ctx = CallContext(
+            services={
+                "datalab_image_service": _SvcInv(),
+                "resolve_coordinates": lambda target_name=None, ra=None, dec=None, **k: (10.0, 20.0, "X"),
+            },
+            result_store=store,
+            user_id=user_id,
+        )
+        return ctx, store
+
+    ctx, store = _ctx_for("user-42")
+    out = dl.SiaSearch().run(dl.SiaSearchInput(ra=10.0, dec=20.0, fov_deg=0.2), ctx).to_native()
+    assert out["success"] is True
+    _frame, meta, status = store.lookup(out["result_id"])
+    assert status == "ok" and meta["owner_id"] == "user-42"
+
+    ctx2, store2 = _ctx_for(None)
+    out2 = dl.SiaSearch().run(dl.SiaSearchInput(ra=10.0, dec=20.0, fov_deg=0.2), ctx2).to_native()
+    assert out2["success"] is True
+    _frame2, meta2, _status2 = store2.lookup(out2["result_id"])
+    assert "owner_id" not in meta2
+
+
+def test_sia_search_records_upstream_truncation_structurally():
+    """f2-CX-21: when SIA caps remote rows, the cap is recorded structurally —
+    store meta + tool summary carry upstream_truncated/upstream_total, and the
+    stored result's provenance surfaces both to every consumer (the
+    datalab_get_result path that later builds a data card)."""
+    class _SvcMany:
+        def search(self, ra, dec, fov, catalog=None, endpoint=None):
+            return {
+                "success": True, "coverage_gap": False, "used_endpoint": "e",
+                "provenance": {"service": "NOIRLab Astro Data Lab SIA"},
+                "rows": [{"obs_bandpass": "g", "access_url": f"u{i}"} for i in range(5)],
+            }
+
+    store = DatalabResultStore(enable_disk_cache=False)
+    ctx = CallContext(
+        services={
+            "datalab_image_service": _SvcMany(),
+            "resolve_coordinates": lambda target_name=None, ra=None, dec=None, **k: (1.0, 2.0, "X"),
+        },
+        result_store=store,
+        user_id="u1",
+    )
+    out = dl.SiaSearch().run(dl.SiaSearchInput(ra=1.0, dec=2.0, fov_deg=0.1, limit=2), ctx).to_native()
+
+    assert out["success"] is True
+    assert out["upstream_truncated"] is True and out["upstream_total"] == 5
+    _frame, meta, _status = store.lookup(out["result_id"])
+    assert meta["upstream_truncated"] is True and meta["upstream_total"] == 5
+    res = store.get(out["result_id"])
+    assert res.provenance["upstream_truncated"] is True
+    assert res.provenance["upstream_total"] == 5
+
+
+def test_sia_search_uncapped_result_carries_no_upstream_flags():
+    """f2-CX-21: an uncapped SIA result must NOT carry the flags — over-flagging
+    would be dishonest in the other direction."""
+    class _SvcFew:
+        def search(self, ra, dec, fov, catalog=None, endpoint=None):
+            return {
+                "success": True, "coverage_gap": False, "used_endpoint": "e",
+                "provenance": {"service": "NOIRLab Astro Data Lab SIA"},
+                "rows": [{"obs_bandpass": "g", "access_url": "u0"}],
+            }
+
+    store = DatalabResultStore(enable_disk_cache=False)
+    ctx = CallContext(
+        services={
+            "datalab_image_service": _SvcFew(),
+            "resolve_coordinates": lambda target_name=None, ra=None, dec=None, **k: (1.0, 2.0, "X"),
+        },
+        result_store=store,
+        user_id="u1",
+    )
+    out = dl.SiaSearch().run(dl.SiaSearchInput(ra=1.0, dec=2.0, fov_deg=0.1), ctx).to_native()
+
+    assert out["success"] is True
+    assert "upstream_truncated" not in out
+    _frame, meta, _status = store.lookup(out["result_id"])
+    assert "upstream_truncated" not in meta

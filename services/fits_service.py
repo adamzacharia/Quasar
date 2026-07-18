@@ -30,17 +30,40 @@ RENDERED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "rendered_i
 os.makedirs(RENDERED_DIR, exist_ok=True)
 
 
-def _pick_science_hdu(hdul) -> Tuple[Any, int]:
-    """Find the first HDU with 2D image data (skip tables, empty primary)."""
+def _pick_science_hdu(hdul, return_slice_info: bool = False):
+    """Find the first HDU with 2D image data (skip tables, empty primary).
+
+    3D+ cubes are collapsed to 2D by taking the middle plane of each extra
+    axis. With ``return_slice_info=True`` a third element is returned: a dict
+    ``{"plane": mid, "n_planes": n, "note": ...}`` describing the collapse
+    (IMG-11), or None when the input was already 2D — callers must disclose
+    which plane was used instead of presenting it as "the image".
+    """
     from astropy.io import fits as afits  # noqa: F811
 
     for i, hdu in enumerate(hdul):
         if hdu.data is not None and hdu.data.ndim >= 2:
-            # If 3D+ cube, collapse to 2D by taking the middle slice or summing
+            # If 3D+ cube, collapse to 2D by taking the middle slice
             data = hdu.data
+            slice_info = None
             while data.ndim > 2:
-                mid = data.shape[0] // 2
+                n_planes = int(data.shape[0])
+                mid = n_planes // 2
+                if n_planes > 1:
+                    # IMG-11: record the collapse so callers can caption it.
+                    slice_info = {
+                        "plane": mid,
+                        "n_planes": n_planes,
+                        "note": (
+                            f"Input is a spectral cube; only the middle plane "
+                            f"(channel {mid} of {n_planes}) was analyzed/rendered. "
+                            "Use cube-aware tools (moment maps, spectra, channel "
+                            "maps) for the full cube."
+                        ),
+                    }
                 data = data[mid]  # take middle channel
+            if return_slice_info:
+                return data, i, slice_info
             return data, i
     raise ValueError("No 2D image data found in FITS file")
 
@@ -123,7 +146,9 @@ def render_fits_image(
         fits_path = _download_fits(url, title or "image")
 
         with afits.open(fits_path, memmap=True) as hdul:
-            data_2d, hdu_idx = _pick_science_hdu(hdul)
+            # IMG-11: capture whether a cube was collapsed to one plane so the
+            # caption/warnings disclose it instead of calling it "the image".
+            data_2d, hdu_idx, slice_info = _pick_science_hdu(hdul, return_slice_info=True)
             try:
                 wcs = WCS(hdul[hdu_idx].header, naxis=2)
             except Exception:
@@ -168,11 +193,21 @@ def render_fits_image(
             plt.close(fig)
 
         caption = title or "FITS Image"
-        return {
+        result = {
             "success": True,
             "image_path": f"/api/images/{img_name}",
             "caption": caption,
         }
+        if slice_info:
+            # IMG-11: disclose the collapsed plane in caption and warnings.
+            result["caption"] = (
+                f"{caption} — middle channel {slice_info['plane']} of "
+                f"{slice_info['n_planes']} (cube collapsed to one plane)"
+            )
+            result["cube_slice"] = {"plane": slice_info["plane"],
+                                    "n_planes": slice_info["n_planes"]}
+            result["warnings"] = [slice_info["note"]]
+        return result
 
     except Exception as e:
         logger.error(f"[FITS] render_fits_image failed: {e}")
@@ -476,11 +511,40 @@ def compute_moment_map(
             except Exception as e:
                 logger.warning(f"[FITS] spectral_slab failed: {e}")
 
-        moment_labels = {
-            0: "Integrated Intensity (Moment 0)",
-            1: "Velocity Field (Moment 1)",
-            2: "Velocity Dispersion (Moment 2)",
-        }
+        # IMG-05: moment 1/2 on a frequency axis are frequency moments, not a
+        # velocity field. Convert to velocity (radio convention, cube rest
+        # frequency) when possible; otherwise label the map honestly and drop
+        # the approaching/receding diverging colormap, whose blue/red sense is
+        # inverted for frequency.
+        result_warnings = []
+        axis_is_freq = cube.spectral_axis.unit.is_equivalent(u.Hz)
+        if order in (1, 2) and axis_is_freq:
+            try:
+                cube = cube.with_spectral_unit(u.km / u.s, velocity_convention="radio")
+                result_warnings.append(
+                    "Spectral axis converted from frequency to velocity "
+                    "(radio convention, cube rest frequency) for the moment map."
+                )
+            except Exception as conv_err:
+                logger.warning(f"[FITS] frequency→velocity conversion unavailable: {conv_err}")
+
+        velocity_axis = cube.spectral_axis.unit.is_equivalent(u.m / u.s)
+        if velocity_axis or order == 0:
+            moment_labels = {
+                0: "Integrated Intensity (Moment 0)",
+                1: "Velocity Field (Moment 1)",
+                2: "Velocity Dispersion (Moment 2)",
+            }
+        else:
+            axis_word = "Frequency" if axis_is_freq else f"Spectral ({cube.spectral_axis.unit})"
+            moment_labels = {
+                1: f"Mean {axis_word} (Moment 1)",
+                2: f"{axis_word} Dispersion (Moment 2)",
+            }
+            result_warnings.append(
+                "The cube has no usable rest frequency, so moment "
+                f"{order} is in spectral-axis units ({cube.spectral_axis.unit}), not velocity."
+            )
 
         # Compute moment — suppress NaN warnings
         import warnings
@@ -499,8 +563,10 @@ def compute_moment_map(
         )
 
         # Choose colormap based on moment type
-        if order == 1:
+        if order == 1 and velocity_axis:
             cmap = "RdBu_r"   # velocity field: blue = approaching, red = receding
+        elif order == 1:
+            cmap = "viridis"  # IMG-05: non-diverging for a mean-frequency map
         elif order == 2:
             cmap = "magma"    # dispersion: dark = calm, bright = turbulent
         else:
@@ -539,6 +605,8 @@ def compute_moment_map(
             "success": True,
             "image_path": f"/api/images/{img_name}",
             "caption": full_title,
+            "moment_unit": unit_str,  # IMG-05: spectral-axis unit is explicit
+            "warnings": result_warnings,
         }
 
     except Exception as e:
@@ -869,6 +937,31 @@ def pv_slice(
                 logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
 
 
+def _footprint_error(cube, ra_deg: float, dec_deg: float,
+                     x_pixel: Optional[int], y_pixel: Optional[int],
+                     nx: int, ny: int) -> str:
+    """Typed out-of-footprint message naming requested vs covered sky (IMG-02)."""
+    if x_pixel is not None and y_pixel is not None:
+        where = f"falls at pixel ({x_pixel}, {y_pixel}), outside"
+    else:
+        where = "does not project onto the image plane and is outside"
+    message = (
+        f"Requested position RA={ra_deg:.5f}, Dec={dec_deg:.5f} {where} "
+        f"the {nx}x{ny} pixel cube footprint."
+    )
+    try:
+        lo = cube.wcs.celestial.pixel_to_world(0, 0)
+        hi = cube.wcs.celestial.pixel_to_world(nx - 1, ny - 1)
+        message += (
+            f" The cube covers RA {min(lo.ra.deg, hi.ra.deg):.5f} to "
+            f"{max(lo.ra.deg, hi.ra.deg):.5f}, Dec {min(lo.dec.deg, hi.dec.deg):.5f} "
+            f"to {max(lo.dec.deg, hi.dec.deg):.5f} (deg)."
+        )
+    except Exception:
+        pass
+    return message
+
+
 def extract_spectrum(
     url: str,
     ra_deg: float = None,
@@ -910,6 +1003,7 @@ def extract_spectrum(
             return {"success": False, "error": f"Not a spectral cube: {e}"}
 
         # Determine pixel position
+        ny, nx = cube.shape[1], cube.shape[2]
         if ra_deg is not None and dec_deg is not None:
             # Convert RA/Dec to pixel via WCS
             from astropy.coordinates import SkyCoord
@@ -918,12 +1012,23 @@ def extract_spectrum(
                 # astropy world_to_pixel returns (x, y) — assigning it as
                 # (y, x) transposed every off-center RA/Dec position (CX-05).
                 x_pix, y_pix = cube.wcs.celestial.world_to_pixel(coord)
-                x_pixel = int(round(float(x_pix)))
-                y_pixel = int(round(float(y_pix)))
-            except Exception:
-                # Fallback to center
-                y_pixel = cube.shape[1] // 2
-                x_pixel = cube.shape[2] // 2
+                x_val, y_val = float(x_pix), float(y_pix)
+            except Exception as wcs_err:
+                # IMG-02: never silently fall back to the cube center while
+                # the title still claims the requested RA/Dec — fail loudly.
+                raise ValueError(
+                    f"Could not convert RA={ra_deg:.5f}, Dec={dec_deg:.5f} to a "
+                    f"pixel via the cube WCS: {wcs_err}"
+                )
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                # IMG-02: unprojectable position == outside the footprint.
+                raise ValueError(_footprint_error(cube, ra_deg, dec_deg, None, None, nx, ny))
+            x_pixel = int(round(x_val))
+            y_pixel = int(round(y_val))
+            if not (0 <= x_pixel < nx and 0 <= y_pixel < ny):
+                # IMG-02: out-of-footprint positions must error with the
+                # requested vs covered region, never clamp to an edge pixel.
+                raise ValueError(_footprint_error(cube, ra_deg, dec_deg, x_pixel, y_pixel, nx, ny))
         elif x_pixel is not None and y_pixel is not None:
             pass  # use provided pixel coords
         else:
@@ -936,8 +1041,9 @@ def extract_spectrum(
             peak = np.unravel_index(np.argmax(collapsed), collapsed.shape)
             y_pixel, x_pixel = int(peak[0]), int(peak[1])
 
-        # Bounds check
-        ny, nx = cube.shape[1], cube.shape[2]
+        # Bounds clamp for the derived-position paths (peak pixel is always
+        # in-bounds; explicit pixel coords keep the legacy clamp) — the RA/Dec
+        # path above errors instead of clamping (IMG-02).
         x_pixel = max(0, min(x_pixel, nx - 1))
         y_pixel = max(0, min(y_pixel, ny - 1))
 
@@ -1093,6 +1199,7 @@ def fit_spectral_line(
             return {"success": False, "error": f"Not a spectral cube: {e}"}
 
         # Determine pixel position (same logic as extract_spectrum)
+        ny, nx = cube.shape[1], cube.shape[2]
         if ra_deg is not None and dec_deg is not None:
             from astropy.coordinates import SkyCoord
             coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
@@ -1100,11 +1207,22 @@ def fit_spectral_line(
                 # astropy world_to_pixel returns (x, y) — assigning it as
                 # (y, x) transposed every off-center RA/Dec position (CX-05).
                 x_pix, y_pix = cube.wcs.celestial.world_to_pixel(coord)
-                x_pixel = int(round(float(x_pix)))
-                y_pixel = int(round(float(y_pix)))
-            except Exception:
-                y_pixel = cube.shape[1] // 2
-                x_pixel = cube.shape[2] // 2
+                x_val, y_val = float(x_pix), float(y_pix)
+            except Exception as wcs_err:
+                # IMG-02: no silent center fallback under a title that still
+                # claims the requested RA/Dec.
+                raise ValueError(
+                    f"Could not convert RA={ra_deg:.5f}, Dec={dec_deg:.5f} to a "
+                    f"pixel via the cube WCS: {wcs_err}"
+                )
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                # IMG-02: unprojectable position == outside the footprint.
+                raise ValueError(_footprint_error(cube, ra_deg, dec_deg, None, None, nx, ny))
+            x_pixel = int(round(x_val))
+            y_pixel = int(round(y_val))
+            if not (0 <= x_pixel < nx and 0 <= y_pixel < ny):
+                # IMG-02: out-of-footprint positions error, never edge-clamp.
+                raise ValueError(_footprint_error(cube, ra_deg, dec_deg, x_pixel, y_pixel, nx, ny))
         elif x_pixel is not None and y_pixel is not None:
             pass
         else:
@@ -1117,8 +1235,7 @@ def fit_spectral_line(
             peak = np.unravel_index(np.argmax(collapsed), collapsed.shape)
             y_pixel, x_pixel = int(peak[0]), int(peak[1])
 
-        # Bounds check
-        ny, nx = cube.shape[1], cube.shape[2]
+        # Bounds clamp for the derived/explicit-pixel paths only (IMG-02).
         x_pixel = max(0, min(x_pixel, nx - 1))
         y_pixel = max(0, min(y_pixel, ny - 1))
 

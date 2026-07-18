@@ -77,10 +77,13 @@ _storage_executor = ThreadPoolExecutor(max_workers=2)
 
 
 # ── Plan Feedback Registry (Human-in-the-Loop) ────────────────────────────────
-# Maps conversation_id → stdlib_queue.Queue for plan review blocking.
+# Maps (conversation_key, run_id) → stdlib_queue.Queue for plan review blocking.
 # When the Conductor emits a plan_review event, it blocks on the queue.
 # The POST /api/plan-feedback endpoint pushes user responses into it.
-_plan_feedback_queues: Dict[str, stdlib_queue.Queue] = {}
+# UIAPI-08: run-scoped keys — one conversation with two concurrent runs used to
+# share a single conversation_id key, so registrations/cleanups clobbered each
+# other and Approve clicks went undeliverable.
+_plan_feedback_queues: Dict[tuple, stdlib_queue.Queue] = {}
 _plan_feedback_lock = _threading.Lock()
 
 # Map conversation_id -> latest_trace_id for score ingestion

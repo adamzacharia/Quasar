@@ -511,6 +511,56 @@ class DatalabImageService:
             "provenance": {"fov_deg": fov_deg, "band": band, "catalog": catalog},
         }
 
+    def _download_fits(self, url: str) -> str:
+        """Download a Data Lab SIA FITS to a temp file under the configured timeout.
+
+        fits_service._download_fits ignores DATALAB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS
+        (its cap is a module constant), which left the documented knob dead
+        config (dl-image-download-timeout-env-dead). Same semantics — file://
+        copy-through, MAX_DOWNLOAD_MB size cap, temp-file cleanup on failure —
+        but bounded by self.download_timeout.
+        """
+        import shutil
+        import tempfile
+
+        import requests
+
+        from services import fits_service
+
+        if url.startswith("file://") or os.path.exists(url):
+            src = url.replace("file://", "", 1)
+            tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+            tmp.close()
+            shutil.copyfile(src, tmp.name)
+            return tmp.name
+
+        max_bytes = fits_service.MAX_DOWNLOAD_MB * 1024 * 1024
+        resp = requests.get(url, timeout=self.download_timeout, stream=True)
+        resp.raise_for_status()
+        content_length = resp.headers.get("Content-Length")
+        if content_length and int(content_length) > max_bytes:
+            raise ValueError(
+                f"FITS file is {int(content_length) / (1024 * 1024):.0f} MB, "
+                f"exceeds {fits_service.MAX_DOWNLOAD_MB} MB limit"
+            )
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        size = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise ValueError(
+                        f"FITS file exceeds {fits_service.MAX_DOWNLOAD_MB} MB limit"
+                    )
+                tmp.write(chunk)
+            tmp.close()
+        except Exception:
+            tmp.close()
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+            raise
+        return tmp.name
+
     def _load_image(self, row: Mapping[str, Any], *, ra: float, dec: float, fov_deg: float) -> FitsImage:
         from astropy.io import fits as afits
         from astropy.wcs import WCS
@@ -519,7 +569,7 @@ class DatalabImageService:
         url = _url_from_row(row)
         if not url:
             raise ValueError("SIA image row has no FITS access URL")
-        path = fits_service._download_fits(url, label="Data Lab SIA image")
+        path = self._download_fits(url)
         try:
             try:
                 data, header = afits.getdata(path, header=True)

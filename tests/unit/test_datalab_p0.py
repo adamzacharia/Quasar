@@ -181,8 +181,14 @@ def test_variability_rank_builder_emits_governed_aggregate():
     assert "q3c_radial_query(ra, dec, 15, -72, 0.3)" in sql
     assert "STDDEV(cmag)" in sql and "GROUP BY id" in sql
     # Distance from the cone center rides along so a target-position query can
-    # pick the NEAREST candidate, not the most variable one (live P14).
-    assert "q3c_dist(AVG(ra), AVG(dec), 15, -72) * 3600.0 AS dist_arcsec" in sql
+    # pick the NEAREST candidate, not the most variable one (live P14). The
+    # mean position is the wrap-safe circular mean, not AVG(ra) — a cone
+    # straddling RA=0/360 averaged 359.999° and 0.001° to ~180°
+    # (variability-avg-ra-wrap).
+    assert "AVG(ra)" not in sql
+    assert "atan2(AVG(sin(radians(ra))), AVG(cos(radians(ra))))" in sql
+    assert "* 3600.0 AS dist_arcsec" in sql
+    assert "AVG(dec) AS dec" in sql
     assert "HAVING COUNT(*) >= 12" in sql
     assert "filter = 'g'" in sql
     assert "ORDER BY var_snr DESC NULLS LAST" in sql
@@ -440,3 +446,45 @@ def test_result_store_memory_ttl_expiry(monkeypatch):
     monkeypatch.setattr(rs.time, "time", lambda: base + 10)
     with pytest.raises(KeyError):
         store.get(rid)
+
+
+def test_rectangular_region_wraps_through_ra_zero():
+    """ra-wrap-rect-footprint-unsupported: ra_min > ra_max is a box wrapping
+    through RA=0/360 and must query the two OR'd sub-boxes, not be rejected
+    (or silently swapped into the 356° complement)."""
+    from services.datalab_query_builders import build_rectangular_region_select
+
+    sql, meta = build_rectangular_region_select(
+        "gaia_dr3", "gaia_source",
+        ra_min=358.0, ra_max=2.0, dec_min=-75.0, dec_max=-70.0, limit=100,
+    )
+    assert sql.count("q3c_poly_query") == 2
+    assert "ARRAY[358, 360, 360, 358]" in sql
+    assert "ARRAY[0, 2, 2, 0]" in sql
+    assert any("wrap" in w.lower() for w in meta["warnings"])
+    # The governor accepts the wrapped builder SQL.
+    assert validate(sql, source="builder", meta=meta).sql == sql
+    # A degenerate zero-width box is still rejected.
+    with pytest.raises(ValueError, match="ra_min != ra_max"):
+        build_rectangular_region_select(
+            "gaia_dr3", "gaia_source", ra_min=10.0, ra_max=10.0, dec_min=0.0, dec_max=1.0
+        )
+    # Non-wrapping boxes keep the single-polygon form.
+    sql2, _meta2 = build_rectangular_region_select(
+        "gaia_dr3", "gaia_source", ra_min=10.0, ra_max=12.0, dec_min=0.0, dec_max=1.0
+    )
+    assert sql2.count("q3c_poly_query") == 1
+
+
+def test_vhs_mag_template_resolves_apermag_columns():
+    """vhs-mag-template-missing: without a template, VHS CMD/CCDs emitted
+    nonexistent jmag/hmag/kmag and 400'd only at the server; band k must map
+    to the VSA 'ks' spelling, and non-IR bands must fail locally."""
+    from services import datalab_registry as reg
+
+    assert reg.mag_column("vhs_dr5", "vhs_cat_v3", "j") == "japermag3"
+    assert reg.mag_column("vhs_dr5", "vhs_cat_v3", "h") == "hapermag3"
+    assert reg.mag_column("vhs_dr5", "vhs_cat_v3", "k") == "ksapermag3"
+    assert reg.mag_column("vhs_dr5", "vhs_cat_v3", "ks") == "ksapermag3"
+    with pytest.raises(ValueError, match="valid bands"):
+        reg.mag_column("vhs_dr5", "vhs_cat_v3", "g")

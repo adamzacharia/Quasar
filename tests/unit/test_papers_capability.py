@@ -390,18 +390,47 @@ def test_extract_details_arxiv_id_skips_ads_resolution():
         "type": "text", "text": "0.035 arcsec", "source": "Paper Extractor: 1812.04040"}
 
 
-def test_extract_details_dotted_bibcode_skips_resolution_verbatim_quirk():
-    # Preserved legacy quirk: the gate is `'.' not in id or len(id) > 20`, and a
-    # standard 19-char bibcode CONTAINS dots — so it is never resolved via ADS
-    # and goes straight (wrongly but verbatim) into the arxiv URL template.
+def test_extract_details_bibcode_resolves_via_ads():
+    # CAP-05: a real ADS bibcode is exactly 19 chars and always contains dots
+    # (2018ApJ...869L..41A), so the legacy `'.' not in id or len(id) > 20`
+    # gate never matched one and the tool 404'd on
+    # arxiv.org/pdf/<bibcode>.pdf. Bibcodes must resolve through ADS.
     pdf = _FakePdf()
     ads = _FakeAds()
     ads.details = {"arxiv_id": "1812.04040"}
     ctx, _ = _ctx(ads_client=ads, pdf_service=pdf)
     out = _run(ExtractPaperDetails(), ctx, identifier="2018ApJ...869L..41A", query="q")
     assert out["success"] is True
-    assert pdf.calls[0][1] == "https://arxiv.org/pdf/2018ApJ...869L..41A.pdf"
-    assert ("details", "2018ApJ...869L..41A") not in ads.calls
+    assert ("details", "2018ApJ...869L..41A") in ads.calls
+    assert pdf.calls[0][1] == "https://arxiv.org/pdf/1812.04040.pdf"
+
+
+def test_reproduce_methods_bibcode_resolves_via_ads():
+    # CAP-05: same bibcode-detection fix in ReproducePaperMethods.
+    pdf = _FakePdf()
+    ads = _FakeAds()
+    ads.details = {"arxiv_id": "1812.04040"}
+    ctx, _ = _ctx(ads_client=ads, pdf_service=pdf,
+                  llm_client=_FakeLLM(text="import casa\n"), agent_config=_FakeConfig())
+    out = _run(ReproducePaperMethods(), ctx, identifier="2015ApJ...808L...3A")
+    assert out["success"] is True
+    assert ("details", "2015ApJ...808L...3A") in ads.calls
+    assert pdf.calls[0] == ("methodology", "https://arxiv.org/pdf/1812.04040.pdf")
+
+
+def test_bibcode_and_arxiv_detection_heuristic():
+    # CAP-05: positive detection — 19-char year-prefixed bibcodes resolve;
+    # new-style and old-style arXiv ids never do; the legacy dotless /
+    # over-long fallbacks are preserved.
+    from capabilities.papers import _needs_ads_resolution
+
+    assert _needs_ads_resolution("2019ApJ...883..170M") is True   # bibcode
+    assert _needs_ads_resolution("2015ApJ...808L...3A") is True   # bibcode
+    assert _needs_ads_resolution("1812.04040") is False           # new arXiv
+    assert _needs_ads_resolution("2301.00001v2") is False         # versioned
+    assert _needs_ads_resolution("astro-ph/9901001") is False     # old arXiv
+    assert _needs_ads_resolution("somebibcode") is True           # dotless legacy
+    assert _needs_ads_resolution("a" * 25 + ".x") is True         # >20 legacy
 
 
 def test_extract_details_dotless_identifier_resolves_via_ads():
@@ -542,3 +571,86 @@ def test_unknown_capability_name_raises():
     agent = _wiring_agent()
     with pytest.raises(KeyError):
         agent._papers_tool_fn("not_a_tool")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R2 — reverse direction: bibcode → archived ALMA data (bib_reference join)
+# ─────────────────────────────────────────────────────────────────────────────
+class _FakeAlminer:
+    def __init__(self, df=None, raise_on_sql=False):
+        self.df = df
+        self.raise_on_sql = raise_on_sql
+        self.queries = []
+
+    def search_by_sql(self, query):
+        self.queries.append(query)
+        if self.raise_on_sql:
+            raise RuntimeError("TAP down")
+        import pandas as pd
+        return self.df if self.df is not None else pd.DataFrame()
+
+
+class _FakeSearchSvcWithAlminer:
+    def __init__(self, alminer):
+        self.alminer_client = alminer
+
+    def search_alma_with_keywords(self, keywords):
+        import pandas as pd
+        return pd.DataFrame()
+
+
+def test_obsid_bibcode_reverse_lookup_attaches_archival_data():
+    import pandas as pd
+    ads = _FakeAds(id_type="bibcode")
+    alminer = _FakeAlminer(df=pd.DataFrame([{
+        "proposal_id": "2017.1.00001.S", "target_name": "HL Tau",
+        "band_list": "6", "member_ous_uid": "uid://A/X/Y",
+        "bib_reference": "2018ApJ...869L..41A",
+    }]))
+    ctx, state = _ctx(ads_client=ads,
+                      search_service=_FakeSearchSvcWithAlminer(alminer))
+    out = _run(SearchPapersByObservationId(), ctx, identifier="2018ApJ...869L..41A")
+
+    assert out["success"] is True
+    assert out["archival_data"][0]["proposal_id"] == "2017.1.00001.S"
+    assert "bib_reference" in out["archive_query"]
+    assert "bib_reference LIKE '%2018ApJ...869L..41A%'" in out["archive_query"]
+    # The ADS paper search path is unchanged.
+    assert out["papers"]
+
+
+def test_obsid_non_bibcode_has_no_archival_data_key():
+    ads = _FakeAds(id_type="project_code")
+    ctx, _ = _ctx(ads_client=ads, search_service=None)
+    out = _run(SearchPapersByObservationId(), ctx, identifier="2019.1.00123.S")
+    assert out["success"] is True
+    assert "archival_data" not in out
+
+
+def test_obsid_bibcode_reverse_lookup_failure_is_nonfatal():
+    ads = _FakeAds(id_type="bibcode")
+    alminer = _FakeAlminer(raise_on_sql=True)
+    ctx, state = _ctx(ads_client=ads,
+                      search_service=_FakeSearchSvcWithAlminer(alminer))
+    out = _run(SearchPapersByObservationId(), ctx, identifier="2018ApJ...869L..41A")
+    assert out["success"] is True
+    assert "archival_data" not in out
+    assert any("Reverse data lookup failed" in line for line in state.console)
+
+
+def test_obsid_bibcode_empty_tap_result_has_no_archival_data():
+    ads = _FakeAds(id_type="bibcode")
+    alminer = _FakeAlminer(df=None)
+    ctx, _ = _ctx(ads_client=ads,
+                  search_service=_FakeSearchSvcWithAlminer(alminer))
+    out = _run(SearchPapersByObservationId(), ctx, identifier="2018ApJ...869L..41A")
+    assert out["success"] is True and "archival_data" not in out
+
+
+def test_ads_client_classifies_bibcodes():
+    from integrations.ads_client import ADSService
+    assert ADSService.classify_observation_identifier("2018ApJ...869L..41A") == "bibcode"
+    assert ADSService.classify_observation_identifier("2024A&A...685A...1A") == "bibcode"
+    assert ADSService.classify_observation_identifier("2019.1.00123.S") == "project_code"
+    assert ADSService.classify_observation_identifier("uid://A001/X1/X2") == "mous_uid"
+    assert ADSService.classify_observation_identifier("something else") == "identifier"

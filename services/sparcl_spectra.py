@@ -77,13 +77,28 @@ class SparclSpectraService:
             ranges, range_warnings = _search_ranges(ra_f, dec_f, radius)
             warnings.extend(range_warnings)
             records: List[Dict[str, Any]] = []
+            box_capped = False
             for ra_min, ra_max, dec_min, dec_max in ranges:
                 result = client.find(
                     outfields=list(OUTFIELDS),
                     constraints={"data_release": releases, "ra": [ra_min, ra_max], "dec": [dec_min, dec_max]},
                     limit=limit_i,
                 )
-                records.extend(_records_list(result))
+                box_records = _records_list(result)
+                box_capped = box_capped or len(box_records) >= limit_i
+                records.extend(box_records)
+            if box_capped:
+                # sparcl-box-limit-silent-truncation: the limit applies to the
+                # remote bounding-box query BEFORE the local cone cut and
+                # distance sort, so hitting the cap means the box was truncated
+                # in server storage order — the true nearest spectrum may be
+                # missing from the result.
+                warnings.append(
+                    f"The remote bounding-box query returned the row cap "
+                    f"(limit={limit_i}) before the local cone filter; the result "
+                    "may be truncated and nearest-neighbor ordering is not "
+                    "guaranteed. Retry with a larger limit or smaller radius."
+                )
 
             rows: List[Dict[str, Any]] = []
             seen = set()
@@ -187,12 +202,25 @@ class SparclSpectraService:
             client = self._get_client()
             records: List[Dict[str, Any]] = []
             if cone:
+                box_capped = False
                 for ra_min, ra_max, dec_min, dec_max in ranges:
                     box = dict(constraints)
                     box["ra"] = [ra_min, ra_max]
                     box["dec"] = [dec_min, dec_max]
                     result = client.find(outfields=list(OUTFIELDS), constraints=box, limit=limit_i)
-                    records.extend(_records_list(result))
+                    box_records = _records_list(result)
+                    box_capped = box_capped or len(box_records) >= limit_i
+                    records.extend(box_records)
+                if box_capped:
+                    # sparcl-box-limit-silent-truncation: see find_spectra — a
+                    # capped box query truncates BEFORE the cone cut/sort.
+                    warnings.append(
+                        f"The remote bounding-box query returned the row cap "
+                        f"(limit={limit_i}) before the local cone filter; the "
+                        "result may be truncated and nearest-neighbor ordering "
+                        "is not guaranteed. Retry with a larger limit or "
+                        "smaller radius."
+                    )
             else:
                 result = client.find(outfields=list(OUTFIELDS), constraints=dict(constraints), limit=limit_i)
                 records.extend(_records_list(result))
@@ -320,18 +348,36 @@ class SparclSpectraService:
                 return {"success": False, "error": f"SparCL spectrum {sid} has no finite wavelength/flux points."}
             warnings: List[str] = []
             smooth_i = _positive_int(smooth, 0, 1000, allow_zero=True)
-            plot_flux = flux
+            # sparcl-smooth-before-ivar-mask: blank ivar<=0 (bad/sky-line)
+            # pixels BEFORE smoothing so a masked artifact (e.g. a cosmic-ray
+            # spike at an ivar=0 pixel) cannot leak into its neighbors'
+            # smoothed values; the boxcar is renormalized over the good pixels
+            # actually inside each window.
+            bad = None
+            if ivar is not None:
+                candidate_bad = ~(np.isfinite(ivar) & (ivar > 0))
+                if np.any(candidate_bad) and not np.all(candidate_bad):
+                    bad = candidate_bad
+            masked_flux = flux
+            if bad is not None:
+                masked_flux = np.array(flux, dtype=float, copy=True)
+                masked_flux[bad] = np.nan
+            plot_flux = masked_flux
             if smooth_i > 1:
                 if smooth_i >= flux.size:
                     warnings.append("smooth exceeds spectrum length; smoothing skipped.")
                 else:
-                    kernel = np.ones(smooth_i, dtype=float) / float(smooth_i)
-                    plot_flux = np.convolve(flux, kernel, mode="same")
-            if ivar is not None:
-                bad = ~(np.isfinite(ivar) & (ivar > 0))
-                if np.any(bad) and not np.all(bad):
-                    plot_flux = np.array(plot_flux, dtype=float, copy=True)
-                    plot_flux[bad] = np.nan
+                    kernel = np.ones(smooth_i, dtype=float)
+                    finite_mask = np.isfinite(masked_flux)
+                    values = np.where(finite_mask, masked_flux, 0.0)
+                    weight = np.convolve(finite_mask.astype(float), kernel, mode="same")
+                    summed = np.convolve(values, kernel, mode="same")
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        plot_flux = np.where(weight > 0, summed / weight, np.nan)
+                    if bad is not None:
+                        # Masked pixels themselves stay blanked in the trace.
+                        plot_flux = np.array(plot_flux, dtype=float, copy=True)
+                        plot_flux[bad] = np.nan
 
             model = record.get("model")
             model_arr = None
@@ -373,6 +419,16 @@ class SparclSpectraService:
                 wavelength, plot_flux, model_arr, sid=sid, spectype=spectype,
                 redshift=redshift, mark_lines=bool(mark_lines),
             )
+            # plotly-downsample-unannotated: also surface the decimation as a
+            # card-level warning, mirroring the in-figure annotation.
+            plot_stride = _downsample_stride(int(wavelength.size))
+            if plot_stride > 1:
+                warnings.append(
+                    f"Interactive plot downsampled (stride {plot_stride}) to "
+                    f"~{int(math.ceil(wavelength.size / plot_stride)):,} of "
+                    f"{int(wavelength.size):,} points; the PNG export keeps "
+                    "full resolution."
+                )
             return {
                 "success": True,
                 "image_base64": render.get("base64_png"),
@@ -476,6 +532,28 @@ def _spectrum_plotly_spec(
         "legend": {"orientation": "h"},
         "margin": {"t": 48, "r": 16},
     }
+    if stride > 1:
+        # plotly-downsample-unannotated: disclose the stride decimation in the
+        # interactive card so narrow features missing from the trace are never
+        # mistaken for absent data; the PNG export keeps full resolution.
+        layout["meta"] = {
+            "downsample": {
+                "stride": stride,
+                "points_shown": int(wl.size),
+                "points_total": int(wavelength.size),
+            }
+        }
+        layout["annotations"] = annotations + [{
+            "text": (
+                f"Interactive view downsampled to {int(wl.size):,} of "
+                f"{int(wavelength.size):,} points — narrow features may be "
+                "missing; the PNG keeps full resolution"
+            ),
+            "xref": "paper", "yref": "paper",
+            "x": 0, "y": -0.22, "xanchor": "left", "yanchor": "top",
+            "showarrow": False,
+            "font": {"size": 10, "color": "rgba(148,163,184,0.95)"},
+        }]
     return {"data": data, "layout": layout}
 
 

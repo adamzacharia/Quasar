@@ -833,7 +833,11 @@ def test_query_alma_band_stays_raw_string_zero(monkeypatch):
     ctx, _ = _ctx(search_service=_FakeSearchService())
     out = _run(QueryAlmaScienceArchive(), ctx, query_type="line_set_projects", band="0")
 
-    assert "(band_list LIKE '%0%')" in captured["where"]
+    # CAP-06: exact-token match on the space-delimited band_list — the old
+    # substring LIKE let band=1 also match Band 10. band="0" must still stay
+    # the raw string (not flip to 6).
+    assert "band_list = '0'" in captured["where"]
+    assert "band_list LIKE '% 0 %'" in captured["where"]
     assert out["source"].startswith("ALMA Band 0 projects")
 
 
@@ -916,3 +920,128 @@ def test_datalab_provider_survives_a_failing_unrelated_service():
     assert ctx.services["datalab_job_service"] is not None
     with pytest.raises(KeyError):
         ctx.service("svo_fps_client")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R2 — sensitivity_search + data_publications templates
+# ─────────────────────────────────────────────────────────────────────────────
+def test_query_alma_sensitivity_search_requires_threshold():
+    ctx, _ = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="sensitivity_search")
+    assert out["success"] is False and "sensitivity_mjy" in out["error"]
+
+
+def test_query_alma_sensitivity_search_happy_path(monkeypatch):
+    tap_df = pd.DataFrame([
+        {"proposal_id": "2019.1.00001.S", "target_name": "deep field",
+         "band_list": "6", "sensitivity_10kms": 0.05},
+        {"proposal_id": "2019.1.00002.S", "target_name": "other",
+         "band_list": "6", "sensitivity_10kms": 0.09},
+    ])
+    captured = {}
+
+    def _fake_tap(where, *, max_results=5000, order_by="proposal_id",
+                  extra_columns=(), ctx):
+        captured["where"] = where
+        captured["order_by"] = order_by
+        captured["extra_columns"] = extra_columns
+        prov = ctx.service("alma_tap_provenance")
+        prov["query"] = f"SELECT ... WHERE {where}"
+        prov["url"] = "https://almascience.nrao.edu/tap"
+        return tap_df.copy()
+
+    monkeypatch.setattr(alma, "_tap_obscore_dataframe", _fake_tap)
+    ctx, state = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="sensitivity_search",
+               sensitivity_mjy=0.1, band=6)
+
+    assert out["success"] is True and out["mode"] == "sensitivity_search"
+    assert "sensitivity_10kms <= 0.1" in captured["where"]
+    assert "band_list = '6'" in captured["where"]
+    assert captured["order_by"] == "sensitivity_10kms"
+    assert "sensitivity_10kms" in captured["extra_columns"]
+    # Best (smallest) sensitivity first.
+    assert out["results"][0]["proposal_id"] == "2019.1.00001.S"
+    assert out["results"][0]["best_sensitivity_10kms_mjy_beam"] == 0.05
+    assert any("estimated achieved rms" in w for w in out["warnings"])
+    assert state.last_run_result["tool_name"] == "query_alma_science_archive"
+
+
+def test_query_alma_sensitivity_search_continuum_column(monkeypatch):
+    captured = {}
+
+    def _fake_tap(where, *, max_results=5000, order_by="proposal_id",
+                  extra_columns=(), ctx):
+        captured["where"] = where
+        return pd.DataFrame()
+
+    monkeypatch.setattr(alma, "_tap_obscore_dataframe", _fake_tap)
+    ctx, _ = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="sensitivity_search",
+               sensitivity_mjy=1.0, continuum=True)
+    assert out["success"] is True
+    assert "cont_sensitivity_bandwidth <= 1" in captured["where"]
+
+
+def test_query_alma_data_publications_requires_identifier():
+    ctx, _ = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="data_publications")
+    assert out["success"] is False and "identifier is required" in out["error"]
+
+
+def test_query_alma_data_publications_unrecognized_identifier():
+    ctx, _ = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="data_publications",
+               identifier="HL Tau")
+    assert out["success"] is False and "Unrecognized identifier" in out["error"]
+
+
+def test_query_alma_data_publications_forward_join(monkeypatch):
+    tap_df = pd.DataFrame([
+        {"proposal_id": "2019.1.01528.S", "target_name": "COSMOS",
+         "band_list": "6", "member_ous_uid": "uid://A001/X1465/X9c6",
+         "bib_reference": "2024A&A...685A...1A 2024A&A...688A..55M",
+         "pub_title": "blob", "publication_year": 2024, "first_author": "A"},
+    ])
+    captured = {}
+
+    def _fake_tap(where, *, max_results=5000, order_by="proposal_id",
+                  extra_columns=(), ctx):
+        captured["where"] = where
+        captured["extra_columns"] = extra_columns
+        return tap_df.copy()
+
+    monkeypatch.setattr(alma, "_tap_obscore_dataframe", _fake_tap)
+    ctx, state = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="data_publications",
+               identifier="2019.1.01528.S")
+
+    assert out["success"] is True and out["mode"] == "data_publications"
+    assert captured["where"] == "proposal_id = '2019.1.01528.S'"
+    assert "bib_reference" in captured["extra_columns"]
+    assert out["n_publications"] == 2
+    assert [p["bibcode"] for p in out["publications"]] == \
+        ["2024A&A...685A...1A", "2024A&A...688A..55M"]
+    assert out["results"][0]["n_publications"] == 2
+    assert state.last_run_result["type"] == "data"
+
+
+def test_query_alma_data_publications_reverse_bibcode(monkeypatch):
+    captured = {}
+
+    def _fake_tap(where, *, max_results=5000, order_by="proposal_id",
+                  extra_columns=(), ctx):
+        captured["where"] = where
+        return pd.DataFrame([{
+            "proposal_id": "2017.1.00001.S", "target_name": "HL Tau",
+            "band_list": "6", "member_ous_uid": "uid://A/X/Y",
+            "bib_reference": "2018ApJ...869L..41A",
+        }])
+
+    monkeypatch.setattr(alma, "_tap_obscore_dataframe", _fake_tap)
+    ctx, _ = _ctx(search_service=_FakeSearchService())
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="data_publications",
+               identifier="2018ApJ...869L..41A")
+    assert out["success"] is True
+    assert captured["where"] == "bib_reference LIKE '%2018ApJ...869L..41A%'"
+    assert "archived data used by publication" in out["source"]

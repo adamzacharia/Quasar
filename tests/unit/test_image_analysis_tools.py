@@ -760,3 +760,175 @@ def test_period_plotly_spec_embeds_refold_meta():
     assert len(meta["time_days"]) == len(meta["value"]) == 300
     assert spec["layout"]["yaxis2"]["autorange"] == "reversed"  # mag fold axis
     assert len(spec["data"][1]["x"]) == 600  # phase plotted twice (phase, phase+1)
+
+def test_capability_vlass_epochs_blink_meta_transport(monkeypatch):  # CX-32
+    """The blink card meta must survive the capability transport: kind/ra/dec/
+    frames (+ registration warnings, CX-18) reach the card, while path/png_path
+    are stripped from the LLM-facing payload."""
+    cap = _viz_cap("vlass_epoch_comparison")
+
+    fake_result = {
+        "success": True,
+        "path": "/plots/vlass_fake.png",
+        "png_path": "C:/tmp/vlass_fake.png",
+        "epochs": [{"epoch": "VLASS1.1"}, {"epoch": "VLASS2.1"}],
+        "frames": [
+            {"url": "/plots/f1.png", "label": "VLASS1.1"},
+            {"url": "/plots/f2.png", "label": "VLASS2.1 — UNREGISTERED"},
+        ],
+        "warnings": ["VLASS2.1: reprojection failed (stub); shown on its native grid."],
+    }
+    monkeypatch.setattr(
+        "services.vlass_epochs.VlassEpochService.epoch_comparison",
+        lambda self, *a, **k: dict(fake_result),
+    )
+    cards: list = []
+    res = cap.run(cap.InputModel(ra=150.0, dec=2.0), _viz_ctx(cards))
+    assert res.success is True
+
+    # Card side: blink meta with frames + the on-card registration warnings.
+    assert len(cards) == 1
+    meta = cards[0]["meta"]
+    assert meta["kind"] == "blink"
+    assert meta["ra"] == 150.0 and meta["dec"] == 2.0
+    assert [f["label"] for f in meta["frames"]] == ["VLASS1.1", "VLASS2.1 — UNREGISTERED"]
+    assert meta["warnings"] == fake_result["warnings"]
+
+    # LLM side: local filesystem paths never reach the model payload.
+    assert "path" not in res.native and "png_path" not in res.native
+    assert res.native.get("image_attached") is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-07-17 scan fixes (IMG-01/02/05/06/10/11/12)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_measure_region_edge_clip_excludes_offimage_pixels(tmp_path):
+    """IMG-01: a region overlapping the image edge must not gain fabricated
+    0-valued pixels — on a constant-5 image the mean must stay exactly 5."""
+    nx = ny = 60
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crval = [150.0, 2.0]
+    w.wcs.crpix = [nx / 2 + 0.5, ny / 2 + 0.5]
+    w.wcs.cdelt = [-1.0 / 3600, 1.0 / 3600]
+    path = tmp_path / "const.fits"
+    fits.PrimaryHDU(data=np.full((ny, nx), 5.0, dtype=np.float32),
+                    header=w.to_header()).writeto(path)
+    # Dec chosen so the aperture centre sits ~2 px from the bottom edge:
+    # y = 29.5 + (dec - 2) * 3600  =>  y = 2  =>  dec = 2 - 27.5 / 3600.
+    out = image_analysis.measure_region(
+        url=str(path), ra=150.0, dec=2.0 - 27.5 / 3600.0, radius_arcsec=6,
+    )
+    assert out["success"] is True
+    stats = out["statistics"]
+    assert stats["mean"] == pytest.approx(5.0, abs=1e-9)
+    assert stats["min"] == pytest.approx(5.0, abs=1e-9)
+    # The clipped circle holds fewer pixels than the full r=6" disc (~113 px).
+    assert stats["n_pixels"] < 100
+    assert any("boundary" in w for w in out["warnings"])
+
+
+def test_extract_spectrum_out_of_footprint_errors(cube_path):
+    """IMG-02: an out-of-footprint RA/Dec must fail loudly, never clamp to an
+    edge pixel under a title that still claims the requested position."""
+    out = fits_service.extract_spectrum(cube_path, ra_deg=10.0, dec_deg=-60.0)
+    assert out["success"] is False
+    assert "outside" in out["error"]
+    assert "10.00000" in out["error"]  # requested position named
+
+
+def test_fit_spectral_line_out_of_footprint_errors(cube_path):
+    out = fits_service.fit_spectral_line(cube_path, ra_deg=10.0, dec_deg=-60.0)
+    assert out["success"] is False
+    assert "outside" in out["error"]
+
+
+def test_moment1_frequency_cube_converts_to_velocity(cube_path):
+    """IMG-05: the test cube has RESTFRQ, so moment-1 must convert the Hz axis
+    to km/s (radio convention) and keep the velocity-field labeling."""
+    out = fits_service.compute_moment_map(cube_path, order=1)
+    assert out["success"] is True
+    assert "Velocity Field" in out["caption"]
+    assert "km" in out["moment_unit"]
+    assert any("radio convention" in w for w in out["warnings"])
+
+
+def test_moment1_without_rest_frequency_is_labeled_mean_frequency(tmp_path, cube_path):
+    """IMG-05: with no rest frequency the map is a mean-frequency map and must
+    say so instead of claiming 'Velocity Field'."""
+    src = fits.open(cube_path)
+    header = src[0].header.copy()
+    del header["RESTFRQ"]
+    path = tmp_path / "norest.fits"
+    fits.PrimaryHDU(data=src[0].data, header=header).writeto(path)
+    src.close()
+    out = fits_service.compute_moment_map(str(path), order=1)
+    assert out["success"] is True
+    assert "Mean Frequency" in out["caption"]
+    assert "Velocity" not in out["caption"]
+    assert "Hz" in out["moment_unit"]
+
+
+def test_detect_sources_nan_gap_photometry_not_negatively_biased(tmp_path):
+    """IMG-06: a source whose aperture overlaps a NaN coverage gap must have
+    the background subtracted over the FINITE pixel area only, and be flagged."""
+    path = _write_image(tmp_path / "gap.fits",
+                        sources=((100, 100, 0.5, 3.0),), noise=0.005, seed=5)
+    with fits.open(path, mode="update") as hdul:
+        hdul[0].data = hdul[0].data + np.float32(1.0)   # positive background
+        hdul[0].data[:, 102:] = np.nan                   # coverage gap in the aperture
+        hdul.flush()
+    out = image_analysis.detect_and_measure_sources(url=path, threshold_sigma=5.0)
+    assert out["success"] is True and out["n_sources"] >= 1
+    src = next(s for s in out["sources"] if abs(s["x"] - 100) < 3 and abs(s["y"] - 100) < 3)
+    assert src.get("aperture_clipped") is True
+    # Old code subtracted bkg*full_area (~63.6 px) from a sum over ~49 finite
+    # pixels -> net ~2; the fixed effective-area subtraction recovers ~16+.
+    assert src["aperture_sum"] > 8
+    assert any("finite pixels" in w for w in out["warnings"])
+
+
+def test_apply_style_dark_mode_does_not_leak_into_publication_plots():
+    """IMG-10: dark_background must not persist in global rcParams after a
+    later publication-style request."""
+    import matplotlib as mpl
+    from services.plotting import PlottingService
+
+    svc = PlottingService()
+    svc._apply_style(dark=True)
+    assert mpl.rcParams["text.color"] in ("white", "w", "#ffffff")
+    svc._apply_style(dark=False)
+    assert mpl.rcParams["text.color"] == "black"
+    assert mpl.rcParams["figure.facecolor"] == "white"
+    mpl.rcdefaults()  # leave global state clean for other tests
+
+
+def test_plot_filenames_unique_within_one_second(monkeypatch, tmp_path):
+    """IMG-12: two plots in the same wall-clock second must not overwrite
+    each other's files."""
+    from services import plotting
+
+    monkeypatch.setattr(plotting, "PLOT_OUTPUT_DIR", str(tmp_path))
+    svc = plotting.PlottingService()
+    a = svc.plot_spectrum([1.0, 2.0, 3.0], [0.1, 0.5, 0.2])
+    b = svc.plot_spectrum([1.0, 2.0, 3.0], [0.1, 0.5, 0.2])
+    assert a["success"] and b["success"]
+    assert a["filename"] != b["filename"]
+    assert os.path.exists(a["png_path"]) and os.path.exists(b["png_path"])
+
+
+def test_render_fits_image_disclosed_cube_slice(cube_path):
+    """IMG-11: rendering a cube through the 2-D path must disclose which
+    plane was shown, in both caption and warnings."""
+    out = fits_service.render_fits_image(cube_path, title="ALMA cube")
+    assert out["success"] is True
+    assert "middle channel 20 of 40" in out["caption"]
+    assert out["cube_slice"] == {"plane": 20, "n_planes": 40}
+    assert any("only the middle plane" in w for w in out["warnings"])
+
+
+def test_image_statistics_disclose_cube_slice(cube_path):
+    """IMG-11: 2-D analysis of a cube URL carries the collapsed-plane note."""
+    out = image_analysis.image_statistics(url=cube_path)
+    assert out["success"] is True
+    assert any("channel 20 of 40" in w for w in out["warnings"])

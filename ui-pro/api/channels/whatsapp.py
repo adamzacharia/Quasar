@@ -19,6 +19,8 @@ Docs: https://developers.facebook.com/docs/whatsapp/cloud-api
 import os
 import json
 import asyncio
+import hashlib
+import hmac
 import re
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, Request, Response, HTTPException, Query
@@ -29,6 +31,10 @@ router = APIRouter(prefix="/channels/whatsapp", tags=["channels"])
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "quasar_whatsapp_verify")
+# UIAPI-09: the Meta app secret used to verify X-Hub-Signature-256 on inbound
+# webhooks. When set, verification is mandatory (fail closed); when unset, the
+# webhook still works for dev setups but logs a warning per request.
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 
 GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -37,8 +43,12 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _get_agent():
-    """Lazy import to avoid circular imports."""
-    from api.main import get_agent  # type: ignore
+    """Lazy import to avoid circular imports.
+
+    get_agent lives in api.deps since the main.py monolith split — importing
+    it from api.main crashed every inbound message (scan UIAPI-01).
+    """
+    from api.deps import get_agent  # type: ignore
     return get_agent()
 
 
@@ -127,6 +137,17 @@ async def whatsapp_verify(
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+def _verify_whatsapp_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Constant-time check of Meta's X-Hub-Signature-256 header (UIAPI-09).
+
+    The header is ``sha256=<hex hmac of the raw body with the app secret>``.
+    """
+    expected = "sha256=" + hmac.new(
+        WHATSAPP_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header or "")
+
+
 @router.post("/webhook")
 async def whatsapp_webhook(request: Request):
     """
@@ -136,8 +157,26 @@ async def whatsapp_webhook(request: Request):
     if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         raise HTTPException(status_code=503, detail="WhatsApp credentials not configured")
 
+    # ── UIAPI-09: authenticate the webhook before acting on it ──────────
+    # Without this, any unauthenticated poster to the well-known webhook URL
+    # can forge a Cloud-API payload that triggers a full agent run (unmetered
+    # LLM spend) and makes the server send WhatsApp messages to arbitrary
+    # numbers. Fail closed when the app secret is configured; warn-and-allow
+    # when it is not, so dev setups without a Meta app keep working.
+    raw_body = await request.body()
+    if WHATSAPP_APP_SECRET:
+        signature = request.headers.get("x-hub-signature-256", "")
+        if not _verify_whatsapp_signature(raw_body, signature):
+            print("[WHATSAPP] Rejected webhook POST with missing/invalid X-Hub-Signature-256")
+            raise HTTPException(status_code=403, detail="Invalid webhook signature")
+    else:
+        print(
+            "[WHATSAPP] WARNING: WHATSAPP_APP_SECRET is not set — webhook "
+            "signature verification is DISABLED and inbound payloads are unauthenticated."
+        )
+
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception:
         return Response(content="ok", status_code=200)
 
@@ -189,14 +228,21 @@ async def _process_and_reply(sender_id: str, user_text: str, message_id: str):
 
     try:
         loop = asyncio.get_event_loop()
-        response_text = await loop.run_in_executor(
-            _executor,
-            lambda: agent.stream_response_api(
-                query=user_text,
-                message_placeholder=None,
-                user_id=f"whatsapp_{sender_id}",
-            )
-        )
+
+        def _run_with_context():
+            # Install a request context (CX-41): without one, conductor
+            # sub-agent tool traces have no collector and per-call accounting
+            # hooks are absent for bot-channel turns.
+            from core.llm_client import llm_request_context
+
+            with llm_request_context(user_id=f"whatsapp_{sender_id}"):
+                return agent.stream_response_api(
+                    query=user_text,
+                    message_placeholder=None,
+                    user_id=f"whatsapp_{sender_id}",
+                )
+
+        response_text = await loop.run_in_executor(_executor, _run_with_context)
     except Exception as e:
         print(f"[WHATSAPP] Agent error: {e}")
         response_text = "Sorry, I encountered an error processing your request. Please try again."
@@ -244,6 +290,8 @@ async def whatsapp_status():
         "phone_number_id": WHATSAPP_PHONE_NUMBER_ID[:6] + "..." if WHATSAPP_PHONE_NUMBER_ID else None,
         "token_set": bool(WHATSAPP_ACCESS_TOKEN),
         "verify_token_set": bool(WHATSAPP_VERIFY_TOKEN),
+        # UIAPI-09: whether inbound webhook signature verification is active.
+        "app_secret_set": bool(WHATSAPP_APP_SECRET),
     }
 
     # Optionally verify the token is valid by calling the API

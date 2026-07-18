@@ -95,6 +95,19 @@ def _shutdown_spectral_line_jobs():
     spectral_line_job_service.shutdown()
 
 
+@app.on_event("shutdown")
+def _shutdown_mcp_bridges():
+    # Release MCP bridge threads (they otherwise park forever on their
+    # keep-alive event and hold child stdio processes open).
+    from . import deps
+
+    if deps._agent is not None:
+        try:
+            deps._agent.shutdown_mcp_servers()
+        except Exception as e:
+            print(f"[MCPServers] Shutdown signalling failed: {e}")
+
+
 # ── Request / response logging middleware ─────────────────────────────────────
 import re  # noqa: E402
 import time as _time  # noqa: E402
@@ -192,10 +205,20 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    # Retry-After is not a CORS-safelisted response header, so a cross-origin
-    # browser cannot read it unless it is explicitly exposed. The login-throttle
-    # 429 (S6) sends Retry-After; the frontend needs to read it.
-    expose_headers=["Retry-After"],
+    # None of these are CORS-safelisted response headers, so a cross-origin
+    # browser cannot read them unless explicitly exposed. Retry-After: the
+    # login-throttle 429 (S6). The X-Quasar-* trio: the export route's
+    # truncation verdict — without them a cross-site browser reads null and
+    # DataTableCard would treat a ceiling-clipped CSV as full, the exact
+    # silent-partial Feature 2 forbids (f2-CX-20). Content-Disposition: the
+    # export filename the client parses from the same response.
+    expose_headers=[
+        "Retry-After",
+        "X-Quasar-Truncated",
+        "X-Quasar-Rowcount",
+        "X-Quasar-Total-Rows",
+        "Content-Disposition",
+    ],
 )
 
 # ── Static file serving for rendered FITS images ─────────────────
@@ -262,6 +285,7 @@ from api.routers import (  # noqa: E402
     personalization,
     proposals,
     provider_keys,
+    results,
     spectral_lines,
     tools,
     usage,
@@ -276,6 +300,7 @@ app.include_router(auth.router)
 app.include_router(fits.router)
 app.include_router(spectral_lines.router)
 app.include_router(datalab.router)
+app.include_router(results.router)
 app.include_router(workbench.router)
 app.include_router(conversations.router)
 app.include_router(chat.router)

@@ -30,6 +30,7 @@ from services.evidence_quality import (
     choose_better_evidence_quality,
     rank_web_sources,
 )
+from services.block_identity import BlockIdAllocator
 from services.content_safety import is_safe_web_image, is_safe_web_source
 from services.model_pricing import TurnCostAccumulator, estimate_cost
 
@@ -201,14 +202,31 @@ def _merge_web_label(existing: str, incoming: Any) -> str:
     return f"{existing} + {label}"
 
 
-def _request_from_trace(trace: Any, tool_name: str) -> Optional[Dict[str, Any]]:
+def _request_from_trace(
+    trace: Any, tool_name: str, call_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """The `request` recorded for the most recent call to ``tool_name``.
 
     Fallback for cards whose result dict was not stamped by the runner (e.g. a
     tool that set its card through a path the stamper does not see). Returns
     None when the tool made no traced call. Feature 1.
+
+    When ``call_id`` is given, the entry whose ``call_id`` matches exactly wins
+    regardless of name — two conductor calls to the SAME tool must each resolve
+    their OWN request, never both the latest by name. Latest-by-name remains
+    the fallback when the id is absent or unmatched. (A1 CX-14 sliver)
     """
-    if not isinstance(trace, list) or not tool_name:
+    if not isinstance(trace, list):
+        return None
+    if call_id:
+        for call in trace:
+            if not isinstance(call, dict) or call.get("call_id") != call_id:
+                continue
+            request = call.get("request")
+            # The producing call is KNOWN — if it recorded no request, show
+            # none rather than substituting another call's. (A1 CX-14 sliver)
+            return request if isinstance(request, dict) and request else None
+    if not tool_name:
         return None
     for call in reversed(trace):
         if not isinstance(call, dict) or call.get("name") != tool_name:
@@ -437,9 +455,12 @@ def _stream_chat_response(
                 conv_id = conversation_service.create_conversation(current_user_id, title, requested_model)
                 logger.info(f"[CHAT] Auto-created conversation {conv_id} with model {requested_model} for user {current_user_id}")
             else:
-                # Frontend sent a conversation_id — verify it exists in the DB
-                existing = conversation_service.get_user_conversations(current_user_id, limit=100)
-                if not any(c["id"] == conv_id for c in existing):
+                # Frontend sent a conversation_id — verify it exists in the DB.
+                # UIAPI-06: a direct id+owner lookup, NOT a scan of the 100 most
+                # recently updated conversations — that scan silently forked any
+                # OLDER conversation into a brand-new thread (reply misfiled,
+                # history lost) for users with >100 conversations.
+                if not conversation_service.conversation_belongs_to_user(conv_id, current_user_id):
                     # ID doesn't exist in DB (orphan/client-generated) — create a proper one
                     title = conversation_service.generate_title_from_message(request.message)
                     conv_id = conversation_service.create_conversation(current_user_id, title, requested_model)
@@ -538,6 +559,10 @@ def _stream_chat_response(
             `usage_emitted` so the two paths never double-emit.
             """
             nonlocal usage_emitted
+            # Snapshot point: close the accumulator so late conductor-thread
+            # calls can't mutate totals AFTER this event / the chat_runs row
+            # (CX-17); their spend stays in the per-call ledger.
+            usage.freeze()
             tokens_total = usage.total_tokens
             if usage_emitted or tokens_total <= 0:
                 return None
@@ -563,6 +588,21 @@ def _stream_chat_response(
             nonlocal run_finalized
             if run_finalized:
                 return
+            # Freeze at the snapshot funnel (CX-17): EVERY finalize path —
+            # including CancelledError, which never reaches usage_sse_line() —
+            # must close the accumulator before reading it, or a surviving
+            # conductor executor thread can mutate totals after the chat_runs
+            # row is written. Surface any late-dropped calls for observability.
+            try:
+                usage.freeze()
+                if usage.late_calls_dropped:
+                    logger.warning(
+                        f"[usage] {usage.late_calls_dropped} late LLM call(s) arrived "
+                        f"after run {run_id}'s usage snapshot; turn totals exclude them "
+                        "(per-call ledger has the full record)."
+                    )
+            except Exception:  # noqa: BLE001 - accounting must never block finalize
+                pass
             try:
                 issue_report_service.finalize_run(
                     run_id,
@@ -593,6 +633,16 @@ def _stream_chat_response(
             except Exception as run_err:
                 logger.warning(f"[RUN] Failed to finalize run {run_id}: {run_err}")
 
+        # Stable per-block identity for this turn (Feature 4). conv_id is
+        # already resolved above (create_conversation runs before this point),
+        # so every block of the turn hashes against the same conversation.
+        # Ids are minted here at emission and persisted into rich_meta; replay
+        # reads them back rather than recomputing, so the eager-vs-done
+        # emission order in this file can never orphan an existing rating.
+        _blocks = BlockIdAllocator(conv_id or request.conversation_id or "", run_id)
+        # The assistant's prose is always the turn's first text block.
+        _text_block_id = _blocks.next("text")
+
         run_meta = {
             "type": "run_meta",
             "run_id": run_id,
@@ -600,6 +650,10 @@ def _stream_chat_response(
             "model": requested_model,
             "provider": provider,
             "conversation_id": conv_id or request.conversation_id or "",
+            # Carries the text block's id to the client: the assistant message
+            # is created before any card event arrives, so it has nowhere else
+            # to learn its identity from.
+            "text_block_id": _text_block_id,
             "inactivity_timeout_seconds": inactivity_timeout,
             # Advertise the HARD ceiling: the effective turn deadline extends while
             # tools are completing, so the frontend watchdog must not pre-empt an
@@ -607,6 +661,28 @@ def _stream_chat_response(
             "turn_timeout_seconds": hard_max_timeout,
         }
         yield f"data: {json.dumps(run_meta)}\n\n"
+
+        def _terminal_run_meta_line() -> str:
+            """Re-emit run_meta with the turn's FINAL status (Feature 4).
+
+            The first run_meta goes out before any work starts, when the outcome
+            is necessarily unknown. Most failure paths then emit an `error` event
+            and the client marks the turn failed from that — but not all: the
+            agent-is-None path reports itself as `token` TEXT followed by an
+            ordinary [DONE], which the client reads as a normal completion. That
+            turn would then look successful to the eval gate, which would demand a
+            star on a backend crash the user cannot judge and cannot rate.
+
+            Re-emitting the same event with the settled status makes the outcome
+            authoritative for every path, without touching the rendered text the
+            way an `error` event would. No-op on healthy turns.
+            """
+            if run_status in ("started", "completed"):
+                return ""
+            final = dict(run_meta)
+            final["status"] = run_status
+            final["errorCode"] = run_error_code
+            return f"data: {json.dumps(final)}\n\n"
 
         if agent is None:
             err = get_agent_error() or "Unknown initialization error"
@@ -622,6 +698,9 @@ def _stream_chat_response(
                 data = json.dumps({"type": "token", "content": chunk + "\n"})
                 yield f"data: {data}\n\n"
                 await asyncio.sleep(0.02)
+            _agent_none_meta = _terminal_run_meta_line()
+            if _agent_none_meta:
+                yield _agent_none_meta
             yield "data: [DONE]\n\n"
             finalize_run_record()
             return
@@ -718,19 +797,30 @@ def _stream_chat_response(
 
                         openai_byok_key = llm_context["provider_api_keys"].get("openai")
                         openai_key_source = "byok" if openai_byok_key else "platform"
-                        usage_quota_service.ensure_allowed(
+                        # reserve=True: the embed call is a real spend point
+                        # with a settle below, so it takes an ATOMIC reservation
+                        # like every LLM call — a bare read-then-check let
+                        # concurrent embedding requests overshoot the daily cap
+                        # (A2 guard CX-02 reopen).
+                        _embed_reservation = usage_quota_service.ensure_allowed(
                             user_id=user_id,
                             user_email=current_user_email,
                             provider="openai",
                             key_source=openai_key_source,
                             byok_token_limit=llm_context["byok_token_limits"].get("openai"),
+                            reserve=True,
                         )
-                        embeddings = (
-                            OpenAIEmbeddings(openai_api_key=openai_byok_key)
-                            if openai_byok_key
-                            else OpenAIEmbeddings()
-                        )
-                        query_vector = embeddings.embed_query(request.message)
+                        try:
+                            embeddings = (
+                                OpenAIEmbeddings(openai_api_key=openai_byok_key)
+                                if openai_byok_key
+                                else OpenAIEmbeddings()
+                            )
+                            query_vector = embeddings.embed_query(request.message)
+                        except Exception:
+                            # The call never spent — free the held tokens.
+                            usage_quota_service.release_reservation(_embed_reservation)
+                            raise
                         # This call is quota-CHECKED above but was never
                         # RECORDED: it goes through langchain_openai, not
                         # LLMClient, so it never reaches LLMClient._record_usage
@@ -757,11 +847,14 @@ def _stream_chat_response(
                                 key_source=openai_key_source,
                                 input_tokens=_embed_tokens,
                                 output_tokens=0,
+                                reservation_id=_embed_reservation,
                             )
                         except Exception as _embed_usage_err:
                             # Accounting must never break retrieval, but a
                             # silent drop hides undercounted spend — log it so a
-                            # persistent recording failure is visible.
+                            # persistent recording failure is visible. The held
+                            # reservation must still come off.
+                            usage_quota_service.release_reservation(_embed_reservation)
                             logger.warning(
                                 f"[PERSONAL_RAG] embedding usage not recorded: {_embed_usage_err}"
                             )
@@ -831,8 +924,13 @@ def _stream_chat_response(
             # ── Plan Feedback Queue (HITL) ────────────────────────────
             # Created at generator scope so the SSE event loop can re-key
             # the queue when conversation_meta arrives with the server UUID.
+            # UIAPI-08: keyed by (conversation_key, run_id), NOT conversation
+            # alone — two concurrent runs in one conversation used to share a
+            # single key, so the second registration clobbered the first and
+            # the first run's cleanup then deleted the second's live queue,
+            # making its Approve click 404.
             _pfq = stdlib_queue.Queue()
-            _pfq_key = [conv_id or f"_anon_{id(_pfq)}"]  # mutable for re-keying
+            _pfq_key = [(conv_id or f"_anon_{id(_pfq)}", run_id)]  # mutable for re-keying
             with _plan_feedback_lock:
                 _plan_feedback_queues[_pfq_key[0]] = _pfq
 
@@ -840,7 +938,7 @@ def _stream_chat_response(
             # (or the anon queue key) BEFORE plan_review events arrive.
             # This is critical for HITL feedback routing — the frontend must
             # know the exact key used in _plan_feedback_queues.
-            _meta_cid = _pfq_key[0]
+            _meta_cid = _pfq_key[0][0]
             early_meta = json.dumps({"type": "conversation_meta", "conversation_id": _meta_cid})
             yield f"data: {early_meta}\n\n"
 
@@ -864,7 +962,15 @@ def _stream_chat_response(
                     try:
                         effective_user_id = (current_user.get("sub") if current_user else None) or "anonymous"
 
-                        # Sync conversation memory to agent
+                        # Sync conversation memory to agent. agent.memory is
+                        # request-thread-local (UIAPI-02), and worker threads
+                        # are POOLED — clear unconditionally so a previous
+                        # request's history (possibly another user's) can
+                        # never survive into this run's prompts.
+                        try:
+                            agent.memory.clear()
+                        except Exception as e:  # noqa: BLE001 - never block the turn
+                            print(f"[WARN] Failed to reset agent memory: {e}")
                         if conv_id:
                             try:
                                 history = conversation_service.get_conversation_messages_for_user(conv_id, effective_user_id)
@@ -894,18 +1000,26 @@ def _stream_chat_response(
                                 run_token=run_id,
                             )
                         finally:
-                            # Clean up the plan feedback queue
+                            # Clean up the plan feedback queue. UIAPI-08:
+                            # identity-guarded — only remove the entry if it is
+                            # still OUR queue, never a successor run's.
                             with _plan_feedback_lock:
-                                _plan_feedback_queues.pop(_pfq_key[0], None)
+                                if _plan_feedback_queues.get(_pfq_key[0]) is _pfq:
+                                    _plan_feedback_queues.pop(_pfq_key[0], None)
 
                         # Snapshot thread-local results BEFORE leaving this thread.
                         # The async generator runs on the event-loop thread where
                         # these thread-local values would be invisible.
+                        # R3: citation metrics ride the request-scoped LLM
+                        # context (still installed on this thread here).
+                        from core.llm_client import get_llm_request_context as _get_llm_ctx
+                        _ctx_obj = _get_llm_ctx()
                         done_payload = {
                             "text": res,
                             "all_results": list(getattr(agent, '_accumulated_run_results', []) or []),
                             "last_result": agent.last_run_result,
                             "tool_trace": list(getattr(agent, '_accumulated_tool_trace', []) or []),
+                            "citation_metrics": getattr(_ctx_obj, "citation_metrics", None),
                         }
                         asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
                     except Exception as e:
@@ -937,6 +1051,14 @@ def _stream_chat_response(
             _rich_data_table = None  # last data table (backward compat)
             _rich_papers = None
             _rich_papers_request = None   # the ADS query behind the papers grid (Feature 1)
+            _rich_papers_block_id = None  # stable id for the grid (Feature 4)
+            # A turn can emit more than one papers grid / notebook (the agent can
+            # search twice; Conductor adds its own notebook alongside the normal
+            # path). The singular fields above are the back-compat primary; these
+            # lists keep EVERY block, so a rating on an earlier grid isn't
+            # orphaned when the next one overwrites the singular field.
+            _rich_papers_groups = []
+            _rich_notebooks = []
             _rich_notebook = None
             _rich_image = None
             _rich_images = []
@@ -951,8 +1073,12 @@ def _stream_chat_response(
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
+            # UIAPI-07: initialized HERE (not only after the loop) so the
+            # timeout/cancel persistence paths always have a defined trace.
+            _tool_trace: List[Any] = []
 
-            def _record_rich_image(img_url, caption, meta=None, request=None):
+            def _record_rich_image(img_url, caption, meta=None, request=None,
+                                   block_id=None, block_kind=None):
                 nonlocal _rich_image
                 if not img_url or img_url in _rich_image_urls:
                     return None
@@ -963,10 +1089,119 @@ def _stream_chat_response(
                 # into messages.metadata so the card keeps it across a reload.
                 if isinstance(request, dict) and request:
                     entry["request"] = request
+                # Stable identity (Feature 4) — the reloaded figure must resolve
+                # to the same rating row as the one the user starred live.
+                if block_id:
+                    entry["blockId"] = block_id
+                    entry["blockKind"] = block_kind or "image"
                 _rich_image_urls.add(img_url)
                 _rich_images.append(entry)
                 _rich_image = entry
                 return entry
+
+            # UIAPI-07: persistence lives in a helper so the timeout path (via
+            # the shared tail) AND the CancelledError handler can both save
+            # what the turn already streamed. Guarded so a cancellation that
+            # lands after the normal save cannot double-persist the message.
+            turn_persisted = False
+
+            def _persist_assistant_turn() -> None:
+                nonlocal turn_persisted
+                if turn_persisted:
+                    return
+                if not (current_user_id and conv_id and (
+                    response_text or _rich_data_tables or _rich_data_table or
+                    _rich_papers or _rich_notebook or _rich_images or _rich_image or
+                    _rich_web_sources or _rich_web_images or
+                    _rich_thinking or _rich_thinking_text
+                )):
+                    return
+                turn_persisted = True
+                try:
+                    rich_meta = {}
+                    if _rich_data_tables:
+                        # Store all data tables for multi-target support
+                        if len(_rich_data_tables) == 1:
+                            rich_meta["dataTable"] = _rich_data_tables[0]
+                        else:
+                            rich_meta["dataTable"] = _rich_data_tables[0]  # primary (backward compat)
+                            rich_meta["dataTables"] = _rich_data_tables    # all tables
+                    elif _rich_data_table:
+                        rich_meta["dataTable"] = _rich_data_table
+                    if _rich_papers:
+                        rich_meta["papers"] = _rich_papers
+                        if _rich_papers_request:
+                            rich_meta["papersRequest"] = _rich_papers_request
+                        # Sibling of papersRequest: `papers` is the raw tile list,
+                        # so the grid's own id has nowhere else to ride.
+                        if _rich_papers_block_id:
+                            rich_meta["papersBlockId"] = _rich_papers_block_id
+                        # Same shape as dataTable/dataTables: the singular field
+                        # stays the back-compat primary and the list carries every
+                        # grid, so a second search can't erase the first one's
+                        # rated block on replay.
+                        if len(_rich_papers_groups) > 1:
+                            rich_meta["papersGroups"] = _rich_papers_groups
+                    if _rich_notebook:
+                        rich_meta["notebook"] = _rich_notebook
+                        if len(_rich_notebooks) > 1:
+                            rich_meta["notebooks"] = _rich_notebooks
+                    if _rich_images:
+                        rich_meta["images"] = _rich_images
+                        rich_meta["image"] = _rich_images[-1]
+                    elif _rich_image:
+                        rich_meta["image"] = _rich_image
+                    if _rich_web_sources:
+                        rich_meta["webSources"] = _rich_web_sources
+                    if _rich_web_images:
+                        rich_meta["webImages"] = _rich_web_images
+                    if _rich_web_provider:
+                        rich_meta["webProvider"] = _rich_web_provider
+                    if _rich_web_image_provider:
+                        rich_meta["webImageProvider"] = _rich_web_image_provider
+                    if _rich_web_search_type:
+                        rich_meta["webSearchType"] = _rich_web_search_type
+                    if _rich_web_query:
+                        rich_meta["webQuery"] = _rich_web_query
+                    if _rich_thinking:
+                        rich_meta["thinkingSteps"] = _rich_thinking
+                    if _rich_thinking_text:
+                        rich_meta["thinking"] = _rich_thinking_text
+                    # Raw request provenance (Feature 1). Without this the exact
+                    # queries are dropped on history replay. Persist a REDACTED,
+                    # reload-safe projection — never the raw arguments/output,
+                    # which can carry credential-bearing URLs into the DB (CX-01).
+                    if _tool_trace:
+                        from core.provenance import persistable_trace
+                        _persist_trace = persistable_trace(_tool_trace)
+                        if _persist_trace:
+                            rich_meta["toolTrace"] = _persist_trace
+                    rich_meta["runMeta"] = {
+                        "run_id": run_id,
+                        "trace_id": trace_id,
+                        "model": requested_model,
+                        "provider": provider,
+                        "conversation_id": conv_id or request.conversation_id or "",
+                        # The text block's id (Feature 4) — restored onto the
+                        # base message, which is the block the prose lives on.
+                        "text_block_id": _text_block_id,
+                    }
+                    # R3: mechanical citation recall/precision — persisted so
+                    # eval mode can read them on history replay.
+                    if _citation_metrics:
+                        rich_meta["runMeta"]["citationMetrics"] = _citation_metrics
+                    # UIAPI-07: failed AND timed_out/cancelled turns persist
+                    # their real status, so a reloaded partial answer replays
+                    # as degraded rather than masquerading as a clean turn.
+                    if run_status not in ("started", "completed"):
+                        rich_meta["runMeta"]["status"] = run_status
+                        rich_meta["runMeta"]["errorCode"] = run_error_code
+                    conversation_service.save_message(
+                        conv_id, "assistant", response_text or "",
+                        metadata=rich_meta if rich_meta else None,
+                    )
+                except Exception as e:
+                    logger.warning(f"[CHAT] Failed to persist assistant message: {e}")
 
             deadline = ChatDeadline(
                 inactivity_seconds=inactivity_timeout,
@@ -1012,8 +1247,14 @@ def _stream_chat_response(
                         if _to_usage_line:
                             yield _to_usage_line
                         yield f"data: {json.dumps({'type': 'error', 'code': timeout_code, 'content': run_error_message, 'run_id': run_id})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+                        # UIAPI-07: BREAK instead of returning — the shared
+                        # tail below persists everything this turn already
+                        # streamed (accumulated tokens + eagerly emitted
+                        # figures) with runMeta.status="timed_out", then emits
+                        # the terminal run_meta and [DONE]. Returning here
+                        # skipped persistence entirely, so a half-answered turn
+                        # vanished from history on reload.
+                        break
                     yield ": keepalive\n\n"
                     continue
                 deadline.mark_activity(_time.perf_counter())
@@ -1065,10 +1306,23 @@ def _stream_chat_response(
                                 # Use inline data if available
                                 _eager_result = _pending_eager_data.pop(0) if _pending_eager_data else None
                                 if _eager_result:
-                                    if _eager_result.get("type") == "data":
-                                        # Do not eagerly emit data cards during streaming to avoid showing intermediate results
-                                        print(f"[EAGER] Bypassed eager emission for data card idx={_eager_idx} during streaming")
-                                    elif _eager_result.get("type") == "image":
+                                    if _eager_result.get("type") != "image":
+                                        # UIAPI-14: images are the ONLY eagerly
+                                        # emitted card kind. "data" results are
+                                        # deliberately bypassed (intermediate
+                                        # tables must not flash mid-stream; the
+                                        # done-path emits the final one), and
+                                        # for every other type the old
+                                        # else-branch called
+                                        # _build_data_card_event, which returns
+                                        # None for all non-"data" types — that
+                                        # branch was confirmed-unreachable dead
+                                        # code and has been removed. As a
+                                        # consequence _eagerly_emitted stays
+                                        # empty today; the done-path guard on it
+                                        # is kept for a future re-enable.
+                                        print(f"[EAGER] Bypassed eager emission for idx={_eager_idx} (type={_eager_result.get('type')}) during streaming")
+                                    else:
                                         # Figures render the moment their tool completes; a
                                         # deadline-killed turn no longer loses already-built
                                         # plots. _emitted_image_urls keeps the done-path from
@@ -1083,29 +1337,17 @@ def _stream_chat_response(
                                             # trace is thread-local and unreachable here).
                                             _eimg_req = _eager_result.get("request")
                                             _eimg_req = _eimg_req if isinstance(_eimg_req, dict) else None
+                                            # Ordinal is burned only now, after the
+                                            # dedup guard — a re-emitted URL must not
+                                            # renumber the blocks behind it.
+                                            _eimg_kind = "plotly" if plotly_spec else "image"
+                                            _eimg_block = _blocks.next(_eimg_kind)
                                             if plotly_spec:
-                                                yield f"data: {json.dumps({'type': 'plotly', 'spec': plotly_spec, 'title': caption, 'png_fallback': img_url, 'meta': meta, 'request': _eimg_req})}\n\n"
+                                                yield f"data: {json.dumps({'type': 'plotly', 'spec': plotly_spec, 'title': caption, 'png_fallback': img_url, 'meta': meta, 'request': _eimg_req, 'blockId': _eimg_block, 'blockKind': 'plotly'})}\n\n"
                                             else:
-                                                yield f"data: {json.dumps({'type': 'image', 'url': img_url, 'caption': caption, 'meta': meta, 'request': _eimg_req})}\n\n"
-                                            _record_rich_image(img_url, caption, meta, request=_eimg_req)
+                                                yield f"data: {json.dumps({'type': 'image', 'url': img_url, 'caption': caption, 'meta': meta, 'request': _eimg_req, 'blockId': _eimg_block, 'blockKind': 'image'})}\n\n"
+                                            _record_rich_image(img_url, caption, meta, request=_eimg_req, block_id=_eimg_block, block_kind=_eimg_kind)
                                             print(f"[EAGER] Image emitted during streaming: {str(img_url)[:100]}")
-                                    else:
-                                        card = _build_data_card_event(_eager_result)
-                                        if card:
-                                            _event_str, _rich = card
-                                            _tn = _eager_result.get("tool_name", "search_alma_archive")
-                                            # `request` = the exact call this card came from
-                                            # (Feature 1). The tool trace is thread-local to the
-                                            # agent worker, so on this eager path the request can
-                                            # only come from the result dict, where runner.py
-                                            # stamped it. Already redacted.
-                                            _eager_req = _eager_result.get("request")
-                                            yield f"data: {json.dumps({'type': 'tool_call', 'name': _tn, 'displayName': _tn.replace('_',' ').title(), 'status': 'completed', 'input': {}, 'output': 'Found results', 'request': _eager_req if isinstance(_eager_req, dict) else None})}\n\n"
-                                            yield _event_str
-                                            _rich_data_tables.append(_rich)
-                                            _rich_data_table = _rich
-                                            _eagerly_emitted.add(_eager_idx)
-                                            print(f"[EAGER] Data card emitted for idx={_eager_idx} during streaming")
                             except Exception as _eager_err:
                                 print(f"[WARN] Eager data card emission failed: {_eager_err}")
                         elif isinstance(step, str) and step.startswith("__event__"):
@@ -1115,13 +1357,15 @@ def _stream_chat_response(
                                 # Re-key plan feedback queue when server assigns conversation_id
                                 if event_parsed.get("type") == "conversation_meta":
                                     new_cid = event_parsed.get("conversation_id")
-                                    if new_cid and new_cid != _pfq_key[0]:
+                                    if new_cid and new_cid != _pfq_key[0][0]:
                                         old_key = _pfq_key[0]
+                                        new_key = (new_cid, run_id)  # UIAPI-08: stays run-scoped
                                         with _plan_feedback_lock:
-                                            _plan_feedback_queues.pop(old_key, None)
-                                            _plan_feedback_queues[new_cid] = _pfq
-                                        _pfq_key[0] = new_cid
-                                        print(f"[HITL] Re-keyed plan feedback queue: {old_key[:20]}... → {new_cid[:20]}...")
+                                            if _plan_feedback_queues.get(old_key) is _pfq:
+                                                _plan_feedback_queues.pop(old_key, None)
+                                            _plan_feedback_queues[new_key] = _pfq
+                                        _pfq_key[0] = new_key
+                                        print(f"[HITL] Re-keyed plan feedback queue: {str(old_key[0])[:20]}... → {new_cid[:20]}...")
                                 if event_parsed.get("type") == "web_sources":
                                     _rich_web_sources = _merge_web_sources(
                                         _rich_web_sources,
@@ -1168,6 +1412,7 @@ def _stream_chat_response(
                     _snapshot_all = payload.get("all_results", []) if isinstance(payload, dict) else []
                     _snapshot_last = payload.get("last_result") if isinstance(payload, dict) else None
                     _snapshot_tool_trace = payload.get("tool_trace", []) if isinstance(payload, dict) else []
+                    _snapshot_citation_metrics = payload.get("citation_metrics") if isinstance(payload, dict) else None
                     break
                 if msg_type == "error":
                     run_status = "failed"
@@ -1190,6 +1435,11 @@ def _stream_chat_response(
                     if first_token_ms is None:
                         first_token_ms = int((_time.perf_counter() - run_started_at) * 1000)
                     first_token = False
+                    # UIAPI-07: accumulate as we stream — a timed-out or
+                    # cancelled turn persists exactly what the user already saw
+                    # instead of vanishing on reload. The "done" payload
+                    # replaces this with the agent's full sanitized text.
+                    response_text += payload
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
                 if msg_type == "thought":
@@ -1203,6 +1453,7 @@ def _stream_chat_response(
             _all_results = _snapshot_all if '_snapshot_all' in dir() else []
             _last_result = _snapshot_last if '_snapshot_last' in dir() else None
             _tool_trace = _snapshot_tool_trace if '_snapshot_tool_trace' in dir() else []
+            _citation_metrics = _snapshot_citation_metrics if '_snapshot_citation_metrics' in dir() else None
             # Deduplicate: if last_run_result isn't already in the list, add it
             if _last_result and not _all_results:
                 _all_results = [_last_result]
@@ -1297,7 +1548,23 @@ def _stream_chat_response(
                 await asyncio.sleep(0.05)
 
                 if result_type == "data":
-                    card = _build_data_card_event(_run_result)
+                    # Same allocator as the eager path above: a turn whose first
+                    # table went out eagerly numbers this one "data-1", and the
+                    # id is persisted either way.
+                    # UIAPI-11: built on a worker thread — the card build makes
+                    # a blocking CADC DataLink call (urllib, timeout=8s) and can
+                    # DiskCache-write a large frame; on the event loop a CADC
+                    # outage would stall the whole backend (and every other
+                    # user's SSE keepalive) for up to 8s per card.
+                    _card_result = _run_result
+                    card = await loop.run_in_executor(
+                        _executor,
+                        lambda: _build_data_card_event(
+                            _card_result,
+                            current_user_id,
+                            block_id_factory=lambda: _blocks.next("data"),
+                        ),
+                    )
                     if card:
                         _event_str, _rich_dt = card
                         yield _event_str
@@ -1311,26 +1578,40 @@ def _stream_chat_response(
                         # The executed ADS query behind this result set (Feature 1).
                         # ONE shared request for the whole grid — repeating the same
                         # query on every paper card would be noise.
+                        # One block id for the grid too, for the same reason: the
+                        # user rates "these papers", not each tile.
+                        _papers_block = _blocks.next("papers")
                         papers_event = json.dumps({
                             "type": "papers", "papers": papers,
                             "request": _rr_request or None,
+                            "blockId": _papers_block, "blockKind": "papers",
                         })
                         yield f"data: {papers_event}\n\n"
                         _rich_papers = papers  # Capture for history
                         _rich_papers_request = _rr_request or None
+                        _rich_papers_block_id = _papers_block
+                        _rich_papers_groups.append({
+                            "papers": papers,
+                            "request": _rr_request or None,
+                            "blockId": _papers_block,
+                        })
                         await asyncio.sleep(0.05)
 
                 elif result_type == "notebook":
                     nb_data = _run_result.get("notebook_data", {})
                     nb_title = _run_result.get("title", "Analysis Notebook")
                     if nb_data:
+                        _nb_block = _blocks.next("notebook")
                         notebook_event = json.dumps({
                             "type": "notebook",
                             "title": nb_title,
                             "data": nb_data,
+                            "blockId": _nb_block, "blockKind": "notebook",
                         })
                         yield f"data: {notebook_event}\n\n"
-                        _rich_notebook = {"title": nb_title, "data": nb_data}
+                        _rich_notebook = {"title": nb_title, "data": nb_data,
+                                          "blockId": _nb_block}
+                        _rich_notebooks.append(_rich_notebook)
                         await asyncio.sleep(0.05)
 
                 elif result_type == "image":
@@ -1340,21 +1621,26 @@ def _stream_chat_response(
                     plotly_spec = _run_result.get("plotly_spec")
                     if img_url and img_url not in _emitted_image_urls:
                         _emitted_image_urls.add(img_url)
+                        _img_kind = "plotly" if plotly_spec else "image"
+                        _img_block = _blocks.next(_img_kind)
                         if plotly_spec:
                             # Interactive card; the PNG stays as fallback + history record.
                             plotly_event = json.dumps({
                                 "type": "plotly", "spec": plotly_spec, "title": caption,
                                 "png_fallback": img_url, "meta": meta,
                                 "request": _rr_request or None,
+                                "blockId": _img_block, "blockKind": "plotly",
                             })
                             yield f"data: {plotly_event}\n\n"
                         else:
                             image_event = json.dumps({
                                 "type": "image", "url": img_url, "caption": caption, "meta": meta,
                                 "request": _rr_request or None,
+                                "blockId": _img_block, "blockKind": "image",
                             })
                             yield f"data: {image_event}\n\n"
-                        _record_rich_image(img_url, caption, meta, request=_rr_request)
+                        _record_rich_image(img_url, caption, meta, request=_rr_request,
+                                           block_id=_img_block, block_kind=_img_kind)
                         await asyncio.sleep(0.05)
 
                 elif result_type == "conductor_result":
@@ -1368,24 +1654,54 @@ def _stream_chat_response(
                             if img_url in _emitted_image_urls:
                                 continue
                             _emitted_image_urls.add(img_url)
+                            # CX-14-residual: normal image events carry the exact
+                            # `request` behind the figure (Feature 1); conductor
+                            # figures must not silently lose theirs. Prefer the
+                            # request runner.py stamped on the image dict, else
+                            # the most recent traced call of the tool the dict
+                            # names. When neither exists the event carries NO
+                            # request — never a fabricated one — and the
+                            # turn-level tool_trace persisted with the message
+                            # is the provenance fallback surface.
+                            _cimg_req = img.get("request")
+                            if not isinstance(_cimg_req, dict) or not _cimg_req:
+                                # The stamped id pins the exact producing call —
+                                # name-only matching gave BOTH cards the latest
+                                # call's request when one tool rendered two
+                                # figures. (A1 CX-14 sliver)
+                                _cimg_req = _request_from_trace(
+                                    _tool_trace, str(img.get("tool_name") or ""),
+                                    call_id=img.get("trace_call_id"),
+                                )
+                            # Conductor figures share the "image" counter with the
+                            # single-image path above — they are the same kind of
+                            # card to the reader, and to the rater.
+                            _cimg_block = _blocks.next("image")
                             image_event = json.dumps({
                                 "type": "image", "url": img_url, "caption": caption, "meta": meta,
+                                "request": _cimg_req or None,
+                                "blockId": _cimg_block, "blockKind": "image",
                             })
                             yield f"data: {image_event}\n\n"
-                            _record_rich_image(img_url, caption, meta)
+                            _record_rich_image(img_url, caption, meta, request=_cimg_req,
+                                               block_id=_cimg_block, block_kind="image")
                             await asyncio.sleep(0.05)
                             
                     # Companion notebook
                     nb_data = _run_result.get("notebook_data", {})
                     nb_title = _run_result.get("title", "Research Notebook")
                     if nb_data:
+                        _cnb_block = _blocks.next("notebook")
                         nb_event = json.dumps({
                             "type": "notebook",
                             "title": nb_title,
                             "data": nb_data,
+                            "blockId": _cnb_block, "blockKind": "notebook",
                         })
                         yield f"data: {nb_event}\n\n"
-                        _rich_notebook = {"title": nb_title, "data": nb_data}
+                        _rich_notebook = {"title": nb_title, "data": nb_data,
+                                          "blockId": _cnb_block}
+                        _rich_notebooks.append(_rich_notebook)
                         await asyncio.sleep(0.05)
 
             if response_text and first_token:
@@ -1393,75 +1709,8 @@ def _stream_chat_response(
                 yield f"data: {data}\n\n"
 
             # ── Persist assistant response + rich UI data to DB ─────
-            if current_user_id and conv_id and (
-                response_text or _rich_data_tables or _rich_data_table or
-                _rich_papers or _rich_notebook or _rich_images or _rich_image or
-                _rich_web_sources or _rich_web_images or
-                _rich_thinking or _rich_thinking_text
-            ):
-                try:
-                    rich_meta = {}
-                    if _rich_data_tables:
-                        # Store all data tables for multi-target support
-                        if len(_rich_data_tables) == 1:
-                            rich_meta["dataTable"] = _rich_data_tables[0]
-                        else:
-                            rich_meta["dataTable"] = _rich_data_tables[0]  # primary (backward compat)
-                            rich_meta["dataTables"] = _rich_data_tables    # all tables
-                    elif _rich_data_table:
-                        rich_meta["dataTable"] = _rich_data_table
-                    if _rich_papers:
-                        rich_meta["papers"] = _rich_papers
-                        if _rich_papers_request:
-                            rich_meta["papersRequest"] = _rich_papers_request
-                    if _rich_notebook:
-                        rich_meta["notebook"] = _rich_notebook
-                    if _rich_images:
-                        rich_meta["images"] = _rich_images
-                        rich_meta["image"] = _rich_images[-1]
-                    elif _rich_image:
-                        rich_meta["image"] = _rich_image
-                    if _rich_web_sources:
-                        rich_meta["webSources"] = _rich_web_sources
-                    if _rich_web_images:
-                        rich_meta["webImages"] = _rich_web_images
-                    if _rich_web_provider:
-                        rich_meta["webProvider"] = _rich_web_provider
-                    if _rich_web_image_provider:
-                        rich_meta["webImageProvider"] = _rich_web_image_provider
-                    if _rich_web_search_type:
-                        rich_meta["webSearchType"] = _rich_web_search_type
-                    if _rich_web_query:
-                        rich_meta["webQuery"] = _rich_web_query
-                    if _rich_thinking:
-                        rich_meta["thinkingSteps"] = _rich_thinking
-                    if _rich_thinking_text:
-                        rich_meta["thinking"] = _rich_thinking_text
-                    # Raw request provenance (Feature 1). Without this the exact
-                    # queries are dropped on history replay. Persist a REDACTED,
-                    # reload-safe projection — never the raw arguments/output,
-                    # which can carry credential-bearing URLs into the DB (CX-01).
-                    if _tool_trace:
-                        from core.provenance import persistable_trace
-                        _persist_trace = persistable_trace(_tool_trace)
-                        if _persist_trace:
-                            rich_meta["toolTrace"] = _persist_trace
-                    rich_meta["runMeta"] = {
-                        "run_id": run_id,
-                        "trace_id": trace_id,
-                        "model": requested_model,
-                        "provider": provider,
-                        "conversation_id": conv_id or request.conversation_id or "",
-                    }
-                    if run_status == "failed":
-                        rich_meta["runMeta"]["status"] = "failed"
-                        rich_meta["runMeta"]["errorCode"] = run_error_code
-                    conversation_service.save_message(
-                        conv_id, "assistant", response_text or "",
-                        metadata=rich_meta if rich_meta else None,
-                    )
-                except Exception as e:
-                    logger.warning(f"[CHAT] Failed to persist assistant message: {e}")
+            # (UIAPI-07: shared with the timeout path — see _persist_assistant_turn.)
+            _persist_assistant_turn()
 
             # ── Log chat analytics ─────────────────────────────────
             try:
@@ -1531,12 +1780,24 @@ def _stream_chat_response(
                 except Exception as _tt_err:
                     logger.warning(f"[CHAT] Failed to emit tool_trace event: {_tt_err}")
 
+            # R3: mechanical citation recall/precision for this turn — consumed
+            # by eval mode and DataLabBench (informational; never affects
+            # question scoring).
+            if _citation_metrics:
+                try:
+                    yield f"data: {json.dumps({'type': 'citation_metrics', 'metrics': _citation_metrics, 'run_id': run_id})}\n\n"
+                except Exception as _cm_err:
+                    logger.warning(f"[CHAT] Failed to emit citation_metrics event: {_cm_err}")
+
             _usage_line = usage_sse_line()
             if _usage_line:
                 yield _usage_line
 
             if run_status == "started":
                 run_status = "completed"
+            _final_meta = _terminal_run_meta_line()
+            if _final_meta:
+                yield _final_meta
             yield "data: [DONE]\n\n"
 
         except asyncio.CancelledError:
@@ -1551,6 +1812,15 @@ def _stream_chat_response(
                     requested_model,
                     run_id,
                 )
+            except Exception:
+                pass
+            # UIAPI-07: a mid-turn page close must not erase what already
+            # streamed — persist the accumulated tokens + eager cards with
+            # runMeta.status="cancelled". Best-effort: cancellation can land
+            # before the accumulators (or the helper) even exist, in which
+            # case there is nothing to save.
+            try:
+                _persist_assistant_turn()
             except Exception:
                 pass
             raise
@@ -1575,6 +1845,14 @@ def _stream_chat_response(
             yield f"data: {error_data}\n\n"
             yield "data: [DONE]\n\n"
         finally:
+            # UIAPI-08 leak guard: if the executor cancelled _run_agent before
+            # it ever started (saturated pool), its finally-block cleanup never
+            # ran and the registered queue would sit in the module-level dict
+            # forever. Identity-compare so a successor run's queue is untouched.
+            if "_pfq" in locals():
+                with _plan_feedback_lock:
+                    if _plan_feedback_queues.get(_pfq_key[0]) is _pfq:
+                        _plan_feedback_queues.pop(_pfq_key[0], None)
             finalize_run_record()
             if lf_trace:
                 try:

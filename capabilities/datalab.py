@@ -78,8 +78,18 @@ def _query_summary(sql: str) -> str:
 fit_rows = _fit_rows
 
 
-def datalab_error(error: Exception) -> ToolResult:
-    """Map an exception to a typed-error ToolResult (never fabricates data)."""
+def datalab_error(
+    error: Exception,
+    *,
+    sql: Optional[str] = None,
+    tool_name: Optional[str] = None,
+) -> ToolResult:
+    """Map an exception to a typed-error ToolResult (never fabricates data).
+
+    When the failure happened AFTER a query was attempted, pass ``sql`` so the
+    provenance surface still shows the exact request that failed (CX-09) —
+    a failed call is precisely when the user most wants to see the query.
+    """
     payload: Dict[str, Any] = {"success": False, "error": str(error)}
     fix_hint = None
     if isinstance(error, datalab_sql_policy.DatalabPolicyError):
@@ -105,7 +115,11 @@ def datalab_error(error: Exception) -> ToolResult:
             )
     if fix_hint is not None:
         payload["fix_hint"] = fix_hint
+    provenance = None
+    if sql:
+        provenance = Provenance(service="datalab", query=sql, tool_name=tool_name)
     return ToolResult(success=False, error=str(error), native=payload,
+                      provenance=provenance,
                       meta=({"fix_hint": fix_hint} if fix_hint else {}))
 
 
@@ -126,6 +140,10 @@ def execute_datalab_sql(
     server-side Data Lab job when a login token is configured, else a local
     threaded run (the anonymous token gets HTTP 401 from the server job API).
     Poll with datalab_job_status / fetch with datalab_job_results."""
+    # The EXECUTED text is validated.sql (the policy may add LIMITs/rewrites);
+    # keep it for the error path so failures report the query that actually ran,
+    # not the pre-validation input (CX-09-residual).
+    executed_sql = sql
     try:
         # Fetch client/store INSIDE the try so a missing/None client or store is
         # mapped through datalab_error (matching the legacy in-try acquisition),
@@ -148,6 +166,7 @@ def execute_datalab_sql(
         # column names on: non-blocking (daemon thread), throttled, never raises.
         datalab_registry.ensure_tap_schema_fresh(client)
         validated = datalab_sql_policy.validate(sql, source=source, meta=meta)
+        executed_sql = validated.sql  # CX-09-residual
         if async_submit:
             # Must return BEFORE client.query: with async_=True the client
             # returns a plain jobid string, not a DatalabResult.
@@ -166,6 +185,15 @@ def execute_datalab_sql(
             "tool_name": tool_name,
             "validated_sql": validated.sql,
             "warnings": validated.warnings,
+            # Scope the stored result to its requesting user so the export
+            # route's owner guard is not vacuously skipped
+            # (dl-export-owner-gap / UIAPI-05).
+            **({"owner_id": str(ctx.user_id)} if ctx.user_id else {}),
+            # A LIMIT-capped SELECT stored here is itself a slice of the
+            # matching rows — ride the F2 upstream channel so any card built
+            # from this result can never read as complete. The remote total is
+            # unknown (service-side cap), so no upstream_total. (scan-L5)
+            **({"upstream_truncated": True} if trunc_warning else {}),
             "provenance": {
                 **result.provenance,
                 "query": validated.sql,
@@ -240,13 +268,15 @@ def execute_datalab_sql(
                 ctx.service("datalab_job_service").register_external(
                     str(fallback_jobid),
                     kind="server_query",
-                    params={"tool_name": tool_name, "sql": sql, "policy_source": source},
+                    params={"tool_name": tool_name, "sql": executed_sql, "policy_source": source},
                     status="running",
                     **_job_owner_kwargs(ctx),
                 )
             except Exception:  # noqa: BLE001 - registration is best-effort
                 pass
-        return datalab_error(e)
+        # executed_sql is validated.sql once validation succeeded — the text
+        # that actually ran (CX-09-residual); before that point it is the input.
+        return datalab_error(e, sql=executed_sql, tool_name=tool_name)
 
 
 def _job_owner_kwargs(ctx: CallContext) -> Dict[str, str]:
@@ -275,6 +305,15 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
         "policy_source": source,
         "catalog": validated.meta.get("catalog"),
         "table": validated.meta.get("table"),
+        # Builder healpix {column, nside, scheme} must survive into the job
+        # record so JobResults can re-attach it when persisting server-job rows
+        # — without it sky_density_map decodes RING pixels as NESTED with a
+        # guessed nside (dl-async-healpix-scheme-lost).
+        **(
+            {"healpix": validated.meta["healpix"]}
+            if isinstance(validated.meta, dict) and validated.meta.get("healpix")
+            else {}
+        ),
     }
     poll_note = (
         "Poll ONCE with datalab_job_status(job_id) if the user is waiting, then end the "
@@ -297,30 +336,64 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
             "warnings": validated.warnings,
             "note": "Query submitted as a server-side Data Lab job (survives restarts). " + poll_note,
         }
-        return ToolResult(success=True, warnings=list(validated.warnings or []), native=native)
+        return ToolResult(
+            success=True,
+            warnings=list(validated.warnings or []),
+            # The submitted SQL is this call's exact request (CX-09) — surface
+            # it even though the rows arrive later via the job tools.
+            provenance=Provenance(service="datalab", query=validated.sql, tool_name=tool_name),
+            native=native,
+        )
 
     # Anonymous token → local threaded runner. Capture plain locals (the client
     # and store are long-lived singletons), never ctx — the closure runs on the
     # job service worker after this request's CallContext is gone.
     sql_text = validated.sql
     store = ctx.result_store
+    owner_id = str(ctx.user_id) if ctx.user_id else None
+    healpix_meta = (
+        validated.meta.get("healpix") if isinstance(validated.meta, dict) else None
+    )
+    row_limit = validated.meta.get("row_limit") if isinstance(validated.meta, dict) else None
     store_meta = {
         **validated.meta,
         "tool_name": tool_name,
         "validated_sql": sql_text,
         "warnings": validated.warnings,
+        **({"owner_id": owner_id} if owner_id else {}),  # dl-export-owner-gap
     }
 
     def _job(cancel_check):
         result = client.query(sql=sql_text, fmt="pandas", async_fallback=False)
+        # Mirror the sync path's provenance stamps: healpix {column,nside,scheme}
+        # (dl-async-healpix-scheme-lost) and the row-cap truncation flag so a
+        # capped async result can never be plotted as complete.
+        trunc_warning = datalab_sql_policy.limit_truncation_warning(
+            len(result.dataframe), row_limit
+        )
+        job_meta = dict(store_meta)
+        if trunc_warning:
+            job_meta["warnings"] = list(job_meta.get("warnings") or []) + [trunc_warning]
         result_id = store.put(result.dataframe, {
-            **store_meta,
-            "provenance": {**result.provenance, "query": sql_text, "tool_name": tool_name, "policy_source": source},
+            **job_meta,
+            "provenance": {
+                **result.provenance,
+                "query": sql_text,
+                "tool_name": tool_name,
+                "policy_source": source,
+                **({"healpix": healpix_meta} if healpix_meta else {}),
+                **(
+                    {"row_limit": int(row_limit), "limit_truncated": True}
+                    if trunc_warning
+                    else {}
+                ),
+            },
         })
         return {
             "result_id": result_id,
             "rowcount": int(len(result.dataframe)),
             "columns": [str(col) for col in result.dataframe.columns][:30],
+            **({"warnings": [trunc_warning]} if trunc_warning else {}),
             "note": "Fetch rows with datalab_get_result(result_id).",
         }
 
@@ -342,7 +415,12 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
             "(server-side jobs need a Data Lab login). " + poll_note
         ),
     }
-    return ToolResult(success=True, warnings=list(validated.warnings or []), native=native)
+    return ToolResult(
+        success=True,
+        warnings=list(validated.warnings or []),
+        provenance=Provenance(service="datalab", query=validated.sql, tool_name=tool_name),
+        native=native,
+    )
 
 
 # Server job states → the local job-status vocabulary the model already knows.
@@ -755,6 +833,7 @@ class DensityAggregate(BaseCapability):
                     max_seconds=_budget_override,
                     client=ctx.service("datalab_client"),
                     result_store=ctx.result_store,
+                    owner_id=(str(ctx.user_id) if ctx.user_id else None),  # dl-export-owner-gap
                 )
                 return ToolResult(
                     success=bool(isinstance(tiled, dict) and tiled.get("success")),
@@ -1145,14 +1224,24 @@ class SiaSearch(BaseCapability):
                     if str(row.get("obs_bandpass") or "").strip().lower().startswith(want)
                 ]
             limit = max(1, min(int(inp.limit or 100), 1000))
+            upstream_total = len(rows)
             if len(rows) > limit:
                 warnings.append(f"SIA returned {len(rows)} rows; keeping the first {limit}.")
                 rows = rows[:limit]
             frame = pd.DataFrame(rows)
+            # The stored frame is itself a truncated slice of the remote result
+            # — record that STRUCTURALLY, not just as a warning string, so no
+            # card downstream can offer it as a complete dataset (f2-CX-21).
+            _upstream_flags = (
+                {"upstream_truncated": True, "upstream_total": upstream_total}
+                if upstream_total > len(rows) else {}
+            )
             result_id = store.put(frame, {
                 "tool_name": self.name,
+                **({"owner_id": str(ctx.user_id)} if ctx.user_id else {}),  # dl-export-owner-gap (f2-CX-01)
                 "provenance": result.get("provenance") or {},
                 "warnings": warnings,
+                **_upstream_flags,
             })
             display_cols = [c for c in _SIA_DISPLAY_COLUMNS if c in frame.columns]
             preview_rows, preview_more = _fit_rows(
@@ -1170,6 +1259,7 @@ class SiaSearch(BaseCapability):
                 "preview": preview_rows,
                 "preview_truncated": preview_more,
                 "warnings": warnings,
+                **_upstream_flags,  # (f2-CX-21)
                 "note": (
                     "Inventory preview only (access URLs are in the stored rows); fetch up to "
                     "5000 rows with datalab_get_result(result_id), then render a chosen band/"
@@ -1265,6 +1355,7 @@ class ColorColorDiagram(BaseCapability):
                 title=inp.title or f"{inp.catalog} color-color: {label}",
                 point_sources=bool(inp.point_sources), morphology=inp.morphology,
                 value_cuts=inp.value_cuts, x_expr=inp.x_expr, y_expr=inp.y_expr,
+                owner_id=(str(ctx.user_id) if ctx.user_id else None),  # dl-export-owner-gap
             )
             if isinstance(out, dict):
                 out["_caption"] = inp.title or f"Color-color diagram: {label}"
@@ -1290,6 +1381,11 @@ class ColorMagnitudeDiagramInput(_In):
     value_cuts: Optional[List[Dict[str, Any]]] = None
     x_expr: Optional[str] = None
     y_expr: Optional[str] = None
+    # WD-locus overlay + side-of-line counts (B3). Previously this field did
+    # not exist, so extra="ignore" silently SWALLOWED the argument the agent
+    # prompt rule steers models to pass — no locus drawn, no n_wd_candidates
+    # to quote (found live 2026-07-18).
+    overlay_locus: Optional[str] = None
 
 
 class ColorMagnitudeDiagram(BaseCapability):
@@ -1318,6 +1414,8 @@ class ColorMagnitudeDiagram(BaseCapability):
                 title=inp.title or f"{inp.catalog} CMD: {label}",
                 point_sources=bool(inp.point_sources), morphology=inp.morphology,
                 value_cuts=inp.value_cuts, x_expr=inp.x_expr, y_expr=inp.y_expr,
+                overlay_locus=inp.overlay_locus,
+                owner_id=(str(ctx.user_id) if ctx.user_id else None),  # dl-export-owner-gap
             )
             if isinstance(out, dict):
                 out["_caption"] = inp.title or f"Color-magnitude diagram: {label}"
@@ -1361,8 +1459,16 @@ class JobStatus(BaseCapability):
                     except KeyError:
                         # A fallback job the local service never saw (pre-fix
                         # runs, other workers). Server jobids are unguessable
-                        # tokens; fall through to the live server status.
-                        pass
+                        # tokens; fall through to the live server status, and
+                        # re-register the id for this owner so the Jobs panel
+                        # and the update_external sync below work after a
+                        # restart (dl-server-job-registry-restart-orphan).
+                        try:
+                            ctx.service("datalab_job_service").ensure_external(
+                                job_id, **_job_owner_kwargs(ctx)
+                            )
+                        except Exception:  # noqa: BLE001 - re-registration is best-effort
+                            pass
                 client = _require_server_job_client(ctx)
                 state = str(client.status(job_id)).strip().upper()
                 out = {
@@ -1438,10 +1544,28 @@ class JobResults(BaseCapability):
                     error=(None if ok else str(record.get("error") or "Data Lab job failed")),
                     native=native,
                 )
-            if ctx.user_id:
-                ctx.service("datalab_job_service").status(
+            # Read the local record for its params (catalog/table/query/healpix)
+            # and as the ownership pre-check. A KeyError here must NOT fail the
+            # fetch: after a backend restart the in-memory registry is empty
+            # while the job still exists server-side — the exact fall-through
+            # JobStatus already has (CAP-02); re-register the id for this owner
+            # instead (dl-server-job-registry-restart-orphan).
+            record_params: Dict[str, Any] = {}
+            try:
+                record = ctx.service("datalab_job_service").status(
                     job_id, **_job_owner_kwargs(ctx)
                 )
+                record_params = dict(record.get("params") or {})
+            except KeyError:
+                if ctx.user_id:
+                    try:
+                        ctx.service("datalab_job_service").ensure_external(
+                            job_id, **_job_owner_kwargs(ctx)
+                        )
+                    except Exception:  # noqa: BLE001 - re-registration is best-effort
+                        pass
+            except Exception:  # noqa: BLE001 - params enrichment is best-effort
+                record_params = {}
             client = _require_server_job_client(ctx)
             store = ctx.result_store
             if store is None:
@@ -1449,9 +1573,21 @@ class JobResults(BaseCapability):
                     "Data Lab result store is unavailable; cannot persist the job rows."
                 )
             result = client.results(job_id)
+            # Re-attach what the submit-time record knew: catalog/table/query
+            # (client.results() pre-fills them with None) and the builder's
+            # healpix {column, nside, scheme} so sky_density_map decodes async
+            # aggregates with the right scheme (dl-async-healpix-scheme-lost).
+            record_prov = {
+                key: record_params[key]
+                for key in ("catalog", "table", "healpix")
+                if record_params.get(key) is not None
+            }
+            if record_params.get("sql"):
+                record_prov["query"] = record_params["sql"]
             result_id = store.put(result.dataframe, {
                 "tool_name": self.name,
-                "provenance": {**result.provenance, "jobid": job_id},
+                **({"owner_id": str(ctx.user_id)} if ctx.user_id else {}),  # dl-export-owner-gap
+                "provenance": {**result.provenance, **record_prov, "jobid": job_id},
             })
             rows, truncated = _fit_rows(result.dataframe, 10, char_budget=4000)
             native = {
@@ -1499,9 +1635,21 @@ class JobCancel(BaseCapability):
                 }
                 return ToolResult(success=True, native=native)
             if ctx.user_id:
-                ctx.service("datalab_job_service").status(
-                    job_id, **_job_owner_kwargs(ctx)
-                )
+                try:
+                    ctx.service("datalab_job_service").status(
+                        job_id, **_job_owner_kwargs(ctx)
+                    )
+                except KeyError:
+                    # Same fall-through as JobStatus (CAP-02): a restart wipes
+                    # the in-memory registry while the server job lives on;
+                    # server jobids are unguessable tokens. Re-register for
+                    # this owner so the panel reflects the cancel.
+                    try:
+                        ctx.service("datalab_job_service").ensure_external(
+                            job_id, **_job_owner_kwargs(ctx)
+                        )
+                    except Exception:  # noqa: BLE001 - re-registration is best-effort
+                        pass
             client = _require_server_job_client(ctx)
             client.abort(job_id)
             native = {"success": True, "job_id": job_id, "kind": "server_query", "status": "canceled"}
@@ -1549,10 +1697,13 @@ class XmatchUserList(BaseCapability):
                 raise RuntimeError("Data Lab result store is unavailable; cannot persist the match table.")
             if bool(inp.objects) == bool(str(inp.result_id or "").strip()):
                 raise ValueError("Provide exactly one of objects (list of {ra,dec,...}) or result_id.")
+            source_provenance: Dict[str, Any] = {}
             if inp.objects:
                 frame = cds_xmatch.objects_to_dataframe(inp.objects)
             else:
-                frame = store.get(str(inp.result_id).strip()).dataframe
+                source_result = store.get(str(inp.result_id).strip())
+                frame = source_result.dataframe
+                source_provenance = dict(source_result.provenance or {})
             out = cds_xmatch.xmatch_dataframe(
                 frame,
                 catalog=inp.catalog,
@@ -1562,8 +1713,27 @@ class XmatchUserList(BaseCapability):
                 selection=inp.selection,
             )
             matches = out.pop("dataframe")
+            # A LIMIT-truncated source is a spatially biased, storage-order
+            # slice — the derived match table inherits that bias, so the
+            # truncation stamp must survive into the NEW result's provenance
+            # or downstream plots lose the TRUNCATED SAMPLE caption
+            # (dl-xmatch-truncation-provenance-drop).
+            source_truncated = bool(source_provenance.get("limit_truncated"))
+            trunc_carryover = (
+                {
+                    "limit_truncated": True,
+                    **(
+                        {"row_limit": source_provenance["row_limit"]}
+                        if source_provenance.get("row_limit") is not None
+                        else {}
+                    ),
+                }
+                if source_truncated
+                else {}
+            )
             result_id = store.put(matches, {
                 "tool_name": self.name,
+                **({"owner_id": str(ctx.user_id)} if ctx.user_id else {}),  # dl-export-owner-gap
                 "provenance": {
                     "service": "cds_xmatch",
                     "endpoint": out["endpoint"],
@@ -1572,6 +1742,8 @@ class XmatchUserList(BaseCapability):
                     "selection": out["selection"],
                     "uploaded_rows": out["uploaded_rows"],
                     **({"source_result_id": str(inp.result_id).strip()} if inp.result_id else {}),
+                    **({"source_provenance": source_provenance} if source_provenance else {}),
+                    **trunc_carryover,
                 },
             })
             rows, truncated = _fit_rows(matches, 10, char_budget=4000)
@@ -1581,6 +1753,17 @@ class XmatchUserList(BaseCapability):
                 "matched_rows": out["matched_rows"],
                 "uploaded_rows": out["uploaded_rows"],
                 "upload_truncated": out["upload_truncated"],
+                **(
+                    {
+                        "warnings": [
+                            "The SOURCE result was LIMIT-truncated (a storage-order, "
+                            "spatially biased slice) — this match table inherits that "
+                            "bias; do not present it as the full selection."
+                        ]
+                    }
+                    if source_truncated
+                    else {}
+                ),
                 "catalog": out["cat2"],
                 "radius_arcsec": out["radius_arcsec"],
                 "selection": out["selection"],
@@ -1684,6 +1867,7 @@ class LoadMyTable(BaseCapability):
             result = store.load_my_table(inp.name, **_store_user_kwargs(ctx))
             result_id = store.put(result.dataframe, {
                 "tool_name": self.name,
+                **({"owner_id": str(ctx.user_id)} if ctx.user_id else {}),  # dl-export-owner-gap
                 "provenance": dict(result.provenance),
             })
             rows, truncated = _fit_rows(result.dataframe, 10, char_budget=4000)
@@ -1770,6 +1954,7 @@ class DensityVetting(BaseCapability):
                 client=ctx.service("datalab_client"),
                 result_store=ctx.result_store,
                 image_service=ctx.service("datalab_image_service"),
+                owner_id=(str(ctx.user_id) if ctx.user_id else None),  # dl-export-owner-gap
             )
             out["target"] = label
             # The cutout grid must reach the UI as an image card (2026-07-04 live
@@ -1855,6 +2040,7 @@ class TiledSearch(BaseCapability):
             tile_radius_deg, step_deg = inp.tile_radius_deg, inp.step_deg
             color_cut, value_cuts, morphology = inp.color_cut, inp.value_cuts, inp.morphology
             peak_threshold, max_tiles, candidate_budget = inp.peak_threshold, inp.max_tiles, inp.candidate_budget
+            scan_owner = str(ctx.user_id) if ctx.user_id else None  # dl-export-owner-gap
 
             def _job(cancel_check):
                 return datalab_orchestration.tiled_sky_scan(
@@ -1862,6 +2048,7 @@ class TiledSearch(BaseCapability):
                     color_cut=color_cut, value_cuts=value_cuts, morphology=morphology,
                     peak_threshold=float(peak_threshold), max_tiles=int(max_tiles),
                     candidate_budget=int(candidate_budget), confirm=True, cancel_check=cancel_check,
+                    owner_id=scan_owner,
                 )
 
             job_id = ctx.service("datalab_job_service").start(

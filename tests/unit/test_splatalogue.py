@@ -2,7 +2,7 @@ from astropy.table import Table
 import pytest
 
 from services.cube_workbench import CubeWorkbenchService
-from services.splatalogue import SplatalogueTool
+from services.splatalogue import SplatalogueClient, SplatalogueTool
 
 
 def _astroquery_table():
@@ -156,6 +156,40 @@ def test_slap_fallback_applies_molecule_and_physical_filters(monkeypatch):
     assert result["lines"][0]["frequency_ghz"] == pytest.approx(230.538)
     assert "Astroquery request failed" in result["note"]
     assert result["details"] == ["astroquery: primary unavailable"]
+
+
+def test_internal_slap_fallback_is_labeled_slap_not_astroquery(monkeypatch):
+    # slap-fallback-masquerades-as-advanced: when both Advanced endpoints are
+    # down, SplatalogueClient.query must NOT silently hand raw SLAP rows to
+    # _query_astroquery — the outer search_spectral_lines SLAP path must run so
+    # results are filtered and labeled backend='slap', degraded=True.
+    def advanced_down(self, *args, **kwargs):
+        raise RuntimeError("advanced unavailable")
+
+    monkeypatch.setattr(SplatalogueClient, "_query_threaded", advanced_down)
+    monkeypatch.setattr(SplatalogueClient, "_query_non_threaded", advanced_down)
+    monkeypatch.setattr(
+        SplatalogueTool,
+        "_query_slap",
+        staticmethod(lambda *args, **kwargs: _slap_table()),
+    )
+
+    # version='vall' passes _slap_unsupported_filters, so before the fix the
+    # client's INTERNAL fallback would have succeeded and been mislabeled.
+    result = SplatalogueTool().search_spectral_lines(
+        230.53,
+        230.55,
+        molecule_name="CO",
+        version="vall",
+        exclude=[],
+    )
+
+    assert result["backend"] == "slap"
+    assert result["degraded"] is True
+    assert result["n_matches"] == 1  # CO filter applied via _filter_slap_results
+    assert result["lines"][0]["species"] == "CO"
+    assert "Astroquery request failed" in result["note"]
+    assert any("fallback" in warning.lower() for warning in result["warnings"])
 
 
 def test_search_by_molecule_delegates_advanced_filters(monkeypatch):

@@ -223,8 +223,10 @@ def register_tools(agent: "QuasarAgent") -> None:
             "Run deterministic ALMA Science Archive query templates for hard archive-science questions. "
             "Use this instead of raw ADQL for: Cycle N project counts, Sun/solar projects, projects using "
             "12m+7m+total-power arrays, high-resolution Band N continuum candidates for a target, projects "
-            "covering a required molecular line set such as 12CO/13CO/C18O in the same project, and "
-            "bandwidth-switching calibration diagnostics."
+            "covering a required molecular line set such as 12CO/13CO/C18O in the same project, "
+            "bandwidth-switching calibration diagnostics, archival data sensitive enough to reach a given "
+            "rms (sensitivity_search with sensitivity_mjy), and publication joins (data_publications: "
+            "publications that used a project/MOUS, or the archived data behind an ADS bibcode)."
         ),
         function=agent._alma_tool_fn("query_alma_science_archive"),
         parameters={
@@ -239,6 +241,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                         "line_set_projects",
                         "redshifted_line_projects",
                         "bandwidth_switching_candidates",
+                        "sensitivity_search",
+                        "data_publications",
                     ],
                     "description": "Specific ALMA science/archive query template to run."
                 },
@@ -264,6 +268,9 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "require_same_project": {"type": "boolean", "description": "Require requested line matches in the same proposal_id. Default true."},
                 "include_adql": {"type": "boolean", "description": "Include executed ADQL in provenance. Default true."},
                 "max_results": {"type": "integer", "description": "Maximum TAP rows to fetch before grouping. Default 5000."},
+                "sensitivity_mjy": {"type": "number", "description": "sensitivity_search: required rms in mJy/beam — returns archival data at least this sensitive (achieved rms <= this)."},
+                "continuum": {"type": "boolean", "description": "sensitivity_search: use continuum sensitivity (cont_sensitivity_bandwidth) instead of line sensitivity per 10 km/s. Default false."},
+                "identifier": {"type": "string", "description": "data_publications: ALMA project code (2019.1.00123.S), MOUS uid://..., or an ADS bibcode for the reverse paper→data lookup."},
             },
             "required": ["query_type"]
         },
@@ -2108,6 +2115,8 @@ def register_tools(agent: "QuasarAgent") -> None:
             "Find NASA ADS papers explicitly connected to a specific archive identifier. "
             "Use this instead of generic search_papers when the user provides an ALMA project/proposal code "
             "(e.g. 2019.1.00123.S), MOUS/member_ous_uid (uid://...), ASDM UID, or archive dataset ID. "
+            "Also works in REVERSE: pass an ADS bibcode (e.g. 2018ApJ...869L..41A) to find the archived "
+            "ALMA data that paper used (via the ObsCore bib_reference join). "
             "The lookup uses exact identifier searches and returns provenance metadata for the graph."
         ),
         function=agent._papers_tool_fn(
@@ -2117,7 +2126,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         parameters={
             "type": "object",
             "properties": {
-                "identifier": {"type": "string", "description": "Project/proposal code, MOUS UID, ASDM UID, or archive dataset identifier."},
+                "identifier": {"type": "string", "description": "Project/proposal code, MOUS UID, ASDM UID, archive dataset identifier, or an ADS bibcode (reverse paper→data lookup)."},
                 "facility": {"type": "string", "description": "Facility/bibgroup hint, default ALMA."},
                 "max_results": {"type": "integer", "description": "Number of results to return (default 20, max 50)"},
             },

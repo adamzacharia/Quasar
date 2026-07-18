@@ -50,12 +50,18 @@ this module lazily inside ``_papers_tool_fn``).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 from capabilities.base import BaseCapability, Provenance, ToolResult
 from core.prompts.lit_to_code import LIT_TO_CODE_PROMPT
+from services.alma_science_queries import (
+    publication_join_where,
+    select_obscore_query_extended,
+    summarize_publication_links,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +249,8 @@ class SearchPapersByObservationId(BaseCapability):
         "Find NASA ADS papers explicitly connected to a specific archive identifier. "
         "Use this instead of generic search_papers when the user provides an ALMA project/proposal code "
         "(e.g. 2019.1.00123.S), MOUS/member_ous_uid (uid://...), ASDM UID, or archive dataset ID. "
+        "Also works in REVERSE: pass an ADS bibcode (e.g. 2018ApJ...869L..41A) to find the archived "
+        "ALMA data that paper used (via the ObsCore bib_reference join). "
         "The lookup uses exact identifier searches and returns provenance metadata for the graph."
     )
     category = "literature"
@@ -320,6 +328,31 @@ class SearchPapersByObservationId(BaseCapability):
             except Exception as _enrich_err:
                 _log(f"[OpenAlex] Enrichment failed (non-fatal): {_enrich_err}")
 
+            # ── R2 reverse direction: bibcode → archived ALMA data ────────
+            # Best-effort ObsCore bib_reference join; failures never break
+            # the ADS paper search this tool has always performed.
+            archival_data = None
+            archive_query = None
+            try:
+                clean_id = str(identifier or "").strip()
+                if ads_client.classify_observation_identifier(clean_id) == "bibcode":
+                    search_service = ctx.services.get("search_service")
+                    alminer_client = getattr(search_service, "alminer_client", None)
+                    if alminer_client is not None:
+                        where, _kind = publication_join_where(clean_id)
+                        archive_query = select_obscore_query_extended(
+                            where,
+                            extra_columns=("bib_reference", "pub_title",
+                                           "publication_year", "first_author"),
+                            top=2000,
+                        )
+                        df = alminer_client.search_by_sql(archive_query)
+                        if df is not None and hasattr(df, "empty") and not df.empty:
+                            summary = summarize_publication_links(df)
+                            archival_data = summary.head(50).to_dict("records")
+            except Exception as _rev_err:
+                _log(f"[ALMA bib_reference] Reverse data lookup failed (non-fatal): {_rev_err}")
+
             set_last_run_result({
                 "type": "papers",
                 "papers": papers_list,
@@ -332,7 +365,7 @@ class SearchPapersByObservationId(BaseCapability):
                     "facility": facility,
                 },
             })
-            return _native({
+            out = {
                 "success": True,
                 "count": len(papers_list),
                 "identifier": identifier,
@@ -341,7 +374,15 @@ class SearchPapersByObservationId(BaseCapability):
                 "ads_query": ads_query,
                 "papers": papers_list,
                 "top_title": papers_list[0]["title"] if papers_list else "No results",
-            }, ads_query=ads_query)
+            }
+            if archival_data is not None:
+                out["archival_data"] = archival_data
+                out["archival_data_note"] = (
+                    "ALMA observations whose ObsCore bib_reference lists this bibcode "
+                    "(the archived data this paper used)."
+                )
+                out["archive_query"] = archive_query
+            return _native(out, ads_query=ads_query)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 
@@ -585,6 +626,27 @@ IMPORTANT RULES:
             return _native({"success": False, "error": str(e)})
 
 
+# CAP-05: a real ADS bibcode is EXACTLY 19 characters, starts with a 4-digit
+# year, and always contains dots (e.g. 2019ApJ...883..170M), so the legacy gate
+# `'.' not in id or len(id) > 20` never matched one — every bibcode was sent
+# straight to arxiv.org/pdf/<bibcode>.pdf and 404'd. Detect bibcodes
+# positively, and keep a fast path for new-style (1812.04040) and old-style
+# (astro-ph/9901001) arXiv ids that must never hit ADS resolution.
+_ARXIV_NEW_STYLE_RE = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$")
+_ARXIV_OLD_STYLE_RE = re.compile(r"^[a-z\-]+(\.[A-Za-z]{2})?/\d{7}(v\d+)?$", re.IGNORECASE)
+_ADS_BIBCODE_RE = re.compile(r"^\d{4}[A-Za-z]")
+
+
+def _needs_ads_resolution(identifier: str) -> bool:
+    """True when ``identifier`` should be resolved to an arXiv id via ADS (CAP-05)."""
+    if _ARXIV_NEW_STYLE_RE.match(identifier) or _ARXIV_OLD_STYLE_RE.match(identifier):
+        return False
+    if len(identifier) == 19 and _ADS_BIBCODE_RE.match(identifier):
+        return True  # canonical ADS bibcode
+    # Legacy heuristic retained for anything else (dotless ids, long DOIs, ...).
+    return "." not in identifier or len(identifier) > 20
+
+
 class ExtractPaperDetailsInput(_In):
     identifier: Optional[str]
     query: Optional[str]
@@ -607,7 +669,7 @@ class ExtractPaperDetails(BaseCapability):
         try:
             ads_client = ctx.services.get("ads_client")
             arxiv_id = identifier.strip()
-            if '.' not in arxiv_id or len(arxiv_id) > 20:
+            if _needs_ads_resolution(arxiv_id):  # CAP-05: bibcodes now match
                 if ads_client:
                     try:
                         details = ads_client.get_paper_details(arxiv_id)
@@ -655,7 +717,7 @@ class ReproducePaperMethods(BaseCapability):
             # Try arXiv first (most common for astro papers)
             arxiv_id = identifier.strip()
             # If it looks like a bibcode, try to get the arXiv ID from ADS
-            if '.' not in arxiv_id or len(arxiv_id) > 20:
+            if _needs_ads_resolution(arxiv_id):  # CAP-05: bibcodes now match
                 # Likely an ADS bibcode — try to resolve via ADS
                 if ads_client:
                     try:

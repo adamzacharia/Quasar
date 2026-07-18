@@ -11,6 +11,9 @@ type BlinkCardProps = {
     caption?: string;
     /** Static summary image (e.g. the epoch panel) shown under the player. */
     summaryUrl?: string;
+    /** Registration/coverage caveats from the epoch service (CX-18): an
+     *  unregistered frame with no on-card note reads as a real transient. */
+    warnings?: string[];
 };
 
 const RATES = [
@@ -25,7 +28,7 @@ const RATES = [
  * moved or brightened — the canonical human transient-vetting move that a
  * static side-by-side panel defeats.
  */
-export function BlinkCard({ frames, caption, summaryUrl }: BlinkCardProps) {
+export function BlinkCard({ frames, caption, summaryUrl, warnings }: BlinkCardProps) {
     const [index, setIndex] = useState(0);
     const [playing, setPlaying] = useState(false);
     const [rateIdx, setRateIdx] = useState(1);
@@ -174,6 +177,13 @@ export function BlinkCard({ frames, caption, summaryUrl }: BlinkCardProps) {
                     </div>
                 </div>
             </div>
+            {warnings && warnings.length > 0 && (
+                <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200">
+                    {warnings.map((w, i) => (
+                        <div key={i}>⚠ {w}</div>
+                    ))}
+                </div>
+            )}
             {summaryUrl && (
                 <details className="mt-2">
                     <summary className="cursor-pointer text-[11px] font-medium text-slate-400 hover:text-slate-200">

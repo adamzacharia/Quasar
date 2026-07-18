@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 
 from api.deps import (
     _workbench_user_id,
@@ -126,10 +127,15 @@ async def start_spectral_line_job(
     """Start a catalog, exact ALMA coverage, or line-confusion job."""
     _ensure_spectral_line_explorer_enabled()
     try:
-        return spectral_line_job_service.create_job(
-            user_id=_workbench_user_id(current_user),
-            operation=req.operation,
-            payload=req.payload or {},
+        # sle-jobs-block-event-loop: create_job scans every cached job (full
+        # DiskCache deserialization) for the per-user limit — keep it off the
+        # event loop like resolve-target (guard CX-10).
+        return await run_in_threadpool(
+            lambda: spectral_line_job_service.create_job(
+                user_id=_workbench_user_id(current_user),
+                operation=req.operation,
+                payload=req.payload or {},
+            )
         )
     except Exception as exc:
         _raise_spectral_line_error(exc)
@@ -146,12 +152,17 @@ async def get_spectral_line_job(
     """Return job status, context, warnings, and one stable result page."""
     _ensure_spectral_line_explorer_enabled()
     try:
-        return spectral_line_job_service.get_job(
-            user_id=_workbench_user_id(current_user),
-            job_id=job_id,
-            page=page,
-            page_size=page_size,
-            dataset=dataset,
+        # sle-jobs-block-event-loop: every poll deserializes the full cached
+        # result (up to 50k rows) — run it in the threadpool so one big job
+        # cannot stall every other request on the event loop.
+        return await run_in_threadpool(
+            lambda: spectral_line_job_service.get_job(
+                user_id=_workbench_user_id(current_user),
+                job_id=job_id,
+                page=page,
+                page_size=page_size,
+                dataset=dataset,
+            )
         )
     except Exception as exc:
         _raise_spectral_line_error(exc)
@@ -165,9 +176,13 @@ async def cancel_spectral_line_job(
     """Cancel queued/running spectral-line work and stop future query segments."""
     _ensure_spectral_line_explorer_enabled()
     try:
-        return spectral_line_job_service.cancel_job(
-            user_id=_workbench_user_id(current_user),
-            job_id=job_id,
+        # sle-jobs-block-event-loop: cancel does a locked cache read-modify-
+        # write of the (possibly large) job record — keep it off the loop.
+        return await run_in_threadpool(
+            lambda: spectral_line_job_service.cancel_job(
+                user_id=_workbench_user_id(current_user),
+                job_id=job_id,
+            )
         )
     except Exception as exc:
         _raise_spectral_line_error(exc)
@@ -183,11 +198,15 @@ async def export_spectral_line_job(
     """Export the complete job dataset rather than only the current page."""
     _ensure_spectral_line_explorer_enabled()
     try:
-        filename, media_type, content = spectral_line_job_service.export(
-            user_id=_workbench_user_id(current_user),
-            job_id=job_id,
-            dataset=dataset,
-            format_name=format,
+        # sle-jobs-block-event-loop: export serializes the full dataset (up to
+        # 50k rows of CSV/JSON) — build it in the threadpool.
+        filename, media_type, content = await run_in_threadpool(
+            lambda: spectral_line_job_service.export(
+                user_id=_workbench_user_id(current_user),
+                job_id=job_id,
+                dataset=dataset,
+                format_name=format,
+            )
         )
         return Response(
             content=content,

@@ -33,6 +33,7 @@ METADATA SCHEMA (per chunk in alma_general):
     is_personal    (bool) — Whether this is a personal document
 """
 
+import logging
 import os
 import re
 import uuid
@@ -55,6 +56,8 @@ from services.vector_db import (
     ensure_collection,
 )
 from qdrant_client.models import PayloadSchemaType
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -335,6 +338,57 @@ def _build_recency_rank(
     }
 
 
+def _build_citation_rank(candidates: List[Document]) -> Dict[int, int]:
+    """Rank candidates by doc_citations (OpenAlex cited_by_count), missing last.
+
+    R4 (Pathfinder-style citation weighting): mirrors _build_recency_rank —
+    rank 0 is the most-cited distinct count; chunks without a citation count
+    rank after every chunk that has one.
+    """
+    counts_by_index: Dict[int, int] = {}
+    for idx, doc in enumerate(candidates):
+        raw = (doc.metadata or {}).get("doc_citations")
+        try:
+            if raw is not None and str(raw).strip() != "":
+                counts_by_index[idx] = max(0, int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not counts_by_index:
+        return {idx: 0 for idx in range(len(candidates))}
+
+    unique_counts = sorted(set(counts_by_index.values()), reverse=True)
+    ranks_by_count = {count: rank for rank, count in enumerate(unique_counts)}
+    missing_rank = len(unique_counts)
+    return {
+        idx: ranks_by_count.get(counts_by_index.get(idx), missing_rank)
+        for idx in range(len(candidates))
+    }
+
+
+# Query-conditional weighting (Pathfinder's approach): boost the recency or
+# citation tiebreaker only when the query itself signals that intent. The
+# boost stays inside the bounded tiebreak budget, so relevance always wins.
+_RECENCY_INTENT_RE = re.compile(
+    r"\b(recent|latest|newest|new(est)?\s+results?|current|up[- ]to[- ]date|"
+    r"this\s+year|last\s+year|202[4-9]|203\d)\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_INTENT_RE = re.compile(
+    r"\b(seminal|foundational|landmark|classic|influential|important|"
+    r"highly[- ]cited|most[- ]cited|best[- ]known|canonical)\b",
+    re.IGNORECASE,
+)
+_INTENT_BOOST = 3.0
+
+
+def _ranking_intent_multipliers(query: str) -> Tuple[float, float]:
+    """Return (recency_multiplier, citation_multiplier) for a query."""
+    text = query or ""
+    recency_mult = _INTENT_BOOST if _RECENCY_INTENT_RE.search(text) else 1.0
+    citation_mult = _INTENT_BOOST if _AUTHORITY_INTENT_RE.search(text) else 1.0
+    return recency_mult, citation_mult
+
+
 # ──────────────────────────────────────────────────────────────────
 # Metadata extraction helpers
 # ──────────────────────────────────────────────────────────────────
@@ -430,6 +484,19 @@ def _extract_year_from_content(pages_text: List[str], max_pages: int = 5) -> Opt
     return None
 
 
+_DOI_RE = re.compile(r'\b(10\.\d{4,9}/[^\s"<>\)\]]+)', re.IGNORECASE)
+
+
+def _extract_doi_from_content(pages_text: List[str], max_pages: int = 3) -> Optional[str]:
+    """Scan the first pages for a DOI (R4: enables citation-count enrichment)."""
+    for page_text in pages_text[:max_pages]:
+        match = _DOI_RE.search(page_text or "")
+        if match:
+            # Strip common trailing punctuation picked up by the greedy tail.
+            return match.group(1).rstrip(".,;")
+    return None
+
+
 def _detect_alma_cycle(pages_text: List[str], max_pages: int = 10) -> Optional[str]:
     """Detect the ALMA Cycle referenced in the document."""
     for page_text in pages_text[:max_pages]:
@@ -506,6 +573,9 @@ def extract_document_metadata(file_path: str, pages_text: Optional[List[str]] = 
     except Exception:
         file_size_kb = 0
 
+    # DOI (R4): enables best-effort OpenAlex citation enrichment at ingest.
+    doc_doi = _extract_doi_from_content(pages_text) if pages_text else None
+
     return {
         "doc_year": year,
         "doc_month": month,
@@ -513,6 +583,7 @@ def extract_document_metadata(file_path: str, pages_text: Optional[List[str]] = 
         "doc_category": category,
         "doc_title": title,
         "alma_cycle": alma_cycle or "",
+        "doc_doi": doc_doi or "",
         "file_size_kb": file_size_kb,
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -697,6 +768,17 @@ class RAGService:
             doc_meta = extract_document_metadata(file_path, pages_text, original_filename=original_filename)
             total_pages = len(documents)
             doc_meta["total_pages"] = total_pages
+
+            # R4: best-effort OpenAlex citation-count enrichment (needs a DOI).
+            # Non-fatal by design — ingest must never fail on a metadata lookup.
+            if doc_meta.get("doc_doi") and os.getenv("QUASAR_RAG_CITATION_ENRICH", "1") != "0":
+                try:
+                    from integrations.openalex_client import OpenAlexClient
+                    enrichment = OpenAlexClient().enrich_by_doi(doc_meta["doc_doi"])
+                    if enrichment and enrichment.get("cited_by_count") is not None:
+                        doc_meta["doc_citations"] = int(enrichment["cited_by_count"])
+                except Exception as _cite_err:
+                    logger.debug("OpenAlex citation enrichment skipped: %s", _cite_err)
 
             # Step 3: Split into chunks
             if progress_callback:
@@ -1025,9 +1107,10 @@ class RAGService:
         rrf_k: int = 60,
         *,
         recency_weight: float = 0.1,
+        citation_weight: float = 0.1,
         current_year: Optional[int] = None,
     ) -> List[Document]:
-        """Rerank candidates using Reciprocal Rank Fusion (semantic + BM25 + recency).
+        """Rerank candidates using Reciprocal Rank Fusion (semantic + BM25 + recency + citations).
 
         Combines semantic similarity rank (from Qdrant) with BM25 keyword
         relevance rank. Uses RRF: score = Σ (weight / (rrf_k + rank)).
@@ -1040,8 +1123,16 @@ class RAGService:
             bm25_weight:     Weight for the BM25 (keyword) signal.
             rrf_k:           RRF smoothing constant (standard is 60).
             recency_weight:  Small supplemental weight for doc_year recency.
+            citation_weight: Small supplemental weight for doc_citations
+                             (OpenAlex cited_by_count; R4 Pathfinder-style).
             current_year:    Optional current ALMA doc year; defaults to the
                              maximum candidate doc_year.
+
+        Both supplemental weights are query-conditional: recency-intent
+        queries ("latest", "recent") boost the recency side and
+        authority-intent queries ("seminal", "highly cited") the citation
+        side, but the combined bonus stays strictly inside the smallest gap
+        between distinct relevance scores — relevance always wins.
 
         Returns:
             Top-k documents sorted by combined RRF score.
@@ -1082,14 +1173,16 @@ class RAGService:
             bm25_rank = _rank_scores(bm25_scores, reverse=True, tolerance=1e-12)
 
         recency_rank = _build_recency_rank(candidates, current_year=current_year)
+        citation_rank = _build_citation_rank(candidates)
 
-        # Relevance = semantic + BM25 RRF. Recency is deliberately NOT a free
-        # additive RRF term: as one, a newer-but-less-relevant chunk could
-        # outscore a stronger semantic match (recency's range can exceed the gap
-        # between adjacent relevance ranks). Instead, bound the recency bonus to
-        # be strictly smaller than the smallest gap between *distinct* relevance
-        # scores, so recency can only reorder candidates whose relevance is
-        # (near-)identical — never override a real relevance difference.
+        # Relevance = semantic + BM25 RRF. Recency/citations are deliberately
+        # NOT free additive RRF terms: as one, a newer-but-less-relevant chunk
+        # could outscore a stronger semantic match (their range can exceed the
+        # gap between adjacent relevance ranks). Instead, bound the combined
+        # bonus to be strictly smaller than the smallest gap between *distinct*
+        # relevance scores, so these signals can only reorder candidates whose
+        # relevance is (near-)identical — never override a real relevance
+        # difference.
         relevance = [
             semantic_weight / (rrf_k + semantic_rank[i])
             + bm25_weight / (rrf_k + bm25_rank[i])
@@ -1100,20 +1193,42 @@ class RAGService:
             (hi - lo for lo, hi in zip(distinct_relevance, distinct_relevance[1:])),
             default=0.0,
         )
-        # recency_weight is the fraction of the minimum relevance gap the recency
-        # tiebreaker may use (default 0.1). When all relevance scores are equal
-        # (min_gap == 0) there are no groups to cross, so a tiny absolute span is
-        # enough to order ties.
-        recency_span = (min_gap * recency_weight) if min_gap > 0 else 1e-6
+        # The weights are fractions of the minimum relevance gap the tiebreaker
+        # may use (default 0.1 each). Query intent can boost one side, and the
+        # combined budget is capped below the gap so the invariant holds at any
+        # weight. When all relevance scores are equal (min_gap == 0) there are
+        # no groups to cross, so a tiny absolute span is enough to order ties.
+        recency_mult, citation_mult = _ranking_intent_multipliers(query)
+        rec_w = max(0.0, recency_weight) * recency_mult
+        cit_w = max(0.0, citation_weight) * citation_mult
+        # A flat rank list carries no signal (all chunks share one rank —
+        # e.g. no chunk has a citation count): drop that side entirely so it
+        # neither eats the tiebreak budget nor adds a constant offset.
+        if len(set(recency_rank.values())) <= 1:
+            rec_w = 0.0
+        if len(set(citation_rank.values())) <= 1:
+            cit_w = 0.0
+        total_w = rec_w + cit_w
+        # The bonus budget is the weight-sum fraction of the gap (capped below
+        # it), normalized over the active weights — with recency alone at the
+        # 0.1 default this reduces exactly to the previous recency-only span.
+        budget = (min(0.9, total_w) * min_gap) if min_gap > 0 else 1e-6
         max_recency_rank = max(recency_rank.values(), default=0) or 1
+        max_citation_rank = max(citation_rank.values(), default=0) or 1
 
         rrf_scores = []
         for i in range(len(candidates)):
-            # newer (recency_rank 0) → full recency_span; oldest → ~0.
-            recency_bonus = recency_span * (1 - recency_rank[i] / max_recency_rank)
-            rrf_scores.append((i, relevance[i] + recency_bonus))
+            # newest / most-cited (rank 0) → full factor; oldest/least → ~0.
+            recency_factor = 1 - recency_rank[i] / max_recency_rank
+            citation_factor = 1 - citation_rank[i] / max_citation_rank
+            if total_w > 0:
+                bonus = budget * (rec_w * recency_factor + cit_w * citation_factor) / total_w
+            else:
+                bonus = 0.0
+            rrf_scores.append((i, relevance[i] + bonus))
 
-        # Sort by combined score (relevance dominates; recency only breaks ties).
+        # Sort by combined score (relevance dominates; the supplemental
+        # signals only break relevance ties).
         rrf_scores.sort(key=lambda x: x[1], reverse=True)
 
         # Return top-k with combined score

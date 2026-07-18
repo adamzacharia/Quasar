@@ -69,6 +69,17 @@ class LLMRequestContext:
     # reserved tokens would hold the user's own headroom until the TTL.
     quota_releaser: Optional[Callable[..., None]] = None
     byok_token_limits: Dict[str, Optional[int]] = field(default_factory=dict)
+    # Conductor tool-trace collector (CX-11/CX-39): {"calls": [], "lock": Lock,
+    # "owner": <request thread ident>}. Rides the REQUEST-scoped context object
+    # (propagated to conductor/executor threads via reinstall) instead of a
+    # singleton agent attribute, so concurrent conductor turns can never
+    # overwrite or cross-append each other's collectors.
+    tool_trace_collector: Optional[Dict[str, Any]] = None
+    # R3: mechanical citation recall/precision computed at synthesis
+    # finalization (services/citation_metrics.py). Rides the request-scoped
+    # context so both the simple-path (runner) and Conductor threads write to
+    # the same per-request slot; the SSE layer surfaces it in run_meta.
+    citation_metrics: Optional[Dict[str, Any]] = None
 
 
 @contextmanager
@@ -110,6 +121,33 @@ def llm_request_context(
 def get_llm_request_context() -> Optional[LLMRequestContext]:
     """Return current request-local LLM context, if any."""
     return getattr(_request_tls, "context", None)
+
+
+@contextmanager
+def reinstall_llm_request_context(ctx: Optional[LLMRequestContext]):
+    """Re-install a captured request context on a DIFFERENT thread (A2 CX-01).
+
+    The context lives in a threading.local, so worker threads spawned by the
+    runner/conductor never inherit it — LLM calls made there used to skip both
+    usage recording and quota admission. Capture ``get_llm_request_context()``
+    on the request thread, hand the object to the worker, and run the worker's
+    body inside this. No-op when ``ctx`` is None.
+    """
+    if ctx is None:
+        yield
+        return
+    previous = getattr(_request_tls, "context", None)
+    _request_tls.context = ctx
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_request_tls, "context")
+            except AttributeError:
+                pass
+        else:
+            _request_tls.context = previous
 
 def set_langfuse_parent(parent):
     """Set the current thread's Langfuse trace/span parent for LLM calls."""

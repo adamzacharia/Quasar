@@ -51,6 +51,51 @@ _EXPR_GRAMMAR_NOTE = (
 _ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)
 _ALLOWED_UNARYOPS = (ast.USub, ast.UAdd)
 
+# Largest constant exponent a ** may carry. Anything bigger is either a typo or
+# a bigint DoS: '9**9**9**9' / 'gmag + 10**10**10' would make compile-time
+# constant folding (or eval) build an astronomically large exact integer,
+# pinning the worker for minutes (dl-expr-pow-bigint-dos / expr-const-pow-dos).
+_MAX_CONST_POW_EXP = 64.0
+
+
+def _const_numeric(node: ast.AST) -> Optional[float]:
+    """Float value of a constant-only subtree, or None when it references
+    columns/functions. All arithmetic is FLOAT so pathological constants
+    overflow to inf instead of hanging on exact-bigint math."""
+    if (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    ):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, _ALLOWED_UNARYOPS):
+        value = _const_numeric(node.operand)
+        if value is None:
+            return None
+        return -value if isinstance(node.op, ast.USub) else value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINOPS):
+        left = _const_numeric(node.left)
+        right = _const_numeric(node.right)
+        if left is None or right is None:
+            return None
+        try:
+            if isinstance(node.op, ast.Pow):
+                if abs(right) > _MAX_CONST_POW_EXP:
+                    return math.inf
+                return left ** right
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            return math.fmod(left, right)
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return math.inf
+    return None
+
 
 def _clean_label(text: Any) -> str:
     """Sanitize a model-supplied display string (plot title/axis label).
@@ -934,6 +979,21 @@ def _validate_expr_node(node: ast.AST, expr: str) -> None:
     if isinstance(node, ast.Expression):
         _validate_expr_node(node.body, expr)
     elif isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINOPS):
+        if isinstance(node.op, ast.Pow):
+            # dl-expr-pow-bigint-dos: bound constant exponents AND the folded
+            # value of a fully-constant power chain — this must run BEFORE
+            # compile(), whose AST optimizer folds int constants exactly and
+            # would hang on e.g. 9**9**9**9 or ((9**64)**64)**64.
+            exponent = _const_numeric(node.right)
+            folded = _const_numeric(node)
+            if (exponent is not None and abs(exponent) > _MAX_CONST_POW_EXP) or (
+                folded is not None and not math.isfinite(folded)
+            ):
+                raise ValueError(
+                    f"Unsafe or unsupported expression: {expr!r}. Constant exponents "
+                    f"are limited to |exp| <= {int(_MAX_CONST_POW_EXP)} and constant "
+                    "power chains must stay finite."
+                )
         _validate_expr_node(node.left, expr)
         _validate_expr_node(node.right, expr)
     elif isinstance(node, ast.UnaryOp) and isinstance(node.op, _ALLOWED_UNARYOPS):

@@ -11,6 +11,7 @@ Registered agent tools:
 
 import os
 import io
+import uuid
 import base64
 import json
 from typing import Optional, List, Dict, Any
@@ -53,6 +54,15 @@ WONG_PALETTE = [
 PLOT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "ui-pro", "public", "plots")
 
 
+def _plot_filename(prefix: str) -> str:
+    """Timestamped + uuid-suffixed plot basename (IMG-12): second-resolution
+    timestamps collide when two plots land in the same wall-clock second and
+    silently overwrite each other's PNG/PDF — suffix with a uuid fragment the
+    way hips_images / fits_service already do."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}"
+
+
 class PlottingService:
     """Generate publication-quality astronomical figures."""
 
@@ -63,11 +73,16 @@ class PlottingService:
         """Apply publication or dark-mode style."""
         import matplotlib
         matplotlib.use("Agg")  # non-interactive backend
+        import matplotlib as mpl
         import matplotlib.pyplot as plt
+        # IMG-10: dark_background mutates global rcParams and PUB_RCPARAMS only
+        # overrides facecolors, so one dark-mode plot leaked white text/ticks
+        # into every later publication plot process-wide. Reset to defaults
+        # before applying either style so nothing persists across requests.
+        mpl.rcdefaults()
         if dark:
             plt.style.use("dark_background")
         else:
-            import matplotlib as mpl
             mpl.rcParams.update(PUB_RCPARAMS)
         return plt
 
@@ -148,8 +163,7 @@ class PlottingService:
             ax.grid(True)
             fig.tight_layout()
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            return self._save_and_encode(fig, f"alma_scatter_{ts}")
+            return self._save_and_encode(fig, _plot_filename("alma_scatter"))  # IMG-12
 
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -226,8 +240,7 @@ class PlottingService:
             ax.grid(True)
             fig.tight_layout()
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            return self._save_and_encode(fig, f"sky_map_{ts}")
+            return self._save_and_encode(fig, _plot_filename("sky_map"))  # IMG-12
 
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -279,8 +292,7 @@ class PlottingService:
             ax.grid(True)
             fig.tight_layout()
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            return self._save_and_encode(fig, f"spectrum_{ts}")
+            return self._save_and_encode(fig, _plot_filename("spectrum"))  # IMG-12
 
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -319,8 +331,7 @@ class PlottingService:
             ax.grid(axis="y", alpha=0.4)
             fig.tight_layout()
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            return self._save_and_encode(fig, f"histogram_{ts}")
+            return self._save_and_encode(fig, _plot_filename("histogram"))  # IMG-12
 
         except Exception as e:
             return {"success": False, "error": str(e)}

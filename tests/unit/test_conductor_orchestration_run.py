@@ -252,3 +252,23 @@ def test_orchestrate_returns_answer_and_run_tuple():
     assert summary["completed"] == 1
     assert not hasattr(conductor, "dag")
     assert not hasattr(conductor, "workflow_memory")
+
+
+def test_parse_plan_json_is_tolerant_of_provider_output_shapes():
+    """L4 (live 2026-07-18): gpt-oss/TACC does not honor json_object — the
+    plan can arrive fenced, prose-wrapped, or empty (reasoning ate the token
+    budget). Raw json.loads killed EVERY Conductor activation; the tolerant
+    parser must recover the object or return {} without raising."""
+    from core.conductor import Conductor
+
+    parse = Conductor._parse_plan_json
+    plan = '{"subtasks": [{"id": "t1"}], "reasoning": "r"}'
+
+    assert parse(plan)["subtasks"] == [{"id": "t1"}]
+    assert parse(f"```json\n{plan}\n```")["subtasks"] == [{"id": "t1"}]
+    assert parse(f"```\n{plan}\n```")["subtasks"] == [{"id": "t1"}]
+    assert parse(f"Here is the decomposition:\n{plan}\nDone.")["subtasks"] == [{"id": "t1"}]
+    assert parse("") == {}
+    assert parse(None) == {}
+    assert parse("The model rambled with no JSON at all.") == {}
+    assert parse('["a", "list", "not", "object"]') == {}

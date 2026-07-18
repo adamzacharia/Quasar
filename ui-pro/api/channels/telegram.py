@@ -29,8 +29,13 @@ class TelegramUpdate(BaseModel):
 
 
 def _get_agent():
-    """Lazy import to avoid circular imports."""
-    from ui_pro.api.main import get_agent  # type: ignore
+    """Lazy import to avoid circular imports.
+
+    get_agent lives in api.deps since the main.py monolith split (UIAPI-01);
+    the old path (a `ui_pro` package name that never existed on disk, plus
+    api.main which no longer exports it) crashed every inbound message.
+    """
+    from api.deps import get_agent  # type: ignore
     return get_agent()
 
 
@@ -99,14 +104,21 @@ async def telegram_webhook(request: Request):
         return Response(content="ok", status_code=200)
 
     loop = asyncio.get_event_loop()
-    response_text = await loop.run_in_executor(
-        _executor,
-        lambda: agent.stream_response_api(
-            query=user_text,
-            message_placeholder=None,
-            user_id=user_id
-        )
-    )
+
+    def _run_with_context():
+        # Install a request context (CX-41): without one, conductor sub-agent
+        # tool traces have no collector and per-call accounting hooks are
+        # absent for bot-channel turns.
+        from core.llm_client import llm_request_context
+
+        with llm_request_context(user_id=user_id):
+            return agent.stream_response_api(
+                query=user_text,
+                message_placeholder=None,
+                user_id=user_id,
+            )
+
+    response_text = await loop.run_in_executor(_executor, _run_with_context)
 
     # Telegram has a 4096 char limit per message — split if needed
     max_len = 4000

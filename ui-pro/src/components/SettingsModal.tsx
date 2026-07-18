@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, BarChart3, Download, Sparkles, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
+import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, BarChart3, Download, Sparkles, Star, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
 import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { resetOnboarding } from "./OnboardingOverlay";
 import { useThemeStore } from "../lib/theme-store";
+import { useChatStore } from "../lib/store";
+import { EVAL_MODE_ENABLED } from "../lib/use-eval-mode";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -400,13 +402,13 @@ function MCPServersPanel() {
             <div className="flex border-b border-slate-700/50 px-4 pt-2 shrink-0">
                 <button 
                     onClick={() => setActiveTab("installed")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 \${activeTab === "installed" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
+                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 ${activeTab === "installed" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
                 >
                     Connected ({servers.length})
                 </button>
                 <button 
                     onClick={() => setActiveTab("add")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 flex flex-row items-center gap-1.5 \${activeTab === "add" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
+                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 flex flex-row items-center gap-1.5 ${activeTab === "add" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
                 >
                     <Plus className="w-4 h-4" /> Add Server
                 </button>
@@ -467,7 +469,7 @@ function MCPServersPanel() {
                 {activeTab === "add" && (
                     <div className="space-y-4 max-w-2xl">
                         {formMsg && (
-                            <div className={`flex items-center gap-2.5 px-4 py-3 rounded-xl text-sm \${formMsg.type === "success" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"}`}>
+                            <div className={`flex items-center gap-2.5 px-4 py-3 rounded-xl text-sm ${formMsg.type === "success" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"}`}>
                                 {formMsg.type === "success" ? <CheckCircle className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
                                 {formMsg.text}
                             </div>
@@ -931,6 +933,9 @@ function IssueReportsPanel() {
         date_to: "",
     });
     const [notes, setNotes] = useState<Record<string, string>>({});
+    // UI-07: a failed status change / note save must be visible, not an
+    // unhandled promise rejection with zero feedback.
+    const [updateError, setUpdateError] = useState<string | null>(null);
 
     const loadReports = useCallback(async () => {
         setLoading(true);
@@ -956,13 +961,26 @@ function IssueReportsPanel() {
     }, [loadReports]);
 
     const updateReport = async (report: AdminIssueReport, status = report.status) => {
-        const response = await fetch(`${API_BASE}/api/admin/issue-reports/${report.id}`, { credentials: "include",
-            method: "PATCH",
-            headers: authBearerHeaders({ "Content-Type": "application/json" }),
-            body: JSON.stringify({ status, admin_notes: notes[report.id] || "" }),
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        await loadReports();
+        // UI-07: the callers (status <select> onChange, Save button) never
+        // caught this promise — a cold-start 401/500 silently dropped the
+        // triage change while the controlled select kept showing the new
+        // value. Surface the failure and reload so the select snaps back to
+        // the stored status.
+        try {
+            const response = await fetch(`${API_BASE}/api/admin/issue-reports/${report.id}`, { credentials: "include",
+                method: "PATCH",
+                headers: authBearerHeaders({ "Content-Type": "application/json" }),
+                body: JSON.stringify({ status, admin_notes: notes[report.id] || "" }),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            setUpdateError(null);
+            await loadReports();
+        } catch (e: unknown) {
+            setUpdateError(
+                `Could not save report ${report.id.slice(0, 8)}: ${e instanceof Error ? e.message : String(e)}`
+            );
+            loadReports().catch(() => undefined);
+        }
     };
 
     const exportReports = async (format: "csv" | "json") => {
@@ -1019,6 +1037,13 @@ function IssueReportsPanel() {
                 <input type="date" value={filters.date_from} onChange={(event) => setFilter("date_from", event.target.value)} className="glass-control rounded-lg px-2 py-2 text-xs" />
                 <input type="date" value={filters.date_to} onChange={(event) => setFilter("date_to", event.target.value)} className="glass-control rounded-lg px-2 py-2 text-xs" />
             </div>
+            {/* UI-07: save-failure banner (same idiom as the Add Server formMsg). */}
+            {updateError && (
+                <div className="flex items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                    {updateError}
+                </div>
+            )}
             {loading ? (
                 <div className="flex items-center gap-2 py-4 text-xs text-slate-500"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading reports...</div>
             ) : reports.length === 0 ? (
@@ -1239,6 +1264,35 @@ function ThemeSwitch() {
     );
 }
 
+// ── Eval Mode Toggle (Feature 4) ──────────────────────────────────────────
+
+/* Labeling workflow, not a product feature: rendered only for admins, and only
+   when NEXT_PUBLIC_ENABLE_EVAL_MODE is set (default off in prod, on locally).
+   When on, every rateable block of the last turn must be starred before the
+   next prompt can be sent — that gate is what keeps the exported label set
+   free of holes. The flag itself lives in use-eval-mode.ts, which is also what
+   BlockRating and the gate consult, so this toggle cannot drift from them. */
+
+function EvalModeSwitch() {
+    const evalMode = useChatStore((s) => s.evalMode);
+    const setEvalMode = useChatStore((s) => s.setEvalMode);
+    return (
+        <button
+            onClick={() => setEvalMode(!evalMode)}
+            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+            title="Rate every block of a turn before sending the next prompt"
+        >
+            <div className="flex items-center gap-2.5">
+                <Star className="w-4 h-4" />
+                <span>Eval Mode</span>
+            </div>
+            <div className={`relative w-9 h-5 rounded-full transition-colors ${evalMode ? "bg-primary/40" : "bg-slate-600"}`}>
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full shadow-sm transition-all duration-200 ${evalMode ? "left-[18px] bg-primary" : "left-0.5 bg-slate-300"}`} />
+            </div>
+        </button>
+    );
+}
+
 // ── Main Settings Modal ───────────────────────────────────────────────────
 
 interface SettingsModalProps {
@@ -1286,7 +1340,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     <div className="space-y-1">
                         <button 
                             onClick={() => setCurrentTab('personalization')}
-                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors \${currentTab === 'personalization' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
+                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${currentTab === 'personalization' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
                         >
                             <FileText className="w-4 h-4" />
                             Personalization
@@ -1302,7 +1356,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                         
                         <button
                             onClick={() => setCurrentTab('mcp')}
-                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors \${currentTab === 'mcp' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
+                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${currentTab === 'mcp' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
                         >
                             <span className="text-lg leading-none">🔌</span>
                             MCP Servers
@@ -1323,6 +1377,9 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     <div className="mt-auto pt-4 border-t border-slate-700/50 mt-6 space-y-2">
                         {/* Theme toggle */}
                         <ThemeSwitch />
+
+                        {/* Eval mode — admins only, and only where the flag is on */}
+                        {isAdmin && EVAL_MODE_ENABLED && <EvalModeSwitch />}
 
                         {/* Restart Tutorial */}
                         <button

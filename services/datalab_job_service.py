@@ -100,6 +100,27 @@ class DatalabJobService:
             }
         return self.status(job_id, owner_id=owner_id)
 
+    def ensure_external(
+        self,
+        job_id: str,
+        *,
+        kind: str = "server_query",
+        params: Optional[Dict[str, Any]] = None,
+        status: str = "running",
+        owner_id: Optional[str] = None,
+    ) -> bool:
+        """Re-register a server-side job the in-memory registry lost (restart,
+        other worker) — ONLY when the id is truly absent, so an id that exists
+        under another owner is never clobbered/re-owned. Returns True when a
+        record was created (dl-server-job-registry-restart-orphan / CAP-02)."""
+        with self._lock:
+            if str(job_id) in self._jobs:
+                return False
+        self.register_external(
+            job_id, kind=kind, params=params, status=status, owner_id=owner_id
+        )
+        return True
+
     def update_external(
         self,
         job_id: str,
