@@ -76,7 +76,7 @@ def _load_fits_image(fits_path: str) -> Tuple[np.ndarray, Any, Any, Optional[str
     from astropy.io import fits as afits
     from astropy.wcs import WCS
 
-    with afits.open(fits_path, memmap=True) as hdul:
+    def _extract(hdul):
         data_2d, hdu_idx, slice_info = _pick_science_hdu(hdul, return_slice_info=True)
         header = hdul[hdu_idx].header.copy()
         try:
@@ -86,7 +86,18 @@ def _load_fits_image(fits_path: str) -> Tuple[np.ndarray, Any, Any, Optional[str
         except Exception:
             wcs = None
         data = np.asarray(data_2d, dtype=float)
-    return data, wcs, header, (slice_info["note"] if slice_info else None)
+        return data, wcs, header, (slice_info["note"] if slice_info else None)
+
+    try:
+        with afits.open(fits_path, memmap=True) as hdul:
+            return _extract(hdul)
+    except ValueError as exc:
+        # Legacy BSCALE/BZERO/BLANK integer-scaled data cannot be
+        # memory-mapped (R7 legacy-FITS robustness) — reopen unmapped.
+        if "memmap" not in str(exc) and "memory-mapped" not in str(exc):
+            raise
+        with afits.open(fits_path, memmap=False) as hdul:
+            return _extract(hdul)
 
 
 def _pixel_scale_arcsec(wcs: Any) -> Optional[float]:
@@ -1250,6 +1261,310 @@ def radial_profile(
                 logger.warning(f"[IMG-ANALYSIS] Could not remove temp file still in use: {fits_path}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. HiPS multi-band aperture photometry (R5)
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-survey validation table. Giordano et al. 2025 (A&A 703, A194;
+# arXiv:2510.09533) ran automated aperture photometry on HiPS FITS maps of
+# the 323 HRS galaxies in 10 bands and matched the expert HRS photometry to
+# within a few per cent in 9 of them. Keyed by RESOLVED HiPS ID so a raw ID
+# passed directly (bypassing the aliases) still hits the gate.
+HIPS_PHOTOMETRY_VALIDATION: Dict[str, Dict[str, str]] = {
+    "CDS/P/GALEXGR6/AIS/FUV": {"status": "validated", "band": "GALEX FUV"},
+    "CDS/P/GALEXGR6/AIS/NUV": {"status": "validated", "band": "GALEX NUV"},
+    "CDS/P/SDSS9/g": {"status": "validated", "band": "SDSS g"},
+    "CDS/P/SDSS9/r": {"status": "validated", "band": "SDSS r"},
+    "CDS/P/SDSS9/i": {"status": "validated", "band": "SDSS i"},
+    "ESAVO/P/HERSCHEL/PACS100": {
+        "status": "known_bad", "band": "PACS 100um",
+        "note": ("Giordano et al. 2025 found a SYSTEMATIC flux error "
+                 "(ratio 0.93-3.87x vs HRS) in the PACS 100um HiPS map, from an "
+                 "inconsistent combination of 1.6\" and 3.2\"-pixel data products — "
+                 "do not use this map for photometry."),
+    },
+    "ESAVO/P/HERSCHEL/PACS160": {"status": "validated", "band": "PACS 160um"},
+    "ESAVO/P/HERSCHEL/SPIRE-250": {"status": "validated", "band": "SPIRE 250um"},
+    "ESAVO/P/HERSCHEL/SPIRE-350": {"status": "validated", "band": "SPIRE 350um"},
+    "ESAVO/P/HERSCHEL/SPIRE-500": {"status": "validated", "band": "SPIRE 500um"},
+}
+
+# MANDATORY caveat — attached to every result, never optional (anti-feature
+# guard: HiPS photometry must not ship without its accuracy disclosure).
+HIPS_PHOTOMETRY_CAVEAT = (
+    "HiPS aperture photometry is suitable ONLY for work that does not require "
+    "better than ~10% flux accuracy (Giordano et al. 2025, A&A 703, A194: "
+    "few-per-cent agreement with expert photometry in the 9 validated bands). "
+    "The hips2fits cutout adds a reprojection step the validation did not "
+    "cover, and HiPS metadata may lack unit/PSF/filter details — verify "
+    "against the native survey products before publication-grade use."
+)
+
+_DEFAULT_PHOTOMETRY_BANDS = ("galex_fuv", "galex_nuv", "sdss_g", "sdss_r", "sdss_i")
+
+
+def _photometry_validation_entry(hips_id: str) -> Dict[str, str]:
+    entry = HIPS_PHOTOMETRY_VALIDATION.get(hips_id)
+    if entry:
+        return dict(entry)
+    return {
+        "status": "unvalidated",
+        "band": hips_id,
+        "note": ("Not in the Giordano et al. 2025 validated set — treat the "
+                 "flux as indicative only and validate against native survey "
+                 "products."),
+    }
+
+
+def hips_aperture_photometry(
+    ra: Optional[float] = None,
+    dec: Optional[float] = None,
+    bands: Optional[List[str]] = None,
+    radius_arcsec: Optional[float] = None,
+    fov_deg: Optional[float] = None,
+    width: Optional[int] = None,
+    include_known_bad: bool = False,
+    title: str = "",
+) -> Dict[str, Any]:
+    """Multi-band aperture photometry from HiPS FITS cutouts (R5).
+
+    For each requested band: fetch a hips2fits FITS cutout centered on
+    (ra, dec), place a circular aperture of ``radius_arcsec`` with a local
+    background annulus (1.5-2.25x the radius), and report the
+    background-subtracted aperture sum in the map's NATIVE units (HiPS
+    metadata is not trusted for flux calibration). Every band carries its
+    per-survey validation status; PACS 100um is skipped unless
+    ``include_known_bad`` is set. The ~10%-accuracy caveat is always attached.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.stats import mad_std
+
+    def _phot_error(message: str, **extra: Any) -> Dict[str, Any]:
+        # Guard CX-03: the accuracy caveat is mandatory on EVERY response
+        # shape, error paths included.
+        out: Dict[str, Any] = {"success": False, "error": message,
+                               "accuracy_caveat": HIPS_PHOTOMETRY_CAVEAT}
+        out.update(extra)
+        return out
+
+    temp_paths: List[str] = []
+    try:
+        from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture
+
+        from services.hips_images import HipsImageService, _normalize_fov_width, resolve_survey
+
+        if ra is None or dec is None:
+            return _phot_error("Provide ra and dec (ICRS degrees) for the aperture center.")
+        ra_f, dec_f = float(ra), float(dec)
+        warnings: List[str] = [HIPS_PHOTOMETRY_CAVEAT]
+        band_list = [str(b) for b in (bands or _DEFAULT_PHOTOMETRY_BANDS) if str(b).strip()]
+        if not band_list:
+            return _phot_error("Provide at least one band/survey.")
+        if len(band_list) > 10:
+            # Guard CX-05: never silently drop requested bands.
+            dropped = band_list[10:]
+            band_list = band_list[:10]
+            warnings.append(
+                "Band list capped at 10; dropped: " + ", ".join(dropped)
+            )
+        # Guard CX-05: an explicit radius is validated as given — only an
+        # OMITTED radius gets the 15" default (0 is invalid, not "unset").
+        r_arcsec = 15.0 if radius_arcsec is None else float(radius_arcsec)
+        if not (0.5 <= r_arcsec <= 900.0):
+            return _phot_error("radius_arcsec must be between 0.5 and 900 arcsec.")
+        # FoV large enough to hold the background annulus with margin; clamp
+        # exactly like the fetch layer so provenance records the values that
+        # were actually requested (CX-06).
+        fov_req = float(fov_deg) if fov_deg else max(0.05, (2.25 * r_arcsec / 3600.0) * 4.0)
+        fov, width_i, fw_warnings = _normalize_fov_width(fov_req, width if width else 512)
+        warnings.extend(fw_warnings)
+
+        svc = HipsImageService()
+        measurements: List[Dict[str, Any]] = []
+        panels: List[Dict[str, Any]] = []
+
+        for band in band_list:
+            try:
+                hips_id = resolve_survey(band)
+            except Exception as res_err:
+                measurements.append({"band": band, "status": "error",
+                                     "error": str(res_err)})
+                continue
+            validation = _photometry_validation_entry(hips_id)
+            if validation["status"] == "known_bad" and not include_known_bad:
+                measurements.append({
+                    "band": band, "hips_id": hips_id,
+                    "status": "skipped_known_bad",
+                    "validation": validation,
+                })
+                warnings.append(
+                    f"{band} ({hips_id}) skipped: {validation.get('note', 'known-bad map')} "
+                    "Pass include_known_bad=true to force it (not recommended)."
+                )
+                continue
+
+            entry: Dict[str, Any] = {"band": band, "hips_id": hips_id,
+                                     "validation": validation}
+            try:
+                fits_url = svc.fits_url(ra_f, dec_f, fov_deg=fov, survey=band, width=width_i)
+                fits_path = _download_fits(fits_url, f"hips photometry {band}")
+                temp_paths.append(fits_path)
+                data, wcs, header, cube_note = _load_fits_image(fits_path)
+                if cube_note:
+                    entry["note"] = cube_note
+                finite = data[np.isfinite(data)]
+                if finite.size == 0 or wcs is None:
+                    entry["status"] = "error"
+                    entry["error"] = ("blank cutout (no coverage?)" if wcs is not None
+                                      else "cutout has no celestial WCS")
+                    measurements.append(entry)
+                    continue
+
+                pix_arcsec = _pixel_scale_arcsec(wcs)
+                if not pix_arcsec or pix_arcsec <= 0:
+                    entry["status"] = "error"
+                    entry["error"] = "could not determine the pixel scale"
+                    measurements.append(entry)
+                    continue
+                x0, y0 = _sky_to_pixel(wcs, ra_f, dec_f)
+                r_pix = r_arcsec / pix_arcsec
+                aperture = CircularAperture([(x0, y0)], r=r_pix)
+                annulus = CircularAnnulus([(x0, y0)], r_in=1.5 * r_pix, r_out=2.25 * r_pix)
+                nonfinite_mask = ~np.isfinite(data)
+                bkg_stats = ApertureStats(data, annulus, mask=nonfinite_mask, sigma_clip=None)
+                _ann_median = float(np.atleast_1d(bkg_stats.median)[0])
+                if math.isfinite(_ann_median):
+                    bkg_per_pix = _ann_median
+                    entry["background_source"] = "annulus"
+                else:
+                    # Guard CX-04: an empty/out-of-frame annulus (FoV too
+                    # small) must not silently masquerade as a local
+                    # background — fall back loudly to the global median.
+                    bkg_per_pix = float(np.nanmedian(finite))
+                    entry["background_source"] = "global_median_annulus_empty"
+                    warnings.append(
+                        f"{band}: background annulus had no usable pixels "
+                        "(FoV too small for 2.25x the aperture radius?) — "
+                        "global image median used instead; treat the net sum "
+                        "with caution."
+                    )
+                src_stats = ApertureStats(data, aperture, mask=nonfinite_mask, sigma_clip=None)
+                ap_sum = float(np.nan_to_num(np.atleast_1d(src_stats.sum)[0], nan=0.0))
+                eff_area = float(np.atleast_1d(src_stats.sum_aper_area.value)[0])
+                net = ap_sum - bkg_per_pix * eff_area
+                bunit = _bunit(header)
+                pixel_area = _pixel_area_arcsec2(wcs, pix_arcsec)
+                beam = _beam_info(header, pixel_area)
+
+                entry.update({
+                    "status": "measured",
+                    "bunit": bunit or None,
+                    "pixel_scale_arcsec": _round(pix_arcsec, 4),
+                    "aperture_radius_arcsec": _round(r_arcsec, 2),
+                    "aperture_sum_native": _round(ap_sum),
+                    "background_per_pix": _round(bkg_per_pix),
+                    "net_sum_native": _round(net),
+                    "effective_area_pix": _round(eff_area, 2),
+                    "map_mad_rms": _round(float(mad_std(finite))),
+                    "flux_units_note": (
+                        f"sums are in native map units ({bunit or 'unknown — HiPS header has no BUNIT'})·pix; "
+                        "physical calibration must come from the native survey"
+                    ),
+                })
+                if eff_area < float(aperture.area) - 1e-6:
+                    entry["aperture_clipped"] = True
+                if beam and _is_jy_per_beam(bunit):
+                    entry["net_flux_jy"] = _round(net / beam["beam_area_pix"])
+                measurements.append(entry)
+                panels.append({"band": band, "data": data, "x0": x0, "y0": y0,
+                               "r_pix": r_pix})
+            except Exception as band_err:
+                entry["status"] = "error"
+                entry["error"] = str(band_err)
+                measurements.append(entry)
+
+        measured = [m for m in measurements if m.get("status") == "measured"]
+        if not measured:
+            return _phot_error("No band produced a measurable cutout.",
+                               measurements=measurements, warnings=warnings)
+
+        unvalidated = [m["band"] for m in measured
+                       if m["validation"]["status"] == "unvalidated"]
+        if unvalidated:
+            warnings.append(
+                "Bands outside the Giordano-validated set (indicative only): "
+                + ", ".join(unvalidated)
+            )
+        forced_bad = [m["band"] for m in measured
+                      if m["validation"]["status"] == "known_bad"]
+        if forced_bad:
+            warnings.append(
+                "KNOWN-BAD bands were forced with include_known_bad and must "
+                "not be used scientifically: " + ", ".join(forced_bad)
+            )
+
+        # Panel figure: one cutout per measured band with the aperture drawn.
+        cols = min(3, len(panels)) or 1
+        rows = int(math.ceil(len(panels) / cols)) or 1
+        fig, axes = plt.subplots(rows, cols, figsize=(4.0 * cols, 4.0 * rows),
+                                 facecolor=FIGURE_FACECOLOR, squeeze=False)
+        for idx, panel in enumerate(panels):
+            ax = axes[idx // cols][idx % cols]
+            ax.set_facecolor(FIGURE_FACECOLOR)
+            ax.imshow(panel["data"], origin="lower", cmap="inferno",
+                      norm=_zscale_norm(panel["data"]))
+            ax.add_patch(plt.Circle((panel["x0"], panel["y0"]), panel["r_pix"],
+                                    fill=False, edgecolor="#22d3ee", linewidth=1.4))
+            ax.set_title(panel["band"], color="white", fontsize=10)
+            ax.set_xticks([]); ax.set_yticks([])
+        for idx in range(len(panels), rows * cols):
+            axes[idx // cols][idx % cols].axis("off")
+        full_title = (f"{title} — HiPS aperture photometry" if title
+                      else f"HiPS aperture photometry (r={r_arcsec:g}\")")
+        fig.suptitle(full_title, color="white", fontsize=13)
+        try:
+            image_path = _save_figure(fig, "hipsphot")
+        except Exception:
+            # Guard CX-07: _save_figure closes the figure only on success.
+            plt.close(fig)
+            raise
+
+        return {
+            "success": True,
+            "image_path": image_path,
+            "caption": full_title,
+            "ra": _round(ra_f, 6),
+            "dec": _round(dec_f, 6),
+            "aperture_radius_arcsec": _round(r_arcsec, 2),
+            "annulus_arcsec": [_round(1.5 * r_arcsec, 2), _round(2.25 * r_arcsec, 2)],
+            "n_bands_measured": len(measured),
+            "measurements": measurements,
+            "accuracy_caveat": HIPS_PHOTOMETRY_CAVEAT,
+            "warnings": warnings,
+            "provenance": {
+                "service": "CDS hips2fits",
+                "base_url": svc.base_url,
+                "params": {
+                    "ra": ra_f, "dec": dec_f, "fov": fov, "width": width_i,
+                    "format": "fits",
+                    "hips": ",".join(m.get("hips_id", m["band"]) for m in measurements),
+                },
+            },
+        }
+    except Exception as e:
+        logger.error(f"[IMG-ANALYSIS] hips_aperture_photometry failed: {e}")
+        return _phot_error(str(e))
+    finally:
+        gc.collect()  # release memmap handles before unlink (Windows)
+        for path in temp_paths:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except PermissionError:
+                    logger.warning(f"[IMG-ANALYSIS] Could not remove temp file still in use: {path}")
+
+
 __all__ = [
     "ImageAnalysisError",
     "image_statistics",
@@ -1257,4 +1572,7 @@ __all__ = [
     "measure_region",
     "fit_gaussian_source",
     "radial_profile",
+    "hips_aperture_photometry",
+    "HIPS_PHOTOMETRY_VALIDATION",
+    "HIPS_PHOTOMETRY_CAVEAT",
 ]

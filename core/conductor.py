@@ -229,6 +229,22 @@ Below are all the sub-agent results (each tackled a piece of the question):
     user explicitly asked for advice. They asked for RESULTS.
 11. NEVER write "Current Blockers" — if something blocked, say what error occurred.
 12. If a sub-agent returned an error string, quote that exact error.
+
+## DOMAIN CHECKLIST — verify each point before finalizing (R7; the #2
+## ReplicationBench failure mode is domain-knowledge omissions):
+
+13. UNITS: every quantitative value carries its unit, and units are consistent
+    across combined results. Watch the classic traps: ObsCore em_min/em_max are
+    wavelengths in METERS (not frequency), frequencies are GHz, resolutions
+    arcsec, sensitivities mJy/beam (state per-channel vs aggregated-continuum).
+14. COORDINATE FRAMES: state the frame/epoch (ICRS/J2000 vs galactic) whenever
+    coordinates are given; never mix frames in one table unlabeled.
+15. CONVENTIONS & COSMOLOGY: when a value depends on a convention — velocity
+    (radio vs optical, LSRK vs barycentric), a cosmology (H0/Ωm) for distances
+    or luminosities, magnitude system (AB vs Vega) — name the assumption used.
+16. PLAUSIBILITY: sanity-check combined numbers against astrophysical ranges;
+    an absurd sub-agent value (negative flux, z=90, kpc-scale beam) is a failure
+    to report per rule 4, not a value to propagate.
 """
 
 

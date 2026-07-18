@@ -54,6 +54,15 @@ SURVEY_ALIASES: Dict[str, str] = {
     "wise_w4": "CDS/P/allWISE/W4",
     "galex_nuv": "CDS/P/GALEXGR6/AIS/NUV",
     "galex_fuv": "CDS/P/GALEXGR6/AIS/FUV",
+    # Herschel FIR maps (R5 HiPS photometry; IDs verified against the CDS
+    # MocServer 2026-07-18). PACS100 is on the photometry known-bad list —
+    # see services/image_analysis.py HIPS_PHOTOMETRY_VALIDATION.
+    "pacs70": "ESAVO/P/HERSCHEL/PACS70",
+    "pacs100": "ESAVO/P/HERSCHEL/PACS100",
+    "pacs160": "ESAVO/P/HERSCHEL/PACS160",
+    "spire250": "ESAVO/P/HERSCHEL/SPIRE-250",
+    "spire350": "ESAVO/P/HERSCHEL/SPIRE-350",
+    "spire500": "ESAVO/P/HERSCHEL/SPIRE-500",
 }
 
 # Color HiPS aliases (multi-plane JPEG surfaces). Poor RGB channels because a

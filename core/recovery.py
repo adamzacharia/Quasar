@@ -18,11 +18,64 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import re
 import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# R7 — ReplicationBench failure mode #1: agents prematurely giving up while
+# falsely citing compute/resource limits ("cannot be completed due to
+# computational constraints") instead of attempting the work with the tools
+# they actually have. Matched against textual task results; a hit triggers
+# ONE replan with an explicit budget statement (capped — a false positive
+# must never re-run an expensive DAG more than once).
+_GIVE_UP_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:cannot|can't|can\s+not|unable\s+to)\s+(?:be\s+)?"
+    r"(?:complet|perform|execut|run|do|carr)\w*\s+"
+    r"(?:this|the|such)?\s*\w{0,12}\s*"
+    r"(?:due\s+to|because\s+of|given|owing\s+to)\s+"
+    r"(?:my|the|our|available\s+)?\s*"
+    r"(?:computational|compute|resource|time|memory|processing)"
+    r"|(?:computational|compute|resource|memory|processing)\s+"
+    r"(?:limit|constraint|restriction|budget)s?\s+"
+    r"(?:prevent|preclude|do(?:es)?\s+not\s+allow|don't\s+allow|make\s+it\s+impossible|prohibit)"
+    r"|limited\s+(?:compute|computational\s+\w+|resources|memory|time)\s+prevents?"
+    r"|(?:infeasible|not\s+feasible|impossible)\s+"
+    r"(?:due\s+to|because\s+of|given)\s+"
+    r"(?:my|the|our)?\s*(?:computational|compute|resource|memory|processing)"
+    r"|too\s+computationally\s+(?:expensive|intensive|demanding)"
+    r"|(?:exceeds?|beyond)\s+(?:my|the|available)\s+"
+    r"(?:computational\s+|compute\s+|processing\s+)?(?:capabilit|capacit|resource)\w*"
+    r"|as\s+an\s+ai(?:\s+(?:language\s+)?model)?\s*,?\s+i\s+(?:cannot|can't|am\s+unable)"
+    r"|would\s+(?:require|take|need)\s+(?:excessive|prohibitive|too\s+much)\s+"
+    r"(?:time|compute|computation|memory|resources)"
+    r")"
+)
+
+# Suppressor (guard CX-12): text that ALSO reports successful completion is an
+# explanation, not a refusal — "would require excessive memory, but the query
+# completed successfully" must not trigger a re-run.
+_COMPLETION_RE = re.compile(
+    r"(?i)\b(?:"
+    r"completed\s+successfully|successfully\s+(?:completed|ran|executed|finished)|"
+    r"query\s+(?:completed|succeeded|ran)|"
+    r"results?\s+(?:are|is)\s+(?:below|as\s+follows|shown)|"
+    r"here\s+(?:are|is)\s+the\s+results?"
+    r")\b"
+)
+
+# Appended to the task description on the single give-up replan.
+_BUDGET_STATEMENT = (
+    " [EXECUTION BUDGET NOTE: You have an adequate budget for this task — "
+    "several minutes of wall-clock and the full archive/catalog/analysis "
+    "tool set. Do NOT refuse based on claimed computational or resource "
+    "limits: attempt the task with the available tools. If a specific step "
+    "genuinely fails, report exactly which tool call failed and with what "
+    "error, instead of declaring the task infeasible.]"
+)
 
 
 class RecoveryStrategy(str, Enum):
@@ -45,6 +98,12 @@ class ToolError(Exception):
 
 class SoftFailureError(Exception):
     """Raised when a tool returns a result with embedded error indicators."""
+    pass
+
+
+class PrematureGiveUpError(Exception):
+    """Raised when a textual result declares infeasibility on claimed
+    compute/resource limits (ReplicationBench failure mode #1, R7)."""
     pass
 
 
@@ -133,7 +192,31 @@ class RecoveryEngine:
                 if self._is_empty_result(result):
                     raise EmptyResultError(f"Empty result for: {task_node.description}")
 
+                # R7: premature give-up on claimed compute limits — challenge
+                # it ONCE (attempt 0 only, and only when a retry attempt
+                # actually exists — CX-13: with max_retries=1 the raise would
+                # end as "recovery exhausted" instead of returning the answer).
+                # On the retried attempt any give-up text is accepted as the
+                # honest answer; a false-positive match must never re-run an
+                # expensive task more than once.
+                give_up = self._check_premature_give_up(result)
+                if give_up and attempt == 0 and self.max_retries > 1:
+                    raise PrematureGiveUpError(give_up)
+
                 return result
+
+            except PrematureGiveUpError as e:
+                last_error = e
+                strategy = RecoveryStrategy.REPLAN
+                self._log_recovery(task_node, strategy, f"premature give-up: {e}", attempt)
+                if on_status:
+                    on_status(
+                        "Recovery (replan): Result declared infeasibility on claimed "
+                        "compute limits — retrying once with an explicit budget statement",
+                        "running",
+                    )
+                if _BUDGET_STATEMENT not in task_node.description:
+                    task_node.description = task_node.description + _BUDGET_STATEMENT
 
             except EmptyResultError as e:
                 last_error = e
@@ -213,6 +296,28 @@ class RecoveryEngine:
         elif isinstance(result, str):
             if "[Tool execution error:" in result:
                 return result
+        return None
+
+    def _check_premature_give_up(self, result: Any) -> Optional[str]:
+        """R7: detect give-up-on-claimed-compute-limits answers.
+
+        Only textual results are checked (LLM answers); dict tool results with
+        real errors are already handled by _check_soft_failure. Returns the
+        matched snippet for the recovery log, or None.
+        """
+        if isinstance(result, str):
+            text = result
+        elif isinstance(result, dict):
+            candidate = result.get("answer") or result.get("text") or result.get("content")
+            text = candidate if isinstance(candidate, str) else ""
+        else:
+            return None
+        if not text:
+            return None
+        match = _GIVE_UP_RE.search(text)
+        if match and not _COMPLETION_RE.search(text):
+            start = max(0, match.start() - 40)
+            return text[start:match.end() + 60].strip()
         return None
 
     async def _replan(self, task_node: Any, error: str, dep_context: Optional[str] = None) -> str:

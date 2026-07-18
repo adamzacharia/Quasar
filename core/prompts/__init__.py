@@ -70,7 +70,7 @@ TABLE: ivoa.obscore
 ===================
 | Column Name           | Type    | Description                              |
 |-----------------------|---------|------------------------------------------|
-| target_name           | VARCHAR | Name of the observed target              |
+| target_name           | VARCHAR | PI-entered target name (free text, inconsistent — NOT for source selection) |
 | s_ra                  | DOUBLE  | Right Ascension (degrees, J2000)         |
 | s_dec                 | DOUBLE  | Declination (degrees, J2000)             |
 | s_resolution          | DOUBLE  | Angular resolution (arcseconds)          |
@@ -97,8 +97,18 @@ Example Queries:
 - Find Band 6 data: SELECT * FROM ivoa.obscore WHERE band_list = '6'
 - Resolution < 0.1": SELECT * FROM ivoa.obscore WHERE s_resolution < 0.1
 - Frequency range: SELECT * FROM ivoa.obscore WHERE frequency BETWEEN 230 AND 240
-- Target search: SELECT * FROM ivoa.obscore WHERE target_name LIKE '%M31%'
 - Target scans only: SELECT * FROM ivoa.obscore WHERE scan_intent LIKE '%TARGET%'
+
+NAME-RESOLVER RULE (official ALMA guidance, archive notebook nb8): to find a
+named source, resolve the name to coordinates via SIMBAD/NED and cone-search
+on s_ra/s_dec (the search_by_target tool does this for you). NEVER select by
+string-matching the PI-entered target_name column — PI names are free text
+("NGC1068", "ngc 1068", "N1068" all occur) and string matches silently miss
+data. If you must match target_name (e.g. solar/planetary targets a resolver
+cannot handle), say explicitly in the answer that the selection is a PI-name
+string match and may be incomplete:
+- Position search: SELECT * FROM ivoa.obscore
+  WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', 10.68, 41.27, 0.1)) = 1
 """
 
 

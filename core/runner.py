@@ -148,6 +148,12 @@ def stream_response_api(
         _email_result_holder = {}  # dedicated email search for researcher queries
         _email_thread = None
         _web_thread = None
+        # The EXACT step label the pre-pass opened. The UI store matches steps
+        # by text, so the close event must reuse this verbatim — rebuilding it
+        # at close time left intent-detected searches spinning forever (live
+        # 2026-07-18: "searching the web in parallel · 24s" long after the
+        # search finished).
+        _web_status_open_label = None
 
         _uq = _user_query.lower()
         # Detect explicit request to search the web
@@ -204,8 +210,9 @@ def stream_response_api(
 
         if _web_search_query:
             if _web_search_reason == "researcher_supplement":
+                _web_status_open_label = "Searching the web for researcher profile"
                 if on_status:
-                    on_status("Searching the web for researcher profile", "running")
+                    on_status(_web_status_open_label, "running")
                 # Extract the person's name for targeted search
                 _person_name = re.sub(
                     r'\b(?:who is|who\'s|tell me about|look up|profile of)\b',
@@ -240,12 +247,13 @@ def stream_response_api(
                 _email_thread = threading.Thread(target=_bg_email_search, daemon=True)
                 _email_thread.start()
             else:
+                msg = "Searching the web in parallel"
+                if _web_search_reason == "cutoff":
+                    msg = "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                elif _web_search_reason == "intent_detection":
+                    msg = "🌐 Query requires real-time information — searching the web in parallel"
+                _web_status_open_label = msg
                 if on_status:
-                    msg = "Searching the web in parallel"
-                    if _web_search_reason == "cutoff":
-                        msg = "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
-                    elif _web_search_reason == "intent_detection":
-                        msg = "🌐 Query requires real-time information — searching the web in parallel"
                     on_status(msg, "running")
 
                 def _bg_web_search():
@@ -424,7 +432,9 @@ def stream_response_api(
             # Fast LLM intent verification.
             try:
                 from core.llm_client import LLMClient
-                _intent_model = os.getenv("QUASAR_PAPER_INTENT_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4o-mini")
+                # TACC gpt-oss-120b: free/unmetered for this deployment, ~3 s —
+                # the old gpt-4o-mini default rode the (quota-dead) OpenAI key.
+                _intent_model = os.getenv("QUASAR_PAPER_INTENT_MODEL") or os.getenv("QUASAR_FAST_MODEL") or "gpt-oss-120b"
                 _mini = LLMClient(model=_intent_model)
                 _intent_resp = _mini.responses.create(
                     model=_intent_model,
@@ -495,8 +505,9 @@ def stream_response_api(
             # Both run concurrently with zero extra latency.
             if _is_researcher_query and _web_thread is None and agent._has_web_provider_key():
                 _web_search_reason = "researcher_supplement"
+                _web_status_open_label = "Searching the web for researcher profile"
                 if on_status:
-                    on_status("Searching the web for researcher profile", "running")
+                    on_status(_web_status_open_label, "running")
 
                 # Extract the person's name from the query for targeted searches
                 _person_name = re.sub(
@@ -686,8 +697,9 @@ def stream_response_api(
 
                     if _needs_web_supplement:
                         _web_search_reason = "rag_supplement"
+                        _web_status_open_label = "Searching the web for updated information"
                         if on_status:
-                            on_status("Searching the web for updated information", "running")
+                            on_status(_web_status_open_label, "running")
 
                         def _bg_web_search_rag():
                             try:
@@ -1032,12 +1044,13 @@ def stream_response_api(
                     if _web_thread is not None:
                         _web_thread.join(timeout=15)
                         if on_status:
-                            _web_status_label = (
-                                "Searching the web for updated information"
-                                if _web_search_reason == "rag_supplement"
-                                else "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                            # Close the EXACT label the pre-pass opened — the UI
+                            # matches steps by text, so a rebuilt label leaves
+                            # the original step spinning forever.
+                            on_status(
+                                _web_status_open_label or "Searching the web in parallel",
+                                "completed",
                             )
-                            on_status(_web_status_label, "completed")
                         web_data = _web_result_holder.get("data")
                         if web_data and web_data.get("success"):
                             # Synthesize a query-relevant summary instead of using
@@ -1679,14 +1692,14 @@ def stream_response_api(
             # 7a. Append parallel web search results if available
             if _web_thread is not None:
                 _web_thread.join(timeout=30)  # wait up to 30s for web results
-                # Close off the web status indicator
+                # Close off the web status indicator with the EXACT label the
+                # pre-pass opened — the UI matches steps by text, so a rebuilt
+                # label leaves the original step spinning forever.
                 if on_status:
-                    _web_status_label = (
-                        "Searching the web for updated information"
-                        if _web_search_reason == "rag_supplement"
-                        else "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
+                    on_status(
+                        _web_status_open_label or "Searching the web in parallel",
+                        "completed",
                     )
-                    on_status(_web_status_label, "completed")
                 web_data = _web_result_holder.get("data")
                 if web_data and web_data.get("success"):
                     # Synthesize a query-relevant summary instead of using

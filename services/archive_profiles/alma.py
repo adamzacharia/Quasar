@@ -100,7 +100,9 @@ PROFILE = ArchiveProfile.model_validate(
                 "dec_column": "s_dec",
                 "columns": [
                     {"name": "target_name", "dtype": "string", "role": "identifier",
-                     "description": "Observed target name as recorded by the PI (match with LIKE '%name%')."},
+                     "description": "PI-entered target name — free text, inconsistent ('NGC1068'/'ngc 1068'/'N1068'). "
+                                    "NOT for source selection: resolve the name and cone-search s_ra/s_dec instead; "
+                                    "use only for labelling, or as an explicitly-flagged string match."},
                     {"name": "s_ra", "dtype": "float", "unit": "deg", "role": "ra",
                      "description": "ICRS right ascension (J2000)."},
                     {"name": "s_dec", "dtype": "float", "unit": "deg", "role": "dec",
@@ -159,6 +161,13 @@ PROFILE = ArchiveProfile.model_validate(
                 "summary": "pass ONLY the filters the user asked for — a plain request is search_by_target(target_name=...) with NO band/resolution/frequency defaults",
                 "applies_to": [{"kind": "surface", "ref": "target_search"}],
                 "prompt_rank": 1,
+            },
+            {
+                "id": "name_resolver_rule",
+                "summary": "resolve source names via SIMBAD/NED to a cone on s_ra/s_dec (search_by_target does this); NEVER string-match PI-entered target_name — if unavoidable, flag it",
+                "applies_to": [{"kind": "surface", "ref": "target_search"},
+                                {"kind": "surface", "ref": "raw_adql"},
+                                {"kind": "table", "ref": "ivoa.obscore"}],
             },
             {
                 "id": "obscore_units",

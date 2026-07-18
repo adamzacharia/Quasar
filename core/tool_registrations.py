@@ -150,7 +150,13 @@ def register_tools(agent: "QuasarAgent") -> None:
     # NEW: ALminer Tools
     agent.tool_registry.register(Tool(
         name="search_alma_with_keywords",
-        description="Search ALMA archives using specific keywords (pi_name, project_code, etc.)",
+        description=(
+            "Search ALMA archives using specific keywords (pi_name, project_code, etc.). "
+            "ESCAPE HATCH for source names (R1 resolver rule): source_name_alma/target_name keys "
+            "string-match the PI-entered target_name and can silently miss data — for source-name "
+            "searches use search_by_target (resolver-based) instead, and if you do match by name "
+            "here, say so in the answer."
+        ),
         function=agent._alma_tool_fn("search_alma_with_keywords"),
         parameters={
             "type": "object",
@@ -2710,6 +2716,37 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "x_pixel": {"type": "number", "description": "X pixel position (alternative to ra/dec)."},
                 "y_pixel": {"type": "number", "description": "Y pixel position."},
                 "max_radius_arcsec": {"type": "number", "description": "Outer profile radius in arcsec (default: quarter of the image)."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="hips_aperture_photometry",
+        description=(
+            "Multi-band aperture photometry from HiPS survey cutouts: circular "
+            "aperture + local background annulus on hips2fits FITS cutouts of "
+            "one position across several bands (default GALEX FUV/NUV + SDSS "
+            "g/r/i; also pacs160/spire250/spire350/spire500 or any raw HiPS ID). "
+            "Sums are in native map units with a per-survey validation status "
+            "(9 Giordano-2025-validated maps; PACS 100um known-bad, skipped) "
+            "and a mandatory ~10%-accuracy caveat. Quick multi-wavelength "
+            "SED-shaped checks — NOT publication-grade photometry."
+        ),
+        function=agent._viz_tool_fn("hips_aperture_photometry"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_name":   {"type": "string", "description": "Target to resolve for the aperture center (alternative to ra/dec)."},
+                "ra":            {"type": "number", "description": "Aperture center ICRS RA in degrees."},
+                "dec":           {"type": "number", "description": "Aperture center ICRS Dec in degrees."},
+                "bands":         {"type": "array", "items": {"type": "string"},
+                                  "description": "Survey aliases or raw HiPS IDs, e.g. ['galex_nuv','sdss_r','spire250']. Default GALEX FUV/NUV + SDSS g/r/i."},
+                "radius_arcsec": {"type": "number", "description": "Aperture radius in arcsec. Default 15."},
+                "fov_deg":       {"type": "number", "description": "Cutout field of view in degrees (default: sized from the aperture)."},
+                "width":         {"type": "integer", "description": "Cutout width in pixels. Default 512."},
+                "include_known_bad": {"type": "boolean", "description": "Force known-bad maps (PACS 100um) with loud warnings. Default false."},
+                "title":         {"type": "string", "description": "Title for the rendered panel."},
             },
             "required": [],
         },

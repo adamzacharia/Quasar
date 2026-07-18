@@ -71,6 +71,15 @@ def _is_retryable(error: Exception) -> bool:
     if isinstance(error, NON_RETRYABLE_EXCEPTIONS):
         return False
 
+    # OpenAI's "insufficient_quota" rides a 429 but is a BILLING state, not a
+    # transient rate limit — retrying burns ~a minute of backoff per call and
+    # stalled every web-search turn for 80 s live (2026-07-18).
+    if (
+        getattr(error, "code", None) == "insufficient_quota"
+        or "insufficient_quota" in str(error)
+    ):
+        return False
+
     status_code = _extract_status_code(error)
     if status_code is not None:
         if status_code in NON_RETRYABLE_STATUS_CODES:

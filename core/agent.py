@@ -1559,7 +1559,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         try:
             from core.llm_client import LLMClient
-            synthesis_model = os.getenv("QUASAR_WEB_SYNTHESIS_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4.1-mini")
+            synthesis_model = os.getenv("QUASAR_WEB_SYNTHESIS_MODEL") or os.getenv("QUASAR_FAST_MODEL") or "gpt-oss-120b"
             client = LLMClient(model=synthesis_model)
             resp = client.responses.create(
                 model=synthesis_model,
@@ -1707,7 +1707,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         try:
             from core.llm_client import LLMClient
-            synthesis_model = os.getenv("QUASAR_WEB_SYNTHESIS_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4.1-mini")
+            synthesis_model = os.getenv("QUASAR_WEB_SYNTHESIS_MODEL") or os.getenv("QUASAR_FAST_MODEL") or "gpt-oss-120b"
             client = LLMClient(model=synthesis_model)
             resp = client.responses.create(
                 model=synthesis_model,
@@ -2063,23 +2063,30 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         outcome: Dict[str, Any] = {}
 
         def run_tool():
-            set_langfuse_parent(parent_lf)
             local: Dict[str, Any] = {}
             try:
-                with reinstall_llm_request_context(parent_llm_ctx):
-                    local["result"] = tool.execute(**args)
-            except BaseException as exc:  # re-raised on the parent thread
-                local["exc"] = exc
-            # This thread's TLS started empty, so its state IS this call's delta.
-            local["acc"] = list(self._accumulated_run_results)
-            local["trace"] = list(self._accumulated_tool_trace)
-            local["last_run_result"] = self.last_run_result
-            local["last_search_results"] = self.last_search_results
-            local["alma"] = dict(self._alma_tap_provenance_state)
-            with lock:
-                if not outcome.get("abandoned"):
-                    outcome.update(local)
-                done.set()
+                set_langfuse_parent(parent_lf)
+                try:
+                    with reinstall_llm_request_context(parent_llm_ctx):
+                        local["result"] = tool.execute(**args)
+                except BaseException as exc:  # re-raised on the parent thread
+                    local["exc"] = exc
+                try:
+                    # This thread's TLS started empty — its state IS this
+                    # call's delta. Best-effort: bare test agents without
+                    # `_tls` must still get their result delivered.
+                    local["acc"] = list(self._accumulated_run_results)
+                    local["trace"] = list(self._accumulated_tool_trace)
+                    local["last_run_result"] = self.last_run_result
+                    local["last_search_results"] = self.last_search_results
+                    local["alma"] = dict(self._alma_tap_provenance_state)
+                except Exception:
+                    pass
+            finally:
+                with lock:
+                    if not outcome.get("abandoned"):
+                        outcome.update(local)
+                    done.set()
 
         worker = threading.Thread(
             target=run_tool,
@@ -2097,7 +2104,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             wait_for = remaining
             if next_beat is not None:
                 wait_for = min(wait_for, next_beat - now)
-            if done.wait(timeout=max(0.05, wait_for)):
+            # Floor must stay below the smallest heartbeat interval tests use
+            # (10 ms) — a coarser quantum would swallow their beats entirely.
+            if done.wait(timeout=max(0.001, wait_for)):
                 break
             if next_beat is not None and time.monotonic() >= next_beat:
                 try:
@@ -2115,8 +2124,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 outcome["abandoned"] = True
 
         if finished:
-            self._accumulated_run_results.extend(outcome.get("acc") or [])
-            self._accumulated_tool_trace.extend(outcome.get("trace") or [])
+            # Merge the worker's TLS deltas into THIS thread's request state.
+            # Conditional so a bare agent without `_tls` (delta collection
+            # skipped above) never touches the properties here either.
+            if outcome.get("acc"):
+                self._accumulated_run_results.extend(outcome["acc"])
+            if outcome.get("trace"):
+                self._accumulated_tool_trace.extend(outcome["trace"])
             if outcome.get("last_run_result") is not None:
                 self.last_run_result = outcome["last_run_result"]
             if outcome.get("last_search_results") is not None:
@@ -5543,7 +5557,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             """
             
             response = self.client.responses.create(
-                model=os.getenv("QUASAR_PERSONAL_MEMORY_MODEL") or os.getenv("QUASAR_FAST_MODEL", "gpt-4o-mini"),
+                # TACC gpt-oss-120b: free/unmetered here — the old gpt-4o-mini
+                # default rode the (quota-dead) OpenAI key.
+                model=os.getenv("QUASAR_PERSONAL_MEMORY_MODEL") or os.getenv("QUASAR_FAST_MODEL") or "gpt-oss-120b",
                 input=prompt,
                 temperature=0.1,
                 max_output_tokens=50

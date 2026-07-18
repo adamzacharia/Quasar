@@ -434,6 +434,170 @@ def test_tavily_extract_rejects_keyword_queries(monkeypatch):
     assert "full http(s) URL" in result["error"]
 
 
+# ── Brave circuit breaker + web-search latency fixes (2026-07-18) ─────────
+# One slow "web search" used to stack: 2×10 s dead Brave attempts, Tavily's
+# include_answer mode (7.2 s vs 3.4 s measured), and a SERIAL +2.7 s Tavily
+# image call after every Brave/Exa success.
+
+
+@pytest.fixture
+def reset_brave_breaker():
+    WebSearchService._brave_down_until = 0.0
+    yield
+    WebSearchService._brave_down_until = 0.0
+
+
+def test_brave_exception_on_both_endpoints_trips_breaker(
+    monkeypatch, isolated_usage_file, reset_brave_breaker
+):
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        raise RuntimeError("simulated hang")
+
+    monkeypatch.setattr(web_search_service.requests, "get", fake_get)
+
+    result = WebSearchService().search_brave("query", max_results=3)
+    assert result["success"] is False
+    assert WebSearchService._brave_cooling_down() is True
+
+    # While the breaker is open, Brave fast-fails without touching the network.
+    def exploding_get(*args, **kwargs):
+        raise AssertionError("network must not be touched while breaker is open")
+
+    monkeypatch.setattr(web_search_service.requests, "get", exploding_get)
+    result2 = WebSearchService().search_brave("query", max_results=3)
+    assert result2 == {"success": False, "error": "Brave circuit breaker open"}
+
+
+def test_brave_429_on_both_endpoints_trips_breaker(
+    monkeypatch, isolated_usage_file, reset_brave_breaker
+):
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return DummyResponse(429, {})
+
+    monkeypatch.setattr(web_search_service.requests, "get", fake_get)
+
+    result = WebSearchService().search_brave("query", max_results=3)
+    assert result["success"] is False
+    assert WebSearchService._brave_cooling_down() is True
+
+
+def test_brave_empty_200_does_not_trip_breaker(
+    monkeypatch, isolated_usage_file, reset_brave_breaker
+):
+    # A working account with thin results is NOT an outage.
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+    responses = [
+        DummyResponse(200, {"grounding": {"generic": [], "map": []}, "sources": {}}),
+        DummyResponse(200, {"web": {"results": []}}),
+    ]
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return responses.pop(0)
+
+    monkeypatch.setattr(web_search_service.requests, "get", fake_get)
+
+    result = WebSearchService().search_brave("query", max_results=3)
+    assert result["success"] is True  # web/search 200 with zero results
+    assert WebSearchService._brave_cooling_down() is False
+
+
+def test_route_skips_brave_and_prefetch_while_breaker_open(
+    monkeypatch, isolated_usage_file, reset_brave_breaker
+):
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    WebSearchService._trip_brave_breaker("test")
+
+    called = {}
+
+    def fake_search_brave(self, query, max_results=5):
+        called["brave"] = True
+        return {"success": True}
+
+    def fake_search_tavily(
+        self, query, max_results=10, search_depth="basic",
+        include_images=True, include_answer=False,
+    ):
+        called["tavily_include_images"] = include_images
+        return {"success": True, "provider": "Tavily", "results": [], "images": []}
+
+    def fake_fetch_images(self, query, max_images=6):
+        called["prefetch"] = True
+        return []
+
+    monkeypatch.setattr(WebSearchService, "search_brave", fake_search_brave)
+    monkeypatch.setattr(WebSearchService, "search_tavily", fake_search_tavily)
+    monkeypatch.setattr(WebSearchService, "_fetch_tavily_images", fake_fetch_images)
+
+    result = WebSearchService().route_and_search("current observatory policy", max_results=5)
+
+    assert result["provider"] == "Tavily"
+    assert "brave" not in called, "breaker must skip Brave without calling it"
+    assert "prefetch" not in called, "no text-only provider in play → no extra Tavily credit"
+    assert called["tavily_include_images"] is True
+
+
+def test_tavily_payload_omits_answer_by_default(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
+    monkeypatch.delitem(sys.modules, "tavily", raising=False)
+    calls = {}
+
+    def fake_tavily_post(self, endpoint, payload, timeout=60):
+        calls["payload"] = payload
+        return {"results": [], "images": []}
+
+    monkeypatch.setattr(WebSearchService, "_tavily_post", fake_tavily_post)
+
+    result = WebSearchService().search_tavily("current policy", max_results=3)
+
+    assert result["success"] is True
+    assert calls["payload"]["include_answer"] is False
+
+
+def test_brave_failure_reuses_prefetched_images_on_tavily_fallback(
+    monkeypatch, isolated_usage_file, reset_brave_breaker
+):
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-test-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+
+    called = {}
+
+    def fake_search_brave(self, query, max_results=5):
+        return {"success": False, "error": "Brave API request failed"}
+
+    def fake_search_tavily(
+        self, query, max_results=10, search_depth="basic",
+        include_images=True, include_answer=False,
+    ):
+        called["tavily_include_images"] = include_images
+        return {"success": True, "provider": "Tavily", "results": [], "images": []}
+
+    def fake_fetch_images(self, query, max_images=6):
+        return [{"url": "https://example.com/img.jpg", "description": "Prefetched"}]
+
+    monkeypatch.setattr(WebSearchService, "search_brave", fake_search_brave)
+    monkeypatch.setattr(WebSearchService, "search_tavily", fake_search_tavily)
+    monkeypatch.setattr(WebSearchService, "_fetch_tavily_images", fake_fetch_images)
+
+    result = WebSearchService().route_and_search("current observatory policy", max_results=5)
+
+    assert result["provider"] == "Tavily"
+    # The in-flight prefetch replaces the slow images+descriptions search mode…
+    assert called["tavily_include_images"] is False
+    # …and its tiles are attached to the final result.
+    assert result["images"][0]["url"] == "https://example.com/img.jpg"
+    assert result["image_provider"] == "Tavily Images"
+
+
 def test_tavily_map_site_normalizes_filters_and_caps_limit(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     calls = {}

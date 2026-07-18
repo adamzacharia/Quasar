@@ -814,6 +814,63 @@ class RadialProfileCap(_AnalysisCapability):
     extra_fields = ("x_pixel", "y_pixel", "max_radius_arcsec")
 
 
+class HipsAperturePhotometryInput(_In):
+    target_name: Optional[str] = None
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    bands: Optional[List[str]] = None
+    radius_arcsec: Optional[float] = None
+    fov_deg: Optional[float] = None
+    width: Optional[int] = None
+    include_known_bad: Optional[bool] = False
+    title: Optional[str] = ""
+
+
+class HipsAperturePhotometry(BaseCapability):
+    name = "hips_aperture_photometry"
+    description = (
+        "Multi-band aperture photometry from HiPS survey cutouts (R5): place a "
+        "circular aperture with a local background annulus on hips2fits FITS "
+        "cutouts of one position across several bands (default GALEX FUV/NUV + "
+        "SDSS g/r/i; also pacs160/spire250/spire350/spire500, or any HiPS ID). "
+        "Sums are reported in native map units with a per-survey validation "
+        "status (Giordano et al. 2025 validated 9 maps; PACS 100um is known-bad "
+        "and skipped) and a mandatory ~10%-accuracy caveat. For quick multi-"
+        "wavelength SED-shaped checks — NOT publication-grade photometry."
+    )
+    category = "analysis"
+    InputModel = HipsAperturePhotometryInput
+    annotations = {"read_only": False, "cost": "network"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        set_lrr = ctx.service("set_last_run_result")
+        try:
+            import services.image_analysis as image_analysis
+
+            ra, dec, label = _resolve_capability_coords(inp.target_name, inp.ra, inp.dec)
+            if ra is None or dec is None:
+                return _native({"success": False,
+                                "error": "Provide target_name or ra/dec for the aperture center."})
+            result = image_analysis.hips_aperture_photometry(
+                ra=ra, dec=dec,
+                bands=inp.bands,
+                radius_arcsec=inp.radius_arcsec,
+                fov_deg=inp.fov_deg,
+                width=inp.width,
+                include_known_bad=bool(inp.include_known_bad),
+                title=inp.title or (label if label else ""),
+            )
+            if result.get("success") and result.get("image_path"):
+                set_lrr({
+                    "type": "image",
+                    "image_url": result["image_path"],
+                    "caption": result.get("caption", ""),
+                })
+            return _native(result)
+        except Exception as e:
+            return _native({"success": False, "error": str(e)})
+
+
 class HipsContourOverlayInput(_In):
     base_survey: Optional[str] = "optical"
     contour_survey: Optional[str] = "vlass"
@@ -1260,6 +1317,7 @@ CAPABILITIES: List[BaseCapability] = [
     MeasureRegion(),
     FitGaussianSource(),
     RadialProfileCap(),
+    HipsAperturePhotometry(),
     HipsContourOverlay(),
     ImageDifference(),
     HipsRgbComposite(),

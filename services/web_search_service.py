@@ -18,6 +18,7 @@ import os
 import re
 import json
 import time
+import threading
 import requests
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -36,6 +37,26 @@ DEFAULT_MAX_RESULTS = 10
 
 class WebSearchService:
     """Intelligent router and rate-limiter for web search providers."""
+
+    # ── Brave circuit breaker ────────────────────────────────────────────
+    # A failing Brave account (timeout / 401 / 429 / 5xx on BOTH endpoints)
+    # used to cost every search up to 2×10 s of dead attempts before the
+    # Tavily fallback even started (live 2026-07-18: ~24 s web phases).
+    # Class-level because the service is instantiated per search call.
+    _BRAVE_COOLDOWN_SECONDS = 600.0
+    _brave_down_until = 0.0
+
+    @classmethod
+    def _brave_cooling_down(cls) -> bool:
+        return time.time() < cls._brave_down_until
+
+    @classmethod
+    def _trip_brave_breaker(cls, why: str) -> None:
+        cls._brave_down_until = time.time() + cls._BRAVE_COOLDOWN_SECONDS
+        print(
+            f"[SEARCH ROUTER] Brave circuit OPEN for "
+            f"{int(cls._BRAVE_COOLDOWN_SECONDS)}s — {why}"
+        )
 
     def __init__(self, browser_service: Optional[Any] = None):
         self.browser_service = browser_service
@@ -265,34 +286,63 @@ class WebSearchService:
                 "academic",
             ])
         )
+        # Exa/Brave return text-only results, so their image tiles come from a
+        # separate Tavily call. It used to run SERIALLY after the text search
+        # (+2.7 s measured 2026-07-18); prefetch it concurrently instead.
+        usage = self._get_usage()
+        exa_eligible = bool(
+            exa_intent and self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT
+        )
+        brave_eligible = bool(
+            self.brave_key
+            and usage.get("brave_count", 0) < MAX_FREE_LIMIT
+            and not self._brave_cooling_down()
+        )
+        img_thread, img_holder = (None, None)
+        if exa_eligible or brave_eligible:
+            img_thread, img_holder = self._start_image_prefetch(query)
+
         if exa_intent:
-            usage = self._get_usage()
-            if self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT:
+            if exa_eligible:
                 print(f"[SEARCH ROUTER] Routed to Exa (Specialist) for: {query!r}")
                 exa_type = self._determine_exa_type(query)
                 res = self.search_exa(query, num_results=max_results, search_type=exa_type)
                 if res.get("success"):
-                    return sanitize_web_payload(self._enrich_with_tavily_images(query, res))
+                    return sanitize_web_payload(
+                        self._attach_prefetched_images(res, img_thread, img_holder)
+                    )
                 print("[SEARCH ROUTER] Exa failed, falling back to Brave/Tavily")
             elif self.exa_key:
                 print("[SEARCH ROUTER] Exa monthly free limit (1000) reached. Falling back.")
 
         # 3. Fresh / Current / RAG fresh info -> route to Brave Search
-        usage = self._get_usage()
-        if self.brave_key and usage.get("brave_count", 0) < MAX_FREE_LIMIT:
+        if brave_eligible:
             print(f"[SEARCH ROUTER] Routed to Brave (Primary) for: {query!r}")
             res = self.search_brave(query, max_results=max_results)
             if res.get("success"):
-                return sanitize_web_payload(self._enrich_with_tavily_images(query, res))
+                return sanitize_web_payload(
+                    self._attach_prefetched_images(res, img_thread, img_holder)
+                )
             print("[SEARCH ROUTER] Brave failed, falling back to Tavily")
+        elif self.brave_key and self._brave_cooling_down():
+            print("[SEARCH ROUTER] Brave circuit breaker open. Falling back to Tavily.")
         elif self.brave_key:
             print("[SEARCH ROUTER] Brave monthly free limit (1000) reached. Falling back.")
 
         # 4. Fallback: Tavily Search
         if self.tavily_key:
             print(f"[SEARCH ROUTER] Routing to Tavily for: {query!r}")
-            res = self.search_tavily(query, max_results=max_results, search_depth=search_depth)
+            # When a prefetch is in flight, reuse those tiles instead of asking
+            # the search call for images+descriptions (the slow combination).
+            res = self.search_tavily(
+                query,
+                max_results=max_results,
+                search_depth=search_depth,
+                include_images=img_thread is None,
+            )
             if res.get("success"):
+                if img_thread is not None:
+                    res = self._attach_prefetched_images(res, img_thread, img_holder)
                 return sanitize_web_payload(res)
                 
         # 5. Ultimate Fallback: Local Scraping / BrowserService
@@ -307,13 +357,18 @@ class WebSearchService:
                 )
                 if not isinstance(fallback_results, list):
                     fallback_results = []
+                if img_thread is not None:
+                    img_thread.join(timeout=4.0)
+                    fallback_images = (img_holder or {}).get("images") or []
+                else:
+                    fallback_images = self._fetch_tavily_images(query) if self.tavily_key else []
                 return sanitize_web_payload({
                     "success": True,
                     "provider": "BrowserService (fallback)",
                     "query": query,
                     "results": fallback_results,
                     "raw_text": fallback.get("raw_text", "") if isinstance(fallback, dict) else "",
-                    "images": self._fetch_tavily_images(query) if self.tavily_key else []
+                    "images": fallback_images
                 })
             except Exception as e:
                 return {"success": False, "error": f"Scraping fallback failed: {e}"}
@@ -527,35 +582,56 @@ class WebSearchService:
             return []
         return self._collect_tavily_images(response, max_images=max_images)
 
-    def _enrich_with_tavily_images(
-        self,
-        query: str,
+    def _start_image_prefetch(self, query: str, max_images: int = 6):
+        """Start the Tavily image fetch on a thread, concurrent with a text search.
+
+        Returns ``(thread, holder)`` or ``(None, None)`` when images are
+        unavailable (no key, images disabled, blocked query).
+        """
+        if not self.tavily_key or not web_images_enabled() or is_explicit_query(query):
+            return None, None
+        holder: Dict[str, Any] = {}
+
+        def _fetch():
+            try:
+                holder["images"] = self._fetch_tavily_images(query, max_images=max_images)
+            except Exception as e:
+                print(f"[SEARCH ROUTER] Tavily image prefetch failed: {e}")
+                holder["images"] = []
+
+        thread = threading.Thread(
+            target=_fetch, name="quasar-image-prefetch", daemon=True
+        )
+        thread.start()
+        return thread, holder
+
+    @staticmethod
+    def _attach_prefetched_images(
         result: Dict[str, Any],
-        max_images: int = 6,
+        img_thread: Optional[threading.Thread],
+        img_holder: Optional[Dict[str, Any]],
+        wait_seconds: float = 4.0,
     ) -> Dict[str, Any]:
-        """Attach image tiles to otherwise text-only Brave/Exa results."""
+        """Attach prefetched image tiles to a text-only result (bounded wait)."""
         if (
-            not isinstance(result, dict)
+            img_thread is None
+            or not isinstance(result, dict)
             or not result.get("success")
             or result.get("images")
-            or not self.tavily_key
-            or not web_images_enabled()
         ):
             return result
-
-        try:
-            images = self._fetch_tavily_images(query, max_images=max_images)
-        except Exception as e:
-            print(f"[SEARCH ROUTER] Tavily image enrichment failed: {e}")
-            images = []
-
+        img_thread.join(timeout=wait_seconds)
+        images = (img_holder or {}).get("images") or []
         if not images:
             return result
-
         enriched = dict(result)
-        enriched["images"] = images
+        enriched["images"] = images[:6]
         enriched["image_provider"] = "Tavily Images"
         return enriched
+
+    # Statuses that mean the account/service is refusing us — worth a cooldown,
+    # unlike a 200 with empty results.
+    _BRAVE_HARD_STATUSES = {401, 402, 403, 422, 429, 500, 502, 503, 504}
 
     def search_brave(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> Dict[str, Any]:
         """Perform search using Brave LLM Context (primary RAG) or Web Search."""
@@ -563,7 +639,14 @@ class WebSearchService:
             return blocked_query_result(query)
         if not self.brave_key:
             return {"success": False, "error": "Brave API key missing"}
+        if self._brave_cooling_down():
+            return {"success": False, "error": "Brave circuit breaker open"}
         max_results = max(1, min(int(max_results), 10))
+
+        # Track failure modes across both endpoints; only a hard failure on
+        # BOTH trips the breaker. Brave answers in ~2 s when healthy, so 5 s
+        # is generous — the old 10 s doubled the worst-case dead time.
+        _hard_failures = []
 
         # Attempt Brave LLM Context endpoint (highly pre-summarized and optimized)
         url = "https://api.search.brave.com/res/v1/llm/context"
@@ -575,9 +658,9 @@ class WebSearchService:
             "q": query,
             "maximum_number_of_urls": min(max_results, 10)
         }
-        
+
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response = requests.get(url, headers=headers, params=params, timeout=5)
             if response.status_code == 200:
                 self._increment_usage("brave")
                 data = response.json()
@@ -590,7 +673,10 @@ class WebSearchService:
                         "results": results,
                         "images": []
                     })
+            elif response.status_code in self._BRAVE_HARD_STATUSES:
+                _hard_failures.append(f"llm/context HTTP {response.status_code}")
         except Exception as e:
+            _hard_failures.append(f"llm/context {type(e).__name__}")
             print(f"[SEARCH ROUTER] Brave LLM Context API call failed: {e}")
 
         # Fallback to standard Brave Web Search
@@ -600,7 +686,7 @@ class WebSearchService:
                 web_url,
                 headers=headers,
                 params={"q": query, "count": min(max_results, 10), "safesearch": "strict"},
-                timeout=10,
+                timeout=5,
             )
             if web_response.status_code == 200:
                 self._increment_usage("brave")
@@ -619,8 +705,14 @@ class WebSearchService:
                     "results": results[:max_results],
                     "images": []
                 })
+            if web_response.status_code in self._BRAVE_HARD_STATUSES:
+                _hard_failures.append(f"web/search HTTP {web_response.status_code}")
         except Exception as e:
+            _hard_failures.append(f"web/search {type(e).__name__}")
             print(f"[SEARCH ROUTER] Brave Web Search API call failed: {e}")
+
+        if len(_hard_failures) >= 2:
+            self._trip_brave_breaker("; ".join(_hard_failures))
 
         return {"success": False, "error": "Brave API request failed"}
 
@@ -630,8 +722,15 @@ class WebSearchService:
         max_results: int = DEFAULT_MAX_RESULTS,
         search_depth: str = "basic",
         include_images: bool = True,
+        include_answer: bool = False,
     ) -> Dict[str, Any]:
-        """Perform Tavily search with source and optional image metadata."""
+        """Perform Tavily search with source and optional image metadata.
+
+        ``include_answer`` defaults OFF: Tavily's generated answer roughly
+        doubled search latency (measured 7.2 s vs 3.4 s, 2026-07-18) and
+        Quasar synthesizes its own summary from the snippets anyway — the raw
+        answer was only a no-snippets fallback.
+        """
         if is_explicit_query(query):
             return blocked_query_result(query)
         if not self.tavily_key:
@@ -643,7 +742,7 @@ class WebSearchService:
             "query": query,
             "max_results": max_results,
             "search_depth": search_depth,
-            "include_answer": True,
+            "include_answer": bool(include_answer),
             "include_images": include_images,
             "include_image_descriptions": include_images,
         }
@@ -654,7 +753,7 @@ class WebSearchService:
                 response = client.search(**payload)
             except Exception as sdk_error:
                 print(f"[SEARCH ROUTER] Tavily SDK search unavailable, using REST: {sdk_error}")
-                response = self._tavily_post("search", payload, timeout=60)
+                response = self._tavily_post("search", payload, timeout=25)
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response

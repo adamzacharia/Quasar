@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -596,15 +597,33 @@ class SearchByTarget(BaseCapability):
                 # Many ALMA observations have offset pointing centers, so
                 # retry with a wider cone search to avoid losing results
                 # (and critically, to keep band/filter params applied).
-                # NB (preserved verbatim): resolve_target returns ra_deg/dec_deg,
-                # so the .get("ra") gate below never passes — the fallback is
-                # DEAD, exactly as in the legacy inline method (documented in
-                # docs/v2 OPEN_ISSUES; enabling it is a behaviour change).
+                # NB (preserved by default): resolve_target returns
+                # ra_deg/dec_deg, so the legacy .get("ra") gate never passes —
+                # the fallback is DEAD, exactly as in the legacy inline method
+                # (documented in docs/v2 OPEN_ISSUES). R1 ships the fix behind
+                # QUASAR_ALMA_POSITIONAL_FALLBACK (default OFF) because
+                # enabling it is a behaviour change and therefore
+                # benchmark-gated (G6): flip it on, re-run DataLabBench vs the
+                # 65.5 baseline, then consider defaulting it on.
                 _log(f"[FALLBACK] Name search empty for '{target_name}', trying positional fallback...")
                 try:
                     resolved = ctx.service("resolve_target")(target_name)
-                    if resolved.get("success") and resolved.get("ra") is not None:
-                        _fb_ra, _fb_dec = resolved["ra"], resolved["dec"]
+                    _fb_flag = os.getenv("QUASAR_ALMA_POSITIONAL_FALLBACK", "0").strip().lower()
+                    if _fb_flag in {"1", "true", "yes", "on"}:
+                        _fb_ra = resolved.get("ra_deg", resolved.get("ra"))
+                        _fb_dec = resolved.get("dec_deg", resolved.get("dec"))
+                        # Guard CX-01: cone_search has no date-range parameter,
+                        # so a date-constrained request must not silently widen
+                        # into out-of-period observations — skip the fallback.
+                        if date_range:
+                            _log("[FALLBACK] Skipped: date_range cannot be applied to the cone fallback.")
+                            _fb_ra = _fb_dec = None
+                    else:
+                        _fb_ra = resolved.get("ra")
+                        _fb_dec = resolved.get("dec")
+                    # Both coordinates gated (CX-02): a malformed resolver dict
+                    # with RA but no Dec must not crash the :.4f log line.
+                    if resolved.get("success") and _fb_ra is not None and _fb_dec is not None:
                         _log(f"[FALLBACK] Resolved to RA={_fb_ra:.4f}, Dec={_fb_dec:.4f} — cone search 0.14°")
                         results = search_service.cone_search(
                             _fb_ra, _fb_dec, radius=0.14,
@@ -1070,7 +1089,13 @@ class SearchAlmaWithKeywordsInput(_In):
 
 class SearchAlmaWithKeywords(BaseCapability):
     name = "search_alma_with_keywords"
-    description = "Search ALMA archives using specific keywords (pi_name, project_code, etc.)"
+    description = (
+        "Search ALMA archives using specific keywords (pi_name, project_code, etc.). "
+        "ESCAPE HATCH for source names (R1 resolver rule): source_name_alma/target_name keys "
+        "string-match the PI-entered target_name and can silently miss data — for source-name "
+        "searches use search_by_target (resolver-based) instead, and if you do match by name "
+        "here, say so in the answer."
+    )
     category = "general"
     InputModel = SearchAlmaWithKeywordsInput
     annotations = {"read_only": True, "cost": "network"}

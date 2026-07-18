@@ -289,7 +289,7 @@ The single highest-leverage internal unlock is **un-parking the benchmark (G6)**
 |---|---|---|---|
 | G1 | Finish `agent.py` split — migrate ~40 inline registrations; finish `core/runner.py` / `core/router.py` extraction; gate < ~1,500 lines | In progress (5,407 lines) | R10 (MCP) |
 | G2/C10 | Fix MCP client bridge (long-lived loop + `run_coroutine_threadsafe`, pooled sessions) | Not started | R10 |
-| G3 | Conductor threads escape cost/quota/BYOK accounting (thread-local context lost) | Open (CX-01 waived twice) | R9, R14 |
+| G3 | Conductor threads escape cost/quota/BYOK accounting (thread-local context lost) | FIXED (A2 scan campaign 2026-07-17; verified + test-gated by R9 2026-07-18) | ~~R9~~ ✅, R14 |
 | G5 | Provenance: capture executed ADQL on common ALMA paths; deepen `service` redaction | Partially open | R15 (weakens it) |
 | G6 | **Un-park DataLabBench** — re-run vs 65.5 baseline; publication numbers | Parked | R1, R6, R7, R12, R13, R14, C18 fix |
 | G7 | Test-suite isolation (whole-dir pytest fails + hangs; CI-affecting); Conductor smoke test | Diagnosed, unfixed | CI trust |
@@ -298,21 +298,21 @@ The single highest-leverage internal unlock is **un-parking the benchmark (G6)**
 | G13 | Session export beyond notebooks (permalinks, bundles) | Not started | R15 covers |
 | G14 | Eval-mode wedge cases (failed-turn gate CX-01/02 REOPEN) | Reopened | R3 metrics UI |
 
-### Roadmap at a glance — all 25 items are **not started**
+### Roadmap at a glance — Tier 1 IMPLEMENTED 2026-07-18 (uncommitted); Tiers 2–3 not started
 
-**Tier 1 — Quick wins**
+**Tier 1 — Quick wins** *(all nine implemented 2026-07-18, working tree; unit-gated 433 tests + boot smoke; benchmark re-run still pending per G6)*
 
-| ID | Feature | Effort | Impact | Depends on |
-|---|---|---|---|---|
-| R1 | ALMA name-resolver rule in text-to-ADQL grounding | S | ★★★ | G6 (for the fallback fix) |
-| R2 | Sensitivity-driven discovery + archive↔literature ObsCore joins | S/M | ★★★ | — |
-| R3 | Citation recall/precision audit on answers | S/M | ★★★ | — |
-| R4 | Time/citation weighting in literature ranking | S/M | ★★ | — |
-| R5 | HiPS aperture photometry + per-survey validation guard | M | ★★★ | — |
-| R6 | Faithfulness/correctness axes in DataLabBench | S | ★★ | bundle with G6 |
-| R7 | ReplicationBench failure-mode guards in RecoveryEngine | S/M | ★★ | G6 (to measure) |
-| R8 | SciX API watch + compatibility shim | S | ★ | — |
-| R9 | Close Conductor cost-accounting leak | M | ★★★ | — |
+| ID | Feature | Effort | Impact | Depends on | Status |
+|---|---|---|---|---|---|
+| R1 | ALMA name-resolver rule in text-to-ADQL grounding | S | ★★★ | G6 (for the fallback fix) | DONE — rule in ALMA_TAP_SCHEMA + profile pitfall; dead fallback fixed behind `QUASAR_ALMA_POSITIONAL_FALLBACK` (default OFF, benchmark-gated) |
+| R2 | Sensitivity-driven discovery + archive↔literature ObsCore joins | S/M | ★★★ | — | DONE — `sensitivity_search` + `data_publications` templates; bibcode→data reverse in `search_papers_by_observation_id`; ObsCore columns live-verified (73 cols) |
+| R3 | Citation recall/precision audit on answers | S/M | ★★★ | — | DONE — mechanical_v1 metrics in `services/citation_metrics.py`, both synthesis hooks, run_meta/SSE surfacing, bench capture (informational) |
+| R4 | Time/citation weighting in literature ranking | S/M | ★★ | — | DONE — doc_doi + OpenAlex cited_by_count at ingest; citation rank + query-conditional weights inside the bounded RRF tiebreak |
+| R5 | HiPS aperture photometry + per-survey validation guard | M | ★★★ | — | DONE — `hips_aperture_photometry` tool; 9 Giordano-validated maps, PACS100 known-bad gate, mandatory ~10% caveat |
+| R6 | Faithfulness/correctness axes in DataLabBench | S | ★★ | bundle with G6 | DONE — BENCH_VERSION 1.2, additive axes + fabrication axis; scoring unchanged; re-run pending (G6) |
+| R7 | ReplicationBench failure-mode guards in RecoveryEngine | S/M | ★★ | G6 (to measure) | DONE — give-up classifier (cap 1 retry), synthesis domain checklist, legacy-FITS tests (+ memmap bug fixed) |
+| R8 | SciX API watch + compatibility shim | S | ★ | — | DONE — provider shim (`ADS_API_PROVIDER`), SciX host live-verified identical |
+| R9 | Close Conductor cost-accounting leak | M | ★★★ | — | DONE — A2 scan-campaign propagation verified end-to-end + gated by `test_conductor_accounting.py` (6 tests) + cost suite (77) |
 
 **Tier 2 — V2-aligned bets**
 

@@ -1045,3 +1045,77 @@ def test_query_alma_data_publications_reverse_bibcode(monkeypatch):
     assert out["success"] is True
     assert captured["where"] == "bib_reference LIKE '%2018ApJ...869L..41A%'"
     assert "archived data used by publication" in out["source"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R1 — resolver rule: flag-gated positional fallback (default OFF)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_positional_fallback_enabled_by_flag_runs_cone(monkeypatch):
+    monkeypatch.setenv("QUASAR_ALMA_POSITIONAL_FALLBACK", "1")
+    cone_df = pd.DataFrame([{"target_name": "M87", "band_list": "6"}])
+    svc = _FakeSearchService(pd.DataFrame())
+    svc.by_target = {"M87": pd.DataFrame()}
+
+    def _cone(ra, dec, radius, facility, max_results):
+        svc.calls.append(("cone_search", ra, dec, radius))
+        return cone_df.copy()
+
+    svc.cone_search = _cone
+    ctx, state = _ctx(search_service=svc,
+                      resolve_target=lambda name: {"success": True, "ra_deg": 187.7, "dec_deg": 12.39})
+    out = _run(SearchByTarget(), ctx, target_name="M87")
+
+    cone_calls = [c for c in svc.calls if c[0] == "cone_search"]
+    assert cone_calls == [("cone_search", 187.7, 12.39, 0.14)]
+    assert out["success"] is True and out["total_results"] == 1
+
+
+def test_positional_fallback_flag_off_stays_dead(monkeypatch):
+    monkeypatch.setenv("QUASAR_ALMA_POSITIONAL_FALLBACK", "0")
+    svc = _FakeSearchService(pd.DataFrame())
+    ctx, _ = _ctx(search_service=svc,
+                  resolve_target=lambda name: {"success": True, "ra_deg": 187.7, "dec_deg": 12.39})
+    out = _run(SearchByTarget(), ctx, target_name="M87")
+    assert not any(c[0] == "cone_search" for c in svc.calls)
+    assert out["total_results"] == 0
+
+
+def test_positional_fallback_flag_on_legacy_ra_keys_also_work(monkeypatch):
+    # A resolver returning the plain ra/dec shape must also feed the cone.
+    monkeypatch.setenv("QUASAR_ALMA_POSITIONAL_FALLBACK", "true")
+    svc = _FakeSearchService(pd.DataFrame())
+    captured = []
+
+    def _cone(ra, dec, radius, facility, max_results):
+        captured.append((ra, dec))
+        return pd.DataFrame()
+
+    svc.cone_search = _cone
+    ctx, _ = _ctx(search_service=svc,
+                  resolve_target=lambda name: {"success": True, "ra": 10.0, "dec": -5.0})
+    _run(SearchByTarget(), ctx, target_name="NGC 253")
+    assert captured == [(10.0, -5.0)]
+
+
+def test_cx01_fallback_skipped_when_date_range_present(monkeypatch):
+    # cone_search cannot honor a date_range — the enabled fallback must skip
+    # rather than silently widen into out-of-period observations.
+    monkeypatch.setenv("QUASAR_ALMA_POSITIONAL_FALLBACK", "1")
+    svc = _FakeSearchService(pd.DataFrame())
+    ctx, state = _ctx(search_service=svc,
+                      resolve_target=lambda name: {"success": True, "ra_deg": 187.7, "dec_deg": 12.39})
+    out = _run(SearchByTarget(), ctx, target_name="M87", date_range="2019-01-01,2019-12-31")
+    assert not any(c[0] == "cone_search" for c in svc.calls)
+    assert out["total_results"] == 0
+    assert any("date_range cannot be applied" in line for line in state.console)
+
+
+def test_cx02_missing_dec_does_not_crash_fallback(monkeypatch):
+    monkeypatch.setenv("QUASAR_ALMA_POSITIONAL_FALLBACK", "1")
+    svc = _FakeSearchService(pd.DataFrame())
+    ctx, _ = _ctx(search_service=svc,
+                  resolve_target=lambda name: {"success": True, "ra_deg": 187.7})
+    out = _run(SearchByTarget(), ctx, target_name="M87")
+    # No cone attempt, no TypeError — clean empty result.
+    assert not any(c[0] == "cone_search" for c in svc.calls)
+    assert out == {"success": True, "total_results": 0, "target": "M87", "note": "No results found."}

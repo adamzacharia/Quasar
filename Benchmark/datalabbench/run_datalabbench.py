@@ -1334,6 +1334,33 @@ def generate_report(results: List[QuestionResult], out_dir: Path, args,
         fp = f"{info['full_pct']:.1f}%" if info["full_pct"] is not None else "—"
         lines.append(f"| T{t} | {info['label']} | {info['n']} | {fp} | {info['auto_pct']:.1f}% |")
 
+    # ── v1.2 axes (R6, additive — same points regrouped, not a rescoring) ──
+    ax = rollup.get("axes", {})
+    faith = ax.get("faithfulness")
+    corr = ax.get("correctness")
+    lines += ["", "## Axes (v1.2, additive)", "",
+              "| Axis | Mean score | Notes |",
+              "|---|---|---|",
+              f"| Faithfulness (task/approach compliance) | {f'{faith:.1f}%' if faith is not None else '—'} | auto + approach-graded judge checkpoints |",
+              f"| Correctness (content/numbers right) | {f'{corr:.1f}%' if corr is not None else '—'} | content-graded judge checkpoints |",
+              f"| Fabrication signals | {ax.get('fabrication_signals', 0)} question(s) | GP-00 hits or zeroed fabrication-guard checkpoints |"]
+    _cm_rows = [
+        (r.id, r.citation_metrics) for r in results
+        if isinstance(r.citation_metrics, dict)
+    ]
+    if _cm_rows:
+        lines += ["", "### Citation metrics (R3, informational — not scored)", "",
+                  "| Question | Recall | Precision | Claim sentences | Citations |",
+                  "|---|---|---|---|---|"]
+        for qid, cm in _cm_rows:
+            rec = cm.get("citation_recall")
+            prec = cm.get("citation_precision")
+            lines.append(
+                f"| {qid} | {rec if rec is not None else '—'} "
+                f"| {prec if prec is not None else '—'} "
+                f"| {cm.get('claim_sentences', '—')} | {cm.get('citations_total', '—')} |"
+            )
+
     # ── Per-question cost column (the required DataLabBench cost surface) ──
     # cost is an estimate; a "—" cost with an "unpriced" source means the
     # question ran on a model with no known price (TACC / self-hosted), so its
