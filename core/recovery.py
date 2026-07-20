@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 # must never re-run an expensive DAG more than once).
 _GIVE_UP_RE = re.compile(
     r"(?i)(?:"
-    r"(?:cannot|can't|can\s+not|unable\s+to)\s+(?:be\s+)?"
+    r"(?:cannot|can't|can\s+not|couldn't|could\s+not|won't|will\s+not|"
+    r"wasn't|was\s+not|isn't|is\s+not|unable\s+to)\s+(?:be\s+)?"
+    r"(?:\w+ly\s+)?"
     r"(?:complet|perform|execut|run|do|carr)\w*\s+"
     r"(?:this|the|such)?\s*\w{0,12}\s*"
     r"(?:due\s+to|because\s+of|given|owing\s+to)\s+"
@@ -66,6 +68,70 @@ _COMPLETION_RE = re.compile(
     r"here\s+(?:are|is)\s+the\s+results?"
     r")\b"
 )
+
+# A completion phrase DIRECTLY preceded by a negator ("this canNOT be
+# completed successfully...") is a REFUSAL, not a completion report — it must
+# not feed the suppressor (verify-round CX-12 regression). Adjacent-only:
+# only an auxiliary ("be"/"been"/"being"/"get") may sit between the negator
+# and the phrase, so an unrelated "not"/"without" earlier in the sentence
+# ("did not use the naive scan and completed successfully") does not negate it.
+_NEG_CORE = (
+    r"\b(?:cannot|can't|can\s+not|couldn't|could\s+not|won't|will\s+not|"
+    r"never|unable\s+to|not|isn't|wasn't|doesn't|didn't|hasn't|haven't|"
+    r"fail(?:s|ed)?\s+to)\s+"
+    r"(?:(?:have|has|had)\s+been\s+|been\s+|be\s+|being\s+|get\s+|to\s+be\s+)?"
+)
+_NEGATION_ADJACENT_RE = re.compile(r"(?i)" + _NEG_CORE + r"$")
+_NEGATION_WITH_ADVERB_RE = re.compile(r"(?i)" + _NEG_CORE + r"(?:\w+ly\s+){1,2}$")
+
+# Structural disambiguation for "not <adverb> completed successfully":
+# focusing-adverb AFFIRMATIVES ("not only/merely/uniquely completed
+# successfully, but also… / ; the others also succeeded") always continue
+# with a correlative or additional-success clause; manner-adverb NEGATIONS
+# ("not fully completed successfully; it would require…") do not. Checking
+# the continuation instead of enumerating adverbs handles the whole class.
+# The continuation must carry ADDITIVE-SUCCESS content: "(but) also
+# <something that is not a failure verb>" or a "succeeded" that is not
+# preceded by a negative quantifier/failure word anywhere in the window.
+# Bare "but"/"additionally"/"as well" can introduce the refusal itself, and
+# "also failed" / "No fallback succeeded" are failures — none of those count.
+_AFFIRMATIVE_ALSO_RE = re.compile(
+    r"(?i)^[^.!?\n]{0,80}?\b(?:but\s+)?also\s+"
+    r"(?!fail|not\b|never\b|couldn|didn|doesn|wasn|isn|cannot\b|can't|won't"
+    r"|(?:did|could|does|do|can|will|would|may|might|must|is|was)\s+not\b)"
+    r"\w+"
+)
+_AFFIRMATIVE_SUCCEED_RE = re.compile(
+    r"(?i)^(?:(?!\b(?:no|none|neither|nothing|never|fail\w*|not)\b)[^.!?\n]){0,90}?"
+    r"\bsucceed(?:ed|s)?\b"
+)
+
+
+def _affirmative_continuation(tail: str) -> bool:
+    return bool(_AFFIRMATIVE_ALSO_RE.search(tail)
+                or _AFFIRMATIVE_SUCCEED_RE.search(tail))
+
+
+def _reports_completion(text: str) -> bool:
+    """True when the text affirmatively reports successful completion.
+
+    Misclassification here degrades GRACEFULLY, never corrupts an answer:
+    a false "completion" verdict merely skips the challenge — the refusal
+    passes through unchallenged, which is exactly the pre-R7 baseline
+    behavior — and a false "refusal" verdict costs at most ONE duplicate
+    subtask execution (the challenge is hard-capped at a single retry).
+    """
+    for match in _COMPLETION_RE.finditer(text):
+        prefix = text[max(0, match.start() - 80):match.start()]
+        if _NEGATION_ADJACENT_RE.search(prefix):
+            continue  # hard-negated completion ("cannot be completed…")
+        if _NEGATION_WITH_ADVERB_RE.search(prefix):
+            tail = text[match.end():match.end() + 90]
+            if _affirmative_continuation(tail):
+                return True  # "not only/merely/… , but also/succeeded…"
+            continue  # adverbial negation without continuation ("not fully…")
+        return True
+    return False
 
 # Appended to the task description on the single give-up replan.
 _BUDGET_STATEMENT = (
@@ -314,8 +380,11 @@ class RecoveryEngine:
             return None
         if not text:
             return None
+        # Normalize typographic apostrophes so "couldn’t"/"can’t" hit the
+        # same contraction alternatives as their ASCII forms.
+        text = text.replace("’", "'").replace("ʼ", "'")
         match = _GIVE_UP_RE.search(text)
-        if match and not _COMPLETION_RE.search(text):
+        if match and not _reports_completion(text):
             start = max(0, match.start() - 40)
             return text[start:match.end() + 60].strip()
         return None

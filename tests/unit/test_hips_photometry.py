@@ -218,3 +218,92 @@ def test_cx08_all_herschel_aliases_resolve():
     assert resolve_survey("spire250") == "ESAVO/P/HERSCHEL/SPIRE-250"
     assert resolve_survey("spire350") == "ESAVO/P/HERSCHEL/SPIRE-350"
     assert resolve_survey("spire500") == "ESAVO/P/HERSCHEL/SPIRE-500"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verify-round CX-03/CX-05 reopens
+# ─────────────────────────────────────────────────────────────────────────────
+def test_cx03_verify_capability_errors_carry_caveat(fake_hips):
+    from capabilities.base import CallContext
+    from capabilities.viz import HipsAperturePhotometry
+
+    cap = HipsAperturePhotometry()
+    ctx = CallContext(services={"set_last_run_result": lambda v: None})
+    # Unresolvable center (no target, no coords).
+    out = cap.run(cap.InputModel(), ctx).to_native()
+    assert out["success"] is False
+    assert out["accuracy_caveat"] == HIPS_PHOTOMETRY_CAVEAT
+
+
+def test_cx05_verify_explicit_empty_band_list_is_an_error(fake_hips):
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=[])
+    assert out["success"] is False and "at least one band" in out["error"]
+    assert out["accuracy_caveat"] == HIPS_PHOTOMETRY_CAVEAT
+    # Whitespace-only entries count as empty too.
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["  "])
+    assert out["success"] is False and "at least one band" in out["error"]
+
+
+def test_cx05_verify_explicit_zero_fov_and_width_are_errors(fake_hips):
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"], fov_deg=0)
+    assert out["success"] is False and "fov_deg" in out["error"]
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"], width=0)
+    assert out["success"] is False and "width" in out["error"]
+
+
+def test_cx05_verify_omitted_inputs_still_default(fake_hips):
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"])
+    assert out["success"] is True
+    assert out["aperture_radius_arcsec"] == 15.0
+
+
+def test_cx03_second_reopen_caveat_survives_import_failure(fake_hips, monkeypatch):
+    # Even if services.image_analysis fails to import inside run(), the error
+    # response still carries a caveat rather than raising.
+    import builtins
+
+    from capabilities.base import CallContext
+    from capabilities.viz import HipsAperturePhotometry
+
+    real_import = builtins.__import__
+
+    def _broken_import(name, *args, **kwargs):
+        if name == "services.image_analysis" or name.endswith("image_analysis"):
+            raise ImportError("simulated import failure")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(__import__("sys").modules, "services.image_analysis", raising=False)
+    monkeypatch.setattr(builtins, "__import__", _broken_import)
+    cap = HipsAperturePhotometry()
+    ctx = CallContext(services={"set_last_run_result": lambda v: None})
+    out = cap.run(cap.InputModel(ra=RA0, dec=DEC0), ctx).to_native()
+    assert out["success"] is False
+    assert "~10%" in out["accuracy_caveat"]
+
+
+def test_cx02_r9round_infinite_fov_is_an_error(fake_hips):
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"],
+                                   fov_deg=float("inf"))
+    assert out["success"] is False and "fov_deg" in out["error"]
+    assert out["accuracy_caveat"] == HIPS_PHOTOMETRY_CAVEAT
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"],
+                                   width=float("inf"))
+    assert out["success"] is False and "width" in out["error"]
+    assert out["accuracy_caveat"] == HIPS_PHOTOMETRY_CAVEAT
+
+
+def test_cx04_r9round_bands_none_uses_default_set(fake_hips):
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0)
+    assert out["success"] is True
+    assert out["n_bands_measured"] == 5
+    measured_bands = [m["band"] for m in out["measurements"] if m["status"] == "measured"]
+    assert measured_bands == ["galex_fuv", "galex_nuv", "sdss_g", "sdss_r", "sdss_i"]
+
+
+def test_cx05_r9round_zero_fov_width_errors_carry_caveat(fake_hips):
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"], fov_deg=0)
+    assert out["success"] is False
+    assert out["accuracy_caveat"] == HIPS_PHOTOMETRY_CAVEAT
+    out = hips_aperture_photometry(ra=RA0, dec=DEC0, bands=["sdss_g"], width=0)
+    assert out["success"] is False
+    assert out["accuracy_caveat"] == HIPS_PHOTOMETRY_CAVEAT

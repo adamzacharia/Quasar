@@ -230,3 +230,286 @@ def test_runner_source_carries_the_reinstall_pattern():
         "runner no longer captures/reinstalls the LLM context around the "
         "conductor thread"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R9 guard round (task-d3c8362-11851) — integration + isolation gates
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_llm_shim(tokens=(11, 7)):
+    """A REAL LLMClient responses shim with only the wire stubbed."""
+    import types
+
+    from core.llm_client import LLMClient
+
+    client = LLMClient(model="gpt-4o-mini")
+    shim = client.responses
+    shim._call_openai = lambda kwargs, attachments=None: types.SimpleNamespace(
+        usage=types.SimpleNamespace(input_tokens=tokens[0], output_tokens=tokens[1]),
+        output_text="ok",
+    )
+    return shim
+
+
+def test_cx01_full_chain_real_llmclient_accounting_through_executor_thread():
+    """The complete R9 chain with the REAL accounting client: sse-style
+    context (quota checker + recorder + BYOK key source) → conductor thread
+    (reinstall) → _execute_node → tool-executor thread (_with_request_ctx)
+    → LLMClient.responses.create() with only the provider wire stubbed.
+    Gates quota admission, BYOK key-source selection, usage recording, and
+    reservation settlement across BOTH thread hops."""
+    shim = _make_llm_shim()
+    recorded, granted, released = [], [], []
+
+    def tool_executor(task, dep_context, model, *extra):
+        out = shim.create(model="gpt-4o-mini", input=task, stream=False)
+        return out.output_text
+
+    conductor = _make_conductor(tool_executor=tool_executor)
+    run = _mini_run()
+    node = _Node()
+    holder = {}
+
+    with llm_request_context(
+        user_id="u-chain",
+        provider_api_keys={"openai": "sk-byok-test"},
+        key_source_by_provider={"openai": "user"},
+        usage_recorder=lambda **kw: recorded.append(kw),
+        quota_checker=lambda **kw: (granted.append(kw), f"res-{len(granted)}")[1],
+        quota_releaser=lambda rid: released.append(rid),
+    ):
+        parent_ctx = get_llm_request_context()
+
+        def conductor_thread_body():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                with reinstall_llm_request_context(parent_ctx):
+                    holder["result"] = loop.run_until_complete(
+                        conductor._execute_node(run, node)
+                    )
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=conductor_thread_body)
+        t.start()
+        t.join(timeout=30)
+
+    assert holder["result"] == "ok"
+    # Quota admission happened INSIDE the executor thread.
+    assert granted and granted[0]["provider"] == "openai"
+    # BYOK routing: the key source resolved from the reinstalled context.
+    assert granted[0]["key_source"] == "user"
+    # Usage recorded with the reservation settled, not leaked.
+    assert recorded and recorded[0]["input_tokens"] == 11
+    assert recorded[0]["output_tokens"] == 7
+    assert recorded[0]["key_source"] == "user"
+    assert recorded[0]["reservation_id"] == "res-1"
+    assert released == []
+
+
+def test_cx03_two_concurrent_requests_do_not_cross_contaminate():
+    """Two simultaneous request contexts (distinct users, recorders, key
+    sources) each drive their own conductor-thread chain concurrently; every
+    executor call must see ITS OWN context object and record into ITS OWN
+    recorder with its own key source."""
+    barrier = threading.Barrier(2, timeout=20)
+    outcomes = {}
+
+    def run_request(tag, key_source):
+        shim = _make_llm_shim()
+        recorded = []
+        seen = {}
+
+        def tool_executor(task, dep_context, model, *extra):
+            seen["ctx"] = get_llm_request_context()
+            barrier.wait()  # both executors in flight at the same time
+            out = shim.create(model="gpt-4o-mini", input=task, stream=False)
+            return f"done-{tag}"
+
+        conductor = _make_conductor(tool_executor=tool_executor)
+        run = _mini_run()
+        node = _Node()
+
+        with llm_request_context(
+            user_id=f"u-{tag}",
+            key_source_by_provider={"openai": key_source},
+            usage_recorder=lambda **kw: recorded.append(kw),
+        ):
+            parent_ctx = get_llm_request_context()
+
+            def body():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    with reinstall_llm_request_context(parent_ctx):
+                        loop.run_until_complete(conductor._execute_node(run, node))
+                finally:
+                    loop.close()
+
+            t = threading.Thread(target=body)
+            t.start()
+            t.join(timeout=30)
+
+        outcomes[tag] = {"ctx": seen["ctx"], "parent": parent_ctx,
+                         "recorded": recorded}
+
+    ta = threading.Thread(target=run_request, args=("A", "user"))
+    tb = threading.Thread(target=run_request, args=("B", "platform"))
+    ta.start(); tb.start()
+    ta.join(timeout=60); tb.join(timeout=60)
+
+    a, b = outcomes["A"], outcomes["B"]
+    # Each executor saw its own request's context object — never the other's.
+    assert a["ctx"] is a["parent"] and b["ctx"] is b["parent"]
+    assert a["ctx"] is not b["ctx"]
+    assert a["ctx"].user_id == "u-A" and b["ctx"].user_id == "u-B"
+    # Each recorder got exactly its own call, with its own key source.
+    assert len(a["recorded"]) == 1 and len(b["recorded"]) == 1
+    assert a["recorded"][0]["key_source"] == "user"
+    assert b["recorded"][0]["key_source"] == "platform"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R9 verify reopen (CX-01) — the PRODUCTION conductor tool executor
+# (QuasarAgent._conductor_tool_executor) driven through the full two-hop
+# chain with the real LLMClient facade, stubbed only at the OpenAI SDK
+# constructor — so BYOK key ROUTING (which api_key the SDK client is built
+# with) is proven, not just accounting metadata.
+# ─────────────────────────────────────────────────────────────────────────────
+def _fake_openai_factory(captured):
+    from types import SimpleNamespace
+
+    class _FakeResponses:
+        def create(self, **kwargs):
+            captured.setdefault("create_calls", []).append(kwargs)
+            return SimpleNamespace(
+                usage=SimpleNamespace(input_tokens=23, output_tokens=9),
+                output_text="production executor ok",
+                output=[],
+                id="resp-fake-1",
+            )
+
+    class _FakeOpenAI:
+        def __init__(self, *args, **kwargs):
+            captured.setdefault("client_kwargs", []).append(kwargs)
+            self.responses = _FakeResponses()
+
+    return _FakeOpenAI
+
+
+def _production_agent():
+    """A partially-constructed QuasarAgent carrying exactly the attributes
+    _conductor_tool_executor needs: the REAL recording LLMClient facade, a
+    (empty) tool registry, per-request TLS, and a no-MCP config."""
+    from types import SimpleNamespace
+
+    from core.agent import QuasarAgent
+    from core.llm_client import LLMClient
+    from core.tools import ToolRegistry
+
+    agent = QuasarAgent.__new__(QuasarAgent)
+    agent._tls = threading.local()
+    agent.tool_registry = ToolRegistry()
+    agent.client = LLMClient(model="gpt-4o-mini")
+    agent.config = SimpleNamespace(enable_mcp=False, mcp_server_url="", model="gpt-4o-mini")
+    return agent
+
+
+def test_cx01_reopen_production_executor_real_byok_routing(monkeypatch):
+    import openai
+
+    captured = {}
+    monkeypatch.setattr(openai, "OpenAI", _fake_openai_factory(captured))
+    # The platform env key must NOT be what reaches the SDK client.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-platform-env")
+    monkeypatch.delenv("HELICONE_API_KEY", raising=False)
+
+    agent = _production_agent()
+    recorded, granted, released = [], [], []
+
+    conductor = _make_conductor(tool_executor=agent._conductor_tool_executor)
+    run = _mini_run()
+    node = _Node()
+    holder = {}
+
+    with llm_request_context(
+        user_id="u-prod",
+        provider_api_keys={"openai": "sk-byok-context"},
+        key_source_by_provider={"openai": "user"},
+        usage_recorder=lambda **kw: recorded.append(kw),
+        quota_checker=lambda **kw: (granted.append(kw), f"res-{len(granted)}")[1],
+        quota_releaser=lambda rid: released.append(rid),
+    ):
+        parent_ctx = get_llm_request_context()
+
+        def conductor_thread_body():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                with reinstall_llm_request_context(parent_ctx):
+                    holder["result"] = loop.run_until_complete(
+                        conductor._execute_node(run, node)
+                    )
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=conductor_thread_body)
+        t.start()
+        t.join(timeout=60)
+
+    # The PRODUCTION executor ran end-to-end and returned the model text.
+    assert holder["result"] == "production executor ok"
+    # REAL BYOK routing: the OpenAI SDK client was constructed with the
+    # context's BYOK key (not the platform env key) INSIDE the executor
+    # thread — this is _get_openai_client resolving the reinstalled context.
+    assert captured["client_kwargs"], "the SDK client was never constructed"
+    used_keys = [kw.get("api_key") for kw in captured["client_kwargs"]]
+    assert used_keys == ["sk-byok-context"]
+    # Quota admission + usage recording + reservation settlement all fired
+    # through the real facade on the executor thread.
+    assert granted and granted[0]["provider"] == "openai"
+    assert granted[0]["key_source"] == "user"
+    assert recorded and recorded[0]["input_tokens"] == 23
+    assert recorded[0]["output_tokens"] == 9
+    assert recorded[0]["reservation_id"] == "res-1"
+    assert released == []
+
+
+def test_cx01_reopen_production_executor_platform_fallback(monkeypatch):
+    """Without a BYOK context key the SAME production path uses the platform
+    env key — proving the routing decision really is context-driven."""
+    import openai
+
+    captured = {}
+    monkeypatch.setattr(openai, "OpenAI", _fake_openai_factory(captured))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-platform-env")
+    monkeypatch.delenv("HELICONE_API_KEY", raising=False)
+
+    agent = _production_agent()
+    recorded = []
+    conductor = _make_conductor(tool_executor=agent._conductor_tool_executor)
+    run = _mini_run()
+    node = _Node()
+
+    with llm_request_context(
+        user_id="u-plat",
+        usage_recorder=lambda **kw: recorded.append(kw),
+    ):
+        parent_ctx = get_llm_request_context()
+
+        def body():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                with reinstall_llm_request_context(parent_ctx):
+                    loop.run_until_complete(conductor._execute_node(run, node))
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=body)
+        t.start()
+        t.join(timeout=60)
+
+    assert captured["client_kwargs"]
+    assert captured["client_kwargs"][0].get("api_key") == "sk-platform-env"
+    assert recorded and recorded[0]["key_source"] == "platform"

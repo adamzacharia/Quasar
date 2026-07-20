@@ -842,15 +842,33 @@ class HipsAperturePhotometry(BaseCapability):
     InputModel = HipsAperturePhotometryInput
     annotations = {"read_only": False, "cost": "network"}
 
+    # Minimal fallback if services.image_analysis itself fails to import —
+    # the caveat must survive even that error path (verify CX-03).
+    _CAVEAT_FALLBACK = (
+        "HiPS aperture photometry is suitable ONLY for work that does not "
+        "require better than ~10% flux accuracy."
+    )
+
+    @classmethod
+    def _caveat(cls) -> str:
+        try:
+            from services.image_analysis import HIPS_PHOTOMETRY_CAVEAT
+            return HIPS_PHOTOMETRY_CAVEAT
+        except Exception:
+            return cls._CAVEAT_FALLBACK
+
     def run(self, inp, ctx) -> ToolResult:
         set_lrr = ctx.service("set_last_run_result")
+        # CX-03: the ~10% caveat is mandatory on EVERY response shape this
+        # tool can produce — capability-level errors included.
         try:
             import services.image_analysis as image_analysis
 
             ra, dec, label = _resolve_capability_coords(inp.target_name, inp.ra, inp.dec)
             if ra is None or dec is None:
                 return _native({"success": False,
-                                "error": "Provide target_name or ra/dec for the aperture center."})
+                                "error": "Provide target_name or ra/dec for the aperture center.",
+                                "accuracy_caveat": self._caveat()})
             result = image_analysis.hips_aperture_photometry(
                 ra=ra, dec=dec,
                 bands=inp.bands,
@@ -868,7 +886,8 @@ class HipsAperturePhotometry(BaseCapability):
                 })
             return _native(result)
         except Exception as e:
-            return _native({"success": False, "error": str(e)})
+            return _native({"success": False, "error": str(e),
+                            "accuracy_caveat": self._caveat()})
 
 
 class HipsContourOverlayInput(_In):

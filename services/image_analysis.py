@@ -1358,26 +1358,46 @@ def hips_aperture_photometry(
             return _phot_error("Provide ra and dec (ICRS degrees) for the aperture center.")
         ra_f, dec_f = float(ra), float(dec)
         warnings: List[str] = [HIPS_PHOTOMETRY_CAVEAT]
-        band_list = [str(b) for b in (bands or _DEFAULT_PHOTOMETRY_BANDS) if str(b).strip()]
-        if not band_list:
-            return _phot_error("Provide at least one band/survey.")
+        # Guard CX-05: explicit invalid inputs are ERRORS; only omission
+        # (None) selects a default. An explicitly empty band list must not
+        # silently become the default set.
+        if bands is None:
+            band_list = list(_DEFAULT_PHOTOMETRY_BANDS)
+        else:
+            band_list = [str(b) for b in bands if str(b).strip()]
+            if not band_list:
+                return _phot_error("Provide at least one band/survey.")
         if len(band_list) > 10:
-            # Guard CX-05: never silently drop requested bands.
+            # Never silently drop requested bands.
             dropped = band_list[10:]
             band_list = band_list[:10]
             warnings.append(
                 "Band list capped at 10; dropped: " + ", ".join(dropped)
             )
-        # Guard CX-05: an explicit radius is validated as given — only an
-        # OMITTED radius gets the 15" default (0 is invalid, not "unset").
+        # An explicit radius is validated as given — only an OMITTED radius
+        # gets the 15" default (0 is invalid, not "unset").
         r_arcsec = 15.0 if radius_arcsec is None else float(radius_arcsec)
         if not (0.5 <= r_arcsec <= 900.0):
             return _phot_error("radius_arcsec must be between 0.5 and 900 arcsec.")
         # FoV large enough to hold the background annulus with margin; clamp
         # exactly like the fetch layer so provenance records the values that
-        # were actually requested (CX-06).
-        fov_req = float(fov_deg) if fov_deg else max(0.05, (2.25 * r_arcsec / 3600.0) * 4.0)
-        fov, width_i, fw_warnings = _normalize_fov_width(fov_req, width if width else 512)
+        # were actually requested (CX-06). Explicit non-positive fov/width are
+        # rejected rather than silently replaced (CX-05).
+        if fov_deg is not None:
+            fov_req = float(fov_deg)
+            if not (math.isfinite(fov_req) and fov_req > 0):
+                return _phot_error("fov_deg must be a positive finite field of view in degrees.")
+        else:
+            fov_req = max(0.05, (2.25 * r_arcsec / 3600.0) * 4.0)
+        if width is not None:
+            if not math.isfinite(float(width)):
+                return _phot_error("width must be a positive finite pixel count.")
+            width_req = int(width)
+            if width_req <= 0:
+                return _phot_error("width must be a positive finite pixel count.")
+        else:
+            width_req = 512
+        fov, width_i, fw_warnings = _normalize_fov_width(fov_req, width_req)
         warnings.extend(fw_warnings)
 
         svc = HipsImageService()
