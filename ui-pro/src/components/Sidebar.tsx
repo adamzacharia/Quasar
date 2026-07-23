@@ -8,7 +8,7 @@ import { useAuthStore } from "../lib/auth-store";
 import {
     Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
     ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu, Waves,
+    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu,
     Database, RefreshCw
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
@@ -660,14 +660,6 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
                         <MessageSquare className="w-5 h-5" />
                     </button>
                     <Link
-                        href="/spectral-lines"
-                        className={`sidebar-rail-button ${pathname === "/spectral-lines" ? "text-primary bg-primary/10" : ""}`}
-                        title="Spectral Line Explorer"
-                        aria-label="Spectral Line Explorer"
-                    >
-                        <Waves className="w-5 h-5" />
-                    </Link>
-                    <Link
                         href="/gallery"
                         className={`sidebar-rail-button ${pathname === "/gallery" ? "text-primary bg-primary/10" : ""}`}
                         title="Recipe Gallery"
@@ -775,11 +767,6 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             )}
 
             <div className={`${isDrawer ? "px-3.5 mb-3" : "px-4 mb-4"} space-y-1`}>
-                <Link href="/spectral-lines" onClick={onClose}
-                    className={`w-full flex items-center gap-3 rounded-xl transition-colors ${isDrawer ? "px-3 py-2.5 text-[12.5px] font-medium" : "px-3 py-2.5 text-sm"} ${pathname === "/spectral-lines" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                    <Waves className={isDrawer ? "size-[15px]" : "w-4 h-4"} />
-                    Spectral Line Explorer
-                </Link>
                 <Link href="/gallery" onClick={onClose}
                     className={`w-full flex items-center gap-3 rounded-xl transition-colors ${isDrawer ? "px-3 py-2.5 text-[12.5px] font-medium" : "px-3 py-2.5 text-sm"} ${pathname === "/gallery" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
                     <BookOpen className={isDrawer ? "size-[15px]" : "w-4 h-4"} />
