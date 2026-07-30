@@ -30,6 +30,14 @@ class DatalabImageService:
         self.sia_client = sia_client or DatalabSiaClient()
         self.plotting_service = plotting_service or PlottingService()
         self.download_timeout = float(os.getenv("DATALAB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "180"))
+        self._hips_service = None  # lazy — only needed for in-survey color completion
+
+    def _get_hips_service(self):
+        if self._hips_service is None:
+            from services.hips_images import HipsImageService
+
+            self._hips_service = HipsImageService(plotting_service=self.plotting_service)
+        return self._hips_service
 
     def search(self, ra: float, dec: float, fov_deg: float, *, catalog: Optional[str] = None, endpoint: Optional[str] = None) -> Dict[str, Any]:
         return self.sia_client.search(ra, dec, fov_deg, catalog=catalog, endpoint=endpoint)
@@ -198,7 +206,10 @@ class DatalabImageService:
     ) -> Dict[str, Any]:
         search = self.search(ra, dec, fov_deg, catalog=catalog, endpoint=endpoint)
         if search.get("coverage_gap"):
-            return self._gap_result(search, bands=[], provenance_extra={"ra": ra, "dec": dec, "fov_deg": fov_deg})
+            gap = self._gap_result(search, bands=[], provenance_extra={"ra": ra, "dec": dec, "fov_deg": fov_deg})
+            return self._same_survey_color_completion(
+                gap, search, ra=ra, dec=dec, fov_deg=fov_deg, catalog=catalog, healthy=[], title=title,
+            )
         rows = search.get("rows") or []
         # RGB band selection (red, green, blue). Choose from bands that have a
         # NON-broken cutout ref: coadd_all indexes broken cross-survey tiles
@@ -215,12 +226,15 @@ class DatalabImageService:
             healthy = [b for b in _WL_ORDER if b in set(self._bands_with_healthy_refs(rows))]
             if len(healthy) < 3:
                 # Fewer than 3 healthy bands -> a true 3-color composite is impossible
-                # here (e.g. only z is healthy at the exact M31 center). Report the
-                # honest healthy-band list so the model can offer a single-band cutout,
-                # a slightly offset/wider field, or a HiPS/DSS2 optical color panel.
-                return self._gap_result(
+                # from SIA tiles here (e.g. only z is healthy at the exact M31 center).
+                # Complete the color request IN-SURVEY from the same survey's official
+                # color HiPS; only when that too is unavailable does the gap surface.
+                gap = self._gap_result(
                     search, bands=healthy,
                     provenance_extra={"healthy_bands": healthy, "reason": "fewer than 3 bands with usable tiles"},
+                )
+                return self._same_survey_color_completion(
+                    gap, search, ra=ra, dec=dec, fov_deg=fov_deg, catalog=catalog, healthy=healthy, title=title,
                 )
             blue_b, red_b = healthy[0], healthy[-1]
             green_b = healthy[len(healthy) // 2]
@@ -434,6 +448,106 @@ class DatalabImageService:
         if coverage_note:
             result["note"] = coverage_note
         return result
+
+    def _same_survey_color_completion(
+        self,
+        gap: Dict[str, Any],
+        search: Mapping[str, Any],
+        *,
+        ra: float,
+        dec: float,
+        fov_deg: float,
+        catalog: Optional[str],
+        healthy: Sequence[str],
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Complete a color request IN-SURVEY when SIA lacks 3 usable bands.
+
+        Hard rule (beta eval 2026-07: 'color image of M31 from the DECam Legacy
+        Surveys' was answered with an optical/2MASS/WISE panel): a color-image
+        request must NEVER be answered with a different survey's imagery. When
+        the same survey publishes an official color HiPS, serve THAT — flagged
+        with provenance. When it does not, or the HiPS is blank at this
+        position, say the requested product cannot be made here and ask; the
+        model must not silently switch surveys.
+        """
+        from services.hips_images import color_hips_for_catalog
+
+        catalog_label = str(catalog or "ls_dr9")
+        healthy_list = [str(b) for b in (healthy or [])]
+        descriptor = color_hips_for_catalog(catalog_label)
+        # Compose the note from scratch rather than appending to the generic
+        # gap note: its "RETRY datalab_image_cutout" clause would contradict
+        # the ask-first instruction below (the single-band option is offered
+        # to the USER here, not retried silently).
+        base_note = (
+            "No image produced (coverage gap): "
+            + (
+                f"only band(s) {healthy_list} have usable tiles at this position"
+                if healthy_list
+                else "the SIA search returned 0 usable rows at this position"
+            )
+            + " (a color composite needs 3 bands)."
+        )
+        no_substitution = (
+            " Tell the user exactly that and ASK whether they want a single-band cutout"
+            + (f" (usable band(s) here: {healthy_list})" if healthy_list else "")
+            + " or a DIFFERENT survey instead — do NOT silently substitute another survey's imagery"
+            " (no hips_multiband_panel, no default optical/2MASS/WISE panels)."
+            " NEVER describe an image or claim bands were rendered when none were."
+        )
+        if descriptor is None:
+            gap["note"] = base_note + (
+                f" A true {catalog_label} color image cannot be produced at this position: "
+                f"{catalog_label} publishes no full-color HiPS to complete it from either."
+                + no_substitution
+            )
+            return gap
+        hips_out = self._get_hips_service().cutout(
+            ra, dec, fov_deg=fov_deg, survey=descriptor["hips_id"], width=512,
+            title=title, detect_blank=True,
+        )
+        if not hips_out.get("success") or hips_out.get("blank"):
+            reason = (
+                "a blank tile (position outside its footprint)"
+                if hips_out.get("blank")
+                else f"an error ({hips_out.get('error')})"
+            )
+            gap["note"] = base_note + (
+                f" The same-survey color HiPS ({descriptor['hips_id']}) was tried as completion but "
+                f"returned {reason} — a true {descriptor['survey_label']} color image cannot be "
+                "produced at this position by any available service." + no_substitution
+            )
+            gap["provenance"] = dict(gap.get("provenance") or {})
+            gap["provenance"]["color_hips_attempted"] = descriptor["hips_id"]
+            return gap
+        provenance = dict(search.get("provenance") or {})
+        provenance.update({
+            "service": "CDS hips2fits",
+            "color_hips": descriptor["hips_id"],
+            "survey": descriptor["survey_label"],
+            "healthy_sia_bands": healthy_list,
+            "hips2fits_params": (hips_out.get("provenance") or {}).get("params"),
+        })
+        note = (
+            f"True-color image of the {descriptor['survey_label']} served via CDS hips2fits "
+            f"({descriptor['hips_id']}): Data Lab SIA had fewer than 3 usable bands at this position "
+            + (f"(healthy band(s): {healthy_list})" if healthy_list else "(no usable tiles)")
+            + ", so this is the survey's official color HiPS — the SAME survey imaging through a "
+            "different image service. State this provenance when describing the image."
+        )
+        return {
+            "success": True,
+            "image_base64": hips_out.get("image_base64"),
+            "path": hips_out.get("path"),
+            "png_path": hips_out.get("png_path"),
+            "used_endpoint": "CDS hips2fits",
+            "bands_used": list(descriptor["bands"]),
+            "coverage_gap": False,
+            "color_hips_completion": descriptor["hips_id"],
+            "note": note,
+            "provenance": provenance,
+        }
 
     def cutout_grid(
         self,

@@ -1490,7 +1490,9 @@ class ResponsesShim:
         yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
 
         function_calls = {}
+        reasoning_done_emitted = False
         output_text = ""
+        reasoning_content = ""
         usage_obj = None
         finish_reason = None
 
@@ -1510,6 +1512,27 @@ class ResponsesShim:
                 finish_reason = choice.finish_reason
 
             delta = choice.delta
+
+            # gpt-oss serves its chain of thought as reasoning deltas. Forward
+            # them (same event type as DeepSeek) so a long-thinking round keeps
+            # the SSE inactivity watchdog fed and the Thinking box live instead
+            # of looking byte-dead for minutes. Content output is unchanged.
+            reasoning_delta = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
+            if reasoning_delta:
+                reasoning_content += reasoning_delta
+                yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
+                # No continue: content/tool_calls co-riding the same chunk
+                # must still be processed below or they'd be silently lost.
+
+            # If we were streaming reasoning but it has now stopped, emit done event
+            if not reasoning_done_emitted:
+                if delta.content or delta.tool_calls:
+                    yield StreamEvent(type="response.reasoning_summary_text.done")
+                    reasoning_done_emitted = True
+
             if delta.content:
                 output_text += delta.content
                 yield StreamEvent(type="response.output_text.delta", delta=delta.content)
@@ -1536,6 +1559,9 @@ class ResponsesShim:
                             item=fc,
                         )
 
+        if not reasoning_done_emitted:
+            yield StreamEvent(type="response.reasoning_summary_text.done")
+
         for fc in function_calls.values():
             yield StreamEvent(type="response.output_item.done", item=fc)
 
@@ -1543,7 +1569,8 @@ class ResponsesShim:
         if finish_reason and finish_reason != "stop":
             print(
                 f"[PROVIDER] tacc stream finish_reason={finish_reason!r} "
-                f"output_chars={len(output_text)} tool_calls={len(completed_items)}"
+                f"output_chars={len(output_text)} reasoning_chars={len(reasoning_content)} "
+                f"tool_calls={len(completed_items)}"
             )
         yield StreamEvent(
             type="response.completed",
@@ -1980,7 +2007,8 @@ class ResponsesShim:
             if reasoning_delta:
                 reasoning_content += reasoning_delta
                 yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
-                continue
+                # No continue: content/tool_calls co-riding the same chunk
+                # must still be processed below or they'd be silently lost.
 
             # If we were streaming reasoning but it has now stopped, emit done event
             if not reasoning_done_emitted:
@@ -2111,13 +2139,29 @@ class LLMClient:
         self._local_client = None
 
     @staticmethod
-    def _http_timeout():
-        """Shared bounded timeout policy for OpenAI-compatible providers."""
+    def _http_timeout(provider: str = ""):
+        """Shared bounded timeout policy for OpenAI-compatible providers.
+
+        The read timeout is per-provider: reasoning providers (gpt-oss via
+        TACC, DeepSeek thinking) legitimately go byte-silent for minutes during
+        prompt prefill / long thinking, and the old flat 90 s read timeout
+        killed those streams mid-turn with httpx.ReadTimeout (live 2026-07:
+        a long-thinking Gaia white-dwarf turn and an overnight run). Precedence:
+        LLM_READ_TIMEOUT_SECONDS_<PROVIDER> > LLM_READ_TIMEOUT_SECONDS >
+        per-provider default (600 s for tacc/deepseek, 300 s otherwise).
+        """
         import httpx
 
+        provider = (provider or "").strip().lower()
+        default_read = "600" if provider in {"tacc", "deepseek"} else "300"
+        read_timeout = (
+            (os.getenv(f"LLM_READ_TIMEOUT_SECONDS_{provider.upper()}") if provider else None)
+            or os.getenv("LLM_READ_TIMEOUT_SECONDS")
+            or default_read
+        )
         return httpx.Timeout(
             connect=float(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "15")),
-            read=float(os.getenv("LLM_READ_TIMEOUT_SECONDS", "90")),
+            read=float(read_timeout),
             write=float(os.getenv("LLM_WRITE_TIMEOUT_SECONDS", "30")),
             pool=float(os.getenv("LLM_POOL_TIMEOUT_SECONDS", "15")),
         )
@@ -2185,18 +2229,18 @@ class LLMClient:
         from openai import OpenAI
         context_key = self._resolve_context_api_key("openai")
         if context_key:
-            return OpenAI(api_key=context_key, timeout=self._http_timeout())
+            return OpenAI(api_key=context_key, timeout=self._http_timeout("openai"))
         if self._openai_client is None:
             api_key, key_source = self._resolve_api_key("openai", "OPENAI_API_KEY")
 
             helicone_key = os.getenv("HELICONE_API_KEY", "")
             if key_source == "byok":
-                return OpenAI(api_key=api_key, timeout=self._http_timeout())
+                return OpenAI(api_key=api_key, timeout=self._http_timeout("openai"))
             if helicone_key:
                 self._openai_client = OpenAI(
                     api_key=api_key,
                     base_url="https://oai.helicone.ai/v1",
-                    timeout=self._http_timeout(),
+                    timeout=self._http_timeout("openai"),
                     default_headers={
                         "Helicone-Auth": f"Bearer {helicone_key}",
                     },
@@ -2206,7 +2250,7 @@ class LLMClient:
                     "Dashboard: https://helicone.ai/dashboard"
                 )
             else:
-                self._openai_client = OpenAI(api_key=api_key, timeout=self._http_timeout())
+                self._openai_client = OpenAI(api_key=api_key, timeout=self._http_timeout("openai"))
         return self._openai_client
 
     def _get_anthropic_client(self):
@@ -2254,7 +2298,7 @@ class LLMClient:
             self._local_client = OpenAI(
                 base_url=base_url,
                 api_key="not-needed",  # Local servers don't require API keys
-                timeout=self._http_timeout(),
+                timeout=self._http_timeout("local"),
             )
         return self._local_client
 
@@ -2269,7 +2313,7 @@ class LLMClient:
             or TACC_DEFAULT_BASE_URL
         )
         if context_key:
-            return OpenAI(api_key=context_key, base_url=base_url, timeout=self._http_timeout())
+            return OpenAI(api_key=context_key, base_url=base_url, timeout=self._http_timeout("tacc"))
         if self._tacc_client is None:
             api_key = (
                 os.getenv("TACC_API_KEY", "")
@@ -2284,7 +2328,7 @@ class LLMClient:
             self._tacc_client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
-                timeout=self._http_timeout(),
+                timeout=self._http_timeout("tacc"),
             )
         return self._tacc_client
 
@@ -2294,14 +2338,14 @@ class LLMClient:
         context_key = self._resolve_context_api_key("deepseek")
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         if context_key:
-            return OpenAI(api_key=context_key, base_url=base_url, timeout=self._http_timeout())
+            return OpenAI(api_key=context_key, base_url=base_url, timeout=self._http_timeout("deepseek"))
         if self._deepseek_client is None:
             api_key, key_source = self._resolve_api_key("deepseek", "DEEPSEEK_API_KEY")
             if key_source == "byok":
-                return OpenAI(api_key=api_key, base_url=base_url, timeout=self._http_timeout())
+                return OpenAI(api_key=api_key, base_url=base_url, timeout=self._http_timeout("deepseek"))
             self._deepseek_client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
-                timeout=self._http_timeout(),
+                timeout=self._http_timeout("deepseek"),
             )
         return self._deepseek_client

@@ -1,0 +1,22 @@
+# Managed by Ansible (deploy/ansible).
+[Unit]
+Description=Quasar backend (FastAPI/uvicorn on :{{ quasar_backend_port }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ quasar_user }}
+Group={{ quasar_user }}
+# WorkingDirectory must be ui-pro: DiskCache and friends resolve CWD-relative
+# paths (ui-pro/cache/...), matching how dev runs it.
+WorkingDirectory={{ quasar_app_dir }}/ui-pro
+ExecStart={{ quasar_venv }}/bin/python launch.py
+Environment=PORT={{ quasar_backend_port }}
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

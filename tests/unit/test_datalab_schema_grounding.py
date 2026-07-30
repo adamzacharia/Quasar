@@ -166,6 +166,43 @@ def test_expansion_catalogs_listed_and_queryable(isolated_cache):
     assert "ls_dr10.tractor" in vq.sql.lower()
 
 
+def test_list_all_schemas_marks_governed_caches_and_survives_outage(isolated_cache, monkeypatch):
+    class _SchemasClient:
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, *, sql=None, fmt="pandas", **kwargs):
+            self.calls += 1
+            assert "tap_schema.schemas" in sql
+            return _Result(pd.DataFrame({
+                "schema_name": ["gaia_dr3", "delve_dr2", "buzzard_dr1"],
+                "description": ["Gaia DR3", "DELVE DR2", "Buzzard simulation"],
+            }))
+
+    client = _SchemasClient()
+    rows = reg.list_all_schemas(client)
+    assert client.calls == 1
+    by_name = {row["schema"]: row for row in rows}
+    # Curated AND verified-expansion catalogs are governed; the rest are not.
+    assert by_name["gaia_dr3"]["registry_governed"] is True
+    assert by_name["delve_dr2"]["registry_governed"] is True
+    assert by_name["buzzard_dr1"]["registry_governed"] is False
+    # A repeat listing is served from the cache — no re-poll.
+    assert reg.list_all_schemas(client) == rows and client.calls == 1
+
+    class _DeadClient:
+        def query(self, **kwargs):
+            raise RuntimeError("service unreachable")
+
+    # Stale cache + dead service: the stale list still beats nothing.
+    monkeypatch.setenv("DATALAB_TAP_SCHEMA_TTL_SECONDS", "0")
+    assert reg.list_all_schemas(_DeadClient()) == rows
+    # No cache at all + dead service: the failure propagates so the capability
+    # can degrade to the curated list with an explicit note.
+    with pytest.raises(RuntimeError, match="unreachable"):
+        reg.list_all_schemas(_DeadClient(), cache_dir=isolated_cache / "empty")
+
+
 def test_refresh_extra_tables_and_bad_names_rejected(isolated_cache):
     tables_df, columns_df = _schema_frames("catwise2020.main", {"ra": True, "dec": True})
     client = _FakeSchemaClient(tables_df, columns_df)

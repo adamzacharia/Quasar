@@ -96,6 +96,26 @@ def _sse_status(step: str, state: str = "running") -> str:
     return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
 
 
+def _provider_failure_error_message(failure: Any) -> Optional[str]:
+    """Map the runner's thread-local provider-failure record to the
+    chat_runs error_message, or None when no failure was recorded.
+
+    Gates on error_class, not message: the canonical failure
+    httpx.ReadTimeout('') stringifies EMPTY, and gating on the message let
+    those runs be recorded as 'completed'. The class name stands in when
+    the message is empty so error_message is never blank on a failed run.
+    """
+    if not isinstance(failure, dict):
+        return None
+    error_class = str(failure.get("error_class") or "")
+    message = str(failure.get("message") or "")
+    if not error_class and not message:
+        return None
+    if not error_class:
+        error_class = "ProviderError"
+    return f"{error_class}: {message}" if message else error_class
+
+
 def _normalize_web_url(value: Any) -> str:
     url = str(value or "").strip().strip("<>")
     url = url.rstrip(".,;:)]}'\"")
@@ -1020,6 +1040,10 @@ def _stream_chat_response(
                             "last_result": agent.last_run_result,
                             "tool_trace": list(getattr(agent, '_accumulated_tool_trace', []) or []),
                             "citation_metrics": getattr(_ctx_obj, "citation_metrics", None),
+                            # Set by the runner's turn-level error handler when a
+                            # provider failure was converted into friendly text —
+                            # the run must still be recorded as failed.
+                            "provider_failure": getattr(agent._tls, "last_provider_failure", None),
                         }
                         asyncio.run_coroutine_threadsafe(queue.put(("done", done_payload)), loop)
                     except Exception as e:
@@ -1413,6 +1437,18 @@ def _stream_chat_response(
                     _snapshot_last = payload.get("last_result") if isinstance(payload, dict) else None
                     _snapshot_tool_trace = payload.get("tool_trace", []) if isinstance(payload, dict) else []
                     _snapshot_citation_metrics = payload.get("citation_metrics") if isinstance(payload, dict) else None
+                    # A provider failure the runner converted into a friendly
+                    # message still ends the turn through this "done" path —
+                    # without this, chat_runs recorded it as completed and
+                    # provider failures were invisible in the DB. The stream
+                    # tail is unchanged (cards, usage, [DONE]); the settled
+                    # status reaches the client via the terminal run_meta.
+                    _provider_failure = payload.get("provider_failure") if isinstance(payload, dict) else None
+                    _pf_error_message = _provider_failure_error_message(_provider_failure)
+                    if _pf_error_message:
+                        run_status = "failed"
+                        run_error_code = "provider_error"
+                        run_error_message = _pf_error_message
                     break
                 if msg_type == "error":
                     run_status = "failed"

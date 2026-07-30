@@ -940,12 +940,13 @@ def test_build_cone_select_accepts_predicates():
 def test_point_source_cut_registry_defaults():
     from services import datalab_registry as reg
     assert reg.point_source_cut("nsc_dr2", "object") == {"column": "class_star", "op": ">", "value": 0.5}
-    assert reg.point_source_cut("des_dr1", "main") == {"column": "spread_model_r", "between": [-0.005, 0.005]}
+    # DES DR1 stellar convention: |spread_model_r| < 0.003.
+    assert reg.point_source_cut("des_dr1", "main") == {"column": "spread_model_r", "between": [-0.003, 0.003]}
     assert reg.point_source_cut("gaia_dr3", "gaia_source") is None  # no star/galaxy separator
     # Returned cut is a copy: mutating it must not corrupt the registry default.
     cut = reg.point_source_cut("des_dr1", "main")
     cut["between"].append(99)
-    assert reg.point_source_cut("des_dr1", "main")["between"] == [-0.005, 0.005]
+    assert reg.point_source_cut("des_dr1", "main")["between"] == [-0.003, 0.003]
 
 
 def test_cmd_point_sources_applies_registry_morphology_cut():
@@ -961,6 +962,27 @@ def test_cmd_point_sources_applies_registry_morphology_cut():
     assert out["success"] is True and out["image_base64"] and out["points"] > 0
     assert "class_star > 0.5" in client.sql[0]  # the cut is in the executed SQL, not post-hoc
     assert out["point_sources"] is True
+
+
+def test_diagram_annotates_sentinel_validity_filter_as_platform_guard():
+    # The machine-injected -5/50 cuts are sentinel removal, not science — the
+    # result must say so (warnings + provenance) so the model never imitates
+    # them as "noise floor" magnitude cuts (NOIRLab beta eval).
+    from services import datalab_orchestration as orch
+    from services.datalab_result_store import DatalabResultStore
+    from tests.unit.test_datalab_p1 import _MemoryPlottingService
+    client = _FakeNSCDiagramClient()
+    out = orch.color_magnitude_diagram(
+        "nsc_dr2", "object", 260.06, 57.92, 0.4, blue_band="g", red_band="r",
+        client=client, result_store=DatalabResultStore(enable_disk_cache=False),
+        plotting_service=_MemoryPlottingService(),
+    )
+    assert out["success"] is True
+    assert any("Validity filter" in w and "not a science cut" in w for w in out["warnings"])
+    filters = out["provenance"]["auto_validity_filters"]
+    assert filters["range"] == [-5.0, 50.0]
+    assert "gmag" in filters["columns"] and "rmag" in filters["columns"]
+    assert "not a science cut" in filters["purpose"]
 
 
 def test_cmd_explicit_value_cut_lands_in_sql():
@@ -1072,7 +1094,7 @@ def test_ccd_point_sources_applies_cut_and_skips_star_galaxy_split():
         client=client, result_store=DatalabResultStore(enable_disk_cache=False),
         plotting_service=_MemoryPlottingService(),
     )
-    assert out["success"] is True and "spread_model_r BETWEEN -0.005 AND 0.005" in client.sql[0]
+    assert out["success"] is True and "spread_model_r BETWEEN -0.003 AND 0.003" in client.sql[0]
     # The sample is already stars-only, so there is no stars/galaxies auto-split.
     assert out["split_col"] is None
     assert out["point_sources"] is True

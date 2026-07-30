@@ -1,0 +1,18 @@
+# Managed by Ansible (deploy/ansible).
+[Unit]
+Description=Quasar frontend (Next.js on 127.0.0.1:{{ quasar_frontend_port }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ quasar_user }}
+Group={{ quasar_user }}
+WorkingDirectory={{ quasar_app_dir }}/ui-pro
+ExecStart={{ quasar_app_dir }}/ui-pro/node_modules/.bin/next start -H 127.0.0.1 -p {{ quasar_frontend_port }}
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

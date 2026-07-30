@@ -1,0 +1,4 @@
+# Real inventory + any unencrypted secrets stay local.
+inventory.ini
+group_vars/vault.yml
+*.retry

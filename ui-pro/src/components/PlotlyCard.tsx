@@ -71,6 +71,178 @@ function darkenLayout(layout: Record<string, unknown> | undefined): Record<strin
     };
 }
 
+// ── Light "publication" export theme ──
+// The dark glass layout above is transparent-on-dark, so a PNG snapshot of it
+// is light-gray text on transparency — invisible once pasted into a white doc.
+// Both export paths (modebar camera + Download button) therefore render a
+// re-skinned CLONE of the live figure instead of snapshotting the DOM.
+const EXPORT_TEXT_COLOR = "#1e293b";                    // slate-800
+const EXPORT_GRID_COLOR = "rgba(100, 116, 139, 0.35)";  // slate-500, visible on white
+const EXPORT_AXIS_COLOR = "rgba(51, 65, 85, 0.9)";      // slate-700
+
+/** Plotly attaches the rendered figure to its root node; the minimal module
+ *  declaration doesn't model that, so widen locally where we read it back. */
+type PlotlyGraphDiv = HTMLElement & {
+    data?: unknown[];
+    layout?: Record<string, unknown>;
+};
+
+/** Plotly.toImage also accepts a figure spec in place of a graph div, which
+ *  lets us export the light re-skin without a visible re-theme flash. */
+type PlotlyToImageFromFigure = (
+    figure: { data: unknown[]; layout: Record<string, unknown>; config?: Record<string, unknown> },
+    options: { format: "png"; scale: number; width?: number; height?: number },
+) => Promise<string>;
+
+function withFontColor(font: unknown, color: string): Record<string, unknown> {
+    return { ...asRecord(font), color };
+}
+
+function rgbChannels(color: unknown): number[] | null {
+    if (typeof color !== "string") return null;
+    const value = color.trim().toLowerCase();
+    if (value === "white") return [255, 255, 255];
+    const hex = value.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/);
+    if (hex) {
+        return hex[1].length === 3
+            ? [...hex[1]].map((c) => parseInt(c + c, 16))
+            : [0, 2, 4].map((i) => parseInt(hex[1].slice(i, i + 2), 16));
+    }
+    const rgb = value.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    if (rgb) return rgb.slice(1, 4).map(Number);
+    return null;
+}
+
+/** True for colors that are illegible on a white background (white and very
+ *  light grays, i.e. every RGB channel >= 200). */
+function isNearWhite(color: unknown): boolean {
+    const channels = rgbChannels(color);
+    return channels !== null && channels.every((ch) => ch >= 200);
+}
+
+/** Wider net for text and guide lines: the dark-theme grays (slate-400 line
+ *  labels, slate marker shapes) sit well under the near-white bar yet are
+ *  still ~2:1 contrast on white. Trace palettes stay on the stricter check
+ *  so deliberately colored data is never touched. */
+function isLowContrastOnWhite(color: unknown): boolean {
+    const channels = rgbChannels(color);
+    return channels !== null && channels.every((ch) => ch >= 140);
+}
+
+/** Deep-clone the live (dark) layout and re-skin it for a standalone PNG:
+ *  solid white background, dark slate text, clearly visible grid and axes. */
+function lightExportLayout(layout: Record<string, unknown> | undefined): Record<string, unknown> {
+    const base = JSON.parse(JSON.stringify(layout ?? {})) as Record<string, unknown>;
+    // A dark template would resurrect light-on-dark defaults under our overrides.
+    delete base.template;
+
+    const axisKeys = Object.keys(base).filter((key) => /^[xy]axis\d*$/.test(key));
+    for (const required of ["xaxis", "yaxis"]) {
+        if (!axisKeys.includes(required)) axisKeys.push(required);
+    }
+    for (const key of axisKeys) {
+        const axis = asRecord(base[key]);
+        const axisTitle = asRecord(axis.title);
+        base[key] = {
+            ...axis,
+            gridcolor: EXPORT_GRID_COLOR,
+            zerolinecolor: EXPORT_AXIS_COLOR,
+            linecolor: EXPORT_AXIS_COLOR,
+            tickcolor: EXPORT_AXIS_COLOR,
+            tickfont: withFontColor(axis.tickfont, EXPORT_TEXT_COLOR),
+            title: { ...axisTitle, font: withFontColor(axisTitle.font, EXPORT_TEXT_COLOR) },
+        };
+    }
+
+    // Annotations keep deliberately colored text; anything light enough to
+    // wash out on white (incl. the slate-400 spectral-line labels) is darkened
+    // (colorless ones inherit the global font, which is dark below).
+    if (Array.isArray(base.annotations)) {
+        base.annotations = base.annotations.map((entry) => {
+            const annotation = asRecord(entry);
+            const font = asRecord(annotation.font);
+            return isLowContrastOnWhite(font.color)
+                ? { ...annotation, font: { ...font, color: EXPORT_TEXT_COLOR } }
+                : annotation;
+        });
+    }
+
+    // Guide shapes (spectral-line markers etc.) use slate strokes tuned for
+    // the dark theme — re-ink light ones so they survive on white.
+    if (Array.isArray(base.shapes)) {
+        base.shapes = base.shapes.map((entry) => {
+            const shape = asRecord(entry);
+            const line = asRecord(shape.line);
+            return isLowContrastOnWhite(line.color)
+                ? { ...shape, line: { ...line, color: EXPORT_AXIS_COLOR } }
+                : shape;
+        });
+    }
+
+    const title = typeof base.title === "string" ? { text: base.title } : asRecord(base.title);
+    return {
+        ...base,
+        paper_bgcolor: "#ffffff",
+        plot_bgcolor: "#ffffff",
+        font: withFontColor(base.font, EXPORT_TEXT_COLOR),
+        title: { ...title, font: withFontColor(title.font, EXPORT_TEXT_COLOR) },
+        legend: {
+            ...asRecord(base.legend),
+            bgcolor: "rgba(255, 255, 255, 0.9)",
+            bordercolor: EXPORT_GRID_COLOR,
+            font: withFontColor(asRecord(base.legend).font, EXPORT_TEXT_COLOR),
+        },
+    };
+}
+
+/** Re-map only trivially unsafe trace colors (white/near-white lines or
+ *  markers → dark slate). Full palette remapping is deliberately out of
+ *  scope — the white background + dark text/axes carry the fix. */
+function lightExportData(data: unknown[]): unknown[] {
+    return data.map((trace) => {
+        const record = asRecord(trace);
+        const line = asRecord(record.line);
+        const marker = asRecord(record.marker);
+        const remapLine = isNearWhite(line.color);
+        const remapMarker = isNearWhite(marker.color);
+        if (!remapLine && !remapMarker) return trace;
+        const out: Record<string, unknown> = { ...record };
+        if (remapLine) out.line = { ...line, color: EXPORT_TEXT_COLOR };
+        if (remapMarker) out.marker = { ...marker, color: EXPORT_TEXT_COLOR };
+        return out;
+    });
+}
+
+/** Render the light publication re-skin off-DOM and return a PNG data URL. */
+async function lightPngDataUrl(Plotly: PlotlyModule, el: PlotlyGraphDiv): Promise<string> {
+    const figure = {
+        // Clone the data like the layout: toImage's figure-spec branch hands
+        // traces to a hidden newPlot whose cleaning mutates them in place —
+        // live references would let that leak into the on-screen figure.
+        data: JSON.parse(JSON.stringify(
+            lightExportData(Array.isArray(el.data) ? el.data : []),
+        )) as unknown[],
+        layout: lightExportLayout(el.layout),
+        config: { displaylogo: false },
+    };
+    const toImage = Plotly.toImage as unknown as PlotlyToImageFromFigure;
+    return toImage(figure, {
+        format: "png",
+        scale: 2,
+        width: el.offsetWidth || 960,
+        height: el.offsetHeight || 480,
+    });
+}
+
+function triggerDownload(dataUrl: string, filename: string) {
+    const anchor = document.createElement("a");
+    anchor.href = dataUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+}
+
 function fileSlug(title?: string): string {
     const slug = (title || "quasar_plot").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     return slug || "quasar_plot";
@@ -174,12 +346,39 @@ export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCa
                 const Plotly = mod.default ?? (mod as unknown as PlotlyModule);
                 if (cancelled) return;
                 plotlyRef.current = Plotly;
-                await Plotly.newPlot(el, spec.data, darkenLayout(spec.layout), {
-                    responsive: true,
-                    displaylogo: false,
-                    modeBarButtonsToRemove: ["lasso2d"],
-                    toImageButtonOptions: { format: "png", filename: fileSlug(title), scale: 2 },
-                });
+                // The built-in camera snapshots the transparent dark layout
+                // (toImageButtonOptions cannot override layout), so swap it for
+                // an identical-looking button that exports the light re-skin.
+                const camera = (Plotly as unknown as { Icons?: { camera?: unknown } }).Icons?.camera;
+                const config: Record<string, unknown> = camera
+                    ? {
+                        responsive: true,
+                        displaylogo: false,
+                        modeBarButtonsToRemove: ["lasso2d", "toImage"],
+                        modeBarButtonsToAdd: [{
+                            name: "toImageLight",
+                            title: "Download plot as a png",
+                            icon: camera,
+                            click: (gd: PlotlyGraphDiv) => {
+                                void lightPngDataUrl(Plotly, gd)
+                                    .then((dataUrl) => triggerDownload(dataUrl, `${fileSlug(title)}.png`))
+                                    .catch(() => {
+                                        // Light export failed (e.g. canvas size cap):
+                                        // serve the server-rendered PNG instead of a dead click.
+                                        if (pngFallback) triggerDownload(pngFallback, `${fileSlug(title)}.png`);
+                                    });
+                            },
+                        }],
+                    }
+                    : {
+                        // Icons missing from the bundle: keep the stock camera
+                        // (dark export) rather than losing the button entirely.
+                        responsive: true,
+                        displaylogo: false,
+                        modeBarButtonsToRemove: ["lasso2d"],
+                        toImageButtonOptions: { format: "png", filename: fileSlug(title), scale: 2 },
+                    };
+                await Plotly.newPlot(el, spec.data, darkenLayout(spec.layout), config);
                 if (cancelled) return;
                 setStatus("ready");
             } catch {
@@ -193,23 +392,20 @@ export function PlotlyCard({ spec, title, pngFallback, meta, request }: PlotlyCa
                 try { plotlyRef.current.purge(el); } catch { /* already gone */ }
             }
         };
-    }, [spec, title]);
+    }, [spec, title, pngFallback]);
 
     const downloadPng = async () => {
         const Plotly = plotlyRef.current;
-        const el = plotRef.current;
+        const el = plotRef.current as PlotlyGraphDiv | null;
         if (!Plotly || !el || downloading) return;
         setDownloading(true);
         try {
-            const dataUrl = await Plotly.toImage(el, { format: "png", scale: 2 });
-            const anchor = document.createElement("a");
-            anchor.href = dataUrl;
-            anchor.download = `${fileSlug(title)}.png`;
-            document.body.appendChild(anchor);
-            anchor.click();
-            document.body.removeChild(anchor);
+            const dataUrl = await lightPngDataUrl(Plotly, el);
+            triggerDownload(dataUrl, `${fileSlug(title)}.png`);
         } catch {
-            // Export is best-effort; the modebar camera button remains available.
+            // Light export failed (e.g. canvas size cap): serve the
+            // server-rendered PNG instead of a dead click.
+            if (pngFallback) triggerDownload(pngFallback, `${fileSlug(title)}.png`);
         } finally {
             setDownloading(false);
         }

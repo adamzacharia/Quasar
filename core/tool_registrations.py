@@ -965,9 +965,23 @@ def register_tools(agent: "QuasarAgent") -> None:
     # Data Lab P0 catalog-TAP tools
     agent.tool_registry.register(Tool(
         name="datalab_list_catalogs",
-        description="List supported NOIRLab Astro Data Lab P0 catalogs and registered tables.",
+        description=(
+            "List NOIRLab Astro Data Lab catalogs. Default scope='registered' returns the curated, "
+            "registry-governed subset (best structured-builder support) and says so; scope='all' also "
+            "queries the live tap_schema for the COMPLETE schema list with descriptions, marking which "
+            "are registry-governed (degrades to the curated list, with a note, if the service is unreachable)."
+        ),
         function=agent._datalab_tool_fn("datalab_list_catalogs"),
-        parameters={"type": "object", "properties": {}, "required": []},
+        parameters={
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string", "enum": ["registered", "all"], "default": "registered",
+                    "description": "'registered' = curated governed subset; 'all' = complete live Data Lab schema inventory.",
+                },
+            },
+            "required": [],
+        },
         category="datalab",
     ))
 
@@ -1028,10 +1042,10 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "dec": {"type": "number"},
                 "radius_deg": {"type": "number"},
                 "columns": {"type": "array", "items": {"type": "string"}},
-                "limit": {"type": "integer", "default": 500},
+                "limit": {"type": "integer", "default": 500, "description": "Row-budget cap (cost governance, not a science cut); truncation is flagged in the result."},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'parallax_over_error','op':'>','value':5}]"},
                 "color_cut": {"type": "object", "description": "{'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
-                "morphology": {"type": "object", "description": "{'column':'class_star','op':'>','value':0.5}"},
+                "morphology": {"type": "object", "description": "Star cut e.g. {'column':'class_star','op':'>','value':0.5}; DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}"},
                 "async_submit": {"type": "boolean", "default": False, "description": "Submit as a background job and return job_id immediately (server-side with DATALAB_TOKEN, else local); poll datalab_job_status."},
             },
             "required": ["catalog", "table", "ra", "dec", "radius_deg"],
@@ -1057,8 +1071,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "all_sky": {"type": "boolean", "default": False, "description": "Explicitly run an unbounded whole-catalog aggregate (slow/expensive)."},
                 "color_cut": {"type": "object", "description": "e.g. {'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'gmag','op':'>','value':19.5}]"},
-                "morphology": {"type": "object", "description": "e.g. {'column':'class_star','op':'>','value':0.5}"},
-                "limit": {"type": "integer", "default": 5000},
+                "morphology": {"type": "object", "description": "Star cut e.g. {'column':'class_star','op':'>','value':0.5}; DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}"},
+                "limit": {"type": "integer", "default": 5000, "description": "Row-budget cap on returned cells (cost governance, not a science cut)."},
                 "async_submit": {"type": "boolean", "default": False, "description": "Submit as a background job and return job_id immediately (skips the sync attempt and auto-tiling); poll datalab_job_status."},
             },
             "required": ["catalog", "table"],
@@ -1144,7 +1158,9 @@ def register_tools(agent: "QuasarAgent") -> None:
         description=(
             "EXPERT/DEBUG ONLY: run governed raw native SQL against Data Lab. "
             "Requires expert_ack=true and a reason; q3c_join remains blocked outside the structured crossmatch builder. "
-            "Returns result_id only, not the full table."
+            "Returns result_id only, not the full table. Do NOT add LIMIT clauses or magnitude cuts the user "
+            "didn't ask for — the governor row-caps queries itself (default 500, ceiling 5000) and flags the "
+            "cap in warnings; disclose any cap to the user and offer async_submit/aggregates for the full selection."
         ),
         function=agent._datalab_tool_fn("datalab_sql_query"),
         parameters={
@@ -1225,7 +1241,15 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="datalab_color_image",
-        description="Render a Data Lab color image from deepest SIA stack images, reprojected to a common WCS before Lupton RGB composition. Auto-selects RGB bands (red=i or z, green=r, blue=g) unless 'bands' is given.",
+        description=(
+            "Render a Data Lab color image from deepest SIA stack images, reprojected to a common "
+            "WCS before Lupton RGB composition. Auto-selects RGB bands (red=i or z, green=r, blue=g) "
+            "unless 'bands' is given. THE tool for 'color image of <target> from <DECam/Legacy "
+            "Surveys/DES>' requests: when fewer than 3 bands have usable tiles it self-completes with "
+            "the SAME survey's official color HiPS via hips2fits (flagged in provenance), and when "
+            "even that is impossible its note says so — relay that and ask; never substitute "
+            "hips_multiband_panel or another survey."
+        ),
         function=agent._datalab_image_tool_fn("datalab_color_image"),
         parameters={
             "type": "object",
@@ -1439,7 +1463,7 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "step_deg": {"type": "number", "default": 0.05},
                 "color_cut": {"type": "object", "description": "e.g. {'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'gmag','op':'<','value':25}]"},
-                "morphology": {"type": "object", "description": "e.g. {'column':'class_star','op':'>','value':0.5} or {'column':'ext_coadd','between':[0,1]}"},
+                "morphology": {"type": "object", "description": "e.g. {'column':'class_star','op':'>','value':0.5}, {'column':'ext_coadd','between':[0,1]}, or the DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}"},
                 "top_n": {"type": "integer", "default": 5},
                 "fov_deg": {"type": "number", "default": 0.05},
                 "band": {"type": "string", "default": "g"},
@@ -1464,10 +1488,10 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "x_bands": {"type": "array", "items": {"type": "string"}, "description": "Two bands for the x color, e.g. ['g','r']."},
                 "y_bands": {"type": "array", "items": {"type": "string"}, "description": "Two bands for the y color, e.g. ['r','i']."},
                 "split_col": {"type": "string", "description": "Morphology column to split stars/galaxies (auto from registry if omitted, e.g. spread_model_r)."},
-                "split_threshold": {"type": "number", "default": 0.005},
-                "limit": {"type": "integer", "default": 3000},
+                "split_threshold": {"type": "number", "default": 0.003, "description": "Star/galaxy boundary on split_col (DES DR1: spread_model_r > 0.003 = galaxy)."},
+                "limit": {"type": "integer", "default": 3000, "description": "Row-budget cap on the plotted sample (cost governance, not a science cut)."},
                 "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (single panel, no star/galaxy split)."},
-                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5} or {'column':'ext_coadd','between':[0,1]}; overrides point_sources (single panel, no star/galaxy split)."},
+                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5}, {'column':'ext_coadd','between':[0,1]}, or the DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}; overrides point_sources (single panel, no star/galaxy split)."},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "Extra server-side cuts, e.g. [{'column':'flags_g','op':'=','value':0}]."},
             },
             "required": ["catalog"],
@@ -1490,9 +1514,9 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "blue_band": {"type": "string", "default": "g"},
                 "red_band": {"type": "string", "default": "r"},
                 "mag_band": {"type": "string", "description": "Magnitude (y) band; defaults to blue_band."},
-                "limit": {"type": "integer", "default": 5000},
-                "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (e.g. NSC class_star>0.5)."},
-                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5} or {'column':'ext_coadd','between':[0,1]}; overrides point_sources."},
+                "limit": {"type": "integer", "default": 5000, "description": "Row-budget cap on the plotted sample (cost governance, not a science cut)."},
+                "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (e.g. NSC class_star>0.5, DES |spread_model_r|<0.003)."},
+                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5}, {'column':'ext_coadd','between':[0,1]}, or the DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}; overrides point_sources."},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "Extra server-side cuts, e.g. [{'column':'parallax_over_error','op':'>','value':5}]."},
             },
             "required": ["catalog"],
@@ -1698,7 +1722,10 @@ def register_tools(agent: "QuasarAgent") -> None:
             "Fetch a live CDS hips2fits PNG cutout for 'show me X', 'what does X look like', "
             "or multiwavelength postage-stamp requests. Supports aliases optical/dss/dss2, sdss, "
             "2mass/nir, wise/mir, galex/uv, rosat/xray, fermi/gamma, vlass/radio, or raw HiPS IDs. "
-            "Use this for broad survey imagery; hips2fits exposes roughly 1000 HiPS surveys."
+            "Use this for broad survey imagery; hips2fits exposes roughly 1000 HiPS surveys. "
+            "For a color image of a SPECIFIC named survey, pass that survey's own color HiPS id "
+            "(e.g. CDS/P/DESI-Legacy-Surveys/DR10/color, CDS/P/DES-DR2/ColorIRG) — never a "
+            "different survey's imagery."
         ),
         function=agent._hips_cutout,
         parameters={
@@ -1718,8 +1745,11 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(Tool(
         name="hips_multiband_panel",
         description=(
-            "Render a multi-panel CDS hips2fits survey view for appearance or multiwavelength "
-            "postage-stamp requests. Defaults to optical, 2MASS, and WISE; failed panels are labeled."
+            "Render side-by-side panels from DIFFERENT surveys for EXPLICIT multi-wavelength "
+            "comparison requests only ('show X across optical/IR/radio'). Defaults to optical, "
+            "2MASS, and WISE; failed panels are labeled. NEVER use this for a 'color image' "
+            "request — a color image of one survey comes from datalab_color_image (DECam/Legacy "
+            "Surveys/DES) or hips_cutout/hips_rgb_composite with that survey's own color HiPS."
         ),
         function=agent._hips_multiband_panel,
         parameters={
@@ -1962,7 +1992,9 @@ def register_tools(agent: "QuasarAgent") -> None:
             "and PNG preview from surveys like DSS2 (optical), 2MASS (near-IR), "
             "SDSS (optical), WISE (mid-IR), NVSS/FIRST (radio). "
             "Use this when users ask for 'an image of', 'show me', 'DSS image', "
-            "or 'what does X look like'."
+            "or 'what does X look like'. For a COLOR image from a specific named "
+            "imaging survey (Legacy Surveys, DES, DECam), use datalab_color_image "
+            "instead — do not substitute one of these surveys."
         ),
         function=agent._viz_tool_fn("get_sky_image"),
         parameters={
@@ -2819,8 +2851,12 @@ def register_tools(agent: "QuasarAgent") -> None:
             "wise_w1..w4, galex_nuv/fuv, dss2_red/dss2_blue — or raw IDs like "
             "'CDS/P/SDSS9/i'. Avoid the color aliases (wise/2mass/sdss/optical): "
             "they are multi-plane and make poor channels. Channels arrive "
-            "pixel-aligned from hips2fits; blank layers are rejected. Default "
-            "is 2MASS K/H/J."
+            "pixel-aligned from hips2fits; blank layers are rejected. The band "
+            "triplet MUST match the requested survey and wavelength regime: an "
+            "optical request needs optical bands (e.g. sdss_i/sdss_r/sdss_g), "
+            "and the 2MASS K/H/J default applies ONLY when no bands are given "
+            "AND near-IR fits the request — never let it hijack an optical or "
+            "survey-specific color request."
         ),
         function=agent._viz_tool_fn("hips_rgb_composite"),
         parameters={

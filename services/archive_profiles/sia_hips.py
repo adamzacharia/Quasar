@@ -44,7 +44,8 @@ PROFILE = ArchiveProfile.model_validate(
             },
             {
                 "id": "multiband_panel",
-                "purpose": "Side-by-side multiwavelength panels (defaults optical/2MASS/WISE).",
+                "purpose": "Side-by-side multiwavelength COMPARISON panels (defaults optical/2MASS/WISE) — "
+                           "only for explicit cross-wavelength requests, never for a 'color image' request.",
                 "tool": "hips_multiband_panel",
                 "request_kind": "http_get",
                 "parameters": [
@@ -74,10 +75,23 @@ PROFILE = ArchiveProfile.model_validate(
                 "prompt_rank": 1,
             },
             {
-                "id": "coverage_limits",
-                "summary": "VLASS covers Dec > -40 only; Legacy Surveys imaging is g,r,z (NO i band); if a DECam color image lacks 3 usable bands, fall back to hips_cutout and say so",
+                "id": "color_stays_on_survey",
+                "summary": "a 'color image of survey X' request stays on survey X: use datalab_color_image (it self-completes from X's own color HiPS) — NEVER hips_multiband_panel",
+                "detail": (
+                    "datalab_color_image already falls back to the SAME survey's official color HiPS "
+                    "(via hips2fits) when Data Lab SIA has fewer than 3 usable bands, and its note says "
+                    "when even that is impossible — relay that verbatim and ASK the user; never "
+                    "substitute hips_multiband_panel (defaults optical/2MASS/WISE) or another survey's "
+                    "imagery for the requested product. Coverage facts: Legacy Surveys imaging is "
+                    "g,r,z (NO i band); VLASS covers Dec > -40 only."
+                ),
                 "applies_to": [{"kind": "archive", "ref": "sia_hips"}],
                 "prompt_rank": 2,
+            },
+            {
+                "id": "coverage_limits",
+                "summary": "VLASS covers Dec > -40 only; Legacy Surveys imaging is g,r,z (NO i band)",
+                "applies_to": [{"kind": "archive", "ref": "sia_hips"}],
             },
             {
                 "id": "fresh_image_per_turn",

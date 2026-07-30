@@ -208,6 +208,102 @@ def test_color_image_refuses_sliver_common_coverage(monkeypatch):
     assert "mostly black" in result["error"]
 
 
+# ── Same-survey color completion (no product substitution on color requests) ──
+# Beta eval 2026-07: 'color image of M31 from the DECam Legacy Surveys' was
+# answered with an optical/2MASS/WISE panel. When SIA has <3 usable bands the
+# service now completes IN-SURVEY from that survey's official color HiPS, and
+# when even that fails it says the product cannot be made — never substitutes.
+
+class _FakeColorHips:
+    def __init__(self, blank=False, success=True):
+        self.blank = blank
+        self.success = success
+        self.calls = []
+
+    def cutout(self, ra, dec, fov_deg=0.25, survey="optical", width=512, title=None, detect_blank=False):
+        self.calls.append({"ra": ra, "dec": dec, "fov_deg": fov_deg, "survey": survey,
+                           "width": width, "detect_blank": detect_blank})
+        if not self.success:
+            return {"success": False, "error": "hips2fits down"}
+        return {
+            "success": True,
+            "image_base64": "abc",
+            "path": "/plots/hips_color.png",
+            "png_path": None,
+            "blank": self.blank,
+            "provenance": {"params": {"hips": survey}},
+        }
+
+
+def _lsdr9_m31_rows():
+    # M31-like inventory: only z has a healthy tile; the g/r refs carry the
+    # known-broken empty col= pattern (LGS tiles that 500 server-side).
+    return [
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "g", "exptime": 900, "access_url": "https://x/cutout?col=&siaRef=g.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "r", "exptime": 900, "access_url": "https://x/cutout?col=&siaRef=r.fits"},
+        {"proctype": "Stack", "prodtype": "image", "obs_bandpass": "z", "exptime": 300, "access_url": "https://x/cutout?col=mzls&siaRef=z.fits"},
+    ]
+
+
+def test_color_image_completes_in_survey_from_color_hips():
+    service = DatalabImageService(sia_client=_FakeSia(_lsdr9_m31_rows()))
+    fake = _FakeColorHips()
+    service._hips_service = fake
+    out = service.color_image(10.68, 41.27, 0.1, catalog="ls_dr9")
+    assert out["success"] is True and out["coverage_gap"] is False
+    assert out["color_hips_completion"] == "CDS/P/DESI-Legacy-Surveys/DR10/color"
+    assert out["bands_used"] == ["g", "r", "z"]
+    assert "True-color" in out["note"] and "hips2fits" in out["note"]
+    assert out["provenance"]["color_hips"] == "CDS/P/DESI-Legacy-Surveys/DR10/color"
+    assert out["provenance"]["healthy_sia_bands"] == ["z"]
+    # The completion fetched the SAME survey's color HiPS with blank detection on.
+    assert fake.calls[0]["survey"] == "CDS/P/DESI-Legacy-Surveys/DR10/color"
+    assert fake.calls[0]["detect_blank"] is True
+
+
+def test_color_image_blank_color_hips_reports_impossible_not_substitute():
+    # Live M31 case: the DR10 color HiPS MOC does not reach the DR9-north area,
+    # so hips2fits serves a uniform PNG there — must NOT be shipped as the image.
+    service = DatalabImageService(sia_client=_FakeSia(_lsdr9_m31_rows()))
+    service._hips_service = _FakeColorHips(blank=True)
+    out = service.color_image(10.68, 41.27, 0.1, catalog="ls_dr9")
+    assert out["coverage_gap"] is True and out["image_base64"] is None
+    assert "cannot be produced" in out["note"]
+    assert "hips_multiband_panel" in out["note"]  # the substitution ban is explicit
+    assert out["provenance"]["color_hips_attempted"] == "CDS/P/DESI-Legacy-Surveys/DR10/color"
+
+
+def test_color_image_no_color_hips_survey_says_so_and_asks():
+    class _NeverHips:
+        def cutout(self, *a, **k):
+            raise AssertionError("catalog has no color HiPS — completion must not be attempted")
+
+    service = DatalabImageService(sia_client=_FakeSia(_lsdr9_m31_rows()))
+    service._hips_service = _NeverHips()
+    out = service.color_image(10.68, 41.27, 0.1, catalog="smash_dr2")
+    assert out["coverage_gap"] is True
+    assert "publishes no full-color HiPS" in out["note"]
+    assert "do NOT silently substitute" in out["note"]
+
+
+def test_color_image_zero_row_gap_also_completes_in_survey():
+    service = DatalabImageService(sia_client=_FakeSia([]))
+    fake = _FakeColorHips()
+    service._hips_service = fake
+    out = service.color_image(150.0, 2.2, 0.1, catalog="ls_dr10")
+    assert out["success"] is True
+    assert out["color_hips_completion"] == "CDS/P/DESI-Legacy-Surveys/DR10/color"
+    assert fake.calls  # the completion path ran off the empty SIA search too
+
+
+def test_sia_hips_profile_routes_color_requests_away_from_multiband_panel():
+    from services.archive_profiles.sia_hips import PROFILE
+
+    ranked = " ".join(PROFILE.prompt_pitfalls())
+    assert "datalab_color_image" in ranked
+    assert "NEVER hips_multiband_panel" in ranked
+
+
 def test_svo_client_returns_cached_wavelengths(monkeypatch):
     calls = {"n": 0}
 

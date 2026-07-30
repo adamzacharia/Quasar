@@ -1,0 +1,49 @@
+# Template for the encrypted secrets file. Create the real one with:
+#
+#   ansible-vault create group_vars/vault.yml
+#
+# then paste this structure in and fill the values (copy them from your local
+# working .env / the Render dashboard). NEVER commit an unencrypted vault.yml.
+# Keys listed here mirror the root .env the backend loads (api/bootstrap.py).
+# Omit anything you don't use — only non-empty keys are written to .env.
+---
+quasar_env_secrets:
+  # LLM providers
+  OPENAI_API_KEY: ""
+  ANTHROPIC_API_KEY: ""
+  GEMINI_API_KEY: ""
+  GROQ_API_KEY: ""
+  DEEPSEEK_API_KEY: ""
+  OPENROUTER_API_KEY: ""
+  SAMBANOVA_API_KEY: ""
+  TACC_API_KEY: ""
+  TACC_BASE_URL: ""
+
+  # Web search / papers
+  TAVILY_API_KEY: ""
+  EXA_API_KEY: ""
+  BRAVE_API_KEY: ""
+  NASA_ADS_API_KEY: ""
+  OPENALEX_API_KEY: ""
+
+  # Persistence
+  TURSO_DATABASE_URL: ""
+  TURSO_AUTH_TOKEN: ""
+  QDRANT_URL: ""
+  QDRANT_API_KEY: ""
+
+  # Auth
+  GOOGLE_CLIENT_ID: ""
+  JWT_SECRET: ""
+  ADMIN_EMAILS: ""
+
+  # Integrations
+  HF_token: ""
+  DATALAB_TOKEN: ""
+
+  # Observability (optional)
+  LANGFUSE_SECRET_KEY: ""
+  LANGFUSE_PUBLIC_KEY: ""
+  LANGFUSE_BASE_URL: ""
+  ROLLBAR_ACCESS_TOKEN: ""
+  ROLLBAR_ENVIRONMENT: "tacc-vm"

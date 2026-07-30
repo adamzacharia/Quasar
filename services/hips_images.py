@@ -70,6 +70,45 @@ SURVEY_ALIASES: Dict[str, str] = {
 COLOR_HIPS_ALIASES = frozenset({"optical", "dss", "dss2", "sdss", "2mass", "nir",
                                 "wise", "mir", "galex", "uv", "gamma", "fermi"})
 
+# Official full-color HiPS for the governed Data Lab imaging catalogs — the
+# SAME survey program served through CDS instead of the Data Lab cutout
+# service. DatalabImageService.color_image uses this to complete a color
+# request in-survey when SIA has <3 usable bands (hard rule: a color request
+# never gets another survey's imagery). IDs verified live against hips2fits
+# 2026-07-28; DELVE, NSC, and SMASH publish no color HiPS. ls_dr9 maps to the
+# DR10 color HiPS: CDS has no DR9 color HiPS and DR10 is the same DECam g/r/z
+# imaging program (note the DR10 MOC does NOT reach the DR9-north BASS/MzLS
+# area, e.g. M31 — callers must blank-check the returned tile).
+CATALOG_COLOR_HIPS: Dict[str, Dict[str, Any]] = {
+    "ls_dr9": {
+        "hips_id": "CDS/P/DESI-Legacy-Surveys/DR10/color",
+        "survey_label": "DECam Legacy Surveys (DESI Legacy Imaging Surveys DR10)",
+        "bands": ["g", "r", "z"],
+    },
+    "ls_dr10": {
+        "hips_id": "CDS/P/DESI-Legacy-Surveys/DR10/color",
+        "survey_label": "DECam Legacy Surveys (DESI Legacy Imaging Surveys DR10)",
+        "bands": ["g", "r", "z"],
+    },
+    "des_dr1": {
+        "hips_id": "CDS/P/DES-DR1/ColorIRG",
+        "survey_label": "Dark Energy Survey DR1",
+        "bands": ["i", "r", "g"],
+    },
+    "des_dr2": {
+        "hips_id": "CDS/P/DES-DR2/ColorIRG",
+        "survey_label": "Dark Energy Survey DR2",
+        "bands": ["i", "r", "g"],
+    },
+}
+
+
+def color_hips_for_catalog(catalog: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Color-HiPS descriptor for a governed imaging catalog, or None when the
+    survey publishes no full-color HiPS (the caller must then say the requested
+    product cannot be made rather than switch surveys)."""
+    return CATALOG_COLOR_HIPS.get(str(catalog or "").strip().lower())
+
 
 class HipsImageError(ValueError):
     """Raised for user-correctable HiPS image failures."""
@@ -168,6 +207,7 @@ class HipsImageService:
         width: Any = 512,
         stretch: Optional[str] = None,
         title: Optional[str] = None,
+        detect_blank: bool = False,
     ) -> Dict[str, Any]:
         try:
             ra_f, dec_f = _validate_coords(ra, dec)
@@ -180,7 +220,12 @@ class HipsImageService:
             with open(png_path, "wb") as handle:
                 handle.write(png_bytes)
             image_base64 = base64.b64encode(png_bytes).decode("ascii")
-            return {
+            coverage_note = (
+                "blank (out-of-footprint) tiles are detected and flagged via the 'blank' key."
+                if detect_blank else
+                "hips2fits can return a blank PNG outside a survey footprint; blankness is not detected in v1."
+            )
+            result = {
                 "success": True,
                 "image_base64": image_base64,
                 "path": f"/plots/{name}.png",
@@ -197,11 +242,31 @@ class HipsImageService:
                     "base_url": self.base_url,
                     "params": self._params(survey_id, ra_f, dec_f, fov, width_i, stretch=stretch),
                     "title": title,
-                    "coverage_note": "hips2fits can return a blank PNG outside a survey footprint; blankness is not detected in v1.",
+                    "coverage_note": coverage_note,
                 },
             }
+            if detect_blank:
+                result["blank"] = self._png_is_blank(png_bytes)
+            return result
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def _png_is_blank(png_bytes: bytes) -> bool:
+        """True when every pixel is identical — hips2fits' out-of-footprint
+        response (verified live: the DR10 color HiPS serves a uniform PNG at
+        M31, which sits outside its MOC). Undecodable bytes count as not-blank
+        so a decode hiccup can't spuriously suppress a real image."""
+        try:
+            import io as _io
+
+            import numpy as np
+            from PIL import Image
+
+            arr = np.asarray(Image.open(_io.BytesIO(png_bytes)).convert("RGB"))
+            return bool(arr.size == 0 or int(arr.max()) == int(arr.min()))
+        except Exception:
+            return False
 
     def multiband_panel(
         self,
@@ -263,6 +328,12 @@ class HipsImageService:
                 "surveys": survey_list,
                 "warnings": warnings,
                 "panels": panels,
+                "note": (
+                    "Multi-wavelength COMPARISON figure (one panel per survey) — NOT a color "
+                    "image of any single survey. Describe it as a cross-survey comparison; a "
+                    "'color image of survey X' request is served by datalab_color_image or "
+                    "survey X's own color HiPS instead."
+                ),
                 "provenance": {
                     "service": "CDS hips2fits",
                     "base_url": self.base_url,
@@ -537,4 +608,11 @@ class HipsImageService:
         return params
 
 
-__all__ = ["HipsImageError", "HipsImageService", "SURVEY_ALIASES", "resolve_survey"]
+__all__ = [
+    "CATALOG_COLOR_HIPS",
+    "HipsImageError",
+    "HipsImageService",
+    "SURVEY_ALIASES",
+    "color_hips_for_catalog",
+    "resolve_survey",
+]

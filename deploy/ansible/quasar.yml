@@ -1,0 +1,234 @@
+# Quasar single-VM deploy (backend :8000 + optional frontend :3001 behind nginx).
+#
+#   ansible-playbook -i inventory.ini quasar.yml                 # full provision / rebuild
+#   ansible-playbook -i inventory.ini quasar.yml --tags deploy   # update code + restart only
+#
+# Tested targets: Ubuntu 24.04 and Rocky/RHEL 9. See README.md in this
+# directory for secrets (ansible-vault), TLS, and TACC firewall notes.
+---
+- name: Provision Quasar VM
+  hosts: quasar
+  become: true
+
+  handlers:
+    - name: restart quasar-backend
+      ansible.builtin.systemd:
+        name: quasar-backend
+        state: restarted
+        daemon_reload: true
+
+    - name: restart quasar-frontend
+      ansible.builtin.systemd:
+        name: quasar-frontend
+        state: restarted
+        daemon_reload: true
+      when: quasar_deploy_frontend
+
+    - name: reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    # ── System packages ──────────────────────────────────────────────
+    - name: Install system packages (Debian/Ubuntu)
+      when: ansible_os_family == "Debian"
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - git
+          - nginx
+          - acl                     # lets become_user work for the unprivileged app user
+          - build-essential
+          - "{{ quasar_python }}"
+          - "{{ quasar_python }}-venv"
+          - "{{ quasar_python }}-dev"
+      tags: [system]
+
+    - name: Install system packages (RHEL/Rocky)
+      when: ansible_os_family == "RedHat"
+      ansible.builtin.dnf:
+        name:
+          - git
+          - nginx
+          - acl
+          - gcc
+          - gcc-c++
+          - make
+          - "{{ quasar_python }}"
+          - "{{ quasar_python }}-devel"
+      tags: [system]
+
+    - name: Add NodeSource repo (Node {{ quasar_node_major }}.x)
+      ansible.builtin.shell: |
+        curl -fsSL https://{{ 'deb' if ansible_os_family == 'Debian' else 'rpm' }}.nodesource.com/setup_{{ quasar_node_major }}.x | bash -
+      args:
+        creates: "{{ '/etc/apt/sources.list.d/nodesource.list' if ansible_os_family == 'Debian' else '/etc/yum.repos.d/nodesource-nodejs.repo' }}"
+      tags: [system]
+
+    - name: Install Node.js
+      ansible.builtin.package:
+        name: nodejs
+        state: present
+      tags: [system]
+
+    # ── App user + directories ───────────────────────────────────────
+    - name: Create quasar system user
+      ansible.builtin.user:
+        name: "{{ quasar_user }}"
+        system: true
+        shell: /bin/bash
+        home: "/home/{{ quasar_user }}"
+        create_home: true
+      tags: [system]
+
+    - name: Create app root
+      ansible.builtin.file:
+        path: "{{ quasar_root }}"
+        state: directory
+        owner: "{{ quasar_user }}"
+        group: "{{ quasar_user }}"
+        mode: "0755"
+      tags: [system]
+
+    # ── Optional GitHub deploy key (private repo over SSH) ───────────
+    - name: Install GitHub deploy key
+      when: quasar_git_deploy_key_src is defined
+      tags: [system, deploy]
+      block:
+        - name: Ensure .ssh dir
+          ansible.builtin.file:
+            path: "/home/{{ quasar_user }}/.ssh"
+            state: directory
+            owner: "{{ quasar_user }}"
+            group: "{{ quasar_user }}"
+            mode: "0700"
+
+        - name: Copy deploy key
+          ansible.builtin.copy:
+            src: "{{ quasar_git_deploy_key_src }}"
+            dest: "/home/{{ quasar_user }}/.ssh/id_ed25519"
+            owner: "{{ quasar_user }}"
+            group: "{{ quasar_user }}"
+            mode: "0600"
+
+    # ── Source checkout ──────────────────────────────────────────────
+    - name: Clone / update Quasar ({{ quasar_git_version }})
+      ansible.builtin.git:
+        repo: "{{ quasar_repo_url }}"
+        dest: "{{ quasar_app_dir }}"
+        version: "{{ quasar_git_version }}"
+        accept_newhostkey: true
+        force: false
+      become_user: "{{ quasar_user }}"
+      notify:
+        - restart quasar-backend
+        - restart quasar-frontend
+      tags: [app, deploy]
+
+    # ── Backend: venv + deps + .env + service ────────────────────────
+    - name: Create venv and install Python requirements
+      ansible.builtin.pip:
+        requirements: "{{ quasar_app_dir }}/requirements.txt"
+        virtualenv: "{{ quasar_venv }}"
+        virtualenv_command: "{{ quasar_python }} -m venv"
+      become_user: "{{ quasar_user }}"
+      notify: restart quasar-backend
+      tags: [app, deploy]
+
+    - name: Render root .env (config + vault secrets)
+      ansible.builtin.template:
+        src: templates/env.j2
+        dest: "{{ quasar_app_dir }}/.env"
+        owner: "{{ quasar_user }}"
+        group: "{{ quasar_user }}"
+        mode: "0600"
+      notify: restart quasar-backend
+      tags: [app, deploy]
+
+    - name: Install quasar-backend systemd unit
+      ansible.builtin.template:
+        src: templates/quasar-backend.service.j2
+        dest: /etc/systemd/system/quasar-backend.service
+        mode: "0644"
+      notify: restart quasar-backend
+      tags: [app]
+
+    - name: Enable + start quasar-backend
+      ansible.builtin.systemd:
+        name: quasar-backend
+        enabled: true
+        state: started
+        daemon_reload: true
+      tags: [app]
+
+    # ── Frontend: npm build + service (skip if UI stays on Vercel) ───
+    - name: Build and run the Next.js frontend
+      when: quasar_deploy_frontend
+      tags: [frontend, deploy]
+      block:
+        - name: npm ci
+          ansible.builtin.command: npm ci
+          args:
+            chdir: "{{ quasar_app_dir }}/ui-pro"
+          become_user: "{{ quasar_user }}"
+          changed_when: true
+
+        - name: next build (NEXT_PUBLIC_* is inlined here — rebuild after changing it)
+          ansible.builtin.command: npm run build
+          args:
+            chdir: "{{ quasar_app_dir }}/ui-pro"
+          environment: "{{ quasar_frontend_env }}"
+          become_user: "{{ quasar_user }}"
+          changed_when: true
+          notify: restart quasar-frontend
+
+        - name: Install quasar-frontend systemd unit
+          ansible.builtin.template:
+            src: templates/quasar-frontend.service.j2
+            dest: /etc/systemd/system/quasar-frontend.service
+            mode: "0644"
+          notify: restart quasar-frontend
+
+        - name: Enable + start quasar-frontend
+          ansible.builtin.systemd:
+            name: quasar-frontend
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ── nginx front door (SSE-safe) ──────────────────────────────────
+    - name: Allow nginx to proxy to localhost under SELinux (RHEL/Rocky)
+      when: ansible_os_family == "RedHat"
+      ansible.builtin.command: setsebool -P httpd_can_network_connect true
+      changed_when: false
+      failed_when: false
+      tags: [nginx]
+
+    - name: Remove Debian default nginx site
+      when: ansible_os_family == "Debian"
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+      tags: [nginx]
+
+    - name: Install nginx site config
+      ansible.builtin.template:
+        src: templates/nginx-quasar.conf.j2
+        dest: /etc/nginx/conf.d/quasar.conf
+        mode: "0644"
+      notify: reload nginx
+      tags: [nginx]
+
+    - name: Check full nginx config
+      ansible.builtin.command: nginx -t
+      changed_when: false
+      tags: [nginx]
+
+    - name: Enable + start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: started
+      tags: [nginx]

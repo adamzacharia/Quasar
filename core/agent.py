@@ -3202,9 +3202,22 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
         status = getattr(error, "status_code", None)
         detail = f" (HTTP {status})" if status else ""
+        # Name the failure class when it is recognizable — "returned an error"
+        # alone gives the user nothing to distinguish a timeout from an outage.
+        error_name = type(error).__name__.lower()
+        if "timeout" in error_name or "timed out" in text.lower():
+            cause = " (the model timed out)"
+        elif status == 429:
+            cause = " (rate-limited)"
+        elif status == 529:
+            cause = " (provider overloaded)"
+        elif "connection" in error_name:
+            cause = " (the provider connection dropped)"
+        else:
+            cause = ""
         return (
             f"The language-model provider returned an error{detail} and the request could not "
-            "be completed. Please try again; if the problem persists, try a different model."
+            f"be completed{cause}. Please try again; if the problem persists, try a different model."
         )
 
     def _compose_final_answer_from_tools(

@@ -102,7 +102,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         },
         "healpix_columns": [],
         "morphology": {
-            "spread_model_r": "DES star/galaxy via spread_model_r > 0.005 => galaxy, ~0 => star. PER-BAND column — use spread_model_r (not 'spread_model'); also spread_model_g/i/z.",
+            "spread_model_r": "DES star/galaxy via spread_model_r > 0.003 => galaxy, |spread_model_r| < 0.003 => star (DES DR1 convention). PER-BAND column — use spread_model_r (not 'spread_model'); also spread_model_g/i/z.",
             "class_star_r": "class_star_r near 1 = star-like (per-band: class_star_g/i/z).",
         },
         "bitmasks": {},
@@ -532,7 +532,7 @@ def default_table(catalog: str) -> str:
 # explicit cut. Thresholds follow each survey's documented star/galaxy convention.
 _POINT_SOURCE_CUTS = {
     "nsc_dr2.object": {"column": "class_star", "op": ">", "value": 0.5},
-    "des_dr1.main": {"column": "spread_model_r", "between": [-0.005, 0.005]},
+    "des_dr1.main": {"column": "spread_model_r", "between": [-0.003, 0.003]},  # DES DR1 stellar cut |spread_model_r| < 0.003
     "delve_dr3.coadd_objects": {"column": "ext_coadd", "between": [0, 1]},  # 0/1 = star/candidate star
     "smash_dr1.object": {"column": "sharp", "between": [-0.5, 0.5]},
     "smash_dr2.object": {"column": "sharp", "between": [-0.5, 0.5]},
@@ -614,7 +614,9 @@ def point_source_cut(catalog: str, table: str) -> Optional[Dict[str, Any]]:
 
 
 def list_catalogs() -> List[Dict[str, Any]]:
-    """Return a compact catalog list for tool output."""
+    """Return the compact CURATED catalog list for tool output — a governed
+    subset of the live service, not the complete Data Lab schema inventory
+    (``list_all_schemas`` reads that from tap_schema.schemas)."""
 
     rows = []
     for name, entry in DATALAB_CATALOGS.items():
@@ -867,6 +869,7 @@ def aggregate_safe_tables() -> set[str]:
 
 DEFAULT_TAP_SCHEMA_CACHE_DIR = Path("cache") / "datalab_tap_schema"
 _TAP_SCHEMA_CACHE_KEY = "tap_schema_v2"
+_SCHEMA_LIST_CACHE_KEY = "tap_schema_schemas_v1"
 # Minimum spacing between refresh ATTEMPTS, so a dead service is not re-polled
 # on every SQL call once the cached payload has gone stale.
 _MIN_REFRESH_RETRY_SECONDS = 600.0
@@ -1053,6 +1056,88 @@ def cached_tap_schema(*, cache_dir: Path | str | None = None) -> Optional[Dict[s
             cache.close()
         except Exception:
             pass
+
+
+def registry_governed_catalogs() -> set[str]:
+    """Schema names the registry governs: curated catalogs + verified expansions."""
+    return set(DATALAB_CATALOGS) | {entry["catalog"] for entry in EXPANSION_CATALOGS}
+
+
+def _cached_schema_list(*, cache_dir: Path | str | None = None) -> Optional[Dict[str, Any]]:
+    cache = _open_cache(cache_dir)
+    if cache is None:
+        return None
+    try:
+        payload = cache.get(_SCHEMA_LIST_CACHE_KEY)
+        return payload if isinstance(payload, Mapping) else None
+    except Exception:
+        # A corrupt/locked cache must not abort the live query.
+        return None
+    finally:
+        try:
+            cache.close()
+        except Exception:
+            pass
+
+
+def list_all_schemas(client: Any, *, cache_dir: Path | str | None = None) -> List[Dict[str, Any]]:
+    """The COMPLETE live Data Lab schema list from ``tap_schema.schemas``, each
+    row marked ``registry_governed`` when the curated registry covers it.
+
+    Cached in the same diskcache as the TAP column payload (own key, same TTL)
+    so repeat listings do not re-poll the service. On a live-query failure a
+    stale cached list is still returned (better ground truth than none); with
+    no cache either, the exception propagates so the caller can degrade to the
+    curated list with an explicit note.
+    """
+
+    cached = _cached_schema_list(cache_dir=cache_dir)
+    # An empty cached list is never authoritative — a zero-row live response
+    # must not short-circuit every listing for a whole TTL.
+    if (
+        cached
+        and cached.get("schemas")
+        and (time.time() - float(cached.get("refreshed_at") or 0.0)) < tap_schema_ttl_seconds()
+    ):
+        return [dict(row) for row in cached.get("schemas") or []]
+    try:
+        df = client.query(
+            sql="SELECT schema_name, description FROM tap_schema.schemas",
+            fmt="pandas",
+        ).dataframe
+    except Exception:
+        if cached and cached.get("schemas"):  # stale beats nothing
+            return [dict(row) for row in cached.get("schemas") or []]
+        raise
+    governed = registry_governed_catalogs()
+    rows: List[Dict[str, Any]] = []
+    for record in df.to_dict("records"):
+        name = str(record.get("schema_name") or "").strip().lower()
+        if not name:
+            continue
+        description = record.get("description")
+        rows.append(
+            {
+                "schema": name,
+                "description": None if pd.isna(description) else description,
+                "registry_governed": name in governed,
+            }
+        )
+    rows.sort(key=lambda row: row["schema"])
+    cache = _open_cache(cache_dir)
+    if cache is not None and rows:
+        try:
+            cache.set(_SCHEMA_LIST_CACHE_KEY, {"schemas": rows, "refreshed_at": time.time()})
+        except Exception:
+            # A cache-write failure must not turn a successful live fetch
+            # into a reported outage.
+            pass
+        finally:
+            try:
+                cache.close()
+            except Exception:
+                pass
+    return [dict(row) for row in rows]
 
 
 def ensure_tap_schema_fresh(
@@ -1354,8 +1439,8 @@ TABLE_PROFILE_INFO: Dict[str, Dict[str, Any]] = {
             "flags_r": ("integer", None, "quality", "SExtractor flags in r."),
             "flags_i": ("integer", None, "quality", "SExtractor flags in i."),
             "flags_z": ("integer", None, "quality", "SExtractor flags in z."),
-            "spread_model_g": ("float", "1", "quality", "Star/galaxy separator in g; ~0 point source, > 0.005 galaxy."),
-            "spread_model_r": ("float", "1", "quality", "Star/galaxy separator in r (canonical band for the cut)."),
+            "spread_model_g": ("float", "1", "quality", "Star/galaxy separator in g; ~0 point source, > 0.003 galaxy."),
+            "spread_model_r": ("float", "1", "quality", "Star/galaxy separator in r (canonical band): > 0.003 galaxy, |spread_model_r| < 0.003 star (DES DR1)."),
             "spread_model_i": ("float", "1", "quality", "Star/galaxy separator in i."),
             "spread_model_z": ("float", "1", "quality", "Star/galaxy separator in z."),
             "spreaderr_model_r": ("float", "1", "uncertainty", "Uncertainty on spread_model_r."),
@@ -1829,6 +1914,29 @@ _PROFILE_PITFALLS = [
         "summary": "catalogs beyond the curated set (delve_dr2, catwise2020, ls_dr10, ...) resolve through the live TAP schema — describe them before querying",
         "applies_to": [{"kind": "archive", "ref": "datalab"}],
     },
+    {
+        "id": "row_caps_are_governance",
+        "summary": "row caps (LIMIT) are platform cost governance, not science cuts — never add a LIMIT the user didn't ask for; disclose caps and offer the uncapped path",
+        "detail": (
+            "Do not invent LIMIT clauses the user did not request. The query governor row-caps every "
+            "row-level query for cost control (default LIMIT 500, ceiling 5000) and flags the cap in the "
+            "result warnings; when a cap truncates results, tell the user the result is capped and offer "
+            "the uncapped path — an async_submit background job or a server-side aggregate builder."
+        ),
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+    },
+    {
+        "id": "magnitude_cut_hygiene",
+        "summary": "never invent saturation/noise-floor magnitude cuts; automatic mag > -5 AND mag < 50 filters are sentinel-removal validity guards, not science choices",
+        "detail": (
+            "The one-shot diagram tools automatically exclude survey sentinel magnitudes (99/-99) with "
+            "mag > -5 AND mag < 50 validity filters — never cite or copy these as science cuts. Apply a "
+            "magnitude range only when the science calls for one, using survey-appropriate values (e.g. "
+            "DES mag_auto_i BETWEEN 16 AND 23 for a clean bright sample); do not rationalize invented "
+            "'avoid the noise floor' or 'mag < 50' cuts."
+        ),
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+    },
 ]
 
 _PROFILE_GOLDEN_EXAMPLES = [
@@ -1860,7 +1968,7 @@ _PROFILE_GOLDEN_EXAMPLES = [
                     "SELECT ra, dec, mag_auto_g - mag_auto_r AS gr, mag_auto_r "
                     "FROM des_dr1.main "
                     "WHERE q3c_radial_query(ra, dec, 34.0, -5.0, 0.5) "
-                    "AND flags_r = 0 AND mag_auto_r < 24 AND spread_model_r < 0.005 "
+                    "AND flags_r = 0 AND mag_auto_r < 24 AND spread_model_r < 0.003 "
                     "LIMIT 5000"
                 ),
                 "expert_ack": True,
@@ -1868,7 +1976,12 @@ _PROFILE_GOLDEN_EXAMPLES = [
             },
         },
         "request": {"kind": "sql", "argument": "sql"},
-        "note": "mag_auto_r / spread_model_r / flags_r are PER-BAND; upper-bound cuts are NaN-safe as written.",
+        "note": (
+            "mag_auto_r / spread_model_r / flags_r are PER-BAND; upper-bound cuts are NaN-safe as "
+            "written. The LIMIT here is a row-budget cap (platform cost governance, ceiling 5000), "
+            "not a science cut — only add one when the user's request needs it, and disclose it; "
+            "without a LIMIT the governor caps row-level queries at 500 and says so in warnings."
+        ),
     },
     {
         "id": "nsc_lmc_density",
@@ -2017,8 +2130,10 @@ __all__ = [
     "ensure_tap_schema_fresh",
     "expansion_qualified_tables",
     "known_columns",
+    "list_all_schemas",
     "list_catalogs",
     "live_columns",
+    "registry_governed_catalogs",
     "live_table_entry",
     "refresh_tap_schema",
     "region_strategy",

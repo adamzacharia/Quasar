@@ -119,6 +119,61 @@ def test_list_and_describe_are_pure_registry_calls():
     ctx, _, _ = _ctx(pd.DataFrame())
     lc = dl.ListCatalogs().run(dl.ListCatalogsInput(), ctx).to_native()
     assert lc["success"] is True and lc["count"] == len(lc["catalogs"]) and lc["count"] > 0
+    # The default scope must SAY it is the curated governed subset, not the
+    # complete Data Lab inventory (NOIRLab beta eval: list flagged incomplete).
+    assert lc["scope"] == "registered"
+    assert "curated" in lc["note"].lower()
+
+
+class _FakeSchemasClient:
+    """Serves a canned tap_schema.schemas frame for scope='all' listings."""
+
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.last_sql = None
+
+    def query(self, sql: str, fmt: str = "pandas") -> DatalabResult:
+        self.last_sql = sql
+        assert "tap_schema.schemas" in sql
+        return DatalabResult.from_dataframe(self.df.copy(), {})
+
+
+def test_list_catalogs_scope_all_returns_live_schema_list(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATALAB_TAP_SCHEMA_CACHE_DIR", str(tmp_path / "tap-schema"))
+    schemas_df = pd.DataFrame({
+        "schema_name": ["gaia_dr3", "buzzard_dr1"],
+        "description": ["Gaia DR3", "Buzzard simulation"],
+    })
+    ctx = CallContext(
+        services={"datalab_client": _FakeSchemasClient(schemas_df)},
+        result_store=DatalabResultStore(enable_disk_cache=False),
+    )
+    out = dl.ListCatalogs().run(dl.ListCatalogsInput(scope="all"), ctx).to_native()
+    assert out["success"] is True and out["scope"] == "all"
+    by_name = {row["schema"]: row for row in out["schemas"]}
+    assert by_name["gaia_dr3"]["registry_governed"] is True
+    assert by_name["buzzard_dr1"]["registry_governed"] is False
+    # The curated list still rides along for the structured builders.
+    assert out["count"] == len(out["catalogs"]) > 0
+
+
+def test_list_catalogs_scope_all_degrades_to_curated_with_note(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATALAB_TAP_SCHEMA_CACHE_DIR", str(tmp_path / "tap-schema"))
+
+    class _DeadClient:
+        def query(self, *args, **kwargs):
+            raise RuntimeError("service unreachable")
+
+    ctx = CallContext(
+        services={"datalab_client": _DeadClient()},
+        result_store=DatalabResultStore(enable_disk_cache=False),
+    )
+    out = dl.ListCatalogs().run(dl.ListCatalogsInput(scope="all"), ctx).to_native()
+    # Network failure degrades to the curated list WITH an explicit note —
+    # never a silent partial answer.
+    assert out["success"] is True
+    assert out["count"] == len(out["catalogs"]) > 0
+    assert "unavailable" in out["note"]
 
 
 def test_datalab_error_maps_policy_error_to_fix_hint():

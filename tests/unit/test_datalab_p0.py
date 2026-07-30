@@ -149,7 +149,8 @@ def test_policy_injects_limit_for_spatial_row_level_select():
     sql_without_limit = sql.rsplit("\nLIMIT", 1)[0]
     validated = validate(sql_without_limit, source="builder", meta=meta)
     assert validated.sql.endswith("LIMIT 500")
-    assert any("Injected LIMIT" in warning for warning in validated.warnings)
+    # The cap must be disclosed as governance, never presented as a science cut.
+    assert any("Row cap LIMIT" in warning and "not a science cut" in warning for warning in validated.warnings)
 
 
 

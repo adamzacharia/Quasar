@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -458,7 +458,10 @@ class _In(BaseModel):
 
 
 class ListCatalogsInput(_In):
-    pass
+    # 'registered' = curated governed subset (fast, offline); 'all' also reads
+    # the complete schema list from the live tap_schema. Literal so a typo
+    # surfaces as a validation error instead of silently meaning 'registered'.
+    scope: Literal["registered", "all"] = "registered"
 
 
 class DescribeTableInput(_In):
@@ -568,8 +571,41 @@ class ListCatalogs(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         try:
             catalogs = datalab_registry.list_catalogs()
-            native = {"success": True, "catalogs": catalogs, "count": len(catalogs)}
-            return ToolResult(success=True, data=catalogs, native=native)
+            native = {
+                "success": True,
+                "scope": "registered",
+                "catalogs": catalogs,
+                "count": len(catalogs),
+                "note": (
+                    "This is the CURATED, registry-governed subset of Data Lab (best structured-"
+                    "builder and SQL-governor support), not the complete service inventory — "
+                    "call with scope='all' for the full live schema list."
+                ),
+            }
+            if str(inp.scope or "registered").strip().lower() != "all":
+                return ToolResult(success=True, data=catalogs, native=native)
+            # scope='all': the complete live tap_schema.schemas inventory, with
+            # the curated subset marked registry_governed. Network failure keeps
+            # the curated list usable — with an explicit note, never silently.
+            try:
+                schemas = datalab_registry.list_all_schemas(ctx.service("datalab_client"))
+                native.update({
+                    "scope": "all",
+                    "schemas": schemas,
+                    "schema_count": len(schemas),
+                    "note": (
+                        "Complete live Data Lab schema list (tap_schema.schemas). Entries with "
+                        "registry_governed=true are the curated subset in 'catalogs' with full "
+                        "structured-builder support; other schemas become queryable after "
+                        "datalab_describe_table caches their live columns."
+                    ),
+                })
+            except Exception as live_error:  # noqa: BLE001 - degrade to the curated list
+                native["note"] = (
+                    "The full live schema list was unavailable "
+                    f"({live_error}); showing only the curated registry-governed subset."
+                )
+            return ToolResult(success=True, data=native, native=native)
         except Exception as e:
             return ToolResult(success=False, error=str(e), native={"success": False, "error": str(e)})
 
@@ -1319,7 +1355,7 @@ class ColorColorDiagramInput(_In):
     x_bands: Optional[List[str]] = None
     y_bands: Optional[List[str]] = None
     split_col: Optional[str] = None
-    split_threshold: Optional[float] = 0.005
+    split_threshold: Optional[float] = 0.003  # DES DR1 spread_model convention
     limit: Optional[int] = 3000
     title: Optional[str] = None
     point_sources: bool = False
@@ -1344,7 +1380,7 @@ class ColorColorDiagram(BaseCapability):
         try:
             table = inp.table or datalab_registry.default_table(inp.catalog)
             radius_deg = float(inp.radius_deg) if inp.radius_deg is not None else 0.5
-            split_threshold = float(inp.split_threshold) if inp.split_threshold is not None else 0.005
+            split_threshold = float(inp.split_threshold) if inp.split_threshold is not None else 0.003
             limit = int(inp.limit) if inp.limit is not None else 3000
             ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
             out = datalab_orchestration.color_color_diagram(

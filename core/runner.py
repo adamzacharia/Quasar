@@ -9,11 +9,14 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from core.llm_client import detect_provider
 from core.logger import logger
+from core.retry import _compute_delay as _retry_compute_delay
+from core.retry import _is_retryable as _retry_is_retryable
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
 # DUAL_SOURCE_SCAFFOLD: referenced at the RAG-context branch — its absence
@@ -25,6 +28,7 @@ from core.agent import DUAL_SOURCE_SCAFFOLD, _run_result_is_new, _unescape_tool_
 from core.conductor import Conductor
 from services.citation_verifier import append_citation_warning
 from services.content_safety import FILTER_NOTICE, is_explicit_query, safe_assistant_text
+from services.secret_redaction import redact_secrets
 
 
 def _stamp_request_on_results(agent, request: Dict[str, Any], tool_name: str,
@@ -99,6 +103,11 @@ def stream_response_api(
         agent.last_search_results = None
         agent._tls.current_conversation_id = conversation_id
         agent._tls.current_user_id = user_id
+        # Cleared per turn; set by the error paths below so the SSE layer can
+        # record the run as failed even though the user sees a friendly message
+        # returned as normal text (provider failures used to land in chat_runs
+        # as status='completed', invisible to diagnostics).
+        agent._tls.last_provider_failure = None
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -1128,6 +1137,11 @@ def stream_response_api(
             # rounds instead of breaking.
             _MAX_CONTINUATIONS = 2
             _continuation_rounds = 0
+            # Per-round stream retries: a mid-stream death (httpx.ReadTimeout
+            # while a reasoning model is byte-silent, connection reset,
+            # transient 5xx) re-issues ONLY the affected round this many times
+            # before the turn-level handler discards the turn.
+            _STREAM_ROUND_RETRIES = int(os.getenv("LLM_STREAM_ROUND_RETRIES", "2"))
             _promise_tail_re = re.compile(
                 r"(?i)\b(let me|now (?:i|let(?:'s)?|we)|i(?:'ll| will)|we(?:'ll| will)|next,? (?:i|we))\b"
                 r"[^.!?]{0,150}\b(render|plot|generat|creat|build|draw|run|execut|quer|fetch|"
@@ -1161,7 +1175,6 @@ def stream_response_api(
                     or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
                 )
-                _round_text_buffer = ""
                 request_kwargs = {
                     "model": selected_model,
                     "input": full_input if _round == 0 else tool_results,
@@ -1209,168 +1222,211 @@ def stream_response_api(
                 if _is_thinking_model:
                     request_kwargs["reasoning"] = {"summary": "auto"}
 
-                try:
-                    response_stream = agent.client.responses.create(**request_kwargs)
-                except Exception as e:
-                    _is_hanging_tool_err = any(
-                        msg in str(e)
-                        for msg in [
-                            "No tool output found for function call",
-                            "must be followed by tool messages",
-                            "insufficient tool messages",
-                            "tool_calls",
-                        ]
-                    )
-                    if _is_hanging_tool_err and "previous_response_id" in request_kwargs:
-                        # Recover from hanging tool call in a previous interrupted turn
-                        print(f"[WARNING] Recovering from hanging tool call state for conv={conversation_id}. Dropping previous_response_id.")
-                        del request_kwargs["previous_response_id"]
-                        last_id = None
-                        agent.clear_response_state(conversation_id, selected_model, run_token)
-                        response_stream = agent.client.responses.create(**request_kwargs)
-                    else:
-                        raise e
-                
-                function_calls = {} # call_id -> dict
-                item_id_to_call_id = {}  # item.id -> call_id mapping
-                _round_finish_reason = None  # provider finish_reason for THIS round
-                _round_text_len_before = len(output_text)
+                # A provider stream can die mid-round (httpx.ReadTimeout while a
+                # reasoning model is byte-silent, connection reset, transient
+                # 5xx): re-issue ONLY this round instead of letting the failure
+                # discard the whole multi-round turn. Retries are allowed only
+                # while the round has not yet streamed user-visible text (so a
+                # retry never duplicates what the user already saw); tool
+                # results and the cached history chain carry across attempts.
+                _stream_attempt = 0
+                while True:
+                    function_calls = {} # call_id -> dict
+                    item_id_to_call_id = {}  # item.id -> call_id mapping
+                    _round_finish_reason = None  # provider finish_reason for THIS round
+                    _round_text_len_before = len(output_text)
+                    _round_text_buffer = ""
 
-                _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
-                _reasoning_emitted = False     # Track if we emitted the reasoning header
-                _emit_reasoning_details = True  # Stream the model-provided reasoning summary.
+                    _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
+                    _reasoning_emitted = False     # Track if we emitted the reasoning header
+                    _emit_reasoning_details = True  # Stream the model-provided reasoning summary.
 
-                for event in response_stream:
-                    if event.type == "response.created":
-                        last_id = event.response.id
-                        agent._set_response_id(
-                            conversation_id,
-                            last_id,
-                            selected_model,
-                            run_token,
-                        )
-                    elif event.type == "response.reasoning_summary_text.delta":
-                        # Stream the model-provided reasoning summary to the Thinking box.
-                        _reasoning_summary_text += event.delta
-                        if on_thought:
-                            on_thought(event.delta)
-                        elif not _reasoning_emitted and on_status:
-                            on_status("🧠 Reasoning", "running")
-                            _reasoning_emitted = True
-                    elif event.type == "response.reasoning_summary_text.done":
-                        # Reasoning summary complete — emit the full text as a thinking step
-                        if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
-                            # Split into individual lines for readable thinking steps
-                            for line in _reasoning_summary_text.strip().splitlines():
-                                line = line.strip()
-                                if line:
-                                    on_status(f"💭 {line}", "completed")
-                            on_status("🧠 Reasoning", "completed")
-                        _reasoning_summary_text = ""
-                        _reasoning_emitted = False
-                    elif event.type == "response.output_text.delta":
-                        # If reasoning was still accumulating when text starts,
-                        # finalize it now (edge case: some models skip the .done event)
-                        if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
-                            for line in _reasoning_summary_text.strip().splitlines():
-                                line = line.strip()
-                                if line:
-                                    on_status(f"💭 {line}", "completed")
-                            if _reasoning_emitted:
-                                on_status("🧠 Reasoning", "completed")
-                            _reasoning_summary_text = ""
-                            _reasoning_emitted = False
-                        if _buffer_round_text:
-                            _round_text_buffer += event.delta
-                        else:
-                            output_text += event.delta
-                        if on_token and not _buffer_round_text:
-                            on_token(event.delta)
-                    elif event.type == "response.output_item.added":
-                        # Check if it's a function_call item
-                        item = event.item
-                        if getattr(item, 'type', None) == 'function_call':
-                            call_id = getattr(item, 'call_id', None)
-                            item_id = getattr(item, 'id', None)
-                            name = getattr(item, 'name', 'unknown')
-                            cid = call_id or item_id
-                            if cid:
-                                function_calls[cid] = {"name": name, "arguments": "", "call_id": cid, "_item_id": item_id}
-                                # Map item_id to call_id so argument deltas can find the right entry
-                                if item_id and item_id != cid:
-                                    item_id_to_call_id[item_id] = cid
-                                if call_id and call_id != item_id:
-                                    item_id_to_call_id[call_id] = cid
-                    elif event.type == "response.output_item.done":
-                        # CRITICAL FIX: The real call_id may only be available
-                        # when the function_call item is DONE, not when it is
-                        # first added.  Update our records with the canonical
-                        # call_id so the follow-up request matches what the
-                        # API expects.
-                        item = event.item
-                        if getattr(item, 'type', None) == 'function_call':
-                            final_call_id = getattr(item, 'call_id', None)
-                            item_id = getattr(item, 'id', None)
-                            if final_call_id:
-                                # Find the entry we stored (keyed by item_id or preliminary call_id)
-                                old_cid = item_id_to_call_id.get(item_id, item_id)
-                                if old_cid in function_calls:
-                                    function_calls[old_cid]["call_id"] = final_call_id
-                                # Also try direct item_id lookup
-                                elif item_id in function_calls:
-                                    function_calls[item_id]["call_id"] = final_call_id
-                    elif event.type == "response.function_call_arguments.delta":
-                        # Try all possible ID fields the API might use.
-                        # OpenAI native: call_id / item_id on event top-level.
-                        # DeepSeek/shim: call_id lives on event.item (FunctionCallItem).
-                        raw_id = (
-                            getattr(event, 'call_id', None)
-                            or getattr(event, 'item_id', None)
-                            or (getattr(event.item, 'call_id', None) if getattr(event, 'item', None) else None)
-                        )
-                        # Resolve to the canonical call_id we stored
-                        cid = item_id_to_call_id.get(raw_id, raw_id)
-                        if cid and cid in function_calls:
-                            function_calls[cid]["arguments"] += event.delta
-                    elif event.type == "response.completed":
-                        # Final sweep: reconcile call_ids AND arguments from the
-                        # completed response.  The streaming deltas may have
-                        # failed to accumulate arguments (e.g. if call_id was
-                        # not resolvable during delta events).
-                        completed_resp = getattr(event, 'response', None)
-                        if completed_resp is not None:
-                            _round_finish_reason = getattr(completed_resp, 'finish_reason', None)
-                        if completed_resp and hasattr(completed_resp, 'output'):
-                            for out_item in completed_resp.output:
-                                if getattr(out_item, 'type', None) == 'function_call':
-                                    final_cid = getattr(out_item, 'call_id', None)
-                                    item_id = getattr(out_item, 'id', None)
-                                    fn_name = getattr(out_item, 'name', '')
-                                    fn_args = getattr(out_item, 'arguments', '')
-                                    if final_cid:
-                                        # Find the matching entry by item_id or name
-                                        old_key = item_id_to_call_id.get(item_id, item_id)
-                                        if old_key in function_calls:
-                                            function_calls[old_key]["call_id"] = final_cid
-                                            # Backfill arguments if streaming failed to accumulate them
-                                            if fn_args and not function_calls[old_key]["arguments"]:
-                                                function_calls[old_key]["arguments"] = fn_args
-                                            if fn_name and not function_calls[old_key]["name"]:
-                                                function_calls[old_key]["name"] = fn_name
+                    try:
+                        try:
+                            response_stream = agent.client.responses.create(**request_kwargs)
+                        except Exception as e:
+                            _is_hanging_tool_err = any(
+                                msg in str(e)
+                                for msg in [
+                                    "No tool output found for function call",
+                                    "must be followed by tool messages",
+                                    "insufficient tool messages",
+                                    "tool_calls",
+                                ]
+                            )
+                            if _is_hanging_tool_err and "previous_response_id" in request_kwargs:
+                                # Recover from hanging tool call in a previous interrupted turn
+                                print(f"[WARNING] Recovering from hanging tool call state for conv={conversation_id}. Dropping previous_response_id.")
+                                del request_kwargs["previous_response_id"]
+                                last_id = None
+                                agent.clear_response_state(conversation_id, selected_model, run_token)
+                                response_stream = agent.client.responses.create(**request_kwargs)
+                            else:
+                                raise e
+
+                        for event in response_stream:
+                            if event.type == "response.created":
+                                last_id = event.response.id
+                                agent._set_response_id(
+                                    conversation_id,
+                                    last_id,
+                                    selected_model,
+                                    run_token,
+                                )
+                            elif event.type == "response.reasoning_summary_text.delta":
+                                # Stream the model-provided reasoning summary to the Thinking box.
+                                _reasoning_summary_text += event.delta
+                                if on_thought:
+                                    on_thought(event.delta)
+                                elif not _reasoning_emitted and on_status:
+                                    on_status("🧠 Reasoning", "running")
+                                    _reasoning_emitted = True
+                            elif event.type == "response.reasoning_summary_text.done":
+                                # Reasoning summary complete — emit the full text as a thinking step
+                                if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
+                                    # Split into individual lines for readable thinking steps
+                                    for line in _reasoning_summary_text.strip().splitlines():
+                                        line = line.strip()
+                                        if line:
+                                            on_status(f"💭 {line}", "completed")
+                                    on_status("🧠 Reasoning", "completed")
+                                _reasoning_summary_text = ""
+                                _reasoning_emitted = False
+                            elif event.type == "response.output_text.delta":
+                                # If reasoning was still accumulating when text starts,
+                                # finalize it now (edge case: some models skip the .done event)
+                                if _emit_reasoning_details and not on_thought and _reasoning_summary_text and on_status:
+                                    for line in _reasoning_summary_text.strip().splitlines():
+                                        line = line.strip()
+                                        if line:
+                                            on_status(f"💭 {line}", "completed")
+                                    if _reasoning_emitted:
+                                        on_status("🧠 Reasoning", "completed")
+                                    _reasoning_summary_text = ""
+                                    _reasoning_emitted = False
+                                if _buffer_round_text:
+                                    _round_text_buffer += event.delta
+                                else:
+                                    output_text += event.delta
+                                if on_token and not _buffer_round_text:
+                                    on_token(event.delta)
+                            elif event.type == "response.output_item.added":
+                                # Check if it's a function_call item
+                                item = event.item
+                                if getattr(item, 'type', None) == 'function_call':
+                                    call_id = getattr(item, 'call_id', None)
+                                    item_id = getattr(item, 'id', None)
+                                    name = getattr(item, 'name', 'unknown')
+                                    cid = call_id or item_id
+                                    if cid:
+                                        function_calls[cid] = {"name": name, "arguments": "", "call_id": cid, "_item_id": item_id}
+                                        # Map item_id to call_id so argument deltas can find the right entry
+                                        if item_id and item_id != cid:
+                                            item_id_to_call_id[item_id] = cid
+                                        if call_id and call_id != item_id:
+                                            item_id_to_call_id[call_id] = cid
+                            elif event.type == "response.output_item.done":
+                                # CRITICAL FIX: The real call_id may only be available
+                                # when the function_call item is DONE, not when it is
+                                # first added.  Update our records with the canonical
+                                # call_id so the follow-up request matches what the
+                                # API expects.
+                                item = event.item
+                                if getattr(item, 'type', None) == 'function_call':
+                                    final_call_id = getattr(item, 'call_id', None)
+                                    item_id = getattr(item, 'id', None)
+                                    if final_call_id:
+                                        # Find the entry we stored (keyed by item_id or preliminary call_id)
+                                        old_cid = item_id_to_call_id.get(item_id, item_id)
+                                        if old_cid in function_calls:
+                                            function_calls[old_cid]["call_id"] = final_call_id
+                                        # Also try direct item_id lookup
                                         elif item_id in function_calls:
-                                            function_calls[item_id]["call_id"] = final_cid
-                                            if fn_args and not function_calls[item_id]["arguments"]:
-                                                function_calls[item_id]["arguments"] = fn_args
-                                            if fn_name and not function_calls[item_id]["name"]:
-                                                function_calls[item_id]["name"] = fn_name
-                                        elif final_cid not in function_calls:
-                                            # Entirely new — create the entry
-                                            function_calls[final_cid] = {
-                                                "name": fn_name,
-                                                "arguments": fn_args,
-                                                "call_id": final_cid,
-                                                "_item_id": item_id,
-                                            }
+                                            function_calls[item_id]["call_id"] = final_call_id
+                            elif event.type == "response.function_call_arguments.delta":
+                                # Try all possible ID fields the API might use.
+                                # OpenAI native: call_id / item_id on event top-level.
+                                # DeepSeek/shim: call_id lives on event.item (FunctionCallItem).
+                                raw_id = (
+                                    getattr(event, 'call_id', None)
+                                    or getattr(event, 'item_id', None)
+                                    or (getattr(event.item, 'call_id', None) if getattr(event, 'item', None) else None)
+                                )
+                                # Resolve to the canonical call_id we stored
+                                cid = item_id_to_call_id.get(raw_id, raw_id)
+                                if cid and cid in function_calls:
+                                    function_calls[cid]["arguments"] += event.delta
+                            elif event.type == "response.completed":
+                                # Final sweep: reconcile call_ids AND arguments from the
+                                # completed response.  The streaming deltas may have
+                                # failed to accumulate arguments (e.g. if call_id was
+                                # not resolvable during delta events).
+                                completed_resp = getattr(event, 'response', None)
+                                if completed_resp is not None:
+                                    _round_finish_reason = getattr(completed_resp, 'finish_reason', None)
+                                if completed_resp and hasattr(completed_resp, 'output'):
+                                    for out_item in completed_resp.output:
+                                        if getattr(out_item, 'type', None) == 'function_call':
+                                            final_cid = getattr(out_item, 'call_id', None)
+                                            item_id = getattr(out_item, 'id', None)
+                                            fn_name = getattr(out_item, 'name', '')
+                                            fn_args = getattr(out_item, 'arguments', '')
+                                            if final_cid:
+                                                # Find the matching entry by item_id or name
+                                                old_key = item_id_to_call_id.get(item_id, item_id)
+                                                if old_key in function_calls:
+                                                    function_calls[old_key]["call_id"] = final_cid
+                                                    # Backfill arguments if streaming failed to accumulate them
+                                                    if fn_args and not function_calls[old_key]["arguments"]:
+                                                        function_calls[old_key]["arguments"] = fn_args
+                                                    if fn_name and not function_calls[old_key]["name"]:
+                                                        function_calls[old_key]["name"] = fn_name
+                                                elif item_id in function_calls:
+                                                    function_calls[item_id]["call_id"] = final_cid
+                                                    if fn_args and not function_calls[item_id]["arguments"]:
+                                                        function_calls[item_id]["arguments"] = fn_args
+                                                    if fn_name and not function_calls[item_id]["name"]:
+                                                        function_calls[item_id]["name"] = fn_name
+                                                elif final_cid not in function_calls:
+                                                    # Entirely new — create the entry
+                                                    function_calls[final_cid] = {
+                                                        "name": fn_name,
+                                                        "arguments": fn_args,
+                                                        "call_id": final_cid,
+                                                        "_item_id": item_id,
+                                                    }
+                        break  # round streamed to completion
+                    except Exception as _stream_err:
+                        # Already-shown text cannot be un-streamed — a retry
+                        # would duplicate it, so hand the turn-level handler
+                        # the failure instead.
+                        _round_streamed_text = (
+                            len(output_text) > _round_text_len_before
+                            and not _buffer_round_text
+                        )
+                        # A deadline-cancelled run has no consumer left — an
+                        # orphaned thread must not burn retry attempts and
+                        # backoff sleeps working into the void.
+                        if (
+                            _round_streamed_text
+                            or _stream_attempt >= _STREAM_ROUND_RETRIES
+                            or not _retry_is_retryable(_stream_err)
+                            or not agent._response_run_active(conversation_id, selected_model, run_token)
+                        ):
+                            raise
+                        _stream_attempt += 1
+                        _retry_delay = _retry_compute_delay(_stream_attempt - 1, 1.0, 8.0)
+                        print(
+                            f"[STREAM] Round {_round} stream died "
+                            f"({type(_stream_err).__name__}: {str(_stream_err)[:200]}) — "
+                            f"retrying the round ({_stream_attempt}/{_STREAM_ROUND_RETRIES}) "
+                            f"in {_retry_delay:.1f}s"
+                        )
+                        if on_status:
+                            on_status("Provider stream interrupted — retrying", "running")
+                        time.sleep(_retry_delay)
+                        if on_status:
+                            on_status("Provider stream interrupted — retrying", "completed")
                 
                 if not function_calls:
                     if _buffer_round_text and _round_text_buffer:
@@ -1853,6 +1909,10 @@ def stream_response_api(
             # Responses API not available in this OpenAI version
             error_msg = f"Responses API not available: {ae}. Please upgrade the openai package."
             print(f"[ERROR] {error_msg}")
+            agent._tls.last_provider_failure = {
+                "error_class": type(ae).__name__,
+                "message": redact_secrets(ae)[:500],
+            }
             return error_msg
             
         except Exception as e:
@@ -1912,4 +1972,13 @@ def stream_response_api(
                 exc_info=True,
             )
             print(f"[ERROR] Error with Responses API: {str(e)}")
+            # The friendly message below is returned as NORMAL text, so the SSE
+            # layer would otherwise record this run as completed. Leave the real
+            # failure on the thread-local for it to pick up.
+            # This message lands verbatim in chat_runs.error_message via the
+            # SSE done path — same redaction as the worker error path.
+            agent._tls.last_provider_failure = {
+                "error_class": type(e).__name__,
+                "message": redact_secrets(e)[:500],
+            }
             return agent._user_facing_provider_error(e)

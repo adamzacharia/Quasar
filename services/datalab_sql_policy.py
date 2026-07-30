@@ -137,12 +137,17 @@ def validate(sql: str, *, source: str = "builder", meta: Optional[Mapping[str, A
         limit = _limit_value(clean)
         if limit is None:
             final_sql = f"{query}\nLIMIT {DEFAULT_ROW_CAP}"
-            warnings.append(f"Injected LIMIT {DEFAULT_ROW_CAP} output cap.")
+            warnings.append(
+                f"Row cap LIMIT {DEFAULT_ROW_CAP} added by the query governor — platform cost "
+                "control, not a science cut. If it truncates the result, tell the user and offer "
+                "the uncapped path (async_submit background job or an aggregate builder)."
+            )
             metadata.setdefault("row_limit", DEFAULT_ROW_CAP)
         elif limit > MAX_ROW_CAP:
             _raise(
                 f"LIMIT {limit} exceeds the Data Lab row cap {MAX_ROW_CAP}",
-                f"Use LIMIT <= {MAX_ROW_CAP} or a builder aggregate.",
+                f"Reduce LIMIT to <= {MAX_ROW_CAP} (the platform row cap), or get the full "
+                "selection through a builder aggregate or an async_submit background job.",
             )
         else:
             # Record the effective cap so execution layers can detect results
@@ -312,7 +317,8 @@ def _add_nan_guards(query: str, clean: str, warnings: List[str]) -> tuple[str, s
     warnings.append(
         "Auto-added NaN finiteness guards (col < 'Infinity') to: " + "; ".join(guarded) + ". "
         "Data Lab stores missing floats as NaN, which Postgres orders ABOVE every real number, "
-        "so bare >/>=/!= cuts would have admitted every missing-value row."
+        "so bare >/>=/!= cuts would have admitted every missing-value row. This is a data-validity "
+        "guardrail added by the query governor, not a science cut."
     )
     return rewritten, _scrub_sql(rewritten)
 
@@ -378,7 +384,8 @@ def _inject_default_quality_cuts(
             new_query = f"{query} WHERE {pred_sql}"
     warnings.append(
         f"Auto-applied {catalog}.{table} registry quality cuts to expert SQL: {pred_sql}. "
-        "These defaults make results comparable to the survey's canonical selection — "
+        "These are platform survey-quality defaults (not user-requested science cuts) that make "
+        "results comparable to the survey's canonical selection — disclose them in the answer; "
         "include your own cut on those columns to override."
     )
     return new_query, _scrub_sql(new_query)

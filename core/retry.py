@@ -92,9 +92,25 @@ def _is_retryable(error: Exception) -> bool:
         if status_code >= 500:
             return True
 
+    # httpx transport failures cover mid-stream connection deaths whose type
+    # names don't match the substring patterns below (ReadError = TCP reset
+    # during body read, RemoteProtocolError = peer closed mid-body). openai
+    # does NOT wrap iteration errors, so these surface raw from the stream.
+    # Guarded import: this module is also used where httpx isn't guaranteed.
+    try:
+        import httpx
+    except ImportError:
+        pass
+    else:
+        if isinstance(error, httpx.TransportError):
+            return True
+
     # Connection errors, timeouts → retryable
     error_name = type(error).__name__.lower()
-    retryable_patterns = ['timeout', 'connection', 'network', 'reset', 'eof']
+    retryable_patterns = [
+        'timeout', 'connection', 'network', 'reset', 'eof',
+        'readerror', 'remoteprotocol', 'incomplete',
+    ]
     return any(p in error_name for p in retryable_patterns)
 
 

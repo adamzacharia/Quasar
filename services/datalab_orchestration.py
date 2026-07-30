@@ -735,7 +735,8 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     # Registry default quality cuts (e.g. DES flags_*=0) ride along unless the
     # caller cut the same column (live P5: garbage colors stretched CCD axes).
     value_cuts, quality_note = reg.merge_default_quality_cuts(catalog, table, [dict(vc) for vc in (extra_value_cuts or [])])
-    for col in dict.fromkeys(magcols.values()):
+    validity_cols = list(dict.fromkeys(magcols.values()))
+    for col in validity_cols:
         value_cuts.append({"column": col, "op": ">", "value": _VALID_MAG_RANGE[0]})
         value_cuts.append({"column": col, "op": "<", "value": _VALID_MAG_RANGE[1]})
     # An explicit morphology cut wins over point_sources (which pulls the
@@ -758,6 +759,20 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     meta = dict(meta or {})
     meta["point_source_cut_applied"] = ps_applied
     meta["morphology"] = morph_cut
+    # The -5/50 cuts above are sentinel removal, NOT survey science — annotate
+    # them so the provenance SQL cannot be imitated/rationalized as a science
+    # choice ("mag < 50", "avoid the noise floor"; NOIRLab beta eval).
+    meta["auto_validity_filters"] = {
+        "columns": validity_cols,
+        "range": list(_VALID_MAG_RANGE),
+        "purpose": "sentinel-magnitude removal (99/-99); automatic data-validity filter, not a science cut",
+    }
+    meta.setdefault("warnings", []).append(
+        f"Validity filter {_VALID_MAG_RANGE[0]:g} < mag < {_VALID_MAG_RANGE[1]:g} applied "
+        f"automatically to {', '.join(validity_cols)} to drop survey sentinel values (99/-99). "
+        "It is a platform data-validity guard, not a science cut — never present it as one or "
+        "copy it into user-facing SQL as a magnitude selection."
+    )
     if ps_note:
         meta.setdefault("warnings", []).append(ps_note)
     if quality_note:
@@ -977,7 +992,7 @@ def _split_groups(split_col, s, finite, split_threshold):
 def color_color_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_bands=("g", "r"), y_bands=("r", "i"),
-    split_col=None, split_threshold=0.005, limit=3000, title=None,
+    split_col=None, split_threshold=0.003, limit=3000, title=None,
     point_sources=False, morphology=None, value_cuts=None,
     x_expr=None, y_expr=None,
     client=None, result_store=None, plotting_service=None, owner_id=None,
@@ -1050,7 +1065,8 @@ def color_color_diagram(
     plotly_spec = _plotly_scatter_spec(panels, x_label=xl, y_label=yl, title=plot_title)
     ps_applied = bool(_meta.get("point_source_cut_applied"))
     return _render_diagram(plotting, fig, "datalab_ccd", rid,
-                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
+                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
+                            "auto_validity_filters": _meta.get("auto_validity_filters")},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col,
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "populations": populations,
@@ -1116,7 +1132,8 @@ def color_magnitude_diagram(
         x_label=xl, y_label=yl, title=plot_title, invert_y=True,
     )
     return _render_diagram(plotting, fig, "datalab_cmd", rid,
-                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
+                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
+                            "auto_validity_filters": _meta.get("auto_validity_filters")},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "points": int(finite.sum()),
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "warnings": list(_meta.get("warnings") or []),
