@@ -173,8 +173,17 @@ class ModelRouter:
         """
         Check if the model's provider is healthy. If not, return a fallback.
         The static ROUTING_TABLE is unchanged — health is a filter on top.
+
+        Gated behind QUASAR_MODEL_FAILOVER (CX-06): the shared HealthMonitor
+        now carries LIVE data, so an ungated consult here would reroute
+        Conductor helper models as a side effect of merely wiring the monitor.
+        Same kill-switch semantics as the runner's turn-start failover — read
+        per call, default OFF, enable with 1/true/yes/on.
         """
         if self.health_monitor is None:
+            return model
+        flag = (os.getenv("QUASAR_MODEL_FAILOVER", "0") or "0").strip().lower()
+        if flag not in {"1", "true", "yes", "on"}:
             return model
 
         provider = detect_provider(model)
@@ -182,11 +191,31 @@ class ModelRouter:
             return model
 
         fallback = self.health_monitor.get_fallback_model(model, provider)
-        if fallback:
-            logger.warning(
-                "Health check: '%s' (%s) unhealthy — routing to fallback '%s'",
-                model, provider, fallback,
-            )
-            return fallback
+        if not fallback or fallback == model:
+            return model  # No fallback available, try anyway
 
-        return model  # No fallback available, try anyway
+        # CX-06 (round 2): the mapped fallback passes the SAME eligibility
+        # gates as the runner's turn-start failover — a different provider
+        # with a usable key path that is itself healthy — otherwise rerouting
+        # just trades one failure mode for another. Cheap, side-effect-free
+        # gates run FIRST so a rejected reroute never claims the fallback
+        # provider's single-flight recovery probe (CX-20); when the final
+        # health check claims it (True), we DO reroute and the subtask's call
+        # settles the probe. (No attachment gate here: Conductor subtasks
+        # never carry user uploads — those ride only the runner chat path.)
+        fallback_provider = detect_provider(fallback)
+        if fallback_provider == provider:
+            return model
+        # Lazy import: several unit suites stub core.llm_client with only the
+        # symbols this module's top level needs.
+        from core.llm_client import provider_has_key_path
+        if not provider_has_key_path(fallback_provider):
+            return model
+        if not self.health_monitor.is_healthy(fallback_provider):
+            return model
+
+        logger.warning(
+            "Health check: '%s' (%s) unhealthy — routing to fallback '%s' (%s)",
+            model, provider, fallback, fallback_provider,
+        )
+        return fallback

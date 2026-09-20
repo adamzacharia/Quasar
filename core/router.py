@@ -11,10 +11,56 @@ if TYPE_CHECKING:
     from core.agent import QuasarAgent
 
 
+_ARCHIVE_INTENT_RE = re.compile(r"\b(?:alma|archive|observations?|projects?|mous|datasets?)\b")
+_BAND_LIST_RE = re.compile(
+    r"\bbands?\s+(\d+(?:\s*(?:,|or|and|/|-|\u2013|\u2014|to|through|thru)\s*(?:band\s*)?\d+)*)"
+)
+_BAND_TOKEN_RE = re.compile(r"(\d+)|(-|\u2013|\u2014|\bto\b|\bthrough\b|\bthru\b)")
+_RESOLUTION_RE = re.compile(
+    r"(?:under|below|less than|better than|finer than|<)\s*(\d+(?:\.\d+)?)\s*(arcsec(?:ond)?s?|mas|[\"\u2033])"
+)
+# Negated / archive-name phrasings must not become constraints.
+_PUBLIC_RE = re.compile(r"(?<!non-)(?<!non )(?<!not )\bpublic\b")
+_SCIENCE_RE = re.compile(r"\bscience\W{1,4}(?:observations?|data|targets?|scans?|only|products?)\b")  # tolerates markdown
+# Species commonly requested by name in ALMA line searches (case-sensitive, matched on the raw prompt).
+_SPECIES_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:1[23]C(?:1[78])?O|C1[78]O|CO|HCO\+|H13CO\+|DCO\+|HCN|H13CN|DCN|HNC|HN13C|CS|13CS|C34S|SiO|"
+    r"N2H\+|N2D\+|CN|SO2|SO|H2O|NH3|NH2D|CH3OH|CH3CN|HC3N|H2CO|OCS|C2H|CCH|CH3CCH|HCOOCH3|CH3OCH3|CH\+|OH|HD)"
+    r"(?![A-Za-z0-9])"
+)
+
+
+def _bands_from_prompt(q: str) -> List[int]:
+    """Band numbers named in the prompt; inclusive ranges ('6-7', '6 to 7') expanded."""
+    bands: List[int] = []
+    for match in _BAND_LIST_RE.finditer(q):
+        prev: Optional[int] = None
+        pending_range = False
+        for tok in _BAND_TOKEN_RE.finditer(match[1]):
+            if tok.group(1):
+                n = int(tok.group(1))
+                if pending_range and prev is not None and prev < n <= prev + 9:
+                    bands.extend(range(prev + 1, n + 1))
+                else:
+                    bands.append(n)
+                prev, pending_range = n, False
+            else:
+                pending_range = True
+    return list(dict.fromkeys(b for b in bands if 1 <= b <= 10))
+
+
 def route_alma_science_archive_query(agent: "QuasarAgent", query: str) -> Optional[Dict[str, Any]]:
-    """Map known hard ALMA science prompts to deterministic tool args."""
+    """Extract explicit archive constraints without target-specific defaults.
+
+    Every branch is gated on archive intent, values come only from the prompt,
+    and the target is deliberately NOT extracted (the tool directive tells the
+    model to supply the user's target or coordinates) — a regex guess at a
+    multi-token identifier is worse than no guess.
+    """
     raw = str(query or "")
     q = raw.lower()
+    if not _ARCHIVE_INTENT_RE.search(q):
+        return None
     cycle_match = re.search(r"\bcycle\s+(\d{1,2})\b", q)
     cycle = int(cycle_match.group(1)) if cycle_match else None
 
@@ -24,38 +70,36 @@ def route_alma_science_archive_query(agent: "QuasarAgent", query: str) -> Option
     if cycle is not None and all(term in q for term in ("12m", "7m")) and re.search(r"total\s+power|\btp\b", q):
         return {"query_type": "cycle_array_combo_projects", "cycle": cycle, "arrays": ["12m", "7m", "TP"]}
 
-    if re.search(r"\bhh\s*212\b", q) and re.search(r"band\s*7|\bb7\b", q):
-        return {
-            "query_type": "high_resolution_band_data",
-            "target": "HH 212",
-            "band": 7,
-            "max_resolution_arcsec": 0.1,
-        }
-
-    if all(term in q for term in ("12co", "13co", "c18o")):
-        args: Dict[str, Any] = {
-            "query_type": "line_set_projects",
-            "band": 6,
-            "lines": ["12CO", "13CO", "C18O"],
-            "require_same_project": True,
-        }
-        if re.search(r"protostellar|proto-stellar|disk", q):
-            args["topic_filter"] = "protostellar disks"
+    bands = _bands_from_prompt(q)
+    resolution = _RESOLUTION_RE.search(q)
+    if "alma" in q and bands and (resolution or re.search(r"high[-\s]?resolution", q)):
+        args: Dict[str, Any] = {"query_type": "high_resolution_band_data", "band": bands}
+        if resolution:
+            args["max_resolution_arcsec"] = float(resolution[1]) / (1000 if resolution[2] == "mas" else 1)
+        if _PUBLIC_RE.search(q):
+            args["public_only"] = True
+        if _SCIENCE_RE.search(q):
+            args["science_only"] = True
         return args
 
-    z_match = re.search(r"\bz\s*[=~]?\s*(\d+(?:\.\d+)?)\s*(?:-|to|–)\s*(\d+(?:\.\d+)?)", q)
+    species = list(dict.fromkeys(_SPECIES_RE.findall(raw)))
+    if "alma" in q and len(species) > 1 and re.search(r"\blines?\b|molecular|isotop|transitions?", q):
+        args = {"query_type": "line_set_projects", "lines": species}
+        if bands:
+            args["band"] = bands
+        return args
+
+    z_match = re.search(r"\bz\s*[=~]?\s*(\d+(?:\.\d+)?)\s*(?:-|to|\u2013)\s*(\d+(?:\.\d+)?)", q)
     if z_match and re.search(r"\bco\b|carbon monoxide|rest frequenc", q):
         return {
             "query_type": "redshifted_line_projects",
             "redshift_min": float(z_match.group(1)),
             "redshift_max": float(z_match.group(2)),
             "rest_species": "CO",
-            "science_category": "Galaxy",
-            "require_same_project": True,
         }
 
     if re.search(r"bandwidth\s+switching|spectral\s+setup", q):
-        args: Dict[str, Any] = {"query_type": "bandwidth_switching_candidates"}
+        args = {"query_type": "bandwidth_switching_candidates"}
         if cycle is not None:
             args["cycle"] = cycle
         return args

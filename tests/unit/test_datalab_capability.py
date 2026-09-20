@@ -329,8 +329,8 @@ def test_sia_search_inventory_stores_rows_and_filters_band():
     assert out["result_id"].startswith("dlr_")
     assert out["coverage_gap"] is False
     assert out["position"]["label"] == "M31"
-    # preview shows display columns only; access_url stays in the stored rows
-    assert all("access_url" not in row for row in out["preview"])
+    # Discovery previews preserve access URLs as well as the exposure metadata.
+    assert out["preview"][0]["access_url"] == "https://x/1"
     stored = ctx.result_store.get(out["result_id"]).dataframe
     assert list(stored["access_url"]) == ["https://x/1"]
     assert svc.calls[0][3] == "ls_dr9"
@@ -446,7 +446,12 @@ def _patch_tiling(monkeypatch):
 
     def fake_tiled(catalog, table, **kw):
         calls.append({"catalog": catalog, "table": table, **kw})
-        return {"success": True, "result_id": "dlr_tiled", "tiles": 4, "merged": True}
+        # Mirror the real contract (CX-06 verify): pre-tiling warnings arrive
+        # via extra_warnings and appear in the result's (and stored) warnings.
+        return {
+            "success": True, "result_id": "dlr_tiled", "tiles": 4, "merged": True,
+            "warnings": [w for w in (kw.get("extra_warnings") or []) if w],
+        }
 
     monkeypatch.setattr(dl.datalab_orchestration, "tiled_density_aggregate", fake_tiled)
     return calls
@@ -1406,3 +1411,154 @@ def test_sia_search_uncapped_result_carries_no_upstream_flags():
     assert "upstream_truncated" not in out
     _frame, meta, _status = store.lookup(out["result_id"])
     assert "upstream_truncated" not in meta
+
+
+# ── CX-18: band-substitution skip when >half the guard budget is spent ────
+
+
+def test_band_substitution_retry_skipped_after_half_budget(monkeypatch):
+    import time as _timemod
+
+    import capabilities.datalab as cd
+    from capabilities.base import CallContext
+    from capabilities.datalab import ImageCutout
+
+    calls = {"n": 0}
+
+    class _FakeImageService:
+        def cutout(self, *args, **kwargs):
+            calls["n"] += 1
+            return {
+                "success": False,
+                "error": "no usable g tiles here",
+                "suggested_bands": ["r", "i"],
+            }
+
+    # Budget 10 s; first monotonic() call (the _t0 capture) returns 0, every
+    # later call returns 6 → elapsed 6 > 10 * 0.5, so the retry must be
+    # SKIPPED and reported instead of executed.
+    monkeypatch.setattr(cd, "_cutout_guard_budget", lambda: 10.0)
+    state = {"first": True}
+
+    def _mono():
+        if state["first"]:
+            state["first"] = False
+            return 0.0
+        return 6.0
+
+    monkeypatch.setattr(_timemod, "monotonic", _mono)
+
+    ctx = CallContext(
+        services={
+            "datalab_image_service": _FakeImageService(),
+            "resolve_coordinates": lambda target_name, ra, dec: (ra, dec, f"RA {ra}, Dec {dec}"),
+        }
+    )
+    cap = ImageCutout()
+    out = cap.run(
+        cap.InputModel(ra=10.0, dec=-5.0, fov_deg=0.05, band="g"), ctx
+    ).to_native()
+
+    assert calls["n"] == 1, "the substitution retry must NOT execute"
+    skipped = out["band_substitution_skipped"]
+    assert skipped["requested"] == "g"
+    assert skipped["available"] == ["r", "i"]
+    assert any("SKIPPED" in w for w in out["warnings"])
+
+
+# ── CX-26: grid peak cap env parsing must never break import or uncap ─────
+
+
+def test_grid_peak_cap_env_parsing(monkeypatch):
+    from capabilities.datalab import _DEFAULT_MAX_GRID_PEAKS, _grid_peak_cap
+
+    monkeypatch.delenv("DATALAB_CUTOUT_GRID_MAX_PEAKS", raising=False)
+    assert _grid_peak_cap() == _DEFAULT_MAX_GRID_PEAKS
+    monkeypatch.setenv("DATALAB_CUTOUT_GRID_MAX_PEAKS", "20")
+    assert _grid_peak_cap() == 20
+    monkeypatch.setenv("DATALAB_CUTOUT_GRID_MAX_PEAKS", "0")
+    assert _grid_peak_cap() == 0  # documented disable
+    for bad in ("not-an-int", "-3", "nan", "inf"):
+        monkeypatch.setenv("DATALAB_CUTOUT_GRID_MAX_PEAKS", bad)
+        assert _grid_peak_cap() == _DEFAULT_MAX_GRID_PEAKS, bad
+    monkeypatch.setenv("DATALAB_CUTOUT_GRID_MAX_PEAKS", "0.9")
+    assert _grid_peak_cap() == _DEFAULT_MAX_GRID_PEAKS, (
+        "sub-1 decimals must not truncate into an accidental disable"
+    )
+
+
+def test_datalab_error_flags_requests_timeouts():
+    import requests
+
+    from capabilities.datalab import datalab_error
+
+    out = datalab_error(requests.exceptions.ReadTimeout("read timed out")).to_native()
+    assert out["success"] is False and out["timeout"] is True
+    out = datalab_error(TimeoutError("wall clock")).to_native()
+    assert out["timeout"] is True
+    out = datalab_error(ValueError("not a timeout")).to_native()
+    assert "timeout" not in out
+
+
+# ── 2026-08 guard round (task-3c99b37-89): CX-05 / CX-06 ─────────────────────
+def test_toolresult_provenance_carries_platform_row_cap_sync_and_async():
+    """CX-05: the canonical ToolResult Provenance (not only the stored-result
+    meta) must disclose a platform-chosen row cap, on the direct sync path AND
+    the async submit path; a user-passed limit stays unflagged."""
+    df = pd.DataFrame({"ra": [1.0], "dec": [2.0]})
+    ctx, client, store = _ctx(df)
+
+    res = dl.SelectCatalogRows().run(
+        dl.SelectCatalogRowsInput(
+            catalog="gaia_dr3", table="gaia_source", ra=229.0, dec=-0.1, radius_deg=0.05
+        ),
+        ctx,
+    )
+    assert res.success is True and res.provenance is not None
+    assert res.provenance.platform_row_cap == 500
+
+    res2 = dl.SelectCatalogRows().run(
+        dl.SelectCatalogRowsInput(
+            catalog="gaia_dr3", table="gaia_source", ra=229.0, dec=-0.1,
+            radius_deg=0.05, limit=300,
+        ),
+        ctx,
+    )
+    assert res2.success is True
+    assert getattr(res2.provenance, "platform_row_cap", None) is None
+
+    # Async submit (anonymous token → local job path): the up-front provenance
+    # is stamped before any rows exist.
+    ctx2 = CallContext(
+        services={"datalab_client": client, "datalab_job_service": _FakeJobService()},
+        result_store=store,
+    )
+    res3 = dl.SelectCatalogRows().run(
+        dl.SelectCatalogRowsInput(
+            catalog="gaia_dr3", table="gaia_source", ra=229.0, dec=-0.1,
+            radius_deg=0.05, async_submit=True,
+        ),
+        ctx2,
+    )
+    assert res3.success is True and res3.provenance is not None
+    assert res3.provenance.platform_row_cap == 500
+
+
+def test_density_aggregate_tiled_fallback_carries_morphology_warning(monkeypatch):
+    """CX-06: when the sync attempt times out and the cone auto-tiles, the
+    morphology-deviation warning stamped into the (dead) sync meta must reach
+    the tiled result's warnings — a wide-cone morphology mistake must never
+    execute silently."""
+    _patch_tiling(monkeypatch)
+    ctx, _ = _agg_ctx(_TimeoutClient())
+    out = dl.DensityAggregate().run(
+        dl.DensityAggregateInput(
+            catalog="nsc_dr2", table="object", ra=266.4, dec=-29.0,
+            radius_deg=3.0, confirm=True,
+            # class_star at spread_model scale: the classic 167x conflation.
+            morphology={"column": "class_star", "op": ">", "value": 0.003},
+        ),
+        ctx,
+    ).to_native()
+    assert out["success"] is True
+    assert any("MORPHOLOGY THRESHOLD CHECK" in w for w in out.get("warnings") or [])

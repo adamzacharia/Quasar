@@ -73,11 +73,23 @@ def test_calculate_alma_sensitivity_defaults(monkeypatch):
     assert seen["band"] == 6 and seen["bandwidth_ghz"] == 7.5
     assert seen["t_integration_s"] == 60.0 and seen["n_polarizations"] == 2
     assert seen["pwv_mm"] == 1.0 and seen["n_antennas"] is None
+    assert seen["array"] == "12m" and seen["robust_weighting_factor"] == 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # resolve_target (module function + capability)
 # ─────────────────────────────────────────────────────────────────────────────
+def _no_sesame(monkeypatch):
+    """Make the Sesame step fail offline so the SIMBAD fallback path is exercised."""
+    from astropy.coordinates import SkyCoord
+    from astropy.coordinates.name_resolve import NameResolveError
+
+    def _unavailable(name, *args, **kwargs):
+        raise NameResolveError("sesame unavailable in tests")
+
+    monkeypatch.setattr(SkyCoord, "from_name", classmethod(lambda cls, name, *a, **k: _unavailable(name)))
+
+
 class _FakeSimbadResult:
     def __init__(self, ra, dec, colnames=("ra", "dec")):
         self._data = {colnames[0]: [ra], colnames[1]: [dec]}
@@ -91,6 +103,7 @@ class _FakeSimbadResult:
 
 
 def test_resolve_target_success(monkeypatch):
+    _no_sesame(monkeypatch)
     import astroquery.simbad as sq
     monkeypatch.setattr(sq.Simbad, "query_object",
                         staticmethod(lambda name: _FakeSimbadResult(187.7059, 12.3911)))
@@ -101,6 +114,7 @@ def test_resolve_target_success(monkeypatch):
 
 
 def test_resolve_target_not_found(monkeypatch):
+    _no_sesame(monkeypatch)
     import astroquery.simbad as sq
     monkeypatch.setattr(sq.Simbad, "query_object", staticmethod(lambda name: None))
     out = resolve_target("Nowhere")
@@ -108,6 +122,7 @@ def test_resolve_target_not_found(monkeypatch):
 
 
 def test_resolve_target_capability_wraps_module_fn(monkeypatch):
+    _no_sesame(monkeypatch)
     import astroquery.simbad as sq
     monkeypatch.setattr(sq.Simbad, "query_object",
                         staticmethod(lambda name: _FakeSimbadResult(10.0, -5.0)))
@@ -116,6 +131,7 @@ def test_resolve_target_capability_wraps_module_fn(monkeypatch):
 
 
 def test_resolve_target_null_name_is_caught(monkeypatch):
+    _no_sesame(monkeypatch)
     import astroquery.simbad as sq
 
     def _boom(name):
@@ -164,6 +180,7 @@ def test_calc_registrations_keep_their_legacy_surface():
 def test_agent_resolve_target_delegates_to_module_fn(monkeypatch):
     # The thin agent method other families receive by injection still works.
     agent = _wiring_agent()
+    _no_sesame(monkeypatch)
     import astroquery.simbad as sq
     monkeypatch.setattr(sq.Simbad, "query_object",
                         staticmethod(lambda name: _FakeSimbadResult(1.0, 2.0)))
@@ -221,14 +238,29 @@ def test_beam_230ghz_16km_numeric_parity():
 
 
 def test_alma_sensitivity_band6_numeric_parity():
-    # Band 6 defaults (233 GHz, Tsys 120 K, eta 0.65, 50 antennas, 7.5 GHz,
-    # 60 s, 2 pol, 1 mm PWV) → 135.7 µJy/beam continuum.
+    # Technical Handbook (Cycle 13) eq. 9.8 with the ASC defaults:
+    #   dS = 2 k Tsys / (eta_q eta_c A_eff sqrt(N(N-1) n_pol dnu t))
+    # Band 6: Tsys 120 K (representative), eta_ap 0.68 (Table 9.3) x 113.1 m^2
+    # = 76.91 m^2, eta_q 0.96, eta_c 0.88, N = 43, n_pol = 2, dnu = 7.5 GHz,
+    # t = 60 s:
+    #   sqrt(43*42*2*7.5e9*60) = sqrt(1.6254e15) = 4.0316e7
+    #   denominator = 0.96*0.88*76.91*4.0316e7 = 2.6194e9
+    #   dS = 2*1.380649e-23*120 / 2.6194e9 = 1.265e-30 W m^-2 Hz^-1 = 126.5 uJy
+    # The former pin (135.7 uJy with 50 antennas, eta 0.65, no efficiencies)
+    # used 2kT with N(N-1)/2 under the root: sqrt(2) = 1.41x too pessimistic
+    # (report G-12); with eta = 1 and 50 antennas the standard form gives 96 uJy.
     out = _run(CalculateAlmaSensitivity(), band=6)
     assert out["success"] is True
-    assert out["frequency_ghz"] == pytest.approx(233.0)
+    assert out["frequency_ghz"] == pytest.approx(230.0)
     assert out["tsys_k"] == 120
-    assert out["n_antennas"] == 50 and out["n_baselines"] == 1225
-    assert out["continuum_sensitivity_ujy_beam"] == pytest.approx(135.7, rel=1e-2)
+    assert out["n_antennas"] == 43 and out["n_baselines"] == 903
+    assert out["quantization_efficiency"] == 0.96 and out["correlator_efficiency"] == 0.88
+    assert out["continuum_sensitivity_ujy_beam"] == pytest.approx(126.5, rel=1e-2)
+    assert "N*(N-1)" in out["formula"] and "/2" not in out["formula"]
+    # eta = 1, 50 antennas, Tsys 120: the textbook 2kT/(A sqrt(N(N-1) n_pol dnu t))
+    # = 96 uJy scaled by 1/(0.96*0.88) and eta_ap 0.68/0.65 -> 108.6 uJy.
+    out50 = _run(CalculateAlmaSensitivity(), band=6, n_antennas=50, tsys_k=120)
+    assert out50["continuum_sensitivity_ujy_beam"] == pytest.approx(108.6, rel=1e-2)
 
 
 def test_convert_coordinates_m31_frames_numeric_parity():

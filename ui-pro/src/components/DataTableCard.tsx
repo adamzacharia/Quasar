@@ -30,10 +30,19 @@ function QA2StatusBadge({ status }: { status: string }) {
     const label = status && status !== "—" ? status : "Unknown";
     const normalized = label.replace(/[\s_-]+/g, "").toLowerCase();
 
-    const styleByStatus: Record<string, { dot: string; text: string }> = {
-        pass: { dot: "bg-emerald-400 shadow-emerald-400/30", text: "text-emerald-200" },
-        semipass: { dot: "bg-amber-300 shadow-amber-300/30", text: "text-amber-200" },
-        unknown: { dot: "bg-slate-500 shadow-slate-500/20", text: "text-slate-400" },
+    // Three-state QA2 (PASS / SEMIPASS / FAIL) comes from the QA2 report; the
+    // ObsCore qa2_passed flag only yields the coarse "Pass" / "Not Pass".
+    const styleByStatus: Record<string, { dot: string; text: string; title: string }> = {
+        pass: { dot: "bg-emerald-400 shadow-emerald-400/30", text: "text-emerald-200",
+            title: "QA2 PASS (from the qa2_passed flag this can also be SEMIPASS; the QA2 report is authoritative)" },
+        semipass: { dot: "bg-amber-300 shadow-amber-300/30", text: "text-amber-200",
+            title: "QA2 SEMIPASS (from the QA2 report): delivered with documented shortfalls" },
+        notpass: { dot: "bg-orange-400 shadow-orange-400/30", text: "text-orange-200",
+            title: "qa2_passed = F: SEMIPASS or FAIL — read the QA2 report (get_alma_qa2_status)" },
+        fail: { dot: "bg-rose-500 shadow-rose-500/30", text: "text-rose-200",
+            title: "QA2 FAIL (from the QA2 report)" },
+        unknown: { dot: "bg-slate-500 shadow-slate-500/20", text: "text-slate-400",
+            title: "QA2 disposition unknown" },
     };
     const style = styleByStatus[normalized];
 
@@ -42,7 +51,7 @@ function QA2StatusBadge({ status }: { status: string }) {
     }
 
     return (
-        <span className={`inline-flex items-center gap-1.5 font-sans text-xs font-semibold ${style.text}`}>
+        <span className={`inline-flex items-center gap-1.5 font-sans text-xs font-semibold ${style.text}`} title={style.title}>
             <span className={`h-2 w-2 shrink-0 rounded-full shadow-[0_0_8px_currentColor] ${style.dot}`} aria-hidden="true" />
             {label}
         </span>

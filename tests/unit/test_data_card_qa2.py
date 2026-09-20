@@ -96,7 +96,7 @@ def test_no_s_region_column_yields_no_footprints():
     assert "skyFootprints" not in demographics
 
 
-def test_alma_observation_qa2_false_maps_to_semipass():
+def test_alma_observation_qa2_false_is_not_semipass():
     api_main = load_api_main_module()
 
     df = pd.DataFrame([
@@ -119,7 +119,10 @@ def test_alma_observation_qa2_false_maps_to_semipass():
         "tool_name": "search_alma_archive",
     })
 
-    assert rich["rows"][0]["QA2"] == "SemiPass"
+    # qa2_passed = F means SEMIPASS *or* FAIL: the flag cannot say which, so the
+    # badge shows the coarse "Not Pass" until the QA2 report resolves it.
+    assert rich["rows"][0]["QA2"] == "Not Pass"
+    assert rich["rows"][0]["QA2"] != "SemiPass"
 
 
 def test_alma_product_data_card_includes_qa2_column():

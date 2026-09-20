@@ -3,12 +3,20 @@
 #   ansible-playbook -i inventory.ini quasar.yml                 # full provision / rebuild
 #   ansible-playbook -i inventory.ini quasar.yml --tags deploy   # update code + restart only
 #
-# Tested targets: Ubuntu 24.04 and Rocky/RHEL 9. See README.md in this
-# directory for secrets (ansible-vault), TLS, and TACC firewall notes.
+# Production dependency acceptance target: Ubuntu 24.04 / CPython 3.12.
+# Existing Rocky/RHEL 9 provisioning tasks remain but are not lock-tested here.
+# See README.md for secrets (ansible-vault), TLS, and TACC firewall notes.
 ---
 - name: Provision Quasar VM
   hosts: quasar
   become: true
+  vars:
+    # Human-edited requirements live in requirements/production.in. This is
+    # the generated, hash-locked CPython 3.12 / x86_64 Linux artifact.
+    quasar_production_lock: "{{ quasar_app_dir }}/requirements/production-py312-linux-x86_64.txt"
+    quasar_venvs_dir: "{{ quasar_root }}/venvs"
+    quasar_venv_next_link: "{{ quasar_root }}/.venv-next"
+    quasar_legacy_venv_backup: "{{ quasar_venvs_dir }}/legacy-pre-lock"
 
   handlers:
     - name: restart quasar-backend
@@ -126,14 +134,14 @@
         - restart quasar-frontend
       tags: [app, deploy]
 
-    # ── Backend: venv + deps + .env + service ────────────────────────
-    - name: Create venv and install Python requirements
-      ansible.builtin.pip:
-        requirements: "{{ quasar_app_dir }}/requirements.txt"
-        virtualenv: "{{ quasar_venv }}"
-        virtualenv_command: "{{ quasar_python }} -m venv"
-      become_user: "{{ quasar_user }}"
-      notify: restart quasar-backend
+    # ── Backend: immutable locked venv + .env + service ───────────────
+    - name: Create versioned venv root
+      ansible.builtin.file:
+        path: "{{ quasar_venvs_dir }}"
+        state: directory
+        owner: "{{ quasar_user }}"
+        group: "{{ quasar_user }}"
+        mode: "0755"
       tags: [app, deploy]
 
     - name: Render root .env (config + vault secrets)
@@ -146,20 +154,208 @@
       notify: restart quasar-backend
       tags: [app, deploy]
 
+    - name: Read production lock checksum
+      ansible.builtin.stat:
+        path: "{{ quasar_production_lock }}"
+        checksum_algorithm: sha256
+      register: quasar_lock_stat
+      tags: [app, deploy]
+
+    - name: Require the generated production lock
+      ansible.builtin.assert:
+        that:
+          - quasar_lock_stat.stat.exists
+          - quasar_lock_stat.stat.isreg | default(false)
+          - (quasar_lock_stat.stat.checksum | default('') | length) == 64
+        fail_msg: >-
+          Missing production lock {{ quasar_production_lock }}. Regenerate it
+          from requirements/production.in as documented in deploy/ansible/README.md.
+      tags: [app, deploy]
+
+    - name: Select lock-addressed Python 3.12 venv
+      ansible.builtin.set_fact:
+        quasar_release_venv: "{{ quasar_venvs_dir }}/py312-{{ quasar_lock_stat.stat.checksum }}"
+        quasar_release_marker: "{{ quasar_venvs_dir }}/py312-{{ quasar_lock_stat.stat.checksum }}/.quasar-lock-ok"
+      tags: [app, deploy]
+
+    - name: Inspect active venv path without following links
+      ansible.builtin.stat:
+        path: "{{ quasar_venv }}"
+        follow: false
+      register: quasar_active_venv_stat
+      tags: [app, deploy]
+
+    - name: Record whether this release is already active
+      ansible.builtin.set_fact:
+        quasar_release_is_active: >-
+          {{
+            quasar_active_venv_stat.stat.exists
+            and (quasar_active_venv_stat.stat.islnk | default(false))
+            and (quasar_active_venv_stat.stat.lnk_source | default('') == quasar_release_venv)
+          }}
+      tags: [app, deploy]
+
+    - name: Inspect release validation marker
+      ansible.builtin.stat:
+        path: "{{ quasar_release_marker }}"
+      register: quasar_release_marker_stat
+      tags: [app, deploy]
+
+    - name: Refuse to delete an active unvalidated release
+      ansible.builtin.fail:
+        msg: >-
+          Active venv {{ quasar_release_venv }} has no validation marker.
+          Restore or inspect it manually before deploying.
+      when:
+        - quasar_release_is_active | bool
+        - not quasar_release_marker_stat.stat.exists
+      tags: [app, deploy]
+
+    - name: Remove an interrupted unactivated release
+      ansible.builtin.file:
+        path: "{{ quasar_release_venv }}"
+        state: absent
+      when:
+        - not quasar_release_marker_stat.stat.exists
+        - not (quasar_release_is_active | bool)
+      tags: [app, deploy]
+
+    - name: Build and validate the locked release venv
+      when: not quasar_release_marker_stat.stat.exists
+      tags: [app, deploy]
+      block:
+        - name: Install exact hashed production dependencies
+          ansible.builtin.pip:
+            requirements: "{{ quasar_production_lock }}"
+            virtualenv: "{{ quasar_release_venv }}"
+            virtualenv_command: "{{ quasar_python }} -m venv"
+            extra_args: "--require-hashes --only-binary=:all:"
+          become_user: "{{ quasar_user }}"
+
+        - name: Check locked dependency consistency
+          ansible.builtin.command:
+            argv:
+              - "{{ quasar_release_venv }}/bin/python"
+              - -m
+              - pip
+              - check
+          become_user: "{{ quasar_user }}"
+          changed_when: false
+
+        - name: Smoke-test production imports and intentional SparCL absence
+          ansible.builtin.command:
+            argv:
+              - "{{ quasar_release_venv }}/bin/python"
+              - -c
+              - >-
+                import importlib.util;
+                import alminer, fastapi, langchain, langchain_community,
+                langchain_openai, lsdb, mcp, openai, pandas, pyvo,
+                qdrant_client, uvicorn;
+                from pyvo.registry import Freetext;
+                assert Freetext is not None;
+                assert importlib.util.find_spec("sparcl") is None
+          become_user: "{{ quasar_user }}"
+          changed_when: false
+
+        - name: Smoke-test Quasar app and agent before activation
+          ansible.builtin.command:
+            argv:
+              - "{{ quasar_release_venv }}/bin/python"
+              - -c
+              - >-
+                from api.main import app;
+                from api.deps import get_agent, get_agent_error;
+                agent = get_agent();
+                assert app is not None;
+                assert agent is not None, get_agent_error();
+                agent.shutdown_mcp_servers()
+          args:
+            chdir: "{{ quasar_app_dir }}/ui-pro"
+          become_user: "{{ quasar_user }}"
+          changed_when: false
+
+        - name: Mark release venv as validated
+          ansible.builtin.copy:
+            content: "{{ quasar_lock_stat.stat.checksum }}\n"
+            dest: "{{ quasar_release_marker }}"
+            owner: "{{ quasar_user }}"
+            group: "{{ quasar_user }}"
+            mode: "0444"
+
+    - name: Recheck release dependency consistency
+      ansible.builtin.command:
+        argv:
+          - "{{ quasar_release_venv }}/bin/python"
+          - -m
+          - pip
+          - check
+      become_user: "{{ quasar_user }}"
+      changed_when: false
+      tags: [app, deploy]
+
+    - name: Recheck release imports
+      ansible.builtin.command:
+        argv:
+          - "{{ quasar_release_venv }}/bin/python"
+          - -c
+          - >-
+            import importlib.util;
+            import alminer, fastapi, langchain, langchain_community,
+            langchain_openai, lsdb, mcp, openai, pandas, pyvo,
+            qdrant_client, uvicorn;
+            from pyvo.registry import Freetext;
+            assert Freetext is not None;
+            assert importlib.util.find_spec("sparcl") is None
+      become_user: "{{ quasar_user }}"
+      changed_when: false
+      tags: [app, deploy]
+
+    - name: Recheck Quasar app and agent before activation
+      ansible.builtin.command:
+        argv:
+          - "{{ quasar_release_venv }}/bin/python"
+          - -c
+          - >-
+            from api.main import app;
+            from api.deps import get_agent, get_agent_error;
+            agent = get_agent();
+            assert app is not None;
+            assert agent is not None, get_agent_error();
+            agent.shutdown_mcp_servers()
+      args:
+        chdir: "{{ quasar_app_dir }}/ui-pro"
+      become_user: "{{ quasar_user }}"
+      changed_when: false
+      tags: [app, deploy]
+
+    - name: Inspect preserved legacy venv backup
+      ansible.builtin.stat:
+        path: "{{ quasar_legacy_venv_backup }}"
+        follow: false
+      register: quasar_legacy_venv_backup_stat
+      when:
+        - quasar_active_venv_stat.stat.exists
+        - not (quasar_active_venv_stat.stat.islnk | default(false))
+      tags: [app, deploy]
+
+    - name: Refuse to overwrite a legacy venv backup
+      ansible.builtin.fail:
+        msg: >-
+          Both {{ quasar_venv }} and {{ quasar_legacy_venv_backup }} exist.
+          Resolve the prior migration manually before deploying.
+      when:
+        - quasar_active_venv_stat.stat.exists
+        - not (quasar_active_venv_stat.stat.islnk | default(false))
+        - quasar_legacy_venv_backup_stat.stat.exists | default(false)
+      tags: [app, deploy]
+
     - name: Install quasar-backend systemd unit
       ansible.builtin.template:
         src: templates/quasar-backend.service.j2
         dest: /etc/systemd/system/quasar-backend.service
         mode: "0644"
       notify: restart quasar-backend
-      tags: [app]
-
-    - name: Enable + start quasar-backend
-      ansible.builtin.systemd:
-        name: quasar-backend
-        enabled: true
-        state: started
-        daemon_reload: true
       tags: [app]
 
     # ── Frontend: npm build + service (skip if UI stays on Vercel) ───
@@ -196,6 +392,152 @@
             enabled: true
             state: started
             daemon_reload: true
+
+    - name: Activate and verify the validated backend release
+      tags: [app, deploy]
+      block:
+        - name: Preserve the pre-lock legacy venv directory
+          ansible.builtin.command:
+            argv:
+              - mv
+              - --
+              - "{{ quasar_venv }}"
+              - "{{ quasar_legacy_venv_backup }}"
+          register: quasar_legacy_venv_move
+          when:
+            - quasar_active_venv_stat.stat.exists
+            - not (quasar_active_venv_stat.stat.islnk | default(false))
+
+        - name: Remove stale activation link
+          ansible.builtin.file:
+            path: "{{ quasar_venv_next_link }}"
+            state: absent
+          when: not (quasar_release_is_active | bool)
+
+        - name: Stage validated venv symlink
+          ansible.builtin.file:
+            src: "{{ quasar_release_venv }}"
+            dest: "{{ quasar_venv_next_link }}"
+            state: link
+            owner: "{{ quasar_user }}"
+            group: "{{ quasar_user }}"
+          when: not (quasar_release_is_active | bool)
+
+        - name: Activate validated venv symlink atomically
+          ansible.builtin.command:
+            argv:
+              - mv
+              - -Tf
+              - --
+              - "{{ quasar_venv_next_link }}"
+              - "{{ quasar_venv }}"
+          when: not (quasar_release_is_active | bool)
+          register: quasar_venv_activation
+          notify: restart quasar-backend
+
+        - name: Enable + start quasar-backend
+          ansible.builtin.systemd:
+            name: quasar-backend
+            enabled: true
+            state: started
+            daemon_reload: true
+
+        - name: Apply service changes before backend health validation
+          ansible.builtin.meta: flush_handlers
+
+        - name: Verify backend health and agent dependency load
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ quasar_backend_port }}/health"
+            method: GET
+            status_code: 200
+            return_content: true
+          register: quasar_backend_health
+          until:
+            - (quasar_backend_health.status | default(0)) == 200
+            - (quasar_backend_health.json | default({})).get('agent_loaded', false) | bool
+          retries: 12
+          delay: 5
+
+      rescue:
+        - name: Remove stale rollback link
+          ansible.builtin.file:
+            path: "{{ quasar_venv_next_link }}"
+            state: absent
+
+        - name: Stage previous validated venv symlink
+          ansible.builtin.file:
+            src: "{{ quasar_active_venv_stat.stat.lnk_source }}"
+            dest: "{{ quasar_venv_next_link }}"
+            state: link
+          when:
+            - quasar_venv_activation is defined
+            - quasar_venv_activation.changed | default(false)
+            - quasar_active_venv_stat.stat.islnk | default(false)
+
+        - name: Restore previous validated venv symlink atomically
+          ansible.builtin.command:
+            argv:
+              - mv
+              - -Tf
+              - --
+              - "{{ quasar_venv_next_link }}"
+              - "{{ quasar_venv }}"
+          when:
+            - quasar_venv_activation is defined
+            - quasar_venv_activation.changed | default(false)
+            - quasar_active_venv_stat.stat.islnk | default(false)
+
+        - name: Remove failed first-deploy venv symlink
+          ansible.builtin.file:
+            path: "{{ quasar_venv }}"
+            state: absent
+          when:
+            - quasar_venv_activation is defined
+            - quasar_venv_activation.changed | default(false)
+            - not (quasar_active_venv_stat.stat.islnk | default(false))
+
+        - name: Restore preserved legacy venv directory
+          ansible.builtin.command:
+            argv:
+              - mv
+              - --
+              - "{{ quasar_legacy_venv_backup }}"
+              - "{{ quasar_venv }}"
+          when:
+            - quasar_legacy_venv_move is defined
+            - quasar_legacy_venv_move.changed | default(false)
+            - quasar_active_venv_stat.stat.exists
+            - not (quasar_active_venv_stat.stat.islnk | default(false))
+
+        - name: Restart restored backend
+          ansible.builtin.systemd:
+            name: quasar-backend
+            state: restarted
+            daemon_reload: true
+          when:
+            - quasar_active_venv_stat.stat.exists
+            - >-
+              (quasar_venv_activation is defined
+               and (quasar_venv_activation.changed | default(false)))
+              or
+              (quasar_legacy_venv_move is defined
+               and (quasar_legacy_venv_move.changed | default(false)))
+
+        - name: Stop failed first-deploy backend
+          ansible.builtin.systemd:
+            name: quasar-backend
+            state: stopped
+          failed_when: false
+          when:
+            - quasar_venv_activation is defined
+            - quasar_venv_activation.changed | default(false)
+            - not quasar_active_venv_stat.stat.exists
+
+        - name: Fail after backend activation rollback
+          ansible.builtin.fail:
+            msg: >-
+              The new lock-addressed backend release failed activation or
+              health validation. The previous venv was restored when available.
 
     # ── nginx front door (SSE-safe) ──────────────────────────────────
     - name: Allow nginx to proxy to localhost under SELinux (RHEL/Rocky)

@@ -6,6 +6,7 @@ untouched."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -17,8 +18,10 @@ from core.llm_client import detect_provider
 from core.logger import logger
 from core.retry import _compute_delay as _retry_compute_delay
 from core.retry import _is_retryable as _retry_is_retryable
+from services.usage_quota_service import QuotaExceededError
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
+from core.turn_recovery import partial_tool_answer, serialize_tool_result, tool_call_key
 # DUAL_SOURCE_SCAFFOLD: referenced at the RAG-context branch — its absence
 # made every documentation-grounded query NameError into a misleading
 # provider-error message (scan CAR-2). Conductor: its absence made the whole
@@ -67,6 +70,105 @@ if TYPE_CHECKING:
     from core.agent import QuasarAgent
 
 
+def _result_indicates_timeout(result) -> bool:
+    """True when a tool result represents a wall-clock timeout.
+
+    Central classification (verify CX-16/CX-27): the tool guard, the FITS
+    download watchdog, and an all-panels-timed-out cutout grid all stamp
+    ``timeout: True`` on their result dict; the runner closes such steps with
+    state "error" so the SSE layer never counts them as deadline-extending
+    progress. Anything else — including non-dict results — is not a timeout.
+    """
+    return isinstance(result, dict) and result.get("timeout") is True
+
+
+def _maybe_failover_model(agent, selected_model: str, on_status=None, attachments=None) -> str:
+    """Turn-start health failover (RE-A2) — OFF unless QUASAR_MODEL_FAILOVER=1.
+
+    The chat model is always explicitly user-selected (request.model), so a
+    silent switch is never acceptable. The flag is read PER TURN and defaults
+    OFF — this changes WHICH model answers; enable with QUASAR_MODEL_FAILOVER=1
+    (also accepts true/yes/on). Even when ON, the switch only engages when ALL
+    of these hold:
+
+      (a) the primary model's provider is currently marked unhealthy by the
+          shared HealthMonitor (3+ consecutive recorded call failures);
+      (b) a fallback mapping exists (core.health_monitor.FALLBACK_MODELS, or
+          the QUASAR_<PROVIDER>_FALLBACK_MODEL env override) — env overrides
+          pass the SAME gates below, no bypass (CX-07);
+      (c) the fallback is on a DIFFERENT provider than the primary (a
+          same-provider "fallback" would just re-dial the unhealthy service);
+      (d) if the turn carries attachments, the fallback's provider accepts
+          EVERY attachment KIND on the turn (CX-09/CX-21) — provider-file
+          references are per-provider kinds and each builder silently drops
+          foreign ones, so a "capable" provider can still lose a document;
+      (e) the fallback's provider has a usable key path — BYOK/request-context
+          key or platform env key (core.llm_client.provider_has_key_path);
+      (f) the fallback's provider is not itself marked unhealthy — checked
+          LAST (CX-20): is_healthy() can claim the provider's single-flight
+          recovery probe, and a switch that any cheaper gate would reject
+          must never consume a probe that no call will then settle.
+
+    Otherwise the primary is kept and the existing per-round retry /
+    friendly-error path speaks. When the switch engages, a VISIBLE status note
+    is emitted so the user always knows which model answered. Never raises —
+    failover must never break a turn.
+    """
+    flag = (os.getenv("QUASAR_MODEL_FAILOVER", "0") or "0").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return selected_model
+    try:
+        monitor = getattr(agent, "health_monitor", None)
+        if monitor is None:
+            return selected_model
+        provider = detect_provider(selected_model)
+        if monitor.is_healthy(provider):
+            return selected_model
+        fallback = monitor.get_fallback_model(selected_model, provider)
+        if not fallback or fallback == selected_model:
+            return selected_model
+        fallback_provider = detect_provider(fallback)
+        # CX-07: env-override fallbacks get no special treatment — the target
+        # must be a DIFFERENT provider.
+        if fallback_provider == provider:
+            return selected_model
+        # Lazy import: several unit suites stub core.llm_client with only the
+        # symbols the module top-level needs.
+        from core.llm_client import provider_has_key_path, providers_accepting_attachments
+        if attachments:
+            accepted_by = providers_accepting_attachments(attachments)
+            if fallback_provider not in accepted_by:
+                logger.warning(
+                    "[health] Failover to '%s' (%s) skipped: turn carries %d "
+                    "attachment(s) whose kind(s) that provider's builder does "
+                    "not accept — keeping '%s' rather than dropping the "
+                    "user's uploads",
+                    fallback, fallback_provider, len(attachments), selected_model,
+                )
+                return selected_model
+        if not provider_has_key_path(fallback_provider, getattr(agent, "client", None)):
+            return selected_model
+        # CX-20: the probe-claiming health check runs LAST — every rejection
+        # above is side-effect-free, so a rejected switch never consumes the
+        # fallback provider's single recovery probe. When this check claims
+        # the probe (True), we DO switch, and the fallback call settles it.
+        if not monitor.is_healthy(fallback_provider):
+            return selected_model
+        logger.warning(
+            "[health] Failover engaged (QUASAR_MODEL_FAILOVER=1): '%s' (%s) is "
+            "degraded — using '%s' (%s) for this turn",
+            selected_model, provider, fallback, fallback_provider,
+        )
+        if on_status:
+            note = f"Model {selected_model} is degraded — using {fallback} for this turn"
+            on_status(note, "running")
+            on_status(note, "completed")
+        return fallback
+    except Exception:
+        logger.debug("[health] turn-start failover check failed", exc_info=True)
+        return selected_model
+
+
 def stream_response_api(
     agent,
     query,
@@ -89,6 +191,11 @@ def stream_response_api(
         if not conversation_id:
             conversation_id = f"anon_{uuid.uuid4().hex[:12]}"
         selected_model = model or agent.config.model
+        # Turn-start health failover (RE-A2). Applied BEFORE _begin_response_run
+        # so every per-model state key (response ids, run tokens) uses the model
+        # that actually answers. No-op unless QUASAR_MODEL_FAILOVER=1 — see
+        # _maybe_failover_model for the full gate conditions.
+        selected_model = _maybe_failover_model(agent, selected_model, on_status, attachments)
         agent._begin_response_run(conversation_id, selected_model, run_token)
 
         # Periodic cleanup to prevent unbounded memory growth
@@ -108,6 +215,36 @@ def stream_response_api(
         # returned as normal text (provider failures used to land in chat_runs
         # as status='completed', invisible to diagnostics).
         agent._tls.last_provider_failure = None
+        # Per-turn consecutive-timeout breaker state (consumed by
+        # agent._execute_tool_guarded; chat-executor threads are POOLED, so a
+        # stale dict from a previous turn must never survive) and a worker-side
+        # wall-clock deadline mirroring the SSE hard cap.
+        # agent_future.cancel() cannot stop a running thread, so the worker
+        # must SELF-terminate: before this, a deadline-killed turn kept
+        # executing tools for up to ~750 s more (zombie runner), and four
+        # zombies exhausted the 4-slot chat executor, killing every new chat.
+        # Same-turn malformed-history recovery re-enters this function on the
+        # SAME thread (_history_recovery_attempted=True) — it must INHERIT the
+        # original deadline and breaker streaks, not restart them (CX-06).
+        _prior_deadline = getattr(agent._tls, "turn_deadline", "__unset__")
+        if _history_recovery_attempted and _prior_deadline != "__unset__":
+            _turn_deadline = _prior_deadline
+            _turn_hard_seconds = getattr(agent._tls, "turn_hard_seconds", 0.0)
+        else:
+            agent._tls.tool_timeout_breaker = {}
+            try:
+                _turn_hard_seconds = float(os.getenv("CHAT_HARD_MAX_TIMEOUT_SECONDS", "900") or 0)
+            except ValueError:
+                _turn_hard_seconds = 900.0
+            # NaN/inf/negative are treated like the documented 0 = disabled,
+            # explicitly, instead of silently never-firing comparisons (CX-07).
+            if not math.isfinite(_turn_hard_seconds) or _turn_hard_seconds <= 0:
+                _turn_hard_seconds = 0.0
+            _turn_deadline = (
+                (time.monotonic() + _turn_hard_seconds) if _turn_hard_seconds else None
+            )
+            agent._tls.turn_deadline = _turn_deadline
+            agent._tls.turn_hard_seconds = _turn_hard_seconds
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -365,7 +502,7 @@ def stream_response_api(
         _is_alma_science_archive_query = bool(_alma_science_route) or bool(
             re.search(
                 r"\b(?:cycle\s+\d{1,2}|observed\s+the\s+sun|solar\s+projects?|"
-                r"12m|7m|total\s+power|hh\s*212|high[-\s]?resolution|"
+                r"12m|7m|total\s+power|high[-\s]?resolution|"
                 r"12co|13co|c18o|bandwidth\s+switching|spectral\s+setup|z\s*[=~]?\s*\d+(?:\.\d+)?\s*(?:-|to|\u2013)\s*\d+(?:\.\d+)?)\b",
                 _query_lower,
             )
@@ -882,11 +1019,14 @@ def stream_response_api(
                 "You MUST call `query_alma_science_archive` now. Map the request as follows: "
                 "Cycle Sun/solar projects -> query_type='cycle_solar_projects'; "
                 "Cycle array combo with 12m/7m/total power -> query_type='cycle_array_combo_projects' and arrays=['12m','7m','TP']; "
-                "HH212 or target Band high-resolution continuum -> query_type='high_resolution_band_data'; "
-                "12CO/13CO/C18O in Band 6 same project -> query_type='line_set_projects' with lines=['12CO','13CO','C18O']; "
-                "Galaxies at z=1-2 with CO -> query_type='redshifted_line_projects'; "
+                "Target observations with band/resolution constraints -> query_type='high_resolution_band_data'; "
+                "Required molecular lines -> query_type='line_set_projects'; "
+                "A redshift interval and rest species -> query_type='redshifted_line_projects'; "
                 "Bandwidth Switching -> query_type='bandwidth_switching_candidates'. "
-                f"If an exact argument mapping is provided here, use it exactly: {route_text}. "
+                f"Explicit constraints extracted from the user: {route_text}. "
+                "Supply the user's target or coordinates, ALL requested bands as a list, resolution ceiling, "
+                "public_only and science_only. Do not substitute narrower constraints. Target searches resolve "
+                "coordinates and use a positional cone; results have one row per member_ous_uid. "
                 "Do NOT answer from memory or documentation context."
             )
             full_input += science_directive
@@ -1118,16 +1258,21 @@ def stream_response_api(
                 # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:
             print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
-        
+
+        # Visible to the turn-level error handler below: a provider failure
+        # after tool rounds must still be able to return the evidence collected.
+        output_text = ""
+        _had_tool_calls = False
+        _all_tool_results: List[Dict[str, Any]] = []
         try:
-            
+
             # Smart token budget replaces hard MAX_TOOL_ROUNDS = 12
             _token_budget = TokenBudget(max_budget=100_000)
             last_id = agent._get_response_id(conversation_id, selected_model)
             output_text = ""
             _had_tool_calls = False
             _web_tool_results: List[Dict[str, Any]] = []
-            _all_tool_results: List[Dict[str, Any]] = []  # every round's tool outputs (for the no-text safety net)
+            _all_tool_results = []  # every round's tool outputs (for the no-text safety net)
             tool_results: List[Dict[str, Any]] = []
 
             # Provider-truncation recovery (live P6/P8/P9: DeepSeek hits its
@@ -1137,6 +1282,21 @@ def stream_response_api(
             # rounds instead of breaking.
             _MAX_CONTINUATIONS = 2
             _continuation_rounds = 0
+            # Reasoning-only stop (the model narrates a tool call in its
+            # reasoning channel, then ends the turn with no text and no call).
+            # Recovery re-SAMPLES the same logical round from the pre-round
+            # history state — the empty assistant turn never enters the chain
+            # (live: chaining a nudge after the empty turn locked gpt-oss into
+            # repeating the fault 3/3). From the second retry on, an explicit
+            # instruction rides along with the original input.
+            _MAX_REASONING_RETRIES = 3
+            _reasoning_only_retries = 0
+            _round_offset = 0          # physical rounds consumed by re-samples
+            _resample_note = None
+            _seen_tool_calls = {}
+            _duplicate_rounds = 0
+            _finalize_next = False
+            _soft_deadline = (_turn_deadline - 0.3 * _turn_hard_seconds) if _turn_deadline else None
             # Per-round stream retries: a mid-stream death (httpx.ReadTimeout
             # while a reasoning model is byte-silent, connection reset,
             # transient 5xx) re-issues ONLY the affected round this many times
@@ -1162,7 +1322,8 @@ def stream_response_api(
             _instructions = agent.system_prompt + ("\n\n" + DUAL_SOURCE_SCAFFOLD if _dual_source_active else "")
 
             # 5. Call Responses API with manual streaming loop
-            for _round in range(_token_budget.HARD_MAX_ITERATIONS if hasattr(_token_budget, 'HARD_MAX_ITERATIONS') else 25):
+            _max_rounds = getattr(_token_budget, 'HARD_MAX_ITERATIONS', 25)
+            for _round in range(_max_rounds):
                 # A deadline-killed run invalidates the token and clears the
                 # provider history mid-flight (live DS-P8: the next round then
                 # 400'd against a broken chain). Stop instead of working into
@@ -1170,14 +1331,22 @@ def stream_response_api(
                 if _round > 0 and not agent._response_run_active(conversation_id, selected_model, run_token):
                     print("[STREAM] Run no longer active (cancelled/timed out) — ending the tool loop")
                     break
-                _buffer_round_text = _round == 0 and (
+                if _turn_deadline is not None and time.monotonic() > _turn_deadline:
+                    print(
+                        f"[STREAM] Turn exceeded its {_turn_hard_seconds:.0f}s hard cap — "
+                        "self-terminating before the next round"
+                    )
+                    break
+                _eff_round = _round - _round_offset  # logical round (re-samples repeat a round)
+                _round_prev_last_id = last_id        # pre-round history state for re-sampling
+                _buffer_round_text = _eff_round == 0 and (
                     _is_archive_fetch or _is_paper_query or _is_openalex_query
                     or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
                 )
                 request_kwargs = {
                     "model": selected_model,
-                    "input": full_input if _round == 0 else tool_results,
+                    "input": full_input if _eff_round == 0 else tool_results,
                     "instructions": _instructions,
                     "previous_response_id": last_id,
                     "tools": tools,
@@ -1187,18 +1356,46 @@ def stream_response_api(
                     "user_id": user_id,
                     "session_id": conversation_id,
                 }
-                if _round == 0 and attachments:
+                _finalizing = (_finalize_next or _duplicate_rounds >= 2 or _round == _max_rounds - 1
+                               or (_soft_deadline is not None and time.monotonic() >= _soft_deadline))
+                if _finalizing:
+                    print("[RECOVERY] Tool-loop budget reached — composing final answer")
+                    _final_note = (
+                        "[SYSTEM CONTINUATION] Time to answer now. Use the collected tool results, "
+                        "preserve the user's requested output format, and disclose incomplete results. "
+                        "Do not call more tools."
+                    )
+                    _pending = request_kwargs["input"]
+                    request_kwargs.update(
+                        tool_choice="none",  # keep the schemas: tool_use/tool_result history needs them (Anthropic 400s without)
+                        input=([*_pending, {"role": "user", "content": _final_note}]
+                               if isinstance(_pending, list) else str(_pending) + "\n\n" + _final_note),
+                    )
+                    _buffer_round_text = False
+                if _resample_note:
+                    _pending_input = request_kwargs["input"]
+                    request_kwargs["input"] = (
+                        [*_pending_input, {"role": "user", "content": _resample_note}]
+                        if isinstance(_pending_input, list)
+                        else str(_pending_input) + "\n\n" + _resample_note
+                    )
+                    _resample_note = None
+                if _eff_round == 0 and attachments:
                     request_kwargs["attachments"] = attachments
 
                 # Force tool call on first round for data-fetch queries.
                 # This prevents the LLM from answering from conversation
                 # memory and ensures a fresh data card is always shown.
-                if _round == 0 and (
+                if not _finalizing and _eff_round == 0 and (
                     _is_archive_fetch or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
                     or _is_imagery_request or _is_radio_sed_query
                 ):
                     request_kwargs["tool_choice"] = "required"
+                    # First attempt: emulated (auto + nudge) so the model keeps its natural
+                    # argument quality; after a reasoning-only stop the re-sample asks the
+                    # server to enforce a tool call.
+                    request_kwargs["tool_choice_strict"] = _reasoning_only_retries > 0
 
                 # Strip unsupported params (e.g. temperature for o-series/gpt-5-mini/deepseek-v4-pro)
                 _no_temp = {"o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini", "deepseek-v4-pro", "deepseek-v4-flash"}
@@ -1238,6 +1435,7 @@ def stream_response_api(
                     _round_text_buffer = ""
 
                     _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
+                    _round_had_reasoning = False
                     _reasoning_emitted = False     # Track if we emitted the reasoning header
                     _emit_reasoning_details = True  # Stream the model-provided reasoning summary.
 
@@ -1267,15 +1465,11 @@ def stream_response_api(
                         for event in response_stream:
                             if event.type == "response.created":
                                 last_id = event.response.id
-                                agent._set_response_id(
-                                    conversation_id,
-                                    last_id,
-                                    selected_model,
-                                    run_token,
-                                )
+                                agent._set_response_id(conversation_id, last_id, selected_model, run_token)
                             elif event.type == "response.reasoning_summary_text.delta":
                                 # Stream the model-provided reasoning summary to the Thinking box.
                                 _reasoning_summary_text += event.delta
+                                _round_had_reasoning = _round_had_reasoning or bool(event.delta.strip())
                                 if on_thought:
                                     on_thought(event.delta)
                                 elif not _reasoning_emitted and on_status:
@@ -1416,11 +1610,19 @@ def stream_response_api(
                             raise
                         _stream_attempt += 1
                         _retry_delay = _retry_compute_delay(_stream_attempt - 1, 1.0, 8.0)
+                        _downgrade_note = ""
+                        if request_kwargs.get("tool_choice_strict"):
+                            # The server-ENFORCED tool call is the only request
+                            # shape that died in every provider-killed trial of
+                            # 2026-09-17; the retry uses the emulated form
+                            # (auto + nudge) that the same prompt survived.
+                            request_kwargs["tool_choice_strict"] = False
+                            _downgrade_note = " with tool_choice downgraded to emulated required (auto + nudge)"
                         print(
                             f"[STREAM] Round {_round} stream died "
                             f"({type(_stream_err).__name__}: {str(_stream_err)[:200]}) — "
                             f"retrying the round ({_stream_attempt}/{_STREAM_ROUND_RETRIES}) "
-                            f"in {_retry_delay:.1f}s"
+                            f"in {_retry_delay:.1f}s{_downgrade_note}"
                         )
                         if on_status:
                             on_status("Provider stream interrupted — retrying", "running")
@@ -1433,6 +1635,23 @@ def stream_response_api(
                         output_text += _round_text_buffer
                         if on_token:
                             on_token(_round_text_buffer)
+                    if (_round_had_reasoning and not output_text[_round_text_len_before:].strip()
+                            and _reasoning_only_retries < _MAX_REASONING_RETRIES and not _finalizing):
+                        _reasoning_only_retries += 1
+                        _round_offset += 1
+                        last_id = _round_prev_last_id  # branch from the pre-round state
+                        if _reasoning_only_retries >= 2:
+                            _resample_note = (
+                                "[SYSTEM CONTINUATION] Respond with the function call(s) this request "
+                                "needs — an actual tool call, not a description of one — or give the "
+                                "final answer."
+                            )
+                        print(
+                            f"[RECOVERY] reasoning-only stop — retry {_reasoning_only_retries}/"
+                            f"{_MAX_REASONING_RETRIES} (re-sampling round {_eff_round} from the pre-round state"
+                            + (", with explicit instruction)" if _resample_note else ")")
+                        )
+                        continue
                     # A no-tool-call round normally means the final answer — but a
                     # provider-truncated round looks identical (live DS-P6/P8/P9:
                     # stream ended mid-sentence after "Now I'll render...").
@@ -1472,7 +1691,12 @@ def stream_response_api(
                         continue
                     break  # No tool calls — we have the final text
 
+                if _finalizing:
+                    agent.clear_response_state(conversation_id, selected_model, run_token)
+                    break  # Discard unanswered calls from a provider ignoring tool_choice='none'.
+
                 _had_tool_calls = True
+                _reasoning_only_retries = 0  # productive round: recovery budget is per logical round
                 if _buffer_round_text and _round_text_buffer:
                     print(
                         f"[STREAM] Suppressed pre-tool assistant text "
@@ -1484,11 +1708,22 @@ def stream_response_api(
                 _token_budget.record_output(len(output_text), tool_calls=len(function_calls))
                 if not _token_budget.should_continue():
                     print(f"[TOKEN BUDGET] Stopping — {_token_budget.get_stats()}")
-                    break
+                    _finalize_next = True
                 
                 # Execute each function call and collect results
                 tool_results = []
+                _round_duplicates = 0
                 for fc in function_calls.values():
+                    # Check run liveness between tools, not only at round tops —
+                    # each remaining call can burn its full guard budget (150 s
+                    # default) after the stream is already dead, and a batch of
+                    # five cutouts used to run to completion on a cancelled turn.
+                    if not agent._response_run_active(conversation_id, selected_model, run_token):
+                        print("[STREAM] Run no longer active — skipping remaining tool calls in this batch")
+                        break
+                    if _turn_deadline is not None and time.monotonic() > _turn_deadline:
+                        print("[STREAM] Turn hard cap reached mid-batch — skipping remaining tool calls")
+                        break
                     tool_name = fc["name"]
                     try:
                         args_str = fc["arguments"]
@@ -1496,6 +1731,26 @@ def stream_response_api(
                     except json.JSONDecodeError:
                         args = {}
                     args = _unescape_tool_args(args)
+                    _call_key = tool_call_key(tool_name, args)
+                    _prior_call = _seen_tool_calls.get(_call_key)
+                    _polling = bool(re.search(r"status|poll|wait|job", tool_name))
+                    if _prior_call and not _polling:
+                        _round_duplicates += 1
+                        cached = json.loads(_prior_call)
+                        if isinstance(cached, dict) and cached.get("success") and re.search(r"search|query", tool_name):
+                            result_str = serialize_tool_result({
+                                "repeated_call": True,
+                                "note": "You already ran this; use its result or change approach. This call was not re-executed.",
+                                "previous_result": cached,
+                            })
+                            agent._record_tool_trace(tool_name, args, result_str)
+                            tool_results.append({"type": "function_call_output", "call_id": fc["call_id"], "output": result_str})
+                            continue
+                    if _finalize_next or (_soft_deadline is not None and time.monotonic() >= _soft_deadline):
+                        _finalize_next = True
+                        tool_results.append({"type": "function_call_output", "call_id": fc["call_id"],
+                                             "output": json.dumps({"partial": True, "error": "Tool budget reached; answer from collected results now."})})
+                        continue
 
                     print(f"[TOOL CALL] {tool_name}({args})")
 
@@ -1506,6 +1761,7 @@ def stream_response_api(
 
                     _trace_result_obj = None
                     _tool_sidecar = None
+                    _tool_timed_out = False
                     tool = agent.tool_registry.get_tool(tool_name)
                     if not tool:
                         # gpt-oss habitually typos tool names ("datlab_density_vetting")
@@ -1535,6 +1791,7 @@ def stream_response_api(
                                 step_label=step_label,
                                 on_status=on_status,
                             )
+                            _tool_timed_out = _result_indicates_timeout(result)
                             if _run_result_is_new(_rr_before, agent.last_run_result):
                                 _primary_run_result = (
                                     agent.last_run_result.copy()
@@ -1544,7 +1801,7 @@ def stream_response_api(
                             else:
                                 _primary_run_result = None
                             _auto_paper_result = None
-                            if tool_name in {"search_by_target", "search_by_position"}:
+                            if tool_name in {"search_by_target", "search_by_position"} and re.search(r"\b(papers?|publications?|literature|bibliograph\w*)\b", _query_lower):
                                 try:
                                     if on_status:
                                         on_status("Searching papers linked to observation", "running")
@@ -1579,7 +1836,7 @@ def stream_response_api(
                             # (the trace itself is thread-local to this worker
                             # and invisible to the SSE generator). Feature 1.
                             result, _tool_sidecar = agent._pop_provenance_sidecar(result)
-                            _trace_result_obj = result if isinstance(result, dict) else None
+                            _trace_result_obj = result
                             try:
                                 from core.provenance import build_tool_request
                                 _tool_request = build_tool_request(
@@ -1595,7 +1852,9 @@ def stream_response_api(
                                     since=_acc_len_before,
                                     primary=_primary_run_result,
                                 )
-                            result_str = json.dumps(result, default=str)[:8000]  # increased for multi-step chains
+                            if _prior_call and not _polling and isinstance(result, dict):
+                                result = dict(result, repeat_note="You already ran this; use its result or change approach.")
+                            result_str = serialize_tool_result(result)
                             _acc_len_after = len(agent._accumulated_run_results)
 
                             # If the tool itself already accumulated results
@@ -1682,11 +1941,17 @@ def stream_response_api(
                         result_str = json.dumps(_unknown)
 
                     if on_status:
-                        on_status(step_label, "completed")
+                        # A timed-out tool must not close as a plain completion:
+                        # sse.py extends the turn deadline on completed steps and
+                        # a bare label would defeat its timeout exclusion (CX-04).
+                        # "error" closes the step with a failure mark in the UI
+                        # and never extends the deadline.
+                        on_status(step_label, "error" if _tool_timed_out else "completed")
 
                     agent._record_tool_trace(tool_name, args, result_str,
                                             result_obj=_trace_result_obj,
                                             provenance=_tool_sidecar)
+                    _seen_tool_calls[_call_key] = result_str
                     tool_results.append({
                         "type": "function_call_output",
                         "call_id": fc["call_id"],
@@ -1694,8 +1959,28 @@ def stream_response_api(
                     })
 
                 # Apply tool result budget — truncate oversized old results
+                _duplicate_rounds = _duplicate_rounds + 1 if _round_duplicates == len(function_calls) else 0
                 tool_results = apply_tool_result_budget(tool_results)
                 _all_tool_results.extend(tool_results)
+
+            # A deadline/cancel break must not fall through into composition,
+            # web-thread joins, and citation verification — that postprocessing
+            # tail alone kept zombie turns alive for minutes after the stream
+            # was already dead (CX-05). Return what streamed and stop.
+            if (
+                (_turn_deadline is not None and time.monotonic() > _turn_deadline)
+                or not agent._response_run_active(conversation_id, selected_model, run_token)
+            ):
+                print("[STREAM] Turn expired/cancelled — skipping post-round composition")
+                # A partial batch may leave unanswered calls at the provider
+                # head. Clear this run's state before a follow-up can inherit it.
+                agent.clear_response_state(conversation_id, selected_model, run_token)
+                if agent._response_run_active(conversation_id, selected_model, run_token) and _all_tool_results:
+                    partial = partial_tool_answer(_all_tool_results, "Turn deadline reached before completion")
+                    if on_token:
+                        on_token(partial)
+                    return safe_assistant_text(output_text + partial)
+                return safe_assistant_text(output_text or "")
 
             # Emit final step
             if on_status:
@@ -1905,6 +2190,32 @@ def stream_response_api(
             
             return safe_assistant_text(output_text)
             
+        except QuotaExceededError as qe:
+            # A token quota tripping MID-TURN (per-call checker inside
+            # ResponsesShim.create) used to fall through to the generic
+            # "language-model provider returned an error" text below —
+            # robert-eval A2's "quota masquerade": the evaluator was told the
+            # provider failed when his allowance had simply run out. Surface
+            # the real quota message; the SSE layer still records the run as
+            # failed via the thread-local.
+            logger.warning(
+                "Turn ended by token quota for conversation %s: %s",
+                conversation_id,
+                str(qe),
+            )
+            agent._tls.last_provider_failure = {
+                "error_class": "QuotaExceededError",
+                "message": redact_secrets(qe)[:500],
+            }
+            _quota_msg = str(qe) or (
+                "You have reached your included token allowance for this "
+                "provider. Headroom returns as usage ages out of the rolling "
+                "window, or add your own API key in Settings."
+            )
+            if on_token:
+                on_token(_quota_msg)
+            return _quota_msg
+
         except AttributeError as ae:
             # Responses API not available in this OpenAI version
             error_msg = f"Responses API not available: {ae}. Please upgrade the openai package."
@@ -1981,4 +2292,24 @@ def stream_response_api(
                 "error_class": type(e).__name__,
                 "message": redact_secrets(e)[:500],
             }
-            return agent._user_facing_provider_error(e)
+            _friendly = agent._user_facing_provider_error(e)
+            # Evidence already collected must not die with the stream. A turn
+            # that ran tool rounds and then lost the provider (after the
+            # per-round retries) returns the friendly notice PLUS the bounded
+            # partial tool evidence — the same shape the hard-deadline path
+            # emits — instead of a bare error string.
+            if _all_tool_results and agent._response_run_active(conversation_id, selected_model, run_token):
+                agent.clear_response_state(conversation_id, selected_model, run_token)
+                partial = partial_tool_answer(
+                    _all_tool_results,
+                    f"Provider stream failed before the answer was composed ({type(e).__name__})",
+                )
+                print(
+                    f"[RECOVERY] provider failure after {len(_all_tool_results)} tool result(s) — "
+                    "returning the partial tool evidence with the error notice"
+                )
+                tail = ("\n\n" if output_text else "") + _friendly + "\n\n" + partial
+                if on_token:
+                    on_token(tail)
+                return safe_assistant_text(output_text + tail)
+            return _friendly

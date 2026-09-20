@@ -38,6 +38,7 @@ from services.provider_file_service import (
     UploadedChatFile,
 )
 from services.provider_key_service import ProviderKeyError, ProviderKeyService
+from services.provider_catalog_service import ProviderCatalogService
 from services.issue_report_service import ChatDeadline, IssueReportService
 from services.spectral_line_explorer import (
     SpectralLineJobService,
@@ -64,7 +65,18 @@ spectral_line_job_service = SpectralLineJobService()
 provider_file_service = ProviderFileService()
 provider_key_service = ProviderKeyService()
 usage_quota_service = UsageQuotaService()
-issue_report_service = IssueReportService()
+# Consenting issue reports capture the question, the answer and the surrounding
+# turns from the server's own conversation store (not just the client excerpt).
+# Ownership-scoped: returns None unless the conversation belongs to the
+# reporter. The read is bounded to the newest 400 messages: the reported answer
+# is almost always the latest turn, and the excerpt itself is capped at 6
+# messages (CX-06).
+issue_report_service = IssueReportService(
+    snapshot_lookup=conversation_service.get_feedback_snapshot_source,
+    conversation_lookup=lambda conversation_id, user_id: (
+        conversation_service.get_conversation_messages_for_user(conversation_id, user_id, last_n=400)
+    ),
+)
 analytics_service = AnalyticsService()
 
 
@@ -157,6 +169,14 @@ ANTHROPIC_VISIBLE_MODEL_IDS = (
     else []
 )
 
+provider_catalog_service = ProviderCatalogService(provider_key_service, {
+    "openai": OPENAI_VISIBLE_MODEL_IDS,
+    "deepseek": DEEPSEEK_VISIBLE_MODEL_IDS,
+    "tacc": TACC_MENU_MODEL_IDS,
+    "anthropic": _visible_model_list("QUASAR_ANTHROPIC_MODELS", ANTHROPIC_DEFAULT_MODEL_IDS),
+    "google": _visible_model_list("QUASAR_GOOGLE_MODELS", ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]),
+})
+
 
 # ── Auth / user helpers ───────────────────────────────────────────────────────
 def _bearer_token(authorization: Any) -> Optional[str]:
@@ -228,6 +248,7 @@ def _build_llm_context_for_user(user_id: str) -> Dict[str, Any]:
         "key_source_by_provider": key_sources,
         "byok_token_limits": byok_limits,
         "metadata": metadata,
+        "model_providers": provider_catalog_service.model_providers(user_id, list(api_keys)),
     }
 
 

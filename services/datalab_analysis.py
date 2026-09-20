@@ -501,9 +501,15 @@ def period_fold(
     t = pd.to_numeric(frame[time_col], errors="coerce")
     mag = pd.to_numeric(frame[mag_col], errors="coerce")
     # Reject non-finite AND sentinel magnitudes: surveys pad missing photometry
-    # with |mag| >= 90 (e.g. 99.99 / -99), which would inject a spurious flat
-    # baseline into the periodogram if folded.
-    mask = np.isfinite(t) & np.isfinite(mag) & (np.abs(mag) < 90.0)
+    # with sentinel values (e.g. 99.99 / -99), which would inject a spurious
+    # flat baseline into the periodogram if folded. The bounds come from the
+    # registry's unified SENTINEL_MAG_RANGE — sentinel removal, NOT a science
+    # cut (RE-B2 unification of the former ad-hoc |mag| < 90 threshold).
+    from services.datalab_registry import SENTINEL_MAG_RANGE as _sentinel_range
+    mask = (
+        np.isfinite(t) & np.isfinite(mag)
+        & (mag > _sentinel_range[0]) & (mag < _sentinel_range[1])
+    )
     # Only weight by uncertainties when enough epochs have FINITE, POSITIVE errors;
     # otherwise fall back to an unweighted periodogram. Passing NaN/zero dy to
     # LombScargle yields all-NaN power and crashes nanargmax.

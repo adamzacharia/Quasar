@@ -45,7 +45,7 @@ class DAGCache:
     cache = DAGCache("data/dag_cache.json")
 
     # Before decomposing:
-    cached = cache.find_similar("Compare ALMA data for NGC 1068 with papers")
+    cached = cache.find_similar("Compare ALMA data for IC 342 with papers")
     if cached:
         subtasks = cached["subtasks"]  # reuse the template!
     else:
@@ -54,7 +54,7 @@ class DAGCache:
 
     # The cache automatically generalizes query patterns so
     # "Compare ALMA data for M87 with papers" matches the template
-    # from "Compare ALMA data for NGC 1068 with papers".
+    # from "Compare ALMA data for IC 342 with papers".
     """
 
     def __init__(self, cache_path: str = "data/dag_cache.json", max_entries: int = 200):
@@ -97,7 +97,7 @@ class DAGCache:
           "Compare ALMA Band 6 observations of M87 with papers on its jet"
           → "compare alma band {BAND} observations of {TARGET} with papers on its jet"
 
-          "Search ALMA for NGC 1068 and find recent papers"
+          "Search ALMA for IC 342 and find recent papers"
           → "search alma for {TARGET} and find recent papers"
         """
         q = query.lower().strip()

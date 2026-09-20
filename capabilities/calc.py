@@ -29,6 +29,7 @@ from capabilities.base import BaseCapability, ToolResult
 from services.astro_calculators import (
     calculate_alma_sensitivity,
     calculate_beam,
+    calculate_doppler_shift,
     calculate_redshift,
     convert_coordinates,
 )
@@ -48,40 +49,83 @@ def _native(out: Dict[str, Any]) -> ToolResult:
 
 
 def resolve_target(target_name: str) -> Dict[str, Any]:
-    """Resolve target name to RA/Dec using SIMBAD (Fix 3)"""
+    """Resolve a target name to ICRS RA/Dec in degrees.
+
+    Resolution order:
+      1. CDS Sesame through ``astropy.coordinates.SkyCoord.from_name`` — the
+         astropy-ecosystem standard resolver (SIMBAD, then NED, then VizieR).
+         Any astropy/pyvo user resolving the same name obtains byte-identical
+         coordinates, so archive requests Quasar derives from them (SIA POS /
+         SIZE, cone centres) reproduce exactly.
+      2. SIMBAD via astroquery when Sesame is unreachable or has no match.
+
+    Coordinates are returned exactly as the resolver provides them. They used to
+    be rounded to six decimals (~4 mas); that silently changed every derived
+    request parameter and made Quasar's archive queries irreproducible against
+    the same query issued directly.
+    """
     try:
-        from astroquery.simbad import Simbad
         from astropy.coordinates import SkyCoord
         import astropy.units as u
 
-        result = Simbad.query_object(target_name)
-
-        if result is None or len(result) == 0:
-            return {
-                "success": False,
-                "error": f"SIMBAD could not resolve '{target_name}'. Check spelling or try alternate designation."
-            }
-
-        # Get coordinates from first match. astroquery <0.4.8 returns
-        # 'RA'/'DEC' sexagesimal strings; newer versions return lowercase
-        # 'ra'/'dec' already in degrees.
-        cols = {c.lower(): c for c in result.colnames}
-        ra_val = result[cols['ra']][0]
-        dec_val = result[cols['dec']][0]
+        coord = None
+        resolver = None
+        sesame_error = None
         try:
-            coord = SkyCoord(ra=float(ra_val) * u.deg, dec=float(dec_val) * u.deg)
-        except (TypeError, ValueError):
-            coord = SkyCoord(str(ra_val), str(dec_val), unit=(u.hourangle, u.deg))
+            coord = SkyCoord.from_name(target_name)
+            resolver = "CDS Sesame"
+        except Exception as exc:  # NameResolveError, network failure, bad input
+            sesame_error = f"{type(exc).__name__}: {exc}"
 
+        if coord is None:
+            try:
+                from astroquery.simbad import Simbad
+            except ImportError:
+                return {"success": False, "error": "astroquery not installed. Cannot resolve target names."}
+
+            try:
+                result = Simbad.query_object(target_name)
+            except Exception as exc:
+                detail = f" (Sesame: {sesame_error})" if sesame_error else ""
+                return {"success": False,
+                        "error": f"Resolution failed: SIMBAD: {type(exc).__name__}: {exc}{detail}"}
+            if result is None or len(result) == 0:
+                detail = f" (Sesame: {sesame_error})" if sesame_error else ""
+                return {
+                    "success": False,
+                    "error": (
+                        f"SIMBAD could not resolve '{target_name}'{detail}. "
+                        "Check spelling or try alternate designation."
+                    ),
+                }
+
+            # Get coordinates from first match. astroquery <0.4.8 returns
+            # 'RA'/'DEC' sexagesimal strings; newer versions return lowercase
+            # 'ra'/'dec' already in degrees.
+            cols = {c.lower(): c for c in result.colnames}
+            ra_val = result[cols['ra']][0]
+            dec_val = result[cols['dec']][0]
+            try:
+                coord = SkyCoord(ra=float(ra_val) * u.deg, dec=float(dec_val) * u.deg)
+            except (TypeError, ValueError):
+                coord = SkyCoord(str(ra_val), str(dec_val), unit=(u.hourangle, u.deg))
+            resolver = "SIMBAD"
+
+        ra_deg = float(coord.ra.deg)
+        dec_deg = float(coord.dec.deg)
         return {
             "success": True,
             "target_name": target_name,
-            "ra_deg": round(coord.ra.deg, 6),
-            "dec_deg": round(coord.dec.deg, 6),
-            "message": f"Resolved '{target_name}' to RA={coord.ra.deg:.4f}°, Dec={coord.dec.deg:.4f}°. Use search_by_position with these coordinates."
+            "ra_deg": ra_deg,
+            "dec_deg": dec_deg,
+            "resolver": resolver,
+            "message": (
+                f"Resolved '{target_name}' via {resolver} to RA={ra_deg:.6f}°, Dec={dec_deg:.6f}° "
+                "(full-precision values in ra_deg/dec_deg). Use search_by_position with these coordinates."
+            ),
         }
     except ImportError:
-        return {"success": False, "error": "astroquery not installed. Cannot resolve target names."}
+        return {"success": False, "error": "astropy/astroquery not installed. Cannot resolve target names."}
     except Exception as e:
         return {"success": False, "error": f"Resolution failed: {str(e)}"}
 
@@ -97,8 +141,9 @@ class ResolveTargetInput(_In):
 class ResolveTarget(BaseCapability):
     name = "resolve_target"
     description = (
-        "Resolve a target name to RA/Dec coordinates using SIMBAD. Use this if "
-        "search_by_target returns empty for a valid target name."
+        "Resolve a target name to ICRS RA/Dec degrees (CDS Sesame: SIMBAD, then NED, then VizieR; "
+        "SIMBAD fallback). Returns full-precision coordinates and the resolver used. Use this "
+        "before positional searches or if search_by_target returns empty for a valid name."
     )
     category = "general"
     InputModel = ResolveTargetInput
@@ -203,17 +248,23 @@ class CalculateAlmaSensitivityInput(_In):
     n_polarizations: Optional[int] = 2
     channel_width_khz: Optional[float] = None
     pwv_mm: Optional[float] = 1.0
+    array: Optional[str] = "12m"
+    frequency_ghz: Optional[float] = None
+    robust_weighting_factor: Optional[float] = 1.0
+    shadowing_fraction: Optional[float] = 0.0
+    tsys_k: Optional[float] = None
 
 
 class CalculateAlmaSensitivity(BaseCapability):
     name = "calculate_alma_sensitivity"
     description = (
-        "Estimate ALMA continuum and spectral line sensitivity using "
-        "the radiometer equation. Returns noise level in mJy/beam and "
-        "uJy/beam for given band, bandwidth, and integration time. "
-        "Includes Tsys scaling for weather (PWV). Use when the user "
-        "asks about ALMA sensitivity, noise levels, or integration "
-        "time estimates."
+        "Estimate ALMA point-source sensitivity with the Technical Handbook radiometer "
+        "equation (eq. 9.8 for the 12-m/7-m Arrays, eq. 9.11 for Total Power): "
+        "quantization 0.96 and correlator 0.88 efficiencies, Table 9.3 aperture "
+        "efficiencies, N(N-1) baselines, default 43/10/3 antennas. Returns continuum "
+        "(and optional line) rms in mJy/beam and uJy/beam with every assumption stated. "
+        "Bands 1-10; array '12m'|'7m'|'TP'. The official ALMA Sensitivity Calculator "
+        "remains authoritative for proposals (real Tsys from PWV octile + elevation)."
     )
     category = "analysis"
     InputModel = CalculateAlmaSensitivityInput
@@ -226,6 +277,45 @@ class CalculateAlmaSensitivity(BaseCapability):
                 t_integration_s=inp.t_integration_s, n_antennas=inp.n_antennas,
                 n_polarizations=inp.n_polarizations,
                 channel_width_khz=inp.channel_width_khz, pwv_mm=inp.pwv_mm,
+                array=inp.array or "12m", frequency_ghz=inp.frequency_ghz,
+                robust_weighting_factor=inp.robust_weighting_factor if inp.robust_weighting_factor is not None else 1.0,
+                shadowing_fraction=inp.shadowing_fraction or 0.0,
+                tsys_k=inp.tsys_k,
+            ))
+        except Exception as e:
+            return _native({"success": False, "error": str(e)})
+
+
+class CalculateDopplerShiftInput(_In):
+    rest_frequency_ghz: Optional[float] = None
+    observed_frequency_ghz: Optional[float] = None
+    redshift: Optional[float] = None
+    velocity_kms: Optional[float] = None
+    convention: Optional[str] = "radio"
+    frame: Optional[str] = "LSRK"
+
+
+class CalculateDopplerShift(BaseCapability):
+    name = "calculate_doppler_shift"
+    description = (
+        "Convert between rest frequency, observed (sky) frequency, redshift and velocity "
+        "with an explicit Doppler convention (radio | optical | relativistic) and reference-"
+        "frame label (LSRK default; ALMA native visibilities are TOPO per execution block). "
+        "Give rest_frequency_ghz plus one of observed_frequency_ghz / redshift / velocity_kms "
+        "(or observed + redshift/velocity to recover the rest frequency). Use before any "
+        "line-coverage or channel-width-to-velocity statement."
+    )
+    category = "analysis"
+    InputModel = CalculateDopplerShiftInput
+    annotations = {"read_only": True, "cost": "cpu"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        try:
+            return _native(calculate_doppler_shift(
+                rest_frequency_ghz=inp.rest_frequency_ghz,
+                observed_frequency_ghz=inp.observed_frequency_ghz,
+                redshift=inp.redshift, velocity_kms=inp.velocity_kms,
+                convention=inp.convention or "radio", frame=inp.frame or "LSRK",
             ))
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -237,11 +327,12 @@ CAPABILITIES: List[BaseCapability] = [
     ConvertCoordinates(),
     CalculateBeam(),
     CalculateAlmaSensitivity(),
+    CalculateDopplerShift(),
 ]
 
 __all__ = [
     "CAPABILITIES",
     "resolve_target",
     "ResolveTarget", "CalculateRedshift", "ConvertCoordinates",
-    "CalculateBeam", "CalculateAlmaSensitivity",
+    "CalculateBeam", "CalculateAlmaSensitivity", "CalculateDopplerShift",
 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -12,6 +13,12 @@ import numpy as np
 
 from integrations.datalab_sia_client import DatalabSiaClient
 from services.plotting import PlottingService
+
+# Hard cap on concurrently-abandoned FITS download workers (verify CX-31): a
+# header-trickling server leaves an uncancellable worker behind; each holds a
+# slot until its socket finally errors, and when all slots are held further
+# downloads fail FAST instead of stacking threads+sockets without bound.
+_DOWNLOAD_SLOTS = threading.BoundedSemaphore(8)
 
 
 @dataclass
@@ -45,6 +52,76 @@ class DatalabImageService:
     def deepest_by_band(self, rows: Sequence[Mapping[str, Any]], bands: Iterable[str]) -> Dict[str, Dict[str, Any]]:
         candidates = self.candidates_by_band(rows, bands)
         return {band: items[0] for band, items in candidates.items() if items}
+
+    @staticmethod
+    def summarize_inventory(rows: Sequence[Mapping[str, Any]], max_groups: int = 12) -> Dict[str, Any]:
+        """What an image inventory contains and how deep it goes, per band.
+
+        Counts product types (proctype x prodtype), bands and observing
+        programs, and for every band the number of Stack/image products with
+        the longest exposure among them. Answers "what imaging exists here and
+        how deep is it" without the caller having to page through raw frames,
+        and makes it explicit that stacked products live in the queried
+        collection itself (a coadd/tile collection is a different product
+        family, not where an archive's per-program stacks are).
+        """
+        products: Dict[tuple, int] = {}
+        bands: Dict[str, int] = {}
+        programs: Dict[str, int] = {}
+        stacks: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            proctype = str(_row_get(row, "proctype") or "").strip()
+            prodtype = str(_row_get(row, "prodtype") or "").strip()
+            products[(proctype, prodtype)] = products.get((proctype, prodtype), 0) + 1
+            band_tokens = str(_row_get(row, "obs_bandpass") or "").strip().lower().split()
+            band = band_tokens[0] if band_tokens else ""
+            if band:
+                bands[band] = bands.get(band, 0) + 1
+            program = str(_row_get(row, "obs_collection") or _row_get(row, "proposal_id") or "").strip()
+            if program:
+                programs[program] = programs.get(program, 0) + 1
+            if band and proctype.lower() == "stack" and prodtype.lower() == "image":
+                exposure = _to_positive_float(_row_get(row, "exptime"))
+                entry = stacks.setdefault(band, {"count": 0, "max_exptime": None, "deepest": None})
+                entry["count"] += 1
+                if exposure is not None and (entry["max_exptime"] is None or exposure > entry["max_exptime"]):
+                    entry["max_exptime"] = exposure
+                    entry["deepest"] = {
+                        "exptime": _row_get(row, "exptime"),
+                        "access_url": _url_from_row(row),
+                        "program": program or None,
+                        "instrument": _row_get(row, "instrument_name") or _row_get(row, "instrument"),
+                    }
+        top_products = sorted(products.items(), key=lambda kv: -kv[1])[:max_groups]
+        return {
+            "rows_total": len(rows),
+            "products": [{"proctype": k[0], "prodtype": k[1], "count": v} for k, v in top_products],
+            "bands": dict(sorted(bands.items(), key=lambda kv: -kv[1])),
+            "programs": dict(sorted(programs.items(), key=lambda kv: -kv[1])[:max_groups]),
+            "stack_images_per_band": dict(sorted(stacks.items())),
+            "stack_image_bands": sorted(stacks),
+        }
+
+    @staticmethod
+    def deepest_archive_images(rows: Sequence[Mapping[str, Any]], bands=None) -> List[Dict[str, Any]]:
+        """Max exposure per band among Stack/image records, retaining wire values."""
+        wanted = {str(b).strip().lower() for b in bands} if bands else None
+        selected = {}
+        for row in rows:
+            if str(_row_get(row, "proctype") or "").strip().lower() != "stack":
+                continue
+            if str(_row_get(row, "prodtype") or "").strip().lower() != "image":
+                continue
+            band = str(_row_get(row, "obs_bandpass") or "").strip().lower().split()
+            if not band or (wanted and band[0] not in wanted):
+                continue
+            exposure = _to_positive_float(_row_get(row, "exptime"))
+            if exposure is None:
+                continue
+            if band[0] not in selected or exposure > selected[band[0]][0]:
+                selected[band[0]] = (exposure, dict(row))
+        order = [str(b).strip().lower() for b in bands] if bands else sorted(selected)
+        return [selected[b][1] for b in dict.fromkeys(order) if b in selected]
 
     def candidates_by_band(
         self,
@@ -172,6 +249,7 @@ class DatalabImageService:
                 "coverage_gap": False,
                 "image_base64": None,
                 "path": None,
+                "source_service": "NOIRLab Astro Data Lab (SIA)",  # guard CX-13
                 "bands_used": [],
                 "error": (
                     f"All {len(candidates)} matching {band_key}-band tiles failed to download from the "
@@ -256,6 +334,7 @@ class DatalabImageService:
                     "coverage_gap": False,
                     "image_base64": None,
                     "path": None,
+                    "source_service": "NOIRLab Astro Data Lab (SIA)",  # guard CX-13
                     "bands_used": [],
                     "error": (
                         f"All matching {band}-band tiles failed to download from the Data Lab cutout "
@@ -352,6 +431,7 @@ class DatalabImageService:
                 "coverage_gap": True,
                 "image_base64": None,
                 "path": None,
+                "source_service": "NOIRLab Astro Data Lab (SIA)",  # guard CX-13
                 "bands_used": [],
                 "band_coverage": coverage_summary,
                 "error": (
@@ -542,6 +622,9 @@ class DatalabImageService:
             "path": hips_out.get("path"),
             "png_path": hips_out.get("png_path"),
             "used_endpoint": "CDS hips2fits",
+            # NOT Data Lab: this same-survey completion is served by CDS —
+            # state it in the answer (RE-B4 mixed-provenance labeling).
+            "source_service": "CDS hips2fits",
             "bands_used": list(descriptor["bands"]),
             "coverage_gap": False,
             "color_hips_completion": descriptor["hips_id"],
@@ -602,6 +685,11 @@ class DatalabImageService:
             except Exception as exc:  # noqa: BLE001 - one bad panel should not kill the grid
                 panel["coverage_gap"] = True
                 panel["error"] = str(exc)
+                if _is_timeout_error(exc):
+                    # Tracked so an all-timeouts grid can honor the runner's
+                    # timeout contract instead of closing as a completion
+                    # (verify CX-27).
+                    panel["timeout"] = True
                 ax.text(0.5, 0.5, "No coverage", ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([])
                 ax.set_yticks([])
@@ -612,21 +700,127 @@ class DatalabImageService:
             axes[idx // cols][idx % cols].axis("off")
         fig.suptitle(title)
         fig.tight_layout()
+        _panel_timeouts = sum(1 for p in panels if p.get("timeout"))
+        if n and _panel_timeouts == n:
+            # Every panel timed out: this is a TIMEOUT, not a rendered grid —
+            # returning success would close the tool step as an ordinary
+            # completion and extend the SSE turn deadline (verify CX-27).
+            # Decided BEFORE rendering: encoding a grid of empty panels wastes
+            # time and leaves unreferenced PNG/PDF files behind (CX-32).
+            plt.close(fig)
+            return {
+                "success": False,
+                "timeout": True,
+                "source_service": "NOIRLab Astro Data Lab (SIA)",  # guard CX-13
+                "error": (
+                    f"all {n} grid panels timed out downloading tiles within "
+                    "the download wall-clock budget. Do NOT retry this exact "
+                    "call; narrow the FOV or reduce the peak count."
+                ),
+                "panels": panels,
+                "used_endpoint": endpoint,
+                "provenance": {"fov_deg": fov_deg, "band": band, "catalog": catalog},
+            }
         render = self.plotting_service._save_and_encode(fig, f"datalab_cutout_grid_{uuid.uuid4().hex[:10]}")
-        return {
+        result = {
             "success": True,
             "image_base64": render.get("base64_png"),
             "path": render.get("web_url"),
             "png_path": render.get("png_path"),
             "used_endpoint": endpoint,
+            "source_service": "NOIRLab Astro Data Lab (SIA)",  # guard CX-13
             "bands_used": [str(band).lower()] if any_image else [],
             "coverage_gap": not any_image,
             "panels": panels,
             "provenance": {"fov_deg": fov_deg, "band": band, "catalog": catalog},
         }
+        if _panel_timeouts:
+            # Mixed success/timeout grid: still a rendered grid (success=True),
+            # but the timed-out panels render as "No coverage" without having
+            # been checked — the grid is PARTIAL and must say so at the top
+            # level, machine-readably (panel_timeouts) and loudly (guard CX-12).
+            result["panel_timeouts"] = _panel_timeouts
+            result["warnings"] = [
+                f"{_panel_timeouts} of {n} grid panels timed out downloading tiles and render "
+                "as 'No coverage' — those positions were NOT vetted (timeout, not absence of "
+                "imaging). The grid is PARTIAL; retry the timed-out peaks with a smaller "
+                "fov_deg if they matter."
+            ]
+        return result
+
+    def _download_wall_seconds(self) -> float:
+        """Total wall-clock budget for one FITS download.
+
+        Malformed/NaN/inf/negative env values fall back to the derived
+        default instead of disabling or crashing enforcement (CX-09)."""
+        import math as _math
+
+        try:
+            _wall_env = float(os.getenv("DATALAB_IMAGE_DOWNLOAD_WALL_SECONDS", "0") or 0)
+        except ValueError:
+            _wall_env = 0.0
+        if not _math.isfinite(_wall_env) or _wall_env <= 0:
+            _wall_env = 0.0
+        return _wall_env or self.download_timeout * 1.5
 
     def _download_fits(self, url: str) -> str:
-        """Download a Data Lab SIA FITS to a temp file under the configured timeout.
+        """Download a Data Lab SIA FITS to a temp file, wall-clock bounded.
+
+        The transfer runs on a worker thread joined with the wall budget: the
+        HEADER phase happens inside requests.get(), where no response object
+        exists yet to watchdog-close, so a header-trickling server can only be
+        bounded from OUTSIDE the call (CX-08). On expiry the worker is
+        abandoned with tool-guard semantics — the inner watchdog still closes
+        the response once it exists, so abandoned workers unblock rather than
+        pile up."""
+        import time as _time
+
+        if url.startswith("file://") or os.path.exists(url):
+            return self._download_fits_inner(url, self._download_wall_seconds())
+
+        wall_seconds = self._download_wall_seconds()
+        box: Dict[str, Any] = {}
+        if not _DOWNLOAD_SLOTS.acquire(blocking=False):
+            raise TimeoutError(
+                "FITS download refused: all download worker slots are held by "
+                "previous unresponsive transfers. The archive is not keeping "
+                "up — do NOT retry immediately."
+            )
+
+        def _run():
+            try:
+                box["path"] = self._download_fits_inner(url, wall_seconds)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                box["exc"] = exc
+            finally:
+                _DOWNLOAD_SLOTS.release()
+
+        worker = threading.Thread(
+            target=_run, daemon=True, name="quasar-fits-download"
+        )
+        try:
+            worker.start()
+        except BaseException:
+            # A failed start (e.g. "can't start new thread" under the very
+            # exhaustion this cap contains) means _run() never executes — the
+            # permit must be handed back here or it leaks forever (CX-34).
+            _DOWNLOAD_SLOTS.release()
+            raise
+        # Small grace so the inner deadline/watchdog (which produce the more
+        # specific error) fire first when they can.
+        worker.join(wall_seconds + 2.0)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"FITS download exceeded its {wall_seconds:.0f}s wall-clock "
+                "deadline before the response headers arrived (connect/header "
+                "phase unresponsive; worker abandoned)"
+            )
+        if "exc" in box:
+            raise box["exc"]
+        return box["path"]
+
+    def _download_fits_inner(self, url: str, wall_seconds: float) -> str:
+        """The actual transfer (see _download_fits for the outer bound).
 
         fits_service._download_fits ignores DATALAB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS
         (its cap is a module constant), which left the documented knob dead
@@ -649,7 +843,28 @@ class DatalabImageService:
             return tmp.name
 
         max_bytes = fits_service.MAX_DOWNLOAD_MB * 1024 * 1024
-        resp = requests.get(url, timeout=self.download_timeout, stream=True)
+        # A scalar requests timeout is connect + PER-SOCKET-READ, not a total:
+        # a server trickling bytes every <180 s made this download wall-clock
+        # UNBOUNDED (2026-08-04 density hang). Same deadline pattern as
+        # integrations/datalab_client.py._get — stream under a hard cap.
+        import time as _time
+
+        deadline = _time.monotonic() + wall_seconds
+        # Tuple timeout bounds the connect/header phase separately from the
+        # per-read timeout (CX-08); each iter_content read is then bounded by
+        # the read timeout, so the deadline check below can lag by at most
+        # one read timeout — never indefinitely.
+        # Read timeout capped at the wall budget too: an idle gap longer than
+        # the wall is pointless to wait out, and it lets most abandoned
+        # workers self-terminate instead of holding a slot (CX-31).
+        resp = requests.get(
+            url,
+            timeout=(
+                min(15.0, float(self.download_timeout), wall_seconds),
+                min(float(self.download_timeout), wall_seconds),
+            ),
+            stream=True,
+        )
         resp.raise_for_status()
         content_length = resp.headers.get("Content-Length")
         if content_length and int(content_length) > max_bytes:
@@ -659,20 +874,64 @@ class DatalabImageService:
             )
         tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
         size = 0
+        # The in-loop deadline check alone cannot bound a trickling server:
+        # urllib3's read timeout measures gaps between SOCKET reads and
+        # iter_content(256 KiB) buffers until a full chunk accumulates, so a
+        # server dripping single bytes defeats both and the loop body never
+        # runs (verify CX-08). The watchdog timer forcibly closes the response
+        # at the deadline — the blocked read raises immediately and the
+        # handler below converts it to the TimeoutError contract.
+        import threading as _threading
+
+        _watchdog = _threading.Timer(
+            max(0.001, deadline - _time.monotonic()), resp.close
+        )
+        _watchdog.daemon = True
+        _watchdog.start()
         try:
             for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if _time.monotonic() > deadline:
+                    resp.close()
+                    raise TimeoutError(
+                        f"FITS download exceeded its {wall_seconds:.0f}s wall-clock "
+                        "deadline while the response was still streaming "
+                        "(request timed out)"
+                    )
                 size += len(chunk)
                 if size > max_bytes:
                     raise ValueError(
                         f"FITS file exceeds {fits_service.MAX_DOWNLOAD_MB} MB limit"
                     )
                 tmp.write(chunk)
+            # A watchdog-closed response can end the iterator CLEANLY (no
+            # exception) — without this check a partial FITS file would be
+            # returned as if complete (CX-08).
+            if _time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"FITS download exceeded its {wall_seconds:.0f}s wall-clock "
+                    "deadline (stream ended after the deadline; partial file "
+                    "discarded)"
+                )
             tmp.close()
-        except Exception:
+        except TimeoutError:
             tmp.close()
             if os.path.exists(tmp.name):
                 os.unlink(tmp.name)
             raise
+        except Exception:
+            tmp.close()
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+            if _time.monotonic() > deadline:
+                # The watchdog closed the connection mid-read; present it as
+                # the deadline it enforced, not a generic connection error.
+                raise TimeoutError(
+                    f"FITS download exceeded its {wall_seconds:.0f}s wall-clock "
+                    "deadline (watchdog closed the connection)"
+                )
+            raise
+        finally:
+            _watchdog.cancel()
         return tmp.name
 
     def _load_image(self, row: Mapping[str, Any], *, ra: float, dec: float, fov_deg: float) -> FitsImage:
@@ -805,6 +1064,10 @@ class DatalabImageService:
             "image_base64": None,
             "path": None,
             "used_endpoint": search.get("used_endpoint"),
+            # The gap determination came from the Data Lab SIA service — label
+            # it like successful images so provenance is never blank on
+            # user-visible no-image results (RE-B4 / guard CX-13).
+            "source_service": "NOIRLab Astro Data Lab (SIA)",
             "bands_used": [],            # no image was rendered, so no bands were used
             "available_bands": list(bands),
             "coverage_gap": True,
@@ -823,10 +1086,27 @@ class DatalabImageService:
             "png_path": render.get("png_path"),
             "pdf_path": render.get("pdf_path"),
             "used_endpoint": search.get("used_endpoint"),
+            # Serving service, stated explicitly so CDS-vs-Data Lab provenance
+            # is always visible in captions/answers (RE-B4).
+            "source_service": "NOIRLab Astro Data Lab (SIA)",
             "bands_used": list(bands),
             "coverage_gap": False,
             "provenance": provenance,
         }
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """True for wall-clock/transport timeouts (built-in TimeoutError covers the
+    FITS watchdog; requests.Timeout covers connect/read timeouts, which do NOT
+    subclass the built-in — verify CX-27)."""
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        import requests as _requests
+
+        return isinstance(exc, _requests.exceptions.Timeout)
+    except Exception:  # pragma: no cover - requests always present in prod
+        return False
 
 
 def _row_get(row: Mapping[str, Any], name: str) -> Any:

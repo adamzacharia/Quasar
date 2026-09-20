@@ -1,0 +1,1 @@
+{"models":[{"name":"models/gemini-2.0-flash","displayName":"Gemini 2.0 Flash","inputTokenLimit":1048576,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent","countTokens"]},{"name":"models/embedding-001","displayName":"Embedding 001","inputTokenLimit":2048,"supportedGenerationMethods":["embedContent"]}]}

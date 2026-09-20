@@ -228,3 +228,14 @@ docs/QUASAR_V2_DESIGN.md
 docs/QUASAR_V2_EXECUTION_PLAN.md
 docs/implementation_plan.md
 # (Quasar-main.code-workspace already covered by /*.code-workspace above)
+
+# Local-only Codex working agreement (see CLAUDE.md)
+AGENTS.md
+
+# Untracked upstream drops
+/alma-data-skill-main/
+/AstroDataBench-main/
+
+# Pytest temp artifacts & debug error logs
+.pytest-catalog-suite-venv/
+*.err

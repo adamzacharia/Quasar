@@ -18,6 +18,8 @@ import asyncio
 import json
 import queue as stdlib_queue
 import re
+import sys
+import threading
 import uuid
 import time as _time
 from typing import Any, Dict, List, Optional
@@ -33,6 +35,7 @@ from services.evidence_quality import (
 from services.block_identity import BlockIdAllocator
 from services.content_safety import is_safe_web_image, is_safe_web_source
 from services.model_pricing import TurnCostAccumulator, estimate_cost
+from services.feedback_snapshot_service import FeedbackToolTrace
 
 from api import deps
 from api.deps import (
@@ -371,9 +374,11 @@ def _run_with_llm_context(
     quota_checker,
     fn,
     quota_releaser=None,
+    feedback_tool_trace=None,
 ):
     with llm_request_context(
         provider_api_keys=llm_context["provider_api_keys"],
+        model_providers=llm_context.get("model_providers", {}),
         key_source_by_provider=llm_context["key_source_by_provider"],
         byok_token_limits=llm_context["byok_token_limits"],
         user_id=user_id,
@@ -382,11 +387,129 @@ def _run_with_llm_context(
         quota_checker=quota_checker,
         quota_releaser=quota_releaser,
     ):
+        if feedback_tool_trace is not None:
+            from core.llm_client import get_llm_request_context
+            get_llm_request_context().feedback_tool_trace = feedback_tool_trace
         return fn()
 
 
 # ── Shared SSE chat pipeline ──────────────────────────────────────────────────
-def _stream_chat_response(
+# How long the cancel-path fallback waits for a mid-flight run insert before
+# starting the sweep phase (see _finalize_after_insert). Generous vs the DB
+# transport timeouts so a completing insert is never missed, bounded so a
+# truly hung insert cannot occupy an executor worker forever (CX-30).
+_FALLBACK_INSERT_WAIT_SECONDS = 60.0
+# Sweep-retry horizon after that wait expires (round-6 CX-33): a hung remote
+# commit may become VISIBLE only after an earlier sweep saw nothing, so the
+# sweep re-runs on this schedule — sweep immediately, then after each listed
+# delay — until the worker resolves or the horizon ends. The horizon (~10 min)
+# comfortably exceeds any real Turso HTTP processing window while keeping the
+# executor slot bounded; the sweep itself is conditional + idempotent, so
+# extra passes are free.
+_SWEEP_RETRY_DELAYS = (300.0, 300.0)
+
+
+def _spawn_sweep_thread(target) -> None:
+    """Start the sweep-chain daemon thread (seam for tests / verify CX-37)."""
+    threading.Thread(target=target, daemon=True, name="quasar-run-sweep").start()
+
+
+async def _start_run_off_loop(start_fn, finalize_fn, on_expiry_fn=None) -> None:
+    """Create the run row off the event loop; guarantee finalization on cancel.
+
+    Ordering contract (CX-13): the insert and any cancel-path finalization
+    must never race. The worker finalizes ON ITS OWN THREAD, strictly after
+    its insert commits, when the cancel flag is already up; the cancel
+    handler's executor fallback covers the window where the worker finished
+    before the flag was set (then the insert is already committed). Both may
+    fire — the caller's finalize latch makes the second a no-op. Directly
+    async-tested in tests/unit/test_sse_run_lifecycle.py (CX-20)."""
+    cancelled = threading.Event()
+    insert_done = threading.Event()
+
+    def _worker():
+        try:
+            start_fn()
+        finally:
+            insert_done.set()
+            if cancelled.is_set():
+                # Ordered after THIS thread's insert, commit or fail — the
+                # worker owns cancel-during-insert finalization.
+                finalize_fn()
+
+    try:
+        await asyncio.to_thread(_worker)
+    except asyncio.CancelledError:
+        cancelled.set()
+
+        def _finalize_after_insert():
+            # This fallback exists ONLY for the worker-finished-before-the-
+            # flag-was-set window, where insert_done is ALREADY set and the
+            # wait returns immediately. It must NEVER finalize early: a
+            # premature zero-row update would trip the caller's finalize
+            # latch and permanently strand the later row in 'started'
+            # (verify CX-13 round 2). If the wait expires instead, the
+            # worker is unresponsive mid-insert. Its commit is a remote HTTP
+            # call, so the SERVER may have committed while the CLIENT hangs
+            # awaiting the response (verify CX-33 round 5) — the worker's
+            # finally-finalize is then unreachable and the row would strand
+            # in 'started'. on_expiry_fn is the escape hatch: a CONDITIONAL
+            # (status='started') sweep on its own connection that is a no-op
+            # when the commit never landed and can never clobber a proper
+            # finalize, so it safely bypasses the finalize latch. Because
+            # that commit can become VISIBLE only after an earlier sweep saw
+            # nothing (verify CX-33 round 6), the sweep RETRIES across
+            # _SWEEP_RETRY_DELAYS, stopping early if the worker resolves.
+            # Never call finalize_fn on the expiry path (verify CX-30/CX-13).
+            waited = insert_done.wait(_FALLBACK_INSERT_WAIT_SECONDS)
+            if not waited and on_expiry_fn is not None:
+                # Retry passes run on ONE dedicated daemon thread, NOT this
+                # shared default-executor worker: holding an executor slot for
+                # the whole ~10-minute horizon would let a handful of
+                # cancelled-hung inserts starve conversation persistence and
+                # finalization — the exact class this batch fights (verify
+                # CX-35). The thread waits on insert_done itself, so it wakes
+                # EARLY the moment the worker resolves instead of sleeping out
+                # its delay (verify CX-36), and it exits when the worker
+                # resolved (its own finalize supersedes), when a sweep landed,
+                # or after the last pass.
+                def _sweep_chain():
+                    for _delay in (0.0,) + tuple(_SWEEP_RETRY_DELAYS):
+                        if _delay and insert_done.wait(_delay):
+                            return
+                        if insert_done.is_set():
+                            return
+                        try:
+                            if on_expiry_fn():
+                                return
+                        except Exception:
+                            pass
+
+                try:
+                    _spawn_sweep_thread(_sweep_chain)
+                except BaseException:
+                    # Thread exhaustion (verify CX-37, mirroring the FITS
+                    # worker guard): degrade to ONE immediate inline sweep on
+                    # this executor thread — never the full horizon here
+                    # (CX-35) — so an already-visible commit is still swept.
+                    # A commit that becomes visible later is the deploy-level
+                    # orphan sweeper's territory (taskboard RUN-SWEEPER).
+                    try:
+                        on_expiry_fn()
+                    except Exception:
+                        pass
+                return
+            if waited:
+                finalize_fn()
+
+        try:
+            asyncio.get_running_loop().run_in_executor(None, _finalize_after_insert)
+        except Exception:
+            pass
+        raise
+
+
+async def _stream_chat_response(
     request: ChatRequest,
     authorization: Optional[str] = None,
     attachment_context: Optional[Dict[str, Any]] = None,
@@ -400,18 +523,6 @@ def _stream_chat_response(
 
     requested_model = request.model or (getattr(agent.config, "model", None) if agent else None) or os.getenv("DEFAULT_LLM_MODEL", "gpt-oss-120b")
     provider = detect_provider(requested_model)
-    # Enforce the local-only gate on the request path too — the /api/models
-    # filter only hides Claude from the picker, so without this a BYOK user or a
-    # synced conversation whose stored model is claude-* could still invoke it in
-    # production. Keep "hidden" and "unavailable" in sync.
-    if provider == "anthropic" and not _anthropic_models_enabled():
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Anthropic (Claude) models are not enabled on this deployment. "
-                "They are available locally; set QUASAR_ENABLE_ANTHROPIC=1 to enable them here."
-            ),
-        )
     current_user_id = current_user.get("sub") if current_user else None
     current_user_email = _current_user_email(current_user)
     
@@ -423,6 +534,12 @@ def _stream_chat_response(
 
     try:
         llm_context = _build_llm_context_for_user(current_user_id)
+        model_providers = llm_context.get("model_providers", {})
+        provider = model_providers.get(requested_model, provider)
+        if model_providers and requested_model not in model_providers and not requested_model.startswith("local/"):
+            raise HTTPException(status_code=403, detail="Model is not available. Refresh models or add a provider API key.")
+        if provider in {"anthropic", "google"} and not llm_context["provider_api_keys"].get(provider):
+            raise HTTPException(status_code=403, detail="Add a provider API key to use this model.")
         selected_key_source = llm_context["key_source_by_provider"].get(provider, "platform")
         usage_quota_service.ensure_allowed(
             user_id=current_user_id,
@@ -466,9 +583,19 @@ def _stream_chat_response(
     selected_provider_key_scope = ProviderFileService._key_scope(selected_provider_api_key)
 
     # ── Conversation persistence: auto-create + save user message ──────
+    # DB writes go over Turso's HTTP transport and can block for seconds —
+    # they must never run on the event loop, where one slow write freezes
+    # keepalives for EVERY stream on the process (2026-08-04 density hang:
+    # a 20.7-minute zero-byte freeze while the loop was blocked).
     conv_id = request.conversation_id
     if current_user_id:
-        try:
+        # Holder so a save_message failure AFTER a successful create still
+        # yields the new conversation id to the rest of the turn (CX-12) —
+        # matching the old inline semantics where conv_id was assigned before
+        # the exception could land.
+        _conv_holder = {"id": conv_id}
+
+        def _ensure_conversation_and_save_user_msg(conv_id):
             if not conv_id:
                 # No conversation_id from frontend — create a new one
                 title = conversation_service.generate_title_from_message(request.message)
@@ -488,9 +615,25 @@ def _stream_chat_response(
                 else:
                     # Update model in DB to ensure it matches current selected model
                     conversation_service.update_conversation_model(conv_id, requested_model)
+            # Publish the resolved id BEFORE the user-message save so a failed
+            # save cannot orphan a just-created conversation (CX-12).
+            _conv_holder["id"] = conv_id
             conversation_service.save_message(conv_id, "user", request.message)
+            return conv_id
+
+        try:
+            await asyncio.to_thread(_ensure_conversation_and_save_user_msg, conv_id)
+        except asyncio.CancelledError:
+            # The worker thread cannot be stopped and SHOULD complete: it is
+            # persisting the user's own just-sent message, exactly as the old
+            # sync code always did before a disconnect could interrupt the
+            # handler. Nothing to roll back, and no run row exists yet by
+            # design (start_run happens inside the generator). Re-raise so
+            # the request unwinds normally (CX-28).
+            raise
         except Exception as e:
             logger.warning(f"[CHAT] Failed to persist user message: {e}")
+        conv_id = _conv_holder["id"]
 
     if attachment_context is None and provider in {"openai", "anthropic", "google"}:
         attachment_context = provider_file_service.get_active_files(
@@ -530,19 +673,6 @@ def _stream_chat_response(
 
     run_id = str(uuid.uuid4())
     trace_id = str(getattr(lf_trace, "id", "") or "")
-    try:
-        issue_report_service.start_run(
-            run_id=run_id,
-            user_id=current_user_id,
-            conversation_id=conv_id or request.conversation_id or "",
-            trace_id=trace_id,
-            model=requested_model,
-            provider=provider,
-            key_source=selected_key_source,
-            client_ip=client_ip,
-        )
-    except Exception as run_err:
-        logger.warning(f"[RUN] Failed to create run record {run_id}: {run_err}")
 
     async def generate():
         inactivity_timeout = int(os.getenv("CHAT_INACTIVITY_TIMEOUT_SECONDS", "90"))
@@ -604,7 +734,18 @@ def _stream_chat_response(
                 "durationMs": int((_time.perf_counter() - run_started_at) * 1000),
             }) + "\n\n"
 
+        # Racing finalize paths (normal-completion await + its cancellation
+        # fallback, the pre-generator cancel handler, teardown fire-and-forget)
+        # serialize on this lock; run_finalized then makes a completed write
+        # idempotent while a FAILED write stays retryable by a later path
+        # (CX-14).
+        _finalize_lock = threading.Lock()
+
         def finalize_run_record() -> None:
+            with _finalize_lock:
+                _finalize_run_record_locked()
+
+        def _finalize_run_record_locked() -> None:
             nonlocal run_finalized
             if run_finalized:
                 return
@@ -652,6 +793,61 @@ def _stream_chat_response(
                 run_finalized = True
             except Exception as run_err:
                 logger.warning(f"[RUN] Failed to finalize run {run_id}: {run_err}")
+
+        # start_run lives INSIDE the generator (CX-13): a cancellation landing
+        # before the client ever iterates the stream creates no run row at
+        # all. Everything above this point is sync defs/vars — the ONLY await
+        # a cancellation can land on before the main body is this one, and
+        # _start_run_off_loop's ordering contract guarantees the row is
+        # finalized strictly AFTER its insert commits, never racing it.
+        def _do_start_run():
+            # return_row=False: nothing may follow the commit inside start_fn,
+            # or a hung post-commit read could outlive the cancel fallback
+            # with the row already committed but the worker's finally-finalize
+            # unreachable (guard CX-33). The chat path never used the row.
+            issue_report_service.start_run(
+                run_id=run_id,
+                user_id=current_user_id,
+                conversation_id=conv_id or request.conversation_id or "",
+                trace_id=trace_id,
+                model=requested_model,
+                provider=provider,
+                key_source=selected_key_source,
+                client_ip=client_ip,
+                return_row=False,
+            )
+
+        def _finalize_cancelled_start():
+            nonlocal run_status, run_error_code
+            if run_status == "started":
+                run_status = "cancelled"
+                run_error_code = "client_cancelled"
+            finalize_run_record()
+
+        def _sweep_possible_orphan_row() -> bool:
+            # See _start_run_off_loop: the insert worker went unresponsive
+            # past the fallback wait with an ambiguous remote commit. Returns
+            # True when the row was found and swept, ending the retry chain.
+            try:
+                swept = issue_report_service.mark_run_cancelled_if_started(run_id)
+                if swept:
+                    logger.warning(
+                        f"[RUN] Swept orphaned run row {run_id} (cancelled while "
+                        "the insert worker was unresponsive)"
+                    )
+                return swept
+            except Exception as sweep_err:
+                logger.warning(f"[RUN] Orphan sweep failed for {run_id}: {sweep_err}")
+                return False
+
+        try:
+            await _start_run_off_loop(
+                _do_start_run, _finalize_cancelled_start, _sweep_possible_orphan_row
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as run_err:
+            logger.warning(f"[RUN] Failed to create run record {run_id}: {run_err}")
 
         # Stable per-block identity for this turn (Feature 4). conv_id is
         # already resolved above (create_conversation runs before this point),
@@ -722,7 +918,7 @@ def _stream_chat_response(
             if _agent_none_meta:
                 yield _agent_none_meta
             yield "data: [DONE]\n\n"
-            finalize_run_record()
+            await asyncio.to_thread(finalize_run_record)
             return
 
         for note in attachment_context.get("messages", []):
@@ -763,7 +959,7 @@ def _stream_chat_response(
                 run_error_message = msg
                 yield f"data: {json.dumps({'type': 'error', 'content': msg})}\n\n"
                 yield "data: [DONE]\n\n"
-                finalize_run_record()
+                await asyncio.to_thread(finalize_run_record)
                 return
             yield _sse_status("Analyzing uploaded image", "completed")
             enriched_message = (
@@ -940,6 +1136,9 @@ def _stream_chat_response(
             print("[INFO] Routing query to standard Response API (tool-calling loop)")
 
             queue = asyncio.Queue()
+            # Both stream and worker own this request-scoped handle. The stream
+            # can persist completed calls even if the worker never sends done.
+            _feedback_trace_collector = FeedbackToolTrace()
 
             # ── Plan Feedback Queue (HITL) ────────────────────────────
             # Created at generator scope so the SSE event loop can re-key
@@ -1064,6 +1263,7 @@ def _stream_chat_response(
                     quota_checker,
                     _run_agent,
                     quota_releaser=quota_releaser,
+                    feedback_tool_trace=_feedback_trace_collector,
                 ),
             )
 
@@ -1100,6 +1300,7 @@ def _stream_chat_response(
             # UIAPI-07: initialized HERE (not only after the loop) so the
             # timeout/cancel persistence paths always have a defined trace.
             _tool_trace: List[Any] = []
+            _citation_metrics = None
 
             def _record_rich_image(img_url, caption, meta=None, request=None,
                                    block_id=None, block_kind=None):
@@ -1133,11 +1334,13 @@ def _stream_chat_response(
                 nonlocal turn_persisted
                 if turn_persisted:
                     return
+                feedback_evidence = _feedback_trace_collector.freeze(
+                    "completed" if run_status == "started" else run_status)
                 if not (current_user_id and conv_id and (
                     response_text or _rich_data_tables or _rich_data_table or
                     _rich_papers or _rich_notebook or _rich_images or _rich_image or
                     _rich_web_sources or _rich_web_images or
-                    _rich_thinking or _rich_thinking_text
+                    _rich_thinking or _rich_thinking_text or feedback_evidence["total_calls"]
                 )):
                     return
                 turn_persisted = True
@@ -1195,6 +1398,7 @@ def _stream_chat_response(
                     # queries are dropped on history replay. Persist a REDACTED,
                     # reload-safe projection — never the raw arguments/output,
                     # which can carry credential-bearing URLs into the DB (CX-01).
+                    rich_meta["feedbackToolTrace"] = feedback_evidence
                     if _tool_trace:
                         from core.provenance import persistable_trace
                         _persist_trace = persistable_trace(_tool_trace)
@@ -1250,6 +1454,7 @@ def _stream_chat_response(
                     timeout_code = deadline.timeout_code(now)
                     if timeout_code:
                         run_status = "timed_out"
+                        _feedback_trace_collector.freeze(run_status)
                         run_error_code = timeout_code
                         run_error_message = (
                             f"The {provider} model stopped producing progress. "
@@ -1286,7 +1491,16 @@ def _stream_chat_response(
                     msg_type, step, state = msg
                     if msg_type == "status" and isinstance(step, str) and (
                         step.startswith("__tool_heartbeat__")
-                        or (state == "completed" and not step.startswith("__"))
+                        or (
+                            state == "completed"
+                            and not step.startswith("__")
+                            # A guard-timeout notice is a FAILURE, not progress:
+                            # a turn producing nothing but tool timeouts used to
+                            # march all the way to the 900 s hard cap on these
+                            # extensions (2026-08-04 density hang). core/agent.py
+                            # emits the "timed out" phrase — keep in sync.
+                            and " timed out " not in step
+                        )
                     ):
                         # Completed tool steps and live tool heartbeats are real
                         # progress — push the total-turn deadline out so long
@@ -1746,7 +1960,9 @@ def _stream_chat_response(
 
             # ── Persist assistant response + rich UI data to DB ─────
             # (UIAPI-07: shared with the timeout path — see _persist_assistant_turn.)
-            _persist_assistant_turn()
+            # Off-loop: a slow Turso HTTP write here used to freeze keepalives
+            # for every stream on the process (2026-08-04 density hang).
+            await asyncio.to_thread(_persist_assistant_turn)
 
             # ── Log chat analytics ─────────────────────────────────
             try:
@@ -1757,7 +1973,8 @@ def _stream_chat_response(
                         run_tools.append(tool_name)
                 _user_email = current_user.get("email", "") if current_user else ""
                 _user_name = current_user.get("name", "") if current_user else ""
-                analytics_service.log_chat(
+                await asyncio.to_thread(
+                    analytics_service.log_chat,
                     user_id=current_user_id or "anonymous",
                     username=_user_email,
                     email=_user_email,
@@ -1836,8 +2053,10 @@ def _stream_chat_response(
                 yield _final_meta
             yield "data: [DONE]\n\n"
 
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             run_status = "cancelled"
+            if "_feedback_trace_collector" in locals():
+                _feedback_trace_collector.freeze(run_status)
             run_error_code = "client_cancelled"
             run_error_message = "The client cancelled the chat run."
             try:
@@ -1854,9 +2073,13 @@ def _stream_chat_response(
             # streamed — persist the accumulated tokens + eager cards with
             # runMeta.status="cancelled". Best-effort: cancellation can land
             # before the accumulators (or the helper) even exist, in which
-            # case there is nothing to save.
+            # case there is nothing to save. Fire-and-forget on the default
+            # executor: awaiting inside a CancelledError handler risks being
+            # re-cancelled, and a blocking write here would freeze the loop
+            # during teardown (the helper is internally try/except-safe and
+            # idempotent via turn_persisted).
             try:
-                _persist_assistant_turn()
+                asyncio.get_running_loop().run_in_executor(None, _persist_assistant_turn)
             except Exception:
                 pass
             raise
@@ -1889,7 +2112,38 @@ def _stream_chat_response(
                 with _plan_feedback_lock:
                     if _plan_feedback_queues.get(_pfq_key[0]) is _pfq:
                         _plan_feedback_queues.pop(_pfq_key[0], None)
-            finalize_run_record()
+            # Finalization must stay off-loop, but HOW depends on why we are
+            # here (CX-14). Normal completion: the benchmark and UI read the
+            # run row right after [DONE], so the write must COMPLETE before
+            # the stream closes — await it (safe: no teardown in flight).
+            # Teardown (GeneratorExit on client disconnect, CancelledError,
+            # propagating error): never await — an await here can be
+            # re-cancelled and a blocking write would freeze the loop —
+            # fire-and-forget on the default executor instead. Inline call is
+            # the last resort when the loop itself is already gone.
+            if sys.exc_info()[1] is None:
+                try:
+                    await asyncio.to_thread(finalize_run_record)
+                except asyncio.CancelledError:
+                    # The worker thread cannot be stopped and finishes the
+                    # write on its own (the finalize lock makes any second
+                    # entry a no-op) — but the CALLER's cancellation must
+                    # still propagate, not be converted into a normal
+                    # completion (verify CX-29).
+                    raise
+                except RuntimeError:
+                    # Could not even schedule the worker (loop/executor already
+                    # shutting down) — inline is the only remaining option.
+                    finalize_run_record()
+                except BaseException:
+                    # Any other teardown surprise: the worker finishes the
+                    # write on its own; never re-run inline on the loop (CX-14).
+                    pass
+            else:
+                try:
+                    asyncio.get_running_loop().run_in_executor(None, finalize_run_record)
+                except Exception:
+                    finalize_run_record()
             if lf_trace:
                 try:
                     lf_trace.update(

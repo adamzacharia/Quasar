@@ -1,0 +1,2 @@
+{"name":"quasar-design-preview","private":true,"type":"module","scripts":{"dev":"node start.mjs","typecheck":"tsc --noEmit"},"dependencies":{"next":"16.1.6","react":"19.2.3","react-dom":"19.2.3"}}
+

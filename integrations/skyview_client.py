@@ -88,7 +88,7 @@ class SkyViewClient:
         Fetch a sky survey cutout image.
         
         Args:
-            target: Astronomical target name (e.g., 'M87', 'NGC 1068')
+            target: Astronomical target name (e.g., 'M87', 'IC 342')
             survey: Survey name (e.g., 'DSS2 Red', '2MASS-J', 'WISE 3.4')
             ra: RA in degrees (alternative to target)
             dec: Dec in degrees (alternative to target)

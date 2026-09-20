@@ -27,8 +27,12 @@ from run_datalabbench import (  # noqa: E402
 )
 
 
-def test_bench_version_is_1_2():
-    assert BENCH_VERSION == "1.2"
+def test_bench_version_is_1_3():
+    # Deliberately bumped by RE-B2/B3 (2026-08-20): DLB-05 C3's threshold
+    # regex was tightened (adjacency to spread_model context required) and
+    # DLB-14 C3 additionally accepts the unified `cmag < 50` sentinel guard —
+    # scoring-affecting changes confined to those two checks.
+    assert BENCH_VERSION == "1.3"
 
 
 def test_dataset_still_validates():

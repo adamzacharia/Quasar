@@ -47,7 +47,10 @@ _NUMERIC_JSON_TYPES = {"number", "integer"}
 
 # Per archive, at most this many pitfalls may carry a prompt_rank — the
 # prompt index budget (one line per archive) is bounded by construction.
-PROMPT_RANKED_MAX = 2
+# Raised 2 → 3 for RE-B2: datalab's magnitude_cut_hygiene pitfall must reach
+# the prompt (unranked pitfalls never do), alongside nan_ordering and
+# per_band_columns.
+PROMPT_RANKED_MAX = 3
 
 
 class StrictModel(BaseModel):
@@ -234,8 +237,8 @@ class ProfileRef(StrictModel):
 class Pitfall(StrictModel):
     id: str
     # Single-line prompt wording. The 160-char ceiling is load-bearing: with
-    # at most PROMPT_RANKED_MAX ranked pitfalls per archive (see
-    # ArchiveProfile) it bounds every prompt-index line under ~500 chars by
+    # at most PROMPT_RANKED_MAX (3) ranked pitfalls per archive (see
+    # ArchiveProfile) it bounds every prompt-index line under ~600 chars by
     # construction, so the injected block cannot bloat (guard CX-07).
     summary: str = Field(max_length=160)
     detail: Optional[str] = None      # fuller browse_schema explanation

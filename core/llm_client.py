@@ -34,12 +34,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
+from core.retry import _is_retryable as _retry_is_retryable
 from core.retry import with_retry
 from core.langfuse_integration import get_langfuse, _safe_serialize
 from services.secret_redaction import redact_secrets
@@ -54,11 +56,17 @@ _langfuse_tls = _threading.local()
 _request_tls = _threading.local()
 
 
+def _feedback_trace_factory():
+    from services.feedback_snapshot_service import FeedbackToolTrace
+    return FeedbackToolTrace()
+
+
 @dataclass
 class LLMRequestContext:
     """Request-scoped provider key and usage accounting context."""
 
     provider_api_keys: Dict[str, str] = field(default_factory=dict)
+    model_providers: Dict[str, str] = field(default_factory=dict)
     key_source_by_provider: Dict[str, str] = field(default_factory=dict)
     user_id: str = "anonymous"
     user_email: str = ""
@@ -80,12 +88,16 @@ class LLMRequestContext:
     # context so both the simple-path (runner) and Conductor threads write to
     # the same per-request slot; the SSE layer surfaces it in run_meta.
     citation_metrics: Optional[Dict[str, Any]] = None
+    # Full redacted feedback evidence is independent of the compact UI/benchmark
+    # trace. The same context follows tools into worker/conductor threads.
+    feedback_tool_trace: Any = field(default_factory=_feedback_trace_factory)
 
 
 @contextmanager
 def llm_request_context(
     *,
     provider_api_keys: Optional[Dict[str, str]] = None,
+    model_providers: Optional[Dict[str, str]] = None,
     key_source_by_provider: Optional[Dict[str, str]] = None,
     user_id: str = "anonymous",
     user_email: str = "",
@@ -98,6 +110,7 @@ def llm_request_context(
     previous = getattr(_request_tls, "context", None)
     _request_tls.context = LLMRequestContext(
         provider_api_keys=dict(provider_api_keys or {}),
+        model_providers=dict(model_providers or {}),
         key_source_by_provider=dict(key_source_by_provider or {}),
         user_id=user_id or "anonymous",
         user_email=user_email or "",
@@ -188,6 +201,9 @@ TACC_MODEL_ID_SET = frozenset(TACC_MODEL_IDS)
 
 def detect_provider(model: str) -> str:
     """Detect the LLM provider from the model name."""
+    context = get_llm_request_context()
+    if context and model in context.model_providers:
+        return context.model_providers[model]
     if model in TACC_MODEL_ID_SET or model.startswith("tacc/"):
         return "tacc"
     if model.startswith("local/"):
@@ -205,6 +221,100 @@ def detect_provider(model: str) -> str:
 def model_accepts_direct_image_input(model: str) -> bool:
     """Return True when Quasar can pass uploaded images directly to the model."""
     return detect_provider(model) == "openai"
+
+
+# Attachment support is KIND-specific, not provider-wide (CX-21). Uploaded
+# document references carry a per-provider `kind` stamped by
+# services/provider_file_service.py `_ref_to_attachment` (:475-488), and each
+# builder in this module accepts ONLY its own kind, silently `continue`-ing
+# past the rest:
+#   "openai_input_file"       — _build_openai_input     (kind check at :805)
+#   "anthropic_document_file" — _build_anthropic_messages (kind check at :1082)
+#   "gemini_file"             — _build_google_contents  (kind check at :1353)
+# Inline image attachments ("image_url" key or type=="image_url") are built in
+# by _build_openai_input's image branch and _inject_images_into_messages
+# (tacc); anthropic/google builders ignore them, deepseek explicitly DROPS
+# them with a warning, local raises. Turn-start failover must not switch an
+# attachment-carrying turn onto a provider whose builder would drop any of the
+# turn's attachment kinds — the user's uploads would silently vanish.
+ATTACHMENT_KIND_PROVIDERS: Dict[str, frozenset] = {
+    "openai_input_file": frozenset({"openai"}),
+    "anthropic_document_file": frozenset({"anthropic"}),
+    "gemini_file": frozenset({"google"}),
+    "image_url": frozenset({"openai", "tacc"}),
+}
+
+
+def attachment_kind(attachment: Any) -> str:
+    """Classify one attachment dict the way the provider builders do:
+    an explicit provider-file `kind` wins; otherwise the image detection used
+    by _build_openai_input/_inject_images_into_messages ("image_url" key or
+    type=="image_url"); anything else is "unknown"."""
+    if not isinstance(attachment, dict):
+        return "unknown"
+    kind = attachment.get("kind")
+    if kind:
+        return str(kind)
+    if attachment.get("type") == "image_url" or "image_url" in attachment:
+        return "image_url"
+    return "unknown"
+
+
+def providers_accepting_attachments(attachments) -> frozenset:
+    """Providers whose builders accept EVERY attachment in ``attachments``.
+
+    The intersection over per-kind acceptance sets (ATTACHMENT_KIND_PROVIDERS);
+    an unknown kind maps to the empty set — no provider is known to forward
+    it, so failover conservatively stays put. An empty/None list intersects
+    nothing and returns the union of all known-capable providers (no
+    constraint), but callers gate on ``if attachments:`` first anyway.
+    """
+    compatible: Optional[frozenset] = None
+    for attachment in attachments or []:
+        accepts = ATTACHMENT_KIND_PROVIDERS.get(attachment_kind(attachment), frozenset())
+        compatible = accepts if compatible is None else (compatible & accepts)
+        if not compatible:
+            return frozenset()
+    if compatible is None:
+        return frozenset().union(*ATTACHMENT_KIND_PROVIDERS.values())
+    return compatible
+
+
+# Environment variables that establish a platform credential path per provider
+# (mirrors the _get_*_client getters below — keep in sync). "local" needs a
+# base URL rather than a key; TACC accepts three historical env spellings.
+PROVIDER_KEY_ENV_VARS: Dict[str, tuple] = {
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "google": ("GEMINI_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "tacc": ("TACC_API_KEY", "TEJAS_API_KEY", "TEXAS_AI_API_KEY"),
+    "local": ("LOCAL_LLM_BASE_URL",),
+}
+
+
+def provider_has_key_path(provider: str, client: Optional["LLMClient"] = None) -> bool:
+    """True when a call to ``provider`` has SOME usable credential path:
+    a BYOK key (client-scoped or request-context) or a platform env key.
+
+    Used by turn-start health failover (core/runner.py): switching to a
+    fallback whose provider has no key path would just trade one error for
+    another, so the failover only engages when this returns True. Unknown
+    providers return False.
+    """
+    provider = LLMClient._normalize_provider_key(provider)
+    try:
+        if client is not None and (client.provider_api_keys or {}).get(provider):
+            return True
+    except Exception:
+        pass
+    context = get_llm_request_context()
+    if context and (context.provider_api_keys or {}).get(provider):
+        return True
+    return any(
+        (os.getenv(name, "") or "").strip()
+        for name in PROVIDER_KEY_ENV_VARS.get(provider, ())
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -429,13 +539,77 @@ class ResponsesShim:
             logger.warning("[usage] Failed to record LLM usage: %s", redact_secrets(exc))
             self._release_quota(reservation_id)
 
+    def _byok_call(self, provider: str) -> bool:
+        """True when the CURRENT call to ``provider`` rides a user-supplied
+        (BYOK) key — a client-scoped or request-context key, or an explicit
+        key-source declaration. If the key source can't be determined (e.g.
+        a stubbed client in tests), assume platform."""
+        try:
+            if self._llm._resolve_context_api_key(provider):
+                return True
+            return self._llm._resolve_key_source(provider) == "byok"
+        except Exception:
+            return False
+
+    def _record_provider_health(
+        self, provider: str, model: str, error: Optional[BaseException] = None
+    ) -> None:
+        """Feed the process-shared HealthMonitor from THE one choke point every
+        LLM call flows through (RE-A2: record_success/record_failure were never
+        called, so is_healthy() was always True and failover was dead code).
+
+        ``error=None`` records a success. Failures are recorded per PROVIDER
+        (the monitor's key and FALLBACK_MODELS' key) with the model noted in
+        the error text; cancellations, quota trips, and local client-side
+        errors are exempt (see core.health_monitor.health_failure_exempt).
+
+        CX-03 key fairness: failures count against GLOBAL provider health only
+        for PLATFORM-key calls. A failure on a user's own (BYOK) key is that
+        user's key problem — one bad/rate-limited user key must never flip the
+        provider unhealthy for everyone else. Successes record for both key
+        sources (a success is evidence the provider is up regardless of whose
+        key proved it). Never raises — health accounting must not break a
+        live call.
+        """
+        try:
+            from core.health_monitor import get_health_monitor, health_failure_exempt
+
+            monitor = get_health_monitor()
+            if error is None:
+                monitor.record_success(provider)
+            elif not health_failure_exempt(error) and not self._byok_call(provider):
+                monitor.record_failure(
+                    provider,
+                    f"{model}: {type(error).__name__}: {redact_secrets(error)}",
+                )
+        except Exception:  # pragma: no cover - accounting must never bite
+            logger.debug("[health] recording failed", exc_info=True)
+
     def _wrap_usage_stream(
         self, stream: Any, provider: str, model: str, reservation_id: Optional[str] = None
     ):
-        """Wrap a stream and record usage from the completed response event."""
+        """Wrap a stream and record usage from the completed response event.
+
+        Also the streaming half of provider-health recording: only exceptions
+        raised by the UNDERLYING stream (``next(it)``) count as provider
+        failures — the consumer's own ``close()``/``throw()`` surfaces at the
+        ``yield`` below, so a user cancellation is never miscounted.
+        """
         last_response = None
+        it = iter(stream)
         try:
-            for event in stream:
+            while True:
+                try:
+                    event = next(it)
+                except StopIteration:
+                    # Clean exhaustion — the provider delivered a whole stream.
+                    self._record_provider_health(provider, model)
+                    break
+                except Exception as exc:
+                    # Provider-side stream death (mid-stream timeout, reset,
+                    # RemoteProtocolError...) — record ill-health unless exempt.
+                    self._record_provider_health(provider, model, error=exc)
+                    raise
                 response = getattr(event, "response", None)
                 if response is not None and getattr(response, "usage", None):
                     last_response = response
@@ -509,12 +683,18 @@ class ResponsesShim:
         t0 = _time.perf_counter()
 
         try:
+            # Runner-only flag: escalate tool_choice="required" from an emulated
+            # nudge to server-enforced decoding (TACC) — set on re-samples after a
+            # reasoning-only stop. Never forwarded to a provider SDK.
+            strict_required = bool(kwargs.pop("tool_choice_strict", False))
             if provider == "openai":
                 result = self._call_openai(kwargs, attachments=attachments)
             elif provider == "tacc":
                 if stream:
+                    kwargs["_tool_choice_strict"] = strict_required  # read by the TACC shims only
                     result = self._stream_tacc(kwargs, attachments=attachments)
                 else:
+                    kwargs["_tool_choice_strict"] = strict_required
                     result = self._call_tacc(kwargs, attachments=attachments)
             elif provider == "deepseek":
                 if stream:
@@ -603,10 +783,13 @@ class ResponsesShim:
 
             if stream:
                 # Ownership of the reservation passes to the generator, which
-                # settles or releases it in its finally once consumed.
+                # settles or releases it in its finally once consumed — health
+                # for streams is recorded inside _wrap_usage_stream, where the
+                # outcome is actually known.
                 result = self._wrap_usage_stream(result, provider, model, reservation_id)
             else:
                 self._record_usage(provider, model, result, reservation_id)
+                self._record_provider_health(provider, model)
 
             return result
 
@@ -614,6 +797,10 @@ class ResponsesShim:
             # The call never produced usage to settle against, so hand the
             # reservation back rather than making the user wait out its TTL.
             self._release_quota(reservation_id)
+            # Health: covers non-streaming failures (after @with_retry gave up)
+            # and eager stream-creation failures. Quota trips / cancellations /
+            # local client errors are exempt inside the recorder.
+            self._record_provider_health(provider, model, error=e)
             # ── Langfuse: record the error on the generation ──
             if lf_gen:
                 try:
@@ -703,16 +890,55 @@ class ResponsesShim:
     _ANTHROPIC_NO_SAMPLING_PREFIXES = (
         "claude-opus-4-7",
         "claude-opus-4-8",
+        "claude-opus-5",
         "claude-sonnet-5",
         "claude-fable-5",
         "claude-mythos-5",
     )
 
+    _ANTHROPIC_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+
+    # A static prefix list cannot stay correct now that the BYOK catalog
+    # surfaces every model a user's key can see — a new Claude family reaches
+    # the picker the day it ships, long before this tuple is updated. So the
+    # list is only a fast path; the authority is the provider's own rejection,
+    # learned once per process and applied to every later call for that model.
+    _ANTHROPIC_NO_SAMPLING_LEARNED: set[str] = set()
+
     @classmethod
     def _anthropic_accepts_sampling(cls, model: str) -> bool:
         """Return False for Claude models that reject temperature/top_p/top_k."""
         model_id = (model or "").strip().lower()
+        if model_id in cls._ANTHROPIC_NO_SAMPLING_LEARNED:
+            return False
         return not any(model_id.startswith(p) for p in cls._ANTHROPIC_NO_SAMPLING_PREFIXES)
+
+    @classmethod
+    def _strip_sampling_after_rejection(cls, call_kwargs: dict, exc: Exception) -> bool:
+        """Drop sampling params when `exc` is the provider rejecting them.
+
+        Returns True when the call is worth retrying. Matched on the provider's
+        400 body (e.g. "`temperature` is deprecated for this model.") rather
+        than an exception class, because `anthropic` is imported lazily here.
+        """
+        if getattr(exc, "status_code", None) != 400:
+            return False
+        message = str(exc).lower()
+        if not any(param in message for param in cls._ANTHROPIC_SAMPLING_PARAMS):
+            return False
+        if not any(word in message for word in ("deprecated", "unsupported", "not supported", "unexpected")):
+            return False
+        removed = [p for p in cls._ANTHROPIC_SAMPLING_PARAMS if call_kwargs.pop(p, None) is not None]
+        if not removed:
+            return False
+        model_id = str(call_kwargs.get("model", "")).strip().lower()
+        if model_id:
+            cls._ANTHROPIC_NO_SAMPLING_LEARNED.add(model_id)
+        logger.info(
+            "Anthropic model %s rejects %s; retrying without them and remembering for this process.",
+            model_id or "<unknown>", ", ".join(removed),
+        )
+        return True
 
     # Referencing an uploaded file (Files API) in a document block requires this
     # beta header on the messages request as well as on the upload.
@@ -821,10 +1047,20 @@ class ResponsesShim:
             call_kwargs["system"] = system_text
         if anthropic_tools:
             call_kwargs["tools"] = anthropic_tools
+            # A forced-final round keeps the schemas (the Messages API rejects
+            # tool_use/tool_result history without `tools`) and disables new
+            # calls via tool_choice none.
+            if kwargs.get("tool_choice") == "none":
+                call_kwargs["tool_choice"] = {"type": "none"}
         if self._anthropic_has_document(attachments):
             call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
 
-        resp = client.messages.create(**call_kwargs)
+        try:
+            resp = client.messages.create(**call_kwargs)
+        except Exception as exc:
+            if not self._strip_sampling_after_rejection(call_kwargs, exc):
+                raise
+            resp = client.messages.create(**call_kwargs)
 
         # Convert to LLMResponse and cache the turn for the next round.
         result = self._anthropic_to_llm_response(resp)
@@ -860,11 +1096,51 @@ class ResponsesShim:
             call_kwargs["system"] = instructions
         if anthropic_tools:
             call_kwargs["tools"] = anthropic_tools
+            # Forced-final round: keep schemas (tool_use/tool_result history
+            # requires `tools`), forbid new calls.
+            if kwargs.get("tool_choice") == "none":
+                call_kwargs["tool_choice"] = {"type": "none"}
         if self._anthropic_has_document(attachments):
             call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
 
         # Return a generator that yields StreamEvent objects
         return self._anthropic_stream_generator(client, call_kwargs)
+
+    @contextmanager
+    def _anthropic_stream_cm(self, client, call_kwargs):
+        """Open a Messages stream, retrying once without sampling params.
+
+        The rejection is raised when the stream is opened, before any event is
+        produced. `opened` guards the retry so a failure *during* iteration is
+        never replayed — that would duplicate already-streamed output.
+        """
+        opened = False
+        try:
+            with client.messages.stream(**call_kwargs) as stream:
+                opened = True
+                yield stream
+            return
+        except Exception as exc:
+            if opened or not self._strip_sampling_after_rejection(call_kwargs, exc):
+                raise
+        with client.messages.stream(**call_kwargs) as stream:
+            yield stream
+
+    @staticmethod
+    def _log_served_model(requested, event) -> None:
+        """Record the model Anthropic reports for a turn, warning on a mismatch.
+
+        An alias legitimately resolves to a dated snapshot
+        (claude-haiku-4-5 -> claude-haiku-4-5-20251001), so only a served model
+        that is not the requested one nor a snapshot of it is worth a warning.
+        """
+        served = getattr(getattr(event, "message", None), "model", None)
+        if not served or not requested:
+            return
+        if served == requested or served.startswith(f"{requested}-"):
+            logger.info("Anthropic served model=%s (requested %s)", served, requested)
+            return
+        logger.warning("Anthropic served model=%s but %s was requested.", served, requested)
 
     def _anthropic_stream_generator(self, client, call_kwargs):
         """Generate StreamEvent objects from Anthropic streaming."""
@@ -879,9 +1155,15 @@ class ResponsesShim:
         function_calls = {}  # index -> {name, arguments}
         current_tool_index = None
 
-        with client.messages.stream(**call_kwargs) as stream:
+        with self._anthropic_stream_cm(client, call_kwargs) as stream:
             for event in stream:
                 event_type = getattr(event, 'type', '')
+
+                if event_type == 'message_start':
+                    # The provider echoes the model that actually served the
+                    # turn. Logged so a silent substitution (or an alias
+                    # resolving elsewhere) is visible rather than assumed.
+                    self._log_served_model(call_kwargs.get("model"), event)
 
                 if event_type == 'content_block_start':
                     block = getattr(event, 'content_block', None)
@@ -991,6 +1273,8 @@ class ResponsesShim:
                         "tool_use_id": call_id,
                         "content": item.get("output", ""),
                     })
+                elif isinstance(item, dict) and item.get("role") == "user":
+                    tool_results.append({"type": "text", "text": item.get("content", "")})
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
             return messages
@@ -1086,6 +1370,8 @@ class ResponsesShim:
         }
         if gemini_tools:
             call_kwargs["config"]["tools"] = gemini_tools
+        if kwargs.get("tool_choice") == "none":
+            call_kwargs["config"]["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
 
         resp = client.models.generate_content(**call_kwargs)
 
@@ -1121,6 +1407,8 @@ class ResponsesShim:
         }
         if gemini_tools:
             call_kwargs["config"]["tools"] = gemini_tools
+        if kwargs.get("tool_choice") == "none":
+            call_kwargs["config"]["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
 
         # Emit response.created
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
@@ -1291,6 +1579,8 @@ class ResponsesShim:
             call_kwargs["response_format"] = {"type": "json_object"}
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
+        if kwargs.get("tool_choice") == "none":
+            call_kwargs["tool_choice"] = "none"
         resp = completions_engine.create(**call_kwargs)
         return self._chat_completion_to_llm_response(resp)
 
@@ -1329,6 +1619,8 @@ class ResponsesShim:
         usage_obj = None
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
+        if kwargs.get("tool_choice") == "none":
+            call_kwargs["tool_choice"] = "none"
         stream = completions_engine.create(**call_kwargs)
         for chunk in stream:
             if hasattr(chunk, 'usage') and chunk.usage:
@@ -1416,14 +1708,14 @@ class ResponsesShim:
         if openai_tools:
             call_kwargs["tools"] = openai_tools
             if tool_choice:
-                call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
+                call_kwargs["tool_choice"] = self._tacc_tool_choice(tool_choice, bool(kwargs.get("_tool_choice_strict")))
                 if tool_choice == "required":
                     call_kwargs["messages"] = self._apply_required_tool_choice_nudge(call_kwargs["messages"])
         if json_mode and os.getenv("TACC_ENABLE_RESPONSE_FORMAT", "").lower() in {"1", "true", "yes"}:
             call_kwargs["response_format"] = {"type": "json_object"}
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
-        resp = completions_engine.create(**call_kwargs)
+        resp = self._tacc_create_with_tool_choice_fallback(completions_engine, call_kwargs)
         result = self._chat_completion_to_llm_response(resp)
 
         new_messages = list(messages)
@@ -1482,82 +1774,54 @@ class ResponsesShim:
         if openai_tools:
             call_kwargs["tools"] = openai_tools
             if tool_choice:
-                call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
+                call_kwargs["tool_choice"] = self._tacc_tool_choice(tool_choice, bool(kwargs.get("_tool_choice_strict")))
                 if tool_choice == "required":
                     call_kwargs["messages"] = self._apply_required_tool_choice_nudge(call_kwargs["messages"])
 
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
 
-        function_calls = {}
-        reasoning_done_emitted = False
-        output_text = ""
-        reasoning_content = ""
-        usage_obj = None
-        finish_reason = None
+        st = self._new_tacc_stream_state()
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
-        stream = completions_engine.create(**call_kwargs)
-        for chunk in stream:
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage_obj = LLMUsage(
-                    input_tokens=getattr(chunk.usage, "prompt_tokens", 0),
-                    output_tokens=getattr(chunk.usage, "completion_tokens", 0),
+        stream = self._tacc_create_with_tool_choice_fallback(completions_engine, call_kwargs)
+        try:
+            yield from self._iter_tacc_stream(stream, st)
+        except Exception as exc:
+            # A server-ENFORCED tool call (tool_choice="required") that dies
+            # mid-stream before producing any content or call is retried ONCE
+            # with the emulated form (auto + the nudge already in the system
+            # message), and "required" is cooled down for this process. Live
+            # 2026-09-17: every one of the 10 provider-killed benchmark trials
+            # died on exactly this call, seconds after the same prompt had
+            # streamed fine under "auto"; the request-time 400 fallback above
+            # never sees an in-band stream error. Reasoning deltas already
+            # forwarded stay visible — they are commentary, not the answer.
+            if (
+                call_kwargs.get("tool_choice") == "required"
+                and not st.function_calls
+                and not st.output_text
+                and _retry_is_retryable(exc)
+            ):
+                cooldown = self._tacc_required_cooldown_seconds()
+                type(self)._tacc_required_cooldown_until = time.monotonic() + cooldown
+                print(
+                    f"[PROVIDER] tacc stream died under tool_choice=required "
+                    f"({type(exc).__name__}: {str(exc)[:160]}) — retrying this round once with "
+                    f"auto (+nudge); required is cooled down for {cooldown:.0f}s"
                 )
+                st = self._new_tacc_stream_state()
+                stream = completions_engine.create(**{**call_kwargs, "tool_choice": "auto"})
+                yield from self._iter_tacc_stream(stream, st)
+            else:
+                raise
 
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                continue
-            if getattr(choice, "finish_reason", None):
-                finish_reason = choice.finish_reason
-
-            delta = choice.delta
-
-            # gpt-oss serves its chain of thought as reasoning deltas. Forward
-            # them (same event type as DeepSeek) so a long-thinking round keeps
-            # the SSE inactivity watchdog fed and the Thinking box live instead
-            # of looking byte-dead for minutes. Content output is unchanged.
-            reasoning_delta = (
-                getattr(delta, "reasoning_content", None)
-                or getattr(delta, "reasoning", None)
-            )
-            if reasoning_delta:
-                reasoning_content += reasoning_delta
-                yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
-                # No continue: content/tool_calls co-riding the same chunk
-                # must still be processed below or they'd be silently lost.
-
-            # If we were streaming reasoning but it has now stopped, emit done event
-            if not reasoning_done_emitted:
-                if delta.content or delta.tool_calls:
-                    yield StreamEvent(type="response.reasoning_summary_text.done")
-                    reasoning_done_emitted = True
-
-            if delta.content:
-                output_text += delta.content
-                yield StreamEvent(type="response.output_text.delta", delta=delta.content)
-
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in function_calls:
-                        fc = FunctionCallItem(
-                            name=tc.function.name or "" if tc.function else "",
-                            call_id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
-                        )
-                        function_calls[idx] = fc
-                        yield StreamEvent(type="response.output_item.added", item=fc)
-
-                    fc = function_calls[idx]
-                    if tc.function and tc.function.name and not fc.name:
-                        fc.name = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        fc.arguments += tc.function.arguments
-                        yield StreamEvent(
-                            type="response.function_call_arguments.delta",
-                            delta=tc.function.arguments,
-                            item=fc,
-                        )
+        function_calls = st.function_calls
+        reasoning_done_emitted = st.reasoning_done_emitted
+        output_text = st.output_text
+        reasoning_content = st.reasoning_content
+        usage_obj = st.usage_obj
+        finish_reason = st.finish_reason
 
         if not reasoning_done_emitted:
             yield StreamEvent(type="response.reasoning_summary_text.done")
@@ -1566,7 +1830,7 @@ class ResponsesShim:
             yield StreamEvent(type="response.output_item.done", item=fc)
 
         completed_items = [fc for fc in function_calls.values()]
-        if finish_reason and finish_reason != "stop":
+        if finish_reason:
             print(
                 f"[PROVIDER] tacc stream finish_reason={finish_reason!r} "
                 f"output_chars={len(output_text)} reasoning_chars={len(reasoning_content)} "
@@ -1603,6 +1867,122 @@ class ResponsesShim:
             new_messages.append({"role": "assistant", "content": output_text})
         with self._history_lock:
             self._history_cache[resp_id] = new_messages
+
+    @staticmethod
+    def _new_tacc_stream_state():
+        """Mutable per-attempt accumulator for one TACC chat-completions stream."""
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            function_calls={},
+            reasoning_done_emitted=False,
+            channel_call_index={},  # id -> slot for index-less channel deltas
+            output_text="",
+            reasoning_content="",
+            usage_obj=None,
+            finish_reason=None,
+        )
+
+    def _iter_tacc_stream(self, stream, st):
+        """Translate one chat-completions chunk stream into Responses-style
+        events, accumulating into ``st`` so a caller can restart the attempt."""
+        for chunk in stream:
+            if hasattr(chunk, "usage") and chunk.usage:
+                st.usage_obj = LLMUsage(
+                    input_tokens=getattr(chunk.usage, "prompt_tokens", 0),
+                    output_tokens=getattr(chunk.usage, "completion_tokens", 0),
+                )
+
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+            if getattr(choice, "finish_reason", None):
+                st.finish_reason = choice.finish_reason
+
+            delta = choice.delta
+            function_calls = st.function_calls
+            channel_call_index = st.channel_call_index
+
+            # gpt-oss serves its chain of thought as reasoning deltas. Forward
+            # them (same event type as DeepSeek) so a long-thinking round keeps
+            # the SSE inactivity watchdog fed and the Thinking box live instead
+            # of looking byte-dead for minutes. Content output is unchanged.
+            reasoning_delta = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
+            if isinstance(reasoning_delta, dict):
+                reasoning_delta = reasoning_delta.get("content") or reasoning_delta.get("text")
+            if isinstance(reasoning_delta, str) and reasoning_delta:
+                st.reasoning_content += reasoning_delta
+                yield StreamEvent(type="response.reasoning_summary_text.delta", delta=reasoning_delta)
+                # No continue: content/tool_calls co-riding the same chunk
+                # must still be processed below or they'd be silently lost.
+
+            # Some proxies put structured calls under a channel object. Only
+            # consume explicit tool_calls fields; never interpret reasoning prose.
+            tool_deltas = getattr(delta, "tool_calls", None)
+            if not tool_deltas:
+                for channel in ("commentary", "reasoning", "reasoning_content"):
+                    payload = getattr(delta, channel, None)
+                    channel_calls = payload.get("tool_calls") if isinstance(payload, dict) else getattr(payload, "tool_calls", None)
+                    if channel_calls:
+                        tool_deltas = channel_calls
+                        break
+            if isinstance(tool_deltas, dict):
+                tool_deltas = [tool_deltas]
+
+            # If we were streaming reasoning but it has now stopped, emit done event
+            if not st.reasoning_done_emitted:
+                if delta.content or tool_deltas:
+                    yield StreamEvent(type="response.reasoning_summary_text.done")
+                    st.reasoning_done_emitted = True
+
+            if delta.content:
+                st.output_text += delta.content
+                yield StreamEvent(type="response.output_text.delta", delta=delta.content)
+
+            if tool_deltas:
+                for tc in tool_deltas:
+                    if isinstance(tc, dict):
+                        from types import SimpleNamespace
+                        function = tc.get("function") or {}
+                        call_id = tc.get("id")
+                        raw_index = tc.get("index")
+                        if raw_index is None:
+                            # No stream index: a known id continues its call, a new
+                            # id opens the next slot, an id-less delta continues the
+                            # most recent call (argument fragments).
+                            if call_id and call_id in channel_call_index:
+                                raw_index = channel_call_index[call_id]
+                            elif call_id:
+                                raw_index = max(function_calls.keys(), default=-1) + 1
+                                channel_call_index[call_id] = raw_index
+                            else:
+                                raw_index = max(function_calls.keys(), default=0)
+                        elif call_id:
+                            channel_call_index.setdefault(call_id, raw_index)
+                        tc = SimpleNamespace(index=raw_index, id=call_id,
+                                             function=SimpleNamespace(name=function.get("name"),
+                                                                      arguments=function.get("arguments")))
+                    idx = tc.index
+                    if idx not in function_calls:
+                        fc = FunctionCallItem(
+                            name=tc.function.name or "" if tc.function else "",
+                            call_id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
+                        )
+                        function_calls[idx] = fc
+                        yield StreamEvent(type="response.output_item.added", item=fc)
+
+                    fc = function_calls[idx]
+                    if tc.function and tc.function.name and not fc.name:
+                        fc.name = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        fc.arguments += tc.function.arguments
+                        yield StreamEvent(
+                            type="response.function_call_arguments.delta",
+                            delta=tc.function.arguments,
+                            item=fc,
+                        )
 
     def _chat_messages_for_input(self, prev_id, instructions: str, input_data, json_mode: bool = False) -> list:
         """Resolve the message list for a chat-completions round.
@@ -1664,6 +2044,8 @@ class ResponsesShim:
                         "tool_call_id": item.get("call_id", ""),
                         "content": item.get("output", ""),
                     })
+                elif isinstance(item, dict) and item.get("role") == "user":
+                    messages.append({"role": "user", "content": item.get("content", "")})
         else:
             messages.append({"role": "user", "content": str(input_data)})
 
@@ -1706,6 +2088,59 @@ class ResponsesShim:
             updated = f"{updated}\n\n{ResponsesShim._GPT_OSS_TOOL_JSON_RULE}"
         return updated
 
+    # tool_choice="required" pass-through for the TACC OpenAI-compatible server.
+    # Live-verified 2026-09-16: vLLM behind ai.tejas.tacc.utexas.edu honours
+    # "required" (200 + a tool call) even with 160 tool schemas. The earlier
+    # blanket downgrade to "auto" let gpt-oss end forced data-fetch rounds with
+    # reasoning and no call. A server that rejects "required" gets one 400,
+    # after which this process downgrades to "auto" (+nudge).
+    _tacc_required_supported = True
+    # A server-enforced call that died MID-STREAM (in-band error event on a
+    # 200 stream; live 2026-09-17, ~60% of enforced re-samples) puts "required"
+    # on a process-wide cooldown: until it expires, escalations use the
+    # emulated form. Distinct from the permanent 400 downgrade above — a
+    # mid-stream death is a serving-side fault that may clear.
+    _tacc_required_cooldown_until = 0.0
+
+    @staticmethod
+    def _tacc_required_cooldown_seconds() -> float:
+        try:
+            return max(0.0, float(os.getenv("TACC_REQUIRED_TOOL_CHOICE_COOLDOWN_SECONDS", "600")))
+        except ValueError:
+            return 600.0
+
+    def _tacc_tool_choice(self, tool_choice, strict_required=False):
+        """"required" is emulated (auto + nudge) on a first attempt — grammar-
+        constrained decoding degrades argument quality (live 2026-09-16: 3 of 5
+        first calls stuffed constraints into a free-text field) — and enforced
+        server-side only when the runner escalates after a reasoning-only stop,
+        the server has not rejected it, and no mid-stream death cooldown is active."""
+        if not isinstance(tool_choice, str):
+            return "auto"
+        if tool_choice == "required":
+            cls = type(self)
+            enforce = (
+                strict_required
+                and cls._tacc_required_supported
+                and time.monotonic() >= cls._tacc_required_cooldown_until
+            )
+            return "required" if enforce else "auto"
+        return tool_choice
+
+    def _tacc_create_with_tool_choice_fallback(self, completions_engine, call_kwargs):
+        try:
+            return completions_engine.create(**call_kwargs)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status is None:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+            if (call_kwargs.get("tool_choice") == "required" and status == 400
+                    and "tool_choice" in str(exc).lower()):
+                print("[PROVIDER] tacc rejected tool_choice=required; downgrading to auto (+nudge) for this process")
+                type(self)._tacc_required_supported = False
+                return completions_engine.create(**{**call_kwargs, "tool_choice": "auto"})
+            raise
+
     @staticmethod
     def _apply_required_tool_choice_nudge(messages: list) -> list:
         """Emulate tool_choice="required" for providers that only accept "auto".
@@ -1740,6 +2175,8 @@ class ResponsesShim:
                         "tool_call_id": item.get("call_id", ""),
                         "content": item.get("output", ""),
                     })
+                elif isinstance(item, dict) and item.get("role") == "user":
+                    messages.append({"role": "user", "content": item.get("content", "")})
         else:
             messages.append({"role": "user", "content": str(input_data)})
 

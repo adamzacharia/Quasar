@@ -79,7 +79,20 @@ BENCH_NAME = "DataLabBench"
 # (citation_metrics SSE event, R3) as informational per-question fields.
 # v1.1 and v1.2 total scores remain directly comparable; the axes are new
 # columns, not a rescoring.
-BENCH_VERSION = "1.2"
+#
+# v1.3 (2026-08-20, RE-B2/B3): scoring-affecting changes confined to TWO
+# checks. (a) DLB-05 C3's second trace_regex previously passed any 0.00[2-9]
+# literal ANYWHERE in the trace (so an unrelated step_deg=0.005 could earn the
+# spread_model-threshold credit); it now requires the 0.00x literal ADJACENT
+# to spread_model context (same SQL comparison or same JSON cut object, in
+# either order) — scores on that check can only stay equal or DROP.
+# (b) DLB-14 C3's first trace_regex additionally accepts the unified sentinel
+# guard `cmag < 50` that the structured lightcurve builder now emits in place
+# of the old `cmag < 99` (RE-B2 sentinel unification) — a widening that keeps
+# correct tool behavior from losing credit; reference-SQL scoring is
+# unchanged. Everything else — checkpoints, points, penalties, axes — is
+# byte-identical to v1.2.
+BENCH_VERSION = "1.3"
 
 # ---------------------------------------------------------------------------
 # v1.2 axis mapping (R6)
@@ -514,7 +527,17 @@ QUESTIONS = [
                 "desc": "Morphological star/galaxy split via spread_model (in the executed query/tool args)",
                 "checks": [
                     {"kind": "trace_regex", "pattern": r"spread_model"},
-                    {"kind": "trace_regex", "pattern": r"0\.00[2-9]"},
+                    # v1.3: the 0.00x threshold must sit ADJACENT to spread_model
+                    # context — an SQL comparison (spread_model_r > 0.003,
+                    # BETWEEN -0.003 AND 0.003) or the same JSON cut object
+                    # ("column": "spread_model_r", ... "value": 0.003 /
+                    # "split_threshold": 0.003 ... "split_col": "spread_model_r").
+                    # The digit-free gap ([^0-9]) stops credit from an unrelated
+                    # 0.00x literal elsewhere in the trace (e.g. step_deg=0.005).
+                    {"kind": "trace_regex", "pattern": (
+                        r"spread_model\w*[^0-9]{0,40}-?0\.00[2-9]"
+                        r"|(?:split_threshold|value|between)[\"']?\s*:\s*\[?\s*-?0\.00[2-9][^0-9]{0,40}spread_model"
+                    )},
                 ],
             },
             {
@@ -1270,9 +1293,12 @@ QUESTIONS = [
             },
             {
                 "id": "C3", "type": "auto", "points": 10,
-                "desc": "Valid-epoch filtering (cmag < 99) and a single band, in the executed query",
+                "desc": "Valid-epoch (sentinel) filtering and a single band, in the executed query",
                 "checks": [
-                    {"kind": "trace_regex", "pattern": r"cmag\s*(<|&lt;)\s*99"},
+                    # v1.3: the structured lightcurve builder now emits the unified
+                    # sentinel guard `cmag > -5 AND cmag < 50` instead of the old
+                    # `cmag < 99` (RE-B2); both spellings are valid-epoch filtering.
+                    {"kind": "trace_regex", "pattern": r"cmag\s*(<|&lt;)\s*(99|50)"},
                     {"kind": "trace_regex", "pattern": r"filter\s*=\s*'?g|\"filter\""},
                 ],
             },

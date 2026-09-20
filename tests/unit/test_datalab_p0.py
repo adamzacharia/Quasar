@@ -148,7 +148,10 @@ def test_policy_injects_limit_for_spatial_row_level_select():
     sql, meta = build_cone_select("gaia_dr3", "gaia_source", ra=10, dec=0, radius_deg=0.1, limit=50)
     sql_without_limit = sql.rsplit("\nLIMIT", 1)[0]
     validated = validate(sql_without_limit, source="builder", meta=meta)
-    assert validated.sql.endswith("LIMIT 500")
+    # RE-B1: the governor-injected cap is now SELF-DESCRIBING in the SQL and
+    # machine-readable in meta, so provenance can never read it as science.
+    assert validated.sql.endswith("LIMIT 500 /* platform row cap, not a science cut */")
+    assert validated.meta.get("platform_row_cap") == 500
     # The cap must be disclosed as governance, never presented as a science cut.
     assert any("Row cap LIMIT" in warning and "not a science cut" in warning for warning in validated.warnings)
 

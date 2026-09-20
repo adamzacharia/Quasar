@@ -28,15 +28,27 @@ from utils.archive_links import build_archive_link, infer_archive_kind
 from api.serializers.cadc import _fetch_cadc_preview_urls
 
 
-def _normalize_qa2_value(value: Any) -> str:
-    """Normalize archive-table QA2 values for the existing UI badge.
+# QA2 three-state (INT-4, skill guardrail 8). The ObsCore ``qa2_passed`` flag
+# is a boolean: 'T' means PASS *or* SEMIPASS, 'F' means SEMIPASS *or* FAIL — it
+# cannot reconstruct the three-state disposition. Only the QA2 report PDF can
+# (services/alma_qa2.py). The badge therefore renders the flag COARSELY
+# ("Pass" / "Not Pass") immediately, and the report-derived Pass/SemiPass/Fail
+# overlays it from the QA2 cache, which a background warm fills asynchronously
+# so card emission is never blocked on the ~10 s lookup.
+_QA2_FLAG_TRUE = "Pass"
+_QA2_FLAG_FALSE = "Not Pass"
 
-    ALMA's matrix exposes science QA2 as PASS or SEMIPASS. The ObsCore
-    qa2_passed boolean uses T/F, where F corresponds to SEMIPASS in that
-    matrix rather than a third visible "Fail" state.
+
+def _normalize_qa2_value(value: Any) -> str:
+    """Normalize a QA2 value for the UI badge.
+
+    Report vocabulary ('Pass', 'SemiPass', 'Fail') passes through; the
+    ObsCore flag maps to the coarse 'Pass' / 'Not Pass' labels. 'F' and
+    'False' are NEVER rendered as SemiPass (they may be FAIL), and 'Fail' is
+    never softened to SemiPass.
     """
     if isinstance(value, bool):
-        return "Pass" if value else "SemiPass"
+        return _QA2_FLAG_TRUE if value else _QA2_FLAG_FALSE
     if value is None:
         return "Unknown"
 
@@ -45,29 +57,66 @@ def _normalize_qa2_value(value: Any) -> str:
         return "Unknown"
 
     compact = re.sub(r"[\s_-]+", "", text).lower()
-    if compact in {"t", "true", "y", "yes", "1", "pass", "passed", "qa2pass", "qa2passed"}:
-        return "Pass"
-    if compact in {"f", "false", "n", "no", "0", "fail", "failed", "qa2fail", "qa2failed"}:
-        return "SemiPass"
-    if compact in {"semipass", "semipassed", "qa2semipass", "qa2semipassed"}:
-        return "SemiPass"
+    if compact in {"t", "true", "y", "yes", "1"}:
+        return _QA2_FLAG_TRUE
+    if compact in {"f", "false", "n", "no", "0"}:
+        return _QA2_FLAG_FALSE
+    if compact in {"notpass", "notpassed", "nopass"}:
+        return _QA2_FLAG_FALSE
     if "semipass" in compact:
         return "SemiPass"
     if "fail" in compact:
-        return "SemiPass"
+        return "Fail"
     if "pass" in compact:
         return "Pass"
     return text
 
 
 def _qa2_status_from_table(df: Any) -> Optional[Any]:
-    """Return QA2 status from table columns; do not derive it from report PDFs."""
+    """QA2 status per row: report-derived where known, flag-derived otherwise.
+
+    1. An explicit report-derived column (``qa2_status`` from triage) wins.
+    2. Otherwise the ObsCore flag gives the coarse label immediately.
+    3. Cached QA2-report statuses (services.alma_qa2) overlay the flag for
+       any MOUS already resolved — no network on this path — and a
+       background warm is kicked for the rest so the NEXT render (or
+       get_alma_qa2_status) has the three-state value.
+    """
+    if not hasattr(df, "columns"):
+        return None
+    statuses = None
+    source_column = None
     for column in ("qa2_status", "QA2", "qa2_passed", "qa2Passed", "qa2"):
-        if hasattr(df, "columns") and column in df.columns:
-            statuses = df[column].map(_normalize_qa2_value)
-            if statuses.astype(str).str.lower().ne("unknown").any():
-                return statuses
-    return None
+        if column in df.columns:
+            candidate = df[column].map(_normalize_qa2_value)
+            if candidate.astype(str).str.lower().ne("unknown").any():
+                statuses = candidate
+                source_column = column
+                break
+    if statuses is None:
+        return None
+    # Only a FLAG-derived column needs the report overlay; an explicit
+    # qa2_status / QA2 column already carries the three-state value.
+    if source_column in {"qa2_passed", "qa2Passed", "qa2"} and "member_ous_uid" in df.columns:
+        try:
+            from services import alma_qa2
+
+            uids = df["member_ous_uid"].tolist()
+            cached = alma_qa2.cached_statuses(uids)
+            if cached:
+                normalized = df["member_ous_uid"].map(alma_qa2.normalize_mous_uid)
+                overlay = normalized.map(lambda k: cached.get(k))
+                statuses = statuses.where(overlay.isna(), overlay)
+            pending = [
+                uid for uid, label in zip(uids, statuses.tolist())
+                if label in {_QA2_FLAG_TRUE, _QA2_FLAG_FALSE, "Unknown"}
+                and alma_qa2.normalize_mous_uid(uid) not in cached
+            ]
+            if pending:
+                alma_qa2.warm_qa2_cache_async(pending)
+        except Exception:  # noqa: BLE001 - enrichment must never break the card
+            pass
+    return statuses
 
 
 # Per-observation footprint overlays (STC-S s_region) for the sky map. A.footprintsFromSTCS
@@ -216,15 +265,11 @@ def _compute_demographics(df) -> tuple:
         except Exception:
             pass
 
-    # FITS file estimation
+    # FITS file estimation: only a real DataLink inventory (alma_products
+    # frames) can count FITS files. The former "MOUS x 5" / "rows x 3"
+    # guesses were fabricated metrics (A-102) and are gone; the MOUS count is
+    # reported as its own metric instead.
     fits_estimate = 0
-    if "member_ous_uid" in df.columns:
-        unique_mous = df["member_ous_uid"].dropna().nunique()
-        fits_estimate = unique_mous * 5  # ~5 FITS products per MOUS (conservative)
-    elif "obs_publisher_did" in df.columns:
-        fits_estimate = int(df["obs_publisher_did"].dropna().nunique())
-    elif len(df) > 0:
-        fits_estimate = len(df) * 3  # Generic estimate for non-ALMA archives
 
     return demographics, fits_estimate
 
@@ -355,6 +400,10 @@ def _build_data_card_event(
                 # Copy before adding UI-only normalization so we do not mutate agent-owned results.
                 df = df.copy()
                 df["qa2_status"] = qa2_status
+        if archive_kind == "alma" and table_kind == "" and "velocity_resolution" in df.columns:
+            # ObsCore velocity_resolution is m/s; the column header says km/s.
+            df = df.copy()
+            df["velocity_resolution"] = pd.to_numeric(df["velocity_resolution"], errors="coerce") / 1000.0
         product_display_cols = [
             ("filename", "File"),
             ("product_kind", "Product"),
@@ -363,18 +412,22 @@ def _build_data_card_event(
             ("target_name", "Target"),
             ("scan_intent", "Scan Intent"),
             ("member_ous_uid", "MOUS ID"),
+            ("role", "Role"),
+            ("intent", "Intent"),
             ("qa2_status", "QA2"),
             ("qa2_passed", "QA2"),
             ("triage_status", "Triage"),
-            ("readiness_score", "Readiness"),
+            ("readiness_score", "Header check"),
             ("warnings", "Warnings"),
         ]
         project_picker_cols = [
             ("proposal_id", "Proposal ID"),
             ("target_name", "Target"),
             ("band_list", "Band"),
-            ("observations", "Observations"),
+            ("rows", "Rows"),
             ("member_ous_count", "MOUS Count"),
+            ("eb_count", "EBs"),
+            ("data_rights", "Rights"),
             ("dataproduct_type", "Type"),
             ("pi_name", "PI"),
             ("obs_title", "Project Title"),
@@ -596,7 +649,22 @@ def _build_data_card_event(
             filter_label=_filter_label,
         )
 
-        metrics = [{"label": "Results", "value": len(df), "color": "blue"}]
+        _is_obscore_alma = archive_kind == "alma" and table_kind == ""
+        metrics = [{"label": "Rows" if _is_obscore_alma else "Results", "value": len(df), "color": "blue"}]
+        if _is_obscore_alma and "member_ous_uid" in df.columns:
+            # ObsCore rows repeat per EB/field/SPW — the dataset count is the
+            # number of distinct MOUSs (A-37).
+            metrics.append({
+                "label": "MOUS",
+                "value": int(df["member_ous_uid"].dropna().astype(str).nunique()),
+                "color": "emerald",
+            })
+            if "asdm_uid" in df.columns and df["asdm_uid"].notna().any():
+                metrics.append({
+                    "label": "EBs",
+                    "value": int(df["asdm_uid"].dropna().astype(str).nunique()),
+                    "color": "amber",
+                })
         if "band_list" in df.columns:
             metrics.append({
                 "label": "Bands",

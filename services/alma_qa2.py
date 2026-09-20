@@ -27,7 +27,16 @@ QA2_REPORT_BASE_URL = "https://almascience.nrao.edu/dataPortal"
 QA2_CACHEABLE_STATUSES = {"Pass", "SemiPass", "Fail"}
 QA2_CACHE_FILENAME = "alma_qa2_statuses.sqlite3"
 
+# Three-state QA2 vocabulary (skill guardrail 8): the ObsCore qa2_passed
+# flag is T/F and CANNOT reconstruct PASS / SEMIPASS / FAIL — only the QA2
+# report (this module) can. Flag-derived labels therefore stay coarse:
+QA2_FLAG_TRUE_LABEL = "Pass"                 # 'T': PASS or SEMIPASS (flag cannot tell)
+QA2_FLAG_FALSE_LABEL = "Not Pass"            # 'F': report required for SEMIPASS vs FAIL
+QA2_REPORT_LABELS = ("Pass", "SemiPass", "Fail")
+
 _CACHE_LOCK = threading.Lock()
+_WARM_LOCK = threading.Lock()
+_WARM_INFLIGHT: set = set()
 _SESSION_LOCK = threading.Lock()
 _SHARED_SESSION: Optional[requests.Session] = None
 _SHARED_SESSION_POOL_SIZE = 0
@@ -234,6 +243,90 @@ def _write_cached_statuses(
                 conn.commit()
     except sqlite3.Error:
         return
+
+
+def cached_statuses(
+    mous_uids: Iterable[object],
+    cache_ttl_days: Optional[float] = None,
+    cache_path: Optional[object] = None,
+) -> Dict[str, str]:
+    """Report-derived three-state QA2 for the given MOUS UIDs from the local
+    cache only — NO network, safe on the data-card path. Keys are the
+    normalized UID slugs (see :func:`normalize_mous_uid`)."""
+    if cache_path is None and os.getenv("PYTEST_CURRENT_TEST"):
+        # Tests must not read a developer's live cache through the default path.
+        return {}
+    if cache_ttl_days is None:
+        cache_ttl_days = _env_float("QUASAR_QA2_CACHE_TTL_DAYS", 30.0, min_value=0.0)
+    normalized = [normalize_mous_uid(uid) for uid in mous_uids]
+    normalized = [uid for uid in normalized if uid]
+    if not normalized:
+        return {}
+    return _read_cached_statuses(normalized, cache_ttl_days, cache_path=cache_path)
+
+
+def warm_qa2_cache_async(
+    mous_uids: Iterable[object],
+    max_lookup: Optional[int] = None,
+    cache_path: Optional[object] = None,
+) -> int:
+    """Resolve the three-state QA2 for these MOUSs in a background daemon
+    thread so the data card can render immediately from the flag and a later
+    render (or get_alma_qa2_status) reads the report-derived value from the
+    cache. Never blocks; returns the number of UIDs handed to the warmer.
+
+    Disabled with QUASAR_QA2_ASYNC_ENRICH=0 and under pytest (network)."""
+    flag = os.getenv("QUASAR_QA2_ASYNC_ENRICH", "1").strip().lower()
+    if flag in {"0", "false", "no", "off"} or os.getenv("PYTEST_CURRENT_TEST"):
+        return 0
+    if max_lookup is None:
+        max_lookup = _env_int("QUASAR_QA2_MAX_LOOKUP", 40, min_value=0)
+    unique: List[str] = []
+    seen = set()
+    for value in mous_uids:
+        normalized = normalize_mous_uid(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    if not unique or max_lookup <= 0:
+        return 0
+    already = cached_statuses(unique, cache_path=cache_path)
+    with _WARM_LOCK:
+        todo = [uid for uid in unique if uid not in already and uid not in _WARM_INFLIGHT][:max_lookup]
+        for uid in todo:
+            _WARM_INFLIGHT.add(uid)
+    if not todo:
+        return 0
+
+    def _run():
+        try:
+            fetch_qa2_statuses(todo, max_lookup=len(todo), cache_path=cache_path,
+                               overall_timeout_s=_env_float("QUASAR_QA2_ASYNC_TIMEOUT_S", 45.0, 1.0))
+        except Exception:
+            pass
+        finally:
+            with _WARM_LOCK:
+                for uid in todo:
+                    _WARM_INFLIGHT.discard(uid)
+
+    threading.Thread(target=_run, name="alma-qa2-warm", daemon=True).start()
+    return len(todo)
+
+
+def qa2_label_from_flag(flag: object) -> str:
+    """Coarse label for the ObsCore qa2_passed boolean.
+
+    'T' -> "Pass" (PASS or SEMIPASS: the flag cannot tell), 'F' -> "Not Pass"
+    (SEMIPASS or FAIL: read the QA2 report), anything else -> "Unknown".
+    Never returns SemiPass or Fail — those come only from the report."""
+    if isinstance(flag, bool):
+        return QA2_FLAG_TRUE_LABEL if flag else QA2_FLAG_FALSE_LABEL
+    text = str(flag if flag is not None else "").strip().lower()
+    if text in {"t", "true", "y", "yes", "1"}:
+        return QA2_FLAG_TRUE_LABEL
+    if text in {"f", "false", "n", "no", "0"}:
+        return QA2_FLAG_FALSE_LABEL
+    return QA2_UNKNOWN
 
 
 def parse_qa2_status(text: str) -> str:

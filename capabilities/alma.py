@@ -62,24 +62,41 @@ from pydantic import BaseModel, ConfigDict
 
 from capabilities.base import BaseCapability, CallContext, ToolResult
 from services.alma_science_queries import (
+    CO_LADDER_LINES,
     LINE_REST_FREQ_GHZ,
+    aggregate_counts,
+    alma_cone_adql,
+    band_token_where,
     bandwidth_switching_candidates,
     collect_publications,
+    counts_note,
+    cycle_periods_disclosure,
+    exclude_sunyaev,
     filter_band as science_filter_band,
     filter_resolution as science_filter_resolution,
+    is_multi_band,
     line_names_for_species,
     normalize_target_alias,
+    observation_windows_ghz,
+    parse_frequency_support_windows,
     projects_covering_all_lines,
     projects_with_array_combo,
     project_prefix_where,
     publication_join_where,
     redshifted_line_projects,
+    requested_bands,
+    row_matches_band,
     select_obscore_query,
     select_obscore_query_extended,
     sensitivity_where,
+    science_cone_query,
+    summarize_mous,
+    solar_where,
     summarize_projects,
     summarize_publication_links,
     summarize_sensitivity,
+    truncation_info,
+    wavelength_overlap_where,
 )
 from services.cross_archive_matcher import (
     alma_bulk_cone_adql,
@@ -115,19 +132,43 @@ def filter_by_scan_intent(results: pd.DataFrame, scan_intent: Optional[Any]) -> 
     if not intent_col:
         return results, ""
 
+    upper = raw.upper()
     known_intents = re.findall(
-        r"\b(TARGET|BANDPASS|PHASE|FLUX|WVR|CHECK|POINTING|FOCUS|AMPLITUDE|ATMOSPHERE)\b",
-        raw.upper(),
+        r"\b(TARGET|BANDPASS|PHASE|FLUX|WVR|CHECK|POINTING|FOCUS|AMPLITUDE|ATMOSPHERE|CALIBRATE_[A-Z_]+)\b",
+        upper,
     )
-    requested = known_intents or [part.strip().upper() for part in re.split(r"[,;/]+|\s+and\s+", raw) if part.strip()]
-    requested = [part for part in requested if part and part not in {"ONLY", "EXCLUDE", "EXCLUDING", "CALIBRATORS"}]
-    if not requested:
-        return results, ""
+    exclude_mode = bool(re.search(r"\b(EXCLUDE|EXCLUDING|WITHOUT|NOT|NO|NON)\b", upper))
+    calibrators_word = bool(re.search(r"\bCALIBRATORS?\b", upper))
+    # Only the archive's intent vocabulary counts as a filter; free words are
+    # reported as "not understood" instead of silently matching nothing.
+    requested = list(dict.fromkeys(known_intents))
 
-    mask = results[intent_col].astype(str).str.upper().apply(
-        lambda value: any(intent in value for intent in requested)
-    )
-    label = "Scan Intent " + ",".join(requested)
+    def _tokens(value: Any) -> set:
+        return {t for t in re.split(r"[\s,;/]+", str(value or "").upper()) if t}
+
+    if exclude_mode and calibrators_word and not requested:
+        # "exclude calibrators" / "non-calibrator scans": keep rows whose intent
+        # tokens are exclusively TARGET (multi-valued scan_intent is tokenised).
+        mask = results[intent_col].apply(lambda v: _tokens(v) <= {"TARGET"} and bool(_tokens(v)))
+        out = results[mask].copy()
+        out.attrs["scan_intent_mode"] = "exclude_calibrators"
+        return out, "Scan Intent TARGET only (calibrator intents excluded)"
+    if not requested:
+        out = results.copy()
+        # Nothing interpretable: say so instead of silently not filtering.
+        out.attrs["scan_intent_warning"] = (
+            f"scan_intent={raw!r} was not understood (expected TARGET, BANDPASS, PHASE, FLUX, WVR, "
+            "CHECK, POINTING, ...); no scan-intent filter applied."
+        )
+        return out, ""
+
+    wanted = set(requested)
+    if exclude_mode:
+        mask = results[intent_col].apply(lambda v: not (_tokens(v) & wanted))
+        label = "Scan Intent excluding " + ",".join(requested)
+    else:
+        mask = results[intent_col].apply(lambda v: bool(_tokens(v) & wanted))
+        label = "Scan Intent " + ",".join(requested)
     return results[mask].copy(), label
 
 
@@ -151,6 +192,7 @@ def _tap_obscore_dataframe(
     search_service = ctx.service("search_service")
     service = search_service.alminer_client._get_tap_service()
     result = service.search(query)
+    prov["url"] = getattr(result, "quasar_tap_url", prov["url"])
     df = result.to_table().to_pandas()
     if hasattr(search_service.alminer_client, "_standardize_columns"):
         return search_service.alminer_client._standardize_columns(df)
@@ -160,48 +202,82 @@ def _tap_obscore_dataframe(
 _ALMA_TAP_URL = "https://almascience.nrao.edu/tap"
 
 
-def _obscore_cone_adql(ra: float, dec: float, radius_deg: float, public: bool = True) -> str:
-    """The obscore cone equivalent to what the ALMA client executes for a
-    positional/target search (integrations/alminer_client.py).
-
-    The executed path is `alminer.conesearch(..., public=public)` (public
-    defaults True end-to-end, services/search.py). alminer's internal ADQL is
-    opaque third-party code, so this is the reproducible EQUIVALENT request,
-    including the public-data constraint the real call applies (CX-38) — a user
-    replaying it gets the same population, not proprietary rows the executed
-    call excluded.
+def _obscore_cone_adql(ra: float, dec: float, radius_deg: float, public: bool = True,
+                       footprint: bool = True) -> str:
+    """The obscore cone the ALMA client executes for a positional/target search
+    (integrations/alminer_client.py): INTERSECTS over the s_region footprint
+    unioned with the representative-point test, plus data_rights when public.
     """
-    adql = (
-        "SELECT * FROM ivoa.obscore "
-        f"WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
-        f"CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1"
-    )
-    if public:
-        adql += " AND data_rights = 'Public'"
-    return adql
+    return alma_cone_adql(float(ra), float(dec), float(radius_deg), public=public, footprint=footprint)
 
 
-def _set_alma_cone_provenance(ctx: CallContext, ra, dec, radius_deg, public: bool = True) -> None:
+def _set_alma_cone_provenance(ctx: CallContext, ra, dec, radius_deg, public: bool = False,
+                              note: Optional[str] = None, footprint: bool = True,
+                              adql: Optional[str] = None) -> None:
     """Write the executed obscore cone ADQL into the REQUEST-SCOPED provenance
-    state (Feature 1). Built here from this request's own coordinates — no shared
-    client state, so concurrent ALMA requests never cross-attribute. Never raises.
+    state (Feature 1). Built from this request's own coordinates (or the exact
+    ADQL the client recorded in ``df.attrs['quasar_cone']``) — no shared client
+    state, so concurrent ALMA requests never cross-attribute. Never raises.
     """
     try:
-        if ra is None or dec is None or radius_deg is None:
+        if adql is None and (ra is None or dec is None or radius_deg is None):
             return
         prov = ctx.service("alma_tap_provenance")
-        prov["query"] = _obscore_cone_adql(float(ra), float(dec), float(radius_deg), public=public)
+        prov["query"] = adql or _obscore_cone_adql(float(ra), float(dec), float(radius_deg),
+                                                   public=public, footprint=footprint)
         prov["url"] = _ALMA_TAP_URL
-        # Surfaced WITH the query (CX-38): the executed call is
-        # alminer.conesearch, whose internal ADQL is opaque third-party code —
-        # the user must see that this is the reproducible equivalent, not a
-        # byte capture. Rides request.snippet via the provenance sidecar.
-        prov["note"] = (
-            "-- Reproducible equivalent of the executed alminer.conesearch"
-            f"(public={public}) call; alminer's internal ADQL is not captured byte-exactly."
-        )
+        if note:
+            prov["note"] = note
     except Exception:  # noqa: BLE001 - provenance never breaks a search
         pass
+
+
+def _provenance_from_frame(ctx: CallContext, df: Any) -> bool:
+    """Stamp provenance from the cone the client actually executed (recorded in
+    ``df.attrs['quasar_cone']`` by ALminerClient._parallel_search). Returns True
+    when a cone was found."""
+    try:
+        cone = df.attrs.get("quasar_cone") if hasattr(df, "attrs") else None
+    except Exception:
+        cone = None
+    if not isinstance(cone, dict):
+        return False
+    _set_alma_cone_provenance(
+        ctx, cone.get("ra"), cone.get("dec"), cone.get("radius_deg"),
+        public=bool(cone.get("public", False)),
+        note=cone.get("note"),
+        footprint=(cone.get("footprint_mode") != "point_only"),
+        adql=cone.get("adql"),
+    )
+    return True
+
+
+def _frame_attr(df: Any, key: str, default=None):
+    try:
+        return df.attrs.get(key, default)
+    except Exception:
+        return default
+
+
+def _result_summary(df: Any) -> Dict[str, Any]:
+    """rows / MOUS / EB / project counts plus the honest note (guardrail 1)."""
+    counts = aggregate_counts(df)
+    return {"counts": counts, "count_summary": counts_note(counts)}
+
+
+def _band_filter_note(df: Any, bands: List[str]) -> Optional[str]:
+    if df is None or not hasattr(df, "columns") or not bands:
+        return None
+    band_col = next((c for c in ["band_list", "Band", "band"] if c in df.columns), None)
+    if not band_col:
+        return None
+    n_multi = int(df[band_col].apply(is_multi_band).sum())
+    if n_multi:
+        return (
+            f"{n_multi} matched row(s) list more than one band (band-to-band / multi-band); "
+            "confirm the science band from frequency_support."
+        )
+    return None
 
 
 def _redshifted_line_where(
@@ -218,10 +294,11 @@ def _redshifted_line_where(
         rest_freq = LINE_REST_FREQ_GHZ[line_name]
         nu_low = rest_freq / (1.0 + max(z_min, z_max))
         nu_high = rest_freq / (1.0 + min(z_min, z_max))
-        conditions.append(
-            f"((frequency - 0.5*bandwidth/1e9) < {nu_high:.6f} "
-            f"AND (frequency + 0.5*bandwidth/1e9) > {nu_low:.6f})"
-        )
+        # Coarse prefilter on the em_min/em_max wavelength span (skill ADQL
+        # pattern); exact coverage is decided per row from frequency_support in
+        # redshifted_line_projects. frequency +/- bandwidth/2 spanned the
+        # inter-sideband gap (A-16/A-46).
+        conditions.append(wavelength_overlap_where(nu_low, nu_high))
     where = "(" + " OR ".join(conditions) + ")"
     if science_category:
         safe_category = str(science_category).replace("'", "''")
@@ -257,6 +334,7 @@ class SearchByPositionInput(_In):
     band: Any = None
     scan_intent: Any = None
     max_results: Optional[int] = 100
+    public_only: Any = False
 
 
 class SearchByPosition(BaseCapability):
@@ -279,14 +357,21 @@ class SearchByPosition(BaseCapability):
             facility_label = "ALMA"
 
         try:
-            results = search_service.cone_search(
-                ra, dec, radius, facility, max_results
-            )
+            public_only = bool(inp.public_only) and str(inp.public_only).lower() not in {"false", "0", "no"}
+            if facility_label == "ALMA" and public_only:
+                results = search_service.cone_search(
+                    ra, dec, radius, facility, max_results, public=True
+                )
+            else:
+                results = search_service.cone_search(
+                    ra, dec, radius, facility, max_results
+                )
             # Request-local: this capability owns ra/dec/radius, so the exact
             # obscore cone is reconstructable without touching shared client
-            # state (avoids the singleton cross-request race, CX-36).
-            if facility_label == "ALMA":
-                _set_alma_cone_provenance(ctx, ra, dec, radius)
+            # state (avoids the singleton cross-request race, CX-36). Prefer
+            # the cone the client actually executed (footprint mode, TOP).
+            if facility_label == "ALMA" and not _provenance_from_frame(ctx, results):
+                _set_alma_cone_provenance(ctx, ra, dec, radius, public=public_only)
 
             # If the archive query failed, surface a typed error rather than
             # masking the outage as a confirmed empty result. (C3)
@@ -303,23 +388,18 @@ class SearchByPosition(BaseCapability):
                     ),
                 })
 
-            # Post-filter by band if specified
+            # Post-filter by band if specified (token match: band_list is space
+            # delimited, '5 10' band-to-band rows must survive; A-08/A-47)
+            band_note = None
             if band is not None and not results.empty:
-                import re as _re_band
-                band_vals = []
-                if isinstance(band, str):
-                    parts = _re_band.split(r'[,\s]+and[\s]+|[,\s]+', band.strip())
-                    band_vals = [int(p) for p in parts if p.strip().isdigit()]
-                elif isinstance(band, (int, float)):
-                    band_vals = [int(band)]
+                band_vals = requested_bands(band)
                 if band_vals:
                     b_col = next((c for c in ['band_list', 'Band', 'band'] if c in results.columns), None)
                     if b_col:
                         before = len(results)
-                        results = results[results[b_col].astype(str).apply(
-                            lambda x: any(str(b) in [v.strip() for v in x.split(',')] for b in band_vals)
-                        )]
+                        results = results[results[b_col].apply(lambda x: row_matches_band(x, band_vals))]
                         _log(f"[FILTER] Band {band}: {before} → {len(results)} rows")
+                        band_note = _band_filter_note(results, band_vals)
 
             scan_filter_label = ""
             if facility_label == "ALMA" and scan_intent:
@@ -366,15 +446,32 @@ class SearchByPosition(BaseCapability):
                                 top_projects.append(p_upper)
                     top_projects = top_projects[:3]
 
+            summary = _result_summary(results)
+            warnings_out: List[str] = []
+            if band_note:
+                warnings_out.append(band_note)
+            for w in (_frame_attr(results, "source_warnings") or []):
+                warnings_out.append(f"archive source degraded: {w}")
+            if _frame_attr(results, "scan_intent_warning"):
+                warnings_out.append(str(_frame_attr(results, "scan_intent_warning")))
+            truncated = bool(_frame_attr(results, "truncated", False))
+            if truncated:
+                warnings_out.append(f"Row cap reached ({max_results}); the cone holds more rows than shown.")
             return _native({
                 "success": True,
                 "total_results": len(results),
+                **summary,
+                "truncated": truncated,
+                "public_only": public_only,
+                "footprint_mode": (_frame_attr(results, "quasar_cone") or {}).get("footprint_mode"),
                 "ra": ra, "dec": dec, "radius_deg": radius,
                 "top_mous_uids": top_mous,
                 "top_access_urls": top_urls,
+                "access_url_note": "access_url values are MOUS DataLink URLs (list_alma_files), not file downloads.",
                 "top_project_codes": top_projects,
                 "filters_applied": [scan_filter_label] if scan_filter_label else [],
-                "note": f"Found {len(results)} observations. Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+                "warnings": warnings_out,
+                "note": f"{summary['count_summary']} Full dataset with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             })
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -394,14 +491,14 @@ class SearchByTargetInput(_In):
     max_freq_ghz: Optional[float] = None
     min_exp_s: Optional[float] = None
     scan_intent: Any = None
-    public_only: Any = False  # accepted-and-unused, verbatim with the legacy signature
+    public_only: Any = False  # honoured: adds data_rights = 'Public' to the TAP cone (A-06)
 
 
 class SearchByTarget(BaseCapability):
     name = "search_by_target"
     description = (
         "Search the ALMA archive (default) by target name. Supports multiple targets "
-        "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
+        "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, IC 342').\n"
         "Pass facility='VLA', 'VLBA', or 'GBT' to search the NRAO archive instead — "
         "ONLY when the user explicitly asks for those telescopes.\n"
         "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency, scan_intent) "
@@ -424,6 +521,8 @@ class SearchByTarget(BaseCapability):
         max_resolution, min_resolution = inp.max_resolution, inp.min_resolution
         min_freq_ghz, max_freq_ghz, min_exp_s = inp.min_freq_ghz, inp.max_freq_ghz, inp.min_exp_s
         scan_intent = inp.scan_intent
+        public_only = bool(inp.public_only) and str(inp.public_only).lower() not in {"false", "0", "no"}
+        _svc_kw = {"public_only": public_only} if public_only else {}
 
         # ── Normalize facility for routing + result labeling ──
         facility_label = (facility or "ALMA").strip().upper()
@@ -479,7 +578,7 @@ class SearchByTarget(BaseCapability):
 
         try:
             # ── Multi-target support ──────────────────────────────────
-            # Detect "M87 and Sz65" or "M87, NGC 1068" patterns
+            # Detect "M87 and Sz65" or "M87, IC 342" patterns
             # Also handles per-target band specs like:
             #   "M87 in band 6, Sz65 in band 7"  →  per-target bands
             #   "M87, Sz65, NGC23"               →  shared bands (from band= param)
@@ -518,18 +617,16 @@ class SearchByTarget(BaseCapability):
                         continue
                     try:
                         df = search_service.search_by_target(
-                            _tgt, facility, date_range, max_results
+                            _tgt, facility, date_range, max_results, **_svc_kw
                         )
                         _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
                         if _e:
                             _sub_errs.append(f"{_tgt}: {_e}")
                         if not df.empty and _tgt_bands:
-                            # Apply per-target band filter
+                            # Apply per-target band filter (token match)
                             b_col = next((c for c in ["band_list", "Band", "band"] if c in df.columns), None)
                             if b_col:
-                                df = df[df[b_col].astype(str).str.split(",").apply(
-                                    lambda bands: any(str(b).strip() == x.strip() for x in bands for b in _tgt_bands)
-                                )]
+                                df = df[df[b_col].apply(lambda x: row_matches_band(x, _tgt_bands))]
                         if not df.empty:
                             all_frames.append(df)
                             band_label = ",".join(str(b) for b in _tgt_bands) if _tgt_bands else "all"
@@ -559,7 +656,7 @@ class SearchByTarget(BaseCapability):
                 for name in raw_names[:10]:  # Cap at 10 targets
                     try:
                         df = search_service.search_by_target(
-                            name, facility, date_range, max_results
+                            name, facility, date_range, max_results, **_svc_kw
                         )
                         _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
                         if _e:
@@ -583,13 +680,14 @@ class SearchByTarget(BaseCapability):
                         results.attrs["quasar_error"] = "; ".join(_sub_errs)
             else:
                 results = search_service.search_by_target(
-                    target_name, facility, date_range, max_results
+                    target_name, facility, date_range, max_results, **_svc_kw
                 )
-            # NB: target-NAME search resolves coordinates to a cone INSIDE the
-            # client (radius 0.05°); those coords are not exposed race-free, and
-            # re-resolving here would add a SIMBAD call per search. So name-search
-            # provenance is DEFERRED (falls back to kind:"args"); position/cone
-            # search below gets exact request-local ADQL. See reconciliation CX-07.
+            # Target-NAME search resolves coordinates INSIDE the client, which
+            # records the executed cone (ra/dec/radius/footprint mode/ADQL) in
+            # df.attrs['quasar_cone'] — race-free, request-local — so name-search
+            # provenance is the exact executed ADQL (G-18), not kind:"args".
+            if facility_label == "ALMA":
+                _provenance_from_frame(ctx, results)
 
             if results.empty:
                 # ── Automatic positional fallback ─────────────────────
@@ -655,7 +753,20 @@ class SearchByTarget(BaseCapability):
                             "not a confirmed 'no data' result."
                         ),
                     })
-                return _native({"success": True, "total_results": 0, "target": target_name, "note": "No results found."})
+                empty_out: Dict[str, Any] = {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
+                unresolved = _frame_attr(results, "resolver_unresolved")
+                if unresolved:
+                    empty_out["note"] = (
+                        f"The name resolver (SIMBAD) could not resolve '{unresolved}', so no cone search ran. "
+                        "For planets, comets, the Sun or other moving/solar targets the resolver cannot handle, "
+                        "search by PI-entered target_name (advanced_search on target_name with a t_min/t_max "
+                        "window) and state that the selection is a PI-name string match."
+                    )
+                    empty_out["resolver_unresolved"] = unresolved
+                _dr = _frame_attr(results, "date_range")
+                if isinstance(_dr, dict):
+                    empty_out["date_range"] = _dr
+                return _native(empty_out)
 
             # ── Tier 2: Pandas post-filters (non-band) ─────────────────
             filter_parts = []
@@ -700,18 +811,17 @@ class SearchByTarget(BaseCapability):
                     _log(f"[FILTER] {scan_filter_label}: {before} → {len(results)} rows")
 
             band_col = next((c for c in ["band_list", "Band", "band"] if c in results.columns), None)
+            band_note = None
 
             if len(band_list_input) > 1 and band_col:
                 # Multi-band: combine into a single result with all matching bands
+                # (token match on the space-delimited band_list; A-08)
                 band_str_list = [str(b) for b in band_list_input]
-                combined = results[results[band_col].astype(str).str.split(",").apply(
-                    lambda bands: any(x.strip() in band_str_list for x in bands)
-                )]
+                combined = results[results[band_col].apply(lambda x: row_matches_band(x, band_str_list))]
                 for b in band_list_input:
-                    ct = len(results[results[band_col].astype(str).str.split(",").apply(
-                        lambda bands, _b=b: any(str(_b).strip() == x.strip() for x in bands)
-                    )])
+                    ct = int(results[band_col].apply(lambda x, _b=b: row_matches_band(x, [_b])).sum())
                     _log(f"[MULTI-BAND] Band {b}: {ct} rows")
+                band_note = _band_filter_note(combined, band_str_list)
 
                 if not combined.empty:
                     results = combined
@@ -733,11 +843,10 @@ class SearchByTarget(BaseCapability):
                 # Single band filter
                 b = band_list_input[0]
                 before = len(results)
-                results = results[results[band_col].astype(str).str.split(",").apply(
-                    lambda bands, _b=b: any(str(_b).strip() == x.strip() for x in bands)
-                )]
+                results = results[results[band_col].apply(lambda x, _b=b: row_matches_band(x, [_b]))]
                 filter_parts.append(f"Band {b}")
                 _log(f"[FILTER] Band {b}: {before} → {len(results)} rows")
+                band_note = _band_filter_note(results, [str(b)])
 
                 filter_label = f"{facility_label} › {target_name}"
                 if filter_parts:
@@ -788,16 +897,39 @@ class SearchByTarget(BaseCapability):
                                 top_projects.append(p_upper)
                     top_projects = top_projects[:3]
 
-            return _native({
+            summary = _result_summary(results)
+            warnings_out: List[str] = []
+            if band_note:
+                warnings_out.append(band_note)
+            for w in (_frame_attr(results, "source_warnings") or []):
+                warnings_out.append(f"archive source degraded: {w}")
+            if _frame_attr(results, "scan_intent_warning"):
+                warnings_out.append(str(_frame_attr(results, "scan_intent_warning")))
+            _dr = _frame_attr(results, "date_range")
+            if isinstance(_dr, dict) and not _dr.get("applied", True):
+                warnings_out.append(f"date_range {_dr.get('requested')!r} NOT applied: {_dr.get('reason')}")
+            truncated = bool(_frame_attr(results, "truncated", False))
+            if truncated:
+                warnings_out.append(f"Row cap reached ({max_results}); more rows exist for this target.")
+            out = {
                 "success": True,
                 "total_results": len(results),
+                **summary,
+                "truncated": truncated,
+                "public_only": public_only,
+                "footprint_mode": (_frame_attr(results, "quasar_cone") or {}).get("footprint_mode"),
                 "filters_applied": filter_parts,
                 "target": target_name,
                 "top_mous_uids": top_mous,
                 "top_access_urls": top_urls,
+                "access_url_note": "access_url values are MOUS DataLink URLs (list_alma_files), not file downloads.",
                 "top_project_codes": top_projects,
-                "note": f"Found {len(results)} observations matching your constraints. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
-            })
+                "warnings": warnings_out,
+                "note": f"{summary['count_summary']} Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+            }
+            if isinstance(_dr, dict):
+                out["date_range"] = _dr
+            return _native(out)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 
@@ -807,12 +939,17 @@ class SearchByFrequencyInput(_In):
     min_freq_ghz: Optional[float]
     max_freq_ghz: Optional[float]
     facility: Optional[str] = None
-    max_results: Optional[int] = 100
+    max_results: Optional[int] = 5000
+    public_only: Any = False
 
 
 class SearchByFrequency(BaseCapability):
     name = "search_by_frequency"
-    description = "Search archives by frequency range. Defaults to ALMA; pass facility='VLA'/'VLBA'/'GBT' for the NRAO archive."
+    description = (
+        "Search archives by frequency range. Defaults to ALMA (em_min/em_max wavelength overlap over "
+        "ivoa.obscore, TOP max_results rows, truncation disclosed); pass facility='VLA'/'VLBA'/'GBT' "
+        "for the NRAO archive."
+    )
     category = "general"
     InputModel = SearchByFrequencyInput
     annotations = {"read_only": True, "cost": "network"}
@@ -829,9 +966,27 @@ class SearchByFrequency(BaseCapability):
             facility_label = "ALMA"
 
         try:
-            results = search_service.search_by_frequency(
-                min_freq_ghz, max_freq_ghz, facility, max_results
-            )
+            public_only = bool(inp.public_only) and str(inp.public_only).lower() not in {"false", "0", "no"}
+            if facility_label == "ALMA":
+                if public_only:
+                    results = search_service.search_by_frequency(
+                        min_freq_ghz, max_freq_ghz, facility, max_results, public=True
+                    )
+                else:
+                    results = search_service.search_by_frequency(
+                        min_freq_ghz, max_freq_ghz, facility, max_results
+                    )
+                try:
+                    prov = ctx.service("alma_tap_provenance")
+                    if _frame_attr(results, "quasar_adql"):
+                        prov["query"] = _frame_attr(results, "quasar_adql")
+                        prov["url"] = _frame_attr(results, "quasar_tap_url") or _ALMA_TAP_URL
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                results = search_service.search_by_frequency(
+                    min_freq_ghz, max_freq_ghz, facility, max_results
+                )
             # Outage vs. genuinely-empty (C3 / scan CAP-03): search.py tags a
             # failed archive query via df.attrs — never report "0 results"
             # when the archive was simply unavailable.
@@ -852,10 +1007,23 @@ class SearchByFrequency(BaseCapability):
                                                 "source": facility_label,
                                                 "filter_label": f"{facility_label} › {min_freq_ghz}–{max_freq_ghz} GHz",
                                                 "tool_name": "search_by_frequency"})
+            summary = _result_summary(results)
+            truncated = bool(_frame_attr(results, "truncated", False))
+            warnings_out: List[str] = []
+            if truncated:
+                warnings_out.append(
+                    f"Row cap reached (TOP {_frame_attr(results, 'row_cap', max_results)}); more rows overlap "
+                    f"{min_freq_ghz}–{max_freq_ghz} GHz than returned."
+                )
             return _native({
                 "success": True,
                 "total_results": len(results),
-                "note": f"Found {len(results)} observations at {min_freq_ghz}–{max_freq_ghz} GHz. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
+                **summary,
+                "truncated": truncated,
+                "public_only": public_only,
+                "method": "em_min/em_max wavelength overlap (coarse); exact SPW coverage needs frequency_support",
+                "warnings": warnings_out,
+                "note": f"{summary['count_summary']} Rows whose spectral span overlaps {min_freq_ghz}–{max_freq_ghz} GHz. Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
             })
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -1014,7 +1182,11 @@ class GetObservationDetailsInput(_In):
 
 class GetObservationDetails(BaseCapability):
     name = "get_observation_details"
-    description = "Get detailed information about a specific observation"
+    description = (
+        "Look one ALMA identifier up in ivoa.obscore — a MOUS UID (uid://A001/...), an execution-block/"
+        "ASDM UID (uid://A002/...), an obs_publisher_did or a project code — and return the matching rows "
+        "aggregated to rows / MOUS / EBs with bands, targets, data_rights, release dates and QA2 flags."
+    )
     category = "general"
     InputModel = GetObservationDetailsInput
     annotations = {"read_only": True, "cost": "network"}
@@ -1022,6 +1194,8 @@ class GetObservationDetails(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         try:
             details = ctx.service("search_service").get_observation_details(inp.obs_id)
+            if isinstance(details, dict) and details.get("success") is False:
+                return _native({"success": False, "error": details.get("error", "lookup failed"), "details": details})
             return _native({"success": True, "details": details})
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -1146,12 +1320,18 @@ class AdvancedSearch(BaseCapability):
         "Execute a custom ADQL/TAP query directly on the ALMA Science Archive (ivoa.obscore table).\n"
         "ALMA ONLY — NOT for NOIRLab Data Lab catalogs (gaia_dr3/des_dr1/desi_dr1/nsc_dr2/smash/...): "
         "use datalab_sql_query for those.\n"
-        "IMPORTANT: The obscore table has NO 'redshift' column. Use frequency/bandwidth containment instead.\n"
-        "To find observations covering a specific frequency nu_ghz:\n"
-        "  WHERE (frequency - 0.5*bandwidth/1e9) < {nu_ghz} AND (frequency + 0.5*bandwidth/1e9) > {nu_ghz}\n"
-        "Key columns: target_name, s_ra, s_dec, frequency (GHz), bandwidth (Hz), scientific_category,\n"
-        "  science_keyword, proposal_id, member_ous_uid, t_exptime, s_resolution, band_list.\n"
-        "Add OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY to limit results."
+        "IMPORTANT: obscore has NO 'redshift' column. Frequency coverage of nu_ghz: prefilter on the "
+        "wavelength columns (METERS) — WHERE em_min <= 0.299792458/{nu_hi} AND em_max >= 0.299792458/{nu_lo} — "
+        "then confirm exact SPW coverage from frequency_support; frequency +/- bandwidth/2 is WRONG "
+        "(bandwidth is aggregate Hz over non-contiguous SPWs).\n"
+        "Rows repeat per EB/field/SPW: use COUNT(DISTINCT member_ous_uid) for datasets and "
+        "COUNT(DISTINCT asdm_uid) for executions. Cone: INTERSECTS(CIRCLE('ICRS',ra,dec,r), s_region) = 1 "
+            "OR CONTAINS(POINT('ICRS',s_ra,s_dec), CIRCLE('ICRS',ra,dec,r)) = 1 (keeps NULL/TP footprints). "
+        "band_list is space-delimited ('5 10'): match tokens. Public: data_rights = 'Public'.\n"
+        "Key columns: target_name, s_ra, s_dec, s_region, frequency (GHz), bandwidth (Hz), frequency_support, "
+        "em_min/em_max (m), proposal_id, member_ous_uid, asdm_uid, t_exptime, s_resolution, band_list, "
+        "data_rights, obs_release_date, qa2_passed (T/F only), access_url (DataLink URL).\n"
+        "Limit rows with SELECT TOP 500 (ADQL 2.0; OFFSET/FETCH is not supported)."
     )
     category = "general"
     InputModel = AdvancedSearchInput
@@ -1204,10 +1384,17 @@ class AdvancedSearch(BaseCapability):
                 })
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({"type": "data", "data": results, "source": f"SQL: {query}"})
+            try:
+                prov = ctx.service("alma_tap_provenance")
+                prov["query"] = str(query)
+                prov["url"] = _ALMA_TAP_URL
+            except Exception:  # noqa: BLE001
+                pass
 
             return _native({
                 "success": True,
                 "count": len(results),
+                **_result_summary(results),
                 "results": results.to_dict("records") if not results.empty else []
             })
         except Exception as e:
@@ -1227,14 +1414,15 @@ class SearchAlmaCoInRedshiftRangeInput(_In):
 class SearchAlmaCoInRedshiftRange(BaseCapability):
     name = "search_alma_co_in_redshift_range"
     description = (
-        "Search the ALMA archive for observations that cover CO emission lines "
-        "for galaxies at a given redshift range. Handles the CO rest-frequency → "
-        "observed-frequency conversion and TAP frequency-containment query automatically. "
+        "Search the ALMA archive for observations whose spectral windows cover CO emission lines "
+        "for galaxies at a given redshift range. Converts CO rest frequencies to observed frequencies, "
+        "prefilters on the em_min/em_max wavelength span and then verifies EXACT per-SPW coverage from "
+        "frequency_support (not frequency +/- bandwidth/2). "
         "Use this for any query like 'galaxies at z=1-2 with CO coverage' or "
         "'ALMA CO detections at high redshift'.\n"
         "CO transitions checked: J=1-0 (115.3 GHz), J=2-1 (230.5), J=3-2 (345.8), "
-        "J=4-3 (461.0), J=5-4 (576.3), J=6-5 (691.5), J=7-6 (806.7).\n"
-        "Returns: target_name, proposal_id, CO_transition, obs_frequency_ghz, bandwidth_ghz."
+        "J=4-3 (461.0), J=5-4 (576.3), J=6-5 (691.5), J=7-6 (806.7), J=8-7 (921.8).\n"
+        "Returns rows/MOUS/EB counts plus per-row CO_transitions_covered, covering_spw_ghz, coverage_method."
     )
     category = "general"
     InputModel = SearchAlmaCoInRedshiftRangeInput
@@ -1248,55 +1436,42 @@ class SearchAlmaCoInRedshiftRange(BaseCapability):
         if z_min is not None and z_max is not None and z_min > z_max:
             z_min, z_max = z_max, z_min
 
-        # CO rotational transitions: (J_upper, rest_freq_GHz)
-        CO_TRANSITIONS = [
-            ("CO(1-0)",  115.2712018),
-            ("CO(2-1)",  230.5380000),
-            ("CO(3-2)",  345.7959899),
-            ("CO(4-3)",  461.0407682),
-            ("CO(5-4)",  576.2679305),
-            ("CO(6-5)",  691.4730763),
-            ("CO(7-6)",  806.6518060),
-        ]
+        # CO rotational ladder (single source of truth: services.alma_science_queries)
+        CO_TRANSITIONS = [(name, LINE_REST_FREQ_GHZ[name]) for name in CO_LADDER_LINES]
 
-        # Build ADQL frequency-range OR conditions for all transitions
-        # Each transition covers a *range* of frequencies depending on the z range.
-        # ν_obs_min (at z_max) to ν_obs_max (at z_min)
+        # Coarse ADQL prefilter: the em_min/em_max WAVELENGTH span (metres) must
+        # overlap the observed window of at least one transition. Exact coverage
+        # is decided per row from frequency_support below, so the aggregate
+        # `bandwidth` (Hz, summed over non-contiguous SPWs) is never treated as
+        # one contiguous window (A-10/A-16).
         freq_conditions = []
-        transition_map = {}  # (freq_min, freq_max) -> transition label
-
+        windows_by_label: Dict[str, Tuple[float, float]] = {}
         for label, nu_rest in CO_TRANSITIONS:
             nu_at_z_max = nu_rest / (1.0 + z_max)   # lower observed freq (higher z)
             nu_at_z_min = nu_rest / (1.0 + z_min)   # higher observed freq (lower z)
-
-            # We want any observation whose spectral window overlaps [nu_at_z_max, nu_at_z_min]
-            # (frequency - 0.5*bw/1e9) < nu_at_z_min  AND  (frequency + 0.5*bw/1e9) > nu_at_z_max
-            cond = (
-                f"((frequency - 0.5*bandwidth/1e9) < {nu_at_z_min:.4f} "
-                f"AND (frequency + 0.5*bandwidth/1e9) > {nu_at_z_max:.4f})"
-            )
-            freq_conditions.append(cond)
-            transition_map[(round(nu_at_z_max, 4), round(nu_at_z_min, 4))] = label
+            freq_conditions.append(wavelength_overlap_where(nu_at_z_max, nu_at_z_min))
+            windows_by_label[label] = (nu_at_z_max, nu_at_z_min)
 
         freq_where = " OR ".join(freq_conditions)
 
-        # Optional science category filter
-        cat_clause = ""
+        # Optional science category filter (escaped, case-insensitive)
         if science_category:
-            cat_clause = f" AND scientific_category LIKE '%{science_category}%'"
+            safe_cat = str(science_category).replace("'", "''").lower()
+            cat_clause = f" AND LOWER(scientific_category) LIKE '%{safe_cat}%'"
         else:
             # Default: restrict to extragalactic categories
             cat_clause = (
-                " AND (scientific_category LIKE '%Galaxy%' "
-                "OR scientific_category LIKE '%Cosmology%' "
-                "OR scientific_category LIKE '%Active%')"
+                " AND (LOWER(scientific_category) LIKE '%galaxy%' "
+                "OR LOWER(scientific_category) LIKE '%cosmology%' "
+                "OR LOWER(scientific_category) LIKE '%active%')"
             )
 
         adql_query = f"""
 SELECT TOP {max_results}
-       target_name, proposal_id, member_ous_uid,
-       frequency, bandwidth, scientific_category, science_keyword,
-       s_ra, s_dec, t_exptime, s_resolution
+       target_name, proposal_id, member_ous_uid, asdm_uid,
+       frequency, bandwidth, frequency_support, band_list,
+       scientific_category, science_keyword,
+       s_ra, s_dec, t_exptime, s_resolution, data_rights, obs_release_date
 FROM ivoa.obscore
 WHERE ({freq_where})
 {cat_clause}
@@ -1307,7 +1482,7 @@ ORDER BY target_name
 
         try:
             import pyvo
-            tap_url = "https://almascience.eso.org/tap"
+            tap_url = _ALMA_TAP_URL  # one mirror per request (A-89)
             # Surface the exact executed ADQL (CX-07): the query is built
             # request-locally above, so this stamp is race-free.
             try:
@@ -1339,44 +1514,93 @@ ORDER BY target_name
                     },
                 })
 
-            # Annotate which CO transition each observation covers
-            def _which_co(row):
-                obs_nu = float(row.get("frequency", 0))
-                bw_ghz = float(row.get("bandwidth", 0)) / 1e9
-                covered = []
-                for label, nu_rest in CO_TRANSITIONS:
-                    nu_lo = nu_rest / (1 + z_max)
-                    nu_hi = nu_rest / (1 + z_min)
-                    obs_lo = obs_nu - 0.5 * bw_ghz
-                    obs_hi = obs_nu + 0.5 * bw_ghz
-                    if obs_lo < nu_hi and obs_hi > nu_lo:
-                        covered.append(label)
-                return ", ".join(covered) if covered else "unknown"
-
-            df["CO_transitions_covered"] = df.apply(_which_co, axis=1)
-            df["obs_freq_ghz"] = df["frequency"].round(3)
-            df["bandwidth_ghz"] = (df["bandwidth"] / 1e9).round(3)
+            # Decide coverage per row from the exact SPW windows in
+            # frequency_support; rows without it fall back to the aggregate
+            # window and are labelled approximate. Rows the coarse prefilter
+            # let through but no SPW covers are DROPPED (false positives).
+            prefilter_rows = int(len(df))
+            covered_labels: List[str] = []
+            covering_spws: List[str] = []
+            methods: List[str] = []
+            keep: List[bool] = []
+            for _, row in df.iterrows():
+                windows = observation_windows_ghz(row)
+                exact = bool(parse_frequency_support_windows(row.get("frequency_support")))
+                hits: List[str] = []
+                spws: List[str] = []
+                for label, (nu_lo, nu_hi) in windows_by_label.items():
+                    for w in windows:
+                        if w["low_ghz"] < nu_hi and w["high_ghz"] > nu_lo:
+                            hits.append(label)
+                            spws.append(f"{label}: {w['low_ghz']:.3f}-{w['high_ghz']:.3f}")
+                            break
+                keep.append(bool(hits))
+                covered_labels.append(", ".join(hits))
+                covering_spws.append("; ".join(spws))
+                methods.append("frequency_support SPW windows" if exact
+                               else "frequency +/- bandwidth/2 (APPROXIMATE; frequency_support missing)")
+            df = df.assign(CO_transitions_covered=covered_labels, covering_spw_ghz=covering_spws,
+                           coverage_method=methods)[pd.Series(keep, index=df.index)].copy()
+            dropped_false_positives = prefilter_rows - int(len(df))
+            df["obs_freq_ghz"] = pd.to_numeric(df["frequency"], errors="coerce").round(3)
+            df["bandwidth_ghz"] = (pd.to_numeric(df["bandwidth"], errors="coerce") / 1e9).round(3)
+            if df.empty:
+                return _native({
+                    "success": True,
+                    "count": 0,
+                    "prefilter_rows": prefilter_rows,
+                    "message": (
+                        f"{prefilter_rows} row(s) passed the coarse wavelength prefilter but none has a "
+                        f"spectral window (frequency_support) covering a CO line at z={z_min}–{z_max}."
+                    ),
+                    "z_range": [z_min, z_max],
+                })
 
             # Store in agent cache for follow-up plotting
             ctx.service("set_last_search_results")(df)
             ctx.service("set_last_run_result")({"type": "data", "data": df, "source": f"CO z={z_min}-{z_max}"})
 
             # Build summary
-            summary_cols = ["target_name", "proposal_id", "CO_transitions_covered",
-                            "obs_freq_ghz", "bandwidth_ghz", "scientific_category"]
+            summary_cols = ["target_name", "proposal_id", "member_ous_uid", "CO_transitions_covered",
+                            "covering_spw_ghz", "coverage_method", "obs_freq_ghz", "bandwidth_ghz",
+                            "scientific_category", "data_rights"]
             available_cols = [c for c in summary_cols if c in df.columns]
             summary = df[available_cols].drop_duplicates().to_dict("records")
+            trunc = {"rows_fetched": prefilter_rows, "row_cap": int(max_results or 0),
+                     "truncated": bool(max_results and prefilter_rows >= int(max_results))}
+            warnings_out: List[str] = []
+            if trunc["truncated"]:
+                warnings_out.append(
+                    f"TAP fetch hit TOP {max_results}; more rows may cover these lines. Raise max_results "
+                    "or narrow science_category / redshift range."
+                )
+            if dropped_false_positives:
+                warnings_out.append(
+                    f"{dropped_false_positives} row(s) passed the coarse em_min/em_max prefilter but no "
+                    "SPW covers the line; they were dropped."
+                )
+            n_approx = int(sum(1 for m in methods if m.startswith("frequency +/-")))
+            if n_approx:
+                warnings_out.append(
+                    f"{n_approx} row(s) lacked frequency_support; their coverage is approximate."
+                )
 
             return _native({
                 "success": True,
                 "count": len(df),
+                **_result_summary(df),
+                "prefilter_rows": prefilter_rows,
+                "dropped_false_positives": dropped_false_positives,
+                "truncated": trunc["truncated"],
                 "unique_targets": int(df["target_name"].nunique()) if "target_name" in df.columns else None,
                 "z_range": [z_min, z_max],
                 "co_transitions_searched": [t[0] for t in CO_TRANSITIONS],
                 "results": summary[:100],  # cap at 100 for LLM context
+                "warnings": warnings_out,
                 "note": (
-                    "Observations found where CO line at given z falls inside the ALMA spectral window. "
-                    "Use plot_alma_results() to visualize sky distribution."
+                    "Rows whose frequency_support spectral windows cover a CO line at the requested z "
+                    "(coarse em_min/em_max prefilter, exact per-SPW check). Rows repeat per EB/field: "
+                    "see counts for MOUS/EB numbers. Use plot_alma_results() to visualize sky distribution."
                 )
             })
 
@@ -1403,6 +1627,11 @@ class QueryAlmaScienceArchiveInput(_In):
     # rejected exotic-but-legacy-tolerated shapes.
     band: Any = None
     max_resolution_arcsec: Optional[float] = None
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    radius_arcsec: float = 60.0
+    public_only: bool = False
+    science_only: bool = False
     arrays: Optional[List[str]] = None
     lines: Optional[List[str]] = None
     topic_filter: Optional[str] = ""
@@ -1456,23 +1685,28 @@ class QueryAlmaScienceArchive(BaseCapability):
         warnings: List[str] = []
         query_summary = ""
         publications: Optional[List[Dict[str, str]]] = None
+        df = pd.DataFrame()
         try:
             if query_type == "cycle_solar_projects":
                 if cycle is None:
                     return _native({"success": False, "error": "cycle is required"})
-                where = (
-                    f"{project_prefix_where(int(cycle))} AND ("
-                    "LOWER(target_name) LIKE '%sun%' "
-                    "OR LOWER(science_keyword) LIKE '%sun%' "
-                    "OR LOWER(scientific_category) LIKE '%sun%' "
-                    "OR LOWER(obs_title) LIKE '%sun%'"
-                    ")"
-                )
+                # scientific_category = 'Sun' is the primary predicate; the text
+                # fallbacks are word-anchored and exclude Sunyaev-Zel'dovich (G-06).
+                where = f"{project_prefix_where(int(cycle))} AND {solar_where()}"
                 df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
+                before = int(len(df))
+                df = exclude_sunyaev(df)
+                if before - int(len(df)):
+                    warnings.append(f"Dropped {before - int(len(df))} Sunyaev-Zel'dovich row(s) matched by the text fallback.")
                 result_df = summarize_projects(df)
                 source = f"ALMA Cycle {cycle} solar projects"
                 mode = "cycle_solar_projects"
-                query_summary = f"Cycle {cycle} projects with solar/Sun terms in target, keyword, category, or title."
+                warnings.append(cycle_periods_disclosure(int(cycle)))
+                query_summary = (
+                    f"Cycle {cycle} projects with scientific_category 'Sun' or word-anchored Sun/solar terms in "
+                    "target, keyword or title (Sunyaev-Zel'dovich excluded); grouped by proposal_id with "
+                    "rows/MOUS/EB counts."
+                )
 
             elif query_type == "cycle_array_combo_projects":
                 if cycle is None:
@@ -1482,43 +1716,91 @@ class QueryAlmaScienceArchive(BaseCapability):
                 result_df = projects_with_array_combo(df, required_arrays)
                 source = f"ALMA Cycle {cycle} array combo projects"
                 mode = "cycle_array_combo_projects"
+                warnings.append(cycle_periods_disclosure(int(cycle)))
+                warnings.append(
+                    "Array membership is inferred heuristically from antenna_arrays name prefixes "
+                    "(DV/DA = 12-m, CM = 7-m, PM = Total Power) and schedblock_name suffixes; the archive "
+                    "delivers per-MOUS data and has not combined the arrays."
+                )
                 query_summary = f"Cycle {cycle} projects grouped by proposal_id requiring arrays {', '.join(required_arrays)}."
 
             elif query_type == "high_resolution_band_data":
-                if not target:
-                    return _native({"success": False, "error": "target is required"})
+                if not target and (inp.ra is None or inp.dec is None):
+                    return _native({"success": False, "error": "target or both ra and dec are required"})
                 normalized_target = normalize_target_alias(target)
-                if max_resolution_arcsec is None:
-                    max_resolution_arcsec = 0.1
-                    warnings.append("Defaulted high-resolution threshold to <0.1 arcsec.")
-                df = ctx.service("search_service").search_by_target(normalized_target, facility="ALMA", max_results=max_results)
-                df = science_filter_band(df, band)
-                df = science_filter_resolution(df, max_resolution_arcsec)
-                if "dataproduct_type" in df.columns:
-                    image_mask = df["dataproduct_type"].astype(str).str.contains("image|cube", case=False, regex=True, na=False)
-                    df = df[image_mask].copy()
-                result_df = summarize_projects(df)
+                ra, dec = inp.ra, inp.dec
+                if (ra is None) != (dec is None):
+                    raise ValueError("Supply both ra and dec, or neither to resolve the target")
+                if ra is None:
+                    resolved = ctx.service("resolve_target")(normalized_target)
+                    ra, dec = resolved.get("ra_deg"), resolved.get("dec_deg")
+                    if ra is None or dec is None:
+                        raise ValueError(f"Could not resolve target: {normalized_target}")
+                query = science_cone_query(
+                    ra, dec, inp.radius_arcsec, band=band,
+                    max_resolution_arcsec=max_resolution_arcsec,
+                    public_only=inp.public_only, science_only=inp.science_only, top=max_results,
+                )
+                service = ctx.service("search_service").alminer_client._get_tap_service()
+                res = service.search(query)
+                df = res.to_table().to_pandas()
+                # Preserve wire values; some PyVO tables carry bytes.
+                for column in df.select_dtypes(include=["object"]):
+                    df[column] = df[column].map(lambda v: v.decode("utf-8") if isinstance(v, bytes) else v)
+                df.attrs["truncated"] = len(df) >= max_results or getattr(res, "query_status", "") == "OVERFLOW"
+                df.attrs["search_position"] = {"ra_deg": float(ra), "dec_deg": float(dec), "radius_arcsec": inp.radius_arcsec}
+                prov_state["query"] = query
+                prov_state["url"] = getattr(res, "quasar_tap_url", _ALMA_TAP_URL)
+                result_df = summarize_mous(df)
+                # topic_filter is a line_set_projects predicate; it does NOT
+                # constrain the positional cone. A call that carries its
+                # constraints as free text ("Band 6/7, <1 arcsec, public") and no
+                # structured field returns the UNFILTERED MOUS list, and a model
+                # hand-filtering that list under-counted live (fix7 HH212 t2:
+                # 11 of 14). Say so, so the call self-corrects.
+                _structured = [
+                    name for name, present in (
+                        ("band", bool(band)),
+                        ("max_resolution_arcsec", max_resolution_arcsec is not None),
+                        ("public_only", bool(inp.public_only)),
+                        ("science_only", bool(inp.science_only)),
+                    ) if present
+                ]
+                if str(topic_filter or "").strip():
+                    if _structured:
+                        warnings.append(
+                            "topic_filter is ignored by high_resolution_band_data (it only applies to "
+                            "line_set_projects); the structured filters "
+                            + ", ".join(_structured) + " were applied."
+                        )
+                    else:
+                        warnings.append(
+                            "topic_filter is NOT applied by high_resolution_band_data, and no structured "
+                            "filter was given: these results are UNFILTERED by band, angular resolution, "
+                            "public status or science intent. Re-run with the constraints as structured "
+                            "fields — band=[...], max_resolution_arcsec=<arcsec>, public_only=true, "
+                            "science_only=true — instead of describing them in topic_filter."
+                        )
                 source = f"ALMA {normalized_target} Band {band or 'any'} high-resolution candidates"
                 mode = "high_resolution_band_data"
                 query_summary = (
-                    f"Target search for {normalized_target}, Band {band or 'any'}, "
-                    f"resolution < {max_resolution_arcsec} arcsec, image/cube products when available."
+                    f"Positional cone at ({ra}, {dec}), radius {inp.radius_arcsec} arcsec, Band {band or 'any'}, "
+                    + (f"resolution < {max_resolution_arcsec} arcsec, " if max_resolution_arcsec is not None else "no resolution cut, ")
+                    + f"public_only={inp.public_only}, science_only={inp.science_only}; one row per MOUS."
                 )
 
             elif query_type == "line_set_projects":
-                required_lines = lines or ["12CO", "13CO", "C18O"]
-                requested_band = band or 6
+                if not lines:
+                    raise ValueError("lines must contain the requested molecular lines")
+                required_lines = lines
+                requested_band = band
+                if band is not None and not requested_bands(band):
+                    raise ValueError("band must contain ALMA band numbers from 1 to 10")
                 topic = str(topic_filter or "").strip()
                 # band_list is a space-delimited token list ("3 6 7"); a bare
                 # substring LIKE made band=1 also match Band 10 (scan CAP-06) —
                 # match the exact token in every list position instead.
-                _b = str(requested_band).strip()
-                where_parts = [
-                    "("
-                    f"band_list = '{_b}' OR band_list LIKE '{_b} %' "
-                    f"OR band_list LIKE '% {_b}' OR band_list LIKE '% {_b} %'"
-                    ")"
-                ]
+                where_parts = ["(" + " OR ".join(band_token_where(b) for b in requested_bands(band)) + ")"] if band else ["1=1"]
                 if topic:
                     safe_topic = topic.replace("'", "''").lower()
                     where_parts.append(
@@ -1539,8 +1821,9 @@ class QueryAlmaScienceArchive(BaseCapability):
                 )
 
             elif query_type == "redshifted_line_projects":
-                z_min = 1.0 if redshift_min is None else float(redshift_min)
-                z_max = 2.0 if redshift_max is None else float(redshift_max)
+                if redshift_min is None or redshift_max is None:
+                    raise ValueError("redshift_min and redshift_max are required")
+                z_min, z_max = float(redshift_min), float(redshift_max)
                 where, line_names = _redshifted_line_where(rest_species or "CO", z_min, z_max, science_category)
                 df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
                 result_df = redshifted_line_projects(df, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max)
@@ -1559,6 +1842,10 @@ class QueryAlmaScienceArchive(BaseCapability):
                 result_df = bandwidth_switching_candidates(df)
                 source = "ALMA bandwidth-switching calibration candidates" + (f" Cycle {cycle}" if cycle is not None else "")
                 mode = "bandwidth_switching_candidates"
+                if cycle is not None:
+                    warnings.append(cycle_periods_disclosure(int(cycle)))
+                else:
+                    warnings.append("No cycle given: the TOP-capped fetch scans the whole archive from the lowest project codes upward and is certainly incomplete.")
                 warnings.append("Bandwidth Switching likelihood is inferred from public spectral setup metadata; it is not proof of calibration intent.")
                 query_summary = "Projects scored by spectral-window count, bandwidth diversity, tuning diversity, and calibration-like metadata."
 
@@ -1632,12 +1919,21 @@ class QueryAlmaScienceArchive(BaseCapability):
                 return _native({"success": False, "error": f"Unknown query_type: {query_type}"})
 
             elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+            trunc = truncation_info(df, max_results)
+            if trunc["truncated"]:
+                warnings.append(trunc["warning"])
+            raw_counts = aggregate_counts(df)
+            if result_df.attrs.get("ungroupable_rows"):
+                warnings.append(f"{result_df.attrs['ungroupable_rows']} archive rows lack a MOUS identifier; counts are partial.")
             provenance = {
                 "archive": "ALMA Science Archive",
                 "tap_url": prov_state.get("url"),
                 "adql": prov_state.get("query") if include_adql else None,
                 "elapsed_ms": elapsed_ms,
                 "fresh_query": True,
+                "rows_fetched": trunc["rows_fetched"],
+                "row_cap": trunc["row_cap"],
+                "truncated": trunc["truncated"],
             }
             ctx.service("set_last_search_results")(result_df)
             ctx.service("set_last_run_result")({
@@ -1652,13 +1948,25 @@ class QueryAlmaScienceArchive(BaseCapability):
                 "success": True,
                 "mode": mode,
                 "count": len(result_df),
+                "partial": bool(trunc["truncated"] or result_df.attrs.get("partial")),
+                "ungroupable_rows": result_df.attrs.get("ungroupable_rows", 0),
                 "unique_projects": unique_projects,
+                "rows_fetched": trunc["rows_fetched"],
+                "truncated": trunc["truncated"],
+                "counts": raw_counts,
+                "count_summary": counts_note(raw_counts),
                 "source": source,
                 "query_summary": query_summary,
                 "results": result_df.head(100).to_dict("records") if not result_df.empty else [],
+                "results_returned": min(100, len(result_df)),
+                "results_truncated": len(result_df) > 100,
+                "search_position": df.attrs.get("search_position"),
                 "warnings": warnings,
                 "provenance": provenance,
-                "note": "Full result table is shown in the UI data card.",
+                "note": (
+                    "Full result table is shown in the UI data card. High-resolution results are grouped by MOUS. Per-project 'rows' are ObsCore coverage "
+                    "records (repeated per EB/field/SPW); 'n_mous' and 'n_eb' are the dataset and execution counts."
+                ),
             }
             if publications is not None:
                 # R2 data_publications: deduped bibcode list feeding the
@@ -1669,7 +1977,7 @@ class QueryAlmaScienceArchive(BaseCapability):
         except Exception as e:
             import traceback
             logger.error("ALMA science query failed: %s\n%s", e, traceback.format_exc())
-            return _native({"success": False, "error": str(e), "query_type": query_type})
+            return _native({"success": False, "error": str(e), "partial": True, "query_type": query_type})
 
 
 def _match_cross_archive_sources_impl(
@@ -1928,24 +2236,174 @@ class PlotAlmaResults(BaseCapability):
 
 class DownloadAlmaDataInput(_In):
     dry_run: Any = False  # forwarded into a service truthiness gate — Any
+    mous_uids: Optional[List[str]] = None
+    confirm_large: Any = False
+    max_gb: Optional[float] = None
+
+
+_DOWNLOAD_MAX_MOUS_DEFAULT = 5
+
+
+def _preflight_download(datalink_client: Any, mous_uids: List[str], max_bytes: float) -> Dict[str, Any]:
+    """Sum DataLink content_length over the FITS rows of the selected MOUSs
+    (skill guardrail 6: plan bytes from DataLink, allow missing lengths)."""
+    from services.data_product_triage import is_fits_product
+
+    per_mous: List[Dict[str, Any]] = []
+    total_known = 0
+    unknown = 0
+    fits_count = 0
+    errors: List[str] = []
+    for uid in mous_uids:
+        try:
+            inv = datalink_client.list_files(uid)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{uid}: {exc}")
+            continue
+        if not inv.get("success"):
+            errors.append(f"{uid}: {inv.get('error') or inv.get('state')}")
+            continue
+        fits = [f for f in inv.get("files", []) if is_fits_product(f)]
+        known = [f for f in fits if f.get("content_length") is not None]
+        mous_bytes = sum(int(f["content_length"]) for f in known)
+        total_known += mous_bytes
+        unknown += len(fits) - len(known)
+        fits_count += len(fits)
+        per_mous.append({
+            "mous_uid": uid, "state": inv.get("state"), "fits_files": len(fits),
+            "known_bytes": mous_bytes, "size_unknown": len(fits) - len(known),
+        })
+    return {
+        "mous_checked": len(per_mous),
+        "fits_files": fits_count,
+        "total_known_bytes": total_known,
+        "total_known_gb": round(total_known / 1e9, 3),
+        "size_unknown_files": unknown,
+        "max_gb": round(max_bytes / 1e9, 3),
+        "per_mous": per_mous,
+        "errors": errors,
+    }
 
 
 class DownloadAlmaData(BaseCapability):
     name = "download_alma_data"
-    description = "Download ALMA data (FITS) for current results"
+    description = (
+        "Download the FITS products of ALMA MOUSs onto the Quasar SERVER (not the user's machine) after a "
+        "DataLink byte preflight. Pass explicit mous_uids (from a search); without them only a small set "
+        "of MOUSs from the last search is accepted. Refuses when the known total exceeds max_gb (default "
+        "5 GB), when free disk is insufficient, or when sizes are unknown unless confirm_large=true. "
+        "dry_run=true reports the preflight only. Web users should normally use the per-row Download "
+        "links in the results table instead."
+    )
     category = "general"
     InputModel = DownloadAlmaDataInput
     annotations = {"read_only": False, "cost": "network"}
 
     def run(self, inp, ctx) -> ToolResult:
-        """Download ALMA data for observations in current context"""
+        """Download ALMA data for observations in current context (with preflight)."""
+        import shutil
+
         try:
             last_search_results = ctx.service("get_last_search_results")()
             if last_search_results is None or last_search_results.empty:
                 return _native({"success": False, "error": "No results available to download."})
 
-            msg = ctx.service("search_service").download_alma_data(last_search_results, dry_run=inp.dry_run)
-            return _native({"success": True, "message": msg})
+            dry_run = bool(inp.dry_run) and str(inp.dry_run).lower() not in {"false", "0", "no"}
+            confirm_large = bool(inp.confirm_large) and str(inp.confirm_large).lower() not in {"false", "0", "no"}
+            max_mous = int(os.getenv("QUASAR_ALMA_DOWNLOAD_MAX_MOUS", str(_DOWNLOAD_MAX_MOUS_DEFAULT)) or _DOWNLOAD_MAX_MOUS_DEFAULT)
+            max_gb = float(inp.max_gb) if inp.max_gb else float(os.getenv("QUASAR_ALMA_DOWNLOAD_MAX_GB", "5") or 5)
+            max_bytes = max_gb * 1e9
+
+            df = last_search_results
+            selected_uids: List[str] = []
+            if "member_ous_uid" in df.columns:
+                if inp.mous_uids:
+                    wanted = {str(u).strip() for u in inp.mous_uids if str(u).strip()}
+                    df = df[df["member_ous_uid"].astype(str).isin(wanted)]
+                    if df.empty:
+                        return _native({
+                            "success": False,
+                            "error": "None of the requested mous_uids are in the current results.",
+                            "requested": sorted(wanted),
+                        })
+                selected_uids = df["member_ous_uid"].dropna().astype(str).unique().tolist()
+                if not inp.mous_uids and len(selected_uids) > max_mous:
+                    return _native({
+                        "success": False,
+                        "error": (
+                            f"The current results span {len(selected_uids)} MOUSs; bulk-downloading them all is "
+                            f"refused (cap {max_mous}). Pass explicit mous_uids for the datasets you need, or use "
+                            "the per-row Download links in the table."
+                        ),
+                        "mous_uids_available": selected_uids[:50],
+                    })
+
+            preflight: Dict[str, Any] = {"available": False}
+            datalink_client = ctx.services.get("datalink_client") if hasattr(ctx, "services") else None
+            if datalink_client is not None and selected_uids:
+                preflight = _preflight_download(datalink_client, selected_uids, max_bytes)
+                preflight["available"] = True
+
+            download_dir = getattr(getattr(ctx.service("search_service"), "alminer_client", None), "download_dir", "./downloads")
+            try:
+                free_bytes = shutil.disk_usage(download_dir if os.path.isdir(download_dir) else ".").free
+            except Exception:  # noqa: BLE001
+                free_bytes = None
+            preflight["free_disk_gb"] = round(free_bytes / 1e9, 2) if free_bytes is not None else None
+
+            if dry_run:
+                msg = ctx.service("search_service").download_alma_data(df, dry_run=True)
+                return _native({"success": True, "message": msg, "dry_run": True, "preflight": preflight,
+                                "mous_uids": selected_uids})
+
+            refusals: List[str] = []
+            if preflight.get("available"):
+                if preflight.get("errors"):
+                    refusals.append(
+                        f"DataLink preflight failed for {len(preflight['errors'])} MOUS(s): "
+                        + "; ".join(str(e) for e in preflight["errors"][:3])
+                        + " — no byte estimate is possible for them"
+                    )
+                if preflight.get("mous_checked", 0) == 0:
+                    refusals.append("DataLink preflight inspected no MOUS")
+                if preflight["total_known_bytes"] > max_bytes:
+                    refusals.append(
+                        f"known FITS total {preflight['total_known_gb']} GB exceeds the {max_gb} GB cap "
+                        "(raise max_gb explicitly or select fewer MOUSs)"
+                    )
+                if preflight["size_unknown_files"] and not confirm_large:
+                    refusals.append(
+                        f"{preflight['size_unknown_files']} FITS file(s) have no DataLink content_length; pass "
+                        "confirm_large=true to accept an unknown total"
+                    )
+                if free_bytes is not None and preflight["total_known_bytes"] > 0.9 * free_bytes:
+                    refusals.append(
+                        f"free disk ({preflight['free_disk_gb']} GB) is insufficient for {preflight['total_known_gb']} GB"
+                    )
+            elif not confirm_large:
+                refusals.append(
+                    "DataLink preflight unavailable (no DataLink client / no MOUS UIDs); pass confirm_large=true "
+                    "to download without a byte estimate"
+                )
+            if refusals:
+                return _native({
+                    "success": False,
+                    "error": "Download refused by preflight: " + "; ".join(refusals),
+                    "preflight": preflight,
+                    "mous_uids": selected_uids,
+                    "hint": "Web users: use the per-row Download links in the results table; the server download is for notebook/CLI sessions.",
+                })
+
+            msg = ctx.service("search_service").download_alma_data(df, dry_run=False)
+            ok = not str(msg).lower().startswith("download failed")
+            return _native({
+                "success": ok,
+                "message": msg,
+                "preflight": preflight,
+                "mous_uids": selected_uids,
+                "location_note": "Files land on the Quasar server's download directory, not on the user's machine.",
+                **({} if ok else {"error": msg}),
+            })
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 
@@ -2082,6 +2540,13 @@ class CheckLineCoverage(BaseCapability):
             results = ctx.service("search_service").check_line_coverage_on_last(
                 last_search_results, inp.line_freq_ghz, inp.z, inp.line_name
             )
+            _cov_err = _frame_attr(results, "quasar_error")
+            if _cov_err:
+                return _native({
+                    "success": False,
+                    "error": _cov_err,
+                    "note": "Coverage could not be determined — this is not a 'line not covered' result.",
+                })
             # Don't overwrite last_search_results, just return analysis?
             # Or do we overwrite context? Let's overwrite so we can plot THIS result.
             ctx.service("set_last_search_results")(results)
@@ -2090,7 +2555,12 @@ class CheckLineCoverage(BaseCapability):
             return _native({
                 "success": True,
                 "count": len(results),
-                "results": results.to_dict("records")
+                **_result_summary(results),
+                "line_name": inp.line_name,
+                "observed_frequency_ghz": (float(inp.line_freq_ghz) / (1.0 + float(inp.z or 0.0))) if inp.line_freq_ghz is not None else None,
+                "results": results.to_dict("records"),
+                "note": ("No spectral window in the last results covers this frequency." if len(results) == 0
+                         else "Coverage decided per row from frequency_support SPW windows (coverage_method column)."),
             })
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -2115,6 +2585,13 @@ class CheckCoLines(BaseCapability):
 
         try:
             results = ctx.service("search_service").check_co_lines_on_last(last_search_results, inp.z)
+            _co_err = _frame_attr(results, "quasar_error")
+            if _co_err:
+                return _native({
+                    "success": False,
+                    "error": _co_err,
+                    "note": "Coverage could not be determined — this is not a 'no CO coverage' result.",
+                })
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({"type": "data", "data": results, "source": "CO Lines Check"})
 

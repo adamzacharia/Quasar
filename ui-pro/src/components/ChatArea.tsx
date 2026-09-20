@@ -36,7 +36,7 @@ export function ChatArea() {
         activeConversationId, setActiveConversation,
         selectedModel, conversations,
         toggleStar,
-        thinkingSteps, thinkingStatus, addThinkingStep, clearThinking,
+        thinkingSteps, thinkingStatus, addThinkingStep, heartbeatThinkingStep, clearThinking,
         attachThinkingToLastMessage,
         taskGroups, taskItems, taskChecklist, taskExecutionActive,
         handleTaskGroup, handleTaskUpdate, handleTaskList, clearTaskExecution,
@@ -463,6 +463,9 @@ export function ChatArea() {
                     onStatus: (step: string, state: string) => {
                         if (ownerIsActive()) addThinkingStep(step, state as "running" | "completed");
                     },
+                    onRunProgress: (phase: string) => {
+                        if (ownerIsActive()) heartbeatThinkingStep(phase);
+                    },
                     onComplete: () => {
                         if (ownerIsActive()) {
                             attachThinkingToLastMessage();
@@ -533,6 +536,9 @@ export function ChatArea() {
                         onStatus: (step: string, state: string) => {
                             // UI-01: same global-rail guard as onToolCall.
                             if (ownerIsActive()) addThinkingStep(step, state as "running" | "completed");
+                        },
+                        onRunProgress: (phase: string) => {
+                            if (ownerIsActive()) heartbeatThinkingStep(phase);
                         },
                         onData: (data: Record<string, unknown>) => {
                             const tableData = data as unknown as DataTableResult;
@@ -869,6 +875,7 @@ export function ChatArea() {
         markLastAssistantRunFailed,
         messages,
         addThinkingStep,
+        heartbeatThinkingStep,
         clearThinking,
         attachThinkingToLastMessage,
         clearTaskExecution,

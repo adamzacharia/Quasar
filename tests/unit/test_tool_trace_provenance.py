@@ -389,21 +389,25 @@ def test_alma_cone_provenance_is_built_request_local_and_exact():  # CX-07, CX-3
     from capabilities.base import CallContext
 
     adql = _obscore_cone_adql(250.42, 36.46, 0.05)
-    assert adql == (
-        "SELECT * FROM ivoa.obscore WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
-        "CIRCLE('ICRS', 250.42, 36.46, 0.05)) = 1 AND data_rights = 'Public'"
-    )
-    # The executed call is alminer.conesearch(public=True) — the surfaced
-    # equivalent must carry the same public-data constraint (CX-38), and drop
-    # it only when a caller explicitly searches proprietary data too.
-    assert "data_rights" not in _obscore_cone_adql(250.42, 36.46, 0.05, public=False)
+    # The executed cone is the s_region FOOTPRINT test unioned with the
+    # representative-point test (INT-1; the old point-only cone missed mosaics),
+    # over the standard ObsCore projection, plus the public-data constraint.
+    circle = "CIRCLE('ICRS', 250.42000000, 36.46000000, 0.05000000)"
+    assert adql.startswith("SELECT target_name, proposal_id, member_ous_uid, group_ous_uid, asdm_uid")
+    assert f"(INTERSECTS({circle}, s_region) = 1 OR CONTAINS(POINT('ICRS', s_ra, s_dec), {circle}) = 1)" in adql
+    assert adql.endswith("AND data_rights = 'Public'")
+    # The public-data constraint is dropped only when a caller explicitly
+    # searches proprietary data too (CX-38).
+    assert "data_rights = 'Public'" not in _obscore_cone_adql(250.42, 36.46, 0.05, public=False)
+    # Point-only fallback (service rejected INTERSECTS) is expressible and disclosed.
+    assert "INTERSECTS" not in _obscore_cone_adql(250.42, 36.46, 0.05, footprint=False)
 
     # Two "concurrent" requests with their OWN injected state can't cross-attribute.
     a, b = {"query": None, "url": None}, {"query": None, "url": None}
     _set_alma_cone_provenance(CallContext(services={"alma_tap_provenance": a}), 10.0, 20.0, 0.05)
     _set_alma_cone_provenance(CallContext(services={"alma_tap_provenance": b}), 99.0, -5.0, 0.14)
-    assert "10.0, 20.0, 0.05" in a["query"]
-    assert "99.0, -5.0, 0.14" in b["query"]
+    assert "10.00000000, 20.00000000, 0.05000000" in a["query"]
+    assert "99.00000000, -5.00000000, 0.14000000" in b["query"]
     assert a["query"] != b["query"]
 
 
@@ -425,6 +429,10 @@ def test_dispatch_tool_call_pops_sidecar_from_model_payload():  # CX-22
         tool_registry = registry
         _pop_provenance_sidecar = staticmethod(QuasarAgent._pop_provenance_sidecar)
         _record_tool_trace = QuasarAgent._record_tool_trace
+        # Dispatch routes through the timeout guard, which is documented to
+        # tolerate bare test agents (missing run-result state is skipped).
+        _execute_tool_guarded = QuasarAgent._execute_tool_guarded
+        _tool_timeout_seconds = QuasarAgent._tool_timeout_seconds
 
         @property
         def _accumulated_tool_trace(self):

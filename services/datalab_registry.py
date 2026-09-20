@@ -7,6 +7,38 @@ PDF), not guessed. Keep them faithful to the real Data Lab schema.
 
 from __future__ import annotations
 
+# Explicit archive collections are separate from survey catalog fallbacks.
+DATALAB_SIA_SERVICES = {
+    "nsa": "https://datalab.noirlab.edu/sia/nsa",
+    "coadd_all": "https://datalab.noirlab.edu/sia/coadd_all",
+}
+
+# Human/LLM-facing descriptions of the image collections above. Listed by
+# datalab_list_catalogs so an agent exploring "what does Data Lab hold" sees the
+# archive-wide image services, not only the survey catalogs.
+DATALAB_IMAGE_SERVICES = [
+    {
+        "service": "nsa",
+        "endpoint": DATALAB_SIA_SERVICES["nsa"],
+        "name": "NOIRLab Science Archive (all image holdings)",
+        "description": (
+            "Every archived image from NOIRLab telescopes and instruments across all "
+            "observing programs: raw, calibrated (InstCal) and Stack products, with per-row "
+            "exptime, proctype, prodtype, obs_bandpass and access_url. Not limited to any survey."
+        ),
+    },
+    {
+        "service": "coadd_all",
+        "endpoint": DATALAB_SIA_SERVICES["coadd_all"],
+        "name": "All Data Lab survey coadds",
+        "description": (
+            "Coadd/tile images from the Data Lab-hosted surveys (Legacy Surveys, DES, DELVE, ...). "
+            "catalog=<survey id> prefers its registered endpoint; shared endpoints may contain other "
+            "surveys, so check each row's obs_collection/assoc_id."
+        ),
+    },
+]
+
 import logging
 import os
 import re
@@ -43,6 +75,16 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "All-sky (space astrometry mission; covers the LMC/SMC, Galactic plane, both hemispheres).",
+        # Gaia photometric bands per _MAG_TEMPLATE_BANDS (phot_{band}_mean_mag).
+        "bands": ["g", "bp", "rp"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "both",
+            "all_sky": True,
+            "covers_lmc": True,
+            "covers_smc": True,
+            "covers_galactic_plane": True,
+        },
         "citation": {
             "text": "Gaia Data Release 3",
             "doi": "10.1051/0004-6361/202243940",
@@ -73,6 +115,21 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": ["https://datalab.noirlab.edu/sia/coadd_all"],
         "footprint": "~35,000 deg² of archival DECam/Bok/Mosaic imaging — nearly all of the sky south of Dec ≈ +40° plus patchy northern coverage; includes the LMC/SMC region and much of the Galactic plane (depth varies strongly by field).",
+        # NSC DR2 measures ugrizY+VR (Nidever et al. 2021); the curated column
+        # list above carries griz, the survey bandpass set is wider.
+        "bands": ["u", "g", "r", "i", "z", "y", "vr"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            # Spans both hemispheres (south of +40° plus patchy north) — no
+            # dec bound encoded because the patchy northern coverage would make
+            # a hard cut wrong; booleans are what the footprint prose asserts.
+            "hemisphere": "both",
+            "covers_lmc": True,
+            "covers_smc": True,
+            # covers_galactic_plane OMITTED (CX-11): "much of the Galactic
+            # plane (depth varies strongly by field)" is patchy, not pointwise
+            # coverage of every |b| <= 10° position — leave unverified.
+        },
         "citation": {
             "text": "NOIRLab Source Catalog Data Release 2",
             "doi": None,
@@ -108,6 +165,17 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "~5,000 deg² of the southern high-Galactic-latitude sky (roughly -65° < Dec < +5°, avoiding the Galactic plane); does NOT cover the LMC/SMC main bodies.",
+        # DES observes grizY (DR1 paper); curated columns above carry griz.
+        "bands": ["g", "r", "i", "z", "y"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "south",
+            "dec_min": -65.0,
+            "dec_max": 5.0,
+            "covers_lmc": False,
+            "covers_smc": False,
+            "covers_galactic_plane": False,
+        },
         "citation": {"text": "Dark Energy Survey Data Release 1", "doi": "10.3847/1538-4365/ab4f2b", "url": "https://des.ncsa.illinois.edu/releases/dr1"},
     },
     "smash_dr1": {
@@ -136,6 +204,16 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "~480 deg² of targeted DECam fields covering the Magellanic system — LMC, SMC, Bridge, and periphery; field-partitioned (query by fieldid).",
+        # SMASH observed DECam ugriz (Nidever et al. 2017).
+        "bands": ["u", "g", "r", "i", "z"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "south",
+            "covers_lmc": True,
+            "covers_smc": True,
+            # Targeted Magellanic fields only — nowhere near the Galactic plane.
+            "covers_galactic_plane": False,
+        },
         "citation": {"text": "Survey of the MAgellanic Stellar History Data Release 1", "doi": "10.3847/1538-4365/ab6e6c", "url": "https://datalab.noirlab.edu/smash/"},
     },
     "smash_dr2": {
@@ -162,6 +240,14 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "~480 deg² of targeted DECam fields covering the Magellanic system — LMC, SMC, Bridge, and periphery; field-partitioned (query by fieldid).",
+        "bands": ["u", "g", "r", "i", "z"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "south",
+            "covers_lmc": True,
+            "covers_smc": True,
+            "covers_galactic_plane": False,
+        },
         "citation": {"text": "Survey of the MAgellanic Stellar History Data Release 2", "doi": None, "url": "https://datalab.noirlab.edu/smash/"},
     },
     "delve_dr3": {
@@ -188,6 +274,19 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": ["https://datalab.noirlab.edu/sia/delve_dr3", "https://datalab.noirlab.edu/sia/coadd_all"],
         "footprint": "~21,000 deg² of the southern high-Galactic-latitude sky (DECam, Dec ≲ +30°), including dedicated coverage of the Magellanic periphery; avoids the inner Galactic plane.",
+        # DELVE catalogs DECam griz (DR2/DR3 papers).
+        "bands": ["g", "r", "i", "z"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "south",
+            "dec_max": 30.0,
+            # covers_lmc/covers_smc OMITTED (CX-10): the footprint prose only
+            # asserts Magellanic PERIPHERY coverage, which cannot support a
+            # covered verdict across the full LMC 5°/SMC 3° cones — classify
+            # "coverage unverified for this position" and verify per-position.
+            # covers_galactic_plane omitted: prose says "avoids the INNER
+            # Galactic plane" — outer-plane coverage is position-dependent.
+        },
         "citation": {"text": "DECam Local Volume Exploration Survey Data Release 3", "doi": None, "url": "https://datalab.noirlab.edu/delve/"},
     },
     "desi_dr1": {
@@ -209,6 +308,16 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {"desi_target": {"LRG": 0, "ELG": 1, "QSO": 2, "BGS_ANY": 60, "MWS_ANY": 61}},
         "sia_endpoints": [],
         "footprint": "DESI spectroscopic footprint: high-Galactic-latitude northern/equatorial sky (roughly Dec > -20°); does NOT cover the LMC/SMC or the Galactic plane.",
+        # Spectroscopic catalog — no photometric bandpasses of its own.
+        "bands": [],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "north",
+            "dec_min": -20.0,
+            "covers_lmc": False,
+            "covers_smc": False,
+            "covers_galactic_plane": False,
+        },
         "citation": {"text": "DESI Data Release 1", "doi": None, "url": "https://data.desi.lbl.gov/doc/releases/dr1/"},
     },
     "sdss_dr17": {
@@ -228,6 +337,17 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "~14,500 deg² of mostly northern high-Galactic-latitude sky (Dec ≳ -10° plus equatorial stripes); does NOT cover the LMC/SMC.",
+        # specobj is a spectroscopic table — no photometric bandpasses here.
+        "bands": [],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "north",
+            "dec_min": -10.0,
+            "covers_lmc": False,
+            "covers_smc": False,
+            # covers_galactic_plane omitted: mostly high-latitude, but SEGUE
+            # stripes do cross the plane — not a clean boolean.
+        },
         "citation": {"text": "Sloan Digital Sky Survey Data Release 17", "doi": "10.3847/1538-4365/acda98", "url": "https://www.sdss4.org/dr17/"},
     },
     "ls_dr9": {
@@ -250,6 +370,19 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": ["https://datalab.noirlab.edu/sia/coadd_all"],
         "footprint": "~19,700 deg² of high-Galactic-latitude sky in both hemispheres (roughly -68° < Dec < +84°, |b| ≳ 18°); does NOT cover the LMC/SMC or the Galactic plane.",
+        # LS DR9 optical is g/r/z (no i-band until DR10) plus forced unWISE
+        # W1/W2 in the curated dered_mag_* columns (W3/W4 deliberately omitted —
+        # see the column guardrail above).
+        "bands": ["g", "r", "z", "w1", "w2"],
+        "wavelength_regime": ["optical", "mid-ir"],
+        "coverage": {
+            "hemisphere": "both",
+            "dec_min": -68.0,
+            "dec_max": 84.0,
+            "covers_lmc": False,
+            "covers_smc": False,
+            "covers_galactic_plane": False,
+        },
         "citation": {"text": "Legacy Surveys Data Release 9", "doi": None, "url": "https://www.legacysurvey.org/dr9/"},
     },
     "vhs_dr5": {
@@ -281,6 +414,17 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "Southern-hemisphere near-IR (J/H/Ks) survey (~20,000 deg², Dec < 0°); by design EXCLUDES tiles owned by other VISTA surveys — VVV (Galactic plane/bulge) and VMC (inner LMC/SMC) — so inner Magellanic coverage is incomplete; verify per-position.",
+        # J/H/Ks per _MAG_TEMPLATE_BANDS ('k' accepted as an alias for 'ks').
+        "bands": ["j", "h", "ks"],
+        "wavelength_regime": ["near-ir"],
+        "coverage": {
+            "hemisphere": "south",
+            "dec_max": 0.0,
+            # Galactic plane/bulge tiles are owned by VVV, not VHS.
+            "covers_galactic_plane": False,
+            # covers_lmc/covers_smc omitted: inner Magellanic tiles are owned by
+            # VMC, so VHS coverage there is incomplete — verify per-position.
+        },
         "citation": {"text": "VISTA Hemisphere Survey Data Release 5", "doi": None, "url": "https://datalab.noirlab.edu/"},
     },
     "unwise_dr1": {
@@ -318,6 +462,15 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "All-sky unWISE coadd catalog (WISE W1/W2 from time-resolved coadds, ~0.7 mag deeper than AllWISE; Vega photometry; ~2 billion sources).",
+        "bands": ["w1", "w2"],
+        "wavelength_regime": ["mid-ir"],
+        "coverage": {
+            "hemisphere": "both",
+            "all_sky": True,
+            "covers_lmc": True,
+            "covers_smc": True,
+            "covers_galactic_plane": True,
+        },
         "citation": {
             "text": "unWISE Catalog (Schlafly, Meisner & Green 2019)",
             "doi": "10.3847/1538-4365/aafbea",
@@ -356,6 +509,16 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "All-sky near-IR J/H/Ks point-source catalog (2MASS PSC, ~471M sources; includes the LMC/SMC and the full Galactic plane).",
+        # Band tokens per _MAG_TEMPLATE_BANDS ({band}_m); 'k' is physically Ks.
+        "bands": ["j", "h", "k"],
+        "wavelength_regime": ["near-ir"],
+        "coverage": {
+            "hemisphere": "both",
+            "all_sky": True,
+            "covers_lmc": True,
+            "covers_smc": True,
+            "covers_galactic_plane": True,
+        },
         "citation": {
             "text": "Two Micron All Sky Survey (Skrutskie et al. 2006)",
             "doi": "10.1086/498708",
@@ -395,6 +558,15 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "All-sky mid-IR W1/W2/W3/W4 (3.4/4.6/12/22 μm) source catalog (AllWISE, ~748M sources; Vega mags; carries 2MASS crossmatch columns).",
+        "bands": ["w1", "w2", "w3", "w4"],
+        "wavelength_regime": ["mid-ir"],
+        "coverage": {
+            "hemisphere": "both",
+            "all_sky": True,
+            "covers_lmc": True,
+            "covers_smc": True,
+            "covers_galactic_plane": True,
+        },
         "citation": {
             "text": "AllWISE Source Catalog (Cutri et al. 2013; WISE mission: Wright et al. 2010)",
             "doi": "10.1088/0004-6256/140/6/1868",
@@ -434,6 +606,19 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "bitmasks": {},
         "sia_endpoints": [],
         "footprint": "S-PLUS DR4: ~3,000 deg² of the southern sky (incl. Stripe 82 and Magellanic Cloud fields) in the 12-band Javalambre filter system; AB photometry.",
+        # 5 broad + 7 narrow Javalambre bands, matching the {band}_auto columns.
+        "bands": [
+            "u", "g", "r", "i", "z",
+            "j0378", "j0395", "j0410", "j0430", "j0515", "j0660", "j0861",
+        ],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "south",
+            "covers_lmc": True,
+            "covers_smc": True,
+            # covers_galactic_plane omitted: the main survey is high-latitude
+            # but S-PLUS has Galactic sub-survey fields — not a clean boolean.
+        },
         "citation": {
             "text": "Southern Photometric Local Universe Survey DR4 (Mendes de Oliveira et al. 2019; DR4: Herpich et al. 2024)",
             "doi": "10.1093/mnras/stz1985",
@@ -527,18 +712,32 @@ def default_table(catalog: str) -> str:
     return tables[0]
 
 
+# Survey sentinel-magnitude bounds: catalogs pad MISSING photometry with
+# sentinel values (99, 99.99, -99, -9999, ...). Anything outside this range is
+# sentinel padding, never real photometry. This is DATA-VALIDITY hygiene — a
+# platform sentinel-removal guard, NOT a science cut (saturation/noise-floor
+# selections are the caller's job) — and it is the single source of truth for
+# every sentinel threshold in the Data Lab stack (builders, orchestration,
+# analysis). NOIRLab beta eval: three sibling ad-hoc thresholds (cmag<50,
+# cmag<99, |mag|<90) read as unexplained science cuts.
+SENTINEL_MAG_RANGE = (-5.0, 50.0)
+
 # Default point-source (star) selection per table, in the build_catalog_predicates
 # morphology-argument schema. Used when a caller asks for point_sources without an
 # explicit cut. Thresholds follow each survey's documented star/galaxy convention.
+# NOTE the two threshold FAMILIES, which differ by two orders of magnitude and
+# must never be swapped (NOIRLab beta eval: a model applied 0.5 to spread_model):
+#   * class_star-style classifier probabilities: 0.5/0.9 apply to class_star ONLY.
+#   * spread_model-style morphology measures: DES uses |spread_model_r| < 0.003.
 _POINT_SOURCE_CUTS = {
-    "nsc_dr2.object": {"column": "class_star", "op": ">", "value": 0.5},
-    "des_dr1.main": {"column": "spread_model_r", "between": [-0.003, 0.003]},  # DES DR1 stellar cut |spread_model_r| < 0.003
+    "nsc_dr2.object": {"column": "class_star", "op": ">", "value": 0.5},  # 0.5 is a class_star-ONLY convention
+    "des_dr1.main": {"column": "spread_model_r", "between": [-0.003, 0.003]},  # DES DR1 stellar cut |spread_model_r| < 0.003 (NEVER 0.5)
     "delve_dr3.coadd_objects": {"column": "ext_coadd", "between": [0, 1]},  # 0/1 = star/candidate star
     "smash_dr1.object": {"column": "sharp", "between": [-0.5, 0.5]},
     "smash_dr2.object": {"column": "sharp", "between": [-0.5, 0.5]},
     "vhs_dr5.vhs_cat_v3": {"column": "mergedclass", "in": [-1, -2]},  # VSA: -1 star, -2 probable star
     "allwise.source": {"column": "ext_flg", "op": "=", "value": 0},  # 0 = PSF-consistent point source
-    "splus_dr4.dual": {"column": "class_star", "op": ">", "value": 0.9},  # SExtractor CLASS_STAR convention
+    "splus_dr4.dual": {"column": "class_star", "op": ">", "value": 0.9},  # SExtractor CLASS_STAR convention (class_star ONLY)
     # unwise_dr1 and twomass get no default cut: the 2MASS PSC is point sources by
     # construction, and unWISE's 6" PSF makes a blanket spread_model cut unreliable.
 }
@@ -613,6 +812,134 @@ def point_source_cut(catalog: str, table: str) -> Optional[Dict[str, Any]]:
     return {k: (list(v) if isinstance(v, list) else v) for k, v in cut.items()}
 
 
+# ── Structured coverage classification (RE-B5) ──────────────────────────────
+# Machine-readable curation over the per-catalog `coverage` dicts, so
+# datalab_list_catalogs can filter/rank by position server-side instead of the
+# model dumping "covers the LMC: NO" rows. Booleans encode only what the
+# footprint prose (or uncontroversial survey knowledge) asserts; anything not
+# encoded classifies as "unverified", never as covered.
+
+# Region centers/radii match the KNOWN_MW_OBJECTS entries below.
+_LMC_CENTER = (80.894, -69.756)
+_LMC_RADIUS_DEG = 5.0
+_SMC_CENTER = (13.187, -72.829)
+_SMC_RADIUS_DEG = 3.0
+_GALACTIC_PLANE_ABS_B_DEG = 10.0
+# Prose declination limits are "roughly" — allow a grace band before excluding.
+_DEC_RANGE_GRACE_DEG = 2.0
+# Hemisphere labels only exclude when the position is well away from the
+# equator (surveys labeled north/south routinely cross it by a few degrees).
+_HEMISPHERE_EQUATORIAL_BAND_DEG = 20.0
+
+# J2000 ICRS coordinates of the north Galactic pole (standard IAU values).
+_NGP_RA_DEG = 192.859508
+_NGP_DEC_DEG = 27.128336
+
+# Band tokens that name the same physical bandpass across surveys (2MASS spells
+# Ks as 'k' in its column template; VHS spells it 'ks').
+_BAND_TOKEN_ALIASES = {"ks": "k"}
+
+
+def angular_separation_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Great-circle separation in degrees (Vincenty form — stable at all scales)."""
+    import math
+
+    r1, d1, r2, d2 = (math.radians(v) for v in (ra1, dec1, ra2, dec2))
+    dr = r2 - r1
+    num = math.hypot(
+        math.cos(d2) * math.sin(dr),
+        math.cos(d1) * math.sin(d2) - math.sin(d1) * math.cos(d2) * math.cos(dr),
+    )
+    den = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(dr)
+    return math.degrees(math.atan2(num, den))
+
+
+def galactic_latitude_deg(ra: float, dec: float) -> float:
+    """Galactic latitude b (degrees) of an ICRS position — closed form, no deps."""
+    import math
+
+    ra_r, dec_r = math.radians(ra), math.radians(dec)
+    ngp_ra, ngp_dec = math.radians(_NGP_RA_DEG), math.radians(_NGP_DEC_DEG)
+    sin_b = (
+        math.sin(dec_r) * math.sin(ngp_dec)
+        + math.cos(dec_r) * math.cos(ngp_dec) * math.cos(ra_r - ngp_ra)
+    )
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_b))))
+
+
+def _canonical_band(token: Any) -> str:
+    text = str(token or "").strip().lower()
+    return _BAND_TOKEN_ALIASES.get(text, text)
+
+
+def catalog_lists_band(bands: Any, band: str) -> bool:
+    """True when a catalog's `bands` list contains the (alias-normalized) band."""
+    want = _canonical_band(band)
+    if not want:
+        return False
+    return any(_canonical_band(b) == want for b in (bands or []))
+
+
+def coverage_status_for_position(
+    coverage: Any, ra: float, dec: float
+) -> tuple:
+    """Classify one catalog's structured `coverage` dict against a position.
+
+    Returns ``(status, reason)`` with status one of:
+      * ``"covered"``     — the registry asserts coverage here (all-sky, or an
+        explicit region boolean for the LMC/SMC/Galactic plane);
+      * ``"not_covering"`` — the registry asserts NON-coverage (region boolean
+        False, position outside a stated declination range, or deep in the
+        wrong hemisphere);
+      * ``"unverified"``  — the registry makes no claim either way. Dec ranges
+        and hemispheres only ever EXCLUDE: being inside a survey's declination
+        range never proves coverage.
+    """
+    cov = coverage if isinstance(coverage, Mapping) else {}
+    if not cov:
+        return "unverified", "no structured coverage metadata for this catalog"
+
+    regions = []
+    if angular_separation_deg(ra, dec, *_LMC_CENTER) <= _LMC_RADIUS_DEG:
+        regions.append(("covers_lmc", "the LMC region"))
+    if angular_separation_deg(ra, dec, *_SMC_CENTER) <= _SMC_RADIUS_DEG:
+        regions.append(("covers_smc", "the SMC region"))
+    if abs(galactic_latitude_deg(ra, dec)) <= _GALACTIC_PLANE_ABS_B_DEG:
+        regions.append(("covers_galactic_plane", f"the Galactic plane (|b| <= {_GALACTIC_PLANE_ABS_B_DEG:.0f} deg)"))
+
+    # Explicit non-coverage of a matched region wins over everything.
+    for key, label in regions:
+        if cov.get(key) is False:
+            return "not_covering", f"registry footprint states this catalog does not cover {label}"
+    # Explicit coverage of a matched region, or an all-sky footprint.
+    for key, label in regions:
+        if cov.get(key) is True:
+            return "covered", f"registry footprint includes {label}"
+    if cov.get("all_sky") is True:
+        return "covered", "all-sky catalog"
+
+    dec_min, dec_max = cov.get("dec_min"), cov.get("dec_max")
+    if dec_min is not None and dec < float(dec_min) - _DEC_RANGE_GRACE_DEG:
+        return (
+            "not_covering",
+            f"position Dec {dec:+.1f} deg is south of the survey's ~{float(dec_min):+.0f} deg declination limit",
+        )
+    if dec_max is not None and dec > float(dec_max) + _DEC_RANGE_GRACE_DEG:
+        return (
+            "not_covering",
+            f"position Dec {dec:+.1f} deg is north of the survey's ~{float(dec_max):+.0f} deg declination limit",
+        )
+
+    hemisphere = str(cov.get("hemisphere") or "").strip().lower()
+    if abs(dec) > _HEMISPHERE_EQUATORIAL_BAND_DEG:
+        if hemisphere == "north" and dec < 0:
+            return "not_covering", "southern position, northern-hemisphere survey"
+        if hemisphere == "south" and dec > 0:
+            return "not_covering", "northern position, southern-hemisphere survey"
+
+    return "unverified", "coverage unverified for this position"
+
+
 def list_catalogs() -> List[Dict[str, Any]]:
     """Return the compact CURATED catalog list for tool output — a governed
     subset of the live service, not the complete Data Lab schema inventory
@@ -626,6 +953,9 @@ def list_catalogs() -> List[Dict[str, Any]]:
                 "tables": sorted(entry.get("tables", {}).keys()),
                 "region_strategy": entry.get("region_strategy", "q3c"),
                 "footprint": entry.get("footprint"),
+                "bands": list(entry.get("bands", [])),
+                "wavelength_regime": list(entry.get("wavelength_regime", [])),
+                "coverage": dict(entry.get("coverage", {})),
                 "citation": entry.get("citation", {}).get("text"),
             }
         )
@@ -638,6 +968,9 @@ def list_catalogs() -> List[Dict[str, Any]]:
                 "tables": [entry["table"]],
                 "region_strategy": "q3c",
                 "footprint": entry.get("footprint"),
+                "bands": list(entry.get("bands", [])),
+                "wavelength_regime": list(entry.get("wavelength_regime", [])),
+                "coverage": dict(entry.get("coverage", {})),
                 "citation": (entry.get("citation") or {}).get("text"),
             }
         )
@@ -910,6 +1243,16 @@ EXPANSION_CATALOGS: List[Dict[str, Any]] = [
         "catalog": "delve_dr2", "table": "objects",
         "footprint": "DECam Local Volume Exploration Survey DR2 — ~21,000 deg² of the "
                      "high-Galactic-latitude southern sky and Magellanic periphery (grizY).",
+        # DELVE DR2 catalogs DECam griz (Drlica-Wagner et al. 2022).
+        "bands": ["g", "r", "i", "z"],
+        "wavelength_regime": ["optical"],
+        "coverage": {
+            "hemisphere": "south",
+            # High-Galactic-latitude by design (DELVE-WIDE |b| > 10°).
+            "covers_galactic_plane": False,
+            # covers_lmc/covers_smc omitted: DR2 prose says Magellanic
+            # PERIPHERY — main-body coverage is not asserted.
+        },
         "citation": {
             "text": "DELVE Data Release 2 (Drlica-Wagner et al. 2022)",
             "doi": "10.3847/1538-4365/ac78eb",
@@ -919,6 +1262,15 @@ EXPANSION_CATALOGS: List[Dict[str, Any]] = [
     {
         "catalog": "catwise2020", "table": "main",
         "footprint": "CatWISE2020 — all-sky W1+W2 co-adds from WISE/NEOWISE (2010–2018).",
+        "bands": ["w1", "w2"],
+        "wavelength_regime": ["mid-ir"],
+        "coverage": {
+            "hemisphere": "both",
+            "all_sky": True,
+            "covers_lmc": True,
+            "covers_smc": True,
+            "covers_galactic_plane": True,
+        },
         "citation": {
             "text": "CatWISE2020 (Marocco et al. 2021)",
             "doi": "10.3847/1538-4365/abd805",
@@ -929,6 +1281,14 @@ EXPANSION_CATALOGS: List[Dict[str, Any]] = [
         "catalog": "ls_dr10", "table": "tractor",
         "footprint": "DESI Legacy Imaging Surveys DR10 — ~20,000 deg² of grizW1–W4 tractor "
                      "photometry (DECam + BASS/MzLS).",
+        "bands": ["g", "r", "i", "z", "w1", "w2", "w3", "w4"],
+        "wavelength_regime": ["optical", "mid-ir"],
+        "coverage": {
+            # DECam south + BASS/MzLS north. No region booleans: the DR10
+            # boundary (extra southern DECam area vs. the DR9 |b| cut) is not
+            # stated in the footprint prose — verify per-position.
+            "hemisphere": "both",
+        },
         "citation": {
             "text": "DESI Legacy Imaging Surveys DR10 (Dey et al. 2019)",
             "doi": "10.3847/1538-3881/ab089d",
@@ -940,6 +1300,18 @@ EXPANSION_CATALOGS: List[Dict[str, Any]] = [
 _EXPANSION_BY_QUALIFIED: Dict[str, Dict[str, Any]] = {
     f"{entry['catalog']}.{entry['table']}": entry for entry in EXPANSION_CATALOGS
 }
+
+
+def _backfill_coverage_notes() -> None:
+    """Mirror each entry's footprint prose into coverage.notes so the coverage
+    dict is self-contained (machine keys + the human-readable statement)."""
+    for _entry in list(DATALAB_CATALOGS.values()) + EXPANSION_CATALOGS:
+        coverage = _entry.setdefault("coverage", {})
+        if isinstance(coverage, dict):
+            coverage.setdefault("notes", _entry.get("footprint"))
+
+
+_backfill_coverage_notes()
 
 
 def expansion_qualified_tables() -> List[str]:
@@ -1927,7 +2299,7 @@ _PROFILE_PITFALLS = [
     },
     {
         "id": "magnitude_cut_hygiene",
-        "summary": "never invent saturation/noise-floor magnitude cuts; automatic mag > -5 AND mag < 50 filters are sentinel-removal validity guards, not science choices",
+        "summary": "automatic -5 < mag < 50 filters are sentinel removal (99/-99 padding), not science — never invent saturation/noise-floor magnitude cuts",
         "detail": (
             "The one-shot diagram tools automatically exclude survey sentinel magnitudes (99/-99) with "
             "mag > -5 AND mag < 50 validity filters — never cite or copy these as science cuts. Apply a "
@@ -1936,6 +2308,22 @@ _PROFILE_PITFALLS = [
             "'avoid the noise floor' or 'mag < 50' cuts."
         ),
         "applies_to": [{"kind": "archive", "ref": "datalab"}],
+        # Ranked into the system-prompt index (RE-B2): unranked, the projection
+        # never showed it and models kept presenting the guard as science.
+        "prompt_rank": 3,
+    },
+    {
+        "id": "des_morphology_threshold",
+        "summary": "DES star/galaxy: |spread_model_r| < 0.003 = star, spread_model_r > 0.003 = galaxy — 0.5 is a class_star-ONLY convention, never a spread_model threshold",
+        "detail": (
+            "des_dr1.main separates stars from galaxies with the PER-BAND spread_model_r column at the "
+            "~0.003 scale (stars |spread_model_r| < 0.003; galaxies spread_model_r > 0.003). Do NOT "
+            "transplant the 0.5 threshold from class_star-style classifier probabilities (NSC class_star "
+            "> 0.5, S-PLUS class_star > 0.9) onto spread_model — the two families differ by two orders "
+            "of magnitude and spread_model_r > 0.5 selects essentially nothing physical (NOIRLab beta "
+            "eval). class_star_r near 1 = star-like is also available per-band on DES."
+        ),
+        "applies_to": [{"kind": "table", "ref": "des_dr1.main"}],
     },
 ]
 
@@ -1968,8 +2356,7 @@ _PROFILE_GOLDEN_EXAMPLES = [
                     "SELECT ra, dec, mag_auto_g - mag_auto_r AS gr, mag_auto_r "
                     "FROM des_dr1.main "
                     "WHERE q3c_radial_query(ra, dec, 34.0, -5.0, 0.5) "
-                    "AND flags_r = 0 AND mag_auto_r < 24 AND spread_model_r < 0.003 "
-                    "LIMIT 5000"
+                    "AND flags_r = 0 AND mag_auto_r < 24 AND spread_model_r < 0.003"
                 ),
                 "expert_ack": True,
                 "reason": "CMD needs a computed colour column; per-band mag_auto_g/r with NaN-safe upper-bound cuts.",
@@ -1978,9 +2365,10 @@ _PROFILE_GOLDEN_EXAMPLES = [
         "request": {"kind": "sql", "argument": "sql"},
         "note": (
             "mag_auto_r / spread_model_r / flags_r are PER-BAND; upper-bound cuts are NaN-safe as "
-            "written. The LIMIT here is a row-budget cap (platform cost governance, ceiling 5000), "
-            "not a science cut — only add one when the user's request needs it, and disclose it; "
-            "without a LIMIT the governor caps row-level queries at 500 and says so in warnings."
+            "written. Note there is NO LIMIT: row caps are platform cost governance, not science — "
+            "never add a LIMIT the user didn't ask for. The governor row-caps row-level queries "
+            "itself (default 500, ceiling 5000), flags the cap in warnings/provenance, and the "
+            "uncapped path is an async_submit background job or an aggregate builder."
         ),
     },
     {

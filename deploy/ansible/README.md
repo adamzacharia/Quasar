@@ -21,7 +21,9 @@ deploy/ansible/
 - A control machine with **Ansible ≥ 2.14** and SSH access to the VM.
   Ansible does not run natively on Windows — use **WSL** (`sudo apt install
   ansible`), macOS, or any Linux box.
-- VM OS: Ubuntu 24.04 or Rocky/RHEL 9, with an SSH user that can `sudo`.
+- Production target: Ubuntu 24.04 / CPython 3.12 on x86_64. The existing
+  Rocky/RHEL 9 system tasks remain, but this lock is not claimed as
+  acceptance-tested there.
 - Firewall (TACC side): inbound **80/443 only** (nginx is the front door).
   Ports 8000/3001 stay closed — nginx reaches them on localhost.
 
@@ -55,7 +57,8 @@ ansible-playbook -i inventory.ini quasar.yml --ask-vault-pass
 ```
 
 ~10–15 min on a fresh VM (the scientific Python stack dominates). To ship a
-code update later (git pull → pip → npm build → restart, no system changes):
+code update later (git pull → locked venv validation/switch → npm build →
+restart, no system changes):
 
 ```bash
 ansible-playbook -i inventory.ini quasar.yml --ask-vault-pass --tags deploy
@@ -66,12 +69,69 @@ ansible-playbook -i inventory.ini quasar.yml --ask-vault-pass --tags deploy
 | Piece | Detail |
 |---|---|
 | System | git, nginx, build tools, Python 3.12, Node 22 (NodeSource) |
-| User/layout | `quasar` system user; repo at `/opt/quasar/app`, venv at `/opt/quasar/venv` |
+| User/layout | `quasar` system user; repo at `/opt/quasar/app`; lock-addressed venvs under `/opt/quasar/venvs/`; stable link at `/opt/quasar/venv` |
 | Backend | `quasar-backend.service` → `venv/bin/python launch.py` from `ui-pro/` (CWD matters: DiskCache paths are CWD-relative), `.env` rendered at repo root, journald logs |
 | Frontend | `quasar-frontend.service` → `next start` on 127.0.0.1:3001 after `npm ci && npm run build` |
 | nginx | `/api/` → :8000 with SSE settings; `/` → :3001; 200 MB upload cap |
 
 Logs: `journalctl -u quasar-backend -f` / `-u quasar-frontend -f`.
+
+## Production Python dependencies
+
+The dependency files have deliberately different roles:
+
+- `requirements/production.in` is the human-edited list of direct production
+  dependencies. The root `requirements.txt` includes it for the existing
+  development and CI workflow.
+- `requirements/production-py312-linux-x86_64.txt` is generated and must not
+  be edited by hand. Ansible installs this file with pip hash checking and a
+  wheel-only policy.
+- `requirements/optional-sparcl.in` is an optional Python 3.13 input. It is
+  never included in Python 3.12 production.
+
+SparCL 1.3.0 declares `pandas<2.2` on Python versions below 3.13. Production
+keeps `lsdb==0.9.2`, whose nested-pandas dependency requires
+`pandas>=2.2.3,<2.4`; the published metadata therefore cannot resolve together
+on Python 3.12. Quasar already imports the SparCL client lazily, so only
+SparCL-backed spectrum search, retrieval, plotting, stacking, and enrichment
+are unavailable. Do not work around the conflict with `--no-deps` or a
+resolver override.
+
+Generate the lock with **uv 0.11.28** on Linux from the repository root using
+the exact command below:
+
+```bash
+uv pip compile requirements/production.in \
+  --python-version 3.12 \
+  --python-platform x86_64-manylinux_2_28 \
+  --only-binary :all: \
+  --emit-build-options \
+  --generate-hashes \
+  --exclude-newer 2026-09-02T00:00:00Z \
+  --upgrade \
+  --no-cache \
+  --no-python-downloads \
+  --output-file requirements/production-py312-linux-x86_64.txt
+```
+
+`--upgrade` prevents an older output lock from influencing regeneration.
+`--exclude-newer` freezes the candidate universe, while exact versions and
+SHA-256 hashes make installation deterministic. If a future dependency has no
+compatible wheel, stop and review that package explicitly instead of silently
+removing the wheel-only policy.
+
+Ansible hashes the lock and builds a new venv directly at
+`/opt/quasar/venvs/py312-<lock-sha256>`. It runs `pip check`, imports the
+critical packages, verifies `pyvo.registry.Freetext`, and asserts SparCL is
+absent before switching `/opt/quasar/venv`. If service activation or health
+validation fails, the previous symlink (or preserved legacy directory) is
+restored before the play fails. Interrupted, unactivated releases without the
+validation marker are rebuilt. On the first migration, an existing directory
+at `/opt/quasar/venv` is preserved as
+`/opt/quasar/venvs/legacy-pre-lock`; restore it to its original path before
+trying to use it because Python venvs are not relocatable. Old validated
+releases are retained for manual rollback and must be pruned deliberately when
+disk usage warrants it.
 
 ## DNS cutover (quasarassistant.com)
 
@@ -103,12 +163,21 @@ certbot edits the nginx site in place (keeps the SSE proxy settings) and
 installs auto-renewal. The frontend is already built against
 `https://www.quasarassistant.com`, so no rebuild is needed after this.
 
-## Verifying SSE survives the proxy
+## Verifying backend health and SSE
+
+On the VM, verify the backend directly. A successful response must contain
+both HTTP 200 and `"agent_loaded": true`:
 
 ```bash
-curl -N https://<host>/api/health
+curl --fail --silent http://127.0.0.1:8000/health \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("agent_loaded") is True; print(d)'
 ```
 
-then send a chat from the UI and confirm tokens arrive incrementally (not one
-burst at the end). If a response stalls exactly at 60 s, some proxy in the path
-is still buffering — the settings live in `templates/nginx-quasar.conf.j2`.
+The public nginx proxy preserves `/api/` URIs, while the backend health route
+is `/health`; `/api/health` is therefore not a valid public health check under
+the current unchanged proxy configuration.
+
+Then send a chat from the UI through nginx and confirm tokens arrive
+incrementally (not one burst at the end). If a response stalls exactly at 60 s,
+some proxy in the path is still buffering — the settings live in
+`templates/nginx-quasar.conf.j2`.

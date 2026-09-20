@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import logging
 import random
+import re
 import time
 from typing import Any, Callable, Optional, Set, Tuple, Type
 
@@ -36,6 +37,35 @@ NON_RETRYABLE_EXCEPTIONS: Tuple[Type[Exception], ...] = (
     ValueError,
     TypeError,
     KeyError,
+)
+
+# Transport / mid-stream failure signatures, matched on the MESSAGE when the
+# exception carries no HTTP status. A litellm/vLLM gateway that dies after the
+# SSE stream is already 200 delivers its failure as an in-band
+# ``{"error": ...}`` event, which the openai SDK raises as the generic
+# ``APIError`` (status_code=None) — a type name that matched none of the
+# name patterns below, so the stream-round retry in core/runner.py never
+# fired for exactly the deaths it was built for (live 2026-09-17: 10 of 27
+# benchmark trials lost to
+# "litellm.MidStreamFallbackError: litellm.APIConnectionError: ...
+# An error occurred during streaming").
+TRANSPORT_MESSAGE_RE = re.compile(
+    r"(error occurred during streaming|midstreamfallback|apiconnectionerror"
+    r"|connection (?:reset|aborted|closed|error|refused|dropped|lost)"
+    r"|remote end closed|server disconnected|peer closed|broken pipe"
+    r"|incomplete (?:read|chunked|message)|stream (?:ended|closed|interrupted|error|failed)"
+    r"|timed out|timeout|temporarily unavailable|bad gateway|gateway time-?out"
+    r"|service unavailable|overloaded|internal server error)",
+    re.IGNORECASE,
+)
+
+# A mid-stream error whose payload says the REQUEST is at fault is not a
+# transport failure: re-issuing the identical request cannot help.
+NON_RETRYABLE_MESSAGE_RE = re.compile(
+    r"(insufficient_quota|context[_ ]length|maximum context|too many tokens"
+    r"|invalid_request|invalid request|authentication|unauthori[sz]ed|permission"
+    r"|not (?:found|supported)|does not exist|unsupported|malformed|failed to parse)",
+    re.IGNORECASE,
 )
 
 
@@ -111,7 +141,44 @@ def _is_retryable(error: Exception) -> bool:
         'timeout', 'connection', 'network', 'reset', 'eof',
         'readerror', 'remoteprotocol', 'incomplete',
     ]
-    return any(p in error_name for p in retryable_patterns)
+    if any(p in error_name for p in retryable_patterns):
+        return True
+
+    # No HTTP status and no recognisable type name: classify on the message
+    # and on the SDK's own taxonomy. openai raises the bare ``APIError`` for an
+    # in-band error event on an already-open stream (never for a rejected
+    # request — those are ``APIStatusError`` subclasses with a status code),
+    # so a status-less APIError is a stream death unless its payload blames
+    # the request itself.
+    message = str(error)
+    body = getattr(error, "body", None)
+    body_text = ""
+    if isinstance(body, dict):
+        body_text = " ".join(str(body.get(k) or "") for k in ("code", "type", "message", "param"))
+    if NON_RETRYABLE_MESSAGE_RE.search(message) or NON_RETRYABLE_MESSAGE_RE.search(body_text):
+        return False
+    if TRANSPORT_MESSAGE_RE.search(message) or TRANSPORT_MESSAGE_RE.search(body_text):
+        return True
+    if _is_statusless_openai_api_error(error):
+        return True
+    return False
+
+
+def _is_statusless_openai_api_error(error: Exception) -> bool:
+    """True for openai's generic ``APIError`` (mid-stream error event) that is
+    neither a status-bearing ``APIStatusError`` nor already a connection or
+    timeout error (both handled above by type name)."""
+    try:
+        import openai
+    except ImportError:
+        return False
+    api_error = getattr(openai, "APIError", None)
+    status_error = getattr(openai, "APIStatusError", None)
+    if api_error is None or not isinstance(error, api_error):
+        return False
+    if status_error is not None and isinstance(error, status_error):
+        return False
+    return getattr(error, "status_code", None) is None
 
 
 def _compute_delay(attempt: int, backoff_base: float, max_delay: float) -> float:

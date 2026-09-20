@@ -136,13 +136,17 @@ def validate(sql: str, *, source: str = "builder", meta: Optional[Mapping[str, A
     if needs_cap:
         limit = _limit_value(clean)
         if limit is None:
-            final_sql = f"{query}\nLIMIT {DEFAULT_ROW_CAP}"
+            # Self-describing injection (RE-B1): the comment travels with the
+            # provenance SQL so the cap can never read as a science choice,
+            # and platform_row_cap marks it machine-readably.
+            final_sql = f"{query}\nLIMIT {DEFAULT_ROW_CAP} /* platform row cap, not a science cut */"
             warnings.append(
                 f"Row cap LIMIT {DEFAULT_ROW_CAP} added by the query governor — platform cost "
                 "control, not a science cut. If it truncates the result, tell the user and offer "
                 "the uncapped path (async_submit background job or an aggregate builder)."
             )
             metadata.setdefault("row_limit", DEFAULT_ROW_CAP)
+            metadata.setdefault("platform_row_cap", DEFAULT_ROW_CAP)
         elif limit > MAX_ROW_CAP:
             _raise(
                 f"LIMIT {limit} exceeds the Data Lab row cap {MAX_ROW_CAP}",

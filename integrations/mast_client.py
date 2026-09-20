@@ -12,6 +12,9 @@ Registered agent tools:
     - get_mast_products()  (file-level product listing)
 """
 
+import threading
+import uuid
+
 import pandas as pd
 import warnings
 from typing import Optional, Dict, Any, List, Tuple
@@ -25,6 +28,14 @@ except ImportError:
 
 # Canonical cached SIMBAD resolver
 from integrations.simbad_resolver import _resolve_simbad_cached
+
+# Hard cap on concurrently-abandoned MAST download workers (guard CX-01,
+# mirroring services/datalab_image_service.py::_DOWNLOAD_SLOTS): a hung or
+# trickling archive transfer leaves an uncancellable daemon worker behind;
+# each holds a slot until astroquery finally returns/errors, and when all
+# slots are held further downloads fail FAST instead of stacking
+# threads+sockets without bound.
+_DOWNLOAD_SLOTS = threading.BoundedSemaphore(4)
 
 
 class MASTClient:
@@ -288,6 +299,122 @@ class MASTClient:
             print(f"[MAST] Product list error: {e}")
             return pd.DataFrame()
 
+    # L9 (tmp/scan-2026-07-17): period-fold/lightcurve turns stalled to the
+    # no-progress watchdog while download_products blocked on TESS FITS pulls
+    # with no timebox. Astroquery performs the transfer internally (no
+    # response object exists here to watchdog-close), so the bound must come
+    # from OUTSIDE the call — a daemon worker joined with a wall budget, the
+    # same pattern as services/datalab_image_service.py::_download_fits.
+    DOWNLOAD_WALL_DEFAULT_SECONDS = 480.0
+    # Ceiling on accepted MAST_DOWNLOAD_WALL_SECONDS values (guard CX-03):
+    # download_mast_data runs under a 600 s tool-guard override
+    # (core/agent.py _TOOL_TIMEOUT_OVERRIDES). Clamping to 540 s keeps 60 s
+    # of headroom so the specific structured MAST timeout always fires — and
+    # reaches the model — before the generic guard timeout can swallow it.
+    DOWNLOAD_WALL_MAX_SECONDS = 540.0
+
+    def _download_wall_seconds(self) -> float:
+        """Total wall-clock budget for one download_products transfer.
+
+        Malformed/NaN/inf/negative MAST_DOWNLOAD_WALL_SECONDS values fall
+        back to the derived default instead of disabling or crashing
+        enforcement (same contract as DATALAB_IMAGE_DOWNLOAD_WALL_SECONDS).
+        Accepted values are clamped to DOWNLOAD_WALL_MAX_SECONDS so the
+        MAST-specific timeout message always beats the 600 s tool guard
+        (CX-03).
+        """
+        import math
+        import os
+
+        try:
+            wall = float(os.getenv("MAST_DOWNLOAD_WALL_SECONDS", "0") or 0)
+        except ValueError:
+            wall = 0.0
+        if not math.isfinite(wall) or wall <= 0:
+            wall = 0.0
+        wall = min(wall, self.DOWNLOAD_WALL_MAX_SECONDS)
+        return wall or self.DOWNLOAD_WALL_DEFAULT_SECONDS
+
+    def _download_products_bounded(self, prod_table, download_dir: str,
+                                    downloader=None):
+        """Run astroquery's downloader on a worker thread joined with the
+        wall budget (L9). On expiry the daemon worker is abandoned and an
+        honest TimeoutError is raised, so a trickling/hung MAST transfer can
+        no longer outlive even the tool guard's 600 s budget. Abandoned
+        workers are capped by _DOWNLOAD_SLOTS (CX-01): each holds a permit
+        until astroquery returns, and when every slot is held the next call
+        fails fast instead of stacking another thread."""
+        wall_seconds = self._download_wall_seconds()
+        if downloader is None:
+            def downloader(table, ddir):
+                return Observations.download_products(table, download_dir=ddir)
+        box: Dict[str, Any] = {}
+        if not _DOWNLOAD_SLOTS.acquire(blocking=False):
+            raise TimeoutError(
+                "MAST download refused: all download worker slots are held "
+                "by previous unresponsive transfers. The archive is not "
+                "keeping up — do NOT retry immediately."
+            )
+
+        def _run():
+            try:
+                box["manifest"] = downloader(prod_table, download_dir)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                box["exc"] = exc
+            finally:
+                _DOWNLOAD_SLOTS.release()
+
+        worker = threading.Thread(
+            target=_run, daemon=True, name="quasar-mast-download"
+        )
+        try:
+            worker.start()
+        except BaseException:
+            # A failed start (e.g. "can't start new thread" under the very
+            # exhaustion this cap contains) means _run() never executes — the
+            # permit must be handed back here or it leaks forever (mirrors
+            # datalab_image_service CX-34).
+            _DOWNLOAD_SLOTS.release()
+            raise
+        worker.join(wall_seconds)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"MAST product download exceeded its {wall_seconds:.0f}s "
+                "wall-clock deadline while the transfer was still running "
+                "(hung or trickling; worker abandoned). Partial files may "
+                f"remain under {download_dir}."
+            )
+        if "exc" in box:
+            raise box["exc"]
+        return box.get("manifest")
+
+    @staticmethod
+    def _make_call_dir(base_dir: str) -> str:
+        """Create a unique per-call download directory under base_dir (CX-02).
+
+        A timed-out worker is abandoned but keeps writing into ITS call's
+        directory, so a later call must NEVER be handed an existing one:
+        the FULL 128-bit uuid4 hex (not a truncated fragment) plus
+        ``exist_ok=False`` makes silent reuse impossible. On the
+        astronomically-unlikely name collision, retry once with a fresh
+        uuid before giving up.
+        """
+        import os
+
+        last_exc: Optional[BaseException] = None
+        for _ in range(2):
+            call_dir = os.path.join(base_dir, f"dl-{uuid.uuid4().hex}")
+            try:
+                os.makedirs(call_dir, exist_ok=False)
+            except FileExistsError as exc:
+                last_exc = exc
+                continue
+            return call_dir
+        raise FileExistsError(
+            f"could not create a unique MAST download directory under "
+            f"{base_dir} after 2 attempts"
+        ) from last_exc
+
     def download_products(self, products: pd.DataFrame = None,
                           observations: pd.DataFrame = None,
                           download_dir: str = None,
@@ -312,39 +439,46 @@ class MASTClient:
             return {"success": False, "error": "astroquery.mast not available"}
         
         import os
-        download_dir = download_dir or os.path.join(
+        base_dir = download_dir or os.path.join(
             os.path.expanduser("~"), "quasar_data", "mast"
         )
-        os.makedirs(download_dir, exist_ok=True)
-        
+
         try:
             from astropy.table import Table
-            
+
             # Get products if only observations provided
             if products is None or products.empty:
                 if observations is None or observations.empty:
                     return {"success": False, "error": "No data to download. Run search_mast and get_mast_products first."}
-                products = self.get_product_list(observations, 
+                products = self.get_product_list(observations,
                                                  productType=productType,
                                                  extension=extension)
-            
+
             if products.empty:
                 return {"success": False, "error": "No matching data products found."}
-            
+
             # Apply safety limit
             if len(products) > max_files:
                 print(f"[MAST] Limiting download to {max_files} files (of {len(products)} available)")
                 products = products.head(max_files)
-            
+
+            # CX-02: every call transfers into its own per-call subdirectory.
+            # A timed-out worker is abandoned but keeps writing (L9) — a
+            # shared directory would let those late writes collide with a
+            # retry or a later call. The returned manifest/paths point inside
+            # this per-call directory, so the caller only ever sees files
+            # from ITS transfer. Created only once there is actually data to
+            # download, so no-data early returns never leak empty dirs.
+            download_dir = self._make_call_dir(base_dir)
+
             # Convert to astropy table for MAST API
             prod_table = Table.from_pandas(products)
             
             print(f"[MAST] Downloading {len(products)} files to {download_dir}")
             
-            manifest = Observations.download_products(
-                prod_table,
-                download_dir=download_dir
-            )
+            # L9: wall-clock-bounded from outside — astroquery's downloader
+            # has no per-transfer deadline of its own.
+            manifest = self._download_products_bounded(prod_table, download_dir)
             
             if manifest is None:
                 return {"success": False, "error": "Download returned no results"}
@@ -365,6 +499,21 @@ class MASTClient:
                 "note": f"Downloaded {len(downloaded)} files to {download_dir}"
             }
             
+        except TimeoutError as e:
+            # L9: structured timeout — core/runner.py keys step closure and
+            # SSE deadline exclusion on timeout: True
+            # (_result_indicates_timeout).
+            print(f"[MAST] Download timed out: {e}")
+            return {
+                "success": False,
+                "timeout": True,
+                "error": (
+                    f"MAST download TIMEOUT: {e} "
+                    "Do NOT retry this exact call — the archive transfer is "
+                    "not keeping up. Reduce max_files or narrow the product "
+                    "filters, or answer from data already downloaded."
+                ),
+            }
         except Exception as e:
             print(f"[MAST] Download error: {e}")
             import traceback

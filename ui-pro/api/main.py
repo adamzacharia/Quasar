@@ -90,6 +90,29 @@ def _init_all_tables():
         logger.warning(f"[STARTUP] Personalization table init failed: {e}")
 
 
+@app.on_event("startup")
+def _sweep_orphaned_runs():
+    """Mark runs stranded in 'started' by a previous process death as failed
+    (taskboard RUN-SWEEPER; backstop behind the in-request sweep, guard
+    CX-33). On a daemon thread so a slow Turso round-trip never delays boot."""
+    import threading
+
+    def _sweep():
+        try:
+            from api.deps import issue_report_service
+
+            max_age = int(os.getenv("QUASAR_RUN_SWEEP_MAX_AGE_MINUTES", "30") or 30)
+            swept = issue_report_service.sweep_stale_started_runs(
+                max_age_minutes=max_age
+            )
+            if swept:
+                logger.warning(f"[STARTUP] Swept {swept} orphaned 'started' run(s)")
+        except Exception as e:
+            logger.warning(f"[STARTUP] Orphaned-run sweep failed: {e}")
+
+    threading.Thread(target=_sweep, daemon=True, name="quasar-run-sweeper").start()
+
+
 @app.on_event("shutdown")
 def _shutdown_spectral_line_jobs():
     spectral_line_job_service.shutdown()

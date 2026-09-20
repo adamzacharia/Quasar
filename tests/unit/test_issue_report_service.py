@@ -44,6 +44,7 @@ def test_report_without_consent_excludes_conversation_text(tmp_path):
 
     assert report["prompt_excerpt"] == ""
     assert report["response_excerpt"] == ""
+    assert report["conversation_excerpt"] == []
     assert report["provider"] == "tacc"
     assert report["technical_context"]["tools_called"] == ["search_papers"]
     assert report["technical_context"]["provider_chunk_count"] == 0
@@ -67,7 +68,10 @@ def test_report_with_consent_redacts_and_truncates_context(tmp_path):
 
     assert secret not in report["prompt_excerpt"]
     assert len(report["prompt_excerpt"]) <= 2000
-    assert len(report["response_excerpt"]) == 2000
+    # The reported ANSWER is allowed up to MAX_RESPONSE_CHARS (6000): a
+    # 2000-char cap cut most answers in half, which is what a maintainer
+    # needs to read. 3000 chars therefore survive intact.
+    assert len(report["response_excerpt"]) == 3000
 
 
 def test_report_must_reference_users_own_run(tmp_path):

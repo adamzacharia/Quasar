@@ -9,10 +9,11 @@ import csv
 import io
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from services.admin_access import configured_admin_emails, is_admin_email
 from services.db import get_connection
+from services.secret_redaction import redact_secrets
 from pathlib import Path
 
 
@@ -20,6 +21,16 @@ from pathlib import Path
 ADMIN_EMAILS = sorted(configured_admin_emails())
 
 _LOCAL_DB = str(Path(__file__).resolve().parent.parent / "data" / "analytics.db")
+
+
+def _utf8_safe(value: str) -> str:
+    """Drop lone UTF-16 surrogates (a client string clipped mid-emoji): JSON
+    carries them, SQLite text binding cannot encode them."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "replace").decode("utf-8")
 
 
 class AnalyticsService:
@@ -103,9 +114,45 @@ class AnalyticsService:
                     model            TEXT,
                     prompt_preview   TEXT,
                     response_preview TEXT,
-                    created_at       TEXT NOT NULL
+                    created_at       TEXT NOT NULL,
+                    run_id           TEXT
                 )
             """)
+            # run_id lets a thumbs-down be joined to its chat run and to any
+            # issue report filed on the same message. No-op on fresh schemas.
+            for migration in ("ALTER TABLE response_feedback ADD COLUMN run_id TEXT",):
+                try:
+                    cur.execute(migration)
+                except Exception:
+                    pass
+            for column in ("snapshot_id", "snapshot_error"):
+                try:
+                    cur.execute(f"ALTER TABLE response_feedback ADD COLUMN {column} TEXT")
+                except Exception:
+                    try:
+                        cur.execute(f"SELECT {column} FROM response_feedback LIMIT 0")
+                    except Exception:
+                        print(f"[ANALYTICS] WARNING: response_feedback.{column} is missing after migration; feedback writes are unavailable", flush=True)
+            # A swallowed ALTER failure must not masquerade as "column already
+            # exists": probe the column and say so at startup (CX-08).
+            run_id_present = True
+            try:
+                cur.execute("SELECT run_id FROM response_feedback LIMIT 0")
+            except Exception as exc:
+                run_id_present = False
+                print(
+                    "[ANALYTICS] WARNING: response_feedback.run_id is missing after migration; "
+                    f"vote/report linkage will fail: {exc}",
+                    flush=True,
+                )
+            # Join keys for the admin vote/report linkage (after the run_id
+            # migration so the index exists on legacy databases too). The
+            # run_id index is skipped when the column is absent: indexing a
+            # missing column would raise here and stop the API from booting,
+            # which is exactly what the warning above exists to avoid.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_message ON response_feedback(message_id)")
+            if run_id_present:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_run ON response_feedback(run_id)")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_feedback_ts
                 ON response_feedback(created_at DESC)
@@ -354,35 +401,157 @@ class AnalyticsService:
         model: str = "",
         prompt_preview: str = "",
         response_preview: str = "",
+        run_id: str = "",
+        snapshot_id: str = "",
+        snapshot_error: str = "",
     ):
-        """Persist a like/dislike on a specific assistant response."""
-        now = datetime.utcnow().isoformat()
+        """Persist a like/dislike on a specific assistant response.
+
+        The previews are what an admin sees for a vote that never became a
+        full issue report, so they hold the whole question and a readable
+        slice of the answer (600 / 2000 chars) rather than a 200-char stub.
+        """
+        # Timezone-aware UTC: naive timestamps were parsed as LOCAL time by the
+        # admin UI and rendered hours off next to the issue reports (which are
+        # tz-aware). Old rows are normalised on read by _utc_iso().
+        now = datetime.now(timezone.utc).isoformat()
+        # Identifiers are client strings shown to admins and used as join keys:
+        # cap, redact and make them bindable before they touch the DB.
+        message_id = self._ident(message_id)
+        conversation_id = self._ident(conversation_id)
+        model = self._ident(model)
+        run_id = self._ident(run_id)
         conn = self._conn()
         try:
-            # Upsert: if user already voted on this message, update it
-            conn.execute(
-                "DELETE FROM response_feedback WHERE message_id = ? AND user_id = ?",
-                (message_id, user_id),
-            )
+            # Upsert: one vote per user per answer. The answer's client
+            # message_id is NOT stable (a live turn uses a random id, a reload
+            # uses text_block_id), so when the stable run_id is known the
+            # earlier vote on the same run is replaced too (CX-02).
+            if run_id:
+                conn.execute(
+                    "DELETE FROM response_feedback WHERE user_id = ? AND (message_id = ? OR run_id = ?)",
+                    (user_id, message_id, run_id),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM response_feedback WHERE message_id = ? AND user_id = ?",
+                    (message_id, user_id),
+                )
             conn.execute(
                 """INSERT INTO response_feedback
                    (message_id, conversation_id, user_id, feedback, model,
-                    prompt_preview, response_preview, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    prompt_preview, response_preview, created_at, run_id, snapshot_id, snapshot_error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message_id,
                     conversation_id,
                     user_id,
                     feedback,
                     model,
-                    prompt_preview[:200] if prompt_preview else "",
-                    response_preview[:500] if response_preview else "",
+                    # Previews are shown in the admin panel: redact secrets
+                    # (API keys, bearer tokens) before they are persisted (CX-09),
+                    # and drop lone surrogates SQLite cannot bind.
+                    _utf8_safe(redact_secrets(prompt_preview))[:600] if prompt_preview else "",
+                    _utf8_safe(redact_secrets(response_preview))[:2000] if response_preview else "",
                     now,
+                    run_id or "",
+                    self._ident(snapshot_id),
+                    _utf8_safe(redact_secrets(snapshot_error))[:300],
                 ),
             )
             conn.commit()
         finally:
             conn.close()
+
+    _FEEDBACK_ROW_KEYS = (
+        "created_at", "message_id", "run_id", "conversation_id", "user_id",
+        "feedback", "model", "prompt_preview", "response_preview",
+        "snapshot_id", "snapshot_error",
+    )
+
+    @staticmethod
+    def _ident(value) -> str:
+        """Client-supplied identifier: at most 128 chars, secrets redacted,
+        lone surrogates dropped."""
+        return _utf8_safe(redact_secrets(str(value or "")))[:128]
+
+    @staticmethod
+    def _utc_iso(value) -> str:
+        """Present a stored timestamp as tz-aware ISO-8601 UTC.
+
+        Rows written before log_feedback switched to aware timestamps carry a
+        naive ``datetime.utcnow()`` string; without an offset, browsers parse
+        it as local time.
+        """
+        text = str(value or "")
+        if not text:
+            return text
+        if text.endswith("Z") or "+" in text[10:] or "-" in text[10:]:
+            return text
+        return f"{text}+00:00"
+
+    def list_recent_feedback(
+        self, *, feedback: Optional[str] = None, limit: int = 50
+    ) -> List[Dict]:
+        """Most recent votes with their question/answer previews (admin view).
+
+        ``feedback`` filters to 'like' or 'dislike'; anything else means both.
+        """
+        clause = ""
+        params: List = []
+        if feedback in ("like", "dislike"):
+            clause = "WHERE feedback = ?"
+            params.append(feedback)
+        params.append(max(1, min(int(limit), 500)))
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                f"""SELECT created_at, message_id, run_id, conversation_id, user_id,
+                           feedback, model, prompt_preview, response_preview, snapshot_id, snapshot_error
+                    FROM response_feedback
+                    {clause}
+                    ORDER BY created_at DESC
+                    LIMIT ?""",
+                tuple(params),
+            ).fetchall()
+        finally:
+            conn.close()
+        result = [dict(zip(self._FEEDBACK_ROW_KEYS, r)) for r in rows]
+        for row in result:
+            row["created_at"] = self._utc_iso(row.get("created_at"))
+        return result
+
+    def _votes_keyed_by(self, column: str, ids, *, by_user: bool = False) -> Dict:
+        """{id: 'like'|'dislike'} for the given ids of ``column`` (latest wins)."""
+        wanted = [str(v) for v in (ids or []) if v]
+        if not wanted:
+            return {}
+        result: Dict[str, str] = {}
+        conn = self._conn()
+        try:
+            # SQLite's default parameter limit is 999; chunk defensively.
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""SELECT {column}, feedback, user_id FROM response_feedback
+                        WHERE {column} IN ({placeholders})
+                        ORDER BY created_at ASC""",
+                    tuple(chunk),
+                ).fetchall()
+                for key, vote, owner in rows:
+                    result[(str(owner or ""), str(key)) if by_user else str(key)] = str(vote)
+        finally:
+            conn.close()
+        return result
+
+    def get_feedback_for_messages(self, message_ids, *, by_user: bool = False) -> Dict:
+        """{message_id: vote}. Fallback join for reports whose run is unknown."""
+        return self._votes_keyed_by("message_id", message_ids, by_user=by_user)
+
+    def get_feedback_for_runs(self, run_ids, *, by_user: bool = False) -> Dict:
+        """{run_id: vote}. The stable join used to badge issue reports (CX-02)."""
+        return self._votes_keyed_by("run_id", run_ids, by_user=by_user)
 
     def _get_feedback_summary(self) -> Dict:
         """Return aggregated feedback counts."""
@@ -513,7 +682,7 @@ class AnalyticsService:
         try:
             rows = conn.execute(
                 """SELECT created_at, message_id, conversation_id, user_id,
-                          feedback, model, prompt_preview, response_preview
+                          feedback, model, prompt_preview, response_preview, run_id
                    FROM response_feedback
                    ORDER BY created_at DESC"""
             ).fetchall()
@@ -521,6 +690,8 @@ class AnalyticsService:
             conn.close()
         keys = [
             "timestamp", "message_id", "conversation_id", "user_id",
-            "feedback", "model", "prompt_preview", "response_preview",
+            "feedback", "model", "prompt_preview", "response_preview", "run_id",
         ]
+        # Export keeps stored timestamps verbatim (existing consumers); only
+        # the browser-facing listing normalises legacy naive values (CX-11).
         return [dict(zip(keys, r)) for r in rows]

@@ -52,17 +52,28 @@ def test_line_names_for_input_is_case_insensitive():
 
 
 def test_projects_with_array_combo_groups_by_project():
+    # Live ObsCore antenna_arrays values are Pad:Antenna pairs (never the words
+    # '12m'/'ACA'/'TP'); DV/DA = 12-m, CM = 7-m, PM = Total Power (A-01).
     df = pd.DataFrame([
-        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "12m Array", "target_name": "A"},
-        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "7m ACA", "target_name": "A"},
-        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "Total Power", "target_name": "A"},
-        {"proposal_id": "2022.1.00002.S", "antenna_arrays": "12m Array", "target_name": "B"},
+        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "A004:DV07 A025:DA45 J505:DV02", "target_name": "A",
+         "member_ous_uid": "uid://A001/X1/X1", "asdm_uid": "uid://A002/X1/X1"},
+        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "J501:CM03 J502:CM05 J503:CM12", "target_name": "A",
+         "member_ous_uid": "uid://A001/X1/X2", "asdm_uid": "uid://A002/X1/X2"},
+        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "N601:PM03 N602:PM04", "target_name": "A",
+         "member_ous_uid": "uid://A001/X1/X3", "asdm_uid": "uid://A002/X1/X3"},
+        {"proposal_id": "2022.1.00001.S", "antenna_arrays": "N601:PM03 N602:PM04", "target_name": "A",
+         "member_ous_uid": "uid://A001/X1/X3", "asdm_uid": "uid://A002/X1/X4"},
+        {"proposal_id": "2022.1.00002.S", "antenna_arrays": "A004:DV07 A025:DA45", "target_name": "B",
+         "member_ous_uid": "uid://A001/X2/X1", "asdm_uid": "uid://A002/X2/X1"},
     ])
 
     result = projects_with_array_combo(df, ["12m", "7m", "TP"])
 
     assert list(result["proposal_id"]) == ["2022.1.00001.S"]
-    assert "TP" in result.iloc[0]["arrays_found"]
+    assert result.iloc[0]["arrays_found"] == "12m, 7m, TP"
+    # Row grain: 4 rows = 3 MOUS = 4 EBs, reported separately.
+    assert result.iloc[0]["rows"] == 4
+    assert result.iloc[0]["n_mous"] == 3 and result.iloc[0]["n_eb"] == 4
 
 
 def test_line_coverage_and_project_line_set():
@@ -129,8 +140,8 @@ def test_redshifted_co_projects_summarize_project_hits():
     assert "1." in result.iloc[0]["inferred_redshift_ranges"]
 
 
-def test_hh212_alias_normalization():
-    assert normalize_target_alias("HH212") == "HH 212"
+def test_target_identifiers_are_left_to_resolver():
+    assert normalize_target_alias("HH212") == "HH212"
     assert normalize_target_alias("HH 212") == "HH 212"
 
 
@@ -286,7 +297,7 @@ def test_summarize_publication_links_dedupes_bibcodes():
     assert len(out) == 1
     row = out.iloc[0]
     assert row["n_publications"] == 2
-    assert row["observations"] == 2
+    assert row["rows"] == 2
     assert "uid://A/X1/X1" in row["member_ous_uids"] and "uid://A/X1/X2" in row["member_ous_uids"]
 
 

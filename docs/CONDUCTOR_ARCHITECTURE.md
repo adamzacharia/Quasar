@@ -495,7 +495,7 @@ t3 (synthesis):  "Compare archive data with literature"    depends_on: [t1, t2]
 
 **Cost tracking:** The QueryTracer logs that t1 used ~1200 input + 400 output tokens on gpt-4.1 ($0.005), t2 used ~800+200 on gpt-4.1-mini ($0.0006), synthesis used ~2000+1500 on gpt-5.4 ($0.065). Total: ~$0.07.
 
-**DAG cache:** This decomposition pattern is stored in `dag_cache.json`. Next time someone asks "Compare ALMA Band 3 observations of NGC 1068 with papers", the cached template is reused -- skipping the GPT-5.4 planning call.
+**DAG cache:** This decomposition pattern is stored in `dag_cache.json`. Next time someone asks "Compare ALMA Band 3 observations of IC 342 with papers", the cached template is reused -- skipping the GPT-5.4 planning call.
 
 **Output:** Streaming final answer + auto-generated Jupyter notebook (with real M87 Band 6 values pre-filled) + any rendered FITS images.
 

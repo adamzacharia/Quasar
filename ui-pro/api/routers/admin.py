@@ -1,10 +1,13 @@
 """Admin-only endpoints: issue-report management + analytics/feedback exports."""
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 
 from api.deps import (
     _current_user_email,
+    _storage_executor,
     analytics_service,
     conversation_service,
     get_current_user,
@@ -18,6 +21,25 @@ from services.eval_export_service import build_eval_export, to_jsonl
 router = APIRouter()
 
 
+@router.get("/api/admin/feedback/snapshots/{snapshot_id}")
+async def admin_feedback_snapshot(snapshot_id: str, export: bool = False,
+                                  current_user: dict = Depends(get_current_user)):
+    """Admin-only immutable evidence; retrieval never consults the live chat."""
+    if not is_admin_email(_current_user_email(current_user)):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    snapshot = await asyncio.get_event_loop().run_in_executor(
+        _storage_executor, lambda: issue_report_service.snapshots.get(snapshot_id))
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Feedback snapshot not found")
+    from services.feedback_snapshot_service import snapshot_json
+    headers = {"Cache-Control": "no-store"}
+    if export:
+        import uuid
+        safe_id = str(uuid.UUID(snapshot["id"]))
+        headers["Content-Disposition"] = f'attachment; filename="quasar-feedback-{safe_id}.json"'
+    return Response(snapshot_json(snapshot), media_type="application/json", headers=headers)
+
+
 @router.get("/api/admin/issue-reports")
 async def admin_issue_reports(
     status: str = "",
@@ -29,11 +51,17 @@ async def admin_issue_reports(
     limit: int = 200,
     current_user: dict = Depends(get_current_user),
 ):
-    """List private issue reports with admin filters."""
+    """List private issue reports with admin filters.
+
+    Each report carries the reporter's question/answer/context excerpts (when
+    they consented) and the thumbs vote on the same message, so the admin
+    panel can show WHAT was wrong, not just that something was.
+    """
     if not is_admin_email(_current_user_email(current_user)):
         raise HTTPException(status_code=403, detail="Admin access required")
-    return {
-        "reports": issue_report_service.list_reports(
+
+    def _load() -> list:
+        reports = issue_report_service.list_reports(
             status=status,
             provider=provider,
             model=model,
@@ -42,7 +70,28 @@ async def admin_issue_reports(
             date_to=date_to,
             limit=limit,
         )
-    }
+        try:
+            # run_id is the stable key (a message's client id changes between
+            # the live turn and a reload); message_id is the fallback for old rows.
+            votes_by_run = analytics_service.get_feedback_for_runs(
+                [r.get("run_id") for r in reports], by_user=True
+            )
+            votes_by_message = analytics_service.get_feedback_for_messages(
+                [r.get("message_id") for r in reports], by_user=True
+            )
+        except Exception:  # the vote badge is decoration; never fail the listing
+            votes_by_run, votes_by_message = {}, {}
+        for report in reports:
+            report["vote"] = (
+                votes_by_run.get((str(report.get("user_id") or ""), str(report.get("run_id") or "")))
+                or votes_by_message.get((str(report.get("user_id") or ""), str(report.get("message_id") or "")))
+                or ""
+            )
+        return reports
+
+    # Blocking DB (possibly Turso network) reads stay off the event loop (CX-01).
+    reports = await asyncio.get_event_loop().run_in_executor(_storage_executor, _load)
+    return {"reports": reports}
 
 
 @router.patch("/api/admin/issue-reports/{report_id}")
@@ -105,6 +154,43 @@ async def admin_feedback_export(current_user: dict = Depends(get_current_user)):
     if not analytics_service.is_admin(user_email):
         raise HTTPException(status_code=403, detail="Admin access required")
     return analytics_service.export_feedback_json()
+
+
+@router.get("/api/admin/feedback/recent")
+async def admin_feedback_recent(
+    feedback: str = "dislike",
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    """Recent thumbs votes with their question/answer previews. Admin-only.
+
+    A thumbs-down that never became a full issue report was previously
+    invisible except inside the JSON export. ``has_report`` marks votes that
+    do have a report, so the panel can point at it instead of repeating it.
+    """
+    if not is_admin_email(_current_user_email(current_user)):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    kind = feedback if feedback in ("like", "dislike") else None
+
+    def _load() -> list:
+        rows = analytics_service.list_recent_feedback(feedback=kind, limit=limit)
+        try:
+            reported = issue_report_service.reports_exist_for(
+                message_ids=[row.get("message_id") for row in rows],
+                run_ids=[row.get("run_id") for row in rows],
+                by_user=True,
+            )
+        except Exception:
+            reported = {"message_ids": set(), "run_ids": set()}
+        for row in rows:
+            row["has_report"] = (
+                (str(row.get("user_id") or ""), str(row.get("run_id") or "")) in reported["run_ids"]
+                or (str(row.get("user_id") or ""), str(row.get("message_id") or "")) in reported["message_ids"]
+            )
+        return rows
+
+    rows = await asyncio.get_event_loop().run_in_executor(_storage_executor, _load)
+    return {"feedback": rows}
 
 
 @router.get("/api/admin/eval/export")

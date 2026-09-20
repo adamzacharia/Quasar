@@ -101,12 +101,13 @@ def test_parse_error_twice_returns_friendly_message_without_raw_dump():
 
 
 def test_generic_error_returns_friendly_message_without_retry():
-    fake = _FakeResponses(failures=5, error_text="kaboom: connection reset by peer")
+    fake = _FakeResponses(failures=5, error_text="kaboom: unexpected provider payload")
     agent = _make_agent(fake)
 
     result = agent.stream_response_api("hello there", conversation_id="conv-3")
 
-    # Not a parse/hanging-tool error — no retry.
+    # Not a parse/hanging-tool error and not a transport signature — no retry
+    # (a 'connection reset' message WOULD now be retried by the stream-round gate).
     assert len(fake.create_calls) == 1
     assert "could not be completed" in result
     assert "kaboom" not in result
@@ -115,7 +116,7 @@ def test_generic_error_returns_friendly_message_without_retry():
 def test_provider_failure_is_recorded_for_run_status():
     """The friendly message rides back as normal text, so the SSE layer needs
     the thread-local failure record to mark the run failed in chat_runs."""
-    fake = _FakeResponses(failures=5, error_text="kaboom: connection reset by peer")
+    fake = _FakeResponses(failures=5, error_text="kaboom: unexpected provider payload")
     agent = _make_agent(fake)
 
     agent.stream_response_api("hello there", conversation_id="conv-3b")

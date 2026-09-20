@@ -71,6 +71,12 @@ class ToolCall:
     output: str = ""
     ok: bool = True
     sql: str = ""      # structured SQL field recorded by the agent trace
+    # The uniform request provenance (core/provenance.py) the agent stamps on
+    # every traced call: kind ('adql' | 'http' | 'ads' | 'params' | 'args')
+    # and the literal copyable text. For an ADQL-executing tool this is the
+    # EXACT query that ran, which is what ALMABench scores (INT-9).
+    request_kind: str = ""
+    request_text: str = ""
 
 
 @dataclass
@@ -209,12 +215,15 @@ def _clean_sql(sql: str) -> str:
 # query_summary/validated_sql in their outputs) against TAP. A free-text
 # `query` argument on any other successful tool (web_search, ADS, ...) is a
 # search string, not run SQL, and must earn no sql_regex/position credit.
+# ALMABench (Benchmark/almabench) widens this module variable to the ALMA
+# ADQL-executing tools; DataLabBench keeps the datalab_* default.
 _SQL_CAPABLE_TOOL_RE = re.compile(r"^datalab_", re.IGNORECASE)
+SQL_CAPABLE_TOOL_RE = _SQL_CAPABLE_TOOL_RE
 
 
 def extract_executed_sql(calls: List[ToolCall]) -> List[str]:
-    """SQL that actually ran: args/outputs/structured field of SUCCESSFUL
-    calls to SQL-capable (Data Lab) tools."""
+    """SQL that actually ran: args/outputs/structured field/request provenance
+    of SUCCESSFUL calls to SQL-capable tools."""
     seen, out = set(), []
 
     def add(sql: Optional[str]):
@@ -225,10 +234,12 @@ def extract_executed_sql(calls: List[ToolCall]) -> List[str]:
             out.append(sql)
 
     for c in calls:
-        if not c.ok or not _SQL_CAPABLE_TOOL_RE.match(c.name or ""):
+        if not c.ok or not SQL_CAPABLE_TOOL_RE.match(c.name or ""):
             continue
         if c.sql:
             add(c.sql)
+        if c.request_kind == "adql" and c.request_text:
+            add(c.request_text)
         for k in ("sql", "query", "adql"):
             v = c.arguments.get(k)
             if isinstance(v, str):
@@ -276,9 +287,23 @@ _Q3C_RADIAL_RE = re.compile(
 )
 
 
+# ADQL cone: CIRCLE('ICRS', ra, dec, radius_deg) — used by the ALMA
+# INTERSECTS/CONTAINS footprint cones (never appears in Data Lab q3c SQL).
+_ADQL_CIRCLE_RE = re.compile(
+    r"CIRCLE\s*\(\s*'[^']*'\s*,\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,\s*([-\d.eE+/]+)\s*\)",
+    re.IGNORECASE,
+)
+
+
 def q3c_cones_from_sql(sql_blob: str) -> List[Dict[str, float]]:
     cones = []
     for m in _Q3C_RADIAL_RE.finditer(sql_blob or ""):
+        ra = safe_number(m.group(1))
+        dec = safe_number(m.group(2))
+        radius = safe_number(m.group(3))
+        if ra is not None and dec is not None:
+            cones.append({"ra": ra, "dec": dec, "radius": radius})
+    for m in _ADQL_CIRCLE_RE.finditer(sql_blob or ""):
         ra = safe_number(m.group(1))
         dec = safe_number(m.group(2))
         radius = safe_number(m.group(3))
@@ -909,12 +934,15 @@ def query_quasar(question: str, api_url: str, model: str, timeout: int,
                     ev.response_text += event.get("content", "")
                 elif etype == "tool_trace":
                     for call in event.get("calls", []):
+                        req = call.get("request") if isinstance(call.get("request"), dict) else {}
                         ev.calls.append(ToolCall(
                             name=str(call.get("name", "")),
                             arguments=call.get("arguments") or {},
                             output=str(call.get("output", ""))[:4000],
                             ok=bool(call.get("ok", True)),
                             sql=str(call.get("sql", "")),
+                            request_kind=str(req.get("kind", "") or ""),
+                            request_text=str(req.get("text", "") or ""),
                         ))
                     ev.trace_source = "tool_trace"
                 elif etype == "image":

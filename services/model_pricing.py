@@ -38,6 +38,10 @@ _VERSION_SUFFIX = re.compile(r"^[-@:_.]\d")
 # Date the tables below were last checked against provider pricing pages.
 PRICING_LAST_VERIFIED = "2026-07-16"
 
+# Existing deployment-alias estimates are useful to billing but must not be
+# displayed as known catalog prices. Keep provenance beside the rate table.
+CATALOG_UNVERIFIED_PRICES = frozenset({"gpt-5.4-mini", "deepseek-v4-pro", "deepseek-v4-flash"})
+
 # {provider: {model: {input_per_mtok, output_per_mtok}}} in USD per 1M tokens.
 MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
     "anthropic": {

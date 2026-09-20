@@ -107,7 +107,7 @@ _TOOLS = [{
 }]
 
 
-def test_tacc_required_tool_choice_downgraded_with_nudge_nonstreaming():
+def test_tacc_required_tool_choice_is_emulated_on_first_attempt_nonstreaming():
     client, completions = _client_with_fake_tacc()
     client.responses.create(
         model="gpt-oss-120b",
@@ -117,12 +117,12 @@ def test_tacc_required_tool_choice_downgraded_with_nudge_nonstreaming():
         tool_choice="required",
     )
     sent = completions.calls[-1]
-    assert sent["tool_choice"] == "auto"
+    assert sent["tool_choice"] == "auto"  # first attempt: emulated with the nudge
     assert sent["messages"][0]["role"] == "system"
     assert "Tool use is REQUIRED" in sent["messages"][0]["content"]
 
 
-def test_tacc_required_tool_choice_downgraded_with_nudge_streaming():
+def test_tacc_required_tool_choice_is_emulated_on_first_attempt_streaming():
     client, completions = _client_with_fake_tacc()
     list(client.responses.create(
         model="gpt-oss-120b",
@@ -261,3 +261,46 @@ def test_data_queries_detected_as_live_data(agent_module, query):
 def test_plain_knowledge_query_not_live_data(agent_module):
     agent = agent_module.QuasarAgent.__new__(agent_module.QuasarAgent)
     assert agent._is_live_data_query("What is the ALMA proprietary period?") is False
+
+
+def test_tacc_server_rejecting_required_downgrades_once_and_remembers(monkeypatch):
+    """A server that 400s on tool_choice=required gets one retry with auto
+    (+nudge); the process remembers and stops sending required."""
+    import httpx
+    import openai
+    from types import SimpleNamespace as NS
+    from core.llm_client import LLMClient, ResponsesShim
+    monkeypatch.setattr(ResponsesShim, "_tacc_required_supported", True)
+    calls = []
+
+    def create(**kw):
+        calls.append(kw)
+        if kw.get("tool_choice") == "required":
+            raise openai.BadRequestError(
+                "tool_choice value required is not supported",
+                response=httpx.Response(400, request=httpx.Request("POST", "http://tacc.test")),
+                body=None,
+            )
+        return iter([NS(choices=[NS(delta=NS(content="ok", tool_calls=None), finish_reason="stop")])])
+
+    client = LLMClient(model="gpt-oss-120b")
+    client._get_tacc_client = lambda: NS(chat=NS(completions=NS(create=create)))
+    list(client.responses.create(model="gpt-oss-120b", input="hi", tools=_TOOLS, tool_choice="required",
+                                 tool_choice_strict=True, stream=True))
+    assert [c["tool_choice"] for c in calls] == ["required", "auto"]
+    list(client.responses.create(model="gpt-oss-120b", input="again", tools=_TOOLS, tool_choice="required",
+                                 tool_choice_strict=True, stream=True))
+    assert calls[-1]["tool_choice"] == "auto"  # remembered: no second 400
+    assert "Tool use is REQUIRED" in calls[-1]["messages"][0]["content"]
+
+
+def test_tacc_strict_required_is_enforced_server_side(monkeypatch):
+    from core.llm_client import ResponsesShim
+    monkeypatch.setattr(ResponsesShim, "_tacc_required_supported", True)
+    client, completions = _client_with_fake_tacc()
+    list(client.responses.create(model="gpt-oss-120b", instructions="system prompt", input="show me an image of M31",
+                                 tools=_TOOLS, tool_choice="required", tool_choice_strict=True, stream=True))
+    sent = completions.calls[-1]
+    assert sent["tool_choice"] == "required" and "tool_choice_strict" not in sent
+    assert "Tool use is REQUIRED" in sent["messages"][0]["content"]
+

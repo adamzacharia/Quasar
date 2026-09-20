@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -19,6 +21,16 @@ _LOCAL_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 
 class ProviderKeyError(ValueError):
     """Raised when provider-key storage cannot complete safely."""
+
+
+@dataclass(frozen=True)
+class StoredCatalog:
+    models_json: str
+    fetched_at: str
+
+
+class CatalogRateLimitError(ProviderKeyError):
+    """Too many provider validation/discovery attempts for one account."""
 
 
 def _current_environment() -> str:
@@ -98,6 +110,18 @@ class ProviderKeyService:
                 ON user_provider_keys(user_id)
                 """
             )
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_provider_models (
+                user_id TEXT NOT NULL, provider TEXT NOT NULL,
+                key_revision TEXT NOT NULL, models_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL, PRIMARY KEY (user_id, provider)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS provider_validation_limits (
+                user_id TEXT PRIMARY KEY, window_id INTEGER NOT NULL, attempts INTEGER NOT NULL
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS provider_model_attempts (
+                user_id TEXT NOT NULL, provider TEXT NOT NULL, revision TEXT NOT NULL,
+                attempted_at REAL NOT NULL, PRIMARY KEY (user_id, provider)
+            )""")
             conn.commit()
         finally:
             conn.close()
@@ -148,7 +172,8 @@ class ProviderKeyService:
             conn.close()
         return self._metadata_from_row(row) if row else None
 
-    def save_key(self, user_id: str, provider: str, raw_key: str, token_limit: Optional[int] = None) -> Dict:
+    def save_key(self, user_id: str, provider: str, raw_key: str, token_limit: Optional[int] = None,
+                 *, catalog: StoredCatalog | None = None) -> Dict:
         provider = _normalize_provider(provider)
         key = (raw_key or "").strip()
         if len(key) < 8:
@@ -190,6 +215,15 @@ class ProviderKeyService:
                     """,
                     (user_id, provider, encrypted, last4, token_limit, created_at, now),
                 )
+            # Rotate key and catalog together. No stale catalog may survive a
+            # different credential, even if its last four characters match.
+            conn.execute("DELETE FROM user_provider_models WHERE user_id=? AND provider=?", (user_id, provider))
+            if catalog is not None:
+                conn.execute("""INSERT INTO user_provider_models
+                    (user_id, provider, key_revision, models_json, fetched_at) VALUES (?, ?, ?, ?, ?)""",
+                    (user_id, provider, encrypted, catalog.models_json, catalog.fetched_at))
+                conn.execute("""UPDATE user_provider_keys SET status='valid', last_tested_at=?
+                    WHERE user_id=? AND provider=?""", (now, user_id, provider))
             conn.commit()
         finally:
             conn.close()
@@ -264,6 +298,8 @@ class ProviderKeyService:
         provider = _normalize_provider(provider)
         conn = self._conn()
         try:
+            conn.execute("DELETE FROM user_provider_models WHERE user_id=? AND provider=?", (user_id, provider))
+            conn.execute("DELETE FROM provider_model_attempts WHERE user_id=? AND provider=?", (user_id, provider))
             cur = conn.execute(
                 "DELETE FROM user_provider_keys WHERE user_id = ? AND provider = ?",
                 (user_id, provider),
@@ -272,6 +308,98 @@ class ProviderKeyService:
         finally:
             conn.close()
         return getattr(cur, "rowcount", 0) > 0
+
+    def key_snapshot(self, user_id: str, provider: str) -> tuple[str, str] | None:
+        """Internal decrypted credential + opaque encrypted revision; never serialize."""
+        provider = _normalize_provider(provider)
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT encrypted_key FROM user_provider_keys WHERE user_id=? AND provider=?",
+                               (user_id, provider)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        revision = str(row[0])
+        try:
+            return self._fernet.decrypt(revision.encode()).decode(), revision
+        except InvalidToken:
+            raise ProviderKeyError("Stored API key could not be decrypted. Rotate the key.") from None
+
+    def get_catalog(self, user_id: str, provider: str) -> StoredCatalog | None:
+        conn = self._conn()
+        try:
+            row = conn.execute("""SELECT c.models_json, c.fetched_at FROM user_provider_models c
+                JOIN user_provider_keys k ON k.user_id=c.user_id AND k.provider=c.provider
+                    AND k.encrypted_key=c.key_revision
+                WHERE c.user_id=? AND c.provider=?""", (user_id, provider)).fetchone()
+        finally:
+            conn.close()
+        return StoredCatalog(str(row[0]), str(row[1])) if row else None
+
+    def cache_catalog(self, user_id: str, provider: str, revision: str, catalog: StoredCatalog) -> bool:
+        """Compare-and-set: in-flight discovery cannot resurrect a removed/rotated key."""
+        conn = self._conn()
+        try:
+            cur = conn.execute("""INSERT INTO user_provider_models
+                (user_id, provider, key_revision, models_json, fetched_at)
+                SELECT user_id, provider, encrypted_key, ?, ? FROM user_provider_keys
+                WHERE user_id=? AND provider=? AND encrypted_key=?
+                ON CONFLICT(user_id, provider) DO UPDATE SET key_revision=excluded.key_revision,
+                    models_json=excluded.models_json, fetched_at=excluded.fetched_at""",
+                (catalog.models_json, catalog.fetched_at, user_id, provider, revision))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def admit_validation(self, user_id: str) -> None:
+        """Ten attempts/account/10 minutes, atomically shared by all API workers.
+
+        Save, test, manual refresh, and automatic discovery share this budget;
+        failed validations count too. One row per user keeps storage bounded.
+        """
+        window = int(time.time()) // 600
+        conn = self._conn()
+        try:
+            cur = conn.execute("""INSERT INTO provider_validation_limits(user_id, window_id, attempts)
+                VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET window_id=excluded.window_id,
+                attempts=CASE WHEN provider_validation_limits.window_id=excluded.window_id
+                    THEN provider_validation_limits.attempts+1 ELSE 1 END
+                WHERE provider_validation_limits.window_id<>excluded.window_id
+                    OR provider_validation_limits.attempts<10""", (user_id, window))
+            conn.commit()
+            if cur.rowcount == 0:
+                raise CatalogRateLimitError("Too many provider key checks. Try again in 10 minutes.")
+        finally:
+            conn.close()
+
+    def claim_discovery(self, user_id: str, provider: str, revision: str) -> bool:
+        """Shared five-minute automatic-refresh lease/backoff, separate from user checks."""
+        now = time.time()
+        conn = self._conn()
+        try:
+            cur = conn.execute("""INSERT INTO provider_model_attempts(user_id, provider, revision, attempted_at)
+                SELECT user_id, provider, encrypted_key, ? FROM user_provider_keys
+                WHERE user_id=? AND provider=? AND encrypted_key=?
+                ON CONFLICT(user_id, provider) DO UPDATE SET revision=excluded.revision,
+                    attempted_at=excluded.attempted_at
+                WHERE provider_model_attempts.revision<>excluded.revision
+                    OR provider_model_attempts.attempted_at < ?""", (now, user_id, provider, revision, now - 300))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def list_catalogs(self, user_id: str) -> dict[str, StoredCatalog]:
+        conn = self._conn()
+        try:
+            rows = conn.execute("""SELECT c.provider, c.models_json, c.fetched_at FROM user_provider_models c
+                JOIN user_provider_keys k ON k.user_id=c.user_id AND k.provider=c.provider
+                    AND k.encrypted_key=c.key_revision WHERE c.user_id=?""", (user_id,)).fetchall()
+            return {str(row[0]): StoredCatalog(str(row[1]), str(row[2])) for row in rows}
+        finally:
+            conn.close()
 
     @staticmethod
     def _normalize_token_limit(value: int) -> int:

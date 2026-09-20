@@ -86,6 +86,7 @@ interface ChatStore {
     clearMessages: () => void;
     toggleStar: (id: string) => void;
     addThinkingStep: (step: string, state: "running" | "completed") => void;
+    heartbeatThinkingStep: (phase: string) => void;
     clearThinking: () => void;
     fetchModels: () => Promise<void>;
     attachThinkingToLastMessage: () => void;
@@ -861,11 +862,48 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const steps = [...s.thinkingSteps];
         const existingIdx = steps.findIndex(t => t.text === step);
         if (existingIdx >= 0) {
-            steps[existingIdx] = { ...steps[existingIdx], status: state };
+            steps[existingIdx] = {
+                ...steps[existingIdx],
+                status: state,
+                // A reused label re-entering "running" is a NEW invocation —
+                // restart its timer so heartbeat elapsed times measure this
+                // run, not the earlier one (CX-15).
+                ...(state === "running"
+                    ? { startedAt: Date.now(), elapsedSeconds: undefined }
+                    : {}),
+            };
         } else {
-            steps.push({ text: step, status: state });
+            steps.push({
+                text: step,
+                status: state,
+                ...(state === "running" ? { startedAt: Date.now() } : {}),
+            });
         }
         return { thinkingSteps: steps, thinkingStatus: "running" };
+    }),
+
+    // Tool heartbeats (SSE `run_progress`, ~15 s cadence while a guarded tool
+    // is still executing) stamp elapsed time onto the matching RUNNING step so
+    // long tool calls read as alive instead of frozen (2026-08-04 density
+    // hang). Falls back to the last running step when the label differs.
+    heartbeatThinkingStep: (phase) => set((s) => {
+        let idx = s.thinkingSteps.findIndex(
+            t => t.status === "running" && t.text === phase,
+        );
+        if (idx < 0) {
+            for (let i = s.thinkingSteps.length - 1; i >= 0; i--) {
+                if (s.thinkingSteps[i].status === "running") { idx = i; break; }
+            }
+        }
+        if (idx < 0) return {};
+        const steps = [...s.thinkingSteps];
+        const startedAt = steps[idx].startedAt ?? Date.now() - 15_000;
+        steps[idx] = {
+            ...steps[idx],
+            startedAt,
+            elapsedSeconds: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
+        };
+        return { thinkingSteps: steps };
     }),
 
     clearThinking: () => set({ thinkingSteps: [], thinkingStatus: "idle" }),

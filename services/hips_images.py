@@ -39,8 +39,24 @@ SURVEY_ALIASES: Dict[str, str] = {
     "fermi": "CDS/P/Fermi/color",
     "vlass": VLASS_HIPS_ID,
     "radio": VLASS_HIPS_ID,
+    # DECam Legacy Surveys (RE-B4): color + per-band HiPS so a "color image of
+    # the Legacy Surveys/DECam" fallback can stay ON-SURVEY instead of being
+    # silently substituted with DSS2/2MASS/WISE. IDs verified against the CDS
+    # MocServer 2026-08-20 (CDS/P/DESI-Legacy-Surveys/DR10/{color,g,r,i,z}).
+    "ls": "CDS/P/DESI-Legacy-Surveys/DR10/color",
+    "legacy_surveys": "CDS/P/DESI-Legacy-Surveys/DR10/color",
+    "decals": "CDS/P/DESI-Legacy-Surveys/DR10/color",
+    "decam": "CDS/P/DESI-Legacy-Surveys/DR10/color",
     # Single-band aliases — use these as RGB channels (color aliases above are
     # 3-plane JPEG-style HiPS and make poor RGB inputs).
+    "ls_g": "CDS/P/DESI-Legacy-Surveys/DR10/g",
+    "ls_r": "CDS/P/DESI-Legacy-Surveys/DR10/r",
+    "ls_i": "CDS/P/DESI-Legacy-Surveys/DR10/i",
+    "ls_z": "CDS/P/DESI-Legacy-Surveys/DR10/z",
+    "decam_g": "CDS/P/DESI-Legacy-Surveys/DR10/g",
+    "decam_r": "CDS/P/DESI-Legacy-Surveys/DR10/r",
+    "decam_i": "CDS/P/DESI-Legacy-Surveys/DR10/i",
+    "decam_z": "CDS/P/DESI-Legacy-Surveys/DR10/z",
     "2mass_j": "CDS/P/2MASS/J",
     "2mass_h": "CDS/P/2MASS/H",
     "2mass_k": "CDS/P/2MASS/K",
@@ -68,7 +84,8 @@ SURVEY_ALIASES: Dict[str, str] = {
 # Color HiPS aliases (multi-plane JPEG surfaces). Poor RGB channels because a
 # single plane is not a real band; rgb_composite warns when one is used.
 COLOR_HIPS_ALIASES = frozenset({"optical", "dss", "dss2", "sdss", "2mass", "nir",
-                                "wise", "mir", "galex", "uv", "gamma", "fermi"})
+                                "wise", "mir", "galex", "uv", "gamma", "fermi",
+                                "ls", "legacy_surveys", "decals", "decam"})
 
 # Official full-color HiPS for the governed Data Lab imaging catalogs — the
 # SAME survey program served through CDS instead of the Data Lab cutout
@@ -230,6 +247,9 @@ class HipsImageService:
                 "image_base64": image_base64,
                 "path": f"/plots/{name}.png",
                 "png_path": png_path,
+                # Serving service, stated explicitly so mixed CDS-vs-Data Lab
+                # provenance is always visible in captions/answers (RE-B4).
+                "source_service": "CDS hips2fits",
                 "survey": survey,
                 "survey_id": survey_id,
                 "ra": ra_f,
@@ -325,6 +345,7 @@ class HipsImageService:
                 "dec": dec_f,
                 "fov_deg": fov,
                 "width": width_i,
+                "source_service": "CDS hips2fits",  # RE-B4 provenance labeling
                 "surveys": survey_list,
                 "warnings": warnings,
                 "panels": panels,
@@ -404,7 +425,8 @@ class HipsImageService:
                 if band.strip().lower() in COLOR_HIPS_ALIASES:
                     raise HipsImageError(
                         f"{band!r} is a color (multi-plane) HiPS and cannot be an RGB channel. "
-                        "Use single-band aliases: 2mass_j/h/k, sdss_g/r/i/z, wise_w1..w4, "
+                        "Use single-band aliases: ls_g/ls_r/ls_i/ls_z (DECam Legacy Surveys), "
+                        "2mass_j/h/k, sdss_g/r/i/z, wise_w1..w4, "
                         "galex_nuv/fuv, dss2_red/dss2_blue (or a raw single-band HiPS ID)."
                     )
                 survey_id = resolve_survey(band)
@@ -460,6 +482,7 @@ class HipsImageService:
                 "dec": dec_f,
                 "fov_deg": fov,
                 "width": width_i,
+                "source_service": "CDS hips2fits",  # RE-B4 provenance labeling
                 "surveys": survey_list,
                 "survey_ids": survey_ids,
                 "channels": {"red": survey_list[0], "green": survey_list[1], "blue": survey_list[2]},

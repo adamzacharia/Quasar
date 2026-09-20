@@ -1,12 +1,21 @@
 """
 ALminer Client Integration
 Wraps alminer functionality for Quasar
+
+Failure-state contract (INT-5): every archive failure returns an EMPTY frame
+carrying ``df.attrs["quasar_error"]`` (see :func:`_errored_frame`), never a
+bare empty frame. Callers (services/search.py, capabilities/alma.py) read that
+marker to tell "archive unavailable / query failed" apart from "no matching
+data", so an outage is never reported to the user as "no data exists".
+A genuinely empty result carries no marker (and may carry
+``attrs["resolver_unresolved"]`` when the name resolver found nothing).
 """
 
 import pandas as pd
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Tuple
 import warnings
 import os
+import time
 
 # Try to import alminer, handle if missing
 try:
@@ -21,10 +30,29 @@ try:
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
-    
+
 # ── Cached SIMBAD resolution (canonical impl: integrations/simbad_resolver.py) ──
 from integrations.simbad_resolver import _resolve_simbad_cached
+from services.alma_science_queries import (
+    LINE_REST_FREQ_GHZ,
+    OBSCORE_BASE_COLUMNS,
+    alma_cone_adql,
+    aggregate_counts,
+    counts_note,
+    observation_windows_ghz,
+    parse_frequency_support_windows,
+    wavelength_overlap_where,
+)
 
+
+ALMA_TAP_URL = "https://almascience.nrao.edu/tap"
+ALMA_AQ_URL = "https://almascience.nrao.edu/aq/"
+DEFAULT_ROW_CAP = 5000
+
+
+def _row_cap(value, default=DEFAULT_ROW_CAP):
+    """Keep the query, transport and truncation metadata on the same limit."""
+    return max(1, min(int(default if value is None else value), 20000))
 
 # Canonical ALMA result columns — guaranteed present on BOTH the TAP and
 # ALminer paths by _standardize_columns so downstream code sees a deterministic
@@ -32,249 +60,299 @@ from integrations.simbad_resolver import _resolve_simbad_cached
 _CANONICAL_ALMA_COLUMNS = [
     "s_ra", "s_dec", "t_exptime", "Band", "resolution", "sensitivity",
     "bandwidth", "freq_min", "freq_max", "freq_min_ghz", "freq_max_ghz",
-    "telescope", "instrument_name", "access_url",
+    "telescope", "instrument_name", "access_url", "archive_url",
 ]
 
 
+def _errored_frame(error: str) -> pd.DataFrame:
+    """Empty frame tagged with the archive error (outage != empty, C3)."""
+    df = pd.DataFrame()
+    df.attrs["quasar_error"] = str(error)
+    df.attrs["partial"] = True
+    return df
+
+
+def _is_footprint_rejection(exc: Exception) -> bool:
+    """True only when the service objected to the footprint predicate itself."""
+    text = str(exc).lower()
+    return ("intersects" in text or "s_region" in text) and ("not supported" in text or "unsupported" in text or "syntax" in text or "unknown" in text or "error" in text)
+
+
 class ALminerClient:
-    """Client for interacting with ALMA archive via ALminer"""
+    """Client for interacting with ALMA archive via ALminer + the ALMA TAP"""
+
+    SOURCE_TIMEOUT_S = 390
 
     def __init__(self):
         """Initialize ALminer client"""
         if not ALMINER_AVAILABLE:
-            warnings.warn("alminer not installed. ALMA searches will fail.")
-        
+            warnings.warn("alminer not installed. ALMA searches will fall back to TAP only.")
+
         # Ensure we have a downloads directory
         self.download_dir = "./downloads"
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir, exist_ok=True)
-        
+
         # Cached TAP service — reuse TCP connection across queries
         self._tap_service = None
 
     def _get_tap_service(self):
         """Get or create a cached pyvo TAPService instance."""
         if self._tap_service is None:
-            import pyvo
-            from integrations.tap import _TimeoutHTTPSession
-            session = _TimeoutHTTPSession(timeout=30.0)
-            try:
-                self._tap_service = pyvo.dal.TAPService(
-                    'https://almascience.nrao.edu/tap', session=session)
-            except TypeError:
-                # Older pyvo without session support
-                self._tap_service = pyvo.dal.TAPService('https://almascience.nrao.edu/tap')
+            from integrations.alma_tap import AlmaTapService
+            self._tap_service = AlmaTapService()
         return self._tap_service
-            
-    def search_by_target(self, target_name: str, public: bool = True) -> pd.DataFrame:
+
+    # ── Target / cone search ────────────────────────────────────────────────
+    def search_by_target(self, target_name: str, public: bool = True,
+                         max_results: Optional[int] = None) -> pd.DataFrame:
         """
         Search ALMA archive by target name.
-        Strategy: 
+        Strategy:
         1. Resolve name to RA/Dec via SIMBAD (cached)
-        2. Race TAP and ALminer in parallel - return whichever succeeds first
+        2. TAP footprint cone (INTERSECTS s_region OR point) then ALminer fallback
         """
         print(f"[ALMA] Starting search for '{target_name}'")
-        
+
         # Step 1: Resolve target name using cached SIMBAD lookup
         try:
             ra_deg, dec_deg = _resolve_simbad_cached(target_name)
-            if ra_deg is None:
-                print(f"[ALMA] SIMBAD could not resolve '{target_name}'")
-                return pd.DataFrame()
-            print(f"[ALMA] Resolved to RA={ra_deg:.4f}, Dec={dec_deg:.4f}")
         except Exception as e:
             print(f"[ALMA] SIMBAD resolution failed: {e}")
-            return pd.DataFrame()
-        
-        # Step 2: Race TAP and ALminer in parallel
-        return self._parallel_search(ra_deg, dec_deg, radius=0.05, target_name=target_name)
-    
-    def _parallel_search(self, ra: float, dec: float, radius: float = 0.05, target_name: str = "") -> pd.DataFrame:
+            return _errored_frame(f"Name resolution (SIMBAD) failed for '{target_name}': {e}")
+        if ra_deg is None:
+            print(f"[ALMA] SIMBAD could not resolve '{target_name}'")
+            # A genuine empty: nothing to search. Moving/solar targets need a
+            # name/time-window path the caller can offer.
+            df = pd.DataFrame()
+            df.attrs["resolver_unresolved"] = str(target_name)
+            return df
+        print(f"[ALMA] Resolved to RA={ra_deg:.4f}, Dec={dec_deg:.4f}")
+
+        # Step 2: TAP then ALminer, each bounded
+        # 1 arcmin: ALminer's documented default target search radius
+        # (alminer.target(search_radius=1.0)); the old 0.05 deg (3 arcmin) pulled
+        # in unrelated neighbours for compact targets.
+        return self._parallel_search(ra_deg, dec_deg, radius=1.0 / 60, target_name=target_name,
+                                     public=public, max_results=max_results)
+
+    def _parallel_search(self, ra: float, dec: float, radius: float = 0.05, target_name: str = "",
+                         public: bool = True, max_results: Optional[int] = None) -> pd.DataFrame:
         """
         Primary-plus-fallback cone search: try TAP, then ALminer, SEQUENTIALLY.
         Each source is bounded by a per-source timeout on a daemon thread, so
         there is no two-thread race and no stranded in-flight search (C14).
         Returns one canonical column schema via _standardize_columns.
+
+        Every outcome is recorded: a source that timed out or raised is never
+        silently treated as "no result" (A-19/A-59). Only when NO source
+        returned an actual frame does the caller get an errored frame.
         """
         import threading
 
-        def _run_bounded(fn, timeout):
-            box = {}
+        def _run_bounded(fn, timeout) -> Tuple[Optional[pd.DataFrame], Optional[str], bool]:
+            box: Dict[str, Any] = {}
 
             def _target():
                 try:
                     box["df"] = fn()
-                except Exception as exc:  # ImportError, network, parse — all "no result"
+                except Exception as exc:  # ImportError, network, parse
                     box["err"] = exc
 
             t = threading.Thread(target=_target, daemon=True)
             t.start()
             t.join(timeout)
-            return box.get("df")
+            if t.is_alive():
+                return None, f"timed out after {timeout} s", True
+            if "err" in box:
+                return None, str(box["err"]) or box["err"].__class__.__name__, False
+            return box.get("df"), None, False
+
+        cone_meta: Dict[str, Any] = {
+            "ra": float(ra), "dec": float(dec), "radius_deg": float(radius),
+            "public": bool(public), "footprint_mode": "intersects_or_point",
+        }
+        top = _row_cap(max_results)
 
         def tap_search():
             print("[ALMA] TAP search starting...")
             service = self._get_tap_service()
-            query = (
-                "SELECT * FROM ivoa.obscore "
-                f"WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
-                f"CIRCLE('ICRS', {ra}, {dec}, {radius})) = 1"
-            )
-            res = service.search(query)
-            return res.to_table().to_pandas()
+            query = alma_cone_adql(ra, dec, radius, public=public, top=top)
+            try:
+                res = service.search(query, maxrec=top)
+            except Exception as exc:
+                if not _is_footprint_rejection(exc):
+                    raise
+                # Service rejected the footprint predicate: point-only fallback,
+                # disclosed through attrs so provenance tells the truth.
+                print(f"[ALMA] TAP rejected INTERSECTS (falling back to point cone): {exc}")
+                query = alma_cone_adql(ra, dec, radius, public=public, top=top, footprint=False)
+                cone_meta["footprint_mode"] = "point_only"
+                res = service.search(query, maxrec=top)
+            cone_meta["adql"] = query
+            cone_meta["url"] = getattr(res, "quasar_tap_url", ALMA_TAP_URL)
+            df = res.to_table().to_pandas()
+            df.attrs["truncated"] = bool(len(df) >= top or getattr(res, "query_status", "") == "OVERFLOW")
+            df.attrs["row_cap"] = top
+            return df
 
         def alminer_search():
-            import alminer
+            if not ALMINER_AVAILABLE:
+                raise ImportError("alminer is not installed")
+            import alminer as _alminer
             print("[ALMA] ALminer search starting...")
-            return alminer.conesearch(ra, dec, search_radius=radius, print_targets=False)
+            df = _alminer.conesearch(ra, dec, search_radius=radius, public=public, print_targets=False)
+            cone_meta.setdefault("footprint_mode", "point_only")
+            cone_meta["adql"] = alma_cone_adql(ra, dec, radius, public=public, footprint=False)
+            cone_meta["url"] = ALMA_TAP_URL
+            cone_meta["note"] = (
+                "-- Reproducible equivalent of the executed alminer.conesearch"
+                f"(public={public}) call; alminer's internal ADQL is not captured byte-exactly."
+            )
+            df = df if df is not None else pd.DataFrame()
+            capped = df.head(top).copy()
+            capped.attrs.update(row_cap=top, truncated=len(df) >= top)
+            return capped
 
+        failures: List[str] = []
+        empty_frames: List[pd.DataFrame] = []
         for name, fn in (("TAP", tap_search), ("ALminer", alminer_search)):
-            df = _run_bounded(fn, 60)
-            if df is not None and not df.empty:
-                print(f"[ALMA] {name} found {len(df)} results")
-                return self._standardize_columns(df)
-        print("[ALMA] Both TAP and ALminer returned no results (or timed out)")
-        return pd.DataFrame()
+            df, err, timed_out = _run_bounded(fn, self.SOURCE_TIMEOUT_S if name == "TAP" else 60)
+            if df is None:
+                failures.append(f"{name}: {err}")
+                print(f"[ALMA] {name} failed: {err}")
+                continue
+            if not df.empty:
+                print(f"[ALMA] {name} found {len(df)} rows")
+                out = self._standardize_columns(df)
+                out.attrs["quasar_cone"] = dict(cone_meta)
+                out.attrs["source"] = name
+                out.attrs["truncated"] = bool(df.attrs.get("truncated", False))
+                if failures:
+                    out.attrs["source_warnings"] = list(failures)
+                return out
+            if name == "TAP":
+                # The primary footprint query answered successfully. A missing
+                # optional fallback cannot turn a valid empty result into failure.
+                df.attrs["quasar_cone"] = dict(cone_meta)
+                return df
+            empty_frames.append(df)
+        if empty_frames and not failures:
+            # At least one source answered with a real (empty) table — a
+            # genuine empty result. Failures of the other source ride along
+            # as warnings so the caller can disclose them.
+            print("[ALMA] Archive answered: no rows in this cone")
+            out = pd.DataFrame()
+            out.attrs["quasar_cone"] = dict(cone_meta)
+            if failures:
+                out.attrs["source_warnings"] = list(failures)
+            return out
+        print("[ALMA] Every source failed: " + "; ".join(failures))
+        return _errored_frame(
+            "ALMA archive cone search failed on every source (" + "; ".join(failures) + ")"
+        )
 
-    def search_by_position(self, ra: float, dec: float, radius: float = 0.016, public: bool = True) -> pd.DataFrame:
+    def search_by_position(self, ra: float, dec: float, radius: float = 1.0 / 60, public: bool = True,
+                           max_results: Optional[int] = None) -> pd.DataFrame:
         """
-        Search ALMA archive by position (cone search)
+        Search ALMA archive by position (cone search over footprints).
+        Default radius 1 arcmin = ALminer's documented default search radius.
         radius is in degrees (default ~1 arcmin)
         """
-        if not ALMINER_AVAILABLE:
-            print("[ALminer] ERROR: alminer not available")
-            return pd.DataFrame()
-
         try:
-            print(f"[ALminer] Starting conesearch: RA={ra}, Dec={dec}, radius={radius}°")
-            print("[ALminer] Connecting to ALMA archive (this may take 30-60 seconds)...")
-            
-            # Use threading with timeout to prevent infinite hang
-            import threading
-            result_holder = [None]
-            error_holder = [None]
-            
-            def do_search():
-                try:
-                    result_holder[0] = alminer.conesearch(ra, dec, search_radius=radius, public=public, print_targets=False)
-                except Exception as e:
-                    error_holder[0] = e
-            
-            search_thread = threading.Thread(target=do_search, daemon=True)
-            search_thread.start()
-            search_thread.join(timeout=120)  # 2 minute timeout
-            
-            if search_thread.is_alive():
-                print("[ALminer] ERROR: Search timed out after 2 minutes!")
-                return pd.DataFrame()
-            
-            if error_holder[0]:
-                raise error_holder[0]
-            
-            df = result_holder[0]
-            if df is None:
-                print("[ALminer] Search returned None")
-                return pd.DataFrame()
-                
-            print(f"[ALminer] Search complete! Found {len(df)} results")
-            return self._standardize_columns(df)
+            return self._parallel_search(float(ra), float(dec), radius=float(radius),
+                                         public=public, max_results=max_results)
         except Exception as e:
-            print(f"[ALminer] Position search error: {e}")
-            import traceback
-            traceback.print_exc()
-            return pd.DataFrame()
+            print(f"[ALMA] Position search error: {e}")
+            return _errored_frame(f"ALMA position search failed: {e}")
 
+    # ── Keyword / ADQL / frequency ──────────────────────────────────────────
     def search_by_keywords(self, keywords: Dict[str, Any], public: bool = True) -> pd.DataFrame:
         """
         Search by ALMA keywords (PI name, proposal ID, etc.)
         Example keywords: {'pi_name': 'Smith', 'proposal_id': '2017.1.000'}
         """
         if not ALMINER_AVAILABLE:
-            return pd.DataFrame()
-            
+            return _errored_frame("alminer is not installed; keyword search is unavailable.")
+
         try:
-            # Construct dictionary for alminer.key_search
-            # It accepts arguments like scientist='Name', project_code='ID'
-            # We map generic keywords to what alminer expects
-            # Commonly used: project_code, source_name_alma, scientific_category, pi_name
-            
-            # Pass the keywords directly if they match alminer arguments
-            df = alminer.key_search(public=public, print_targets=False, **keywords)
+            search_dict = {key: value if isinstance(value, list) else [str(value)]
+                           for key, value in keywords.items()}
+            df = alminer.keysearch(search_dict, public=public, print_targets=False)
+            if df is None:
+                return pd.DataFrame()
             return self._standardize_columns(df)
         except Exception as e:
             print(f"ALminer keyword search error: {e}")
-            return pd.DataFrame()
-    
-    def search_by_sql(self, query: str) -> pd.DataFrame:
+            return _errored_frame(f"ALMA keyword search failed: {e}")
+
+    def search_by_sql(self, query: str, maxrec: int = 20000) -> pd.DataFrame:
         """
-        Execute a custom TAP query using ALminer
+        Execute custom ADQL through the same retrying PyVO transport as cones.
         """
-        if not ALMINER_AVAILABLE:
-            return pd.DataFrame()
-            
         try:
-            df = alminer.run_tap_query(query, print_targets=False)
-            return self._standardize_columns(df)
+            maxrec = _row_cap(maxrec, default=20000)
+            res = self._get_tap_service().search(query, maxrec=maxrec)
+            df = self._standardize_columns(res.to_table().to_pandas())
+            df.attrs["quasar_adql"] = query
+            df.attrs["quasar_tap_url"] = getattr(res, "quasar_tap_url", ALMA_TAP_URL)
+            df.attrs["truncated"] = len(df) >= maxrec or getattr(res, "query_status", "") == "OVERFLOW"
+            df.attrs["row_cap"] = maxrec
+            return df
         except Exception as e:
             print(f"ALminer SQL/TAP search error: {e}")
-            return pd.DataFrame()
+            return _errored_frame(f"ALMA TAP query failed: {e}")
 
-    def search_by_frequency(self, min_freq_ghz: float, max_freq_ghz: float, public: bool = True) -> pd.DataFrame:
+    def search_by_frequency(self, min_freq_ghz: float, max_freq_ghz: float, public: bool = True,
+                            max_results: Optional[int] = None) -> pd.DataFrame:
         """
-        Search by frequency range
-        Using key_search frequency parameters if supported, or falling back.
-        ALminer doesn't have a direct frequency range search function easily wrapped like target(),
-        but we can use key_search with frequency parameters or TAP.
-        
-        Using TAP is more robust for range queries.
+        Search by frequency range using the wavelength-overlap idiom.
+
+        ``frequency`` is a single representative value; observations whose
+        spectral windows overlap [min, max] but whose representative value
+        lies outside were missed by ``frequency BETWEEN``. The skill's
+        em_min/em_max overlap (wavelengths in METRES) is the correct coarse
+        prefilter; exact SPW coverage still needs frequency_support.
         """
-        if not ALMINER_AVAILABLE:
-            return pd.DataFrame()
-            
         try:
+            lo = float(min_freq_ghz)
+            hi = float(max_freq_ghz)
+            if lo > hi:
+                lo, hi = hi, lo
+            top = _row_cap(max_results)
+            where = wavelength_overlap_where(lo, hi)
+            if public:
+                where += " AND data_rights = 'Public'"
+            query = (
+                f"SELECT TOP {top} {', '.join(OBSCORE_BASE_COLUMNS)} "
+                f"FROM ivoa.obscore WHERE {where} ORDER BY proposal_id"
+            )
             service = self._get_tap_service()
-            
-            query = f'''
-            SELECT *
-            FROM ivoa.obscore
-            WHERE frequency >= {min_freq_ghz}
-              AND frequency <= {max_freq_ghz}
-            '''
-            res = service.search(query)
+            res = service.search(query, maxrec=top)
             df = res.to_table().to_pandas()
-            
-            if not df.empty:
-                print(f"[ALMA] Frequency search found {len(df)} results")
-                return self._standardize_columns(df)
-            else:
-                print("[ALMA] Frequency search returned no results")
-                return pd.DataFrame()
-                
+            print(f"[ALMA] Frequency search found {len(df)} rows")
+            out = self._standardize_columns(df) if not df.empty else pd.DataFrame()
+            out.attrs["quasar_adql"] = query
+            out.attrs["quasar_tap_url"] = getattr(res, "quasar_tap_url", ALMA_TAP_URL)
+            out.attrs["truncated"] = bool(len(df) >= top or getattr(res, "query_status", "") == "OVERFLOW")
+            out.attrs["row_cap"] = top
+            return out
         except ImportError:
-            print("[ALMA] pyvo not available for frequency search")
-            return pd.DataFrame()
+            return _errored_frame("pyvo is not installed; ALMA frequency search is unavailable.")
         except Exception as e:
             print(f"[ALMA] Frequency search error: {e}")
-            return pd.DataFrame()
+            return _errored_frame(f"ALMA frequency search failed: {e}")
 
     def get_run_summary(self, df: pd.DataFrame) -> str:
-        """Get a text summary of the results"""
-        if not ALMINER_AVAILABLE or df.empty:
+        """Get a text summary of the results (rows vs datasets vs executions)."""
+        if df is None or df.empty:
             return "No data available to summarize."
-        
-        # Provide a simple custom summary or leverage alminer summary calls if they return text
-        # alminer.summary() usually prints to stdout.
-        # We can construct manual summary
-        summary = f"Found {len(df)} observations.\n"
-        if 'project_code' in df.columns:
-            projects = df['project_code'].nunique()
-            summary += f"Unique Projects: {projects}\n"
+        summary = counts_note(aggregate_counts(df)) + "\n"
         if 'target_name' in df.columns:
-            targets = df['target_name'].nunique()
-            summary += f"Unique Targets: {targets}\n"
-        
+            summary += f"Unique Targets: {df['target_name'].nunique()}\n"
         return summary
 
+    # ── Plots ───────────────────────────────────────────────────────────────
     def plot_sky_distribution(self, df: pd.DataFrame, filename: str = "alma_sky_plot.png") -> bytes:
         """
         Generate sky distribution plot
@@ -288,18 +366,18 @@ class ALminerClient:
             # Save to temp file, read bytes, cleanup
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                 tmp_path = tmp.name
-            
+
             alminer.plot_sky(df, savefig=tmp_path)
-            
+
             with open(tmp_path, 'rb') as f:
                 image_bytes = f.read()
-            
+
             # Cleanup temp file
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-            
+
             return image_bytes
         except Exception as e:
             print(f"Error plotting sky distribution: {e}")
@@ -317,17 +395,17 @@ class ALminerClient:
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                 tmp_path = tmp.name
-            
+
             alminer.plot_bands(df, savefig=tmp_path)
-            
+
             with open(tmp_path, 'rb') as f:
                 image_bytes = f.read()
-            
+
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-            
+
             return image_bytes
         except Exception as e:
             print(f"Error plotting frequency coverage: {e}")
@@ -345,82 +423,112 @@ class ALminerClient:
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                 tmp_path = tmp.name
-            
+
             alminer.plot_overview(df, savefig=tmp_path)
-            
+
             with open(tmp_path, 'rb') as f:
                 image_bytes = f.read()
-            
+
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-            
+
             return image_bytes
         except Exception as e:
             print(f"Error plotting overview: {e}")
             return b""
 
-    def download_data(self, df: pd.DataFrame, dry_run: bool = False) -> str:
+    # ── Download ────────────────────────────────────────────────────────────
+    def download_data(self, df: pd.DataFrame, dry_run: bool = False,
+                      download_dir: Optional[str] = None) -> str:
         """
-        Download data for the observations in the dataframe
+        Download FITS products for the observations in the dataframe.
+
+        This call is SYNCHRONOUS: it returns only after alminer has finished
+        (or the caller's tool guard abandoned the thread). The byte/disk
+        preflight lives in capabilities/alma.py (DownloadAlmaData); this method
+        only performs the transfer.
         """
-        if not ALMINER_AVAILABLE or df.empty:
+        if not ALMINER_AVAILABLE or df is None or df.empty:
             return "ALminer not available or empty dataframe."
 
+        target_dir = download_dir or self.download_dir
         try:
-            # alminer.download_data(df, fitsonly=..., dryrun=...)
-            # We'll default to just FITS to save space/time, and dry_run for safety
-            
-            alminer.download_data(df, download_dir=self.download_dir, dryrun=dry_run, fitsonly=True)
-            
+            os.makedirs(target_dir, exist_ok=True)
+            started = time.time()
+            alminer.download_data(df, download_dir=target_dir, dryrun=dry_run, fitsonly=True)
+            elapsed = time.time() - started
             if dry_run:
-                return f"Dry run complete. Would download to {self.download_dir}"
-            else:
-                return f"Download initiated to {self.download_dir}"
+                return f"Dry run complete. Would download FITS products to {target_dir}"
+            files = []
+            try:
+                for root, _dirs, names in os.walk(target_dir):
+                    files.extend(os.path.join(root, n) for n in names)
+            except OSError:
+                pass
+            return (
+                f"Download completed (synchronous, {elapsed:.0f} s) to {target_dir} "
+                f"on the Quasar server; {len(files)} file(s) now present there."
+            )
         except Exception as e:
             return f"Download failed: {e}"
 
+    # ── Column normalisation ────────────────────────────────────────────────
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Standardize ALminer output columns to match Quasar's expected format
-        """
-        if df.empty:
-            return df
+        Standardize ALminer/TAP output columns to Quasar's expected format.
 
-        # Rename columns to match UI expectations
+        ObsCore ``access_url`` is the MOUS DataLink URL and is KEPT (skill:
+        follow the returned URL, never rewrite it); the hand-built Archive
+        Query page link lives in ``archive_url``. ``sensitivity_10kms`` and
+        ``s_resolution`` are kept and get display aliases (``sensitivity``,
+        ``resolution``) instead of being renamed away (A-22).
+        """
+        if df is None or df.empty:
+            return df if df is not None else pd.DataFrame()
+
         rename_map = {
             'ra': 's_ra',
             'dec': 's_dec',
             'integration_time': 't_exptime',
             'band_number': 'Band',
-            's_resolution': 'resolution',
-            'sensitivity_10kms': 'sensitivity',
-            'bandwidth': 'bandwidth',
             'min_freq_ghz': 'freq_min',
-            'max_freq_ghz': 'freq_max'
+            'max_freq_ghz': 'freq_max',
+            'min_freq_GHz': 'freq_min',
+            'max_freq_GHz': 'freq_max',
         }
-        
-        # Apply renaming for columns that exist
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-        
+
+        # Aliases (keep the archive column, add the display name)
+        if 's_resolution' in df.columns and 'resolution' not in df.columns:
+            df['resolution'] = df['s_resolution']
+        if 'sensitivity_10kms' in df.columns and 'sensitivity' not in df.columns:
+            df['sensitivity'] = df['sensitivity_10kms']
+
         # Ensure standard columns exist
         df['telescope'] = 'ALMA'
         df['instrument_name'] = 'ALMA'
-        
+
+        # Frequency span from frequency_support (TAP shape has no min/max
+        # frequency columns; alminer's shape does).
+        if 'frequency_support' in df.columns and 'freq_min' not in df.columns:
+            spans = df['frequency_support'].apply(_frequency_span_ghz)
+            df['freq_min'] = spans.apply(lambda s: s[0])
+            df['freq_max'] = spans.apply(lambda s: s[1])
+
         # Add frequency aliases for CLI display compatibility
         if 'freq_min' in df.columns and 'freq_min_ghz' not in df.columns:
             df['freq_min_ghz'] = df['freq_min']
         if 'freq_max' in df.columns and 'freq_max_ghz' not in df.columns:
             df['freq_max_ghz'] = df['freq_max']
-        
-        # Construct useful Archive URL
+
+        # Archive Query page deep link per MOUS (the DataLink access_url stays).
         if 'member_ous_uid' in df.columns:
-            df['access_url'] = df['member_ous_uid'].apply(
-                lambda x: f"https://almascience.nrao.edu/aq/?member_ous_id={x}" if pd.notna(x) else ""
+            from urllib.parse import quote_plus
+            df['archive_url'] = df['member_ous_uid'].apply(
+                lambda x: f"{ALMA_AQ_URL}?member_ous_id={quote_plus(str(x))}" if pd.notna(x) else ""
             )
-        elif 'obs_publisher_did' in df.columns:
-             pass
 
         # C14: guarantee a stable canonical column set on BOTH source paths.
         for _col in _CANONICAL_ALMA_COLUMNS:
@@ -429,35 +537,36 @@ class ALminerClient:
 
         return df
 
-    def get_line_coverage(self, df: pd.DataFrame, line_freq: float, z: float = 0.0, line_name: str = "Line") -> pd.DataFrame:
+    # ── Line coverage (frequency_support-based) ─────────────────────────────
+    def get_line_coverage(self, df: pd.DataFrame, line_freq: float, z: float = 0.0,
+                          line_name: str = "Line") -> pd.DataFrame:
         """
-        Check which observations cover a specific line frequency (GHz)
+        Rows of ``df`` whose spectral windows cover ``line_freq`` GHz (rest) at
+        redshift ``z``. Decided from ``frequency_support`` per row (exact SPW
+        windows); rows lacking it fall back to frequency +/- bandwidth/2 and are
+        labelled approximate. Returns an errored frame when coverage cannot be
+        determined at all, instead of a silent "0 covered" (A-61).
         """
-        if not ALMINER_AVAILABLE or df.empty:
+        if df is None or df.empty:
             return pd.DataFrame()
-            
         try:
-            # alminer.line_coverage returns a filtered dataframe
-            result = alminer.line_coverage(df, line_freq=line_freq, z=z, line_name=line_name, print_targets=False)
-            return self._standardize_columns(result)
-        except Exception as e:
-            print(f"Line coverage check failed: {e}")
-            return pd.DataFrame()
+            observed = float(line_freq) / (1.0 + float(z or 0.0))
+        except (TypeError, ValueError) as e:
+            return _errored_frame(f"Invalid line frequency/redshift: {e}")
+        return _coverage_rows(df, {line_name: observed})
 
     def get_co_lines(self, df: pd.DataFrame, z: float = 0.0) -> pd.DataFrame:
         """
-        Check for CO, 13CO, and C18O lines in the observations
+        Rows of ``df`` covering any CO / 13CO / C18O transition at redshift ``z``.
         """
-        if not ALMINER_AVAILABLE or df.empty:
+        if df is None or df.empty:
             return pd.DataFrame()
-            
-        try:
-            # alminer.CO_lines returns a DataFrame of matching observations
-            result = alminer.CO_lines(df, z=z, print_targets=False)
-            return self._standardize_columns(result)
-        except Exception as e:
-            print(f"CO lines check failed: {e}")
-            return pd.DataFrame()
+        lines = {
+            name: freq / (1.0 + float(z or 0.0))
+            for name, freq in LINE_REST_FREQ_GHZ.items()
+            if name.startswith(("12CO(", "13CO(", "C18O(", "CO("))
+        }
+        return _coverage_rows(df, lines)
 
     def search_by_catalog(self, catalog_data: Dict[str, List[Any]]) -> pd.DataFrame:
         """
@@ -465,13 +574,68 @@ class ALminerClient:
         catalog_data expected format: {"Name": [...], "RAJ2000": [...], "DEJ2000": [...]}
         """
         if not ALMINER_AVAILABLE:
-            return pd.DataFrame()
+            return _errored_frame("alminer is not installed; catalog search is unavailable.")
 
         try:
-            # Convert dictionary to DataFrame for alminer
             cat_df = pd.DataFrame(catalog_data)
             result = alminer.catalog(cat_df, print_targets=False)
+            if result is None:
+                return pd.DataFrame()
             return self._standardize_columns(result)
         except Exception as e:
             print(f"Catalog search failed: {e}")
-            return pd.DataFrame()
+            return _errored_frame(f"ALMA catalog search failed: {e}")
+
+
+def _frequency_span_ghz(value: Any) -> Tuple[Any, Any]:
+    windows = parse_frequency_support_windows(value)
+    if not windows:
+        return (pd.NA, pd.NA)
+    return (min(w["low_ghz"] for w in windows), max(w["high_ghz"] for w in windows))
+
+
+def _coverage_rows(df: pd.DataFrame, lines: Dict[str, float]) -> pd.DataFrame:
+    """Filter rows covering any of ``lines`` ({name: observed GHz})."""
+    has_support = "frequency_support" in df.columns
+    has_fallback = "frequency" in df.columns and "bandwidth" in df.columns
+    if not has_support and not has_fallback:
+        return _errored_frame(
+            "Cannot determine line coverage: results carry neither frequency_support "
+            "nor frequency/bandwidth columns."
+        )
+    keep_index: List[Any] = []
+    covered_names: List[str] = []
+    covering_spws: List[str] = []
+    methods: List[str] = []
+    decidable = 0
+    for idx, row in df.iterrows():
+        windows = observation_windows_ghz(row)
+        if not windows:
+            continue
+        decidable += 1
+        exact = bool(parse_frequency_support_windows(row.get("frequency_support")))
+        hits: List[str] = []
+        spws: List[str] = []
+        for name, nu in lines.items():
+            for w in windows:
+                if w["low_ghz"] <= nu <= w["high_ghz"]:
+                    hits.append(name)
+                    spws.append(f"{w['low_ghz']:.3f}-{w['high_ghz']:.3f} GHz")
+                    break
+        if hits:
+            keep_index.append(idx)
+            covered_names.append(", ".join(hits))
+            covering_spws.append("; ".join(spws))
+            methods.append("frequency_support SPW windows" if exact
+                           else "frequency +/- bandwidth/2 (APPROXIMATE: aggregate bandwidth treated as contiguous)")
+    if decidable == 0:
+        return _errored_frame(
+            "Cannot determine line coverage: no row carries a parseable frequency_support "
+            "or a numeric frequency/bandwidth."
+        )
+    out = df.loc[keep_index].copy()
+    out["lines_covered"] = covered_names
+    out["covering_spw_ghz"] = covering_spws
+    out["coverage_method"] = methods
+    out.attrs["rows_undecidable"] = int(len(df) - decidable)
+    return out

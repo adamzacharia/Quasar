@@ -7,6 +7,7 @@ LLM routing can call one tool and receive auditable tables/counts.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -30,6 +31,7 @@ LINE_REST_FREQ_GHZ: Dict[str, float] = {
     "CO(5-4)": 576.2679305,
     "CO(6-5)": 691.4730763,
     "CO(7-6)": 806.6518060,
+    "CO(8-7)": 921.7997000,
 }
 
 CO_LADDER_LINES = [
@@ -40,6 +42,7 @@ CO_LADDER_LINES = [
     "CO(5-4)",
     "CO(6-5)",
     "CO(7-6)",
+    "CO(8-7)",
 ]
 
 UNIT_TO_GHZ = {
@@ -76,11 +79,9 @@ def escape_adql(value: str) -> str:
 
 
 def normalize_target_alias(target: str) -> str:
-    """Normalize compact common names that archive resolvers often space out."""
+    """Normalize whitespace; let the resolver interpret catalog identifiers."""
     clean = as_text(target)
-    if re.fullmatch(r"hh\s*212", clean, flags=re.IGNORECASE):
-        return "HH 212"
-    return clean
+    return re.sub(r"\s+", " ", clean)
 
 
 # alma-cycle-prefix-wrong-pre-cycle8: the cycle→proposal-year relation is NOT
@@ -103,6 +104,8 @@ _CYCLE_TO_PROPOSAL_YEAR: Dict[int, int] = {
     9: 2022,
     10: 2023,
     11: 2024,
+    12: 2025,
+    13: 2026,
 }
 
 
@@ -122,24 +125,298 @@ def cycle_to_project_prefix(cycle: int) -> str:
     return f"{year}.{suffix}."
 
 
-def project_prefix_where(cycle: int) -> str:
-    return f"proposal_id LIKE '{cycle_to_project_prefix(cycle)}%'"
+def cycle_project_prefixes(
+    cycle: int,
+    *,
+    include_supplemental: bool = True,
+    include_ddt: bool = True,
+) -> List[str]:
+    """Every proposal_id prefix that belongs to one ALMA cycle.
+
+    A cycle is not only its main call (``<year>.1.``): Cycle 7 also had the
+    2019.2 supplemental call, and every cycle carries DDT projects with a
+    letter period (``2019.A.``). Counting only ``.1.`` undercounts a cycle
+    (skill: SKILL.md "UID and project-code grammar"; cycle-capabilities.md).
+    Cycle 0 keeps its ``.0.`` special case.
+    """
+    main = cycle_to_project_prefix(cycle)
+    year = main.split(".")[0]
+    prefixes = [main]
+    if int(cycle) != 0:
+        if include_supplemental:
+            prefixes.append(f"{year}.2.")
+        if include_ddt:
+            prefixes.append(f"{year}.A.")
+    return prefixes
+
+
+def cycle_periods_disclosure(
+    cycle: int,
+    *,
+    include_supplemental: bool = True,
+    include_ddt: bool = True,
+) -> str:
+    """Human-readable statement of which project-code periods a cycle query included."""
+    prefixes = cycle_project_prefixes(
+        cycle, include_supplemental=include_supplemental, include_ddt=include_ddt
+    )
+    year = prefixes[0].split(".")[0]
+    parts = [f"main call {prefixes[0]}*"]
+    if int(cycle) != 0:
+        parts.append(f"supplemental call {year}.2.*" if include_supplemental
+                     else "supplemental-call projects EXCLUDED")
+        parts.append(f"DDT letter period {year}.A.*" if include_ddt
+                     else "DDT projects EXCLUDED")
+    return f"Cycle {int(cycle)} project codes included: " + "; ".join(parts) + "."
+
+
+def project_prefix_where(
+    cycle: int,
+    *,
+    include_supplemental: bool = True,
+    include_ddt: bool = True,
+) -> str:
+    """ADQL predicate selecting every project code of one cycle (see
+    :func:`cycle_project_prefixes`)."""
+    prefixes = cycle_project_prefixes(
+        cycle, include_supplemental=include_supplemental, include_ddt=include_ddt
+    )
+    clauses = [f"proposal_id LIKE '{prefix}%'" for prefix in prefixes]
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " OR ".join(clauses) + ")"
+
+
+# The standard ObsCore projection every template fetches. Row-grain columns
+# (asdm_uid, group_ous_uid, schedblock_name) make MOUS/EB aggregation
+# possible; s_region/is_mosaic expose the footprint; data_rights and
+# obs_release_date carry access; science_observation/scan_intent/qa2_passed
+# carry intent and QA; access_url is the DataLink URL of the MOUS.
+OBSCORE_BASE_COLUMNS: Tuple[str, ...] = (
+    "target_name", "proposal_id", "member_ous_uid", "group_ous_uid", "asdm_uid",
+    "obs_publisher_did", "schedblock_name",
+    "frequency", "bandwidth", "frequency_support", "band_list",
+    "antenna_arrays", "dataproduct_type", "calib_level",
+    "scientific_category", "science_keyword", "obs_title", "pi_name",
+    "s_ra", "s_dec", "s_region", "is_mosaic",
+    "t_exptime", "s_resolution", "spatial_resolution",
+    "obs_release_date", "data_rights", "science_observation", "scan_intent",
+    "qa2_passed", "access_url", "sensitivity_10kms", "cont_sensitivity_bandwidth",
+    "t_min", "t_max",
+)
+
+
+def _format_columns(columns: Sequence[str]) -> str:
+    lines: List[str] = []
+    line: List[str] = []
+    for column in columns:
+        line.append(column)
+        if len(line) == 4:
+            lines.append(", ".join(line))
+            line = []
+    if line:
+        lines.append(", ".join(line))
+    return ",\n       ".join(lines)
 
 
 def select_obscore_query(where_clause: str, *, top: int = 5000, order_by: str = "proposal_id") -> str:
     top = max(1, min(int(top or 5000), 20000))
     return f"""
 SELECT TOP {top}
-       target_name, proposal_id, member_ous_uid, obs_publisher_did,
-       frequency, bandwidth, frequency_support, band_list,
-       antenna_arrays, dataproduct_type, calib_level,
-       scientific_category, science_keyword, obs_title, pi_name,
-       s_ra, s_dec, t_exptime, s_resolution, spatial_resolution,
-       obs_release_date
+       {_format_columns(OBSCORE_BASE_COLUMNS)}
 FROM ivoa.obscore
 WHERE {where_clause}
 ORDER BY {order_by}
 """
+
+
+def truncation_info(df: Optional[pd.DataFrame], max_results: int) -> Dict[str, Any]:
+    """Did a TOP-limited fetch hit its cap? (skill: capabilities/limits are
+    operational settings — never report a capped fetch as the complete answer)."""
+    rows = int(len(df)) if df is not None else 0
+    cap = int(max_results or 0)
+    truncated = bool((cap and rows >= cap) or (df is not None and df.attrs.get("truncated")))
+    warning = ""
+    if truncated:
+        warning = (
+            f"TAP fetch hit the TOP {cap} row cap (ordered by proposal_id, so the lowest "
+            "project codes come first); counts and project lists below are INCOMPLETE. "
+            "Narrow the query (cycle, band, category) or raise max_results."
+        )
+    return {"rows_fetched": rows, "row_cap": cap, "truncated": truncated, "warning": warning}
+
+
+SPEED_OF_LIGHT_M_GHZ = 0.299792458  # metres * GHz
+
+
+def wavelength_overlap_where(nu_lo_ghz: float, nu_hi_ghz: float) -> str:
+    """ADQL: rows whose [em_min, em_max] wavelength span overlaps [nu_lo, nu_hi] GHz.
+
+    em_min/em_max are WAVELENGTHS IN METRES (skill guardrail 2), so the
+    frequency window [nu_lo, nu_hi] is the wavelength window
+    [c/nu_hi, c/nu_lo]; overlap is em_min <= c/nu_lo AND em_max >= c/nu_hi.
+    This is the coarse prefilter; exact SPW coverage still needs
+    frequency_support (see :func:`parse_frequency_support_windows`).
+    """
+    lo = float(min(nu_lo_ghz, nu_hi_ghz))
+    hi = float(max(nu_lo_ghz, nu_hi_ghz))
+    if lo <= 0 or hi <= 0:
+        raise ValueError("frequency bounds must be positive GHz")
+    lam_max = SPEED_OF_LIGHT_M_GHZ / lo
+    lam_min = SPEED_OF_LIGHT_M_GHZ / hi
+    return f"(em_min <= {lam_max:.12g} AND em_max >= {lam_min:.12g})"
+
+
+def alma_cone_where(ra: float, dec: float, radius_deg: float, *, footprint: bool = True) -> str:
+    """Cone predicate over the s_region FOOTPRINT unioned with the representative
+    point (s_ra, s_dec).
+
+    s_ra/s_dec is a representative position only: a mosaic whose footprint
+    overlaps the cone without its centre falling inside is missed by the
+    point test (skill: archive-query.md ADQL patterns). INTERSECTS(CIRCLE,
+    s_region) catches those; the point test is kept in the OR so rows with a
+    NULL or single-pointing s_region (the Total Power known issue) are not
+    lost. ``footprint=False`` is the point-only fallback for a service that
+    rejects INTERSECTS.
+    """
+    circle = f"CIRCLE('ICRS', {float(ra):.8f}, {float(dec):.8f}, {float(radius_deg):.8f})"
+    point = f"CONTAINS(POINT('ICRS', s_ra, s_dec), {circle}) = 1"
+    if not footprint:
+        return point
+    return f"(INTERSECTS({circle}, s_region) = 1 OR {point})"
+
+
+def alma_cone_adql(
+    ra: float,
+    dec: float,
+    radius_deg: float,
+    *,
+    public: bool = True,
+    top: Optional[int] = None,
+    footprint: bool = True,
+    columns: Sequence[str] = OBSCORE_BASE_COLUMNS,
+) -> str:
+    """The cone query the ALMA client executes (and what provenance reports)."""
+    where = alma_cone_where(ra, dec, radius_deg, footprint=footprint)
+    if public:
+        where += " AND data_rights = 'Public'"
+    top_clause = f"TOP {max(1, min(int(top), 20000))} " if top else ""
+    return f"SELECT {top_clause}{', '.join(columns)} FROM ivoa.obscore WHERE {where}"
+
+
+def science_cone_query(ra, dec, radius_arcsec=60.0, *, band=None,
+                       max_resolution_arcsec=None, public_only=False,
+                       science_only=False, top=5000):
+    """Apply explicit science constraints before the archive's row cap."""
+    if not all(math.isfinite(float(v)) for v in (ra, dec, radius_arcsec)):
+        raise ValueError("Coordinates and radius must be finite")
+    if not (0 <= float(ra) < 360 and -90 <= float(dec) <= 90 and 0 < float(radius_arcsec) <= 648000):
+        raise ValueError("Invalid ICRS coordinates or cone radius")
+    if not 1 <= int(top) <= 20000:
+        raise ValueError("top must be between 1 and 20000")
+    where = alma_cone_where(float(ra), float(dec), float(radius_arcsec) / 3600)
+    bands = requested_bands(band)
+    if band is not None and not bands:
+        raise ValueError("band must contain ALMA band numbers from 1 to 10")
+    if bands:
+        where += " AND (" + " OR ".join(band_token_where(b) for b in bands) + ")"
+    if max_resolution_arcsec is not None:
+        threshold = float(max_resolution_arcsec)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("max_resolution_arcsec must be finite and positive")
+        where += f" AND spatial_resolution < {threshold}"
+    if public_only:
+        where += " AND data_rights = 'Public'"
+    if science_only:
+        where += " AND science_observation = 'T'"
+    columns = ("member_ous_uid", "proposal_id", "target_name", "s_ra", "s_dec",
+               "band_list", "spatial_resolution", "data_rights", "science_observation", "qa2_passed")
+    # No ORDER BY: it made the NRAO proxy time out (502 after 62 s, live 2026-09-16)
+    # while the unsorted query returned in 25 s; grouping sorts by MOUS in Python.
+    return f"SELECT TOP {int(top)} {', '.join(columns)} FROM ivoa.obscore WHERE {where}"
+
+
+def summarize_mous(df: pd.DataFrame) -> pd.DataFrame:
+    """One observation per MOUS; minimum beam size and union of observed bands."""
+    if df.empty:
+        return df.copy()
+    required = {"member_ous_uid", "band_list", "spatial_resolution"}
+    if not required.issubset(df.columns):
+        raise ValueError("Archive result lacks the identifiers or metadata needed for MOUS grouping")
+    valid = df["member_ous_uid"].notna() & df["member_ous_uid"].astype(str).str.strip().ne("")
+    missing = int((~valid).sum())
+    rows = []
+    for uid, group in df[valid].groupby("member_ous_uid", sort=True):
+        row = group.iloc[0].to_dict()
+        row["member_ous_uid"] = uid
+        band_set = {b for v in group.band_list for b in band_tokens(v) if str(b).isdigit()}
+        row["band_list"] = " ".join(sorted(band_set, key=int))
+        row["bands"] = sorted(int(b) for b in band_set)
+        row["spatial_resolution"] = pd.to_numeric(group.spatial_resolution, errors="coerce").min()
+        row["rows"] = len(group)
+        if "qa2_passed" in group:
+            row["qa2_passed"] = "; ".join(dict.fromkeys(as_text(v) for v in group.qa2_passed))
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out.attrs.update(df.attrs)
+    if missing:
+        out.attrs.update(partial=True, ungroupable_rows=missing)
+    return out
+
+
+_SUNYAEV_RE = re.compile(r"sunyaev|zel'?dovich", re.IGNORECASE)
+_SOLAR_SYSTEM_RE = re.compile(r"solar\s+system|\bcomet|trans-neptunian|\bTNO\b|asteroid|\bplanet", re.IGNORECASE)
+
+
+def solar_where() -> str:
+    """Predicate for observations OF THE SUN.
+
+    ``LIKE '%sun%'`` matches the 'Sunyaev-Zel'dovich effect' science keyword
+    and ``'%solar%'`` matches ALMA's 'Solar system' category and its
+    comet/TNO keywords, so the official scientific_category 'Sun' is the
+    primary predicate and the text fallbacks are the word 'sun' anchored on
+    word edges (ADQL has no word boundaries; space-anchored alternatives
+    approximate them) plus the ALMA keyword 'Solar flares'-style phrases
+    ('solar ' followed by a non-system word is NOT attempted). Sunyaev and
+    Solar-System rows are excluded in ADQL and again by
+    :func:`exclude_sunyaev`.
+    """
+    alternatives: List[str] = [
+        "LOWER(scientific_category) = 'sun'",
+        "LOWER(scientific_category) LIKE 'sun %'",
+        "LOWER(scientific_category) LIKE '% sun'",
+        "LOWER(scientific_category) LIKE '% sun %'",
+    ]
+    for column in ("target_name", "science_keyword", "obs_title"):
+        alternatives.append(f"LOWER({column}) = 'sun'")
+        alternatives.append(f"LOWER({column}) LIKE 'sun %'")
+        alternatives.append(f"LOWER({column}) LIKE '% sun'")
+        alternatives.append(f"LOWER({column}) LIKE '% sun %'")
+        alternatives.append(f"LOWER({column}) LIKE '%the sun%'")
+    return (
+        "(" + " OR ".join(alternatives) + ")"
+        " AND LOWER(science_keyword) NOT LIKE '%sunyaev%'"
+        " AND LOWER(obs_title) NOT LIKE '%sunyaev%'"
+        " AND LOWER(scientific_category) NOT LIKE '%solar system%'"
+    )
+
+
+def exclude_sunyaev(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows a text match on 'sun' let through that are NOT the Sun:
+    Sunyaev-Zel'dovich cluster projects and Solar-System (comet / TNO /
+    planet) projects."""
+    if df is None or df.empty:
+        return df
+    text_cols = [c for c in ("science_keyword", "obs_title", "scientific_category", "target_name") if c in df.columns]
+    if not text_cols:
+        return df
+    blob = df[text_cols].astype(str).agg(" ".join, axis=1)
+    keep = ~blob.str.contains(_SUNYAEV_RE, regex=True, na=False)
+    if "scientific_category" in df.columns or "science_keyword" in df.columns:
+        cat_cols = [c for c in ("scientific_category", "science_keyword") if c in df.columns]
+        cats = df[cat_cols].astype(str).agg(" ".join, axis=1)
+        keep &= ~cats.str.contains(_SOLAR_SYSTEM_RE, regex=True, na=False)
+    return df[keep].copy()
 
 
 def first_nonempty(values: Iterable[Any]) -> str:
@@ -157,14 +434,66 @@ def col(df: pd.DataFrame, names: Sequence[str]) -> Optional[str]:
     return None
 
 
-def filter_band(df: pd.DataFrame, band: Optional[int | str]) -> pd.DataFrame:
-    if df is None or df.empty or not band:
+_BAND_SPLIT_RE = re.compile(r"[\s,;/|]+")
+
+
+def band_tokens(value: Any) -> List[str]:
+    """Tolerant tokenizer for the ObsCore ``band_list`` column.
+
+    Live values are numeric and SPACE delimited (``'6'``, band-to-band
+    ``'5 10'``); historical/display forms say ``'BAND 6'`` or use commas.
+    Splitting on ',' alone yields the single token ``'5 10'`` and silently
+    drops every multi-band row (skill guardrail 3).
+    """
+    text = as_text(value)
+    if not text:
+        return []
+    text = re.sub(r"(?i)\bband\b", " ", text)
+    text = re.sub(r"(?i)\bB(?=\d)", "", text)
+    return [t for t in _BAND_SPLIT_RE.split(text.strip()) if t]
+
+
+def normalize_band_token(band: Any) -> str:
+    """'Band 6' / 'B6' / 6 / '6' -> '6'."""
+    tokens = band_tokens(band)
+    return tokens[0] if tokens else ""
+
+
+def requested_bands(band: Any) -> List[str]:
+    """Normalize a user/LLM band argument (int, '6', '6,7', '6 and 7', [6, 7])."""
+    if band is None:
+        return []
+    if isinstance(band, (list, tuple, set)):
+        out: List[str] = []
+        for item in band:
+            out.extend(requested_bands(item))
+        return out
+    text = re.sub(r"(?i)\band\b", " ", as_text(band))
+    return [t for t in band_tokens(text) if t.isdigit() and 1 <= int(t) <= 10]
+
+
+def row_matches_band(value: Any, bands: Sequence[Any]) -> bool:
+    wanted = {normalize_band_token(b) for b in bands if normalize_band_token(b)}
+    if not wanted:
+        return True
+    return bool(wanted & set(band_tokens(value)))
+
+
+def is_multi_band(value: Any) -> bool:
+    return len(band_tokens(value)) > 1
+
+
+def filter_band(df: pd.DataFrame, band: Any) -> pd.DataFrame:
+    """Keep rows whose band_list contains ANY requested band (token match)."""
+    if df is None or df.empty or band is None:
+        return df
+    wanted = requested_bands(band)
+    if not wanted:
         return df
     band_col = col(df, ["band_list", "Band", "band"])
     if not band_col:
         return df
-    needle = str(band).strip().replace("Band", "").replace("band", "").strip()
-    mask = df[band_col].astype(str).str.contains(rf"(^|[^0-9]){re.escape(needle)}([^0-9]|$)", regex=True, na=False)
+    mask = df[band_col].apply(lambda v: row_matches_band(v, wanted))
     return df[mask].copy()
 
 
@@ -189,16 +518,117 @@ def filter_resolution(df: pd.DataFrame, max_arcsec: Optional[float]) -> pd.DataF
     return out[out["_resolution_arcsec"].notna() & (out["_resolution_arcsec"] < float(max_arcsec))].copy()
 
 
+_ANTENNA_PREFIX_RE = re.compile(r"(?:^|[\s:,;])(DV|DA|CM|PM)\d{2}\b", re.IGNORECASE)
+_ANTENNA_PREFIX_TO_ARRAY = {"DV": "12m", "DA": "12m", "CM": "7m", "PM": "TP"}
+
+
 def infer_arrays(text: Any) -> List[str]:
-    clean = as_text(text).lower()
+    """Infer which ALMA arrays a row used.
+
+    The live ObsCore ``antenna_arrays`` column is a blank-separated list of
+    ``Pad:Antenna`` pairs such as ``'A004:DV07 A025:CM03 J505:PM03'`` — it
+    never contains the words '12m', 'ACA' or 'TP'. Antenna-name prefixes are
+    the heuristic the skill recommends (``DV``/``DA`` 12-m, ``CM`` 7-m, ``PM``
+    Total Power; listobs-and-intents.md "Which array? Infer it"). Prose
+    tokens ('12m Array', 'Total Power', '_TM1'/'_7M'/'_TP' SB-name suffixes)
+    are still recognised as a fallback for display-shaped values. This is a
+    heuristic, not an identity contract: heterogeneous EBs can mix 7-m and
+    12-m antennas and the result then lists both.
+    """
+    raw = as_text(text)
     arrays: List[str] = []
-    if re.search(r"\b12\s*m\b|12m|array.*twelve|tm[12]", clean):
+    for match in _ANTENNA_PREFIX_RE.finditer(raw):
+        label = _ANTENNA_PREFIX_TO_ARRAY[match.group(1).upper()]
+        if label not in arrays:
+            arrays.append(label)
+    if arrays:
+        return arrays
+    clean = raw.lower()
+    if re.search(r"\b12\s*m\b|12m|array.*twelve|_tm[12]\b|tm[12]", clean):
         arrays.append("12m")
     if re.search(r"\b7\s*m\b|7m|aca|morita", clean):
         arrays.append("7m")
-    if re.search(r"\btp\b|total\s*power|single\s*dish", clean):
+    if re.search(r"\btp\b|_tp\b|total\s*power|single\s*dish", clean):
         arrays.append("TP")
     return arrays
+
+
+def infer_arrays_from_schedblock(name: Any) -> List[str]:
+    """``_TM1``/``_TM2`` -> 12m, ``_7M`` -> 7m, ``_TP`` -> TP (SB-name heuristic)."""
+    clean = as_text(name).upper()
+    arrays: List[str] = []
+    if re.search(r"_TM[12]\b", clean):
+        arrays.append("12m")
+    if re.search(r"_7M\b", clean):
+        arrays.append("7m")
+    if re.search(r"_TP\b", clean):
+        arrays.append("TP")
+    return arrays
+
+
+def detect_arrays(row: pd.Series) -> List[str]:
+    """Union of antenna-prefix and SB-name heuristics for one ObsCore row."""
+    arrays: List[str] = []
+    for key in ("antenna_arrays", "array", "arrays"):
+        if key in row.index:
+            for label in infer_arrays(row.get(key)):
+                if label not in arrays:
+                    arrays.append(label)
+    if "schedblock_name" in row.index:
+        for label in infer_arrays_from_schedblock(row.get("schedblock_name")):
+            if label not in arrays:
+                arrays.append(label)
+    return arrays
+
+
+def _nunique(group: pd.DataFrame, column: str) -> Optional[int]:
+    if column not in group.columns:
+        return None
+    values = group[column].dropna().astype(str).str.strip()
+    values = values[(values != "") & (values.str.lower() != "nan")]
+    return int(values.nunique())
+
+
+def aggregate_counts(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    """Row-grain honesty for one ObsCore frame (skill guardrail 1).
+
+    ObsCore rows repeat per execution block, per field and per spectral
+    coverage, so ``len(df)`` is NOT a number of observations. Report rows,
+    distinct MOUS (``member_ous_uid`` = datasets), distinct EBs (``asdm_uid``)
+    and distinct projects separately; ``None`` means the column was absent.
+    """
+    if df is None or not hasattr(df, "columns"):
+        return {"rows": 0, "n_mous": None, "n_eb": None, "n_projects": None}
+    counts: Dict[str, Any] = {
+        "rows": int(len(df)),
+        "n_mous": _nunique(df, "member_ous_uid"),
+        "n_eb": _nunique(df, "asdm_uid"),
+        "n_projects": None,
+    }
+    project_col = col(df, ["proposal_id", "project_code"])
+    if project_col:
+        counts["n_projects"] = _nunique(df, project_col)
+    if "data_rights" in df.columns:
+        rights = df["data_rights"].astype(str).str.strip().str.lower()
+        counts["n_public_rows"] = int((rights == "public").sum())
+        counts["n_proprietary_rows"] = int((rights == "proprietary").sum())
+    return counts
+
+
+def counts_note(counts: Dict[str, Any]) -> str:
+    """One sentence stating rows vs datasets vs executions (never 'N observations')."""
+    rows = int(counts.get("rows") or 0)
+    parts = [f"{rows} archive row{'s' if rows != 1 else ''}"]
+    if counts.get("n_mous") is not None:
+        parts.append(f"{counts['n_mous']} dataset{'s' if counts['n_mous'] != 1 else ''} (distinct member_ous_uid)")
+    if counts.get("n_eb") is not None:
+        parts.append(f"{counts['n_eb']} execution block{'s' if counts['n_eb'] != 1 else ''} (distinct asdm_uid)")
+    if counts.get("n_projects") is not None:
+        parts.append(f"{counts['n_projects']} project{'s' if counts['n_projects'] != 1 else ''}")
+    note = ", ".join(parts)
+    if counts.get("n_proprietary_rows"):
+        note += f"; {counts['n_proprietary_rows']} row(s) are proprietary (data_rights)"
+    return note + ". Rows repeat per execution/field/spectral coverage; do not call rows observations."
 
 
 def projects_with_array_combo(df: pd.DataFrame, required_arrays: Sequence[str]) -> pd.DataFrame:
@@ -214,14 +644,17 @@ def projects_with_array_combo(df: pd.DataFrame, required_arrays: Sequence[str]) 
     rows: List[Dict[str, Any]] = []
     for project, group in df.groupby(project_col, dropna=True):
         arrays = set()
-        for value in group[array_col].tolist():
-            arrays.update(infer_arrays(value))
+        for _, row in group.iterrows():
+            arrays.update(detect_arrays(row))
         normalized_arrays = {"TP" if item == "TP" else item.lower() for item in arrays}
         if normalized_required <= normalized_arrays:
             rows.append({
                 "proposal_id": as_text(project),
                 "arrays_found": ", ".join(sorted(arrays)),
-                "observations": int(len(group)),
+                "rows": int(len(group)),
+                "n_mous": _nunique(group, "member_ous_uid"),
+                "n_eb": _nunique(group, "asdm_uid"),
+                "array_inference": "heuristic: antenna prefixes DV/DA=12m, CM=7m, PM=TP (+ SB-name suffix); the archive delivers per-MOUS and has not combined arrays",
                 "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
                 "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group.columns else "",
                 "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group.columns else "",
@@ -415,7 +848,9 @@ def projects_covering_all_lines(df: pd.DataFrame, lines: Sequence[str], z: float
             rows.append({
                 "proposal_id": as_text(project),
                 "covered_lines": ", ".join(sorted(found)),
-                "observations": int(len(group)),
+                "rows": int(len(group)),
+                "n_mous": _nunique(group, "member_ous_uid"),
+                "n_eb": _nunique(group, "asdm_uid"),
                 "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
                 "band_list": first_nonempty(group["band_list"].tolist()) if "band_list" in group.columns else "",
                 "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group.columns else "",
@@ -461,6 +896,8 @@ def redshifted_line_projects(
                 inferred_z_max = min(z_hi, rest_freq / inter_lo - 1.0)
                 hit_rows.append({
                     "proposal_id": as_text(row.get(project_col)),
+                    "member_ous_uid": as_text(row.get("member_ous_uid")),
+                    "asdm_uid": as_text(row.get("asdm_uid")),
                     "target_name": as_text(row.get("target_name")),
                     "transition": line_name,
                     "rest_frequency_ghz": round(rest_freq, 6),
@@ -484,13 +921,35 @@ def redshifted_line_projects(
             "transitions": ", ".join(sorted(set(group["transition"].tolist()))),
             "observed_frequency_ranges_ghz": "; ".join(sorted(set(group["observed_frequency_range_ghz"].tolist()))[:8]),
             "inferred_redshift_ranges": "; ".join(sorted(set(group["inferred_redshift_range"].tolist()))[:8]),
-            "observations": int(len(group)),
+            "rows": int(len(group)),
+            "n_mous": _nunique(group[group["member_ous_uid"] != ""], "member_ous_uid"),
+            "n_eb": _nunique(group[group["asdm_uid"] != ""], "asdm_uid"),
             "band_list": first_nonempty(group["band_list"].tolist()),
             "pi_name": first_nonempty(group["pi_name"].tolist()),
             "obs_title": first_nonempty(group["obs_title"].tolist()),
             "science_keyword": first_nonempty(group["science_keyword"].tolist()),
         })
-    return pd.DataFrame(rows).sort_values(["observations", "proposal_id"], ascending=[False, True])
+    return pd.DataFrame(rows).sort_values(["rows", "proposal_id"], ascending=[False, True])
+
+
+def _band_union(group: pd.DataFrame) -> str:
+    if "band_list" not in group.columns:
+        return ""
+    tokens: List[str] = []
+    for value in group["band_list"].tolist():
+        for token in band_tokens(value):
+            if token not in tokens:
+                tokens.append(token)
+    return " ".join(sorted(tokens, key=lambda t: (not t.isdigit(), int(t) if t.isdigit() else 0, t)))
+
+
+def _release_span(group: pd.DataFrame) -> Tuple[str, str]:
+    if "obs_release_date" not in group.columns:
+        return "", ""
+    values = sorted(v for v in (as_text(x) for x in group["obs_release_date"].tolist()) if v)
+    if not values:
+        return "", ""
+    return values[0], values[-1]
 
 
 def summarize_projects(df: pd.DataFrame) -> pd.DataFrame:
@@ -501,18 +960,38 @@ def summarize_projects(df: pd.DataFrame) -> pd.DataFrame:
         return df
     rows: List[Dict[str, Any]] = []
     for project, group in df.groupby(project_col, dropna=True):
-        rows.append({
+        arrays: List[str] = []
+        for _, row in group.iterrows():
+            for label in detect_arrays(row):
+                if label not in arrays:
+                    arrays.append(label)
+        release_min, release_max = _release_span(group)
+        entry: Dict[str, Any] = {
             "proposal_id": as_text(project),
             "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
-            "observations": int(len(group)),
-            "band_list": first_nonempty(group["band_list"].tolist()) if "band_list" in group.columns else "",
-            "arrays": first_nonempty(group["antenna_arrays"].tolist()) if "antenna_arrays" in group.columns else "",
+            "rows": int(len(group)),
+            "n_mous": _nunique(group, "member_ous_uid"),
+            "n_eb": _nunique(group, "asdm_uid"),
+            "band_list": _band_union(group),
+            "arrays": ", ".join(arrays),
             "resolution_arcsec": min([v for v in (_resolution_arcsec(row) for _, row in group.iterrows()) if v is not None], default=""),
             "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group.columns else "",
             "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group.columns else "",
-            "obs_release_date": first_nonempty(group["obs_release_date"].tolist()) if "obs_release_date" in group.columns else "",
-        })
-    return pd.DataFrame(rows).sort_values(["observations", "proposal_id"], ascending=[False, True])
+            "obs_release_date_min": release_min,
+            "obs_release_date_max": release_max,
+        }
+        if "data_rights" in group.columns:
+            rights = group["data_rights"].astype(str).str.strip().str.lower()
+            entry["n_public_rows"] = int((rights == "public").sum())
+            entry["n_proprietary_rows"] = int((rights == "proprietary").sum())
+        rows.append(entry)
+    out = pd.DataFrame(rows)
+    sort_cols = ["rows", "proposal_id"]
+    ascending = [False, True]
+    if out["n_mous"].notna().any():
+        sort_cols = ["n_mous", "rows", "proposal_id"]
+        ascending = [False, False, True]
+    return out.sort_values(sort_cols, ascending=ascending, na_position="last")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -632,16 +1111,10 @@ def select_obscore_query_extended(
 ) -> str:
     """The standard obscore SELECT plus extra columns (R2 templates)."""
     top = max(1, min(int(top or 5000), 20000))
-    base_columns = (
-        "target_name, proposal_id, member_ous_uid, obs_publisher_did,\n"
-        "       frequency, bandwidth, frequency_support, band_list,\n"
-        "       antenna_arrays, dataproduct_type, calib_level,\n"
-        "       scientific_category, science_keyword, obs_title, pi_name,\n"
-        "       s_ra, s_dec, t_exptime, s_resolution, spatial_resolution,\n"
-        "       obs_release_date"
-    )
-    if extra_columns:
-        base_columns += ",\n       " + ", ".join(extra_columns)
+    extras = [c for c in extra_columns if c not in OBSCORE_BASE_COLUMNS]
+    base_columns = _format_columns(OBSCORE_BASE_COLUMNS)
+    if extras:
+        base_columns += ",\n       " + ", ".join(extras)
     return f"""
 SELECT TOP {top}
        {base_columns}
@@ -693,7 +1166,8 @@ def summarize_publication_links(df: pd.DataFrame) -> pd.DataFrame:
             "proposal_id": as_text(project),
             "n_publications": len(bibcodes),
             "bibcodes": " ".join(bibcodes),
-            "observations": int(len(group)),
+            "rows": int(len(group)),
+            "n_mous": _nunique(group, "member_ous_uid"),
             "member_ous_uids": " ".join(mous_uids[:20]),
             "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
             "band_list": first_nonempty(group["band_list"].tolist()) if "band_list" in group.columns else "",
@@ -701,7 +1175,7 @@ def summarize_publication_links(df: pd.DataFrame) -> pd.DataFrame:
             "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group.columns else "",
         })
     return pd.DataFrame(rows).sort_values(
-        ["n_publications", "observations", "proposal_id"], ascending=[False, False, True]
+        ["n_publications", "rows", "proposal_id"], ascending=[False, False, True]
     )
 
 
@@ -739,14 +1213,27 @@ def bandwidth_switching_candidates(df: pd.DataFrame) -> pd.DataFrame:
         distinct_bandwidths = bandwidth_values.round(3).nunique() if not bandwidth_values.empty else 0
         distinct_freqs = pd.to_numeric(group["frequency"], errors="coerce").dropna().round(3).nunique() if "frequency" in group.columns else 0
         distinct_support = group["frequency_support"].dropna().astype(str).nunique() if "frequency_support" in group.columns else 0
-        interval_counts = [len(observation_intervals_ghz(row)) for _, row in group.iterrows()]
+        # Guardrail 1: never count SPWs by summing frequency_support over
+        # repeated rows — the same MOUS setup appears once per EB/field. A
+        # parseable frequency_support string is counted once per
+        # (member_ous_uid, string); unparseable rows fall back to the
+        # per-row frequency +/- bandwidth/2 window.
+        seen_setups: set = set()
+        interval_counts: List[int] = []
+        interval_widths: List[float] = []
+        for _, row in group.iterrows():
+            parsed = parse_frequency_support_intervals(row.get("frequency_support"))
+            if parsed:
+                key = (as_text(row.get("member_ous_uid")), as_text(row.get("frequency_support")))
+                if key in seen_setups:
+                    continue
+                seen_setups.add(key)
+                intervals = parsed
+            else:
+                intervals = observation_intervals_ghz(row)
+            interval_counts.append(len(intervals))
+            interval_widths.extend(hi - lo for lo, hi in intervals if hi > lo)
         total_spw_intervals = sum(interval_counts)
-        interval_widths = [
-            hi - lo
-            for _, row in group.iterrows()
-            for lo, hi in observation_intervals_ghz(row)
-            if hi > lo
-        ]
         target_text = " ".join(group.get("target_name", pd.Series(dtype=str)).dropna().astype(str).tolist()).lower()
 
         score = 0
@@ -793,7 +1280,9 @@ def bandwidth_switching_candidates(df: pd.DataFrame) -> pd.DataFrame:
             "reasons": "; ".join(reasons),
             "diagnostic_warning": "Diagnostic only: Bandwidth Switching likelihood is inferred from public spectral setup metadata, not proven calibration intent.",
             "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
-            "observations": int(len(group)),
+            "rows": int(len(group)),
+            "n_mous": _nunique(group, "member_ous_uid"),
+            "n_eb": _nunique(group, "asdm_uid"),
             "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group.columns else "",
             "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group.columns else "",
         })

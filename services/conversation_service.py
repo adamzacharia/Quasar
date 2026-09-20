@@ -227,22 +227,37 @@ class ConversationService:
         finally:
             conn.close()
     
-    def get_conversation_messages(self, conversation_id: str) -> List[Dict]:
-        """Get all messages for a conversation
-        
+    def get_conversation_messages(self, conversation_id: str, last_n: Optional[int] = None) -> List[Dict]:
+        """Get all messages for a conversation (or only the newest ``last_n``).
+
         Properly deserializes DataFrames and restores all message fields.
+        ``last_n`` bounds the read for callers that only need the tail (the
+        issue-report context excerpt); results stay in chronological order.
         """
         conn = self._get_conn()
         try:
             cursor = conn.cursor()
-        
-            cursor.execute('''
-                SELECT role, content, message_type, metadata, created_at
-                FROM messages 
-                WHERE conversation_id = ?
-                ORDER BY created_at
-            ''', (conversation_id,))
-        
+
+            if last_n is not None and int(last_n) > 0:
+                cursor.execute('''
+                    SELECT role, content, message_type, metadata, created_at
+                    FROM (
+                        SELECT role, content, message_type, metadata, created_at, id
+                        FROM messages
+                        WHERE conversation_id = ?
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY created_at, id
+                ''', (conversation_id, int(last_n)))
+            else:
+                cursor.execute('''
+                    SELECT role, content, message_type, metadata, created_at
+                    FROM messages
+                    WHERE conversation_id = ?
+                    ORDER BY created_at
+                ''', (conversation_id,))
+
             messages = []
             for row in cursor.fetchall():
                 msg = {
@@ -312,12 +327,71 @@ class ConversationService:
         self,
         conversation_id: str,
         user_id: str,
+        last_n: Optional[int] = None,
     ) -> Optional[List[Dict]]:
-        """Get messages only when the conversation belongs to user_id."""
+        """Get messages only when the conversation belongs to user_id.
+
+        ``last_n`` bounds the read to the newest messages (see
+        get_conversation_messages).
+        """
         if not self.conversation_belongs_to_user(conversation_id, user_id):
             return None
-        return self.get_conversation_messages(conversation_id)
+        return self.get_conversation_messages(conversation_id, last_n=last_n)
     
+    def get_feedback_snapshot_source(self, conversation_id: str, user_id: str) -> Optional[Dict]:
+        """Read a bounded, ordered, ownership-scoped copy without rebuilding DataFrames.
+
+        One SQL statement determines order, count and contents. The window byte
+        sum prevents huge rows from crossing the DB/network boundary; omitted
+        messages carry a marker instead of clipped text or invalid metadata JSON.
+        """
+        from services.feedback_snapshot_service import MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MESSAGES
+        conn = self._get_conn()
+        try:
+            rows = conn.execute('''
+                WITH ordered AS (
+                    SELECT m.id, m.role, m.content, m.metadata, m.created_at,
+                           ROW_NUMBER() OVER (ORDER BY m.created_at, m.id) AS position,
+                           COUNT(*) OVER () AS total,
+                           SUM(length(CAST(m.content AS BLOB)) +
+                               length(CAST(COALESCE(m.metadata, '{}') AS BLOB)) + 256)
+                               OVER (ORDER BY m.created_at, m.id ROWS UNBOUNDED PRECEDING) AS bytes
+                    FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                    WHERE c.id = ? AND c.user_id = ?
+                )
+                SELECT id, role, created_at, total,
+                       CASE WHEN bytes <= ? THEN content END,
+                       CASE WHEN bytes <= ? THEN metadata END,
+                       CASE WHEN bytes > ? THEN 1 ELSE 0 END
+                FROM ordered WHERE position <= ? ORDER BY position
+            ''', (conversation_id, user_id, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES,
+                  MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MESSAGES + 1)).fetchall()
+            if not rows:
+                owned = conn.execute('SELECT 1 FROM conversations WHERE id = ? AND user_id = ?',
+                                     (conversation_id, user_id)).fetchone()
+                return {"messages": [], "total_messages": 0} if owned else None
+            messages = []
+            for row in rows[:MAX_SNAPSHOT_MESSAGES]:
+                msg = {"id": str(row[0]), "role": row[1], "created_at": row[2]}
+                if row[6]:
+                    msg["source_omitted"] = True
+                    messages.append(msg)
+                    break
+                msg["content"] = row[4] or ""
+                try:
+                    metadata = json.loads(row[5] or "{}", parse_constant=lambda _: None)
+                    # The operator transcript is conversation/tool evidence;
+                    # internal reasoning is not part of the user-facing answer.
+                    msg["metadata"] = {k: v for k, v in metadata.items()
+                                       if k not in {"thinking", "thinkingSteps"}} if isinstance(metadata, dict) else {}
+                except (ValueError, TypeError, RecursionError):
+                    msg["metadata"] = {"unavailable": "persisted metadata is invalid JSON"}
+                messages.append(msg)
+            return {"messages": messages, "total_messages": rows[0][3],
+                    "source_truncated": any(row[6] for row in rows[:MAX_SNAPSHOT_MESSAGES])}
+        finally:
+            conn.close()
+
     def get_user_conversations(self, user_id: str, limit: int = 20) -> List[Dict]:
         """Get list of conversations for a user, most recent first"""
         conn = self._get_conn()

@@ -63,6 +63,11 @@ def _pin_offline_env() -> None:
     # implementation (never a tool's name/schema/category), so the rendered doc
     # is invariant to it — pin it off anyway for a clean, reproducible run.
     os.environ["QUASAR_USE_CAPABILITY_DATALAB"] = ""
+    # Runtime-mounted MCP servers (MANNA etc.) are documented as excluded from
+    # this doc; force them off so a dev .env can't make the doc timing- and
+    # environment-dependent (bridge tools register asynchronously).
+    os.environ["QUASAR_ENABLE_MANNA"] = ""
+    os.environ["QUASAR_PLATFORM_MCP_SERVERS"] = ""
 
 
 def _build_registry():
@@ -109,6 +114,9 @@ def _clean(text: str) -> str:
 
 def render(registry) -> str:
     tools = registry.list_tools()
+    # Belt-and-braces for the exclusion _pin_offline_env enforces: bridged MCP
+    # tools are runtime-mounted and never belong in this doc.
+    tools = [t for t in tools if (t.category or "") != "mcp"]
     # Deterministic ordering: category, then tool name.
     tools = sorted(tools, key=lambda t: (t.category or "", t.name))
 

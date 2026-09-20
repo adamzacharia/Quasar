@@ -62,54 +62,13 @@ Instructions:
 - If you need more information, ask for it politely.
 """
 
-# Fix 7: ALMA TAP Schema for SQL/ADQL query generation
-ALMA_TAP_SCHEMA = """
-ALMA TAP Database Schema (ivoa.ObsCore compatible):
-
-TABLE: ivoa.obscore
-===================
-| Column Name           | Type    | Description                              |
-|-----------------------|---------|------------------------------------------|
-| target_name           | VARCHAR | PI-entered target name (free text, inconsistent — NOT for source selection) |
-| s_ra                  | DOUBLE  | Right Ascension (degrees, J2000)         |
-| s_dec                 | DOUBLE  | Declination (degrees, J2000)             |
-| s_resolution          | DOUBLE  | Angular resolution (arcseconds)          |
-| t_exptime             | DOUBLE  | Total integration time (seconds)         |
-| t_min                 | DOUBLE  | Observation start time (MJD)             |
-| t_max                 | DOUBLE  | Observation end time (MJD)               |
-| em_min                | DOUBLE  | Minimum wavelength (meters)              |
-| em_max                | DOUBLE  | Maximum wavelength (meters)              |
-| band_list             | VARCHAR | ALMA band number(s), e.g., '6'           |
-| frequency             | DOUBLE  | Central frequency (GHz)                  |
-| bandwidth             | DOUBLE  | Total bandwidth (GHz)                    |
-| proposal_id           | VARCHAR | ALMA project code (e.g., 2019.1.00123.S) |
-| obs_publisher_did     | VARCHAR | Unique dataset identifier                |
-| member_ous_uid        | VARCHAR | Unique MOUS UID                          |
-| access_url            | VARCHAR | Data download URL                        |
-| cont_sens_bandwidth   | DOUBLE  | Continuum sensitivity (mJy/beam)         |
-| velocity_resolution   | DOUBLE  | Velocity resolution (km/s)               |
-| pol_states            | VARCHAR | Polarization states (e.g., 'XX YY')      |
-| science_observation   | VARCHAR | Science observation flag                 |
-| scan_intent           | VARCHAR | Scan intent, e.g., TARGET or calibrators |
-| qa2_passed            | VARCHAR | QA2 matrix flag ('T' for PASS, 'F' for SEMIPASS) |
-
-Example Queries:
-- Find Band 6 data: SELECT * FROM ivoa.obscore WHERE band_list = '6'
-- Resolution < 0.1": SELECT * FROM ivoa.obscore WHERE s_resolution < 0.1
-- Frequency range: SELECT * FROM ivoa.obscore WHERE frequency BETWEEN 230 AND 240
-- Target scans only: SELECT * FROM ivoa.obscore WHERE scan_intent LIKE '%TARGET%'
-
-NAME-RESOLVER RULE (official ALMA guidance, archive notebook nb8): to find a
-named source, resolve the name to coordinates via SIMBAD/NED and cone-search
-on s_ra/s_dec (the search_by_target tool does this for you). NEVER select by
-string-matching the PI-entered target_name column — PI names are free text
-("NGC1068", "ngc 1068", "N1068" all occur) and string matches silently miss
-data. If you must match target_name (e.g. solar/planetary targets a resolver
-cannot handle), say explicitly in the answer that the selection is a PI-name
-string match and may be incomplete:
-- Position search: SELECT * FROM ivoa.obscore
-  WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', 10.68, 41.27, 0.1)) = 1
-"""
+# ALMA guardrail kernel (INT-6): GENERATED from the dated ObsCore column
+# snapshot by scripts/gen_alma_kernel.py — ~300 tokens of the ALMA data skill's
+# non-negotiables (row grain, units, footprints, band tokens, QA2/DataLink,
+# restore, resolver rule). It replaced a 770-token hand-written table that
+# carried four factual errors (bandwidth GHz, cont_sens_bandwidth,
+# velocity km/s, access_url = download URL). Never edit the text here.
+from core.prompts.alma_kernel import ALMA_TAP_SCHEMA  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,9 @@ from services.usage_quota_service import (
 @pytest.fixture
 def quota_store(monkeypatch, tmp_path):
     monkeypatch.setattr(uqs, "_LOCAL_DB", str(tmp_path / "usage_quota.db"))
+    # Stock-limit assertions must not depend on the caller's environment
+    # (CX-23) — a deploy-style env override would silently change them.
+    monkeypatch.delenv("QUASAR_PLATFORM_TOKEN_LIMITS", raising=False)
     return UsageQuotaService()
 
 
@@ -911,7 +914,10 @@ def test_exhausted_cap_still_reports_the_specific_cap(monkeypatch, quota_store):
     monkeypatch.setenv("QUASAR_CALL_TOKEN_RESERVATION", "4000")
     _spend(quota_store, 100_000)  # exhausts the openai weekly allowance
 
-    with pytest.raises(QuotaExceededError, match="per week"):
+    # The message must name the SPECIFIC cap and be honest that the window is
+    # rolling (robert-eval A1: "resets" wording sent an evaluator waiting for
+    # a reset instant that does not exist).
+    with pytest.raises(QuotaExceededError, match=r"100,000 tokens per ROLLING 7-day window"):
         quota_store.ensure_allowed(
             user_id="u1", user_email="person@example.test", provider="openai",
             key_source="platform", reserve=True,
@@ -1341,3 +1347,146 @@ def test_turn_accumulator_freeze_drops_late_calls():  # A2 CX-17
     assert acc.turn_cost_usd() == before_cost
     assert acc.late_calls_dropped == 1
     assert late_cost is not None                     # the CALL was still priced
+
+
+def test_platform_token_limit_env_override(monkeypatch):
+    """robert-eval A1: weekly caps must be deploy-configurable without a code
+    change — QUASAR_PLATFORM_TOKEN_LIMITS overrides per provider; 0 uncaps."""
+    from services.usage_quota_service import platform_token_limit
+
+    monkeypatch.delenv("QUASAR_PLATFORM_TOKEN_LIMITS", raising=False)
+    assert platform_token_limit("tacc") == 1_000_000
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=5000000, openai=0")
+    assert platform_token_limit("tacc") == 5_000_000
+    assert platform_token_limit("openai") is None
+    assert platform_token_limit("deepseek") == 500_000
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=not-a-number")
+    assert platform_token_limit("tacc") == 1_000_000
+    # CX-11 edges: infinity must not raise OverflowError, NaN must not raise,
+    # and a negative value is malformed (stock limit), NOT an uncap — only
+    # the documented 0 removes the cap.
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=inf")
+    assert platform_token_limit("tacc") == 1_000_000
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=nan")
+    assert platform_token_limit("tacc") == 1_000_000
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=-1")
+    assert platform_token_limit("tacc") == 1_000_000
+    # Decimal values truncate toward zero (documented int coercion).
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=2000000.9")
+    assert platform_token_limit("tacc") == 2_000_000
+
+
+def test_env_platform_cap_enforced_at_consumer_sites(quota_store, monkeypatch):
+    """CX-21: the env override must bite at the real consumers, not just the
+    parser — the read-only admission check, the atomic reserve path, and the
+    usage summary all read platform_token_limit()."""
+    from services.usage_quota_service import QuotaExceededError
+
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=100")
+    _spend(quota_store, 150, provider="tacc")
+
+    with pytest.raises(QuotaExceededError):
+        quota_store.ensure_allowed(
+            user_id="u1", provider="tacc", key_source="platform"
+        )
+    with pytest.raises(QuotaExceededError):
+        quota_store.ensure_allowed(
+            user_id="u1", provider="tacc", key_source="platform", reserve=True
+        )
+    summary = quota_store.usage_summary(user_id="u1")
+    assert summary["platform"]["tacc"]["used_tokens"] == 150
+
+    # 0 removes the cap: the same overspent user is admitted again.
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=0")
+    quota_store.ensure_allowed(user_id="u1", provider="tacc", key_source="platform")
+
+
+def test_env_platform_cap_sub_one_decimal_is_not_an_uncap(quota_store, monkeypatch):
+    """CX-11 regression: int(float("0.9")) == 0 used to silently UNCAP the
+    provider; only the exact documented 0 may do that."""
+    from services.usage_quota_service import platform_token_limit
+
+    monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=0.9")
+    assert platform_token_limit("tacc") == 1_000_000
+
+
+def test_start_run_insert_only_mode(runs):
+    """CX-33: the SSE chat path uses return_row=False so NOTHING follows the
+    commit inside start_fn — the row must still exist and be readable."""
+    runs.start_run(
+        run_id="r-cx33", user_id="u1", conversation_id="c1", trace_id="",
+        model="gpt-4.1", provider="openai", key_source="platform",
+        return_row=False,
+    )
+    row = runs.get_run("r-cx33", user_id="u1")
+    assert row and row["status"] == "started"
+
+
+def test_orphan_sweep_is_conditional_on_started(runs):
+    """CX-33: the sweep marks only rows still 'started' — it can never clobber
+    a proper finalize that got there first."""
+    runs.start_run(
+        run_id="r-sweep", user_id="u1", conversation_id="c1", trace_id="",
+        model="gpt-4.1", provider="openai", key_source="platform",
+        return_row=False,
+    )
+    assert runs.mark_run_cancelled_if_started("r-sweep") is True
+    row = runs.get_run("r-sweep", user_id="u1")
+    assert row["status"] == "cancelled"
+    # Second sweep: row no longer 'started' → untouched no-op.
+    assert runs.mark_run_cancelled_if_started("r-sweep") is False
+
+    runs.start_run(
+        run_id="r-done", user_id="u1", conversation_id="c1", trace_id="",
+        model="gpt-4.1", provider="openai", key_source="platform",
+        return_row=False,
+    )
+    runs.finalize_run("r-done", status="completed", duration_ms=10)
+    assert runs.mark_run_cancelled_if_started("r-done") is False
+    assert runs.get_run("r-done", user_id="u1")["status"] == "completed"
+
+
+def test_sweep_stale_started_runs(runs):
+    """Taskboard RUN-SWEEPER: deploy-level backstop marks long-stale 'started'
+    rows failed, while fresh, finalized, and LIVE (heartbeating) rows are
+    untouched. A stale started_at with a fresh updated_at is a live run whose
+    heartbeat proves activity — sweeping it would kill an active turn
+    (guard CX-10)."""
+    from datetime import datetime, timedelta, timezone
+
+    for rid in ("r-stale", "r-fresh", "r-live", "r-done2"):
+        runs.start_run(
+            run_id=rid, user_id="u1", conversation_id="c1", trace_id="",
+            model="gpt-4.1", provider="openai", key_source="platform",
+            return_row=False,
+        )
+    runs.finalize_run("r-done2", status="completed", duration_ms=5)
+    backdated = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    conn = runs._conn()
+    try:
+        # Truly orphaned: BOTH timestamps stale (no heartbeat for 2 hours).
+        conn.execute(
+            "UPDATE chat_runs SET started_at = ?, updated_at = ? WHERE id = ?",
+            (backdated, backdated, "r-stale"),
+        )
+        # Live long run: old started_at but a FRESH updated_at heartbeat
+        # (update_run_activity fires per tool step) — must NOT be swept.
+        conn.execute(
+            "UPDATE chat_runs SET started_at = ? WHERE id = ?",
+            (backdated, "r-live"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert runs.sweep_stale_started_runs(max_age_minutes=30) == 1
+    assert runs.get_run("r-stale", user_id="u1")["status"] == "failed"
+    assert runs.get_run("r-stale", user_id="u1")["error_code"] == "orphaned"
+    assert runs.get_run("r-fresh", user_id="u1")["status"] == "started"
+    # CX-10: the heartbeating run survived the sweep despite its old started_at.
+    assert runs.get_run("r-live", user_id="u1")["status"] == "started"
+    assert runs.get_run("r-done2", user_id="u1")["status"] == "completed"
+    # Idempotent: nothing left to sweep.
+    assert runs.sweep_stale_started_runs(max_age_minutes=30) == 0
+    # The age floor (20 min) resists a foot-gun zero/negative value.
+    assert runs.sweep_stale_started_runs(max_age_minutes=0) == 0

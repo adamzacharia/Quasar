@@ -377,7 +377,10 @@ def test_query_alma_redshifted_lines_provenance_and_state(monkeypatch):
     assert out["provenance"]["adql"].startswith("SELECT TOP")
     assert out["provenance"]["tap_url"] == "https://almascience.nrao.edu/tap"
     assert state.last_run_result["tool_name"] == "query_alma_science_archive"
-    assert "frequency" in captured["where"]
+    # The redshifted-line prefilter is the em_min/em_max wavelength overlap
+    # (skill ADQL pattern), not frequency +/- bandwidth/2 (A-16/A-46).
+    assert "em_min" in captured["where"] and "em_max" in captured["where"]
+    assert "bandwidth" not in captured["where"]
 
 
 def test_query_alma_include_adql_false_drops_the_query(monkeypatch):
@@ -386,7 +389,7 @@ def test_query_alma_include_adql_false_drops_the_query(monkeypatch):
                         pd.DataFrame([{"proposal_id": "P1", "frequency_support": "1..2GHz"}]))
     ctx, _ = _ctx(search_service=_FakeSearchService())
     out = _run(QueryAlmaScienceArchive(), ctx, query_type="redshifted_line_projects",
-               include_adql=False)
+               include_adql=False, redshift_min=1, redshift_max=2)
     assert out["provenance"]["adql"] is None
 
 
@@ -399,9 +402,9 @@ def test_query_alma_require_same_project_identity_gate(monkeypatch):
     ctx, _ = _ctx(search_service=_FakeSearchService())
 
     real_false = _run(QueryAlmaScienceArchive(), ctx, query_type="redshifted_line_projects",
-                      require_same_project=False)
+                      require_same_project=False, redshift_min=1, redshift_max=2)
     stringy = _run(QueryAlmaScienceArchive(), ctx, query_type="redshifted_line_projects",
-                   require_same_project="false")
+                   require_same_project="false", redshift_min=1, redshift_max=2)
 
     assert any("require_same_project=False" in w for w in real_false["warnings"])
     assert not any("require_same_project=False" in w for w in stringy["warnings"])
@@ -561,7 +564,15 @@ def test_download_alma_data_requires_results_then_downloads():
 
     state.last_search_results = _ALMA_DF
     out = _run(DownloadAlmaData(), ctx, dry_run=True)
-    assert out == {"success": True, "message": "downloaded 2 rows (dry_run=True)"}
+    assert out["success"] is True and out["dry_run"] is True
+    assert out["message"] == "downloaded 2 rows (dry_run=True)"
+    assert out["preflight"]["available"] is False   # no DataLink client injected
+    assert sorted(out["mous_uids"]) == ["uid://A/X1/X1", "uid://A/X2/X1"]
+    # A real download without a preflight is refused unless the caller accepts it.
+    refused = _run(DownloadAlmaData(), ctx)
+    assert refused["success"] is False and "preflight" in refused["error"]
+    accepted = _run(DownloadAlmaData(), ctx, confirm_large=True)
+    assert accepted["success"] is True and accepted["message"].startswith("downloaded 2 rows")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -822,8 +833,8 @@ def test_null_ra_dec_flow_into_the_legacy_try():
     assert svc.calls[0][:3] == ("cone_search", None, None)
 
 
-def test_query_alma_band_stays_raw_string_zero(monkeypatch):
-    # CX-02: band="0" is truthy in legacy — `band or 6` must NOT flip to 6.
+def test_query_alma_invalid_band_does_not_invent_default(monkeypatch):
+    # Invalid input must never silently select a different band.
     captured = {}
     monkeypatch.setattr(alma, "_tap_obscore_dataframe",
                         lambda where, *, max_results=5000, order_by="proposal_id", ctx:
@@ -831,14 +842,13 @@ def test_query_alma_band_stays_raw_string_zero(monkeypatch):
                          pd.DataFrame([{"proposal_id": "P1", "frequency_support": "1..2GHz",
                                         "band_list": "0"}]))[1])
     ctx, _ = _ctx(search_service=_FakeSearchService())
-    out = _run(QueryAlmaScienceArchive(), ctx, query_type="line_set_projects", band="0")
+    out = _run(QueryAlmaScienceArchive(), ctx, query_type="line_set_projects", band="0", lines=["CO"])
 
     # CAP-06: exact-token match on the space-delimited band_list — the old
     # substring LIKE let band=1 also match Band 10. band="0" must still stay
     # the raw string (not flip to 6).
-    assert "band_list = '0'" in captured["where"]
-    assert "band_list LIKE '% 0 %'" in captured["where"]
-    assert out["source"].startswith("ALMA Band 0 projects")
+    assert not out["success"] and "band" in out["error"]
+    assert not captured
 
 
 def test_query_alma_early_returns_need_no_search_service():

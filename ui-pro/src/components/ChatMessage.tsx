@@ -22,7 +22,15 @@ import { BlockRating } from "./BlockRating";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
 import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
-import { canSubmitIssueReport, shouldOpenIssueReport } from "../lib/feedback-report";
+import {
+    CONTEXT_CONSENT_LABEL,
+    FEEDBACK_PREVIEW_LIMITS,
+    REPORT_EXCERPT_LIMITS,
+    canSubmitIssueReport,
+    clipReportExcerpt,
+    defaultIncludeContext,
+    shouldOpenIssueReport,
+} from "../lib/feedback-report";
 import { safeAssistantWebText } from "../lib/content-safety";
 import { latestRunningPhase } from "../lib/active-phase";
 
@@ -74,9 +82,11 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
     const [showReport, setShowReport] = useState(false);
     const [category, setCategory] = useState("stuck_slow");
     const [description, setDescription] = useState("");
-    const [includeContext, setIncludeContext] = useState(false);
+    const [includeContext, setIncludeContext] = useState<boolean>(defaultIncludeContext());
     const [reportState, setReportState] = useState<"idle" | "sending" | "sent">("idle");
     const [reportError, setReportError] = useState("");
+    const [votePending, setVotePending] = useState(false);
+    const [voteSaved, setVoteSaved] = useState(false);
     const { activeConversationId, selectedModel } = useChatStore();
 
     const copyText = () => {
@@ -85,26 +95,36 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
         setTimeout(() => setCopied(false), 2000);
     };
 
-    const sendFeedback = async (type: "like" | "dislike") => {
-        const newFeedback = feedback === type ? null : type;
-        setFeedback(newFeedback);
-        if (!newFeedback) return; // toggled off — no API call
+    const sendFeedback = async (type: "like" | "dislike", shareContext = false, reportId = "") => {
+        setVotePending(true);
+        setReportError("");
         try {
-            await fetch(`${API_BASE}/api/feedback`, { credentials: "include",
+            const response = await fetch(`${API_BASE}/api/feedback`, { credentials: "include",
                 method: "POST",
                 headers: authBearerHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({
                     message_id: message.id,
                     run_id: message.runMeta?.run_id || "",
-                    feedback: newFeedback,
+                    feedback: type,
+                    include_context: shareContext,
+                    report_id: reportId,
                     conversation_id: activeConversationId || "",
                     model: message.runMeta?.model || selectedModel || "",
-                    prompt_preview: reportPrompt.slice(0, 200),
-                    response_preview: message.content?.slice(0, 500) || "",
+                    prompt_preview: shareContext ? clipReportExcerpt(reportPrompt, FEEDBACK_PREVIEW_LIMITS.prompt) : "",
+                    response_preview: shareContext ? clipReportExcerpt(message.content || "", FEEDBACK_PREVIEW_LIMITS.response) : "",
                 }),
             });
-        } catch {
-            // Silent fail — feedback is non-critical
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+            setFeedback(type);
+            setVoteSaved(type === "dislike");
+            if (payload.snapshot_error) setReportError(`Vote saved. ${payload.snapshot_error}`);
+            return true;
+        } catch (error) {
+            setReportError(error instanceof Error ? error.message : "Could not save feedback.");
+            return false;
+        } finally {
+            setVotePending(false);
         }
     };
 
@@ -122,8 +142,8 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                     category,
                     description: description.trim(),
                     include_context: includeContext,
-                    prompt_excerpt: includeContext ? reportPrompt : "",
-                    response_excerpt: includeContext ? message.content : "",
+                    prompt_excerpt: includeContext ? clipReportExcerpt(reportPrompt, REPORT_EXCERPT_LIMITS.prompt) : "",
+                    response_excerpt: includeContext ? clipReportExcerpt(message.content, REPORT_EXCERPT_LIMITS.response) : "",
                     technical_context: {
                         user_agent: navigator.userAgent,
                         page: window.location.pathname,
@@ -135,6 +155,10 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                 const payload = await response.json().catch(() => ({}));
                 throw new Error(payload.detail || `HTTP ${response.status}`);
             }
+            const saved = (await response.json()).report;
+            if (!saved?.id) throw new Error("The server did not return the saved report.");
+            await sendFeedback("dislike", includeContext, saved.id);
+            if (saved.snapshot_error) setReportError(`Report saved. ${saved.snapshot_error}`);
             setReportState("sent");
         } catch (error) {
             setReportState("idle");
@@ -156,7 +180,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                         className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
                         <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
                     </button>
-                    <button onClick={() => { sendFeedback("dislike"); setShowReport(shouldOpenIssueReport("dislike")); }} title="Report a problem"
+                    <button onClick={() => { setReportState("idle"); setShowReport(shouldOpenIssueReport("dislike")); }} title="Report a problem"
                         className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
                         <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
                     </button>
@@ -176,7 +200,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                         </button>
                     </div>
                     {reportState === "sent" ? (
-                        <div className="mt-3 text-xs text-emerald-300">Report saved. Thank you.</div>
+                        <div className="mt-3 text-xs text-emerald-300">Report saved. Thank you.{reportError && <p role="alert">{reportError}</p>}</div>
                     ) : (
                         <>
                             <select value={category} onChange={(event) => setCategory(event.target.value)}
@@ -191,16 +215,22 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                                 placeholder="What happened, and what did you expect?" rows={3}
                                 className="mt-2 w-full resize-y rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 placeholder:text-slate-600" />
                             <label className="mt-2 flex items-start gap-2 text-[11px] text-slate-400">
-                                <input type="checkbox" checked={includeContext}
+                                <input type="checkbox" checked={includeContext} disabled={votePending || reportState === "sending"}
                                     onChange={(event) => setIncludeContext(event.target.checked)} className="mt-0.5" />
-                                Include this question and response. Technical diagnostics are included automatically.
+                                {CONTEXT_CONSENT_LABEL}
                             </label>
+                            <button type="button" disabled={votePending || voteSaved || reportState === "sending"}
+                                onClick={() => sendFeedback("dislike", includeContext)}
+                                className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-200 disabled:opacity-50">
+                                {votePending ? "Saving vote..." : voteSaved ? "Downvote saved" : "Save downvote only"}
+                            </button>
+                            {voteSaved && <p className="mt-2 text-[11px] text-slate-400">Your vote has been saved with the consent choice you made then. This checkbox now applies to a new report.</p>}
                             {!message.runMeta?.run_id && (
                                 <div className="mt-2 text-[11px] text-amber-300">Diagnostics are unavailable for this older message.</div>
                             )}
                             {reportError && <div className="mt-2 text-[11px] text-red-300">{reportError}</div>}
                             <button type="button" onClick={submitIssueReport}
-                                disabled={!canSubmitIssueReport(description, message.runMeta?.run_id) || reportState === "sending"}
+                                disabled={!canSubmitIssueReport(description, message.runMeta?.run_id) || votePending || reportState === "sending"}
                                 className="mt-3 flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300">
                                 {reportState === "sending" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
                                 Send report

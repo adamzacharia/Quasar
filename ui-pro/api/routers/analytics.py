@@ -14,6 +14,7 @@ from api.deps import (
     _safe_authorization_header,
     _storage_executor,
     analytics_service,
+    conversation_service,
     get_current_user,
     issue_report_service,
 )
@@ -77,33 +78,86 @@ async def submit_feedback(req: Request, current_user: dict = Depends(get_current
         raise HTTPException(status_code=401, detail="Authentication required")
 
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        _executor,
-        lambda: analytics_service.log_feedback(
+    # The run id is client-supplied. It is stored only when the run belongs to
+    # the voter: otherwise anyone could attach a vote to someone else's run and
+    # flip that report's admin vote badge or has_report flag (CX-02).
+    claimed_run_id = str(body.get("run_id") or "")
+    owned_run = None
+    if claimed_run_id:
+        try:
+            owned_run = await loop.run_in_executor(
+                _storage_executor,
+                lambda: issue_report_service.get_run(claimed_run_id, user_id=user_id),
+            )
+        except Exception as exc:
+            # Run store outage: keep the vote, drop the unverifiable link.
+            print(f"[FEEDBACK] run ownership lookup failed; storing vote unlinked: {exc}", flush=True)
+            owned_run = None
+    run_id = claimed_run_id if owned_run else ""
+    # The conversation id is client-supplied too. Take it from the owned run
+    # when there is one; otherwise store it (and use it for the Langfuse
+    # session fallback) only if the conversation belongs to the voter, so a
+    # vote can neither be displayed under nor scored against someone else's
+    # conversation.
+    claimed_conv_id = str(body.get("conversation_id") or "")
+    conv_id = str(owned_run.get("conversation_id") or "") if owned_run else ""
+    if not conv_id and claimed_conv_id:
+        try:
+            owned_conv = await loop.run_in_executor(
+                _storage_executor,
+                lambda: conversation_service.conversation_belongs_to_user(claimed_conv_id, user_id),
+            )
+        except Exception:
+            owned_conv = False
+        conv_id = claimed_conv_id if owned_conv else ""
+    # Only a literal affirmative boolean opts into context capture.
+    include_context = body.get("include_context") is True
+
+    def _save_feedback():
+        snapshot, snapshot_error = (None, "")
+        linked_snapshot_id = ""
+        report_id = str(body.get("report_id") or "")
+        linked_report = issue_report_service.get_report(report_id) if report_id else None
+        if linked_report and (linked_report.get("user_id") != user_id
+                              or linked_report.get("run_id") != run_id):
+            linked_report = None
+        if include_context and feedback == "dislike" and linked_report:
+            linked_snapshot_id = linked_report.get("snapshot_id") or ""
+            snapshot_error = linked_report.get("snapshot_error") or ""
+        elif feedback == "dislike" and include_context:
+            snapshot, snapshot_error = issue_report_service.build_feedback_snapshot(
+                user_id=user_id, conversation_id=conv_id, message_id=message_id,
+                run_id=run_id, include_context=True, description=body.get("description", ""))
+            if snapshot:
+                try:
+                    issue_report_service.snapshots.insert(snapshot)
+                except Exception:
+                    snapshot = None
+                    snapshot_error = "Conversation snapshot unavailable: storage write failed"
+        analytics_service.log_feedback(
             message_id=message_id,
             feedback=feedback,
-            conversation_id=body.get("conversation_id", ""),
+            conversation_id=conv_id,
             user_id=user_id,
             model=body.get("model", ""),
-            prompt_preview=body.get("prompt_preview", ""),
-            response_preview=body.get("response_preview", ""),
-        ),
-    )
+            prompt_preview=body.get("prompt_preview", "") if include_context else "",
+            response_preview=body.get("response_preview", "") if include_context else "",
+            run_id=run_id,
+            snapshot_id=snapshot["id"] if snapshot else linked_snapshot_id,
+            snapshot_error=snapshot_error,
+        )
+        return {"snapshot_id": snapshot["id"] if snapshot else linked_snapshot_id, "snapshot_error": snapshot_error}
+
+    capture = await loop.run_in_executor(_storage_executor, _save_feedback)
 
     # ── Langfuse: ingest user feedback score in real-time ──────────
     from core.langfuse_integration import get_langfuse
     lf_client = get_langfuse()
     if lf_client:
         try:
-            conv_id = body.get("conversation_id", "")
-            run_id = body.get("run_id", "")
-            trace_id = None
-            if run_id and current_user:
-                run = await loop.run_in_executor(
-                    _storage_executor,
-                    lambda: issue_report_service.get_run(run_id, user_id=user_id),
-                )
-                trace_id = run.get("trace_id") if run else None
+            # Ownership was already established above; reuse that lookup and
+            # the verified conversation id (never the raw client value).
+            trace_id = owned_run.get("trace_id") if owned_run else None
             if not trace_id and conv_id:
                 trace_id = _latest_traces.get(conv_id)
 
@@ -128,7 +182,7 @@ async def submit_feedback(req: Request, current_user: dict = Depends(get_current
         except Exception as lf_err:
             print(f"[Langfuse] Failed to ingest feedback score: {lf_err}", flush=True)
 
-    return {"success": True, "feedback": feedback}
+    return {"success": True, "feedback": feedback, **capture}
 
 
 @router.post("/api/block-feedback")

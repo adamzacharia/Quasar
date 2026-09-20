@@ -1,0 +1,109 @@
+# Quasar production direct dependencies.
+#
+# Humans edit this file. TACC does not install it directly: compile the exact
+# CPython 3.12 / x86_64 Linux lock documented in deploy/ansible/README.md.
+
+# Core
+setuptools<75
+numpy
+pandas==2.3.3
+scipy
+matplotlib
+pillow
+plotly
+requests
+python-dotenv
+rich
+humanize
+
+# Archive-profile golden-query validation (tests/unit/test_archive_profiles.py):
+# AST-parse SQL/ADQL golden examples -- no regex fallback
+# (duel task-81b3b73-2145 DX-13).
+sqlglot
+
+# Astronomy
+astropy>=6.1.0
+astroquery
+astropy-healpix
+reproject
+spectral-cube
+# >=1.8 required: services/vo_registry.py uses pyvo.registry.Freetext (absent in 1.2.x).
+pyvo>=1.8
+# 0.1.3 pins pyvo==1.2.1, which is incompatible with the requirement above.
+alminer==0.1.2
+# Quantitative image analysis (services/image_analysis.py) + cube PV slices
+# (services/fits_service.pv_slice) + MOC algebra (services/moc_coverage.py).
+photutils>=2.0
+regions>=0.9
+pvextractor>=0.4
+mocpy>=0.15
+radio-beam>=0.3
+# NOIRLab Astro Data Lab uses Quasar's requests-based connector in production.
+# The optional astro-datalab client is deliberately not part of this graph.
+altair==4.2.2
+legacy-cgi>=2.6; python_version >= "3.13"
+lightkurve>=2.4
+psrqpy>=1.2
+
+# AI / LLM -- exact candidate seeds to validate when compiling the Python 3.12 lock.
+openai==2.41.1
+anthropic>=0.25.0,<1.0.0
+google-genai>=1.0.0,<2.0.0
+tavily-python>=0.3.0,<1.0.0
+
+# RAG -- exact candidate seeds; compilation must resolve and freeze the
+# remaining direct ranges in the generated production lock.
+langchain==0.3.30
+langchain-community==0.3.31
+langchain-openai==0.3.35
+qdrant-client==1.18.0
+langchain-pymupdf4llm>=0.2.0,<1.0.0
+tiktoken>=0.7.0,<1.0.0
+# BM25 keyword scoring for hybrid RAG rerank (services/rag_service._hybrid_rerank).
+# Import is guarded, but without this dep hybrid search silently degrades to
+# semantic-only -- declaring it makes the documented hybrid behaviour real. (C6)
+rank_bm25>=0.2.2,<1.0.0
+
+# Web / API
+fastapi
+uvicorn
+python-multipart
+aiofiles
+aiohttp
+httpx
+beautifulsoup4
+
+# Auth
+google-auth
+PyJWT
+cryptography
+
+# Database
+libsql-client
+
+# Task queue
+celery>=5.4.0,<6.0.0
+
+# Monitoring
+loguru>=0.7.0
+rollbar>=0.16.0
+langfuse>=2.0.0,<3.0.0
+
+# Runtime utilities
+GitPython
+Jinja2
+arxiv
+diskcache
+h5py
+imageio
+networkx
+
+# Multimodal Universe / LSDB (HATS catalogs on Hugging Face). Lazy-imported by
+# services/mmu_hats.py; keeping these in production preserves MMU/HATS tools.
+lsdb==0.9.2
+huggingface_hub
+
+# MCP client SDK -- consumer side of the bridge in core/agent.py
+# (_mount_mcp_bridges), used to mount external MCP servers such as MANNA.
+# Lazy-imported; Quasar boots fine without it and logs a clear message.
+mcp>=1.8,<2

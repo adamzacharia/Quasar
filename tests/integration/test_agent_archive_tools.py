@@ -106,7 +106,11 @@ def _install_agent_import_stubs():
             TokenBudget=dummy("TokenBudget"),
             apply_tool_result_budget=lambda results: results,
         ),
-        "core.health_monitor": _stub_module("core.health_monitor", HealthMonitor=dummy("HealthMonitor")),
+        "core.health_monitor": _stub_module(
+            "core.health_monitor",
+            HealthMonitor=dummy("HealthMonitor"),
+            get_health_monitor=dummy("get_health_monitor"),
+        ),
     }
 
     originals = {}
@@ -290,16 +294,16 @@ class AgentArchiveToolTests(unittest.TestCase):
                 {"query_type": "cycle_array_combo_projects", "cycle": 9, "arrays": ["12m", "7m", "TP"]},
             ),
             (
-                "HH212 Band 7 high-resolution continuum candidate summary.",
-                {"query_type": "high_resolution_band_data", "target": "HH 212", "band": 7, "max_resolution_arcsec": 0.1},
+                "ALMA observations of NGC 4321 in Band 7 with resolution under 0.1 arcsec.",
+                {"query_type": "high_resolution_band_data", "band": [7], "max_resolution_arcsec": 0.1},
             ),
             (
-                "Protostellar disks with 12CO, 13CO, C18O Band 6 in same project.",
-                {"query_type": "line_set_projects", "band": 6, "lines": ["12CO", "13CO", "C18O"], "require_same_project": True, "topic_filter": "protostellar disks"},
+                "Which ALMA projects observed 12CO, 13CO and C18O lines in Band 6?",
+                {"query_type": "line_set_projects", "lines": ["12CO", "13CO", "C18O"], "band": [6]},
             ),
             (
-                "Galaxies at z=1-2 with CO rest frequency in spectral setup.",
-                {"query_type": "redshifted_line_projects", "redshift_min": 1.0, "redshift_max": 2.0, "rest_species": "CO", "science_category": "Galaxy", "require_same_project": True},
+                "ALMA projects on galaxies at z=1-2 with the CO rest frequency in the spectral setup.",
+                {"query_type": "redshifted_line_projects", "redshift_min": 1.0, "redshift_max": 2.0, "rest_species": "CO"},
             ),
             (
                 "Which projects likely needed Bandwidth Switching for calibration?",

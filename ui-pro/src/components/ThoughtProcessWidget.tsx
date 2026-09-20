@@ -7,6 +7,10 @@ export interface ThoughtStep {
     text: string;
     status: "completed" | "running" | "error";
     isCode?: boolean;
+    /** Epoch ms when the step started running (set by the store). */
+    startedAt?: number;
+    /** Seconds the step has been running, refreshed by tool heartbeats. */
+    elapsedSeconds?: number;
 }
 
 interface ThoughtProcessWidgetProps {
@@ -132,7 +136,16 @@ export function ThoughtProcessWidget({
                                         color: 'var(--q-text-muted)',
                                     }}>{step.text}</pre>
                                 ) : (
-                                    step.text
+                                    <>
+                                        {step.text}
+                                        {step.status === "running" &&
+                                            typeof step.elapsedSeconds === "number" &&
+                                            step.elapsedSeconds >= 15 && (
+                                            <span style={{ color: 'var(--q-text-muted)' }}>
+                                                {` · still running (${step.elapsedSeconds}s)`}
+                                            </span>
+                                        )}
+                                    </>
                                 )}
                             </div>
                         </div>

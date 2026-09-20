@@ -115,7 +115,7 @@ from core.observability import QueryTracer
 from core.session_memory import SessionMemory
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
-from core.health_monitor import HealthMonitor
+from core.health_monitor import HealthMonitor, get_health_monitor
 
 # mem0 DISABLED — it pulls in sentence-transformers + PyTorch (~1–1.5GB RAM),
 # which causes OOM on 2GB Render instances. The app already uses Qdrant + RAG
@@ -179,45 +179,72 @@ def _unescape_tool_args(args: Any) -> Any:
 
 
 _MCP_TOOL_CALL_TIMEOUT_SECONDS = 120
+# Bridge setup (connect + initialize + list_tools) retries: a transient
+# archive/network hiccup at boot must not disable a platform server until the
+# process restarts, but a persistently broken config must not retry forever.
+_MCP_BRIDGE_MAX_ATTEMPTS = 3
+_MCP_BRIDGE_RETRY_BACKOFF_SECONDS = 5.0
+# Transports that do NOT spawn a local process; everything else is treated as
+# command execution by the mount path and the stdio RCE gate.
+_MCP_URL_TRANSPORTS = ("http", "streamable_http")
 
 
-def _build_mcp_tool_wrapper(session, orig_name, loop):
+def _mcp_call_timeout_seconds() -> float:
+    """Per-call MCP timeout: QUASAR_MCP_TOOL_TIMEOUT_SECONDS overrides the
+    default. Read at call time so operators can tune without a restart; must
+    stay below the outer tool guard (_TOOL_TIMEOUT_DEFAULT_SECONDS) or the
+    guard's budget, not this one, is what the user sees."""
+    raw = os.getenv("QUASAR_MCP_TOOL_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return _MCP_TOOL_CALL_TIMEOUT_SECONDS
+
+
+def _build_mcp_tool_wrapper(session, orig_name, loop, server_name=""):
     """Return a sync Tool callable that dispatches the MCP call_tool coroutine
-    onto the bridge's long-lived event loop (C10 fix — no per-call loop)."""
+    onto the bridge's long-lived event loop (C10 fix — no per-call loop).
+
+    Results are normalized to the native tool-result shape (success/data/error
+    + provenance sidecar) by adapters.mcp.normalize_mcp_result, so bridged
+    tools feed the tool trace and provenance UI like native archive calls."""
     import asyncio
     from concurrent.futures import TimeoutError as FutureTimeoutError
 
+    from adapters.mcp import normalize_mcp_failure, normalize_mcp_result
+
     def wrapper(**kwargs):
+        def _fail(msg):
+            # Infrastructure failures honor the same success/error/provenance
+            # contract as server-reported failures (CX-10).
+            return normalize_mcp_failure(server_name, orig_name, msg, kwargs)
+
         async def _do_call():
             res = await session.call_tool(orig_name, arguments=kwargs)
-            if getattr(res, "content", None):
-                return [c.text for c in res.content if getattr(c, "type", "") == "text"]
-            elif getattr(res, "isError", False):
-                return {"error": "Tool execution failed"}
-            return {"status": "success"}
+            return normalize_mcp_result(server_name, orig_name, res, kwargs)
 
         if loop.is_closed() or not loop.is_running():
-            return {"error": "MCP bridge event loop is not running"}
+            return _fail("MCP bridge event loop is not running")
 
         coro = _do_call()
         try:
             fut = asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception as e:
             coro.close()
-            return {"error": str(e)}
+            return _fail(str(e))
 
+        timeout = _mcp_call_timeout_seconds()
         try:
-            return fut.result(timeout=_MCP_TOOL_CALL_TIMEOUT_SECONDS)
+            return fut.result(timeout=timeout)
         except FutureTimeoutError:
             fut.cancel()
-            return {
-                "error": (
-                    "MCP tool call timed out after "
-                    f"{_MCP_TOOL_CALL_TIMEOUT_SECONDS} seconds"
-                )
-            }
+            return _fail(f"MCP tool call timed out after {timeout} seconds")
         except Exception as e:
-            return {"error": str(e)}
+            return _fail(str(e))
 
     return wrapper
 
@@ -403,7 +430,10 @@ class QuasarAgent:
         print("DEBUG: Init SessionMemory")
         self.session_memory = SessionMemory(client=self.client)
         print("DEBUG: Init HealthMonitor")
-        self.health_monitor = HealthMonitor()
+        # Process-shared instance (RE-A2): ResponsesShim records every LLM
+        # call's outcome into it, so the runner's turn-start failover, the
+        # ModelRouter, and the conductor status panel all see live data.
+        self.health_monitor = get_health_monitor()
         # Wire health monitor into model router
         self.model_router.health_monitor = self.health_monitor
         print("DEBUG: Init Conductor")
@@ -440,12 +470,32 @@ class QuasarAgent:
             verbose=True,
         )
 
+        # Process-wide MCP servers (e.g. MANNA) — mounted regardless of
+        # user_id, which is empty for the FastAPI singleton agent.
+        self._load_platform_mcp_servers()
+
         # Load per-user custom tools (if user_id is set)
         if self.config.user_id:
             print(f"DEBUG: Loading MCP servers for {self.config.user_id}")
             self._load_mcp_servers(self.config.user_id)
-        
+
         print("DEBUG: Agent init done")
+
+    def _load_platform_mcp_servers(self):
+        """Mount operator-configured MCP servers (env-driven, process-wide).
+
+        The stdio RCE gate does not apply here: these configs come from the
+        deployment environment (QUASAR_ENABLE_MANNA / MANNA_MCP_URL /
+        QUASAR_PLATFORM_MCP_SERVERS), not from web users.
+        """
+        try:
+            from services.mcp_server_service import platform_mcp_servers
+            configs = platform_mcp_servers()
+        except Exception as e:
+            print(f"[MCPServers] Failed to read platform MCP config: {e}")
+            return
+        if configs:
+            self._mount_mcp_bridges(configs, enforce_stdio_gate=False)
 
     def _load_mcp_servers(self, user_id: str):
         """
@@ -454,17 +504,40 @@ class QuasarAgent:
         """
         try:
             from services.mcp_server_service import MCPServerService
+            configs = MCPServerService().load_servers(user_id)
+        except Exception as e:
+            print(f"[MCPServers] Failed to load MCP configs for {user_id}: {e}")
+            return
+        if configs:
+            self._mount_mcp_bridges(configs, enforce_stdio_gate=True)
+
+    def _mount_mcp_bridges(self, configs, enforce_stdio_gate: bool):
+        """Spawn one bridge (thread + event loop + ClientSession) per MCP
+        server config and register its exported tools as {server}__{tool}.
+
+        ``enforce_stdio_gate`` applies the S2 RCE guard (QUASAR_ENABLE_MCP_STDIO)
+        and must be True for user-supplied configs; platform (env-supplied)
+        configs pass False.
+        """
+        try:
             import asyncio
             import threading
+        except Exception as e:  # pragma: no cover
+            print(f"[MCPServers] Failed to set up MCP clients: {e}")
+            return
+        try:
             from mcp.client.stdio import stdio_client, StdioServerParameters
             from mcp.client.sse import sse_client
             from mcp.client.session import ClientSession
-            
-            svc = MCPServerService()
-            configs = svc.load_servers(user_id)
-            if not configs:
-                return
-                
+        except ImportError as e:
+            # Loud and specific: the bridge is dead code without the SDK.
+            print(
+                "[MCPServers] The 'mcp' SDK is not installed — MCP servers "
+                f"cannot be mounted (pip install mcp). Import error: {e}"
+            )
+            return
+
+        try:
             # We must maintain sessions for the lifetime of the agent.
             if not hasattr(self, "_mcp_exit_stacks"):
                 self._mcp_exit_stacks = []
@@ -475,72 +548,129 @@ class QuasarAgent:
                 
             def _start_mcp_bridge(config):
                 loop = asyncio.new_event_loop()
+                # Registered BEFORE the bridge thread starts so an immediate
+                # shutdown_mcp_servers() can never miss this bridge (CX-08).
+                # asyncio.Event has no loop affinity until first awaited
+                # (Python >= 3.10), so creating it here is safe.
+                _shutdown = asyncio.Event()
+                self._mcp_shutdown_events.append((loop, _shutdown))
+
+                async def _connect_and_register(stack):
+                    """Open the transport, initialize the session, register tools."""
+                    transport = (config.get("transport") or "stdio").strip().lower()
+
+                    if transport == "streamable_http":
+                        # Modern MCP HTTP transport (e.g. MANNA's /mcp).
+                        from mcp.client.streamable_http import streamablehttp_client
+                        url = config.get("url")
+                        if not url:
+                            raise ValueError("HTTP transport requires a URL")
+                        read, write, _ = await stack.enter_async_context(
+                            streamablehttp_client(url)
+                        )
+                    elif transport == "http":
+                        url = config.get("url")
+                        if not url:
+                            raise ValueError("HTTP transport requires a URL")
+                        # legacy SSE transport; kept for existing per-user configs
+                        read, write = await stack.enter_async_context(sse_client(url))
+                    else:
+                        # Default to stdio
+                        env = os.environ.copy()
+                        env.update(config.get("env", {}))
+
+                        server_params = StdioServerParameters(
+                            command=config["command"],
+                            args=config.get("args", []),
+                            env=env
+                        )
+                        read, write = await stack.enter_async_context(stdio_client(server_params))
+
+                    session = await stack.enter_async_context(ClientSession(read, write))
+                    await session.initialize()
+
+                    tools_resp = await session.list_tools()
+                    for mcp_tool in tools_resp.tools:
+                        t_name = f"{config['name']}__{mcp_tool.name}"
+                        t_desc = mcp_tool.description or f"Tool {mcp_tool.name} from {config['name']}"
+                        t_params = mcp_tool.inputSchema
+
+                        sync_fn = _build_mcp_tool_wrapper(
+                            session, mcp_tool.name, loop, config["name"]
+                        )
+
+                        self.tool_registry.register(Tool(
+                            name=t_name,
+                            description=t_desc,
+                            function=sync_fn,
+                            parameters=t_params,
+                            category="mcp"
+                        ))
+                        print(f"[MCPServers] Registered bridged tool: {t_name}")
+
                 # We need to run the async MCP client bridging in a background thread/event loop
                 # because the stdio client is fully async, but Quasar's tool_registry expects sync callables.
+                async def _close_stack(stack):
+                    try:
+                        await stack.aclose()
+                    except Exception as e:
+                        print(f"[MCPServers] Failed to close bridge {config['name']}: {e}")
+
                 async def _run_client():
                     from contextlib import AsyncExitStack
-                    stack = AsyncExitStack()
-                    
-                    try:
-                        transport = config.get("transport", "stdio")
-                        
-                        if transport == "http":
-                            url = config.get("url")
-                            if not url:
-                                raise ValueError("HTTP transport requires a URL")
-                            # sse_client requires the URL
-                            read, write = await stack.enter_async_context(sse_client(url))
-                        else:
-                            # Default to stdio
-                            env = os.environ.copy()
-                            env.update(config.get("env", {}))
-                            
-                            server_params = StdioServerParameters(
-                                command=config["command"],
-                                args=config.get("args", []),
-                                env=env
+
+                    attempts = 0
+                    while not _shutdown.is_set():
+                        stack = AsyncExitStack()
+                        # Race setup against shutdown so a hung transport
+                        # enter / initialize / list_tools cannot outlive
+                        # shutdown_mcp_servers() (CX-08).
+                        setup = asyncio.ensure_future(_connect_and_register(stack))
+                        stop = asyncio.ensure_future(_shutdown.wait())
+                        done, _pending = await asyncio.wait(
+                            {setup, stop}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if setup not in done:
+                            setup.cancel()
+                            await asyncio.gather(setup, return_exceptions=True)
+                            await _close_stack(stack)
+                            print(f"[MCPServers] Bridge for {config['name']} cancelled during setup")
+                            return
+                        stop.cancel()
+                        await asyncio.gather(stop, return_exceptions=True)
+
+                        setup_error = setup.exception()
+                        if setup_error is not None:
+                            attempts += 1
+                            print(
+                                f"[MCPServers] Failed to bridge {config['name']} "
+                                f"(attempt {attempts}/{_MCP_BRIDGE_MAX_ATTEMPTS}): {setup_error}"
                             )
-                            read, write = await stack.enter_async_context(stdio_client(server_params))
-                    
-                        session = await stack.enter_async_context(ClientSession(read, write))
-                        await session.initialize()
-                        
-                        # List exported tools
-                        tools_resp = await session.list_tools()
-                        
-                        for mcp_tool in tools_resp.tools:
-                            t_name = f"{config['name']}__{mcp_tool.name}"
-                            t_desc = mcp_tool.description or f"Tool {mcp_tool.name} from {config['name']}"
-                            t_params = mcp_tool.inputSchema
-                            
-                            sync_fn = _build_mcp_tool_wrapper(session, mcp_tool.name, loop)
-                            
-                            self.tool_registry.register(Tool(
-                                name=t_name,
-                                description=t_desc,
-                                function=sync_fn,
-                                parameters=t_params,
-                                category="mcp"
-                            ))
-                            print(f"[MCPServers] Registered bridged tool: {t_name}")
-                            
+                            await _close_stack(stack)
+                            if attempts >= _MCP_BRIDGE_MAX_ATTEMPTS:
+                                print(f"[MCPServers] Giving up on {config['name']}.")
+                                return
+                            # Abortable backoff: a shutdown during the wait
+                            # ends the loop instead of another attempt.
+                            try:
+                                await asyncio.wait_for(
+                                    _shutdown.wait(),
+                                    timeout=_MCP_BRIDGE_RETRY_BACKOFF_SECONDS * attempts,
+                                )
+                                return
+                            except asyncio.TimeoutError:
+                                continue
+
+                        # Mounted: keep the event loop alive so the stdio pipes
+                        # stay open, parked on the shutdown event so the bridge
+                        # thread can exit cleanly.
                         self._mcp_exit_stacks.append(stack)
-
-                        # Keep the event loop alive so the stdio pipes stay open,
-                        # but wait on a shutdown event instead of sleeping forever
-                        # so the bridge thread can exit cleanly.
-                        _shutdown = asyncio.Event()
-                        self._mcp_shutdown_events.append((loop, _shutdown))
-                        await _shutdown.wait()
-                        print(f"[MCPServers] Bridge for {config['name']} shutting down")
-
-                    except Exception as e:
-                        print(f"[MCPServers] Failed to bridge {config['name']}: {e}")
-                    finally:
                         try:
-                            await stack.aclose()
-                        except Exception as e:
-                            print(f"[MCPServers] Failed to close bridge {config['name']}: {e}")
+                            await _shutdown.wait()
+                            print(f"[MCPServers] Bridge for {config['name']} shutting down")
+                        finally:
+                            await _close_stack(stack)
+                        return
                 
                 # Run the bridge setup in a dedicated background thread per server
                 # This ensures the async context manager stays alive and connected.
@@ -570,8 +700,14 @@ class QuasarAgent:
                 
             from services.mcp_server_service import mcp_stdio_enabled
             for cfg in configs:
-                transport = (cfg.get("transport") or "stdio").lower()
-                if transport == "stdio" and not mcp_stdio_enabled():
+                transport = (cfg.get("transport") or "stdio").strip().lower()
+                # Anything that is not a URL transport is executed as a local
+                # command, so the gate must cover unknown strings too (CX-01).
+                if (
+                    transport not in _MCP_URL_TRANSPORTS
+                    and enforce_stdio_gate
+                    and not mcp_stdio_enabled()
+                ):
                     # RCE guard: don't spawn local-command MCP servers unless
                     # explicitly enabled for a trusted environment. (S2)
                     print(
@@ -589,7 +725,7 @@ class QuasarAgent:
         """Signal every MCP bridge thread to close its session and exit.
 
         Safe to call multiple times and when no bridges are running. Each
-        bridge coroutine is parked on an asyncio.Event (see _load_mcp_servers);
+        bridge coroutine is parked on an asyncio.Event (see _mount_mcp_bridges);
         setting it lets the coroutine fall through to its finally block, close
         the AsyncExitStack (terminating the child process / SSE connection),
         and stop its loop so the daemon thread can finish its teardown.
@@ -844,7 +980,8 @@ DOMAIN ROUTING (read first):
   datalab_* tools. NEVER route these to ALMA tools or observatory documentation.
 - Radio interferometry data, ALMA/VLA observations, proposal/policy/instrument questions → ALMA
   archive tools and the documentation context.
-- Named-target imagery across wavelengths → hips_cutout / hips_multiband_panel / datalab imaging.
+- Named-target imagery across wavelengths → hips_cutout / hips_multiband_panel / datalab_color_image /
+  datalab_image_cutout. Survey-specific color imagery (DECam/Legacy Surveys/DES) → datalab_color_image FIRST.
 - The documentation (RAG) context, when present, covers observatory/instrument manuals (mostly
   ALMA/radio). It is IRRELEVANT to survey-catalog data requests — if the user wants catalog data,
   call the data tools and ignore weak documentation snippets.
@@ -898,10 +1035,11 @@ GUIDELINES:
 - **ALMA DATA PRODUCT TRIAGE**: When the user asks to fetch, inspect, list, or triage ALMA FITS/data products, call `triage_alma_data_products`. If they provide a project/proposal code, MOUS UID, ASDM UID, or dataset ID, triage that exact identifier directly. If they provide only a target name such as "M87", first use `triage_alma_data_products` to show available project codes and ask the user which project to triage; do NOT guess. If the previous turn showed a project-code picker and the user replies with a row number like "#4", "number 4", or "use the fourth one", call `triage_alma_data_products` with that reply exactly. If they provide a band preference, pass it so the picker is filtered first. Never auto-download huge products; remote header inspection and product listing are safe.
 - **RESEARCH TRENDS**: When the user asks about publication volume, field growth, or funding landscape — "How much research on FRBs?", "Is interest in X growing?", "Who funds research on Y?" — call `get_research_trends`. Returns papers-per-year breakdown and top funders.
 - **NEVER MENTION DATA SOURCES**: NEVER mention "OpenAlex", "OpenAlex profile", "OpenAlex database", or any internal data source by name in your response. Present all researcher/trend/enrichment data as if it is native QUASAR knowledge. Do NOT include links to OpenAlex pages or API URLs.
+- **NEVER PRESENT TOOL NAMES AS SERVICES**: snake_case tool identifiers (`datalab_list_catalogs`, `hips_cutout`, `vo_adql_query`, …) are QUASAR-internal plumbing, NOT archive APIs, endpoints, or services. Never write "the datalab_list_catalogs API/service/endpoint returned…" or cite a tool id as a data source in your answer — describe the action in plain language ("the registered Data Lab catalog list", "an SIA cutout from Astro Data Lab") and name the REAL archive or service instead. (A NOIRLab evaluator flagged exactly this confusion.)
 - **WEB TOOLS**: Use `web_search` ONLY for non-paper, non-archive real-time queries: current telescope schedules, observatory news, instrument specs, call-for-proposals, or operational status. Use `web_extract_url` ONLY when the user provides full http(s) URLs to read or when a prior map/search result gives a specific URL whose full page text is truly needed. Use `web_map_site` to discover URLs on a known site before extraction. Use `web_crawl_site` for bounded documentation/site-section extraction. Use `web_research` for comprehensive web reports and comparisons. NEVER use web tools when the user asks for papers/publications — use `search_papers` instead.
 - **WEB TOOL ROUTING**: Keyword query → `web_search`. Full URL(s) to read/summarize/quote → `web_extract_url`. Site root URL plus "find pages" → `web_map_site`. Site section plus "crawl/docs" → `web_crawl_site`. Do NOT call `navigate_to_url` after `web_search` unless the user explicitly asks you to open a specific result URL. Do NOT pass keyword queries to `web_extract_url`.
-- **IMAGERY ROUTING**: when the user asks to SEE something (show me X / what does X look like / image of X), call an imaging tool (hips_cutout / hips_multiband_panel / vlass_cutout / stamps) in THIS turn - even if a similar image was produced earlier in the conversation. Prior images are not re-displayed with a new answer; an answer about appearance without a fresh tool-produced image is incomplete.
-- **DATA LAB / LEGACY SURVEYS IMAGERY**: For a Legacy Surveys / DECam / "coadd" color image (e.g. "color image of M31 from the DECam Legacy Surveys"), call `datalab_color_image` with just ra/dec/fov — it auto-selects an available 3-band triplet and renders the Lupton RGB. Do NOT hand-pick bands or pre-judge coverage. Key facts: (1) **LS DR9 imaging bands are g, r, z — there is NO i band**; never conclude "no color image" because i is missing. (2) Pick the FOV from the target's apparent size and the "center" intent (M31's D25 ≈ 3°, so "center" ≈ 0.1–0.2°), not a fixed constant. (3) The `coadd_all` cutout service has genuinely BROKEN/partial coverage at some bright nearby galaxies (e.g. the exact center of M31 has only usable z-band; the g/r/i tiles there are broken Local Group Survey refs). When `datalab_color_image` returns coverage_gap because fewer than 3 bands are usable, DO NOT just report failure and stop — the user asked for a color image, so **deliver it from a survey that does cover the target**: call `hips_cutout` (DSS2/color) or `hips_multiband_panel` for an optical color view. Report honestly that the Legacy Surveys coadd lacked full multi-band coverage at this position and that the color image shown is from the fallback survey. Only claim an image "shown" when a tool actually rendered one this turn.
+- **IMAGERY ROUTING**: when the user asks to SEE something (show me X / what does X look like / image of X), call an imaging tool (hips_cutout / hips_multiband_panel / vlass_cutout / stamps / datalab_color_image / datalab_image_cutout) in THIS turn - even if a similar image was produced earlier in the conversation. Prior images are not re-displayed with a new answer; an answer about appearance without a fresh tool-produced image is incomplete. When the user names a survey (DECam / Legacy Surveys / DES), route to datalab_color_image / datalab_image_cutout, not a generic hips tool.
+- **DATA LAB / LEGACY SURVEYS IMAGERY**: For a Legacy Surveys / DECam / "coadd" color image (e.g. "color image of M31 from the DECam Legacy Surveys"), call `datalab_color_image` with just ra/dec/fov — it auto-selects an available 3-band triplet and renders the Lupton RGB. Do NOT hand-pick bands or pre-judge coverage. Key facts: (1) **LS DR9 imaging bands are g, r, z — there is NO i band**; never conclude "no color image" because i is missing. (2) Pick the FOV from the target's apparent size and the "center" intent (M31's D25 ≈ 3°, so "center" ≈ 0.1–0.2°), not a fixed constant. (3) The `coadd_all` cutout service has genuinely BROKEN/partial coverage at some bright nearby galaxies (e.g. the exact center of M31 has only usable z-band; the g/r/i tiles there are broken Local Group Survey refs). When `datalab_color_image` returns coverage_gap because fewer than 3 bands are usable, the tool has ALREADY tried the same survey's official color HiPS as completion — a remaining gap means a true color image from THAT survey genuinely cannot be made at this position. **NEVER silently substitute another survey's imagery for a "color image" request** — no hips_multiband_panel, no default DSS2/2MASS/WISE panels presented as the answer. Instead: report the gap honestly (which bands were usable, why the color composite failed) and OFFER the user an explicit choice: (a) a same-survey SINGLE-BAND cutout in a usable band (`datalab_image_cutout`, or `hips_cutout` with an ls_g/ls_r/ls_i/ls_z single-band HiPS — those aliases serve the Legacy Surveys DR10 HiPS, which DOES carry i; the no-i rule above is about DR9 SIA tiles), or (b) an optical color view from a DIFFERENT survey (e.g. `hips_cutout` DSS2/color) **explicitly labeled with that survey's name — never presented as the requested survey**. If they choose (b), state the actual source survey and image service in the answer (results carry `source_service`, e.g. "CDS hips2fits" vs Data Lab — repeat it). Only claim an image "shown" when a tool actually rendered one this turn.
 - **STRICT WEB SAFETY**: Never provide, summarize, cite, or link to pornographic, sexually explicit, nude, erotic, escort, or adult-entertainment content. Never emit general-web image URLs. If the web safety filter withholds results, state only that results were withheld by the safety filter and do not reconstruct the blocked content from memory.
 - After a tool runs (except search_papers), summarize the output concisely.
 - If a search returns many results, offer to plot them (but execute the search first).
@@ -915,7 +1053,7 @@ GUIDELINES:
 - **MULTI-WAVELENGTH / MIXED SOURCES**: For JWST/HST data with rich filtering (instrument, program, filter), prefer `search_mast` or `search_mast_by_criteria` — they provide deeper queries than search_cadc_archive. For ESO/VLT data (MUSE, KMOS, X-Shooter, FORS2), use `search_eso_archive`. For infrared catalog data (WISE, 2MASS, Spitzer), use `search_irsa`. Use `search_cadc_archive` for general multi-wavelength cone searches or telescopes like Gemini, JCMT, and CFHT. When the user asks for data from DIFFERENT archives (e.g. "ALMA data of M87 and JWST data of NGC23"), make SEPARATE tool calls for each: search_by_target(target_name="M87") for ALMA, then search_mast(target_name="NGC23", mission="JWST") for JWST. Each produces its own data card in the UI.
 - **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
 - **MMU/HATS CATALOG RULE**: Use `search_mmu_hats_catalog` when the user asks for source/catalog properties from large surveys -- Gaia astrometry/proper motions/parallaxes, DESI/SDSS redshifts and classifications, TESS source metadata, Chandra spectra metadata, what sources are near this position, source tables for ML, or cross-survey enrichment. Use the archive tools (search_by_target, search_by_position, search_mast, search_cadc_archive, search_eso_archive, triage_alma_data_products) when the user asks for observation availability, project/proposal IDs, FITS/data products, or telescope archive records. For combined requests (find ALMA data for M87 and Gaia sources in the field), call the archive tool FIRST to get observations/positions, THEN search_mmu_hats_catalog to enrich the field. For catalog-to-catalog matching use crossmatch_mmu_hats_catalogs within a bounded cone; if it fails, run two bounded cone searches and say so. Examples: Find ALMA data for M87 -> search_by_target. What Gaia sources are near M87? -> search_mmu_hats_catalog(catalog_key='gaia', target_name='M87'). Download ALMA FITS files -> ALMA/DataLink tools, never MMU/HATS.
-- **LIVE IMAGERY RULE**: Use `hips_cutout` or `hips_multiband_panel` for "show me", appearance, and multiwavelength postage-stamp questions; they are deeper and broader than `get_sky_image`. Use `vlass_cutout` for 3 GHz radio continuum imagery (Dec > -40 only). Use `search_ztf_alerts`, `ztf_light_curve`, and `ztf_stamps` for transients and variability. Use `ned_sed_plot` for literature SEDs. Use `sparcl_find_spectra` and `sparcl_plot_spectrum` for real DESI/SDSS optical spectra. MMU/Data Lab remain authoritative for catalog tables.
+- **LIVE IMAGERY RULE**: Use `hips_cutout` or `hips_multiband_panel` for "show me", appearance, and multiwavelength postage-stamp questions; they are deeper and broader than `get_sky_image`. Use `datalab_color_image` / `datalab_image_cutout` when the user names a specific survey (DECam / Legacy Surveys / DES) — a "color image of survey X" must come from survey X. Use `vlass_cutout` for 3 GHz radio continuum imagery (Dec > -40 only). Use `search_ztf_alerts`, `ztf_light_curve`, and `ztf_stamps` for transients and variability. Use `ned_sed_plot` for literature SEDs. Use `sparcl_find_spectra` and `sparcl_plot_spectrum` for real DESI/SDSS optical spectra. MMU/Data Lab remain authoritative for catalog tables.
 - **RADIO SED RULE**: Use `radio_sed` for compact-source radio continuum SED or radio spectral-index questions; always repeat its flags and state that v1 uses TGSS/GLEAM/SUMSS/NVSS/FIRST catalog fluxes without resolution matching, flux-scale corrections, or image-plane photometry.
 - **SKY MONITOR RULE**: When the user wants ongoing watching ("keep an eye on", "alert me", "monitor"), use `monitor_add_target` then `monitor_check_now`; report only NEW alerts, and use `monitor_list_targets` / `monitor_remove_target` to manage the watchlist.
 - **VO DISCOVERY RULE**: When no built-in tool covers an archive/dataset, use the VO chain: `vo_find_services` -> `vo_list_tables` -> `vo_describe_table` -> `vo_adql_query` (SELECT-only). Always inspect the schema before writing ADQL, quote table names containing '/' or '+' in double quotes, and pass a keyword to `vo_list_tables` on big services like VizieR.
@@ -939,14 +1077,14 @@ GUIDELINES:
   `datalab_density_vetting` (densest-clump search + cutout grid),
   `datalab_period_fold` (variable-star phase folding),
   `datalab_q3c_crossmatch` (two-catalog positional crossmatch — never hand-write q3c_join SQL),
-  `datalab_image_cutout` / `datalab_color_image` / `datalab_cutout_grid` (survey imagery),
+  `datalab_image_cutout` / `datalab_color_image` / `datalab_cutout_grid` (survey imagery — for MORE THAN ONE position/peak sharing one band/catalog/FOV, ALWAYS make ONE `datalab_cutout_grid` call with all peaks; NEVER a series of per-peak `datalab_image_cutout` calls — each separate call costs its own tool budget plus an LLM round-trip. Split into multiple calls only when targets genuinely need different bands, FOVs, or catalogs),
   `datalab_tiled_search` + `datalab_confirm_sky_area` (wide-area candidate searches — ALWAYS confirm the sky area with the user before scanning more than ~100 deg²).
   Chain datalab_select_catalog_rows→plotting only when no one-shot tool fits.
 - **WHITE DWARF / HR-DIAGRAM SELECTION**: For white-dwarf candidate searches or any "which of these are white dwarfs" HR-diagram question, build the absolute-magnitude CMD with `datalab_color_magnitude_diagram` using x_expr='bp_rp', y_expr='phot_g_mean_mag + 5*log10(parallax) - 10', point_sources=true, AND pass `overlay_locus='wd'` — it draws the WD locus and the result reports `n_wd_candidates` (finite points on the faint side of the locus) plus a `wd_locus_note`. Quote those tool-computed counts in your answer; NEVER eyeball the diagram, never call the lower main sequence a "WD cooling track", and never answer WD counts from memory. Include astrometric quality cuts (e.g. parallax_over_error > 5 with its NaN finiteness guard) in the selection before quoting candidate counts.
 - **DATA LAB EXPERT SQL**: datalab_sql_query requires a bound: a q3c cone (q3c_radial_query), an indexed equality (e.g. SMASH `fieldid = 169`, `id = '169.429960'`, DESI `targetid = N`), a registry-approved BETWEEN box, or a GROUP BY aggregate on an aggregate-safe table. All-sky ROW-level pulls are rejected — use aggregates for footprints/histograms. Wide `datalab_density_aggregate` cones that exceed the sync window auto-tile into sub-cones and merge — call it ONCE with the full cone rather than hand-tiling. If a query returns a jobid, poll datalab_job_status a FEW times only; when the result says stop_polling, end the turn and tell the user the job is still running.
 - **DATA LAB NaN CONVENTION (CRITICAL for correctness)**: Data Lab tables store missing float values as NaN (not SQL NULL), and Postgres orders NaN ABOVE every real number — so a bare `col > x`, `col >= x`, or `col != x` cut silently ADMITS every missing-value row (e.g. `parallax_over_error > 5` alone returns thousands of rows that have NO astrometry). In datalab_sql_query, every one-sided lower-bound or not-equal cut on a nullable float column (parallax, pm, pmra, pmdec, parallax_over_error, mags, colors, snr_*, chi2, …) MUST carry a finiteness guard: `AND col < 'Infinity'` — e.g. `WHERE parallax_over_error > 5 AND parallax_over_error < 'Infinity' AND pm > 150 AND pm < 'Infinity'`. Cuts with an upper bound (`<`, `<=`, BETWEEN, two-sided ranges) are already NaN-safe. The structured value_cuts on datalab tools add this guard automatically — prefer them when possible.
-- **SURVEY COVERAGE CLAIMS**: Before claiming a catalog contains (or lacks) a target/region, check the `footprint` field returned by datalab_list_catalogs / datalab_describe_table, or call survey_covers_position for the exact position. NEVER list every catalog as covering a target — curate by footprint (e.g. the LMC is NOT covered by SDSS, DESI, LS DR9, or DES).
-- **DENSITY / SKY-DISTRIBUTION MAPS**: NEVER build a sky-density or overdensity map from a row-LIMITed pull (datalab_select_catalog_rows, datalab_sql_query rows, crossmatch rows) — capped results are storage-order, spatially clustered slices and the map will show one corner of the field. For "where do sources clump / density map / footprint" questions use `datalab_density_aggregate` (server-side GROUP BY counts EVERY row) or `datalab_density_vetting` (finds + ranks peaks). For a WHOLE survey field (e.g. "SMASH field 169"), bound the aggregate with the indexed value_cut `fieldid = N` and NO cone — never guess a cone center for a named field. For overdensity hunts, either use density_vetting or pass `matched_filter=true` to datalab_sky_density_map, and REPORT the detected peak RA/Dec coordinates in the answer — a map alone does not answer "where do they clump". If a result carries a "hit its row cap" warning, do not plot its sky distribution — rerun with an aggregate, and always relay the truncation to the user.
+- **SURVEY COVERAGE CLAIMS**: Before claiming a catalog contains (or lacks) a target/region, check coverage. datalab_list_catalogs can now curate BY POSITION itself: pass `target` (or `ra`/`dec`) and it ranks known-covering catalogs first, labels unknown coverage 'coverage unverified for this position', and excludes known non-covering catalogs with reasons — prefer that over listing everything and guessing. Otherwise check the `footprint`/`coverage` fields from datalab_list_catalogs / datalab_describe_table, or call survey_covers_position for the exact position. NEVER list every catalog as covering a target — curate by footprint (e.g. the LMC is NOT covered by SDSS, DESI, LS DR9, or DES).
+- **DENSITY / SKY-DISTRIBUTION MAPS**: NEVER build a sky-density or overdensity map from a row-LIMITed pull (datalab_select_catalog_rows, datalab_sql_query rows, crossmatch rows) — capped results are storage-order, spatially clustered slices and the map will show one corner of the field. For "where do sources clump / density map / footprint" questions use `datalab_density_aggregate` (server-side GROUP BY counts EVERY row) or `datalab_density_vetting` (finds + ranks peaks). For a WHOLE survey field (e.g. "SMASH field 169"), bound the aggregate with the indexed value_cut `fieldid = N` and NO cone — never guess a cone center for a named field. For overdensity hunts, either use density_vetting or pass `matched_filter=true` to datalab_sky_density_map, and REPORT the detected peak RA/Dec coordinates in the answer — a map alone does not answer "where do they clump". If a result carries a "hit its row cap" warning, do not plot its sky distribution — rerun with an aggregate, and always relay the truncation to the user. If `datalab_density_vetting` times out, fall back to `datalab_density_aggregate` for the peaks and then ONE `datalab_cutout_grid` call for ALL peak cutouts — never one `datalab_image_cutout` per peak, and never retry the timed-out vetting call.
 - **DEFAULT QUALITY CUTS**: the Data Lab catalog tools automatically apply registry survey-quality cuts (DESI zpix: zwarn=0 + survey='main' + main_primary; DES: flags_g/r/i=0; SDSS specobj: zwarning=0) unless you pass your own cut on those columns — state the applied cuts when reporting counts. When the user implies an object CLASS on a spectroscopic catalog (galaxies/LRGs → spectype='GALAXY' on DESI zpix, class='GALAXY' on SDSS specobj; quasars → 'QSO'), ADD that class cut yourself.
 - **SED SAMPLES**: `datalab_sed_plot` IS multi-object. For "SEDs of a sample / a few hundred objects", call it ONCE with `sample_n` (e.g. `{{"result_id": "dlr_...", "sample_n": 300}}`) — it overlays up to 300 SEDs with the per-band median highlighted. Use `row_index` only for ONE object; never claim the tool is single-object and never loop per row.
 - **RELAY TOOL WARNINGS**: if any tool result this turn contains a `warnings` field, a "no significant period", "truncated", "hit its row cap", or "partial coverage" note, you MUST repeat that caveat faithfully in your final answer. NEVER present a result as complete or significant when its own tool output says otherwise — report "no significant period (FAP=0.28)" rather than claiming a period was found, and state coverage gaps rather than describing a partial map as the full region.
@@ -981,46 +1119,110 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     # ── Phase 0: DataLink + FITS backing methods ──────────────────────────
 
+    # Role order used when a DataLink listing is truncated for the LLM: science
+    # products and the restore/QA documents first, diagnostics and tars last.
+    _ALMA_ROLE_RANK = {
+        "science FITS": 0, "primary beam": 1, "clean mask": 1, "README": 2, "QA report": 2,
+        "weblog": 2, "script": 3, "pipeline artifact": 3, "calibration": 4, "auxiliary tar": 4,
+        "product tar (split)": 5, "tar bundle": 5, "imaging diagnostic": 6,
+        "raw ASDM (per-EB, restore only)": 7, "other": 8, "unknown": 9,
+    }
+
     @log_tool
     def _list_alma_files(self, mous_uid: str, filename_pattern: str = None) -> Dict[str, Any]:
-        """List deliverable files for a MOUS via the ALMA DataLink protocol."""
+        """List the typed DataLink inventory of a MOUS (files, service descriptors,
+        nested DataLink entries, error rows) with an explicit state.
+
+        Empty and invalid are DIFFERENT outcomes (skill: an empty anonymous
+        DataLink table is the normal answer for a proprietary MOUS; an invalid
+        UID returns an explicit fault) and are reported as such (A-23).
+        """
+        from services.data_product_triage import category_counts, product_role
+
         try:
             result = self.datalink_client.list_files(
                 mous_uid=mous_uid,
                 pattern=filename_pattern,
             )
-            # list_files() returns a dict: {success, mous_uid, total_files, files, error?}
-            # Unpack the file list from the dict
-            if isinstance(result, dict):
-                if not result.get("success", False):
-                    return {
-                        "success": False,
-                        "mous_uid": mous_uid,
-                        "error": result.get("error", "DataLink query failed"),
-                    }
-                file_list = result.get("files", [])
-            elif isinstance(result, list):
-                # Legacy path: if list_files ever returns a raw list
-                file_list = result
-            else:
-                file_list = []
+            if isinstance(result, list):  # legacy shape: raw list of files
+                result = {"success": True, "state": "ok", "mous_uid": mous_uid, "files": result,
+                          "services": [], "nested": [], "errors": []}
+            if not isinstance(result, dict):
+                return {"success": False, "error": "DataLink client returned an unexpected payload", "mous_uid": mous_uid}
 
-            if not file_list:
+            state = result.get("state") or ("ok" if result.get("success") else "unavailable")
+            if not result.get("success", False):
+                return {
+                    "success": False,
+                    "mous_uid": result.get("mous_uid", mous_uid),
+                    "state": state,
+                    "error": result.get("error", "DataLink query failed"),
+                    "errors": result.get("errors", []),
+                    "note": (
+                        "The MOUS UID was rejected by the DataLink service (explicit not-found fault)."
+                        if state == "not_found" else
+                        "Transport failure: the archive did not answer. This does not tell whether the MOUS exists or has files."
+                    ),
+                }
+
+            file_list = list(result.get("files", []))
+            services = list(result.get("services", []))
+            nested = list(result.get("nested", []))
+            errors = list(result.get("errors", []))
+            size = result.get("size_summary") or {}
+
+            if not file_list and not nested:
                 return {
                     "success": True,
-                    "mous_uid": mous_uid,
+                    "mous_uid": result.get("mous_uid", mous_uid),
+                    "state": state,
                     "file_count": 0,
-                    "message": "No files found. The MOUS UID might be invalid or the data is not yet public.",
+                    "service_count": len(services),
+                    "nested_datalink_count": 0,
+                    "errors": errors,
+                    "message": result.get("message") or (
+                        "The DataLink table is valid but lists no files visible to anonymous access — "
+                        "typically a proprietary MOUS (check data_rights/obs_release_date). It does NOT mean the "
+                        "UID is invalid."
+                        if state == "empty_or_unauthorized" else
+                        f"No file rows matched" + (f" pattern {filename_pattern!r}." if filename_pattern else ".")
+                    ),
                 }
-            return {
+
+            ranked = sorted(file_list, key=lambda f: (self._ALMA_ROLE_RANK.get(product_role(f), 8), str(f.get("filename", ""))))
+            shown = ranked[:50]
+            omitted_by_role: Dict[str, int] = {}
+            for f in ranked[50:]:
+                role = product_role(f)
+                omitted_by_role[role] = omitted_by_role.get(role, 0) + 1
+            out = {
                 "success": True,
-                "mous_uid": mous_uid,
+                "mous_uid": result.get("mous_uid", mous_uid),
+                "state": state,
                 "file_count": len(file_list),
-                "files": file_list[:50],  # Cap at 50 for LLM context
-                "note": f"Found {len(file_list)} file(s)." + (
-                    f" Showing first 50." if len(file_list) > 50 else ""
+                "service_count": len(services),
+                "nested_datalink_count": len(nested),
+                "category_counts": category_counts(file_list),
+                "size_summary": size,
+                "files": [
+                    {**f, "role": product_role(f)} for f in shown
+                ],
+                "nested": nested[:10],
+                "services": [{"service_def": s.get("service_def"), "semantics": s.get("semantics"),
+                              "description": s.get("description")} for s in services[:10]],
+                "errors": errors,
+                "partial_parse": bool(result.get("partial_parse")),
+                "note": (
+                    f"{len(file_list)} file row(s), {len(services)} service descriptor(s), "
+                    f"{len(nested)} nested DataLink entr(y/ies); "
+                    f"{size.get('n_size_unknown', 0)} file size(s) unknown. "
+                    "access_url values are direct file links; sizes come from DataLink content_length. "
+                    "The standard delivery has NO calibrated MS (restore with scriptForPI). "
+                    "Filename SPW numbers are pipeline virtual IDs; do not treat filenames as authoritative metadata."
+                    + (f" Showing first 50 of {len(file_list)} files, omitted by role: {omitted_by_role}." if len(file_list) > 50 else "")
                 ),
             }
+            return out
         except Exception as e:
             return {"success": False, "error": str(e), "mous_uid": mous_uid}
 
@@ -1273,6 +1475,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     "message": "Observation rows were found, but no MOUS UID was available for DataLink product discovery.",
                 }
 
+            mous_total = int(observations["member_ous_uid"].dropna().astype(str).nunique()) if "member_ous_uid" in observations.columns else len(mous_uids)
             return self._triage_alma_mous_products(
                 mous_uids=mous_uids,
                 label=lookup_label,
@@ -1283,6 +1486,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 observation_metadata_by_mous=observation_metadata_by_mous,
                 max_products=max_products,
                 max_header_checks=max_header_checks,
+                mous_total=mous_total,
             )
         except Exception as e:
             return {"success": False, "mode": "error", "error": str(e), "query": identifier_or_target}
@@ -1343,16 +1547,33 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         observation_metadata_by_mous: Optional[Dict[str, Dict[str, Any]]] = None,
         max_products: int = 40,
         max_header_checks: int = 6,
+        mous_total: Optional[int] = None,
     ) -> Dict[str, Any]:
+        from services.data_product_triage import category_counts
+
         product_rows: List[Dict[str, Any]] = []
         all_files: List[Dict[str, Any]] = []
         errors: List[str] = []
+        mous_states: Dict[str, str] = {}
+        service_rows = 0
+        nested_rows = 0
 
         for mous_uid in mous_uids:
             result = self.datalink_client.list_files(mous_uid=mous_uid)
+            state = result.get("state") or ("ok" if result.get("success") else "unavailable")
+            mous_states[mous_uid] = state
             if not result.get("success"):
-                errors.append(f"{mous_uid}: {result.get('error', 'DataLink query failed')}")
+                errors.append(f"{mous_uid} [{state}]: {result.get('error', 'DataLink query failed')}")
                 continue
+            if state == "empty_or_unauthorized":
+                errors.append(
+                    f"{mous_uid} [empty_or_unauthorized]: DataLink lists no files visible to anonymous access "
+                    "(typically proprietary) — not an invalid UID."
+                )
+            for err in result.get("errors") or []:
+                errors.append(f"{mous_uid} [row error]: {err}")
+            service_rows += len(result.get("services") or [])
+            nested_rows += len(result.get("nested") or [])
             for file_info in result.get("files", []):
                 enriched = dict(file_info)
                 enriched["_mous_uid"] = mous_uid
@@ -1401,7 +1622,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             }
 
         fits_count = sum(1 for item in all_files if is_fits_product(item))
-        large_count = sum(1 for item in all_files if float(item.get("size_mb") or 0) > 500)
+        known_sizes = [float(item["size_mb"]) for item in all_files if item.get("size_mb") is not None]
+        large_count = sum(1 for size in known_sizes if size > 500)
+        size_unknown_count = len(all_files) - len(known_sizes)
+        # size_mb is MiB (bytes / 1024^2); report decimal GB like DataLink's size_summary.
+        total_known_gb = round(sum(known_sizes) * 1024.0 * 1024.0 / 1e9, 3)
+        mous_total_n = int(mous_total) if mous_total is not None else len(mous_uids)
+        mous_truncated = mous_total_n > len(mous_uids)
         return {
             "success": True,
             "mode": "triage",
@@ -1409,20 +1636,41 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "project_code": proposal_id or None,
             "target_name": target_name or None,
             "band": band or None,
+            "observation_rows": observation_count,
             "observation_count": observation_count,
+            "mous_total": mous_total_n,
             "mous_checked": len(mous_uids),
+            "mous_truncated": mous_truncated,
+            "mous_states": mous_states,
             "total_products_found": len(all_files),
             "products_listed": len(product_rows),
             "fits_products_found": fits_count,
+            "category_counts": category_counts(all_files),
+            "service_descriptor_rows": service_rows,
+            "nested_datalink_rows": nested_rows,
             "header_checks": header_checks,
             "large_products_over_500mb": large_count,
+            "size_unknown_count": size_unknown_count,
+            "total_known_size_gb": total_known_gb,
             "header_summaries": header_summaries,
             "errors": errors,
             "message": (
-                f"Found {len(all_files)} ALMA DataLink product(s) across {len(mous_uids)} MOUS dataset(s); "
+                f"Found {len(all_files)} ALMA DataLink file(s) across {len(mous_uids)} of {mous_total_n} MOUS dataset(s); "
                 f"listed {len(product_rows)} and inspected {header_checks} FITS header(s) without downloading full files."
+                + (" Not every MOUS was inspected (raise max_mous)." if mous_truncated else "")
+                + (f" {size_unknown_count} file size(s) are unknown (no DataLink content_length)." if size_unknown_count else "")
             ),
-            "safety": "No large science files were downloaded. Header checks used remote FITS header reads only.",
+            "safety": (
+                "No files were downloaded; header checks used remote FITS header reads only. "
+                + (f"{size_unknown_count} product size(s) are unknown, so the total volume cannot be bounded. "
+                   if size_unknown_count else f"Known product volume: {total_known_gb} GB. ")
+                + ("Some MOUSs returned no DataLink rows or failed (see errors); the inventory is partial."
+                   if errors else "")
+            ),
+            "product_caveat": (
+                "Delivered FITS may omit fields/SPWs/channels (imaging mitigation); the calibrated MS is not "
+                "delivered (restore with scriptForPI). 'Header check' scores header completeness, not science readiness."
+            ),
         }
 
     @staticmethod
@@ -1583,11 +1831,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # Fallback to raw Tavily answer
         return safe_assistant_text(web_data.get("answer", "").strip())
 
-    _EXTERNAL_URL_RE = re.compile(r"https?://[^\s)\]>\"'`]+", re.IGNORECASE)
+    # A backslash never belongs to a URL: the evidence blob is JSON-encoded
+    # tool output (json.dumps of already-serialised results), so every URL in
+    # it is followed by an escaped quote (`...SIZE=0.1\"`). Including the
+    # backslash made every tool-returned URL fail the whitelist and get
+    # stripped as "fabricated" (live 2026-09-16: 6 archive cutout links per turn).
+    _EXTERNAL_URL_RE = re.compile(r"https?://[^\s)\]>\"'`\\]+", re.IGNORECASE)
 
     @staticmethod
     def _normalize_url(url: str) -> str:
-        return str(url or "").rstrip(".,;:!?'\")]}>").lower()
+        return str(url or "").rstrip("\\").rstrip(".,;:!?'\")]}>").lower()
 
     def _strip_unverified_urls(self, text: str, *, sources: List[str], on_token=None) -> str:
         """Strip external URLs that no tool, web search, or documentation context
@@ -1921,6 +2174,39 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "monitor_list_targets": "Listing sky-monitor watchlist",
             "monitor_remove_target": "Removing sky-monitor target",
             "monitor_check_now": "Checking watchlist for new ZTF alerts",
+            # Data Lab family (RE-C2: the raw-name fallback surfaced internal
+            # tool ids like "Running datalab list catalogs" in the UI chips).
+            "datalab_list_catalogs": "Listing registered Data Lab catalogs",
+            "datalab_describe_table": "Inspecting Data Lab table schema",
+            "datalab_cone_count": "Counting Data Lab sources in the cone",
+            "datalab_select_catalog_rows": "Selecting Data Lab catalog rows",
+            "datalab_sql_query": "Running SQL on Astro Data Lab",
+            "datalab_get_result": "Fetching stored Data Lab result rows",
+            "datalab_save_result": "Saving result to My Tables",
+            "datalab_load_my_table": "Loading a saved Data Lab table",
+            "datalab_list_my_tables": "Listing saved Data Lab tables",
+            "datalab_q3c_crossmatch": "Crossmatching Data Lab catalogs",
+            "datalab_density_aggregate": "Aggregating Data Lab source density",
+            "datalab_density_vetting": "Searching for density peaks with cutouts",
+            "datalab_sky_density_map": "Mapping Data Lab sky density",
+            "datalab_tiled_search": "Running wide-area tiled Data Lab search",
+            "datalab_confirm_sky_area": "Confirming search sky area",
+            "datalab_image_cutout": "Rendering Data Lab image cutout",
+            "datalab_cutout_grid": "Rendering Data Lab cutout grid",
+            "datalab_color_image": "Rendering Data Lab color image",
+            "datalab_sia_search": "Searching Data Lab image inventory",
+            "datalab_color_magnitude_diagram": "Plotting color-magnitude diagram",
+            "datalab_color_color_diagram": "Plotting color-color diagram",
+            "datalab_catalog_scatter": "Plotting catalog scatter",
+            "datalab_sed_plot": "Plotting spectral energy distribution",
+            "datalab_lss_wedge": "Plotting large-scale-structure wedge",
+            "datalab_period_fold": "Phase-folding the light curve",
+            "datalab_star_lightcurve": "Fetching star light curve",
+            "datalab_variable_candidates": "Searching variable-star candidates",
+            "datalab_job_status": "Checking Data Lab async job",
+            "datalab_job_results": "Fetching Data Lab job results",
+            "datalab_job_cancel": "Cancelling Data Lab async job",
+            "datalab_export_notebook": "Exporting analysis notebook",
             "vo_find_services": "Searching the IVOA registry",
             "vo_list_tables": "Listing TAP service tables",
             "vo_describe_table": "Inspecting table schema",
@@ -1958,9 +2244,30 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     _TOOL_TIMEOUT_DEFAULT_SECONDS = 150.0
     # Tools that legitimately run long (multi-step research, bulk downloads).
     _TOOL_TIMEOUT_OVERRIDES: Dict[str, float] = {
+        "query_alma_science_archive": 390.0,
+        "advanced_search": 390.0,
+        "get_observation_details": 390.0,
+        "search_by_frequency": 390.0,
+        "search_by_target": 465.0,
+        "search_by_position": 465.0,
         "web_research": 420.0,
         "download_alma_data": 600.0,
+        # L9: bulk MAST FITS pulls (e.g. TESS lightcurves) legitimately run
+        # long — match download_alma_data; MASTClient's own wall bound
+        # (MAST_DOWNLOAD_WALL_SECONDS, default 480 s) fires first with the
+        # more specific error.
+        "download_mast_data": 600.0,
+        # Density vetting = density SQL PLUS an SIA cutout grid in one call;
+        # under NSC/archive load it cannot fit the 150 s default, and its
+        # abandonment is what tipped the 2026-08-04 production hang into the
+        # aggregate + per-peak-cutout grind (density report fix 10).
+        "datalab_density_vetting": 300.0,
     }
+    # Same-tool timeouts in one turn before the guard fails further calls
+    # instantly (the model retries timed-out calls despite the "Do NOT retry"
+    # error text — live 2026-08-04 density repro — and each retry burns a
+    # full guard budget).
+    _TOOL_TIMEOUT_BREAKER_TRIPS = 2
 
     @classmethod
     def _tool_timeout_seconds(cls, tool_name: str) -> Optional[float]:
@@ -2010,6 +2317,49 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             timeout_seconds if timeout_seconds is not None
             else self._tool_timeout_seconds(tool_name)
         )
+        deadline = getattr(getattr(self, "_tls", None), "turn_deadline", None)
+        hard_seconds = getattr(getattr(self, "_tls", None), "turn_hard_seconds", 0)
+        if deadline is not None and hard_seconds:
+            remaining = max(0.001, deadline - 0.3 * hard_seconds - time.monotonic())
+            budget = min(budget, remaining) if budget is not None else remaining
+
+        # Consecutive-timeout circuit breaker. Turn-scoped state lives on the
+        # runner thread's TLS (reset per turn in core/runner.py); paths that
+        # never set it (Conductor executor threads, bare test agents) get None
+        # and the breaker is simply disabled there.
+        _breaker = getattr(getattr(self, "_tls", None), "tool_timeout_breaker", None)
+        if (
+            budget is not None
+            and _breaker is not None
+            and _breaker.get(tool_name, 0) >= self._TOOL_TIMEOUT_BREAKER_TRIPS
+        ):
+            logger.warning(
+                f"[TOOL ⏱] {tool_name} circuit breaker open "
+                f"({_breaker[tool_name]} timeouts this turn) — failing instantly"
+            )
+            if on_status is not None and step_label:
+                try:
+                    # ui-pro/api/sse.py keys on the "timed out" phrase to
+                    # withhold its deadline extension for this status.
+                    on_status(
+                        f"{step_label} skipped — timed out "
+                        f"{_breaker[tool_name]} times this turn",
+                        "completed",
+                    )
+                except Exception:
+                    pass
+            return {
+                "success": False,
+                "timeout": True,
+                "circuit_breaker": True,
+                "error": (
+                    f"CIRCUIT BREAKER: '{tool_name}' already timed out "
+                    f"{_breaker[tool_name]} times this turn, so this call was "
+                    "NOT executed. Do NOT call this tool again this turn; "
+                    "answer with the data you already have, or use a "
+                    "different tool."
+                ),
+            }
 
         interval: Optional[float] = None
         if on_status is not None:
@@ -2079,6 +2429,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     local["trace"] = list(self._accumulated_tool_trace)
                     local["last_run_result"] = self.last_run_result
                     local["last_search_results"] = self.last_search_results
+                    # hasattr on the worker's fresh TLS distinguishes
+                    # "explicitly set — possibly to None, a deliberate card
+                    # CLEAR (e.g. the Data Lab ctx provider)" from "never
+                    # touched". The getter's None fallback erases that
+                    # difference, and the old `is not None` merge silently
+                    # dropped clears — a stale data card from an earlier tool
+                    # survived any guarded tool that cleared it.
+                    local["lrr_set"] = hasattr(self._tls, "last_run_result")
+                    local["lsr_set"] = hasattr(self._tls, "last_search_results")
                     local["alma"] = dict(self._alma_tap_provenance_state)
                 except Exception:
                     pass
@@ -2124,6 +2483,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 outcome["abandoned"] = True
 
         if finished:
+            # A completed call (success OR fast failure) proves the service is
+            # responsive again — reset this tool's timeout streak.
+            if _breaker is not None:
+                _breaker.pop(tool_name, None)
             # Merge the worker's TLS deltas into THIS thread's request state.
             # Conditional so a bare agent without `_tls` (delta collection
             # skipped above) never touches the properties here either.
@@ -2131,9 +2494,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 self._accumulated_run_results.extend(outcome["acc"])
             if outcome.get("trace"):
                 self._accumulated_tool_trace.extend(outcome["trace"])
-            if outcome.get("last_run_result") is not None:
+            if outcome.get("lrr_set"):
                 self.last_run_result = outcome["last_run_result"]
-            if outcome.get("last_search_results") is not None:
+            if outcome.get("lsr_set"):
                 self.last_search_results = outcome["last_search_results"]
             alma = outcome.get("alma") or {}
             if alma.get("query") is not None or alma.get("url") is not None:
@@ -2146,8 +2509,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             f"[TOOL ⏱] {tool_name} exceeded its {budget:.0f}s budget — "
             "abandoned (the worker keeps running detached; its result is discarded)"
         )
+        if _breaker is not None:
+            _breaker[tool_name] = _breaker.get(tool_name, 0) + 1
         if on_status is not None and step_label:
             try:
+                # ui-pro/api/sse.py keys on the "timed out" phrase to withhold
+                # its deadline extension for this status — keep in sync.
                 on_status(
                     f"{step_label} timed out after {int(budget)}s — continuing with available data",
                     "completed",
@@ -2770,6 +3137,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "analysis_service": getattr(self, "analysis_service", None),
                 "plotting_service": getattr(self, "plotting_service", None),
                 "mast_client": getattr(self, "mast_client", None),
+                # DataLink client for the download_alma_data byte preflight (INT-3).
+                "datalink_client": getattr(self, "datalink_client", None),
                 # Bound callable → byte-identical SIMBAD resolution for the
                 # (dead, preserved-verbatim) positional fallback + CADC fallback.
                 "resolve_target": self._resolve_target,
@@ -3234,7 +3603,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         Weaker models sometimes exhaust the tool loop without emitting any final
         text; without this round the user would only see the mechanical step
         summary from _summarize_tool_outcomes."""
-        compact = [str(tr.get("output") or "")[:1500] for tr in (tool_results or [])[-12:]]
+        from core.turn_recovery import compact_tool_outputs
+        compact = compact_tool_outputs(tool_results or [])
         compact = [c for c in compact if c]
         if not compact:
             return ""
@@ -3245,7 +3615,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             + "\n\nWrite the final answer to the user's question based ONLY on these results. "
             "Plots and data cards produced by the tools are already displayed above your reply, "
             "so refer to them naturally. If some steps failed, briefly say what failed and answer "
-            "with what succeeded. Do not call tools; reply in plain text now."
+            "with what succeeded. Do not call tools; preserve the user's requested output format."
         )
         request_kwargs = {
             "model": selected_model,
@@ -3271,6 +3641,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # keeps ownership of conversation state.
             return text
         except Exception as final_err:
+            from services.usage_quota_service import QuotaExceededError
+            if isinstance(final_err, QuotaExceededError):
+                # The runner has a dedicated handler that surfaces the real
+                # quota message (CX-10) — composition must not swallow it
+                # into an empty answer.
+                raise
             print(f"[WARNING] Final-answer composition round failed: {final_err}")
             return ""
 
@@ -4788,7 +5164,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     tool_name,
                     kwargs if isinstance(kwargs, dict) else {},
                     "",
-                    result_obj=result if isinstance(result, dict) else None,
+                    result_obj=result,
                     provenance=_sidecar,
                 )
                 return result
@@ -5084,6 +5460,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         :meth:`_pop_provenance_sidecar`); it carries the EXACT executed
         query/endpoint, which the model-facing dict does not."""
         try:
+            # Capture before the legacy 200-call/2,000-character display caps.
+            # The request context propagates into guarded and conductor workers.
+            from core.llm_client import get_llm_request_context
+            _feedback_ctx = get_llm_request_context()
+            _feedback_trace = getattr(_feedback_ctx, "feedback_tool_trace", None)
+            if _feedback_trace is not None:
+                _feedback_trace.record(tool_name, args,
+                                       result_obj if result_obj is not None else result_str,
+                                       provenance)
             trace = self._accumulated_tool_trace
             # Reset BEFORE the cap check so a call that records nothing can
             # never leave a stale id for the conductor image capture to pick
@@ -5195,7 +5580,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             try:
                 result = self._execute_tool_guarded(tool, args, tool_name=tool_name)
                 result, _sidecar = self._pop_provenance_sidecar(result)
-                result_obj = result if isinstance(result, dict) else None
+                result_obj = result
                 result_str = _json.dumps(result, default=str)[:8000]
             except Exception as e:
                 result_str = _json.dumps({"error": str(e)})
@@ -5511,10 +5896,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             
             # === BUILD SUMMARY STRING ===
             summary_parts = [f"**{source_name} - ALMA Archive Summary**"]
-            summary_parts.append(f"- **Total Execution Blocks**: {total_rows}")
-            
+            # ObsCore rows repeat per EB/field/SPW: rows are NOT execution blocks.
+            summary_parts.append(f"- **Archive rows**: {total_rows}")
+            if 'asdm_uid' in df.columns:
+                unique_eb = int(df['asdm_uid'].dropna().astype(str).nunique())
+                summary_parts.append(f"- **Unique execution blocks (asdm_uid)**: {unique_eb}")
+            else:
+                summary_parts.append("- **Execution blocks**: not available (asdm_uid not selected)")
+
             if unique_mous is not None:
-                summary_parts.append(f"- **Unique MOUS UIDs**: {unique_mous}")
+                summary_parts.append(f"- **Unique datasets (MOUS)**: {unique_mous}")
             if unique_projects is not None:
                 summary_parts.append(f"- **Unique Projects**: {unique_projects}")
             
@@ -5531,7 +5922,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             
         except Exception as e:
             print(f"[red]Summary generation failed: {e}[/red]")
-            return f"Found {len(df)} observations for {source_name}."
+            return f"{len(df)} archive rows (coverage records, not observations) for {source_name}."
 
     def reset_conversation(self):
         """Reset the conversation memory"""

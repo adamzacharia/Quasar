@@ -1,12 +1,15 @@
 "use client";
 
+import { FeedbackTranscript } from "./FeedbackTranscript";
+
 import { useEffect, useRef, useState, useCallback } from "react";
-import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, BarChart3, Download, Sparkles, Star, Sun, Moon, ScrollText, ExternalLink, Github } from "lucide-react";
+import { X, Upload, FileText, Trash2, Lock, Loader2, CheckCircle, AlertCircle, Wrench, Plus, BarChart3, Download, Sparkles, Star, Sun, Moon, ScrollText, ExternalLink, Github, RefreshCw } from "lucide-react";
 import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { resetOnboarding } from "./OnboardingOverlay";
 import { useThemeStore } from "../lib/theme-store";
 import { useChatStore } from "../lib/store";
 import { EVAL_MODE_ENABLED } from "../lib/use-eval-mode";
+import { useAvailableModels } from "../lib/useAvailableModels";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -580,6 +583,14 @@ function ProviderKeysPanel() {
     const [limits, setLimits] = useState<Record<string, string>>({});
     const [busy, setBusy] = useState<string | null>(null);
     const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+    /** Per-provider inline errors, so a bad key reports against its own card. */
+    const [providerError, setProviderError] = useState<Record<string, string>>({});
+
+    // Same shared catalog the model selector reads, so saving or removing a key
+    // updates the dropdown without a reload.
+    const { providers: catalogs, reload: reloadCatalog } = useAvailableModels();
+    const modelCount = (provider: string) =>
+        catalogs.find(c => c.provider === provider)?.models.length ?? 0;
 
     const getKey = (provider: string) => keys.find(k => k.provider === provider);
 
@@ -617,6 +628,7 @@ function ProviderKeysPanel() {
         const limitText = (limits[provider] || "").trim();
         setBusy(`${provider}:save`);
         setMessage(null);
+        setProviderError(prev => ({ ...prev, [provider]: "" }));
         try {
             const res = await fetch(`${API_BASE}/api/provider-keys`, { credentials: "include",
                 method: "POST",
@@ -632,8 +644,11 @@ function ProviderKeysPanel() {
             setApiKeys(prev => ({ ...prev, [provider]: "" }));
             setMessage({ type: "success", text: `${provider} key saved.` });
             fetchState();
+            void reloadCatalog();
         } catch (e) {
-            setMessage({ type: "error", text: e instanceof Error ? e.message : "Save failed." });
+            // The input keeps its value so a mistyped key can be corrected.
+            const text = e instanceof Error ? e.message : "Save failed.";
+            setProviderError(prev => ({ ...prev, [provider]: text }));
         } finally {
             setBusy(null);
         }
@@ -661,21 +676,29 @@ function ProviderKeysPanel() {
         }
     };
 
-    const testKey = async (provider: string) => {
+    /** One control for both jobs: re-check the key and re-pull its model list.
+     *
+     *  Hits the `test` endpoint rather than `refresh-models` because it is a
+     *  superset — it re-validates the credential, stamps `last_tested_at`, and
+     *  re-caches the catalog in the same round-trip. */
+    const revalidateProvider = async (provider: string) => {
         if (!isAuthenticated) return;
-        setBusy(`${provider}:test`);
+        setBusy(`${provider}:refresh`);
         setMessage(null);
+        setProviderError(prev => ({ ...prev, [provider]: "" }));
         try {
             const res = await fetch(`${API_BASE}/api/provider-keys/${provider}/test`, { credentials: "include",
                 method: "POST",
                 headers: authBearerHeaders(),
             });
             const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || "Test failed.");
-            setMessage({ type: "success", text: `${provider} key is valid.` });
+            if (!res.ok) throw new Error(data.detail || "Refresh failed.");
+            const count = data?.catalog?.models?.length ?? 0;
+            setMessage({ type: "success", text: `${provider}: key valid · ${count} models available.` });
             fetchState();
+            void reloadCatalog();
         } catch (e) {
-            setMessage({ type: "error", text: e instanceof Error ? e.message : "Test failed." });
+            setProviderError(prev => ({ ...prev, [provider]: e instanceof Error ? e.message : "Refresh failed." }));
         } finally {
             setBusy(null);
         }
@@ -695,6 +718,7 @@ function ProviderKeysPanel() {
             if (!res.ok) throw new Error(data.detail || "Delete failed.");
             setMessage({ type: "success", text: `${provider} key deleted.` });
             fetchState();
+            void reloadCatalog();
         } catch (e) {
             setMessage({ type: "error", text: e instanceof Error ? e.message : "Delete failed." });
         } finally {
@@ -840,12 +864,26 @@ function ProviderKeysPanel() {
                                     <p className="text-xs text-slate-500 mt-1">
                                         {meta ? `Key ending ${meta.key_last4} - ${meta.status}${meta.last_tested_at ? ` - tested ${formatDate(meta.last_tested_at)}` : ""}` : providerInfo.quotaLabel}
                                     </p>
+                                    {meta && (
+                                        <div className="text-xs text-slate-400 mt-1 flex items-center gap-1.5">
+                                            <span>Connected · {modelCount(providerInfo.id)} models available</span>
+                                            <button
+                                                onClick={() => revalidateProvider(providerInfo.id)}
+                                                disabled={isBusy}
+                                                title="Re-check this key and refresh its model list"
+                                                aria-label="Re-check key and refresh models"
+                                                className="p-0.5 rounded text-primary hover:bg-primary/10 disabled:opacity-50"
+                                            >
+                                                <RefreshCw className={`w-3 h-3 ${busy === `${providerInfo.id}:refresh` ? "animate-spin" : ""}`} />
+                                            </button>
+                                        </div>
+                                    )}
+                                    {providerError[providerInfo.id] && (
+                                        <p className="text-xs text-red-300 mt-1">{providerError[providerInfo.id]}</p>
+                                    )}
                                 </div>
                                 {meta && (
                                     <div className="flex items-center gap-2">
-                                        <button onClick={() => testKey(providerInfo.id)} disabled={isBusy} className="text-xs px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50">
-                                            {busy === `${providerInfo.id}:test` ? "Testing..." : "Test"}
-                                        </button>
                                         <button onClick={() => deleteKey(providerInfo.id)} disabled={isBusy} className="p-1.5 rounded-lg text-red-300 hover:bg-red-500/10 disabled:opacity-50" title="Delete key">
                                             <Trash2 className="w-4 h-4" />
                                         </button>
@@ -901,7 +939,29 @@ interface AnalyticsSummary {
     feedback?: { likes: number; dislikes: number; total: number };
 }
 
+interface AdminExcerptMessage {
+    role: string;
+    content: string;
+    truncated?: boolean;
+    is_reported_answer?: boolean;
+    /** How the reported answer was identified: "run_id" (exact),
+     *  "answer_text" (legacy history matched by its text) or
+     *  "last_assistant" (best guess). */
+    anchor_method?: string;
+    created_at?: string;
+    tools?: string[];
+}
+
+function anchorNote(method?: string): string {
+    if (!method || method === "run_id") return "";
+    if (method === "answer_text") return " · matched by answer text";
+    if (method === "answer_text_ambiguous") return " · matched by answer text (several identical answers; latest shown)";
+    return " · best guess: latest answer in the conversation";
+}
+
 interface AdminIssueReport {
+    snapshot_id?: string;
+    snapshot_error?: string;
     id: string;
     created_at: string;
     status: "new" | "investigating" | "resolved" | "dismissed";
@@ -911,14 +971,104 @@ interface AdminIssueReport {
     model: string;
     trace_id?: string;
     run_id: string;
+    conversation_id?: string;
+    message_id?: string;
     admin_notes?: string;
+    /** Reporter consented to share the question/answer/context. */
+    include_context?: boolean;
+    prompt_excerpt?: string;
+    response_excerpt?: string;
+    /** Server-captured turns ending at the reported answer (consent only). */
+    conversation_excerpt?: AdminExcerptMessage[];
+    /** Thumbs vote on the same message, when one exists. */
+    vote?: "like" | "dislike" | "";
     technical_context?: {
         run_status?: string;
         duration_ms?: number;
         tools_called?: string[];
         first_token_ms?: number | null;
         provider_chunk_count?: number;
+        conversation_excerpt_error?: string;
     };
+}
+
+interface AdminRecentVote {
+    snapshot_id?: string;
+    snapshot_error?: string;
+    created_at: string;
+    message_id: string;
+    run_id?: string;
+    conversation_id?: string;
+    user_id?: string;
+    feedback: "like" | "dislike";
+    model?: string;
+    prompt_preview?: string;
+    response_preview?: string;
+    has_report?: boolean;
+}
+
+/** Long user/assistant text inside an admin card: preserves line breaks,
+ *  scrolls instead of stretching the card, collapsed by default. */
+function ReportTextBlock({ label, text, tone = "neutral", open = false }: {
+    label: string; text: string; tone?: "neutral" | "question" | "answer"; open?: boolean;
+}) {
+    const border = tone === "question" ? "border-sky-500/20" : tone === "answer" ? "border-emerald-500/20" : "border-slate-800";
+    return (
+        <details open={open} className={`rounded-lg border ${border} bg-slate-900/60`}>
+            <summary className="cursor-pointer select-none px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                {label}
+            </summary>
+            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words px-3 pb-3 font-sans text-xs leading-5 text-slate-200">{text}</pre>
+        </details>
+    );
+}
+
+/** What the reporter actually saw: question, answer, and the turns before. */
+function ReportContext({ report }: { report: AdminIssueReport }) {
+    const excerpt = report.conversation_excerpt || [];
+    const excerptError = report.technical_context?.conversation_excerpt_error;
+    if (!report.include_context) {
+        return (
+            <div className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-200">
+                The reporter chose not to share the question and answer. Only diagnostics are available; use the run and conversation ids below to look it up.
+            </div>
+        );
+    }
+    // Prefer the server-captured excerpt (whole answer, prior turns); fall
+    // back to the client excerpts for reports filed before that existed.
+    if (excerpt.length > 0) {
+        const answerIndex = excerpt.findIndex((m) => m.is_reported_answer);
+        return (
+            <div className="mt-2 space-y-1.5">
+                {excerpt.map((m, index) => {
+                    const isAnswer = index === answerIndex;
+                    const isQuestion = !isAnswer && m.role === "user" && index === answerIndex - 1;
+                    const label = isAnswer
+                        ? `Reported answer (${m.role})${m.truncated ? " · truncated" : ""}${m.tools?.length ? ` · tools: ${m.tools.join(", ")}` : ""}${anchorNote(m.anchor_method)}`
+                        : `${isQuestion ? "Question" : "Earlier turn"} (${m.role})${m.truncated ? " · truncated" : ""}`;
+                    return (
+                        <ReportTextBlock key={index} label={label} text={m.content}
+                            tone={isAnswer ? "answer" : isQuestion ? "question" : "neutral"}
+                            open={isAnswer || isQuestion} />
+                    );
+                })}
+            </div>
+        );
+    }
+    return (
+        <div className="mt-2 space-y-1.5">
+            {report.prompt_excerpt ? <ReportTextBlock label="Question" text={report.prompt_excerpt} tone="question" open /> : null}
+            {report.response_excerpt ? <ReportTextBlock label="Reported answer" text={report.response_excerpt} tone="answer" open /> : null}
+            {!report.prompt_excerpt && !report.response_excerpt && (
+                <div className="rounded-lg border border-slate-800 px-3 py-2 text-[11px] text-slate-500">
+                    Context was requested but is unavailable{excerptError ? `: ${excerptError}` : "."}
+                </div>
+            )}
+            {excerptError && (report.prompt_excerpt || report.response_excerpt) && (
+                <div className="text-[10px] text-slate-500">Server-side context unavailable ({excerptError}); showing the reporter's excerpt.</div>
+            )}
+        </div>
+    );
 }
 
 function IssueReportsPanel() {
@@ -1054,16 +1204,33 @@ function IssueReportsPanel() {
                         <div key={report.id} className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
                             <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
                                 <span className="rounded bg-red-500/10 px-2 py-0.5 text-red-300">{report.category.replace("_", " ")}</span>
+                                {report.vote && (
+                                    <span className={`rounded px-2 py-0.5 ${report.vote === "dislike" ? "bg-red-500/10 text-red-300" : "bg-emerald-500/10 text-emerald-300"}`}
+                                        title="Thumbs vote on the same message">
+                                        {report.vote === "dislike" ? "👎 thumbs down" : "👍 thumbs up"}
+                                    </span>
+                                )}
                                 <span>{report.provider} / {report.model}</span>
                                 <span>{new Date(report.created_at).toLocaleString()}</span>
                                 <span>run {report.run_id.slice(0, 8)}</span>
                             </div>
-                            <p className="mt-2 text-xs leading-5 text-slate-200">{report.description}</p>
+                            <p className="mt-2 text-xs leading-5 text-slate-200">
+                                <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Reporter said: </span>
+                                {report.description}
+                            </p>
+                            <ReportContext report={report} />
+                            <FeedbackTranscript snapshotId={report.snapshot_id} error={report.snapshot_error} />
                             <div className="mt-2 text-[10px] text-slate-500">
                                 Run: {report.technical_context?.run_status || "unknown"}
                                 {" · "}First token: {report.technical_context?.first_token_ms ?? "—"} ms
                                 {" · "}Chunks: {report.technical_context?.provider_chunk_count ?? "—"}
                                 {" · "}Tools: {(report.technical_context?.tools_called || []).join(", ") || "none"}
+                            </div>
+                            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-slate-600">
+                                <span title="Chat run id">run {report.run_id}</span>
+                                {report.conversation_id && <span title="Conversation id">conv {report.conversation_id}</span>}
+                                {report.message_id && <span title="Message id">msg {report.message_id}</span>}
+                                {report.trace_id && <span title="Trace id">trace {report.trace_id}</span>}
                             </div>
                             <div className="mt-3 grid gap-2 md:grid-cols-[160px_1fr_auto]">
                                 <select value={report.status} onChange={(event) => updateReport(report, event.target.value as AdminIssueReport["status"])}
@@ -1076,6 +1243,88 @@ function IssueReportsPanel() {
                                 <input value={notes[report.id] || ""} onChange={(event) => setNotes((current) => ({ ...current, [report.id]: event.target.value }))}
                                     placeholder="Admin notes" className="glass-control rounded-lg px-2 py-2 text-xs" />
                                 <button onClick={() => updateReport(report)} className="glass-control rounded-lg px-3 py-2 text-xs text-slate-200">Save</button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** Thumbs-down votes that never became a full report, with the question and
+ *  answer previews the vote was cast on. Previously visible only inside the
+ *  JSON export. */
+function RecentDislikesPanel() {
+    const [votes, setVotes] = useState<AdminRecentVote[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            setLoading(true);
+            try {
+                const response = await fetch(`${API_BASE}/api/admin/feedback/recent?feedback=dislike&limit=50`, {
+                    credentials: "include",
+                    headers: authBearerHeaders(),
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const payload = await response.json();
+                if (!cancelled) {
+                    setVotes((payload.feedback || []) as AdminRecentVote[]);
+                    setError(null);
+                }
+            } catch (e: unknown) {
+                if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
+    return (
+        <div className="space-y-3">
+            <div>
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Recent Thumbs-Down</h4>
+                <p className="mt-1 text-[10px] text-slate-500">Recent downvotes, including votes without a written report. Consented snapshots open the conversation as it was when feedback was saved.</p>
+            </div>
+            {error && (
+                <div className="flex items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                    Could not load recent votes: {error}
+                </div>
+            )}
+            {loading ? (
+                <div className="flex items-center gap-2 py-4 text-xs text-slate-500"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading votes...</div>
+            ) : error ? null : votes.length === 0 ? (
+                <div className="rounded-xl border border-slate-800 p-4 text-xs text-slate-500">No thumbs-down votes recorded.</div>
+            ) : (
+                <div className="space-y-2">
+                    {votes.map((vote) => (
+                        <div key={`${vote.message_id}-${vote.created_at}`} className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                            <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
+                                <span className="rounded bg-red-500/10 px-2 py-0.5 text-red-300">👎 thumbs down</span>
+                                {vote.has_report && <span className="rounded bg-sky-500/10 px-2 py-0.5 text-sky-300">report filed</span>}
+                                <span>{vote.model || "unknown model"}</span>
+                                <span>{new Date(vote.created_at).toLocaleString()}</span>
+                            </div>
+                            <div className="mt-2 space-y-1.5">
+                                {vote.prompt_preview ? (
+                                    <ReportTextBlock label="Question" text={vote.prompt_preview} tone="question" open />
+                                ) : (
+                                    <div className="text-[11px] text-slate-500">No question preview was sent with this vote.</div>
+                                )}
+                                {vote.response_preview ? (
+                                    <ReportTextBlock label="Answer (preview)" text={vote.response_preview} tone="answer" />
+                                ) : null}
+                            </div>
+                            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-slate-600">
+                                <FeedbackTranscript snapshotId={vote.snapshot_id} error={vote.snapshot_error} />
+                                {vote.run_id && <span title="Chat run id">run {vote.run_id}</span>}
+                                {vote.conversation_id && <span title="Conversation id">conv {vote.conversation_id}</span>}
+                                <span title="Message id">msg {vote.message_id}</span>
                             </div>
                         </div>
                     ))}
@@ -1205,6 +1454,7 @@ function AnalyticsPanel() {
             )}
 
             {isAuthenticated && <IssueReportsPanel />}
+            {isAuthenticated && <RecentDislikesPanel />}
 
             {/* Export / Download */}
             <div>
@@ -1298,13 +1548,24 @@ function EvalModeSwitch() {
 interface SettingsModalProps {
     open: boolean;
     onClose: () => void;
+    /** Deep-link a specific tab when opening. Omitted opens the last-viewed tab. */
+    initialTab?: TabType;
 }
 
 type TabType = 'personalization' | 'providerKeys' | 'mcp' | 'analytics';
 
-export function SettingsModal({ open, onClose }: SettingsModalProps) {
+export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps) {
     const backdropRef = useRef<HTMLDivElement>(null);
     const [currentTab, setCurrentTab] = useState<TabType>('personalization');
+    // Adjust during render rather than in an effect: a deep link supplies a new
+    // `initialTab` only when the modal is being opened at a specific tab, and
+    // the user stays free to switch tabs afterwards.
+    const [appliedTab, setAppliedTab] = useState<TabType | undefined>(initialTab);
+    if (initialTab && initialTab !== appliedTab) {
+        setAppliedTab(initialTab);
+        setCurrentTab(initialTab);
+    }
+    if (!initialTab && appliedTab) setAppliedTab(undefined);
     const { user } = useAuthStore();
     const isAdmin = Boolean(user?.is_admin);
 

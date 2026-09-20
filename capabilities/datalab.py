@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -91,6 +93,20 @@ def datalab_error(
     a failed call is precisely when the user most wants to see the query.
     """
     payload: Dict[str, Any] = {"success": False, "error": str(error)}
+    # The runner keys tool-step closure ("error", never deadline-extending)
+    # on this flag (CX-27) — an internal wall-clock TimeoutError (the FITS
+    # download watchdog) or a requests connect/read Timeout (which does NOT
+    # subclass the built-in) must not close as an ordinary completion.
+    _is_timeout = isinstance(error, TimeoutError)
+    if not _is_timeout:
+        try:
+            import requests as _requests
+
+            _is_timeout = isinstance(error, _requests.exceptions.Timeout)
+        except Exception:
+            _is_timeout = False
+    if _is_timeout:
+        payload["timeout"] = True
     fix_hint = None
     if isinstance(error, datalab_sql_policy.DatalabPolicyError):
         fix_hint = error.fix_hint
@@ -199,6 +215,21 @@ def execute_datalab_sql(
                 "query": validated.sql,
                 "tool_name": tool_name,
                 "policy_source": source,
+                # A cap the PLATFORM chose (builder default/clamp or governor
+                # injection) is stamped so provenance can never present it as
+                # a science choice (RE-B1).
+                **(
+                    {"platform_row_cap": int(validated.meta["platform_row_cap"])}
+                    if isinstance(validated.meta, dict) and validated.meta.get("platform_row_cap")
+                    else {}
+                ),
+                # Named platform budgets (e.g. the crossmatch small-side CTE
+                # cap) disclose the same way (guard CX-01).
+                **(
+                    {"platform_row_caps": dict(validated.meta["platform_row_caps"])}
+                    if isinstance(validated.meta, dict) and validated.meta.get("platform_row_caps")
+                    else {}
+                ),
                 **(
                     {"row_limit": int(row_limit), "limit_truncated": True}
                     if trunc_warning
@@ -254,6 +285,13 @@ def execute_datalab_sql(
                 tool_name=tool_name,
                 rowcount=int(len(result.dataframe)),
                 endpoint=(result.provenance or {}).get("endpoint"),
+                # Platform-chosen caps ride the canonical ToolResult provenance
+                # too, not only the stored-result meta (guard CX-05).
+                **(
+                    {"platform_row_cap": int(validated.meta["platform_row_cap"])}
+                    if isinstance(validated.meta, dict) and validated.meta.get("platform_row_cap")
+                    else {}
+                ),
             ),
             native=summary,
         )
@@ -341,7 +379,17 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
             warnings=list(validated.warnings or []),
             # The submitted SQL is this call's exact request (CX-09) — surface
             # it even though the rows arrive later via the job tools.
-            provenance=Provenance(service="datalab", query=validated.sql, tool_name=tool_name),
+            provenance=Provenance(
+                service="datalab",
+                query=validated.sql,
+                tool_name=tool_name,
+                # Platform-chosen caps disclose on the async submit too (CX-05).
+                **(
+                    {"platform_row_cap": int(validated.meta["platform_row_cap"])}
+                    if isinstance(validated.meta, dict) and validated.meta.get("platform_row_cap")
+                    else {}
+                ),
+            ),
             native=native,
         )
 
@@ -355,6 +403,9 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
         validated.meta.get("healpix") if isinstance(validated.meta, dict) else None
     )
     row_limit = validated.meta.get("row_limit") if isinstance(validated.meta, dict) else None
+    platform_row_cap = (
+        validated.meta.get("platform_row_cap") if isinstance(validated.meta, dict) else None
+    )
     store_meta = {
         **validated.meta,
         "tool_name": tool_name,
@@ -382,6 +433,7 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
                 "tool_name": tool_name,
                 "policy_source": source,
                 **({"healpix": healpix_meta} if healpix_meta else {}),
+                **({"platform_row_cap": int(platform_row_cap)} if platform_row_cap else {}),  # RE-B1
                 **(
                     {"row_limit": int(row_limit), "limit_truncated": True}
                     if trunc_warning
@@ -418,7 +470,17 @@ def _submit_async_query(validated, *, tool_name: str, source: str, ctx: CallCont
     return ToolResult(
         success=True,
         warnings=list(validated.warnings or []),
-        provenance=Provenance(service="datalab", query=validated.sql, tool_name=tool_name),
+        provenance=Provenance(
+            service="datalab",
+            query=validated.sql,
+            tool_name=tool_name,
+            # Platform-chosen caps disclose on the local async path too (CX-05).
+            **(
+                {"platform_row_cap": int(platform_row_cap)}
+                if platform_row_cap
+                else {}
+            ),
+        ),
         native=native,
     )
 
@@ -462,6 +524,14 @@ class ListCatalogsInput(_In):
     # the complete schema list from the live tap_schema. Literal so a typo
     # surfaces as a validation error instead of silently meaning 'registered'.
     scope: Literal["registered", "all"] = "registered"
+    # RE-B5 server-side curation: an optional position (target name OR ra/dec)
+    # ranks the curated rows by structured registry coverage — known-covering
+    # first, unknown coverage labeled (never dropped), known non-covering
+    # excluded with reasons. An optional band keeps only catalogs listing it.
+    target: Optional[str] = None
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    band: Optional[str] = None
 
 
 class DescribeTableInput(_In):
@@ -486,7 +556,10 @@ class SelectCatalogRowsInput(_In):
     dec: float
     radius_deg: float
     columns: Optional[List[str]] = None
-    limit: int = 500
+    # None = the caller made no row-budget choice; the builder applies the
+    # platform default (500) and FLAGS it (platform_row_cap + warning + SQL
+    # comment) so the cap never reads as a science cut (RE-B1).
+    limit: Optional[int] = None
     value_cuts: Optional[List[Dict[str, Any]]] = None
     color_cut: Optional[Dict[str, Any]] = None
     morphology: Optional[Dict[str, Any]] = None
@@ -507,8 +580,11 @@ class Q3cCrossmatchInput(_In):
     match_radius_arcsec: float = 1.0
     small_columns: Optional[List[str]] = None
     big_columns: Optional[List[str]] = None
-    small_limit: int = 10000
-    limit: int = 500
+    # None = platform default (10000) on the pre-join CTE, flagged as a named
+    # platform cap (platform_row_caps.small_side + SQL comment, guard CX-01).
+    small_limit: Optional[int] = None
+    # None = platform default (500), flagged as a platform cap (RE-B1).
+    limit: Optional[int] = None
 
 
 class SqlQueryInput(_In):
@@ -553,7 +629,9 @@ class DensityAggregateInput(_In):
     color_cut: Optional[Dict[str, Any]] = None
     value_cuts: Optional[List[Dict[str, Any]]] = None
     morphology: Optional[Dict[str, Any]] = None
-    limit: Optional[int] = 5000
+    # None = the builder's automatic cell cap (5000), flagged as a platform
+    # cap in warnings/provenance instead of read as a science choice (RE-B1).
+    limit: Optional[int] = None
     async_submit: Any = False  # `Any`, not bool — see all_sky above
     confirm: Any = False  # `Any`, not bool — see all_sky above (HITL wide-area gate)
 
@@ -568,22 +646,157 @@ class ListCatalogs(BaseCapability):
     InputModel = ListCatalogsInput
     annotations = {"read_only": True, "cost": "cheap"}
 
+    # target-vs-explicit-coordinate agreement tolerance (CX-12): 1 arcmin.
+    _TARGET_COORD_MISMATCH_DEG = 1.0 / 60.0
+
+    @staticmethod
+    def _validate_icrs(ra_f: float, dec_f: float, source: str) -> None:
+        """Shared range check for explicit AND resolver-returned coordinates
+        (CX-13 — the resolver output gets exactly the same validation)."""
+        if not 0.0 <= ra_f < 360.0 or not -90.0 <= dec_f <= 90.0:
+            raise ValueError(
+                f"{source} must be valid ICRS degrees "
+                f"(got RA={ra_f!r}, Dec={dec_f!r}; RA in [0, 360), Dec in [-90, +90])."
+            )
+
+    @classmethod
+    def _resolve_position(cls, inp, ctx):
+        """(ra, dec, label) from target/ra/dec inputs, or None when unfiltered.
+
+        Explicit ra+dec are validated locally (same ranges as the shared
+        resolver); a target name goes through the injected coordinate resolver
+        — the same _datalab_coordinates the imaging tools use. When BOTH are
+        supplied they must agree to within 1 arcmin (CX-12): a mismatch is a
+        typed error, never a silent label of unrelated coordinates."""
+        has_ra, has_dec = inp.ra is not None, inp.dec is not None
+        target = (inp.target or "").strip()
+        if has_ra and has_dec:
+            ra_f, dec_f = float(inp.ra), float(inp.dec)
+            cls._validate_icrs(ra_f, dec_f, "ra/dec")
+            if not target:
+                return ra_f, dec_f, f"RA={ra_f:.5f}, Dec={dec_f:.5f}"
+            # Both given: resolve the name and require agreement (CX-12).
+            t_ra, t_dec, _ = ctx.service("resolve_coordinates")(
+                target_name=target, ra=None, dec=None
+            )
+            t_ra, t_dec = float(t_ra), float(t_dec)
+            cls._validate_icrs(t_ra, t_dec, f"coordinates resolved for target {target!r}")
+            sep_deg = datalab_registry.angular_separation_deg(ra_f, dec_f, t_ra, t_dec)
+            if sep_deg > cls._TARGET_COORD_MISMATCH_DEG:
+                raise ValueError(
+                    f"target/coordinate mismatch: {target!r} resolves to "
+                    f"RA={t_ra:.5f}, Dec={t_dec:.5f}, which is {sep_deg * 60.0:.1f} arcmin "
+                    f"from the explicit ra/dec (RA={ra_f:.5f}, Dec={dec_f:.5f}; "
+                    "tolerance 1.0 arcmin). Pass either the target name OR the "
+                    "coordinates — not two different positions."
+                )
+            return ra_f, dec_f, target
+        if has_ra or has_dec:
+            raise ValueError("Provide BOTH ra and dec (or a target name) to filter by position.")
+        if target:
+            ra_f, dec_f, label = ctx.service("resolve_coordinates")(
+                target_name=target, ra=None, dec=None
+            )
+            ra_f, dec_f = float(ra_f), float(dec_f)
+            cls._validate_icrs(ra_f, dec_f, f"coordinates resolved for target {target!r}")
+            return ra_f, dec_f, str(label)
+        return None
+
     def run(self, inp, ctx) -> ToolResult:
         try:
             catalogs = datalab_registry.list_catalogs()
+            total_registered = len(catalogs)
+            note_bits = [
+                "This is the CURATED, registry-governed subset of Data Lab "
+                f"({total_registered} registered catalogs with structured coverage/band metadata; "
+                "best structured-builder and SQL-governor support), NOT the full Data Lab schema "
+                "set — call with scope='all' for the complete live schema list."
+            ]
+            filters: Dict[str, Any] = {}
+            excluded_by_band: List[str] = []
+            excluded_by_coverage: List[Dict[str, str]] = []
+
+            band = str(inp.band or "").strip().lower()
+            if band:
+                kept = []
+                for row in catalogs:
+                    if datalab_registry.catalog_lists_band(row.get("bands"), band):
+                        kept.append(row)
+                    else:
+                        excluded_by_band.append(row["catalog"])
+                catalogs = kept
+                filters["band"] = band
+                note_bits.append(
+                    f"Filtered to catalogs listing the {band!r} band "
+                    f"({len(catalogs)} of {total_registered}; the rest are in excluded_by_band)."
+                )
+
+            position = self._resolve_position(inp, ctx)
+            if position is not None:
+                ra_f, dec_f, label = position
+                covered_rows, unverified_rows = [], []
+                for row in catalogs:
+                    status, reason = datalab_registry.coverage_status_for_position(
+                        row.get("coverage"), ra_f, dec_f
+                    )
+                    if status == "not_covering":
+                        excluded_by_coverage.append({"catalog": row["catalog"], "reason": reason})
+                        continue
+                    row = dict(row)
+                    if status == "covered":
+                        row["coverage_status"] = "covered"
+                        row["coverage_reason"] = reason
+                        covered_rows.append(row)
+                    else:
+                        row["coverage_status"] = "coverage unverified for this position"
+                        row["coverage_reason"] = reason
+                        unverified_rows.append(row)
+                catalogs = covered_rows + unverified_rows
+                filters["position"] = {"ra": ra_f, "dec": dec_f, "label": label}
+                note_bits.append(
+                    f"Ranked by registry footprint coverage at {label}: known-covering catalogs "
+                    "first; entries marked 'coverage unverified for this position' have no registry "
+                    "statement either way (verify with survey_covers_position or a cone count); "
+                    "known non-covering catalogs are listed in excluded_by_coverage — do not "
+                    "present them as options for this position."
+                )
+
+            note_bits.append(
+                "Image collections are separate from catalogs: datalab_sia_search with "
+                "service='nsa' searches the whole NOIRLab Science Archive image holdings, "
+                "service='coadd_all' all survey coadds, catalog=<survey id> prefers its registered endpoint "
+                "(shared endpoints can include other surveys; check obs_collection/assoc_id) "
+                "(see image_services)."
+            )
             native = {
                 "success": True,
                 "scope": "registered",
+                "image_services": [dict(row) for row in datalab_registry.DATALAB_IMAGE_SERVICES],
+                "note": " ".join(note_bits),
                 "catalogs": catalogs,
                 "count": len(catalogs),
-                "note": (
-                    "This is the CURATED, registry-governed subset of Data Lab (best structured-"
-                    "builder and SQL-governor support), not the complete service inventory — "
-                    "call with scope='all' for the full live schema list."
-                ),
+                "total_registered": total_registered,
             }
+            if filters:
+                native["filters"] = filters
+            if excluded_by_band:
+                native["excluded_by_band"] = excluded_by_band
+            if excluded_by_coverage:
+                native["excluded_by_coverage"] = excluded_by_coverage
             if str(inp.scope or "registered").strip().lower() != "all":
                 return ToolResult(success=True, data=catalogs, native=native)
+            # scope='all' + curation (CX-19, defined interplay): position/band
+            # filters apply ONLY to the curated 'catalogs' rows above — the live
+            # tap_schema inventory has no coverage/band metadata to filter on,
+            # so 'schemas' is always the complete unfiltered list.
+            filters_clause = (
+                (
+                    " Position/band curation applies ONLY to the curated 'catalogs' rows — "
+                    "the live 'schemas' inventory has no coverage metadata and is never filtered."
+                )
+                if filters
+                else ""
+            )
             # scope='all': the complete live tap_schema.schemas inventory, with
             # the curated subset marked registry_governed. Network failure keeps
             # the curated list usable — with an explicit note, never silently.
@@ -598,13 +811,13 @@ class ListCatalogs(BaseCapability):
                         "registry_governed=true are the curated subset in 'catalogs' with full "
                         "structured-builder support; other schemas become queryable after "
                         "datalab_describe_table caches their live columns."
-                    ),
+                    ) + filters_clause,
                 })
             except Exception as live_error:  # noqa: BLE001 - degrade to the curated list
                 native["note"] = (
                     "The full live schema list was unavailable "
                     f"({live_error}); showing only the curated registry-governed subset."
-                )
+                ) + filters_clause
             return ToolResult(success=True, data=native, native=native)
         except Exception as e:
             return ToolResult(success=False, error=str(e), native={"success": False, "error": str(e)})
@@ -670,6 +883,14 @@ class SelectCatalogRows(BaseCapability):
             )
             if quality_note:
                 meta.setdefault("warnings", []).append(quality_note)
+            # Orders-of-magnitude morphology-threshold conflations (e.g.
+            # class_star's 0.5 applied to spread_model) warn LOUDLY but still
+            # execute — never silently clamped (RE-B3).
+            morph_warning = datalab_query_builders.morphology_deviation_warning(
+                inp.catalog, table, inp.morphology
+            )
+            if morph_warning:
+                meta.setdefault("warnings", []).append(morph_warning)
         except Exception as e:
             return datalab_error(e)
         return execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx, async_submit=inp.async_submit)
@@ -812,6 +1033,11 @@ class DensityAggregate(BaseCapability):
             )
             if quality_note:
                 meta.setdefault("warnings", []).append(quality_note)
+            morph_warning = datalab_query_builders.morphology_deviation_warning(
+                inp.catalog, inp.table, inp.morphology
+            )
+            if morph_warning:
+                meta.setdefault("warnings", []).append(morph_warning)
             if inp.async_submit:
                 # First-class job path: hand back a job_id up front; skips the
                 # sync attempt AND the tiling fallback entirely.
@@ -866,6 +1092,12 @@ class DensityAggregate(BaseCapability):
                     healpix_column=inp.healpix_column,
                     ra=float(inp.ra), dec=float(inp.dec), radius_deg=float(inp.radius_deg),
                     predicates=predicates, limit=inp.limit,
+                    # Quality-cut note + morphology warning were stamped into
+                    # the SYNC attempt's meta, which dies with it on timeout —
+                    # they must reach the tiled result AND its persisted store
+                    # meta (guard CX-06 verify: post-hoc appending to the
+                    # returned dict left the stored result_id without them).
+                    extra_warnings=[w for w in (quality_note, morph_warning) if w],
                     max_seconds=_budget_override,
                     client=ctx.service("datalab_client"),
                     result_store=ctx.result_store,
@@ -1070,6 +1302,20 @@ def _resolve_coords(target_name, ra, dec, ctx: CallContext):
     return ctx.service("resolve_coordinates")(target_name=target_name, ra=ra, dec=dec)
 
 
+def _cutout_guard_budget() -> float:
+    """The wall-clock budget the agent's tool guard gives one cutout call.
+
+    Lazy import: core.agent transitively imports this module, so a module-level
+    import would be a cycle. Falls back to the guard's stock default when the
+    agent layer is absent (bare capability tests)."""
+    try:
+        from core.agent import QuasarAgent
+
+        return float(QuasarAgent._tool_timeout_seconds("datalab_image_cutout") or 0.0)
+    except Exception:
+        return 150.0
+
+
 class ImageCutoutInput(_In):
     fov_deg: float
     ra: Optional[float] = None
@@ -1089,7 +1335,10 @@ class ImageCutout(BaseCapability):
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
 
     def run(self, inp, ctx) -> ToolResult:
+        import time as _time
+
         service = ctx.service("datalab_image_service")
+        _t0 = _time.monotonic()
         try:
             ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
             caption = inp.title or f"Data Lab {inp.band}-band cutout: {label}"
@@ -1101,6 +1350,34 @@ class ImageCutout(BaseCapability):
             no_image = not (result.get("image_base64") or result.get("path"))
             suggested = list(result.get("suggested_bands") or [])
             if no_image and suggested:
+                # The retry doubles the internal ceiling (SIA search + tile
+                # downloads all over again). When the first attempt already
+                # ate most of the tool's guard budget, retrying can only end
+                # as an abandoned-worker timeout (2026-08-04 density hang) —
+                # report the substitution CHOICE instead of making it.
+                _budget = _cutout_guard_budget()
+                _elapsed = _time.monotonic() - _t0
+                if _budget and _elapsed > _budget * 0.5:
+                    warnings = list(result.get("warnings") or [])
+                    warnings.append(
+                        f"No usable {inp.band}-band tiles at this position. A "
+                        f"{suggested[0]}-band substitution retry was SKIPPED because "
+                        f"{_elapsed:.0f}s of the {_budget:.0f}s tool budget was already "
+                        f"spent. Available bands here: {', '.join(suggested[:4])} — "
+                        "re-call with one of them explicitly if wanted."
+                    )
+                    result["warnings"] = warnings
+                    result["band_substitution_skipped"] = {
+                        "requested": str(inp.band),
+                        "available": suggested[:4],
+                        "elapsed_seconds": round(_elapsed, 1),
+                    }
+                    result["_caption"] = caption
+                    return ToolResult(
+                        success=bool(result.get("success")),
+                        error=(None if result.get("success") else result.get("error")),
+                        native=result,
+                    )
                 sub_band = suggested[0]
                 sub_caption = inp.title or f"Data Lab {sub_band}-band cutout: {label} (requested {inp.band}, not available here)"
                 retry = service.cutout(
@@ -1165,6 +1442,32 @@ class ColorImage(BaseCapability):
             return datalab_error(e)
 
 
+_DEFAULT_MAX_GRID_PEAKS = 12
+
+
+def _grid_peak_cap() -> int:
+    """Env-tunable cutout-grid peak cap (DATALAB_CUTOUT_GRID_MAX_PEAKS).
+
+    Read per call so a bad value can never break module import (CX-26):
+    malformed or negative values fall back to the default; 0 disables the cap
+    (documented escape hatch)."""
+    raw = (os.getenv("DATALAB_CUTOUT_GRID_MAX_PEAKS", "") or "").strip()
+    if not raw:
+        return _DEFAULT_MAX_GRID_PEAKS
+    try:
+        fval = float(raw)
+    except (ValueError, OverflowError):
+        return _DEFAULT_MAX_GRID_PEAKS
+    if not math.isfinite(fval):
+        return _DEFAULT_MAX_GRID_PEAKS
+    if fval == 0:
+        return 0  # exact documented disable — never via truncation
+    val = int(fval)
+    # Sub-1 decimals must not truncate into an accidental disable, and
+    # negatives are malformed (verify CX-26 round 2).
+    return val if val >= 1 else _DEFAULT_MAX_GRID_PEAKS
+
+
 class CutoutGridInput(_In):
     peaks: List[Dict[str, Any]]
     fov_deg: float
@@ -1184,11 +1487,31 @@ class CutoutGrid(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         service = ctx.service("datalab_image_service")
         try:
+            # Hard peak-count bound (CX-02): the grid runs one sequential SIA
+            # search+download per peak on a detached worker, so an unbounded
+            # peak list from the model could grind long after the outer tool
+            # budget abandoned the call. Parsed per call, never at import
+            # (CX-26): malformed/negative env values fall back to the default;
+            # 0 disables. 12 ≳ every legitimate "top-N peaks" ask seen live.
+            cap = _grid_peak_cap()
+            peaks = list(inp.peaks)
+            grid_cap_note = None
+            if cap > 0 and len(peaks) > cap:
+                grid_cap_note = (
+                    f"Requested {len(peaks)} peaks; rendered the first "
+                    f"{cap} (grid peak cap). Re-call with the "
+                    "remaining peaks if the rest are genuinely needed."
+                )
+                peaks = peaks[:cap]
             result = service.cutout_grid(
-                inp.peaks, float(inp.fov_deg),
+                peaks, float(inp.fov_deg),
                 band=inp.band, catalog=inp.catalog, endpoint=inp.endpoint, title=inp.title,
             )
             result["_caption"] = inp.title
+            if grid_cap_note:
+                warnings = list(result.get("warnings") or [])
+                warnings.append(grid_cap_note)
+                result["warnings"] = warnings
             return ToolResult(
                 success=bool(result.get("success")),
                 error=(None if result.get("success") else result.get("error")),
@@ -1206,6 +1529,9 @@ class SiaSearchInput(_In):
     band: Optional[str] = None
     catalog: Optional[str] = None
     endpoint: Optional[str] = None
+    service: Optional[str] = None
+    bands: Optional[List[str]] = None
+    deepest_per_band: bool = False
     limit: int = 100
 
 
@@ -1213,6 +1539,7 @@ class SiaSearchInput(_In):
 # SIA row set (incl. access_url) is kept in the stored result.
 _SIA_DISPLAY_COLUMNS = [
     "obs_bandpass", "exptime", "proctype", "prodtype",
+    "access_url",
     "instrument", "telescope", "mjd_obs", "date_obs", "survey",
 ]
 
@@ -1226,10 +1553,21 @@ class SiaSearch(BaseCapability):
 
     name = "datalab_sia_search"
     description = (
-        "List the Data Lab SIA image inventory covering a position: bands, exposure "
-        "times, proc/prod types, and access URLs, stored under a result_id. Use this to "
-        "see what imaging exists (and how deep) BEFORE datalab_image_cutout / "
-        "datalab_color_image; fetch rows with datalab_get_result."
+        "List the NOIRLab image inventory (SIA) covering a position: obs_bandpass, exptime, "
+        "proctype/prodtype and access_url per image, stored under a result_id. With no catalog, "
+        "service or endpoint specified, defaults to the archive-wide 'nsa' collection. Only restrict "
+        "to a survey catalog/coadd collection when the user requests that survey; do not invent "
+        "a survey filter for an archive-wide image search. Choose the "
+        "collection first: service='nsa' = the NOIRLab Science Archive, i.e. ALL archived images "
+        "from every NOIRLab telescope/instrument/program (raw, calibrated and Stack products); "
+        "service='coadd_all' = survey coadd/mosaic tiles only (Legacy Surveys, DES, DELVE, ...), a different "
+        "product family from the archive's per-program stacked images, which are proctype='Stack' rows "
+        "inside 'nsa' (the result's inventory.stack_images_per_band shows them) - 'stacked images in the "
+            "NOIRLab Science Archive' means those 'nsa' Stack rows, NOT coadd_all; catalog=<survey id> prefers "
+        "that survey's registered endpoint, which may be shared: check obs_collection/assoc_id for the actual survey. "
+        "deepest_per_band=true with bands=[...] returns the longest-exposure "
+        "Stack/image row per requested band, selected before any row limit. Use this BEFORE "
+        "datalab_image_cutout / datalab_color_image; fetch rows with datalab_get_result."
     )
     category = "datalab"
     InputModel = SiaSearchInput
@@ -1247,18 +1585,101 @@ class SiaSearch(BaseCapability):
                     "inventory result_id. Not issuing the remote query."
                 )
             ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
+            endpoint = inp.endpoint
+            selected_service = inp.service
+            if not any((inp.service, inp.catalog, inp.endpoint)):
+                selected_service = "nsa"
+            if selected_service:
+                from services.datalab_registry import DATALAB_SIA_SERVICES
+                selected = DATALAB_SIA_SERVICES.get(selected_service.strip().lower())
+                if not selected:
+                    raise ValueError(f"Unknown SIA service: {selected_service}")
+                if endpoint and endpoint.rstrip('/') != selected.rstrip('/'):
+                    raise ValueError("service and endpoint specify different SIA collections")
+                endpoint = selected
             result = service.search(
                 ra_f, dec_f, float(inp.fov_deg),
-                catalog=inp.catalog, endpoint=inp.endpoint,
+                catalog=None if selected_service else inp.catalog, endpoint=endpoint,
             )
             rows = list(result.get("rows") or [])
+            from services.datalab_image_service import DatalabImageService
+            inventory = DatalabImageService.summarize_inventory(rows)
             warnings: List[str] = []
-            if inp.band:
-                want = str(inp.band).strip().lower()
+            if inp.catalog and inp.service:
+                warnings.append(f"service='{inp.service}' takes precedence; catalog='{inp.catalog}' was ignored.")
+            if inp.catalog and not selected_service and not inp.endpoint:
+                warnings.append("catalog selects a preferred endpoint, not a row filter; verify each row's obs_collection/assoc_id before attributing it to a survey.")
+            # A "deepest per band" request narrowed to a survey scope (a survey
+            # catalog or the coadd-tile collection) is answered from a different
+            # product family than the archive's per-program Stack images. Show
+            # what the archive-wide collection holds for the same bands so the
+            # caller can tell a survey-scoped answer from an archive-wide one
+            # (live: the same request answered from survey tiles reported
+            # different images and exposures than the archive-wide stacks).
+            archive_wide = None
+            _narrowed_to_survey = bool(inp.deepest_per_band) and not inp.endpoint and (
+                selected_service == "coadd_all" or bool(inp.catalog and not selected_service)
+            )
+            if _narrowed_to_survey:
+                from services.datalab_registry import DATALAB_SIA_SERVICES
+                _requested_bands = inp.bands or ([inp.band] if inp.band else None)
+                _wanted = {str(x).strip().lower() for x in _requested_bands} if _requested_bands else None
+                scope = f"service='{selected_service}'" if selected_service else f"catalog='{inp.catalog}'"
+                try:
+                    wide = service.search(ra_f, dec_f, float(inp.fov_deg), endpoint=DATALAB_SIA_SERVICES["nsa"])
+                    wide_rows = list(wide.get("rows") or [])
+                    wide_inventory = DatalabImageService.summarize_inventory(wide_rows)
+                    wide_deepest = DatalabImageService.deepest_archive_images(wide_rows, _requested_bands)
+                    archive_wide = {
+                        "collection": "nsa",
+                        "rows_total": len(wide_rows),
+                        "stack_images_per_band": {
+                            b: v for b, v in wide_inventory["stack_images_per_band"].items()
+                            if _wanted is None or b in _wanted
+                        },
+                        "deepest_images": wide_deepest,
+                    }
+                    if wide_deepest:
+                        depths = ", ".join(
+                            f"{str(r.get('obs_bandpass') or '').split(' ')[0]}: {r.get('exptime')} s" for r in wide_deepest
+                        )
+                        warnings.append(
+                            f"{scope} narrowed this search to survey coadd/tile products, a different product "
+                            "family from the archive's per-program Stack images and a SEPARATE SIA service from the "
+                            "NOIRLab Science Archive itself. The NOIRLab Science Archive service (service='nsa', the "
+                            f"default) holds Stack images for {depths} (archive_wide_comparison.deepest_images). "
+                            "The archive named in the request decides which rows to report: a request for images "
+                            "'in/on the NOIRLab Science Archive', or one naming no survey, is answered from the "
+                            "archive-wide rows even when a survey tile lists a longer exposure; report the survey "
+                            "tiles only when the user asked for that survey or for the deepest image from any source."
+                        )
+                    else:
+                        warnings.append(
+                            f"{scope} narrowed this search to survey coadd/tile products; the archive-wide "
+                            "collection (service='nsa') has no Stack images for the requested bands here "
+                            "(see archive_wide_comparison)."
+                        )
+                except Exception as wide_err:  # noqa: BLE001 - the comparison is advisory
+                    archive_wide = {"collection": "nsa", "error": str(wide_err)[:300]}
+                    warnings.append(
+                        f"{scope} narrowed this search to survey coadd/tile products; the archive-wide "
+                        "comparison (service='nsa') could not be retrieved, so this result covers only that scope."
+                    )
+            if inp.band and inp.bands and set(b.lower() for b in inp.bands) != {inp.band.lower()}:
+                raise ValueError("band and bands conflict; supply one selection")
+            requested = inp.bands or ([inp.band] if inp.band else [])
+            if inp.deepest_per_band:
+                rows = DatalabImageService.deepest_archive_images(rows, inp.bands or ([inp.band] if inp.band else None))
+            if requested:
+                wanted = {str(b).strip().lower() for b in requested}
                 rows = [
                     row for row in rows
-                    if str(row.get("obs_bandpass") or "").strip().lower().startswith(want)
+                    if str(row.get("obs_bandpass") or "").strip().lower().split(" ")[0] in wanted
                 ]
+            present = {str(row.get("obs_bandpass") or "").strip().lower().split(" ")[0] for row in rows}
+            missing = sorted({str(b).strip().lower() for b in requested} - present)
+            if missing:
+                warnings.append("No matching images for requested bands: " + ", ".join(missing))
             limit = max(1, min(int(inp.limit or 100), 1000))
             upstream_total = len(rows)
             if len(rows) > limit:
@@ -1288,20 +1709,36 @@ class SiaSearch(BaseCapability):
                 "tool_name": self.name,
                 "result_id": result_id,
                 "rowcount": int(len(frame)),
-                "coverage_gap": bool(result.get("coverage_gap")),
+                "coverage_gap": not bool(rows),
+                "archive_coverage_gap": bool(result.get("coverage_gap")),
+                "missing_bands": missing,
+                "partial": bool(missing or upstream_total > len(rows) or result.get("partial")),
+                "coverage_status": result.get("coverage_status"),
+                "endpoint_errors": result.get("endpoint_errors") or [],
                 "used_endpoint": result.get("used_endpoint"),
                 "position": {"ra": ra_f, "dec": dec_f, "label": label, "fov_deg": float(inp.fov_deg)},
                 "columns": [str(c) for c in frame.columns][:30],
                 "preview": preview_rows,
                 "preview_truncated": preview_more,
+                "selection": "maximum exptime per band among Stack/image rows" if inp.deepest_per_band else "inventory",
+                "inventory": inventory,
+                "collection": (selected_service or ("endpoint" if inp.endpoint else inp.catalog)),
+                **({"archive_wide_comparison": archive_wide} if archive_wide is not None else {}),
                 "warnings": warnings,
                 **_upstream_flags,  # (f2-CX-21)
                 "note": (
                     "Inventory preview only (access URLs are in the stored rows); fetch up to "
                     "5000 rows with datalab_get_result(result_id), then render a chosen band/"
-                    "position with datalab_image_cutout."
+                    "position with datalab_image_cutout. inventory.stack_images_per_band lists the "
+                    "stacked products (proctype Stack, prodtype image) present in THIS collection with "
+                    "the longest exposure per band; to pick the deepest stack per band call this tool "
+                    "again on the same collection with deepest_per_band=true and bands=[...]. Survey "
+                    "coadd tiles (service=coadd_all) are a different product family, not the archive's "
+                    "per-program stacks."
                 ),
             }
+            if inp.deepest_per_band:
+                summary["deepest_images"] = rows
             return ToolResult(
                 success=True,
                 result_id=result_id,
@@ -1355,8 +1792,15 @@ class ColorColorDiagramInput(_In):
     x_bands: Optional[List[str]] = None
     y_bands: Optional[List[str]] = None
     split_col: Optional[str] = None
-    split_threshold: Optional[float] = 0.003  # DES DR1 spread_model convention
-    limit: Optional[int] = 3000
+    # None = derived from the split column's FAMILY (class_star → 0.5;
+    # spread_model/registered conventions → the _POINT_SOURCE_CUTS value, e.g.
+    # DES 0.003). A hardcoded 0.003 default misclassified nearly every source
+    # on class_star splits (guard CX-03). Explicit values are used as given and
+    # run through morphology_deviation_warning (warn, never clamp).
+    split_threshold: Optional[float] = None
+    # None = the CCD plotting budget (3000) is applied as a FLAGGED platform
+    # cap, not baked into the SQL as if it were a science choice (RE-B1).
+    limit: Optional[int] = None
     title: Optional[str] = None
     point_sources: bool = False
     morphology: Optional[Dict[str, Any]] = None
@@ -1380,8 +1824,13 @@ class ColorColorDiagram(BaseCapability):
         try:
             table = inp.table or datalab_registry.default_table(inp.catalog)
             radius_deg = float(inp.radius_deg) if inp.radius_deg is not None else 0.5
-            split_threshold = float(inp.split_threshold) if inp.split_threshold is not None else 0.003
-            limit = int(inp.limit) if inp.limit is not None else 3000
+            # None passes through: the orchestration derives the default from
+            # the split column's family/registered convention (guard CX-03) —
+            # never blanket-default to the DES spread_model 0.003.
+            split_threshold = float(inp.split_threshold) if inp.split_threshold is not None else None
+            # None passes through: the orchestration/builder applies the CCD
+            # plotting budget as a flagged platform cap (RE-B1).
+            limit = int(inp.limit) if inp.limit is not None else None
             ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
             out = datalab_orchestration.color_color_diagram(
                 inp.catalog, table, ra_f, dec_f, radius_deg,
@@ -1410,7 +1859,9 @@ class ColorMagnitudeDiagramInput(_In):
     blue_band: str = "g"
     red_band: str = "r"
     mag_band: Optional[str] = None
-    limit: Optional[int] = 5000
+    # None = the CMD plotting budget (5000) is applied as a FLAGGED platform
+    # cap, not baked into the SQL as if it were a science choice (RE-B1).
+    limit: Optional[int] = None
     title: Optional[str] = None
     point_sources: bool = False
     morphology: Optional[Dict[str, Any]] = None
@@ -1440,7 +1891,9 @@ class ColorMagnitudeDiagram(BaseCapability):
         try:
             table = inp.table or datalab_registry.default_table(inp.catalog)
             radius_deg = float(inp.radius_deg) if inp.radius_deg is not None else 0.4
-            limit = int(inp.limit) if inp.limit is not None else 5000
+            # None passes through: the orchestration/builder applies the CMD
+            # plotting budget as a flagged platform cap (RE-B1).
+            limit = int(inp.limit) if inp.limit is not None else None
             blue_band = inp.blue_band or "g"
             red_band = inp.red_band or "r"
             ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
@@ -2166,7 +2619,11 @@ class VariableCandidatesInput(_In):
     radius_deg: float = 0.2
     band: Optional[str] = None
     min_epochs: int = 10
-    limit: int = 100
+    # None = the builder applies its documented default (100) and FLAGS it as a
+    # platform-chosen budget (platform_row_cap + warning + SQL comment) exactly
+    # like the diagram budgets; explicit values are the user's own provenance
+    # and stay unflagged (RE-B1 / guard CX-02).
+    limit: Optional[int] = None
 
 
 class VariableCandidates(BaseCapability):
@@ -2248,7 +2705,9 @@ class StarLightcurveInput(_In):
     source_id: Optional[str] = None
     ra: Optional[float] = None
     dec: Optional[float] = None
-    limit: int = 500
+    # None = the builder applies its documented default (500) and FLAGS it as a
+    # platform-chosen budget; explicit values stay unflagged (RE-B1 / CX-02).
+    limit: Optional[int] = None
 
 
 class StarLightcurve(BaseCapability):

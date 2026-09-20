@@ -83,7 +83,13 @@ def test_spectrum_plotly_spec_shapes_and_json_safety():
     json.dumps(spec, allow_nan=False)  # raises if any NaN survived
     labels = {a["text"] for a in spec["layout"]["annotations"]}
     assert "H alpha" in labels
-    assert len(spec["layout"]["shapes"]) == len(spec["layout"]["annotations"]) > 0
+    # 6000 points exceed PLOTLY_MAX_POINTS, so the decimation must be disclosed:
+    # layout meta plus one footer annotation on top of the 1:1 line overlays.
+    line_annotations = [a for a in spec["layout"]["annotations"] if a.get("textangle") == -90]
+    assert len(spec["layout"]["shapes"]) == len(line_annotations) > 0
+    footers = [a for a in spec["layout"]["annotations"] if a.get("textangle") != -90]
+    assert len(footers) == 1 and "downsampled" in footers[0]["text"]
+    assert spec["layout"]["meta"]["downsample"]["points_total"] == 6000
 
 
 def test_spectrum_plotly_spec_no_lines_without_redshift():

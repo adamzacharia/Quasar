@@ -1,4 +1,4 @@
-# DataLabBench v1.0 — Scoring Rubric
+# DataLabBench v1.3 — Scoring Rubric
 
 > GENERATED from `dlb_dataset_v1.py` by `run_datalabbench.py --emit-rubric`.
 > Do not edit by hand — edit the dataset and regenerate.
@@ -359,7 +359,7 @@ SELECT mjd, cmag, cerr, filter FROM smash_dr1.source WHERE q3c_radial_query(ra, 
 |---|---|---|---|
 | C1 | auto | 15 | Multi-epoch smash_dr1.source queried (not the coadd object table) (1 checks, each worth 15/1 pts) |
 | C2 | auto | 10 | Star isolated by a ~1-arcsec cone at (185.4311, -31.9953) or by object id (1 checks, each worth 10/1 pts) |
-| C3 | auto | 10 | Valid-epoch filtering (cmag < 99) and a single band, in the executed query (2 checks, each worth 10/2 pts) |
+| C3 | auto | 10 | Valid-epoch (sentinel) filtering and a single band, in the executed query (2 checks, each worth 10/2 pts) |
 | C4 | auto | 20 | Lomb-Scargle period search + phase fold executed (2 checks, each worth 20/2 pts) |
 | C5 | auto | 10 | Folded light curve rendered (1 checks, each worth 10/1 pts) |
 | C6 | judge | 15 | Period is reported and plausible for an RR Lyrae — *Full credit: a concrete period in days within 0.1-1.0 d (RRab typically ~0.4-0.9 d, RRc ~0.2-0.45 d), consistent with the tool output. Zero for a period outside the physical range or none reported.* |

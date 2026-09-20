@@ -94,6 +94,7 @@ class DatalabSiaClient:
         *,
         endpoint: Optional[str] = None,
         catalog: Optional[str] = None,
+        service: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Search Data Lab SIA endpoints around an ICRS position.
 
@@ -112,7 +113,16 @@ class DatalabSiaClient:
             raise ValueError("fov_deg must be positive")
 
         size = self._sia_size(fov_f, dec_f)
-        endpoints = self._candidate_endpoints(endpoint=endpoint, catalog=catalog or self.catalog)
+        if service:
+            key = str(service).strip().lower()
+            if key not in datalab_registry.DATALAB_SIA_SERVICES:
+                raise ValueError(f"Unknown SIA service: {service}")
+            selected = datalab_registry.DATALAB_SIA_SERVICES[key]
+            if endpoint and endpoint.rstrip('/') != selected.rstrip('/'):
+                raise ValueError("service and endpoint specify different SIA collections")
+            endpoints = [selected]
+        else:
+            endpoints = self._candidate_endpoints(endpoint=endpoint, catalog=catalog or self.catalog)
         endpoints_tried: List[Dict[str, Any]] = []
         last_error: Optional[Exception] = None
         last_zero: Optional[SiaSearchResult] = None
@@ -135,7 +145,9 @@ class DatalabSiaClient:
                 provenance={
                     "service": "NOIRLab Astro Data Lab SIA",
                     "endpoint": ep,
-                    "catalog": catalog or self.catalog,
+                    "catalog": None if (service or endpoint) else (catalog or self.catalog),
+                    "collection": next((name for name, url in datalab_registry.DATALAB_SIA_SERVICES.items()
+                                        if ep.rstrip('/') == url.rstrip('/')), None),
                     "ra": ra_f,
                     "dec": dec_f,
                     "fov_deg": fov_f,
@@ -155,7 +167,14 @@ class DatalabSiaClient:
             last_zero = result
 
         if last_zero is not None:
-            return last_zero.to_dict()
+            out = last_zero.to_dict()
+            if last_error is not None:
+                # A preferred endpoint failed and only a fallback answered (empty):
+                # that is indeterminate coverage, not a verified gap.
+                out["partial"] = True
+                out["coverage_status"] = "unknown"
+                out["endpoint_errors"] = [e for e in endpoints_tried if "error" in e]
+            return out
         if last_error is not None:
             raise DatalabSiaClientError(f"All Data Lab SIA endpoints failed: {last_error}") from last_error
         raise DatalabSiaClientError("No Data Lab SIA endpoints configured")
@@ -174,7 +193,10 @@ class DatalabSiaClient:
     def _candidate_endpoints(self, *, endpoint: Optional[str], catalog: Optional[str]) -> List[str]:
         endpoints: List[str] = []
         if endpoint:
-            endpoints.append(str(endpoint).strip())
+            # An explicit archive selection must never silently switch collections.
+            return [str(endpoint).strip()]
+        if catalog and str(catalog).strip().lower() in datalab_registry.DATALAB_SIA_SERVICES:
+            return [datalab_registry.DATALAB_SIA_SERVICES[str(catalog).strip().lower()]]
         if catalog:
             key = str(catalog or "").strip().lower()
             entry = datalab_registry.DATALAB_CATALOGS.get(key) or {}

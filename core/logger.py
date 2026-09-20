@@ -63,8 +63,95 @@ _loguru_logger.add(
     enqueue=True,
 )
 
+# ── std-logging compatibility shim ────────────────────────────────────────────
+# Callers across the codebase use the loguru logger with stdlib idioms:
+# ``logger.error("failed for %s: %s", conv_id, err, exc_info=True)``. Loguru
+# formats with str.format, so the ``%s`` placeholders were printed literally
+# and ``exc_info`` was silently swallowed as an unused format kwarg — the
+# provider-failure log at core/runner.py read
+# ``Responses API request failed for conversation %s: %s`` with no traceback,
+# which is exactly what hid the exception class behind the 2026-09-17
+# provider-killed benchmark trials. This wrapper renders %-style records and
+# ``exc_info``/``stack_info`` the way the stdlib would, then delegates
+# everything else (add/remove/opt/bind/level/catch/...) to loguru unchanged.
+_STD_KWARGS = ("exc_info", "stack_info", "stacklevel", "extra")
+
+
+class _StdCompatLogger:
+    """Loguru logger that also understands stdlib ``%``-args and ``exc_info``."""
+
+    __slots__ = ("_logger",)
+
+    def __init__(self, base):
+        object.__setattr__(self, "_logger", base)
+
+    def __getattr__(self, name):  # add/remove/opt/bind/level/catch/... pass through
+        return getattr(object.__getattribute__(self, "_logger"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_logger"), name, value)
+
+    def _emit(self, level, message, args, kwargs, *, force_exception=False):
+        base = object.__getattribute__(self, "_logger")
+        exc_info = kwargs.pop("exc_info", None)
+        stack_info = kwargs.pop("stack_info", None)
+        kwargs.pop("stacklevel", None)
+        extra = kwargs.pop("extra", None)
+        if args and isinstance(message, str) and "%" in message:
+            try:
+                message = message % args
+                args = ()
+            except (TypeError, ValueError, KeyError):
+                pass  # not a %-style record after all — let loguru format it
+        elif args and not isinstance(message, str):
+            message = str(message)
+        exception = None
+        if force_exception or exc_info is True:
+            exception = True                      # loguru captures sys.exc_info()
+        elif isinstance(exc_info, BaseException) or isinstance(exc_info, tuple):
+            exception = exc_info
+        target = base.opt(depth=2, exception=exception)
+        if extra:
+            target = target.bind(**extra)
+        if stack_info:
+            import traceback as _tb
+            message = f"{message}\n{''.join(_tb.format_stack()[:-3])}"
+        target.log(level, message, *args, **kwargs)
+
+    def trace(self, message, *args, **kwargs):
+        self._emit("TRACE", message, args, kwargs)
+
+    def debug(self, message, *args, **kwargs):
+        self._emit("DEBUG", message, args, kwargs)
+
+    def info(self, message, *args, **kwargs):
+        self._emit("INFO", message, args, kwargs)
+
+    def success(self, message, *args, **kwargs):
+        self._emit("SUCCESS", message, args, kwargs)
+
+    def warning(self, message, *args, **kwargs):
+        self._emit("WARNING", message, args, kwargs)
+
+    warn = warning
+
+    def error(self, message, *args, **kwargs):
+        self._emit("ERROR", message, args, kwargs)
+
+    def critical(self, message, *args, **kwargs):
+        self._emit("CRITICAL", message, args, kwargs)
+
+    fatal = critical
+
+    def exception(self, message, *args, **kwargs):
+        self._emit("ERROR", message, args, kwargs, force_exception=True)
+
+    def log(self, level, message, *args, **kwargs):
+        self._emit(level, message, args, kwargs)
+
+
 # Public logger instance
-logger = _loguru_logger
+logger = _StdCompatLogger(_loguru_logger)
 
 
 # ── Rollbar integration (graceful no-op if token not set) ────────────────────

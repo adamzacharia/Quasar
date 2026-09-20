@@ -107,7 +107,7 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
 
 3. Each sub-task must be a SINGLE, concrete, actionable step — not a vague directive.
    BAD:  "Analyze the data"
-   GOOD: "Search ALMA archive for NGC 1068 Band 6 observations with resolution < 0.5 arcsec"
+   GOOD: "Search ALMA archive for IC 342 Band 6 observations with resolution < 0.5 arcsec"
 
 4. Assign each task to ONE agent type:
    - "archive": ALMA archive searches (search_by_target, search_by_position, search_cadc_archive)
@@ -126,8 +126,8 @@ Given a complex user query, break it into ordered sub-tasks with EXPLICIT DEPEND
   t1 (archive): search_by_target for M87 → t2 (analysis): check_co_lines or check_line_coverage → t3 (synthesis)
   That's 3 tasks maximum. Do NOT search VLA unless explicitly requested. Do NOT add extra analysis.
 
-**Multi-target search** (e.g. "ALMA data on M87 and NGC 1068"):
-  t1 (archive): search_by_target("M87, NGC 1068") → t2 (synthesis)
+**Multi-target search** (e.g. "ALMA data on M87 and IC 342"):
+  t1 (archive): search_by_target("M87, IC 342") → t2 (synthesis)
   Both targets in ONE call, not separate tasks.
 
 ## Anti-Patterns (NEVER do these)

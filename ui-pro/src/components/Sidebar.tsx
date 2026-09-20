@@ -1,18 +1,19 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useChatStore } from "../lib/store";
 import { useAuthStore } from "../lib/auth-store";
 import {
     Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
-    ChevronDown, Bot, X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2, Cpu,
+    X, ExternalLink, Github, BookOpen, Search,
+    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2,
     Database, RefreshCw
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
-import { isTaccModel } from "../lib/models";
+import { ModelDropdown } from "./ModelDropdown";
+import { ModelIcon } from "./ModelIcon";
 import {
     listDatalabJobs, cancelDatalabJob, listMyTables, deleteMyTable,
     type DatalabJobRecord, type MyTableEntry,
@@ -55,195 +56,6 @@ function OverlayPanel({ open, onClose, title, icon: Icon, children }: {
             <div className="flex-1 overflow-y-auto">
                 {children}
             </div>
-        </div>
-    );
-}
-
-const MODEL_PRICING: Record<string, { in: number, out: number }> = {
-    // GPT-5 Series
-    "gpt-5.4": { in: 15.00, out: 45.00 },
-    "gpt-5.4-mini": { in: 0.75, out: 4.50 },
-    "gpt-5.4-2026-03-05": { in: 15.00, out: 45.00 },
-    "gpt-5": { in: 10.00, out: 30.00 },
-    "gpt-5-mini": { in: 0.50, out: 1.50 },
-    "gpt-5-nano": { in: 0.10, out: 0.30 },
-    
-    // GPT-4 Series
-    "gpt-4.1": { in: 2.50, out: 10.00 },
-    "gpt-4o": { in: 2.50, out: 10.00 },
-    "gpt-4o-mini": { in: 0.15, out: 0.60 },
-    
-    // Anthropic (current Messages API model IDs)
-    "claude-opus-4-8": { in: 5.00, out: 25.00 },
-    "claude-sonnet-5": { in: 3.00, out: 15.00 },
-    "claude-haiku-4-5": { in: 1.00, out: 5.00 },
-    "claude-fable-5": { in: 10.00, out: 50.00 },
-    
-    // Google Gemini
-    "gemini-2.5-pro": { in: 1.25, out: 5.00 },
-    "gemini-1.5-pro": { in: 1.25, out: 5.00 },
-    "gemini-1.5-flash": { in: 0.075, out: 0.30 },
-
-    // DeepSeek
-    "deepseek-v4-pro": { in: 0.435, out: 0.87 },
-    "deepseek-v4-flash": { in: 0.14, out: 0.28 },
-};
-
-function getModelCost(model: string) {
-    if (model.startsWith("local/")) return { in: 0, out: 0 };
-    if (isTaccModel(model)) return null;
-    if (MODEL_PRICING[model]) return MODEL_PRICING[model];
-    // Fallbacks
-    if (model.includes("deepseek-v4-flash")) return MODEL_PRICING["deepseek-v4-flash"];
-    if (model.includes("deepseek-v4-pro") || model.includes("deepseek")) return MODEL_PRICING["deepseek-v4-pro"];
-    if (model.includes("gpt-4o-mini")) return MODEL_PRICING["gpt-4o-mini"];
-    if (model.includes("gpt-5.4-mini")) return MODEL_PRICING["gpt-5.4-mini"];
-    if (model.includes("gpt-5.4")) return MODEL_PRICING["gpt-5.4"];
-    if (model.includes("gpt-4.1") || model.includes("gpt-4o")) return MODEL_PRICING["gpt-4o"];
-    if (model.includes("fable")) return MODEL_PRICING["claude-fable-5"];
-    if (model.includes("sonnet")) return MODEL_PRICING["claude-sonnet-5"];
-    if (model.includes("haiku")) return MODEL_PRICING["claude-haiku-4-5"];
-    if (model.includes("opus")) return MODEL_PRICING["claude-opus-4-8"];
-    if (model.includes("flash")) return MODEL_PRICING["gemini-1.5-flash"];
-    if (model.includes("pro") && model.includes("gemini")) return MODEL_PRICING["gemini-1.5-pro"];
-    return null;
-}
-
-function getModelTag(model: string) {
-    if (isTaccModel(model)) return "US hosted";
-    return null;
-}
-
-/* ────────────────────────────────────────────
-   MODEL ICON COMPONENT
-   ──────────────────────────────────────────── */
-function ModelIcon({ model, className = "w-4 h-4" }: { model: string; className?: string }) {
-    const isTacc = isTaccModel(model);
-    const isDeepSeek = model.toLowerCase().includes("deepseek");
-    const isOpenAI = !isTacc && (model.startsWith("gpt-") || model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4"));
-
-    if (isTacc) {
-        return <Cpu className={`${className} text-cyan-300 shrink-0`} />;
-    }
-
-    if (isDeepSeek) {
-        return (
-            <svg viewBox="0 0 512 509.64" className={`${className} fill-[#4D6BFE] shrink-0`} xmlns="http://www.w3.org/2000/svg">
-                <path fillRule="nonzero" d="M440.898 139.167c-4.001-1.961-5.723 1.776-8.062 3.673-.801.612-1.479 1.407-2.154 2.141-5.848 6.246-12.681 10.349-21.607 9.859-13.048-.734-24.192 3.368-34.04 13.348-2.093-12.307-9.048-19.658-19.635-24.37-5.54-2.449-11.141-4.9-15.02-10.227-2.708-3.795-3.447-8.021-4.801-12.185-.861-2.509-1.725-5.082-4.618-5.512-3.139-.49-4.372 2.142-5.601 4.349-4.925 9.002-6.833 18.921-6.647 28.962.432 22.597 9.972 40.597 28.932 53.397 2.154 1.47 2.707 2.939 2.032 5.082-1.293 4.41-2.832 8.695-4.186 13.105-.862 2.817-2.157 3.429-5.172 2.205-10.402-4.346-19.391-10.778-27.332-18.553-13.481-13.044-25.668-27.434-40.873-38.702a177.614 177.614 0 00-10.834-7.409c-15.512-15.063 2.032-27.434 6.094-28.902 4.247-1.532 1.478-6.797-12.251-6.736-13.727.061-26.285 4.653-42.288 10.777-2.34.92-4.801 1.593-7.326 2.142-14.527-2.756-29.608-3.368-45.367-1.593-29.671 3.305-53.368 17.329-70.788 41.272-20.928 28.785-25.854 61.482-19.821 95.59 6.34 35.943 24.683 65.704 52.876 88.974 29.239 24.123 62.911 35.943 101.32 33.677 23.329-1.346 49.307-4.468 78.607-29.27 7.387 3.673 15.142 5.144 28.008 6.246 9.911.92 19.452-.49 26.839-2.019 11.573-2.449 10.773-13.166 6.586-15.124-33.915-15.797-26.47-9.368-33.24-14.573 17.235-20.39 43.213-41.577 53.369-110.222.8-5.448.121-8.877 0-13.287-.061-2.692.553-3.734 3.632-4.041 8.494-.981 16.742-3.305 24.314-7.471 21.975-12.002 30.84-31.719 32.933-55.355.307-3.612-.061-7.348-3.879-9.245v-.003zM249.4 351.89c-32.872-25.838-48.814-34.352-55.4-33.984-6.155.368-5.048 7.41-3.694 12.002 1.415 4.532 3.264 7.654 5.848 11.634 1.785 2.634 3.017 6.551-1.784 9.493-10.587 6.55-28.993-2.205-29.856-2.635-21.421-12.614-39.334-29.269-51.954-52.047-12.187-21.924-19.267-45.435-20.435-70.542-.308-6.061 1.478-8.207 7.509-9.307 7.94-1.471 16.127-1.778 24.068-.615 33.547 4.9 62.108 19.902 86.054 43.66 13.666 13.531 24.007 29.699 34.658 45.496 11.326 16.778 23.514 32.761 39.026 45.865 5.479 4.592 9.848 8.083 14.035 10.656-12.62 1.407-33.673 1.714-48.075-9.676zm15.899-102.519c.521-2.111 2.421-3.658 4.722-3.658a4.74 4.74 0 011.661.305c.678.246 1.293.614 1.786 1.163.861.859 1.354 2.083 1.354 3.368 0 2.695-2.154 4.837-4.862 4.837a4.748 4.748 0 01-4.738-4.034 5.01 5.01 0 01.077-1.981zm47.208 26.915c-2.606.996-5.2 1.778-7.707 1.88-4.679.244-9.787-1.654-12.556-3.981-4.308-3.612-7.386-5.631-8.679-11.941-.554-2.695-.247-6.858.246-9.246 1.108-5.144-.124-8.451-3.754-11.451-2.954-2.449-6.711-3.122-10.834-3.122-1.539 0-2.954-.673-4.001-1.224-1.724-.856-3.139-3-1.785-5.634.432-.856 2.525-2.939 3.018-3.305 5.6-3.185 12.065-2.144 18.034.244 5.54 2.266 9.727 6.429 15.759 12.307 6.155 7.102 7.263 9.063 10.773 14.39 2.771 4.163 5.294 8.451 7.018 13.348.877 2.561.071 4.74-2.341 6.277-.981.625-2.109 1.044-3.191 1.458z" />
-            </svg>
-        );
-    }
-
-    if (isOpenAI) {
-        return (
-            <svg viewBox="-1 -.1 949.1 959.8" className={`${className} text-white fill-current shrink-0`} xmlns="http://www.w3.org/2000/svg">
-                <path d="m925.8 456.3c10.4 23.2 17 48 19.7 73.3 2.6 25.3 1.3 50.9-4.1 75.8-5.3 24.9-14.5 48.8-27.3 70.8-8.4 14.7-18.3 28.5-29.7 41.2-11.3 12.6-23.9 24-37.6 34-13.8 10-28.5 18.4-44.1 25.3-15.5 6.8-31.7 12-48.3 15.4-7.8 24.2-19.4 47.1-34.4 67.7-14.9 20.6-33 38.7-53.6 53.6-20.6 15-43.4 26.6-67.6 34.4-24.2 7.9-49.5 11.8-75 11.8-16.9.1-33.9-1.7-50.5-5.1-16.5-3.5-32.7-8.8-48.2-15.7s-30.2-15.5-43.9-25.5c-13.6-10-26.2-21.5-37.4-34.2-25 5.4-50.6 6.7-75.9 4.1-25.3-2.7-50.1-9.3-73.4-19.7-23.2-10.3-44.7-24.3-63.6-41.4s-35-37.1-47.7-59.1c-8.5-14.7-15.5-30.2-20.8-46.3s-8.8-32.7-10.6-49.6c-1.8-16.8-1.7-33.8.1-50.7 1.8-16.8 5.5-33.4 10.8-49.5-17-18.9-31-40.4-41.4-63.6-10.3-23.3-17-48-19.6-73.3-2.7-25.3-1.3-50.9 4-75.8s14.5-48.8 27.3-70.8c8.4-14.7 18.3-28.6 29.6-41.2s24-24 37.7-34 28.5-18.5 44-25.3c15.6-6.9 31.8-12 48.4-15.4 7.8-24.3 19.4-47.1 34.3-67.7 15-20.6 33.1-38.7 53.7-53.7 20.6-14.9 43.4-26.5 67.6-34.4 24.2-7.8 49.5-11.8 75-11.7 16.9-.1 33.9 1.6 50.5 5.1s32.8 8.7 48.3 15.6c15.5 7 30.2 15.5 43.9 25.5 13.7 10.1 26.3 21.5 37.5 34.2 24.9-5.3 50.5-6.6 75.8-4s50 9.3 73.3 19.6c23.2 10.4 44.7 24.3 63.6 41.4 18.9 17 35 36.9 47.7 59 8.5 14.6 15.5 30.1 20.8 46.3 5.3 16.1 8.9 32.7 10.6 49.6 1.8 16.9 1.8 33.9-.1 50.8-1.8 16.9-5.5 33.5-10.8 49.6 17.1 18.9 31 40.3 41.4 63.6zm-333.2 426.9c21.8-9 41.6-22.3 58.3-39s30-36.5 39-58.4c9-21.8 13.7-45.2 13.7-68.8v-223q-.1-.3-.2-.7-.1-.3-.3-.6-.2-.3-.5-.5-.3-.3-.6-.4l-80.7-46.6v269.4c0 2.7-.4 5.5-1.1 8.1-.7 2.7-1.7 5.2-3.1 7.6s-3 4.6-5 6.5a32.1 32.1 0 0 1 -6.5 5l-191.1 110.3c-1.6 1-4.3 2.4-5.7 3.2 7.9 6.7 16.5 12.6 25.5 17.8 9.1 5.2 18.5 9.6 28.3 13.2 9.8 3.5 19.9 6.2 30.1 8 10.3 1.8 20.7 2.7 31.1 2.7 23.6 0 47-4.7 68.8-13.8zm-455.1-151.4c11.9 20.5 27.6 38.3 46.3 52.7 18.8 14.4 40.1 24.9 62.9 31s46.6 7.7 70 4.6 45.9-10.7 66.4-22.5l193.2-111.5.5-.5q.2-.2.3-.6.2-.3.3-.6v-94l-233.2 134.9c-2.4 1.4-4.9 2.4-7.5 3.2-2.7.7-5.4 1-8.2 1-2.7 0-5.4-.3-8.1-1-2.6-.8-5.2-1.8-7.6-3.2l-191.1-110.4c-1.7-1-4.2-2.5-5.6-3.4-1.8 10.3-2.7 20.7-2.7 31.1s1 20.8 2.8 31.1c1.8 10.2 4.6 20.3 8.1 30.1 3.6 9.8 8 19.2 13.2 28.2zm-50.2-417c-11.8 20.5-19.4 43.1-22.5 66.5s-1.5 47.1 4.6 70c6.1 22.8 16.6 44.1 31 62.9 14.4 18.7 32.3 34.4 52.7 46.2l193.1 111.6q.3.1.7.2h.7q.4 0 .7-.2.3-.1.6-.3l81-46.8-233.2-134.6c-2.3-1.4-4.5-3.1-6.5-5a32.1 32.1 0 0 1 -5-6.5c-1.3-2.4-2.4-4.9-3.1-7.6-.7-2.6-1.1-5.3-1-8.1v-227.1c-9.8 3.6-19.3 8-28.3 13.2-9 5.3-17.5 11.3-25.5 18-7.9 6.7-15.3 14.1-22 22.1-6.7 7.9-12.6 16.5-17.8 25.5zm663.3 154.4c2.4 1.4 4.6 3 6.6 5 1.9 1.9 3.6 4.1 5 6.5 1.3 2.4 2.4 5 3.1 7.6.6 2.7 1 5.4.9 8.2v227.1c32.1-11.8 60.1-32.5 80.8-59.7 20.8-27.2 33.3-59.7 36.2-93.7s-3.9-68.2-19.7-98.5-39.9-55.5-69.5-72.5l-193.1-111.6q-.3-.1-.7-.2h-.7q-.3.1-.7.2-.3.1-.6.3l-80.6 46.6 233.2 134.7zm80.5-121h-.1v.1zm-.1-.1c5.8-33.6 1.9-68.2-11.3-99.7-13.1-31.5-35-58.6-63-78.2-28-19.5-61-30.7-95.1-32.2-34.2-1.4-68 6.9-97.6 23.9l-193.1 111.5q-.3.2-.5.5l-.4.6q-.1.3-.2.7-.1.3-.1.7v93.2l233.2-134.7c2.4-1.4 5-2.4 7.6-3.2 2.7-.7 5.4-1 8.1-1 2.8 0 5.5.3 8.2 1 2.6.8 5.1 1.8 7.5 3.2l191.1 110.4c1.7 1 4.2 2.4 5.6 3.3zm-505.3-103.2c0-2.7.4-5.4 1.1-8.1.7-2.6 1.7-5.2 3.1-7.6 1.4-2.3 3-4.5 5-6.5 1.9-1.9 4.1-3.6 6.5-4.9l191.1-110.3c1.8-1.1 4.3-2.5 5.7-3.2-26.2-21.9-58.2-35.9-92.1-40.2-33.9-4.4-68.3 1-99.2 15.5-31 14.5-57.2 37.6-75.5 66.4-18.3 28.9-28 62.3-28 96.5v223q.1.4.2.7.1.3.3.6.2.3.5.6.2.2.6.4l80.7 46.6zm43.8 294.7 103.9 60 103.9-60v-119.9l-103.8-60-103.9 60z" />
-            </svg>
-        );
-    }
-
-    return <Bot className={className} />;
-}
-
-/* ────────────────────────────────────────────
-   MODEL DROPDOWN
-   ──────────────────────────────────────────── */
-function ModelDropdown({ selectedModel, availableModels, onSelect }: {
-    selectedModel: string;
-    availableModels: string[];
-    onSelect: (model: string) => void;
-}) {
-    const [open, setOpen] = useState(false);
-    const ref = useRef<HTMLDivElement>(null);
-
-    useEffect(() => {
-        function handleClick(e: MouseEvent) {
-            if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-        }
-        document.addEventListener("mousedown", handleClick);
-        return () => document.removeEventListener("mousedown", handleClick);
-    }, []);
-
-    const taccModels = availableModels.filter(isTaccModel);
-    const openaiModels = availableModels.filter(m => !isTaccModel(m) && (m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")));
-    const deepseekModels = availableModels.filter(m => !isTaccModel(m) && m.toLowerCase().includes("deepseek"));
-    const geminiModels = availableModels.filter(m => !isTaccModel(m) && (m.startsWith("gemini-") || m.startsWith("gemma-")));
-    const claudeModels = availableModels.filter(m => !isTaccModel(m) && m.startsWith("claude-"));
-    const localModels = availableModels.filter(m => m.startsWith("local/"));
-
-    const renderGroup = (label: string, models: string[]) => models.length === 0 ? null : (
-        <>
-            <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
-                {label}
-            </div>
-            {models.map((model) => {
-                const cost = getModelCost(model);
-                const tag = getModelTag(model);
-                return (
-                    <button key={model} onClick={() => { onSelect(model); setOpen(false); }}
-                        className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors ${model === selectedModel ? "bg-primary/15 text-primary border-l-2 border-primary" : "text-slate-300 hover:bg-slate-700/70 hover:text-white"}`}>
-                        <div className="flex flex-col items-start truncate overflow-hidden pr-2">
-                            <span className="font-medium truncate w-full text-left">{model.startsWith("local/") ? model.replace("local/", "") : model}</span>
-                            {tag && (
-                                <span className="mt-1 inline-flex items-center rounded border border-cyan-400/30 bg-cyan-400/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-cyan-200">
-                                    {tag}
-                                </span>
-                            )}
-                            {cost && (
-                                <span className="text-[9px] text-slate-500 font-mono mt-0.5">
-                                    In: ${cost.in}/M · Out: ${cost.out}/M
-                                </span>
-                            )}
-                        </div>
-                        {model === selectedModel && <Check className="w-4 h-4 text-primary shrink-0" />}
-                    </button>
-                );
-            })}
-        </>
-    );
-
-    const currentCost = getModelCost(selectedModel);
-    const currentTag = getModelTag(selectedModel);
-
-    return (
-        <div ref={ref} className="relative">
-            <button onClick={() => setOpen(!open)}
-                className="flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors border border-slate-700/50">
-                <div className="flex items-center justify-between w-full">
-                    <div className="flex items-center gap-2"><ModelIcon model={selectedModel} className="w-4 h-4 shrink-0" /><span className="truncate">Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "[Local] ") : selectedModel}</span></div>
-                    <ChevronDown className={`w-4 h-4 shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
-                </div>
-                {currentCost && (
-                    <div className="flex items-center gap-2 mt-1 ml-6 text-[10px] text-slate-400/80 font-mono">
-                        <span>In: ${currentCost.in}/M</span>
-                        <span className="text-slate-600">|</span>
-                        <span>Out: ${currentCost.out}/M</span>
-                    </div>
-                )}
-                {currentTag && (
-                    <div className="mt-1 ml-6">
-                        <span className="inline-flex items-center rounded border border-cyan-400/30 bg-cyan-400/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-cyan-200">
-                            {currentTag}
-                        </span>
-                    </div>
-                )}
-            </button>
-
-            {open && (
-                <div className="absolute bottom-full left-0 right-0 mb-1.5 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl shadow-black/50 overflow-hidden z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 max-h-72 overflow-y-auto custom-scrollbar">
-                    {renderGroup("OpenAI", openaiModels)}
-                    {deepseekModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
-                    {renderGroup("DeepSeek", deepseekModels)}
-                    {taccModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
-                    {renderGroup("TACC Tejas", taccModels)}
-                    {claudeModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
-                    {renderGroup("Anthropic Claude", claudeModels)}
-                    {geminiModels.length > 0 && (openaiModels.length > 0 || deepseekModels.length > 0 || taccModels.length > 0 || claudeModels.length > 0) && <div className="border-t border-slate-700/50 mx-2" />}
-                    {renderGroup("Google Gemini", geminiModels)}
-                    {localModels.length > 0 && <div className="border-t border-slate-700/50 mx-2" />}
-                    {renderGroup("Local LLM", localModels)}
-                </div>
-            )}
         </div>
     );
 }
@@ -568,7 +380,7 @@ interface SidebarProps {
 export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClose }: SidebarProps) {
     const {
         conversations, activeConversationId, setActiveConversation,
-        createNewConversation, selectedModel, availableModels, setSelectedModel,
+        createNewConversation, selectedModel, setSelectedModel,
         fetchModels, loadConversations, loadConversationMessages,
         deleteConversation, clearAllConversations,
     } = useChatStore();
@@ -591,6 +403,8 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
 
     const [activePanel, setActivePanel] = useState<"papers" | "datalab" | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
+    // Set when Settings is opened from a deep link (e.g. "add an API key").
+    const [settingsTab, setSettingsTab] = useState<"providerKeys" | undefined>(undefined);
     const [query, setQuery] = useState("");
 
     const isDrawer = variant === "drawer";
@@ -698,7 +512,7 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
                     )}
                 </div>
 
-                <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+                <SettingsModal open={settingsOpen} initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(undefined); }} />
             </aside>
         );
     }
@@ -821,8 +635,8 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
                 {/* Model Dropdown */}
                 <ModelDropdown
                     selectedModel={selectedModel}
-                    availableModels={availableModels}
                     onSelect={setSelectedModel}
+                    onAddProviderKey={() => { setSettingsTab("providerKeys"); setSettingsOpen(true); }}
                 />
 
                 {/* Compact action row: Saved · Data Lab · Settings · Help */}
@@ -890,7 +704,7 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             </OverlayPanel>
 
             {/* Settings float modal — rendered outside sidebar via portal-like pattern */}
-            <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+            <SettingsModal open={settingsOpen} initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(undefined); }} />
         </aside>
     );
 }

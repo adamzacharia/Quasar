@@ -812,11 +812,11 @@ class ALMACoverageService:
             spectral_predicates.append(
                 f"(em_min <= {lambda_max:.15g} AND em_max >= {lambda_min:.15g})"
             )
+        # Footprint-aware cone: INTERSECTS on s_region unioned with the
+        # representative-point test (mosaics; NULL/TP footprints) — A-18.
+        circle = f"CIRCLE('ICRS', {ra_deg:.10f}, {dec_deg:.10f}, {radius_deg:.10f})"
         clauses = [
-            "CONTAINS("
-            "POINT('ICRS', s_ra, s_dec), "
-            f"CIRCLE('ICRS', {ra_deg:.10f}, {dec_deg:.10f}, {radius_deg:.10f})"
-            ") = 1",
+            f"(INTERSECTS({circle}, s_region) = 1 OR CONTAINS(POINT('ICRS', s_ra, s_dec), {circle}) = 1)",
             "(" + " OR ".join(spectral_predicates) + ")",
         ]
         if min_calib_level is not None and int(min_calib_level) > 0:

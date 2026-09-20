@@ -85,7 +85,7 @@ class ESOTAPClient:
         against the ESO TAP ObsCore table.
         
         Args:
-            target: Astronomical target name (e.g., 'NGC 1068', 'Eta Carinae')
+            target: Astronomical target name (e.g., 'IC 342', 'Eta Carinae')
             instrument: ESO instrument filter (e.g., 'MUSE', 'KMOS', 'XSHOOTER')
             collection: Data collection filter
             radius_arcmin: Search radius in arcminutes (default 1')

@@ -47,11 +47,12 @@ def test_wrapper_reuses_one_loop_across_calls(monkeypatch):
     try:
         assert ready.wait(timeout=5)
         sess = _FakeSession()
-        wrapper = _build_mcp_tool_wrapper(sess, "toolx", loop)
+        wrapper = _build_mcp_tool_wrapper(sess, "toolx", loop, "srv")
         r1 = wrapper(a=1)
         r2 = wrapper(a=2)
-        assert r1 == {"status": "success"}
-        assert r2 == {"status": "success"}
+        # empty content + no structuredContent normalizes to success/data=None
+        assert r1["success"] is True and r1["data"] is None
+        assert r2["success"] is True and r2["data"] is None
         assert sess.calls == [("toolx", {"a": 1}), ("toolx", {"a": 2})]
         assert len(sess.loops) == 2
         assert sess.loops[0] is loop and sess.loops[1] is loop
@@ -59,14 +60,14 @@ def test_wrapper_reuses_one_loop_across_calls(monkeypatch):
         monkeypatch.setattr(agent_module, "_MCP_TOOL_CALL_TIMEOUT_SECONDS", 0.01)
         slow_sess = _SlowSession()
         timeout_wrapper = _build_mcp_tool_wrapper(slow_sess, "slow_tool", loop)
-        assert timeout_wrapper() == {
-            "error": "MCP tool call timed out after 0.01 seconds"
-        }
+        timeout_result = timeout_wrapper()
+        assert timeout_result["success"] is False
+        assert timeout_result["error"] == "MCP tool call timed out after 0.01 seconds"
         assert slow_sess.cancelled.wait(timeout=5)
 
-        bridge_source = inspect.getsource(QuasarAgent._load_mcp_servers)
+        bridge_source = inspect.getsource(QuasarAgent._mount_mcp_bridges)
         assert bridge_source.count("asyncio.new_event_loop()") == 1
-        assert "_build_mcp_tool_wrapper(session, mcp_tool.name, loop)" in bridge_source
+        assert "_build_mcp_tool_wrapper(" in bridge_source
         assert "loop.run_forever()" in bridge_source
         assert "run_until_complete(_do_call())" not in bridge_source
     finally:

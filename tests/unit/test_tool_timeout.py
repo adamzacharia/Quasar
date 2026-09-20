@@ -209,3 +209,197 @@ def test_timeout_emits_closing_status():
     timed_out = [s for s in statuses if "timed out" in s[0]]
     assert timed_out and timed_out[0][1] == "completed"
     assert "Searching CADC archive" in timed_out[0][0]
+
+
+# ── consecutive-timeout circuit breaker (DH-P0) ─────────────────────────
+# The model retries timed-out calls despite the "Do NOT retry" error text
+# (live 2026-08-04 density repro); each retry burned a full guard budget.
+# After _TOOL_TIMEOUT_BREAKER_TRIPS timeouts of the same tool in one turn,
+# further calls must fail instantly.
+
+
+def _breaker_agent():
+    agent = _agent()
+    # core/runner.py resets this dict at the top of every turn.
+    agent._tls.tool_timeout_breaker = {}
+    return agent
+
+
+def test_breaker_trips_after_two_timeouts_and_fails_instantly():
+    agent = _breaker_agent()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def execute(**kwargs):
+        calls["n"] += 1
+        release.wait(5.0)
+        return {"success": True}
+
+    for _ in range(QuasarAgent._TOOL_TIMEOUT_BREAKER_TRIPS):
+        result = agent._execute_tool_guarded(
+            _tool(execute), {}, tool_name="slow_tool", timeout_seconds=0.1
+        )
+        assert result["timeout"] is True
+        assert "circuit_breaker" not in result
+
+    # A deliberately LONG budget: the breaker must return without waiting it
+    # out, and the generous bound keeps the assertion immune to scheduler
+    # stalls on loaded Windows CI (CX-24) while still proving instant-fail.
+    start = time.monotonic()
+    result = agent._execute_tool_guarded(
+        _tool(execute), {}, tool_name="slow_tool", timeout_seconds=5.0
+    )
+    elapsed = time.monotonic() - start
+    release.set()
+
+    assert result["circuit_breaker"] is True
+    assert result["timeout"] is True
+    assert "CIRCUIT BREAKER" in result["error"]
+    assert "slow_tool" in result["error"]
+    assert elapsed < 1.0, "a breaker-tripped call must not wait out the budget"
+    assert calls["n"] == QuasarAgent._TOOL_TIMEOUT_BREAKER_TRIPS, (
+        "the tripped call must never execute the tool"
+    )
+
+
+def test_breaker_is_per_tool():
+    agent = _breaker_agent()
+    agent._tls.tool_timeout_breaker = {"slow_tool": 99}
+
+    result = agent._execute_tool_guarded(
+        _tool(lambda **kw: "ok"), {}, tool_name="other_tool", timeout_seconds=5.0
+    )
+    assert result == "ok"
+
+
+def test_breaker_resets_on_completed_call():
+    agent = _breaker_agent()
+    agent._tls.tool_timeout_breaker = {"flaky_tool": 1}
+
+    result = agent._execute_tool_guarded(
+        _tool(lambda **kw: "ok"), {}, tool_name="flaky_tool", timeout_seconds=5.0
+    )
+    assert result == "ok"
+    # A completed call proves the service responds again — streak cleared.
+    assert agent._tls.tool_timeout_breaker == {}
+
+
+def test_breaker_disabled_without_turn_state():
+    # Conductor executor threads and bare test agents never set the TLS
+    # dict — the guard must behave exactly as before there (no breaker).
+    agent = _agent()
+    for _ in range(3):
+        result = agent._execute_tool_guarded(
+            _tool(lambda **kw: time.sleep(3) or "late"),
+            {},
+            tool_name="slow_tool",
+            timeout_seconds=0.05,
+        )
+        assert result["timeout"] is True
+        assert "circuit_breaker" not in result
+
+
+def test_breaker_status_carries_timed_out_phrase():
+    # ui-pro/api/sse.py withholds its deadline extension for completed
+    # statuses containing " timed out " — the breaker notice must match.
+    agent = _breaker_agent()
+    agent._tls.tool_timeout_breaker = {"slow_tool": 2}
+    statuses = []
+
+    result = agent._execute_tool_guarded(
+        _tool(lambda **kw: "never"),
+        {},
+        tool_name="slow_tool",
+        step_label="Fetching image cutout",
+        on_status=lambda t, s: statuses.append((t, s)),
+        timeout_seconds=5.0,
+    )
+
+    assert result["circuit_breaker"] is True
+    assert any(" timed out " in t and s == "completed" for t, s in statuses)
+
+
+def test_worker_clear_of_last_run_result_propagates():
+    """A guarded tool that CLEARS the stale card (Data Lab ctx provider sets
+    last_run_result = None) must propagate that clear to the calling thread —
+    the old `is not None` merge dropped it, so a stale data card from an
+    earlier tool survived and could be re-emitted by the streaming loop."""
+    agent = _agent()
+    agent.last_run_result = {"type": "data", "stale": True}
+    agent.last_search_results = ["stale-row"]
+
+    def execute(**kwargs):
+        agent.last_run_result = None
+        agent.last_search_results = None
+        return {"success": True}
+
+    result = agent._execute_tool_guarded(
+        _tool(execute), {}, tool_name="clearer", timeout_seconds=5.0
+    )
+    assert result == {"success": True}
+    assert agent.last_run_result is None
+    assert agent.last_search_results is None
+
+
+def test_untouched_tls_does_not_clobber_parent_state():
+    """The inverse guard: a tool that never touches card state must leave the
+    calling thread's existing values alone (the set-flags must be False)."""
+    agent = _agent()
+    agent.last_run_result = {"type": "data", "keep": True}
+
+    result = agent._execute_tool_guarded(
+        _tool(lambda **kw: {"success": True}), {}, tool_name="hands_off",
+        timeout_seconds=5.0,
+    )
+    assert result == {"success": True}
+    assert agent.last_run_result == {"type": "data", "keep": True}
+
+
+def test_result_indicates_timeout_classification():
+    """CX-16/CX-27: the runner's timeout classification is central and typed —
+    guard timeouts, FITS watchdog errors, and all-panels-timed-out grids all
+    stamp timeout=True; everything else closes as a normal completion."""
+    from core.runner import _result_indicates_timeout
+
+    assert _result_indicates_timeout({"success": False, "timeout": True})
+    assert _result_indicates_timeout(
+        {"success": False, "timeout": True, "circuit_breaker": True}
+    )
+    assert not _result_indicates_timeout({"success": True})
+    assert not _result_indicates_timeout({"success": False, "error": "boom"})
+    assert not _result_indicates_timeout({"timeout": "true"})  # strict is-True
+    assert not _result_indicates_timeout("TIMEOUT")
+    assert not _result_indicates_timeout(None)
+
+
+def test_final_composition_reraises_quota_error(monkeypatch):
+    """CX-21: a quota trip during final-answer composition must reach the
+    runner's dedicated handler, not vanish into an empty string."""
+    from services.usage_quota_service import QuotaExceededError
+
+    agent = _agent()
+
+    class _Responses:
+        @staticmethod
+        def create(**kwargs):
+            raise QuotaExceededError("weekly platform quota exhausted")
+
+    agent.client = types.SimpleNamespace(responses=_Responses())
+    agent.config = types.SimpleNamespace(
+        temperature=0.2, max_tokens=1024, model="gpt-4.1"
+    )
+    monkeypatch.setattr(QuasarAgent, "system_prompt", "test prompt", raising=False)
+    # Non-empty tool results — an empty list legitimately short-circuits to ""
+    # before any LLM call is made.
+    with pytest.raises(QuotaExceededError):
+        agent._compose_final_answer_from_tools(
+            "q", [{"output": '{"rows": 3}'}], "gpt-4.1"
+        )
+
+
+def test_density_vetting_override(monkeypatch):
+    """Density report fix 10: vetting = SQL + cutout grid in one call and
+    cannot fit the 150 s default under archive load."""
+    monkeypatch.delenv("QUASAR_TOOL_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("QUASAR_TOOL_TIMEOUT_OVERRIDES", raising=False)
+    assert QuasarAgent._tool_timeout_seconds("datalab_density_vetting") == 300.0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import uuid
 from dataclasses import dataclass
@@ -23,6 +24,39 @@ PLATFORM_TOKEN_LIMITS = {
     "openai": 100_000,
     "tacc": 1_000_000,
 }
+
+
+def platform_token_limit(provider: str) -> Optional[int]:
+    """The weekly platform-key allowance for one provider.
+
+    Env override (robert-eval A1: the cap was a hardcoded constant with no
+    deploy-time knob): ``QUASAR_PLATFORM_TOKEN_LIMITS="tacc=5000000,openai=0"``
+    — a value of 0 removes that provider's weekly cap entirely; providers not
+    named keep their stock limit. Read per call so tests can monkeypatch env.
+    """
+    raw = os.getenv("QUASAR_PLATFORM_TOKEN_LIMITS", "")
+    for pair in raw.split(","):
+        name, sep, value = pair.partition("=")
+        if sep and name.strip().lower() == provider:
+            # Malformed values (non-numeric, NaN, ±inf) fall back to the stock
+            # limit. ONLY the exact documented sentinel 0 removes the cap:
+            # int-truncation must never turn a sub-1 decimal like "0.9" into
+            # an accidental uncap, and negatives are nonsense, not an uncap —
+            # both fall back to the stock limit (CX-11).
+            try:
+                fval = float(value)
+            except ValueError:
+                break
+            if not math.isfinite(fval):
+                break
+            if fval == 0:
+                return None
+            parsed = int(fval)
+            if parsed <= 0:
+                break
+            return parsed
+    return PLATFORM_TOKEN_LIMITS.get(provider)
+
 
 PLATFORM_QUOTA_WINDOW_DAYS = 7
 
@@ -314,7 +348,7 @@ class UsageQuotaService:
         provider_daily = PLATFORM_DAILY_TOKEN_LIMITS.get(provider)
         if provider_daily is not None:
             caps.append((provider, self.daily_window_start(), provider_daily))
-        weekly = PLATFORM_TOKEN_LIMITS.get(provider)
+        weekly = platform_token_limit(provider)
         if weekly is not None:
             caps.append((provider, self.weekly_window_start(), weekly))
         return caps
@@ -494,7 +528,7 @@ class UsageQuotaService:
         # trip, and neither loosens the other.
         self._enforce_daily_caps(user_id, provider)
 
-        limit = PLATFORM_TOKEN_LIMITS.get(provider)
+        limit = platform_token_limit(provider)
         if limit is None:
             return
         used = self.get_used_tokens(
@@ -504,11 +538,17 @@ class UsageQuotaService:
             since=self.weekly_window_start(),
         )
         if used >= limit:
+            # The window is ROLLING (weekly_window_start = now − 7 days):
+            # there is no reset instant, headroom trickles back as old usage
+            # ages out — the message must not promise a "reset" (robert-eval
+            # A1: the old wording sent the evaluator waiting for one).
             raise QuotaExceededError(
                 "You have exhausted your included Quasar token allowance. "
                 f"Your {_provider_label(provider)} platform-key allowance is "
-                f"{limit:,} tokens per week. "
-                "Please try again after your weekly quota window resets."
+                f"{limit:,} tokens per ROLLING 7-day window. Headroom returns "
+                "gradually as your usage from the past 7 days ages out of the "
+                "window — there is no fixed reset time. You can also add your "
+                "own API key in Settings to continue immediately."
             )
 
     def ensure_allowed(
@@ -795,7 +835,7 @@ class UsageQuotaService:
         admin = is_admin_email(user_email)
         window_start = self.weekly_window_start()
         for provider in providers:
-            platform_limit = PLATFORM_TOKEN_LIMITS.get(provider)
+            platform_limit = platform_token_limit(provider)
             platform_used = self.get_used_tokens(user_id, provider, "platform", since=window_start)
             platform[provider] = {
                 "used_tokens": platform_used,

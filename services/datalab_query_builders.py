@@ -17,6 +17,22 @@ _SAFE_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 DEFAULT_ROW_LIMIT = 500
 MAX_ROW_LIMIT = 5000
+# Appended to every LIMIT the PLATFORM chose (no limit requested, or the
+# request was clamped to the ceiling) so the provenance SQL can never read as
+# a science choice (RE-B1, NOIRLab beta eval). Deliberately contains no digits
+# and not the word "AND" so SQL-shape checks and NaN-guard regexes never see it.
+PLATFORM_ROW_CAP_COMMENT = "/* platform row cap, not a science cut */"
+# Injected sentinel-magnitude guards carry this marker for the same reason —
+# provenance readers must see data validity, not a saturation/noise-floor cut.
+SENTINEL_GUARD_COMMENT = "/* sentinel-removal guard, not a science cut */"
+# Single source of truth for sentinel-magnitude bounds (RE-B2): real photometry
+# lives inside this range; 99/99.99/-99/... padding marks MISSING measurements.
+SENTINEL_MAG_RANGE = registry.SENTINEL_MAG_RANGE
+# A model-supplied morphology threshold this many times larger or smaller than
+# the table's registered star/galaxy convention is almost certainly a threshold
+# conflation (e.g. class_star's 0.5 applied to spread_model — NOIRLab beta
+# eval). Such cuts get a LOUD warning; they are never silently clamped.
+MORPHOLOGY_DEVIATION_FACTOR = 20.0
 # Cap cone radius so an all-sky cone (radius_deg=180/360) can't seq-scan a catalog.
 MAX_CONE_RADIUS_DEG = float(os.getenv("DATALAB_MAX_CONE_RADIUS_DEG", "30"))
 # Whitelisted comparison operators for structured selection cuts.
@@ -111,13 +127,19 @@ def build_cone_select(
     dec: float,
     radius_deg: float,
     columns: Optional[Sequence[str]] = None,
-    limit: int = DEFAULT_ROW_LIMIT,
+    limit: Optional[int] = None,
     predicates: Optional[Sequence[str]] = None,
+    default_limit: int = DEFAULT_ROW_LIMIT,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     _validate_sky(ra, dec, radius_deg)
-    row_limit = _limit(limit)
+    # Row-level pulls always need SOME cap (cost governance); when the caller
+    # did not choose one, the platform default is applied and FLAGGED so the
+    # provenance can never read as a science choice (RE-B1). `default_limit`
+    # lets one-shot diagram tools declare their plotting budget as that
+    # platform default instead of baking it into the tool schema.
+    row_limit, cap_reason = _resolve_limit(limit, default=default_limit)
     select_cols = _select_columns(info, columns)
     # Extra cuts must come from build_catalog_predicates (registry-validated),
     # so the LIMIT budget is spent on rows that survive the selection.
@@ -130,9 +152,10 @@ def build_cone_select(
         f"SELECT {select_cols}\n"
         f"FROM {info['qualified_name']}\n"
         f"WHERE " + "\n  AND ".join(where_parts) + "\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
-    return sql, _meta("cone_select", info, spatial_bound=True, row_limit=row_limit)
+    meta = _meta("cone_select", info, spatial_bound=True, row_limit=row_limit)
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
 def build_rectangular_region_select(
@@ -144,11 +167,11 @@ def build_rectangular_region_select(
     dec_min: float,
     dec_max: float,
     columns: Optional[Sequence[str]] = None,
-    limit: int = DEFAULT_ROW_LIMIT,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
     _validate_rect(ra_min, ra_max, dec_min, dec_max)
-    row_limit = _limit(limit)
+    row_limit, cap_reason = _resolve_limit(limit)
     select_cols = _select_columns(info, columns)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     warnings: List[str] = []
@@ -184,10 +207,13 @@ def build_rectangular_region_select(
         ]
         where = polys[0] if len(polys) == 1 else "(" + " OR ".join(polys) + ")"
         spatial = "q3c_poly_query"
-    sql = f"SELECT {select_cols}\nFROM {info['qualified_name']}\nWHERE {where}\nLIMIT {row_limit}"
+    sql = (
+        f"SELECT {select_cols}\nFROM {info['qualified_name']}\nWHERE {where}\n"
+        + _limit_clause(row_limit, cap_reason)
+    )
     meta = _meta("rectangular_region_select", info, spatial_bound=True, row_limit=row_limit)
     meta.update({"spatial_strategy": spatial, "warnings": warnings})
-    return sql, meta
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
 def build_density_aggregate(
@@ -202,11 +228,11 @@ def build_density_aggregate(
     radius_deg: Optional[float] = None,
     all_sky: bool = False,
     predicates: Optional[Sequence[str]] = None,
-    limit: int = MAX_ROW_LIMIT,
+    limit: Optional[int] = None,
     field_bound: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
-    row_limit = _limit(limit, maximum=MAX_ROW_LIMIT)
+    row_limit, cap_reason = _resolve_limit(limit, maximum=MAX_ROW_LIMIT, default=MAX_ROW_LIMIT)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     # Require an explicit region: an unbounded GROUP BY over a billion-row catalog
     # is a full-catalog scan. Give a cone, opt in explicitly with all_sky=True, or
@@ -246,7 +272,7 @@ def build_density_aggregate(
             f"{where}"
             f"GROUP BY {hpix}\n"
             f"ORDER BY source_count DESC\n"
-            f"LIMIT {row_limit}"
+            + _limit_clause(row_limit, cap_reason)
         )
     elif mode_key == "grid":
         step = _positive(step_deg, "step_deg")
@@ -258,12 +284,13 @@ def build_density_aggregate(
             f"{where}"
             f"GROUP BY ra_bin, dec_bin\n"
             f"ORDER BY source_count DESC\n"
-            f"LIMIT {row_limit}"
+            + _limit_clause(row_limit, cap_reason)
         )
     else:
         raise ValueError("density aggregate mode must be grid or healpix")
     meta = _meta("density_aggregate", info, aggregate=True, spatial_bound=has_cone, row_limit=row_limit)
     meta["warnings"] = warnings
+    _flag_platform_cap(meta, row_limit, cap_reason)
     if mode_key == "healpix":
         # Record the column's authoritative pixelization: decoding RING pixels
         # with the renderer's NESTED default scatters cells across the sky
@@ -291,10 +318,13 @@ def build_catalog_predicates(
     color_cut:  {"bands": ["mag_auto_g", "mag_auto_r"], "min": -0.5, "max": 0.5}
     value_cuts: [{"column": "mag_auto_g", "op": ">", "value": 19.5}, ...]  (op in _CUT_OPS)
     morphology: {"column": "ext_coadd", "between": [0, 1]} |
-                {"column": "class_star", "op": ">", "value": 0.5} |
+                {"column": "class_star", "op": ">", "value": 0.5}   (0.5 is class_star-ONLY) |
+                {"column": "spread_model_r", "between": [-0.003, 0.003]}  (DES stellar cut) |
                 {"column": "ext_coadd", "in": [0, 1]}
     Every column is checked against the registry; operators are whitelisted; values are
     numeric-formatted — so the output is safe to append to a builder WHERE clause.
+    Callers surfacing warnings should also run morphology_deviation_warning() on the
+    morphology cut (orders-of-magnitude threshold conflations, RE-B3).
     """
     info = _table_info(catalog, table)
     preds: List[str] = []
@@ -342,15 +372,20 @@ def build_q3c_crossmatch(
     match_radius_arcsec: float = 1.0,
     small_columns: Optional[Sequence[str]] = None,
     big_columns: Optional[Sequence[str]] = None,
-    small_limit: int = 10000,
-    limit: int = DEFAULT_ROW_LIMIT,
+    small_limit: Optional[int] = None,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     small = _table_info(small_catalog, small_table)
     big = _table_info(big_catalog, big_table)
     _validate_sky(ra, dec, radius_deg)
     match_radius_deg = _positive(match_radius_arcsec, "match_radius_arcsec") / 3600.0
-    small_row_limit = _limit(small_limit, maximum=50000)
-    row_limit = _limit(limit)
+    # The pre-join CTE cap is a platform budget exactly like the outer LIMIT:
+    # None means the caller made no choice, so the default (10000) must be
+    # flagged — SQL comment + platform_row_caps metadata — never read as a
+    # science cut (RE-B1 / guard CX-01). An explicit in-range value is the
+    # caller's own provenance and stays unflagged.
+    small_row_limit, small_cap_reason = _resolve_limit(small_limit, maximum=50000, default=10000)
+    row_limit, cap_reason = _resolve_limit(limit)
     small_select = _select_columns(small, small_columns, required=[small["ra_column"], small["dec_column"]])
     big_select = _prefixed_columns("big", _column_list(big, big_columns, required=[big["ra_column"], big["dec_column"]]))
     sra, sdec = small["ra_column"], small["dec_column"]
@@ -365,7 +400,9 @@ def build_q3c_crossmatch(
         # no outer ORDER BY can undo it (live P9 post-fix run: the map still
         # showed the far-west edge because only the outer SELECT was ordered).
         f"    ORDER BY q3c_dist({sra}, {sdec}, {_num(ra)}, {_num(dec)})\n"
-        f"    LIMIT {small_row_limit}\n"
+        f"    LIMIT {small_row_limit}"
+        + (f" {PLATFORM_ROW_CAP_COMMENT}" if small_cap_reason else "")
+        + "\n"
         ")\n"
         "SELECT g.*,\n"
         f"       {big_select}\n"
@@ -376,9 +413,10 @@ def build_q3c_crossmatch(
         # the cone CENTER (the cluster/stream the user asked about) instead of a
         # storage-order corner chunk (live P9: the map excluded Pal 5 itself).
         f"ORDER BY q3c_dist(g.{sra}, g.{sdec}, {_num(ra)}, {_num(dec)})\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
     meta = _meta("q3c_crossmatch", small, spatial_bound=True, row_limit=row_limit)
+    _flag_platform_cap(meta, row_limit, cap_reason)
     meta.update(
         {
             "big_catalog": big["catalog"],
@@ -396,6 +434,16 @@ def build_q3c_crossmatch(
             "join_big_dec": bdec,
         }
     )
+    # Named platform budget for the inner CTE cap (guard CX-01): rides
+    # meta['platform_row_caps'] so the outer int meta['platform_row_cap'] —
+    # consumed via int() by every provenance stamper — is never clobbered.
+    _flag_named_platform_cap(
+        meta,
+        name="small_side",
+        row_limit=small_row_limit,
+        platform_reason=small_cap_reason,
+        what="Crossmatch small-side (pre-join CTE) row cap",
+    )
     return sql, meta
 
 
@@ -409,12 +457,12 @@ def build_bitmask_select(
     dec: float,
     radius_deg: float,
     columns: Optional[Sequence[str]] = None,
-    limit: int = DEFAULT_ROW_LIMIT,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
     _validate_sky(ra, dec, radius_deg)
     bit = _bit_value(info, bitmask_column, bit_name)
-    row_limit = _limit(limit)
+    row_limit, cap_reason = _resolve_limit(limit)
     select_cols = _select_columns(info, columns)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     mask = 1 << bit
@@ -423,9 +471,10 @@ def build_bitmask_select(
         f"FROM {info['qualified_name']}\n"
         f"WHERE q3c_radial_query({ra_col}, {dec_col}, {_num(ra)}, {_num(dec)}, {_num(radius_deg)})\n"
         f"  AND (({bitmask_column} & {mask}) != 0)\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
-    return sql, _meta("bitmask_select", info, spatial_bound=True, row_limit=row_limit)
+    meta = _meta("bitmask_select", info, spatial_bound=True, row_limit=row_limit)
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
 def build_zhistogram(
@@ -435,13 +484,13 @@ def build_zhistogram(
     z_column: str = "z",
     bin_width: float = 0.01,
     bin: Optional[float] = None,
-    limit: int = MAX_ROW_LIMIT,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
     z_col = _column(info, z_column)
     width_value = bin_width if bin is None else bin
     width = _positive(width_value, "bin_width")
-    row_limit = _limit(limit, maximum=MAX_ROW_LIMIT)
+    row_limit, cap_reason = _resolve_limit(limit, maximum=MAX_ROW_LIMIT, default=MAX_ROW_LIMIT)
     sql = (
         f"SELECT ROUND(({z_col} / {_num(width)})::numeric, 0) * {_num(width)} AS z_bin,\n"
         f"       COUNT(*) AS source_count\n"
@@ -449,23 +498,25 @@ def build_zhistogram(
         f"WHERE {z_col} IS NOT NULL AND {z_col} {_NAN_GUARD}\n"
         f"GROUP BY z_bin\n"
         f"ORDER BY z_bin\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
-    return sql, _meta("zhistogram", info, aggregate=True, row_limit=row_limit)
+    meta = _meta("zhistogram", info, aggregate=True, row_limit=row_limit)
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
-def build_footprint_aggregate(catalog: str, table: str, *, limit: int = MAX_ROW_LIMIT) -> Tuple[str, Dict[str, Any]]:
+def build_footprint_aggregate(catalog: str, table: str, *, limit: Optional[int] = None) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
-    row_limit = _limit(limit, maximum=MAX_ROW_LIMIT)
+    row_limit, cap_reason = _resolve_limit(limit, maximum=MAX_ROW_LIMIT, default=MAX_ROW_LIMIT)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     sql = (
         f"SELECT ROUND({ra_col}) AS ra_deg, ROUND({dec_col}) AS dec_deg, COUNT(*) AS source_count\n"
         f"FROM {info['qualified_name']}\n"
         f"GROUP BY ra_deg, dec_deg\n"
         f"ORDER BY source_count DESC\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
-    return sql, _meta("footprint_aggregate", info, aggregate=True, row_limit=row_limit)
+    meta = _meta("footprint_aggregate", info, aggregate=True, row_limit=row_limit)
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
 def build_sed_select(
@@ -473,7 +524,7 @@ def build_sed_select(
     ra: float,
     dec: float,
     radius_deg: float,
-    limit: int = DEFAULT_ROW_LIMIT,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     # Forced unWISE W1/W2 only — W3/W4 are NOT in ls_dr9.tractor dered_mag_* (guardrail).
     columns = [
@@ -519,7 +570,7 @@ def build_variability_rank(
     radius_deg: float,
     band: Optional[str] = None,
     min_epochs: int = 10,
-    limit: int = 100,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Per-object variability ranking over a multi-epoch cone (the blog's
     'select high-variability stars' step): scatter, amplitude, and a
@@ -529,7 +580,7 @@ def build_variability_rank(
     epochs = int(min_epochs) if min_epochs else 10
     if epochs < 2:
         raise ValueError("min_epochs must be >= 2 (variability needs repeat epochs)")
-    row_limit = _limit(limit)
+    row_limit, cap_reason = _resolve_limit(limit, default=100)
     band_clause = _band_predicate(band)
     group_by_filter = not bool(band_clause)
     filter_column = "       filter,\n" if group_by_filter else ""
@@ -556,11 +607,14 @@ def build_variability_rank(
         f"       STDDEV(cmag) / NULLIF(AVG(cerr), 0) AS var_snr\n"
         f"FROM {info['qualified_name']}\n"
         f"WHERE q3c_radial_query(ra, dec, {_num(float(ra))}, {_num(float(dec))}, {_num(float(radius_deg))})\n"
-        f"  AND cmag < 50{band_clause}\n"
+        # Sentinel padding (99/-99) marks MISSING epochs — the unified
+        # SENTINEL_MAG_RANGE guard, annotated so it never reads as science.
+        f"  AND cmag > {_num(SENTINEL_MAG_RANGE[0])} AND cmag < {_num(SENTINEL_MAG_RANGE[1])} "
+        f"{SENTINEL_GUARD_COMMENT}{band_clause}\n"
         f"GROUP BY id{', filter' if group_by_filter else ''}\n"
         f"HAVING COUNT(*) >= {epochs}\n"
         f"ORDER BY var_snr DESC NULLS LAST\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
     meta = _meta(
         "variability_rank", info,
@@ -568,7 +622,7 @@ def build_variability_rank(
         min_epochs=epochs, grouped_by_filter=group_by_filter,
         **({"band": str(band).strip().lower()} if band_clause else {}),
     )
-    return sql, meta
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
 def build_variable_star_select(
@@ -577,10 +631,10 @@ def build_variable_star_select(
     source_id: Optional[str] = None,
     ra: Optional[float] = None,
     dec: Optional[float] = None,
-    limit: int = DEFAULT_ROW_LIMIT,
+    limit: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _epoch_table_info(catalog)
-    row_limit = _limit(limit)
+    row_limit, cap_reason = _resolve_limit(limit)
     cols = _select_columns(info, ["id", "ra", "dec", "mjd", "filter", "cmag", "cerr"])
     exact_id_bound = False
     if source_id:
@@ -598,14 +652,17 @@ def build_variable_star_select(
         f"SELECT {cols}\n"
         f"FROM {info['qualified_name']}\n"
         f"WHERE {where}\n"
-        f"  AND cmag < 99\n"
+        # Unified sentinel guard (was an unexplained `cmag < 99`, which even
+        # let -99 sentinels through) — data validity, not science.
+        f"  AND cmag > {_num(SENTINEL_MAG_RANGE[0])} AND cmag < {_num(SENTINEL_MAG_RANGE[1])} "
+        f"{SENTINEL_GUARD_COMMENT}\n"
         f"ORDER BY mjd\n"
-        f"LIMIT {row_limit}"
+        + _limit_clause(row_limit, cap_reason)
     )
     meta = _meta("variable_star_select", info, spatial_bound=spatial, row_limit=row_limit)
     if exact_id_bound:
         meta["exact_id_bound"] = True
-    return sql, meta
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
 def _table_info(catalog: str, table: str) -> Dict[str, Any]:
@@ -723,13 +780,172 @@ def _positive(value: float, name: str) -> float:
     return number
 
 
-def _limit(value: int, *, maximum: int = MAX_ROW_LIMIT) -> int:
-    # Treat None as the default, but 0 / negative are explicit errors (do NOT
-    # silently fall back to the default — that would hide an intended LIMIT 0).
-    number = DEFAULT_ROW_LIMIT if value is None else int(value)
+def _resolve_limit(
+    value: Optional[int],
+    *,
+    maximum: int = MAX_ROW_LIMIT,
+    default: int = DEFAULT_ROW_LIMIT,
+) -> Tuple[int, Optional[str]]:
+    """(row_limit, platform_reason) for a caller-supplied limit.
+
+    platform_reason is None when the caller's explicit, in-range limit was used
+    verbatim (their choice, their provenance). It names WHY the platform picked
+    the number when the caller passed None (auto default) or a value above the
+    ceiling (clamped) — those caps must be flagged, never read as science
+    (RE-B1). 0/negative stay explicit errors (do NOT silently fall back to the
+    default — that would hide an intended LIMIT 0).
+    """
+    if value is None:
+        return int(default), "no row limit was requested; automatic platform cap applied"
+    number = int(value)
     if number <= 0:
         raise ValueError("limit must be positive")
-    return min(number, maximum)
+    if number > int(maximum):
+        return int(maximum), f"requested limit {number} exceeds the platform ceiling {int(maximum)}; clamped"
+    return number, None
+
+
+def _limit_clause(row_limit: int, platform_reason: Optional[str]) -> str:
+    """The SQL LIMIT text — self-describing when the platform chose the cap."""
+    if platform_reason:
+        return f"LIMIT {int(row_limit)} {PLATFORM_ROW_CAP_COMMENT}"
+    return f"LIMIT {int(row_limit)}"
+
+
+def _flag_platform_cap(meta: Dict[str, Any], row_limit: int, platform_reason: Optional[str]) -> Dict[str, Any]:
+    """Stamp platform-applied caps into meta (platform_row_cap + warning).
+
+    The warning rides meta['warnings'] into the governor's validated warnings,
+    so every result built from this SQL discloses that the cap is platform cost
+    governance, not a science choice (RE-B1).
+    """
+    if platform_reason:
+        meta["platform_row_cap"] = int(row_limit)
+        meta.setdefault("warnings", []).append(
+            f"Row cap LIMIT {int(row_limit)} applied by the platform ({platform_reason}) — "
+            "cost governance, not a science cut and not user-requested. If it truncates the "
+            "result, disclose the cap and offer the uncapped path (async_submit background "
+            "job or a server-side aggregate builder)."
+        )
+    return meta
+
+
+def _flag_named_platform_cap(
+    meta: Dict[str, Any],
+    *,
+    name: str,
+    row_limit: int,
+    platform_reason: Optional[str],
+    what: str,
+) -> Dict[str, Any]:
+    """Stamp a NAMED platform-chosen budget (crossmatch small-side CTE cap,
+    orchestration-derived candidate budgets, ...) into meta.
+
+    Named budgets accumulate under ``meta['platform_row_caps']``
+    (e.g. ``{"small_side": 10000}``) so the scalar ``meta['platform_row_cap']``
+    — consumed as an int by every provenance stamper — keeps its outer-LIMIT
+    meaning. Same disclosure contract as :func:`_flag_platform_cap`: platform
+    cost governance, never a science cut (RE-B1 / guard CX-01, CX-09).
+    """
+    if platform_reason:
+        meta.setdefault("platform_row_caps", {})[str(name)] = int(row_limit)
+        meta.setdefault("warnings", []).append(
+            f"{what} LIMIT {int(row_limit)} applied by the platform ({platform_reason}) — "
+            "cost governance, not a science cut and not user-requested. Disclose it if it "
+            "could truncate the result."
+        )
+    return meta
+
+
+def _sentinel_mag_predicates(catalog: str, table: str, columns: Sequence[str]) -> List[str]:
+    """Registry-validated sentinel-removal predicates for magnitude columns.
+
+    One guard pair per column, with the LAST predicate carrying the
+    self-describing SQL comment so provenance readers see data validity, not a
+    saturation/noise-floor science cut (RE-B2).
+    """
+    lo, hi = SENTINEL_MAG_RANGE
+    cuts: List[Dict[str, Any]] = []
+    for col in columns:
+        cuts.append({"column": col, "op": ">", "value": lo})
+        cuts.append({"column": col, "op": "<", "value": hi})
+    preds = build_catalog_predicates(catalog, table, value_cuts=cuts)
+    if preds:
+        preds[-1] = f"{preds[-1]} {SENTINEL_GUARD_COMMENT}"
+    return preds
+
+
+_MORPH_BAND_SUFFIX_RE = re.compile(r"_(?:u|g|r|i|z|y|vr|j|h|k|ks|w1|w2|w3|w4)$")
+
+
+def _morph_family(column: str) -> str:
+    """Column family for morphology comparison: per-band suffixes stripped so
+    spread_model_g compares against the registered spread_model_r convention."""
+    return _MORPH_BAND_SUFFIX_RE.sub("", str(column or "").strip().lower())
+
+
+def _morph_scale(cut: Mapping[str, Any]) -> Optional[float]:
+    """Characteristic |threshold| of a morphology cut, or None when it has no
+    meaningful continuous scale (discrete 'in' codes, zero thresholds)."""
+    try:
+        if cut.get("between"):
+            lo, hi = cut["between"]
+            scale = max(abs(float(lo)), abs(float(hi)))
+        elif cut.get("op") and cut.get("value") is not None:
+            scale = abs(float(cut["value"]))
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return scale if scale > 0 else None
+
+
+def morphology_deviation_warning(
+    catalog: str,
+    table: str,
+    morphology: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """LOUD warning when a caller-supplied morphology threshold is orders of
+    magnitude off the table's registered star/galaxy convention (RE-B3).
+
+    The classic failure: transplanting class_star's 0.5 onto spread_model
+    (DES convention |spread_model_r| < 0.003 — a 167x deviation). The cut is
+    executed as given (the user may genuinely want it); it is never clamped.
+    Returns None when the table has no registered convention, the columns are
+    different families, or the values are within MORPHOLOGY_DEVIATION_FACTOR.
+    """
+    if not morphology:
+        return None
+    try:
+        reference = registry.point_source_cut(catalog, table)
+    except Exception:  # noqa: BLE001 - unknown table => nothing to compare against
+        return None
+    if not reference:
+        return None
+    col = str(morphology.get("column") or "").strip().lower()
+    ref_col = str(reference.get("column") or "").strip().lower()
+    if not col or not ref_col or _morph_family(col) != _morph_family(ref_col):
+        return None
+    supplied = _morph_scale(morphology)
+    expected = _morph_scale(reference)
+    if supplied is None or expected is None:
+        return None
+    ratio = supplied / expected
+    if 1.0 / MORPHOLOGY_DEVIATION_FACTOR < ratio < MORPHOLOGY_DEVIATION_FACTOR:
+        return None
+    fold = ratio if ratio >= 1 else 1.0 / ratio
+    if reference.get("between"):
+        lo, hi = reference["between"]
+        ref_desc = f"{ref_col} BETWEEN {_num(float(lo))} AND {_num(float(hi))}"
+    else:
+        ref_desc = f"{ref_col} {reference.get('op')} {_num(float(reference['value']))}"
+    return (
+        f"MORPHOLOGY THRESHOLD CHECK: the supplied cut {col} at {supplied:g} deviates ~{fold:.0f}x "
+        f"from the registered {catalog}.{table} star/galaxy convention ({ref_desc}). Thresholds near "
+        "0.5 are a class_star-style classifier convention and are almost certainly WRONG for "
+        "spread_model-style columns (DES uses |spread_model_r| < 0.003). The cut was executed as "
+        "given (NOT clamped) — verify the threshold before trusting the star/galaxy split."
+    )
 
 
 def _num(value: float) -> str:
@@ -738,6 +954,11 @@ def _num(value: float) -> str:
 
 __all__ = [
     "MAX_ROW_LIMIT",
+    "MORPHOLOGY_DEVIATION_FACTOR",
+    "PLATFORM_ROW_CAP_COMMENT",
+    "SENTINEL_GUARD_COMMENT",
+    "SENTINEL_MAG_RANGE",
+    "morphology_deviation_warning",
     "build_bitmask_select",
     "build_catalog_predicates",
     "build_cone_count",

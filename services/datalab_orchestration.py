@@ -78,6 +78,20 @@ def _run_builder_sql(
         "provenance": {
             **(getattr(result, "provenance", {}) or {}),
             "validated_sql": validated.sql,
+            # Platform-chosen caps are stamped in provenance so they can never
+            # read as a science choice (RE-B1).
+            **(
+                {"platform_row_cap": int(validated.meta["platform_row_cap"])}
+                if isinstance(validated.meta, dict) and validated.meta.get("platform_row_cap")
+                else {}
+            ),
+            # Named platform budgets (crossmatch small-side, derived candidate
+            # budgets) disclose the same way (guard CX-01/CX-09).
+            **(
+                {"platform_row_caps": dict(validated.meta["platform_row_caps"])}
+                if isinstance(validated.meta, dict) and validated.meta.get("platform_row_caps")
+                else {}
+            ),
             **(
                 {"row_limit": int(validated.meta["row_limit"]), "limit_truncated": True}
                 if trunc_warning
@@ -285,6 +299,7 @@ def tiled_sky_scan(
 
     from services import datalab_registry as registry
     merged_cuts, quality_note = registry.merge_default_quality_cuts(catalog, table, list(value_cuts or []))
+    morph_warning = builders.morphology_deviation_warning(catalog, table, morphology)
     predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=merged_cuts, morphology=morphology)
     # Wall-clock budget + no per-tile async fallback: with the fallback ON, a
     # crowded field turned a 64-tile scan into an hours-long retry storm — each
@@ -297,6 +312,13 @@ def tiled_sky_scan(
     candidates: List[Dict[str, Any]] = []
     tiles_scanned = 0
     tile_errors = 0
+    # Per-tile cap/truncation tracking (guard CX-08): a tile whose ORDER BY
+    # source_count DESC query filled its row cap silently dropped its SPARSEST
+    # density cells BEFORE peak-finding — faint peaks there can be missing and
+    # affected candidates' significances are lower bounds. Surface it.
+    tiles_truncated = 0
+    truncated_tile_indices: set = set()
+    truncated_row_limit: Optional[int] = None
     for idx, (ra, dec) in enumerate(tiles):
         if cancel_check and cancel_check():
             break
@@ -316,6 +338,11 @@ def tiled_sky_scan(
             tile_errors += 1
             continue
         tiles_scanned += 1
+        _tile_row_limit = (meta or {}).get("row_limit")
+        if policy.limit_truncation_warning(len(result.dataframe), _tile_row_limit):
+            tiles_truncated += 1
+            truncated_tile_indices.add(idx)
+            truncated_row_limit = int(_tile_row_limit)
         for pk in _tile_peaks(
             result.dataframe, analysis=analysis, bins=bins,
             sigma_small=sigma_small, sigma_large=sigma_large,
@@ -340,9 +367,28 @@ def tiled_sky_scan(
         if known:
             cand["known_object"] = f"{known['name']} ({known['kind']}, {known['separation_deg']}° away)"
             known_hits += 1
+        # Per-candidate cap disclosure (guard CX-08): the candidate's OWN tile
+        # dropped density cells at the row cap, so its significance is a lower
+        # bound and neighbouring faint peaks may be missing.
+        if cand.get("tile_index") in truncated_tile_indices:
+            cand["warnings"] = list(cand.get("warnings") or []) + [
+                f"This candidate's tile hit the per-tile row cap (LIMIT {truncated_row_limit}); "
+                "the tile's sparsest density cells were dropped BEFORE peak-finding, so the "
+                "significance is a lower bound and nearby faint peaks may be missing."
+            ]
     notes: List[str] = []
+    if tiles_truncated:
+        notes.append(
+            f"{tiles_truncated} tile quer{'y' if tiles_truncated == 1 else 'ies'} hit the "
+            f"per-tile row cap (LIMIT {truncated_row_limit}): the SPARSEST density cells in "
+            "those tiles were dropped BEFORE peak-finding, so faint peaks there may be missing "
+            "and candidates from those tiles (see their warnings) have lower-bound "
+            "significances. Re-run with a coarser step_deg or smaller tiles for a complete scan."
+        )
     if quality_note:
         notes.append(quality_note)
+    if morph_warning:
+        notes.append(morph_warning)
     if dropped_tiles:
         notes.append(f"Capped at {max_tiles} tiles; {dropped_tiles} of {total_tiles} tiles were not scanned.")
     if len(candidates) > len(ranked):
@@ -370,6 +416,7 @@ def tiled_sky_scan(
         "area_deg2": round(area, 3),
         "tiles_total": total_tiles,
         "tiles_scanned": tiles_scanned,
+        "tiles_truncated": tiles_truncated,
         "dropped_tiles": dropped_tiles,
         "budget_stop": budget_stop,
         "candidates_found": len(candidates),
@@ -406,12 +453,30 @@ def density_then_cutouts(
     top_n = max(1, int(top_n))
     from services import datalab_registry as registry
     merged_cuts, quality_note = registry.merge_default_quality_cuts(catalog, table, list(value_cuts or []))
+    morph_warning = builders.morphology_deviation_warning(catalog, table, morphology)
     predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=merged_cuts, morphology=morphology)
+    # The candidate budget is DERIVED by the platform (top_n*4, floor 50) —
+    # never a user science cut, so it gets the full platform-cap treatment:
+    # self-describing SQL comment + platform_row_cap(+named) metadata + a
+    # result note naming it (guard CX-09 / RE-B1).
+    # Clamped to the builder's hard maximum so the DISCLOSED number always
+    # equals the EMITTED LIMIT — for huge top_n the builder clamps the SQL to
+    # MAX_ROW_LIMIT, and an unclamped value here overstated the budget in
+    # platform_row_cap and the note (guard CX-09 verify regression).
+    candidate_budget = min(max(top_n * 4, 50), builders.MAX_ROW_LIMIT)
     sql, meta = builders.build_density_aggregate(
         catalog, table, mode="grid", step_deg=step_deg,
         ra=ra, dec=dec, radius_deg=radius_deg, predicates=predicates,
-        limit=max(top_n * 4, 50),
+        limit=candidate_budget,
     )
+    if sql.rstrip().endswith(f"LIMIT {candidate_budget}"):
+        sql = f"{sql.rstrip()} {builders.PLATFORM_ROW_CAP_COMMENT}"
+    builders._flag_platform_cap(
+        meta, candidate_budget,
+        f"derived candidate budget max(top_n*4, 50) = {candidate_budget}, chosen by the "
+        "platform to bound the density-peak pool",
+    )
+    meta.setdefault("platform_row_caps", {})["candidate_budget"] = int(candidate_budget)
     result_id, result = _run_builder_sql(
         sql, meta, client=client, result_store=result_store, owner_id=owner_id
     )
@@ -424,6 +489,13 @@ def density_then_cutouts(
     notes: List[str] = []
     if quality_note:
         notes.append(quality_note)
+    if morph_warning:
+        notes.append(morph_warning)
+    notes.append(
+        f"Candidate budget: the density scan was capped at LIMIT {candidate_budget} cells — "
+        f"a platform-derived budget (min(max(top_n*4, 50), {builders.MAX_ROW_LIMIT})), not a "
+        "science cut and not user-requested; raise top_n to widen the peak pool (guard CX-09)."
+    )
     for _, row in df.iterrows():
         if len(peaks) >= top_n:
             break
@@ -447,12 +519,28 @@ def density_then_cutouts(
             "they are re-detections, not new candidates."
         )
     grid = image_service.cutout_grid(peaks, fov_deg, band=band, catalog=catalog) if peaks else {"success": True, "panels": []}
+    # Nested-grid timeout semantics (guard CX-11, partial-contest): density
+    # peaks ARE real progress — analysis can proceed and an SSE deadline
+    # extension is then correct — so peaks keep success=True even when the
+    # nested grid fully timed out. But the timeout must be LOUD (warning) and
+    # machine-readable (cutout_grid_timeout), and with NO peaks to show a
+    # fully-timed-out grid is a timeout, not a completion.
+    grid_timeout = bool(isinstance(grid, dict) and grid.get("timeout"))
+    if grid_timeout:
+        notes.append(
+            "CUTOUT GRID TIMEOUT: the nested cutout grid timed out downloading tiles — the "
+            "density peaks above are REAL results (their ranking and coordinates stand), but "
+            "NO grid image was rendered. Do not describe cutouts; offer a retry with fewer "
+            "peaks or a smaller fov_deg."
+        )
     return {
-        "success": True,
+        "success": bool(peaks) or not grid_timeout,
         "result_id": result_id,
         "n_peaks": len(peaks),
         "peaks": peaks,
         "cutout_grid": grid,
+        **({"cutout_grid_timeout": True} if grid_timeout else {}),
+        **({"timeout": True} if grid_timeout and not peaks else {}),
         **({"notes": notes} if notes else {}),
     }
 
@@ -491,7 +579,14 @@ def tiled_density_aggregate(
     dec: float,
     radius_deg: float,
     predicates: Optional[Sequence[str]] = None,
-    limit: int = 5000,
+    # None = the builder's per-tile cell cap (5000) applies and is FLAGGED as a
+    # platform cap (SQL comment + platform_row_cap provenance + warning) — an
+    # explicit default of 5000 here bypassed the flag entirely (guard CX-07).
+    limit: Optional[int] = None,
+    # Warnings computed BEFORE the tiled fallback (quality-cut note, morphology
+    # deviation) must ride into the PERSISTED result too, not only the returned
+    # dict — chained consumers read the stored result_id (guard CX-06 verify).
+    extra_warnings: Optional[Sequence[str]] = None,
     tile_radius_deg: Optional[float] = None,
     max_seconds: Optional[float] = None,
     client: Any = None,
@@ -546,6 +641,13 @@ def tiled_density_aggregate(
     # tiled-agg-silent-cell-truncation). Track it and stamp the provenance.
     tiles_truncated = 0
     effective_limit: Optional[int] = None
+    # Resolve the per-tile cap ONCE, exactly as the builder will: when the
+    # platform chose it (limit=None default or clamped), the final provenance
+    # must record platform_row_cap ALWAYS — not only when a tile happens to
+    # truncate (guard CX-07). User-passed in-range limits stay unflagged.
+    per_tile_limit, tile_cap_reason = builders._resolve_limit(
+        limit, maximum=builders.MAX_ROW_LIMIT, default=builders.MAX_ROW_LIMIT
+    )
 
     def _run_tile(dx: float, dy: float, r: float) -> Optional[Any]:
         nonlocal tiles_truncated, effective_limit
@@ -633,7 +735,13 @@ def tiled_density_aggregate(
         .reset_index(drop=True)
     )
 
-    warnings: List[str] = []
+    warnings: List[str] = [str(w) for w in (extra_warnings or []) if w]
+    if tile_cap_reason:
+        warnings.append(
+            f"Per-tile row cap LIMIT {per_tile_limit} applied by the platform ({tile_cap_reason}) — "
+            "cost governance, not a science cut and not user-requested. Disclose the cap if any "
+            "tile truncates."
+        )
     if budget_stop:
         warnings.append(
             f"Stopped at the {max_seconds:.0f}s tiling budget: {tiles_run} tile queries ran; "
@@ -678,6 +786,9 @@ def tiled_density_aggregate(
             "tiles_failed": tile_errors,
             "tiles_subdivided": subdivided,
             "sync_timeout_fallback": True,
+            # Platform-chosen per-tile cap is stamped ALWAYS, not only when a
+            # tile happened to truncate (guard CX-07 / RE-B1).
+            **({"platform_row_cap": per_tile_limit} if tile_cap_reason else {}),
             # dl-tiled-agg-silent-cell-drop: propagate the row-cap stamp so the
             # plot layer's _truncation_warnings marks the rendered map.
             **(
@@ -723,22 +834,21 @@ def tiled_density_aggregate(
 
 
 def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store,
-                       point_sources=False, morphology=None, extra_value_cuts=None, owner_id=None):
-    """Cone-select the magnitude (+extra) columns for a diagram and return (result_id, df, magcols)."""
+                       point_sources=False, morphology=None, extra_value_cuts=None, owner_id=None,
+                       default_limit=None):
+    """Cone-select the magnitude (+extra) columns for a diagram and return (result_id, df, magcols).
+
+    ``limit=None`` means the caller made NO row-budget choice: the plotting
+    budget ``default_limit`` is applied by the builder as a PLATFORM cap and
+    flagged as such (platform_row_cap + warning + SQL comment, RE-B1)."""
     from services import datalab_registry as reg
     magcols = {b: reg.mag_column(catalog, table, b) for b in bands}
     info = reg.describe_table(catalog, table)
     cols = [info["ra_column"], info["dec_column"]] + list(dict.fromkeys(magcols.values())) + [c for c in (extra_cols or []) if c]
-    # Server-side validity cuts: survey sentinel magnitudes (99.99 / -99) otherwise
-    # blow the axes out to ±80 and waste the LIMIT budget on junk photometry.
-    # Lower bound -5 keeps genuinely bright sources while excluding -9/-99 sentinels.
     # Registry default quality cuts (e.g. DES flags_*=0) ride along unless the
     # caller cut the same column (live P5: garbage colors stretched CCD axes).
     value_cuts, quality_note = reg.merge_default_quality_cuts(catalog, table, [dict(vc) for vc in (extra_value_cuts or [])])
     validity_cols = list(dict.fromkeys(magcols.values()))
-    for col in validity_cols:
-        value_cuts.append({"column": col, "op": ">", "value": _VALID_MAG_RANGE[0]})
-        value_cuts.append({"column": col, "op": "<", "value": _VALID_MAG_RANGE[1]})
     # An explicit morphology cut wins over point_sources (which pulls the
     # catalog's registered star/galaxy cut). Both go through build_catalog_predicates.
     morph_cut = dict(morphology) if morphology else None
@@ -750,9 +860,19 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
         if morph_cut is None:
             ps_note = (f"{catalog}.{table} has no registered star/galaxy separator; "
                        "point_sources request ignored (returning ALL sources).")
+    # Orders-of-magnitude morphology-threshold conflations (class_star's 0.5 on
+    # spread_model) get a LOUD warning; the cut still executes as given (RE-B3).
+    morph_warning = builders.morphology_deviation_warning(catalog, table, morphology)
     predicates = builders.build_catalog_predicates(catalog, table, value_cuts=value_cuts, morphology=morph_cut)
+    # Server-side validity cuts: survey sentinel magnitudes (99.99 / -99) otherwise
+    # blow the axes out to ±80 and waste the LIMIT budget on junk photometry.
+    # Lower bound -5 keeps genuinely bright sources while excluding -9/-99 sentinels.
+    # Built as a separate predicate group whose SQL carries a self-describing
+    # comment, so provenance readers see sentinel removal — not science (RE-B2).
+    predicates = predicates + builders._sentinel_mag_predicates(catalog, table, validity_cols)
     sql, meta = builders.build_cone_select(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
-                                           columns=cols, limit=limit, predicates=predicates)
+                                           columns=cols, limit=limit, predicates=predicates,
+                                           default_limit=(default_limit or builders.DEFAULT_ROW_LIMIT))
     result_id, result = _run_builder_sql(
         sql, meta, client=client, result_store=result_store, owner_id=owner_id
     )
@@ -777,6 +897,8 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
         meta.setdefault("warnings", []).append(ps_note)
     if quality_note:
         meta.setdefault("warnings", []).append(quality_note)
+    if morph_warning:
+        meta.setdefault("warnings", []).append(morph_warning)
     trunc_warning = policy.limit_truncation_warning(len(result.dataframe), meta.get("row_limit"))
     if trunc_warning:
         meta.setdefault("warnings", []).append(
@@ -786,7 +908,15 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     return result_id, result, magcols, meta
 
 
-_VALID_MAG_RANGE = (-5.0, 50.0)
+# Single source of truth: services.datalab_registry.SENTINEL_MAG_RANGE
+# (sentinel-magnitude removal, NOT a science cut — RE-B2 unification).
+_VALID_MAG_RANGE = builders.SENTINEL_MAG_RANGE
+
+# One-shot diagram plotting budgets. These are PLATFORM sample caps applied
+# when the caller passes no limit — flagged in warnings/provenance by the
+# builder, never presented as a science choice (RE-B1).
+CCD_SAMPLE_BUDGET = 3000
+CMD_SAMPLE_BUDGET = 5000
 
 
 def _expr_identifiers(expr: str) -> List[str]:
@@ -813,6 +943,7 @@ def _expr_diagram(
     point_sources=False, morphology=None, value_cuts=None,
     overlay_locus=None,
     client, result_store, plotting, owner_id=None,
+    default_limit=None,
 ):
     """One-shot diagram with derived axes (e.g. a Gaia HR diagram:
     x = bp_rp, y = phot_g_mean_mag + 5*log10(parallax) - 10).
@@ -833,6 +964,7 @@ def _expr_diagram(
     morph_cut = dict(morphology) if morphology else None
     if morph_cut is None and point_sources:
         morph_cut = reg.point_source_cut(catalog, table)
+    morph_warning = builders.morphology_deviation_warning(catalog, table, morphology)
     predicates = builders.build_catalog_predicates(
         catalog, table, value_cuts=[dict(vc) for vc in (value_cuts or [])], morphology=morph_cut,
     )
@@ -842,6 +974,7 @@ def _expr_diagram(
     sql, meta = builders.build_cone_select(
         catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
         columns=select_cols, limit=limit, predicates=predicates,
+        default_limit=(default_limit or builders.DEFAULT_ROW_LIMIT),
     )
     rid, result = _run_builder_sql(
         sql, meta, client=client, result_store=result_store, owner_id=owner_id
@@ -850,7 +983,11 @@ def _expr_diagram(
     x = analysis._eval_expression(df, x_expr)
     y = analysis._eval_expression(df, y_expr)
     finite = np.isfinite(x) & np.isfinite(y)
-    warnings = []
+    # Builder meta warnings (platform row cap disclosure) + the morphology
+    # deviation check must reach the tool result, not die in meta (RE-B1/B3).
+    warnings = list((meta or {}).get("warnings") or [])
+    if morph_warning:
+        warnings.append(morph_warning)
     trunc = policy.limit_truncation_warning(len(df), (meta or {}).get("row_limit"))
     if trunc:
         warnings.append(
@@ -888,7 +1025,10 @@ def _expr_diagram(
     if _locus_info:
         _extra.update(_locus_info)
     return _render_diagram(plotting, fig, prefix, rid,
-                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table},
+                           {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
+                            # Platform-applied sample cap (RE-B1).
+                            **({"platform_row_cap": int((meta or {})["platform_row_cap"])}
+                               if (meta or {}).get("platform_row_cap") else {})},
                            _extra)
 
 
@@ -962,6 +1102,38 @@ def _render_diagram(plotting, fig, prefix, result_id, provenance, extra):
     return out
 
 
+def _resolve_split_threshold(catalog, table, split_col, split_threshold):
+    """(threshold, deviation_warning) for a star/galaxy split column.
+
+    A None threshold must NEVER silently inherit the DES spread_model 0.003:
+    class_star-style classifier probabilities split at 0.5 (0.5 is
+    class_star-ONLY), and a table with a registered star/galaxy convention
+    (_POINT_SOURCE_CUTS) whose column family matches the split column uses
+    that registered scale (guard CX-03). A caller-supplied threshold is used
+    as given — never clamped — and is run through
+    morphology_deviation_warning so orders-of-magnitude conflations get the
+    LOUD RE-B3 warning on the split path too."""
+    col = str(split_col or "").strip().lower()
+    family = builders._morph_family(col)
+    if split_threshold is None:
+        threshold = None
+        try:
+            from services import datalab_registry as reg
+            reference = reg.point_source_cut(catalog, table)
+        except Exception:  # noqa: BLE001 - unknown table => family fallback below
+            reference = None
+        if reference and builders._morph_family(str(reference.get("column") or "")) == family:
+            threshold = builders._morph_scale(reference)
+        if threshold is None:
+            threshold = 0.5 if family == "class_star" else 0.003
+        return float(threshold), None
+    threshold = float(split_threshold)
+    warning = builders.morphology_deviation_warning(
+        catalog, table, {"column": col, "op": "<", "value": threshold}
+    )
+    return threshold, warning
+
+
 def _split_groups(split_col, s, finite, split_threshold):
     """Star/galaxy masks for a morphology split column -> (groups, note).
 
@@ -971,9 +1143,14 @@ def _split_groups(split_col, s, finite, split_threshold):
     'galaxies' and no-data rows under 'stars'
     (delve-ccd-split-misclass / dl-delve-ccd-split-misclassifies).
     Categorical columns use set membership (stars IN (0,1), galaxies IN (2,3),
-    -9 excluded from both panels); the numeric threshold applies only to
-    spread_model-style continuous columns."""
-    if str(split_col).strip().lower() == "ext_coadd":
+    -9 excluded from both panels). class_star-style classifier probabilities
+    are HIGH for stars (registered convention class_star > 0.5), so the
+    threshold split is s > t, not s <= t (guard CX-03). Continuous
+    spread_model-style columns use the registered TWO-SIDED convention
+    |s| <= t (DES: -0.003 <= spread_model_r <= 0.003) — the old one-sided
+    s <= t filed negative outliers below -t under stars (guard CX-04)."""
+    col = str(split_col).strip().lower()
+    if col == "ext_coadd":
         groups = [("stars", finite & s.isin([0, 1])), ("galaxies", finite & s.isin([2, 3]))]
         n_no_data = int((finite & (s == -9)).sum())
         note = (
@@ -983,8 +1160,14 @@ def _split_groups(split_col, s, finite, split_threshold):
             else None
         )
         return groups, note
+    if builders._morph_family(col) == "class_star":
+        return (
+            [("stars", finite & (s > split_threshold)), ("galaxies", finite & (s <= split_threshold))],
+            f"class_star split: stars = {col} > {split_threshold:g} (classifier probability; "
+            "high = star), galaxies = the rest.",
+        )
     return (
-        [("stars", finite & (s <= split_threshold)), ("galaxies", finite & (s > split_threshold))],
+        [("stars", finite & (s.abs() <= split_threshold)), ("galaxies", finite & (s.abs() > split_threshold))],
         None,
     )
 
@@ -992,16 +1175,17 @@ def _split_groups(split_col, s, finite, split_threshold):
 def color_color_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_bands=("g", "r"), y_bands=("r", "i"),
-    split_col=None, split_threshold=0.003, limit=3000, title=None,
+    split_col=None, split_threshold=None, limit=None, title=None,
     point_sources=False, morphology=None, value_cuts=None,
     x_expr=None, y_expr=None,
     client=None, result_store=None, plotting_service=None, owner_id=None,
 ):
     """P5: one-shot color-color diagram. Queries the cone, optionally splits into stars/galaxies
     by a morphology column (auto-detected from the registry, e.g. DES spread_model_r), and renders
-    a 1- or 2-panel CCD as a single image. Sentinel magnitudes (99.99) are cut both server- and
-    client-side so the axes stay physical. An explicit morphology cut overrides point_sources.
-    x_expr/y_expr switch to derived axes (single panel, no star/galaxy split)."""
+    a 1- or 2-panel CCD as a single image. Sentinel magnitudes (99/-99 padding) are cut both
+    server- and client-side via the unified SENTINEL_MAG_RANGE guard (-5 < mag < 50 — sentinel
+    removal, not science) so the axes stay physical. An explicit morphology cut overrides
+    point_sources. x_expr/y_expr switch to derived axes (single panel, no star/galaxy split)."""
     import pandas as pd
     from services import datalab_registry as reg
     from services.plotting import PlottingService
@@ -1016,18 +1200,27 @@ def color_color_diagram(
             x_expr=str(x_expr), y_expr=str(y_expr), invert_y=False, prefix="datalab_ccd",
             limit=limit, title=title, point_sources=point_sources, morphology=morphology,
             value_cuts=value_cuts, client=client, result_store=result_store, plotting=plotting,
-            owner_id=owner_id,
+            owner_id=owner_id, default_limit=CCD_SAMPLE_BUDGET,
         )
     # A morphology-selected sample is one population — don't auto-split it into stars/galaxies.
     if split_col is None and not point_sources and not morphology:
         split_col = reg.morphology_split_column(catalog, table)
+    # Threshold semantics (guard CX-03): None derives the FAMILY default
+    # (class_star → 0.5; registered spread_model-style conventions → their
+    # _POINT_SOURCE_CUTS scale) instead of blanket-defaulting to DES's 0.003;
+    # explicit thresholds run through the morphology deviation check too.
+    split_deviation_warning = None
+    if split_col is not None:
+        split_threshold, split_deviation_warning = _resolve_split_threshold(
+            catalog, table, split_col, split_threshold
+        )
 
     bands = list(dict.fromkeys([*x_bands, *y_bands]))
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands,
         extra_cols=[split_col] if split_col else [], limit=limit, client=client, result_store=result_store,
         point_sources=point_sources, morphology=morphology, extra_value_cuts=value_cuts,
-        owner_id=owner_id,
+        owner_id=owner_id, default_limit=CCD_SAMPLE_BUDGET,
     )
     df = result.dataframe
     _ps_applied = bool(_meta.get("point_source_cut_applied"))
@@ -1066,19 +1259,25 @@ def color_color_diagram(
     ps_applied = bool(_meta.get("point_source_cut_applied"))
     return _render_diagram(plotting, fig, "datalab_ccd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
-                            "auto_validity_filters": _meta.get("auto_validity_filters")},
+                            "auto_validity_filters": _meta.get("auto_validity_filters"),
+                            # Platform-applied sample cap, stamped so it can
+                            # never read as a science choice (RE-B1).
+                            **({"platform_row_cap": int(_meta["platform_row_cap"])}
+                               if _meta.get("platform_row_cap") else {})},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col,
+                            "split_threshold": split_threshold,
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "populations": populations,
                             "warnings": list(_meta.get("warnings") or [])
-                            + ([split_note] if split_note else []),
+                            + ([split_note] if split_note else [])
+                            + ([split_deviation_warning] if split_deviation_warning else []),
                             "excluded_invalid_mags": int(len(df) - int(finite.sum())),
                             "plotly_spec": plotly_spec})
 
 
 def color_magnitude_diagram(
     catalog, table, ra, dec, radius_deg, *,
-    blue_band="g", red_band="r", mag_band=None, limit=5000, title=None,
+    blue_band="g", red_band="r", mag_band=None, limit=None, title=None,
     point_sources=False, morphology=None, value_cuts=None,
     x_expr=None, y_expr=None, overlay_locus=None,
     client=None, result_store=None, plotting_service=None, owner_id=None,
@@ -1103,7 +1302,7 @@ def color_magnitude_diagram(
             limit=limit, title=title, point_sources=point_sources, morphology=morphology,
             value_cuts=value_cuts, overlay_locus=overlay_locus,
             client=client, result_store=result_store, plotting=plotting,
-            owner_id=owner_id,
+            owner_id=owner_id, default_limit=CMD_SAMPLE_BUDGET,
         )
     mag_band = mag_band or blue_band
     bands = list(dict.fromkeys([blue_band, red_band, mag_band]))
@@ -1111,6 +1310,7 @@ def color_magnitude_diagram(
         catalog, table, ra, dec, radius_deg, bands=bands, extra_cols=[], limit=limit,
         client=client, result_store=result_store, point_sources=point_sources,
         morphology=morphology, extra_value_cuts=value_cuts, owner_id=owner_id,
+        default_limit=CMD_SAMPLE_BUDGET,
     )
     df = result.dataframe
     valid = _valid_mag_mask(*[df[magcols[b]] for b in dict.fromkeys([blue_band, red_band, mag_band])])
@@ -1133,7 +1333,11 @@ def color_magnitude_diagram(
     )
     return _render_diagram(plotting, fig, "datalab_cmd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
-                            "auto_validity_filters": _meta.get("auto_validity_filters")},
+                            "auto_validity_filters": _meta.get("auto_validity_filters"),
+                            # Platform-applied sample cap, stamped so it can
+                            # never read as a science choice (RE-B1).
+                            **({"platform_row_cap": int(_meta["platform_row_cap"])}
+                               if _meta.get("platform_row_cap") else {})},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "points": int(finite.sum()),
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "warnings": list(_meta.get("warnings") or []),

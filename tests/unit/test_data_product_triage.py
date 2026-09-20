@@ -52,7 +52,7 @@ _stub_module("core.agent_pool", AgentPool=_Dummy)
 _stub_module("core.context_manager", ContextManager=_Dummy)
 _stub_module("core.session_memory", SessionMemory=_Dummy)
 _stub_module("core.token_budget", TokenBudget=_Dummy, apply_tool_result_budget=lambda result, *args, **kwargs: result)
-_stub_module("core.health_monitor", HealthMonitor=_Dummy)
+_stub_module("core.health_monitor", HealthMonitor=_Dummy, get_health_monitor=_Dummy)
 _stub_module("core.prompts.lit_to_code", LIT_TO_CODE_PROMPT="")
 _stub_module("services.ads_auto_link", build_exact_project_paper_links=lambda *args, **kwargs: None)
 _stub_module("services.evidence_quality", annotate_web_source_evidence=lambda value: value, rank_web_sources=lambda value: value)
@@ -69,8 +69,15 @@ _stub_module("services.gcn_monitor", GCNAlertMonitor=_Dummy)
 _stub_module("services.notebook_gen", generate_analysis_notebook=lambda *args, **kwargs: {})
 _stub_module("services.pdf_processing", PDFProcessingService=_Dummy)
 _stub_module("services.fits_processing", FITSProcessingService=_Dummy)
+# The real band-token helpers: services.data_product_triage imports them at
+# module load (band_list is space-delimited, A-08), so the stub must carry them.
+import services.alma_science_queries as _real_asq  # noqa: E402
+
 _stub_module(
     "services.alma_science_queries",
+    band_tokens=_real_asq.band_tokens,
+    requested_bands=_real_asq.requested_bands,
+    row_matches_band=_real_asq.row_matches_band,
     LINE_REST_FREQ_GHZ={},
     bandwidth_switching_candidates=lambda *args, **kwargs: pd.DataFrame(),
     filter_band=lambda df, *args, **kwargs: df,
@@ -145,7 +152,8 @@ def test_project_picker_groups_options():
 
     assert list(picker["proposal_id"]) == ["2019.1.00001.S", "2021.1.00002.S"]
     assert picker.iloc[0]["member_ous_count"] == 2
-    assert picker.iloc[0]["observations"] == 2
+    assert picker.iloc[0]["rows"] == 2
+    assert "observations" not in picker.columns  # rows are coverage records, not observations
 
 
 def test_scan_intent_filter_keeps_target_rows():

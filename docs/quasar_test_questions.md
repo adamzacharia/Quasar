@@ -25,7 +25,7 @@ This document contains 50 pairs of questions and follow-ups to test Quasar's cap
 7. **Q:** "Search for the protoplanetary disk AS 209."
    * **Follow-up:** "Are any of these public data?"
 
-8. **Q:** "Find observations of NGC 1068."
+8. **Q:** "Find observations of IC 342."
    * **Follow-up:** "Sort them by observation date, newest first."
 
 9. **Q:** "Look for the quasar 3C 273."

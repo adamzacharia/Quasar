@@ -43,7 +43,7 @@ async def chat(request: ChatRequest, req: Request = None, authorization: Optiona
         _ip = (req.headers.get("x-forwarded-for", "").split(",")[0].strip()
                or (req.client.host if req.client else ""))
         cookie_token = read_auth_cookie(req)
-    return _stream_chat_response(
+    return await _stream_chat_response(
         request, authorization=authorization, client_ip=_ip, cookie_token=cookie_token
     )
 
@@ -72,6 +72,12 @@ async def chat_with_files(
     provider = detect_provider(selected_model)
     try:
         upload_llm_context = _build_llm_context_for_user(user_id)
+        model_providers = upload_llm_context.get("model_providers", {})
+        provider = model_providers.get(selected_model, provider)
+        if model_providers and selected_model not in model_providers and not selected_model.startswith("local/"):
+            return _sse_error_response("Model is not available. Refresh models or add a provider API key.")
+        if provider in {"anthropic", "google"} and not upload_llm_context["provider_api_keys"].get(provider):
+            return _sse_error_response("Add a provider API key to use this model.")
         upload_user_email = _current_user_email(current_user)
         upload_key_source = upload_llm_context["key_source_by_provider"].get(provider, "platform")
         usage_quota_service.ensure_allowed(
@@ -172,7 +178,7 @@ async def chat_with_files(
             for preview in mixed_document_previews:
                 enriched_text += preview
 
-    if image_contents and model_accepts_direct_image_input(selected_model):
+    if image_contents and provider == "openai":
         attachment_context = attachment_context or {
             "provider": provider,
             "attachments": [],
@@ -199,7 +205,7 @@ async def chat_with_files(
         grounded_summary=grounded_summary,
         web_search=web_search,
     )
-    return _stream_chat_response(
+    return await _stream_chat_response(
         req, authorization=auth_header, attachment_context=attachment_context,
         cookie_token=cookie_token,
     )

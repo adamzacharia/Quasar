@@ -7,26 +7,259 @@ import io
 import json
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.db import get_connection
+import math
+from typing import Callable, Iterable, Set, Tuple  # noqa: F401  (complements the typing imports above)
+
 from services.secret_redaction import redact_secrets
+from services.feedback_snapshot_service import FeedbackSnapshotService, build_snapshot
 
 
 RUN_STATUSES = {"started", "completed", "failed", "timed_out", "cancelled"}
 REPORT_STATUSES = {"new", "investigating", "resolved", "dismissed"}
 REPORT_CATEGORIES = {"stuck_slow", "wrong_answer", "incorrect_data", "ui_problem", "other"}
 MAX_CONTEXT_CHARS = 2000
+# Server-captured conversation context (stored only when the reporter consents).
+# The reported ANSWER may be longer than the prompt/description cap: a 2,000-char
+# excerpt cut most Quasar answers in half, which is exactly the part a
+# maintainer needs to read. The excerpt window is the reported answer plus the
+# turns leading up to it, so "this answer is wrong" arrives with the question,
+# the answer, and what came before.
+MAX_RESPONSE_CHARS = 6000
+MAX_EXCERPT_MESSAGES = 6
+MAX_EXCERPT_TOTAL_CHARS = 24000
+MAX_EXCERPT_TOOLS = 12
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _utf8_safe(value: str) -> str:
+    """Drop lone UTF-16 surrogates a JSON client can send (a string clipped in
+    the middle of an emoji). Python accepts them; SQLite cannot bind them, so
+    an otherwise valid report would fail at INSERT (verify follow-up to CX-07)."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "replace").decode("utf-8")
+
+
 def _clean_text(value: Any, limit: int = MAX_CONTEXT_CHARS) -> str:
-    return redact_secrets(str(value or "")).strip()[:limit]
+    return _utf8_safe(redact_secrets(str(value or ""))).strip()[:limit]
+
+
+MAX_DIAGNOSTICS_CHARS = 8000
+MAX_CLIENT_CONTEXT_KEYS = 24
+MAX_CLIENT_CONTEXT_VALUE_CHARS = 400
+
+
+def _bounded_client_context(technical_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Client-supplied diagnostics, bounded BEFORE serialization.
+
+    The client dict is untrusted input; capping keys and value lengths here
+    keeps the serialized diagnostics small enough that the row never has to be
+    cut mid-JSON (CX-05).
+    """
+    if not isinstance(technical_context, dict):
+        return {}
+    bounded: Dict[str, Any] = {}
+    for key in list(technical_context)[:MAX_CLIENT_CONTEXT_KEYS]:
+        value = technical_context[key]
+        # Keys are client strings too: redact and cap them, drop empties.
+        clean_key = _clean_text(key, 64)
+        if not clean_key:
+            continue
+        # Python's json parser accepts the non-standard NaN/Infinity tokens;
+        # a stored NaN cannot be re-serialised by the admin listing and would
+        # 500 it for every admin until the row expires. Treat as absent.
+        if isinstance(value, float) and not math.isfinite(value):
+            value = None
+        if isinstance(value, (int, float, bool)) or value is None:
+            bounded[clean_key] = value
+        else:
+            bounded[clean_key] = _clean_text(
+                value if isinstance(value, str) else json.dumps(value, default=str),
+                MAX_CLIENT_CONTEXT_VALUE_CHARS,
+            )
+    return bounded
+
+
+def _serialize_diagnostics(diagnostics: Dict[str, Any]) -> str:
+    """JSON for technical_context that always parses.
+
+    Never slices the serialized string (that produced unparsable JSON, and
+    list_reports then dropped the whole object, including the conversation
+    lookup error). Over budget, the client block is replaced by a marker and
+    long server strings are shortened; the mandatory keys survive (CX-05).
+    """
+    text = json.dumps(diagnostics, default=str)
+    if len(text) <= MAX_DIAGNOSTICS_CHARS:
+        return text
+    trimmed = dict(diagnostics)
+    trimmed["client"] = {"truncated": True}
+    for key in ("error_message", "last_status", "conversation_excerpt_error"):
+        if isinstance(trimmed.get(key), str):
+            trimmed[key] = trimmed[key][:500]
+    text = json.dumps(trimmed, default=str)
+    if len(text) <= MAX_DIAGNOSTICS_CHARS:
+        return text
+    tools = trimmed.get("tools_called")
+    if isinstance(tools, list):
+        trimmed["tools_called"] = tools[:50]
+        trimmed["tools_called_truncated"] = len(tools) > 50
+    return json.dumps(trimmed, default=str)
+
+
+def _message_run_id(message: Dict[str, Any]) -> str:
+    """run_id persisted on an assistant message (sse.py stores it under
+    metadata.runMeta.run_id); '' when absent or malformed."""
+    meta = message.get("metadata")
+    if not isinstance(meta, dict):
+        return ""
+    run_meta = meta.get("runMeta")
+    if not isinstance(run_meta, dict):
+        return ""
+    return str(run_meta.get("run_id") or "")
+
+
+def _message_tool_names(message: Dict[str, Any]) -> List[str]:
+    """Distinct tool names from a persisted toolTrace, in call order."""
+    meta = message.get("metadata")
+    if not isinstance(meta, dict):
+        return []
+    trace = meta.get("toolTrace")
+    if not isinstance(trace, list):
+        return []
+    names: List[str] = []
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("tool") or item.get("tool_name") or item.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= MAX_EXCERPT_TOOLS:
+            break
+    return names
+
+
+def _anchor_index(
+    messages: List[Dict[str, Any]], run_id: str, response_excerpt: str
+) -> Tuple[Optional[int], str]:
+    """(index, method) of the assistant message the report is about.
+
+    Preference order, with the method recorded so the admin view can show how
+    sure the match is: ``run_id`` (the persisted runMeta.run_id matches the
+    report's run; exact), ``answer_text`` (the latest assistant message whose
+    redacted text starts with the whole redacted client excerpt; legacy
+    history without runMeta), ``last_assistant`` (nothing matched; the latest
+    assistant message is the best guess). (None, "") when the conversation has
+    no assistant message.
+    """
+    if run_id:
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") == "assistant" and _message_run_id(msg) == run_id:
+                return idx, "run_id"
+    # The client excerpt arrives already secret-redacted (create_report cleans
+    # it), so compare against the persisted text redacted the same way, or a
+    # secret near the start would defeat the match (round-1 CX-03). The WHOLE
+    # excerpt is compared, not a 200-char prefix, so answers that share
+    # boilerplate openings stay distinguishable wherever they differ (CX-03).
+    probe = redact_secrets(str(response_excerpt or "")).strip()
+    if len(probe) >= 8:
+        matches: List[int] = []
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") != "assistant":
+                continue
+            persisted = redact_secrets(str(msg.get("content") or "")).strip()
+            if persisted.startswith(probe):
+                matches.append(idx)
+        if len(matches) == 1:
+            return matches[0], "answer_text"
+        if matches:
+            # Identical repeated answers ("Yes, done.", canned refusals) cannot
+            # be told apart by text: take the latest but say so, so the admin
+            # card labels it a guess rather than an exact match.
+            return matches[0], "answer_text_ambiguous"
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") == "assistant":
+            return idx, "last_assistant"
+    return None, ""
+
+
+def build_conversation_excerpt(
+    messages: List[Dict[str, Any]],
+    *,
+    run_id: str,
+    response_excerpt: str = "",
+    max_messages: int = MAX_EXCERPT_MESSAGES,
+    max_total_chars: int = MAX_EXCERPT_TOTAL_CHARS,
+) -> List[Dict[str, Any]]:
+    """The reported answer plus the turns leading up to it, redacted and capped.
+
+    Pure function over the conversation store's message dicts
+    (role/content/metadata[/created_at]); the reporter's consent is checked by
+    the caller. Each entry carries the role, redacted text, a ``truncated``
+    flag, ``is_reported_answer`` on the anchor, and the tool names the
+    assistant called when the persisted trace has them.
+    """
+    if not messages or max_messages < 1:
+        return []
+    anchor, anchor_method = _anchor_index(messages, run_id, response_excerpt)
+    if anchor is None:
+        return []
+    start = max(0, anchor - (max_messages - 1))
+    window = messages[start:anchor + 1]
+    # Redact first, then cap: ``truncated`` must mean "the cap cut text", not
+    # "a secret was redacted" (redaction also shortens the string).
+    prepared = [
+        (start + offset, msg, redact_secrets(str(msg.get("content") or "")).strip())
+        for offset, msg in enumerate(window)
+    ]
+    # Allocate the shared character budget NEWEST-FIRST: the reported answer,
+    # then the question that produced it, then earlier turns. Oldest-first
+    # allocation let four long earlier turns consume the whole budget and
+    # leave the question and the answer empty (CX-01).
+    budget = max(0, int(max_total_chars))
+    allocated: Dict[int, str] = {}
+    for idx, _msg, redacted in reversed(prepared):
+        limit = min(MAX_RESPONSE_CHARS, budget)
+        text = redacted[:limit] if limit > 0 else ""
+        budget -= len(text)
+        allocated[idx] = text
+    excerpt: List[Dict[str, Any]] = []
+    for idx, msg, redacted in prepared:
+        text = allocated[idx]
+        is_anchor = idx == anchor
+        if not text and redacted and not is_anchor:
+            # An earlier turn that received no budget is dropped rather than
+            # rendered as an empty block; the answer is always emitted.
+            continue
+        entry: Dict[str, Any] = {
+            "role": str(msg.get("role") or ""),
+            "content": text,
+            "truncated": len(redacted) > len(text),
+            "is_reported_answer": is_anchor,
+        }
+        if is_anchor:
+            # How the reported answer was identified; anything but "run_id"
+            # is a best-effort guess on legacy history (CX-03, CX-04).
+            entry["anchor_method"] = anchor_method
+        created_at = str(msg.get("created_at") or "")
+        if created_at:
+            entry["created_at"] = created_at
+        tools = _message_tool_names(msg)
+        if tools:
+            entry["tools"] = tools
+        excerpt.append(entry)
+    return excerpt
 
 
 class ChatDeadline:
@@ -92,12 +325,28 @@ class ChatDeadline:
 class IssueReportService:
     """Persist private run diagnostics and user-submitted issue reports."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        conversation_lookup: Optional[Callable[[str, str], Optional[List[Dict[str, Any]]]]] = None,
+        snapshot_lookup: Optional[Callable[[str, str], Optional[Dict[str, Any]]]] = None,
+    ):
         if db_path is None:
             root = Path(__file__).resolve().parent.parent
             db_path = str(root / "data" / "issue_reports.db")
         self._local_db_path = db_path
+        # Read-only accessor (conversation_id, user_id) -> messages, or None
+        # when the conversation does not belong to that user (api.deps injects
+        # ConversationService.get_conversation_messages_for_user). With it, a
+        # consenting report carries the real question, answer and surrounding
+        # turns from the server's own store instead of only the client's
+        # truncated excerpt, and only ever from the reporter's own
+        # conversation. Without it, reports degrade to the client excerpt and
+        # say so in technical_context.
+        self._conversation_lookup = conversation_lookup
+        self._snapshot_lookup = snapshot_lookup
         self._init_db()
+        self.snapshots = FeedbackSnapshotService(self._local_db_path)
 
     def _conn(self):
         return get_connection(self._local_db_path)
@@ -200,6 +449,7 @@ class IssueReportService:
                 provider TEXT,
                 trace_id TEXT,
                 technical_context TEXT,
+                conversation_excerpt TEXT,
                 status TEXT NOT NULL,
                 admin_notes TEXT,
                 created_at TEXT NOT NULL,
@@ -207,6 +457,26 @@ class IssueReportService:
             )
             """
         )
+        # Databases created before the server-side context capture lack the
+        # column; the ALTER is a no-op (swallowed) on fresh schemas. The
+        # follow-up SELECT distinguishes "already present" from a swallowed
+        # real failure (permissions, unsupported DDL) so a missing column is
+        # reported at startup instead of at the first INSERT (CX-08).
+        for migration in (
+            "ALTER TABLE issue_reports ADD COLUMN conversation_excerpt TEXT",
+        ):
+            try:
+                cur.execute(migration)
+            except Exception:
+                pass
+        try:
+            cur.execute("SELECT conversation_excerpt FROM issue_reports LIMIT 0")
+        except Exception as exc:
+            print(
+                "[ISSUE REPORTS] WARNING: issue_reports.conversation_excerpt is missing after "
+                f"migration; consenting reports will fail to store context: {exc}",
+                flush=True,
+            )
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_issue_reports_status_created
@@ -219,6 +489,9 @@ class IssueReportService:
             ON issue_reports(provider, model, created_at DESC)
             """
         )
+        # Join keys for the admin vote/report linkage (reports_exist_for).
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_issue_reports_message ON issue_reports(message_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_issue_reports_run ON issue_reports(run_id)")
 
     def start_run(
         self,
@@ -231,6 +504,7 @@ class IssueReportService:
         provider: str,
         key_source: str,
         client_ip: str = "",
+        return_row: bool = True,
     ) -> Dict[str, Any]:
         now = _utc_now()
         conn = self._conn()
@@ -260,7 +534,82 @@ class IssueReportService:
             conn.commit()
         finally:
             conn.close()
+        if not return_row:
+            # Insert-only mode (SSE chat path — it ignores the row): the
+            # cancel-safe start_run wrapper's guarantee "an unfinished
+            # start_fn committed no row" requires that NOTHING follows the
+            # commit — a post-commit get_run() hanging past the fallback
+            # window stranded the committed row in 'started' (guard CX-33).
+            return {}
         return self.get_run(run_id, user_id=user_id) or {}
+
+    def mark_run_cancelled_if_started(self, run_id: str) -> bool:
+        """Conditionally sweep ONE possibly-orphaned run row (guard CX-33).
+
+        The SSE cancel fallback calls this when the run insert's worker is
+        still unresponsive after the bounded wait: on Turso the server can
+        commit while the client hangs awaiting the HTTP response, so the row
+        may exist even though the inserting worker never reached its
+        finalize. This runs on its OWN connection (sees any server-side
+        commit), is a no-op when the commit never landed, and the
+        status='started' guard means it can never clobber a proper finalize
+        that got there first — which is why it may safely bypass the
+        finalize latch."""
+        now = _utc_now()
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                """
+                UPDATE chat_runs
+                SET status = 'cancelled', error_code = 'client_cancelled',
+                    error_message = 'cancelled while the run record was being created',
+                    updated_at = ?
+                WHERE id = ? AND status = 'started'
+                """,
+                (now, run_id),
+            )
+            conn.commit()
+            return bool(getattr(cur, "rowcount", 0))
+        finally:
+            conn.close()
+
+    def sweep_stale_started_runs(self, *, max_age_minutes: int = 30) -> int:
+        """Mark long-stale 'started' runs as failed (taskboard RUN-SWEEPER).
+
+        Deploy-level backstop behind the in-request lifecycle: process death,
+        a commit that became visible after the in-request sweep horizon
+        (~11 min — guard CX-33), or any other orphaning leaves rows stuck in
+        'started' forever, polluting run analytics. Runs at startup (and may
+        be called periodically); the age floor (20 min) must comfortably
+        exceed both the SSE hard cap (900 s) and the in-request sweep horizon
+        so it can never race a LIVE run. A stale started_at alone is NOT
+        proof of orphaning: update_run_activity heartbeats updated_at on
+        every tool step, so a run with a FRESH updated_at is live and must
+        never be swept (guard CX-10). Timestamps are ISO-8601 UTC strings,
+        so the cutoff comparisons are lexicographic; a NULL updated_at
+        (legacy rows) falls back to the started_at check alone."""
+        max_age_minutes = max(int(max_age_minutes), 20)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+        ).isoformat()
+        now = _utc_now()
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                """
+                UPDATE chat_runs
+                SET status = 'failed', error_code = 'orphaned',
+                    error_message = 'run never finalized (orphaned by a process death or a hung run-record insert)',
+                    updated_at = ?
+                WHERE status = 'started' AND started_at < ?
+                  AND (updated_at IS NULL OR updated_at < ?)
+                """,
+                (now, cutoff, cutoff),
+            )
+            conn.commit()
+            return int(getattr(cur, "rowcount", 0) or 0)
+        finally:
+            conn.close()
 
     def update_run_activity(
         self,
@@ -514,6 +863,32 @@ class IssueReportService:
             "cost_is_estimate": True,
         }
 
+    def build_feedback_snapshot(self, *, user_id: str, conversation_id: str,
+                                message_id: str, run_id: str = "",
+                                include_context: bool = False, description: str = ""):
+        """Fail closed on consent/ownership; keep filing feedback on store outages."""
+        if include_context is not True:
+            return None, ""
+        if self._snapshot_lookup is None:
+            return None, "Full conversation capture is not configured"
+        try:
+            run = self.get_run(run_id, user_id=user_id) if run_id else None
+            if run_id and not run:
+                return None, "Chat run does not belong to reporter"
+            conv_id = str(run.get("conversation_id") or "") if run else conversation_id
+            if not conv_id:
+                return None, "No owned conversation is linked to this feedback"
+            source = self._snapshot_lookup(conv_id, user_id)
+            if source is None:
+                return None, "Conversation does not belong to reporter or was deleted"
+            return build_snapshot(source=source, user_id=user_id, conversation_id=conv_id,
+                                  message_id=_clean_text(message_id, 128), run=run,
+                                  description=_clean_text(description)), ""
+        except Exception:
+            # Never put raw storage errors (which may contain credentials) in
+            # client responses or the capture-status field.
+            return None, "Conversation snapshot unavailable: storage read failed"
+
     def create_report(
         self,
         *,
@@ -527,11 +902,14 @@ class IssueReportService:
         response_excerpt: str = "",
         technical_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        include_context = include_context is True
         if category not in REPORT_CATEGORIES:
             raise ValueError("Unsupported issue category")
         description = _clean_text(description)
         if not description:
             raise ValueError("Issue description is required")
+        # Identifiers are client strings as well: cap, redact, make bindable.
+        message_id = _clean_text(message_id, 128)
         run = self.get_run(run_id, user_id=user_id)
         if not run:
             raise LookupError("Chat run not found")
@@ -539,29 +917,55 @@ class IssueReportService:
         report_id = str(uuid.uuid4())
         now = _utc_now()
         safe_prompt = _clean_text(prompt_excerpt) if include_context else ""
-        safe_response = _clean_text(response_excerpt) if include_context else ""
+        safe_response = _clean_text(response_excerpt, MAX_RESPONSE_CHARS) if include_context else ""
+        excerpt: List[Dict[str, Any]] = []
+        excerpt_error = ""
+        if include_context:
+            excerpt, excerpt_error = self._capture_conversation_excerpt(
+                conversation_id=run.get("conversation_id") or "",
+                run_id=run_id,
+                user_id=user_id,
+                response_excerpt=safe_response,
+            )
         diagnostics = {
             "run_status": run.get("status"),
             "key_source": run.get("key_source"),
             "duration_ms": run.get("duration_ms"),
             "tools_called": run.get("tools_called") or [],
-            "last_status": run.get("last_status"),
             "error_code": run.get("error_code"),
             "error_message": run.get("error_message"),
             "first_token_ms": run.get("first_token_ms"),
             "provider_chunk_count": run.get("provider_chunk_count"),
-            "client": technical_context or {},
+            "client": _bounded_client_context(technical_context),
         }
+        if include_context:
+            # The last SSE status label can embed tool arguments taken from the
+            # user's request (e.g. the target name), so it counts as
+            # conversation text and is stored only with consent.
+            diagnostics["last_status"] = run.get("last_status")
+        if excerpt_error:
+            diagnostics["conversation_excerpt_error"] = excerpt_error
+        snapshot, snapshot_error = self.build_feedback_snapshot(
+            user_id=user_id, conversation_id=run.get("conversation_id") or "",
+            message_id=message_id, run_id=run_id, include_context=include_context,
+            description=description,
+        )
+        if snapshot:
+            diagnostics["snapshot_id"] = snapshot["id"]
+        if snapshot_error:
+            diagnostics["snapshot_error"] = snapshot_error
         conn = self._conn()
         try:
+            if snapshot:
+                self.snapshots.insert(snapshot, conn=conn)
             conn.execute(
                 """
                 INSERT INTO issue_reports (
                     id, run_id, user_id, conversation_id, message_id, category,
                     description, include_context, prompt_excerpt, response_excerpt,
                     model, provider, trace_id, technical_context, status,
-                    admin_notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    admin_notes, created_at, updated_at, conversation_excerpt
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     report_id,
@@ -577,17 +981,88 @@ class IssueReportService:
                     run.get("model") or "",
                     run.get("provider") or "",
                     run.get("trace_id") or "",
-                    _clean_text(json.dumps(diagnostics, default=str), 8000),
+                    _serialize_diagnostics(diagnostics),
                     "new",
                     "",
                     now,
                     now,
+                    json.dumps(excerpt, default=str) if excerpt else "",
                 ),
             )
             conn.commit()
         finally:
             conn.close()
         return self.get_report(report_id) or {}
+
+    def _capture_conversation_excerpt(
+        self,
+        *,
+        conversation_id: str,
+        run_id: str,
+        user_id: str,
+        response_excerpt: str = "",
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """(excerpt, error) from the injected conversation store.
+
+        Never raises: a report must still be filed when the store is
+        unavailable, but the reason is recorded so the admin view can say
+        "context unavailable" instead of showing an empty box. The lookup is
+        ownership-scoped: the run row's conversation_id is trusted only as far
+        as the store confirms it belongs to the reporter.
+        """
+        if self._conversation_lookup is None:
+            return [], "conversation lookup not configured"
+        if not conversation_id:
+            return [], "run has no conversation_id"
+        try:
+            fetched = self._conversation_lookup(conversation_id, user_id)
+        except Exception as exc:  # store outage must not block the report
+            return [], _clean_text(f"conversation lookup failed: {exc}", 300)
+        if fetched is None:
+            return [], "conversation does not belong to reporter"
+        messages = list(fetched or [])
+        excerpt = build_conversation_excerpt(
+            messages, run_id=run_id, response_excerpt=response_excerpt
+        )
+        if not excerpt:
+            return [], "conversation has no persisted assistant message"
+        return excerpt, ""
+
+    def reports_exist_for(
+        self,
+        *,
+        message_ids: Iterable[Any] = (),
+        run_ids: Iterable[Any] = (),
+        by_user: bool = False,
+    ) -> Dict[str, Set[str]]:
+        """Which of the given message ids / run ids already have an issue report.
+
+        Exact lookups over the caller's ids (chunked IN queries on indexed
+        columns) instead of a capped global DISTINCT scan, which produced
+        false negatives once more than the cap had reports (CX-04). The
+        run id is the stable key: a message's client id changes between the
+        live turn and a reload (CX-02).
+        """
+        found: Dict[str, Set[str]] = {"message_ids": set(), "run_ids": set()}
+        conn = self._conn()
+        try:
+            for column, values, key in (
+                ("message_id", message_ids, "message_ids"),
+                ("run_id", run_ids, "run_ids"),
+            ):
+                ids = [str(v) for v in (values or []) if v]
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT DISTINCT {column}, user_id FROM issue_reports WHERE {column} IN ({placeholders})",
+                        tuple(chunk),
+                    ).fetchall()
+                    found[key].update((str(row[1] or ""), str(row[0])) if by_user else str(row[0])
+                                      for row in rows if row and row[0])
+        finally:
+            conn.close()
+        return found
 
     def get_report(self, report_id: str) -> Optional[Dict[str, Any]]:
         rows = self.list_reports(report_id=report_id, limit=1)
@@ -632,7 +1107,7 @@ class IssueReportService:
                 SELECT id, run_id, user_id, conversation_id, message_id, category,
                        description, include_context, prompt_excerpt, response_excerpt,
                        model, provider, trace_id, technical_context, status,
-                       admin_notes, created_at, updated_at
+                       admin_notes, created_at, updated_at, conversation_excerpt
                 FROM issue_reports
                 {where}
                 ORDER BY created_at DESC
@@ -647,15 +1122,32 @@ class IssueReportService:
             "category", "description", "include_context", "prompt_excerpt",
             "response_excerpt", "model", "provider", "trace_id",
             "technical_context", "status", "admin_notes", "created_at", "updated_at",
+            "conversation_excerpt",
         ]
         results = []
         for row in rows:
             item = dict(zip(keys, row))
             item["include_context"] = bool(item["include_context"])
+            # parse_constant only fires for NaN/Infinity/-Infinity: a row
+            # poisoned before the write-side guard existed must not take the
+            # whole listing down (JSONResponse refuses non-finite floats).
             try:
-                item["technical_context"] = json.loads(item["technical_context"] or "{}")
+                item["technical_context"] = json.loads(
+                    item["technical_context"] or "{}", parse_constant=lambda _c: None
+                )
             except (TypeError, json.JSONDecodeError):
                 item["technical_context"] = {}
+            if not isinstance(item["technical_context"], dict):
+                item["technical_context"] = {}
+            item["snapshot_id"] = item["technical_context"].get("snapshot_id", "")
+            item["snapshot_error"] = item["technical_context"].get("snapshot_error", "")
+            try:
+                parsed_excerpt = json.loads(
+                    item.get("conversation_excerpt") or "[]", parse_constant=lambda _c: None
+                )
+            except (TypeError, json.JSONDecodeError):
+                parsed_excerpt = []
+            item["conversation_excerpt"] = parsed_excerpt if isinstance(parsed_excerpt, list) else []
             results.append(item)
         return results
 
@@ -697,12 +1189,13 @@ class IssueReportService:
             "id", "created_at", "status", "category", "description", "provider",
             "model", "run_id", "trace_id", "conversation_id", "message_id",
             "include_context", "prompt_excerpt", "response_excerpt",
-            "technical_context", "admin_notes",
+            "conversation_excerpt", "technical_context", "admin_notes",
         ]
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             record = dict(row)
             record["technical_context"] = json.dumps(record.get("technical_context") or {})
+            record["conversation_excerpt"] = json.dumps(record.get("conversation_excerpt") or [])
             writer.writerow(record)
         return output.getvalue()

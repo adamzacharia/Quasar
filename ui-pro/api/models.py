@@ -7,7 +7,7 @@ SSE pipeline can import them without risk of a circular import.
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 
 class ChatRequest(BaseModel):
@@ -124,7 +124,7 @@ class IssueReportCreateRequest(BaseModel):
     message_id: str
     category: str
     description: str
-    include_context: bool = False
+    include_context: StrictBool = False
     prompt_excerpt: Optional[str] = ""
     response_excerpt: Optional[str] = ""
     technical_context: Optional[Dict[str, Any]] = None

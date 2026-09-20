@@ -29,6 +29,7 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "facility": {"type": "string", "enum": ["VLA", "VLBA", "ALMA", "GBT"], "description": "Observatory facility. Default to ALMA."},
                 "band": {"type": "string", "description": "ALMA band number(s) to filter (3-10). Pass a single band like '6' or multiple like '6,7'."},
                 "scan_intent": {"type": "string", "description": "ALMA scan intent to filter, such as TARGET, BANDPASS, PHASE, FLUX, or WVR. ONLY pass if user explicitly asks for a scan intent."},
+                "public_only": {"type": "boolean", "description": "ALMA: only public rows (data_rights = 'Public'). Default false."},
                 "max_results": {"type": "integer", "description": "Maximum results to return"}
             },
             "required": ["ra", "dec"]
@@ -39,7 +40,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         name="search_by_target",
         description=(
             "Search the ALMA archive (default) by target name. Supports multiple targets "
-            "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, NGC 1068').\n"
+            "separated by 'and' or comma (e.g. 'M87 and Sz65' or 'M87, IC 342').\n"
             "Pass facility='VLA', 'VLBA', or 'GBT' to search the NRAO archive instead — "
             "ONLY when the user explicitly asks for those telescopes.\n"
             "CRITICAL: ONLY pass optional filter parameters (band, resolution, frequency, scan_intent) "
@@ -53,7 +54,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         parameters={
             "type": "object",
             "properties": {
-                "target_name":    {"type": "string",  "description": "Astronomical target name (e.g. 'TW Hya', 'HL Tau'). For multiple targets use comma or 'and': 'M87, NGC 1068'."},
+                "target_name":    {"type": "string",  "description": "Astronomical target name (e.g. 'TW Hya', 'HL Tau'). For multiple targets use comma or 'and': 'M87, IC 342'."},
                 "facility":       {"type": "string",  "enum": ["ALMA", "VLA", "VLBA", "GBT"], "description": "Observatory. Default ALMA."},
                 "band":           {"type": "string", "description": "ALMA band number(s) to filter (3-10). For a single band pass '6'. For multiple bands pass comma-separated like '6,7'. ONLY pass if user explicitly asks for a specific band."},
                 "max_resolution": {"type": "number",  "description": "Maximum angular resolution in arcsec. ONLY pass if user specifies."},
@@ -62,7 +63,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "max_freq_ghz":   {"type": "number",  "description": "Maximum frequency in GHz. ONLY pass if user specifies."},
                 "min_exp_s":      {"type": "number",  "description": "Minimum integration time in seconds. ONLY pass if user specifies."},
                 "scan_intent":    {"type": "string",  "description": "ALMA scan intent to filter, such as TARGET, BANDPASS, PHASE, FLUX, or WVR. ONLY pass if user explicitly asks for a scan intent."},
-                "public_only":    {"type": "boolean", "description": "Only return publicly available data."},
+                "public_only":    {"type": "boolean", "description": "Only return publicly available data (adds data_rights = 'Public'). Default false: proprietary rows are returned and labelled by data_rights."},
+                "date_range":     {"type": "string",  "description": "Observation-date window applied on t_min/t_max (MJD), e.g. '2019-01-01 to 2020-06-30', '2021', 'since 2022-03'. ONLY pass if the user asks."},
             },
             "required": ["target_name"]
         }
@@ -70,7 +72,11 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="search_by_frequency",
-        description="Search archives by frequency range. Defaults to ALMA; pass facility='VLA'/'VLBA'/'GBT' for the NRAO archive.",
+        description=(
+            "Search archives by frequency range. Defaults to ALMA (em_min/em_max wavelength overlap over "
+            "ivoa.obscore, TOP max_results rows, truncation disclosed); pass facility='VLA'/'VLBA'/'GBT' "
+            "for the NRAO archive."
+        ),
         function=agent._alma_tool_fn("search_by_frequency", log_name="_search_by_frequency"),
         parameters={
             "type": "object",
@@ -78,7 +84,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "min_freq_ghz": {"type": "number", "description": "Minimum frequency in GHz"},
                 "max_freq_ghz": {"type": "number", "description": "Maximum frequency in GHz"},
                 "facility": {"type": "string", "enum": ["ALMA", "VLA", "VLBA", "GBT"], "description": "Observatory facility. Default ALMA."},
-                "max_results": {"type": "integer", "description": "Max results"}
+                "max_results": {"type": "integer", "description": "Row cap (TOP). Default 5000; the result says whether it was hit."},
+                "public_only": {"type": "boolean", "description": "ALMA: only public rows (data_rights = 'Public'). Default false."},
             },
             "required": ["min_freq_ghz", "max_freq_ghz"]
         }
@@ -109,12 +116,16 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="get_observation_details",
-        description="Get detailed information about a specific observation",
+        description=(
+            "Look one ALMA identifier up in ivoa.obscore — a MOUS UID (uid://A001/...), an execution-block/"
+            "ASDM UID (uid://A002/...), an obs_publisher_did or a project code — and return the matching rows "
+            "aggregated to rows / MOUS / EBs with bands, targets, data_rights, release dates and QA2 flags."
+        ),
         function=agent._alma_tool_fn("get_observation_details"),
         parameters={
             "type": "object",
             "properties": {
-                "obs_id": {"type": "string", "description": "Observation ID or execution block ID"}
+                "obs_id": {"type": "string", "description": "MOUS UID (uid://A001/...), EB/ASDM UID (uid://A002/...), obs_publisher_did, or project code (2019.1.00123.S)."}
             },
             "required": ["obs_id"]
         }
@@ -177,12 +188,18 @@ def register_tools(agent: "QuasarAgent") -> None:
             "Execute a custom ADQL/TAP query directly on the ALMA Science Archive (ivoa.obscore table).\n"
             "ALMA ONLY — NOT for NOIRLab Data Lab catalogs (gaia_dr3/des_dr1/desi_dr1/nsc_dr2/smash/...): "
             "use datalab_sql_query for those.\n"
-            "IMPORTANT: The obscore table has NO 'redshift' column. Use frequency/bandwidth containment instead.\n"
-            "To find observations covering a specific frequency nu_ghz:\n"
-            "  WHERE (frequency - 0.5*bandwidth/1e9) < {nu_ghz} AND (frequency + 0.5*bandwidth/1e9) > {nu_ghz}\n"
-            "Key columns: target_name, s_ra, s_dec, frequency (GHz), bandwidth (Hz), scientific_category,\n"
-            "  science_keyword, proposal_id, member_ous_uid, t_exptime, s_resolution, band_list.\n"
-            "Add OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY to limit results."
+            "IMPORTANT: obscore has NO 'redshift' column. Frequency coverage of nu_ghz: prefilter on the "
+            "wavelength columns (METERS) — WHERE em_min <= 0.299792458/{nu_hi} AND em_max >= 0.299792458/{nu_lo} — "
+            "then confirm exact SPW coverage from frequency_support; frequency +/- bandwidth/2 is WRONG "
+            "(bandwidth is aggregate Hz over non-contiguous SPWs).\n"
+            "Rows repeat per EB/field/SPW: use COUNT(DISTINCT member_ous_uid) for datasets and "
+            "COUNT(DISTINCT asdm_uid) for executions. Cone: INTERSECTS(CIRCLE('ICRS',ra,dec,r), s_region) = 1 "
+            "OR CONTAINS(POINT('ICRS',s_ra,s_dec), CIRCLE('ICRS',ra,dec,r)) = 1 (keeps NULL/TP footprints). "
+            "band_list is space-delimited ('5 10'): match tokens. Public: data_rights = 'Public'.\n"
+            "Key columns: target_name, s_ra, s_dec, s_region, frequency (GHz), bandwidth (Hz), frequency_support, "
+            "em_min/em_max (m), proposal_id, member_ous_uid, asdm_uid, t_exptime, s_resolution, band_list, "
+            "data_rights, obs_release_date, qa2_passed (T/F only), access_url (DataLink URL).\n"
+            "Limit rows with SELECT TOP 500 (ADQL 2.0; OFFSET/FETCH is not supported)."
         ),
         function=agent._alma_tool_fn("advanced_search"),
         parameters={
@@ -197,14 +214,15 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(Tool(
         name="search_alma_co_in_redshift_range",
         description=(
-            "Search the ALMA archive for observations that cover CO emission lines "
-            "for galaxies at a given redshift range. Handles the CO rest-frequency → "
-            "observed-frequency conversion and TAP frequency-containment query automatically. "
+            "Search the ALMA archive for observations whose spectral windows cover CO emission lines "
+            "for galaxies at a given redshift range. Converts CO rest frequencies to observed frequencies, "
+            "prefilters on the em_min/em_max wavelength span and then verifies EXACT per-SPW coverage from "
+            "frequency_support (not frequency +/- bandwidth/2). "
             "Use this for any query like 'galaxies at z=1-2 with CO coverage' or "
             "'ALMA CO detections at high redshift'.\n"
             "CO transitions checked: J=1-0 (115.3 GHz), J=2-1 (230.5), J=3-2 (345.8), "
-            "J=4-3 (461.0), J=5-4 (576.3), J=6-5 (691.5), J=7-6 (806.7).\n"
-            "Returns: target_name, proposal_id, CO_transition, obs_frequency_ghz, bandwidth_ghz."
+            "J=4-3 (461.0), J=5-4 (576.3), J=6-5 (691.5), J=7-6 (806.7), J=8-7 (921.8).\n"
+            "Returns rows/MOUS/EB counts plus per-row CO_transitions_covered, covering_spw_ghz, coverage_method."
         ),
         function=agent._alma_tool_fn("search_alma_co_in_redshift_range"),
         parameters={
@@ -253,9 +271,14 @@ def register_tools(agent: "QuasarAgent") -> None:
                     "description": "Specific ALMA science/archive query template to run."
                 },
                 "cycle": {"type": "integer", "description": "ALMA cycle number, e.g. 10."},
-                "target": {"type": "string", "description": "Target/source name, e.g. HH212."},
-                "band": {"type": "integer", "description": "ALMA band number, e.g. 6 or 7."},
-                "max_resolution_arcsec": {"type": "number", "description": "Maximum angular resolution in arcsec for high-resolution data."},
+                "target": {"type": "string", "description": "Target/source name to resolve for a positional cone."},
+                "band": {"type": "array", "items": {"type": "integer"}, "description": "ALMA band numbers to include (OR filter), e.g. [6] or [6, 7]. Always a list, even for a single band."},
+                "ra": {"type": "number", "description": "Optional explicit ICRS RA in degrees; supply with dec."},
+                "dec": {"type": "number", "description": "Optional explicit ICRS declination in degrees."},
+                "radius_arcsec": {"type": "number", "default": 60, "description": "Positional cone radius in arcseconds."},
+                "public_only": {"type": "boolean", "description": "Restrict to public observations when requested."},
+                "science_only": {"type": "boolean", "description": "Restrict to science observations when requested."},
+                "max_resolution_arcsec": {"type": "number", "description": "high_resolution_band_data: angular-resolution ceiling in arcsec (e.g. 1.0 for '<1 arcsec'). No cut is applied when omitted — pass the user's threshold."},
                 "arrays": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -345,12 +368,22 @@ def register_tools(agent: "QuasarAgent") -> None:
     
     agent.tool_registry.register(Tool(
         name="download_alma_data",
-        description="Download ALMA data (FITS) for current results",
+        description=(
+            "Download the FITS products of ALMA MOUSs onto the Quasar SERVER (not the user's machine) after a "
+            "DataLink byte preflight. Pass explicit mous_uids (from a search); without them only a small set "
+            "of MOUSs from the last search is accepted. Refuses when the known total exceeds max_gb (default "
+            "5 GB), when free disk is insufficient, or when sizes are unknown unless confirm_large=true. "
+            "dry_run=true reports the preflight only. Web users should normally use the per-row Download "
+            "links in the results table instead."
+        ),
         function=agent._alma_tool_fn("download_alma_data"),
         parameters={
             "type": "object",
             "properties": {
-                "dry_run": {"type": "boolean", "description": "If true, only simulates download. Default False.", "default": False}
+                "dry_run": {"type": "boolean", "description": "Preflight and report only; download nothing. Default false."},
+                "mous_uids": {"type": "array", "items": {"type": "string"}, "description": "Explicit Member OUS UIDs to download (uid://A001/...)."},
+                "confirm_large": {"type": "boolean", "description": "Accept downloads whose sizes DataLink cannot report. Default false."},
+                "max_gb": {"type": "number", "description": "Byte cap for the known FITS total in GB. Default 5."},
             },
             "required": []
         }
@@ -928,7 +961,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         parameters={
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "Astronomical target name (e.g., 'NGC 1068', 'Eta Carinae')"},
+                "target_name": {"type": "string", "description": "Astronomical target name (e.g., 'IC 342', 'Eta Carinae')"},
                 "instrument": {"type": "string", "description": "ESO instrument (e.g., 'MUSE', 'KMOS', 'XSHOOTER', 'FORS2', 'HAWK-I', 'UVES', 'SPHERE')"},
                 "ra": {"type": "number", "description": "RA in degrees (use instead of target_name)"},
                 "dec": {"type": "number", "description": "Dec in degrees (use instead of target_name)"},
@@ -967,9 +1000,18 @@ def register_tools(agent: "QuasarAgent") -> None:
         name="datalab_list_catalogs",
         description=(
             "List NOIRLab Astro Data Lab catalogs. Default scope='registered' returns the curated, "
-            "registry-governed subset (best structured-builder support) and says so; scope='all' also "
-            "queries the live tap_schema for the COMPLETE schema list with descriptions, marking which "
-            "are registry-governed (degrades to the curated list, with a note, if the service is unreachable)."
+            "registry-governed subset (best structured-builder support; a small slice of the full Data "
+            "Lab schema set, and the result says so); scope='all' also queries the live tap_schema for "
+            "the COMPLETE schema list with descriptions, marking which are registry-governed (degrades "
+            "to the curated list, with a note, if the service is unreachable). Rows carry structured "
+            "`bands`, `wavelength_regime`, and `coverage` metadata. For a specific target/position, pass "
+            "`target` (or `ra`+`dec`) and the tool curates for you: known-covering catalogs ranked "
+            "first, unknown coverage labeled 'coverage unverified for this position', known "
+            "non-covering catalogs excluded into `excluded_by_coverage` with reasons — never present "
+            "those as covering the position. Pass `band` (e.g. 'g', 'w1', 'ks') to keep only catalogs "
+            "listing that photometric band. With scope='all', position/band curation still applies "
+            "ONLY to the curated `catalogs` rows; the live `schemas` inventory has no coverage "
+            "metadata and is always returned unfiltered."
         ),
         function=agent._datalab_tool_fn("datalab_list_catalogs"),
         parameters={
@@ -978,6 +1020,16 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "scope": {
                     "type": "string", "enum": ["registered", "all"], "default": "registered",
                     "description": "'registered' = curated governed subset; 'all' = complete live Data Lab schema inventory.",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Astronomical target name (e.g. 'LMC', 'M31') — resolved to a position, then catalogs are filtered/ranked by footprint coverage there.",
+                },
+                "ra": {"type": "number", "description": "RA in decimal degrees (ICRS). Use with dec instead of target."},
+                "dec": {"type": "number", "description": "Dec in decimal degrees (ICRS). Use with ra instead of target."},
+                "band": {
+                    "type": "string",
+                    "description": "Photometric band filter (e.g. 'u', 'g', 'r', 'i', 'z', 'j', 'h', 'ks', 'w1'..'w4'); keeps only catalogs listing that band.",
                 },
             },
             "required": [],
@@ -995,6 +1047,15 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(
         _build_schema_tool(_BrowseSchema(), _SchemaCallContext)
     )
+
+    # ── ALMA on-demand guidance + three-state QA2 (INT-6 / INT-4) ──────────
+    # Progressive disclosure: the system prompt carries the ~300-token ALMA
+    # kernel; the vendored skill's reference sections are served by
+    # browse_alma_guidance(topic) only when needed. get_alma_qa2_status reads
+    # the QA2 report PDF the qa2_passed flag cannot stand in for.
+    from capabilities.alma_guidance import CAPABILITIES as _ALMA_GUIDANCE_CAPS
+    for _cap in _ALMA_GUIDANCE_CAPS:
+        agent.tool_registry.register(_build_schema_tool(_cap, _SchemaCallContext))
 
     agent.tool_registry.register(Tool(
         name="datalab_describe_table",
@@ -1042,10 +1103,10 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "dec": {"type": "number"},
                 "radius_deg": {"type": "number"},
                 "columns": {"type": "array", "items": {"type": "string"}},
-                "limit": {"type": "integer", "default": 500, "description": "Row-budget cap (cost governance, not a science cut); truncation is flagged in the result."},
+                "limit": {"type": "integer", "description": "OPTIONAL row-budget cap. Omit unless the user asked for a specific sample size — the platform then applies its own cap (default 500) and flags it in warnings/provenance as governance, not science."},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'parallax_over_error','op':'>','value':5}]"},
                 "color_cut": {"type": "object", "description": "{'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
-                "morphology": {"type": "object", "description": "Star cut e.g. {'column':'class_star','op':'>','value':0.5}; DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}"},
+                "morphology": {"type": "object", "description": "Morphology cut. class_star-style probabilities use ~0.5-0.9 thresholds (star cut {'column':'class_star','op':'>','value':0.5} — 0.5 applies to class_star ONLY). DES uses spread_model at the ~0.003 scale (galaxy cut {'column':'spread_model_r','op':'>','value':0.003}); NEVER put 0.5 on spread_model."},
                 "async_submit": {"type": "boolean", "default": False, "description": "Submit as a background job and return job_id immediately (server-side with DATALAB_TOKEN, else local); poll datalab_job_status."},
             },
             "required": ["catalog", "table", "ra", "dec", "radius_deg"],
@@ -1071,8 +1132,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "all_sky": {"type": "boolean", "default": False, "description": "Explicitly run an unbounded whole-catalog aggregate (slow/expensive)."},
                 "color_cut": {"type": "object", "description": "e.g. {'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'gmag','op':'>','value':19.5}]"},
-                "morphology": {"type": "object", "description": "Star cut e.g. {'column':'class_star','op':'>','value':0.5}; DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}"},
-                "limit": {"type": "integer", "default": 5000, "description": "Row-budget cap on returned cells (cost governance, not a science cut)."},
+                "morphology": {"type": "object", "description": "Morphology cut. class_star-style probabilities use ~0.5-0.9 thresholds (star cut {'column':'class_star','op':'>','value':0.5} — 0.5 applies to class_star ONLY). DES uses spread_model at the ~0.003 scale (galaxy cut {'column':'spread_model_r','op':'>','value':0.003}); NEVER put 0.5 on spread_model."},
+                "limit": {"type": "integer", "description": "OPTIONAL cap on returned cells. Omit unless the user asked for one — the platform applies its own cap (5000) and flags it in warnings/provenance as governance, not science."},
                 "async_submit": {"type": "boolean", "default": False, "description": "Submit as a background job and return job_id immediately (skips the sync attempt and auto-tiling); poll datalab_job_status."},
             },
             "required": ["catalog", "table"],
@@ -1099,7 +1160,7 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "radius_deg": {"type": "number", "default": 0.2},
                 "band": {"type": "string", "description": "Optional single filter (e.g. 'g') to restrict epochs to one band."},
                 "min_epochs": {"type": "integer", "default": 10, "description": "Minimum epochs per object (>=2)."},
-                "limit": {"type": "integer", "default": 100},
+                "limit": {"type": "integer", "description": "OPTIONAL cap on ranked candidates. Omit unless the user asked for one — the platform applies its own cap (100) and flags it in warnings/provenance as governance, not science."},
             },
             "required": [],
         },
@@ -1121,7 +1182,7 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "source_id": {"type": "string", "description": "SMASH source id (from datalab_variable_candidates)."},
                 "ra": {"type": "number", "description": "Exact position alternative to source_id."},
                 "dec": {"type": "number"},
-                "limit": {"type": "integer", "default": 500},
+                "limit": {"type": "integer", "description": "OPTIONAL cap on returned epochs. Omit unless the user asked for one — the platform applies its own cap (500) and flags it in warnings/provenance as governance, not science."},
             },
             "required": [],
         },
@@ -1145,8 +1206,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "match_radius_arcsec": {"type": "number", "default": 1.0},
                 "small_columns": {"type": "array", "items": {"type": "string"}},
                 "big_columns": {"type": "array", "items": {"type": "string"}},
-                "small_limit": {"type": "integer", "default": 10000},
-                "limit": {"type": "integer", "default": 500},
+                "small_limit": {"type": "integer", "description": "OPTIONAL pre-join cap on the small-side CTE. Omit unless the user asked for one — the platform applies its own cap (10000) and flags it in the SQL and provenance as governance, not science."},
+                "limit": {"type": "integer", "description": "OPTIONAL cap on returned matches. Omit unless the user asked for one — the platform applies its own cap (500) and flags it as governance, not science."},
             },
             "required": ["ra", "dec", "radius_deg"],
         },
@@ -1195,10 +1256,21 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(Tool(
         name="datalab_sia_search",
         description=(
-            "List the Data Lab SIA image inventory covering a position: bands, exposure "
-            "times, proc/prod types, and access URLs, stored under a result_id. Use this to "
-            "see what imaging exists (and how deep) BEFORE datalab_image_cutout / "
-            "datalab_color_image; fetch rows with datalab_get_result."
+            "List the NOIRLab image inventory (SIA) covering a position: obs_bandpass, exptime, "
+            "proctype/prodtype and access_url per image, stored under a result_id. With no catalog, "
+            "service or endpoint specified, defaults to the archive-wide 'nsa' collection. Only restrict "
+            "to a survey catalog/coadd collection when the user requests that survey; do not invent "
+            "a survey filter for an archive-wide image search. Choose the "
+            "collection first: service='nsa' = the NOIRLab Science Archive, i.e. ALL archived images "
+            "from every NOIRLab telescope/instrument/program (raw, calibrated and Stack products); "
+            "service='coadd_all' = survey coadd/mosaic tiles only (Legacy Surveys, DES, DELVE, ...), a different "
+            "product family from the archive's per-program stacked images, which are proctype='Stack' rows "
+            "inside 'nsa' (the result's inventory.stack_images_per_band shows them) - 'stacked images in the "
+            "NOIRLab Science Archive' means those 'nsa' Stack rows, NOT coadd_all; catalog=<survey id> prefers "
+            "that survey's registered endpoint, which may be shared: check obs_collection/assoc_id for the actual survey. "
+            "deepest_per_band=true with bands=[...] returns the longest-exposure "
+            "Stack/image row per requested band, selected before any row limit. Use this BEFORE "
+            "datalab_image_cutout / datalab_color_image; fetch rows with datalab_get_result."
         ),
         function=agent._datalab_tool_fn("datalab_sia_search"),
         parameters={
@@ -1209,8 +1281,11 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "target_name": {"type": "string", "description": "Optional target name to resolve if ra/dec are not supplied."},
                 "fov_deg": {"type": "number", "default": 0.1, "description": "Search field of view in degrees."},
                 "band": {"type": "string", "description": "Optional band prefix filter (e.g. g, r, i)."},
-                "catalog": {"type": "string", "description": "Registered Data Lab catalog used to choose the SIA endpoint."},
+                "catalog": {"type": "string", "description": "Survey catalog id (e.g. a Legacy Surveys or DES release) ONLY when the user asks for that survey's images. It narrows the search to that survey's coadd/tile endpoint, a different product family from the archive-wide Stack products, so never add it to an archive-wide request such as 'the deepest stacked images in the archive': omit catalog and service and the archive-wide collection is searched. Ignored when service is given."},
                 "endpoint": {"type": "string", "description": "Optional explicit SIA endpoint override."},
+                "service": {"type": "string", "enum": ["nsa", "coadd_all"], "description": "Image collection. 'nsa' = the NOIRLab Science Archive itself, archive-wide (the default when neither catalog nor endpoint is given; holds every program's raw, calibrated and Stack images - 'the deepest stacked images in the NOIRLab Science Archive' are its proctype='Stack' rows). 'coadd_all' = Data Lab's survey coadd/mosaic tiles (DES, Legacy Surveys, DELVE, ...), a separate service: use it only when the user names one of those surveys or asks for survey tiles; 'stacked' alone does not mean coadd_all. Takes precedence over catalog; explicit selections never fall back to a different collection."},
+                "deepest_per_band": {"type": "boolean", "description": "Return the longest-exposure Stack/image row per requested band, selected BEFORE the row limit."},
+                "bands": {"type": "array", "items": {"type": "string"}, "description": "Requested optical bands for deepest_per_band selection."},
                 "limit": {"type": "integer", "default": 100, "description": "Max inventory rows kept, capped at 1000."},
             },
             "required": [],
@@ -1220,7 +1295,7 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="datalab_image_cutout",
-        description="Render a single-band NOIRLab Astro Data Lab SIA cutout at RA/Dec or a resolvable target name.",
+        description="Render a single-band NOIRLab Astro Data Lab SIA cutout at ONE RA/Dec or a resolvable target name. For cutouts of SEVERAL positions/peaks sharing one band/catalog/FOV, do NOT call this repeatedly — make one datalab_cutout_grid call with all peaks instead (repeat per-target calls only when targets genuinely need different bands, FOVs, or catalogs).",
         function=agent._datalab_image_tool_fn("datalab_image_cutout"),
         parameters={
             "type": "object",
@@ -1272,7 +1347,7 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="datalab_cutout_grid",
-        description="Render a multi-panel Data Lab SIA cutout grid for peak coordinates; panels without coverage are labeled instead of failing the grid.",
+        description="Render a multi-panel Data Lab SIA cutout grid for peak coordinates; panels without coverage are labeled instead of failing the grid. Prefer ONE call to this tool over repeated datalab_image_cutout calls whenever the positions share one band/catalog/FOV (e.g. density peaks); positions needing different bands/FOVs/catalogs still take separate calls.",
         function=agent._datalab_image_tool_fn("datalab_cutout_grid"),
         parameters={
             "type": "object",
@@ -1463,8 +1538,8 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "step_deg": {"type": "number", "default": 0.05},
                 "color_cut": {"type": "object", "description": "e.g. {'bands':['gmag','rmag'],'min':-0.5,'max':0.5}"},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "e.g. [{'column':'gmag','op':'<','value':25}]"},
-                "morphology": {"type": "object", "description": "e.g. {'column':'class_star','op':'>','value':0.5}, {'column':'ext_coadd','between':[0,1]}, or the DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}"},
-                "top_n": {"type": "integer", "default": 5},
+                "morphology": {"type": "object", "description": "Morphology cut. class_star-style: {'column':'class_star','op':'>','value':0.5} (0.5 is class_star-ONLY); DELVE {'column':'ext_coadd','between':[0,1]}; DES spread_model works at the ~0.003 scale ({'column':'spread_model_r','op':'>','value':0.003} = galaxies) — NEVER 0.5 on spread_model."},
+                "top_n": {"type": "integer", "default": 5, "maximum": 50},
                 "fov_deg": {"type": "number", "default": 0.05},
                 "band": {"type": "string", "default": "g"},
             },
@@ -1474,7 +1549,7 @@ def register_tools(agent: "QuasarAgent") -> None:
     ))
     agent.tool_registry.register(Tool(
         name="datalab_color_color_diagram",
-        description="ONE-SHOT color-color diagram (e.g. g-r vs r-i) for a catalog cone. Queries + plots in a single call; auto-splits into stars vs galaxies (2 panels) using the catalog's morphology column (e.g. DES spread_model_r) unless split_col is given. Sentinel magnitudes (99.99) are excluded automatically. Use this for 'show me a color-color diagram'/'separate stars from galaxies' requests — do NOT chain separate query+plot tools.",
+        description="ONE-SHOT color-color diagram (e.g. g-r vs r-i) for a catalog cone. Queries + plots in a single call; auto-splits into stars vs galaxies (2 panels) using the catalog's morphology column (e.g. DES spread_model_r) unless split_col is given. Sentinel magnitudes (99/-99 padding) are excluded automatically by a -5 < mag < 50 validity guard — sentinel removal, not a science cut; never present it as one. Use this for 'show me a color-color diagram'/'separate stars from galaxies' requests — do NOT chain separate query+plot tools.",
         function=agent._datalab_image_tool_fn("datalab_color_color_diagram"),
         parameters={
             "type": "object",
@@ -1488,10 +1563,10 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "x_bands": {"type": "array", "items": {"type": "string"}, "description": "Two bands for the x color, e.g. ['g','r']."},
                 "y_bands": {"type": "array", "items": {"type": "string"}, "description": "Two bands for the y color, e.g. ['r','i']."},
                 "split_col": {"type": "string", "description": "Morphology column to split stars/galaxies (auto from registry if omitted, e.g. spread_model_r)."},
-                "split_threshold": {"type": "number", "default": 0.003, "description": "Star/galaxy boundary on split_col (DES DR1: spread_model_r > 0.003 = galaxy)."},
-                "limit": {"type": "integer", "default": 3000, "description": "Row-budget cap on the plotted sample (cost governance, not a science cut)."},
+                "split_threshold": {"type": "number", "description": "OPTIONAL star/galaxy boundary on split_col. Omit it: the platform derives the column's own convention (class_star → 0.5; DES spread_model → |0.003|). If you pass one, the scale MUST match the column: DES DR1 |spread_model_r| <= 0.003 = star; class_star-style columns split near 0.5 — 0.5 is NEVER a spread_model threshold."},
+                "limit": {"type": "integer", "description": "OPTIONAL cap on the plotted sample. Omit unless the user asked for a sample size — the platform applies its plotting budget (3000) and flags it as governance, not science."},
                 "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (single panel, no star/galaxy split)."},
-                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5}, {'column':'ext_coadd','between':[0,1]}, or the DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}; overrides point_sources (single panel, no star/galaxy split)."},
+                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE; overrides point_sources (single panel, no star/galaxy split). class_star-style probability cuts use ~0.5-0.9 ({'column':'class_star','op':'>','value':0.5} — 0.5 is class_star-ONLY); DES spread_model works at the ~0.003 scale (galaxy cut {'column':'spread_model_r','op':'>','value':0.003}); DELVE {'column':'ext_coadd','between':[0,1]}. NEVER apply 0.5 to spread_model."},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "Extra server-side cuts, e.g. [{'column':'flags_g','op':'=','value':0}]."},
             },
             "required": ["catalog"],
@@ -1500,7 +1575,7 @@ def register_tools(agent: "QuasarAgent") -> None:
     ))
     agent.tool_registry.register(Tool(
         name="datalab_color_magnitude_diagram",
-        description="ONE-SHOT color-magnitude diagram (CMD): mag_band vs (blue-red) color for a catalog cone. Queries + plots in a single call (magnitude axis inverted). Sentinel magnitudes (99.99) are excluded automatically; set point_sources=true when the user asks for stars/point sources. Use this for 'plot a CMD'/'g vs g-r' requests instead of chaining query+plot tools.",
+        description="ONE-SHOT color-magnitude diagram (CMD): mag_band vs (blue-red) color for a catalog cone. Queries + plots in a single call (magnitude axis inverted). Sentinel magnitudes (99/-99 padding) are excluded automatically by a -5 < mag < 50 validity guard — sentinel removal, not a science cut; never present it as one. Set point_sources=true when the user asks for stars/point sources. Use this for 'plot a CMD'/'g vs g-r' requests instead of chaining query+plot tools.",
         function=agent._datalab_image_tool_fn("datalab_color_magnitude_diagram"),
         parameters={
             "type": "object",
@@ -1514,9 +1589,9 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "blue_band": {"type": "string", "default": "g"},
                 "red_band": {"type": "string", "default": "r"},
                 "mag_band": {"type": "string", "description": "Magnitude (y) band; defaults to blue_band."},
-                "limit": {"type": "integer", "default": 5000, "description": "Row-budget cap on the plotted sample (cost governance, not a science cut)."},
-                "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut (e.g. NSC class_star>0.5, DES |spread_model_r|<0.003)."},
-                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE, e.g. {'column':'class_star','op':'>','value':0.5}, {'column':'ext_coadd','between':[0,1]}, or the DES galaxy cut {'column':'spread_model_r','op':'>','value':0.003}; overrides point_sources."},
+                "limit": {"type": "integer", "description": "OPTIONAL cap on the plotted sample. Omit unless the user asked for a sample size — the platform applies its plotting budget (5000) and flags it as governance, not science."},
+                "point_sources": {"type": "boolean", "default": False, "description": "True = keep only point sources via the catalog's registered star cut. Conventions differ per column family: NSC class_star>0.5 (0.5 is class_star-ONLY) vs DES |spread_model_r|<0.003 — never mix the scales."},
+                "morphology": {"type": "object", "description": "Explicit morphology cut applied in the SQL WHERE; overrides point_sources. class_star-style probability cuts use ~0.5-0.9 ({'column':'class_star','op':'>','value':0.5} — 0.5 is class_star-ONLY); DES spread_model works at the ~0.003 scale (galaxy cut {'column':'spread_model_r','op':'>','value':0.003}); DELVE {'column':'ext_coadd','between':[0,1]}. NEVER apply 0.5 to spread_model."},
                 "value_cuts": {"type": "array", "items": {"type": "object"}, "description": "Extra server-side cuts, e.g. [{'column':'parallax_over_error','op':'>','value':5}]."},
             },
             "required": ["catalog"],
@@ -2033,13 +2108,21 @@ def register_tools(agent: "QuasarAgent") -> None:
     # ── CASA Script Generator Tools ────────────────────────────
     agent.tool_registry.register(Tool(
         name="generate_casa_imaging_script",
-        description="Generate a complete CASA tclean imaging script for ALMA/VLA data. Returns ready-to-run Python code for radio interferometry imaging.",
+        description=(
+            "Generate a CASA tclean imaging script for a CALIBRATED (restored) MeasurementSet. ALMA archive "
+            "packages contain NO calibrated MS: the user must first restore it with the package's "
+            "scriptForPI.py under the CASA version named in the QA2 report/README (or obtain calibrated "
+            "visibilities from an ARC/NRAO SRDP); the result carries that restore guidance. Returns ready-to-run "
+            "Python code (no re-flagging, savemodel='none', datacolumn/spw explicit)."
+        ),
         function=lambda **kw: agent.casa_generator.generate_casa_imaging_script(**kw),
         parameters={
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "Target source field name (as in the MS)"},
-                "vis": {"type": "string", "description": "Path to calibrated Measurement Set (.ms)"},
+                "vis": {"type": "string", "description": "Path to the RESTORED/calibrated Measurement Set (.ms), e.g. calibrated/uid___A002_X....ms"},
+                "datacolumn": {"type": "string", "enum": ["corrected", "data"], "description": "'corrected' for a restored MS with CORRECTED_DATA (default), 'data' for a split-out MS."},
+                "spw": {"type": "string", "description": "SPW selection ('' = all). For mfs continuum exclude line channels (cont.dat)."},
                 "band": {"type": "string", "description": "ALMA band number (e.g. '6', '3', '7')"},
                 "cell": {"type": "string", "description": "Cell size, e.g. '0.02arcsec'"},
                 "imsize": {"type": "integer", "description": "Square image size in pixels"},
@@ -2054,7 +2137,14 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="generate_casa_calibration_script",
-        description="Generate a CASA manual calibration script for ALMA/VLA data reduction. Returns ready-to-run Python code for bandpass, gain, and flux calibration.",
+        description=(
+            "Manual calibration script generator. For ALMA (default) it does NOT emit a recipe: ALMA archive "
+            "data are pipeline-calibrated and the delivery holds caltables + scriptForPI.py, so it returns the "
+            "restore guidance (scriptForPI under the package CASA version, or ARC/SRDP calibrated MS) unless "
+            "force_manual=true is passed for a deliberate bespoke re-reduction (then Tsys/WVR/antpos a priori "
+            "steps, catalogue flux model, calwt=True). For telescope='VLA' it returns a Perley-Butler manual "
+            "recipe (bandpass, gain, flux)."
+        ),
         function=lambda **kw: agent.casa_generator.generate_casa_calibration_script(**kw),
         parameters={
             "type": "object",
@@ -2064,6 +2154,9 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "flux_cal": {"type": "string", "description": "Flux calibrator field name"},
                 "phase_cal": {"type": "string", "description": "Phase calibrator field name"},
                 "refant": {"type": "string", "description": "Reference antenna name (e.g. 'DA41')"},
+                "telescope": {"type": "string", "enum": ["ALMA", "VLA"], "description": "Default ALMA (returns restore guidance unless force_manual)."},
+                "force_manual": {"type": "boolean", "description": "ALMA only: emit a bespoke manual recipe instead of the restore guidance. Default false."},
+                "flux_is_solar_system": {"type": "boolean", "description": "ALMA manual recipe: flux calibrator is a planet/moon (Butler-JPL-Horizons); otherwise a catalogue quasar model is used."},
             },
             "required": ["target", "vis", "flux_cal", "phase_cal", "refant"]
         }
@@ -2548,7 +2641,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         parameters={
             "type": "object",
             "properties": {
-                "region": {"type": "string", "description": "Named region or source, e.g. HUDF, M87, HH 212. Can also contain decimal RA/Dec."},
+                "region": {"type": "string", "description": "Named region or source. Can also contain decimal RA/Dec."},
                 "ra_deg": {"type": "number", "description": "Optional ICRS right ascension in degrees. Use with dec_deg for arbitrary regions."},
                 "dec_deg": {"type": "number", "description": "Optional ICRS declination in degrees. Use with ra_deg for arbitrary regions."},
                 "base_archive": {"type": "string", "description": "Base image archive, default MAST."},
@@ -3006,11 +3099,11 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(Tool(
         name="calculate_beam",
         description=(
-            "Calculate the synthesized beam size for a radio interferometer "
-            "given the maximum baseline and observing frequency. For ALMA, "
-            "you can specify an array configuration name (C-1 through C-10) "
-            "instead of a raw baseline length. Returns beam size in arcsec "
-            "and milliarcsec."
+            "Approximate synthesized beam size for a radio interferometer from the maximum "
+            "baseline and observing frequency (theta ~ 1.22 lambda/B_max, an order-of-magnitude "
+            "proxy, NOT a diffraction limit). For an ALMA configuration name (C-1 .. C-10) it also "
+            "returns the Handbook-style L80 estimate (lambda/L80), which is closer to the delivered "
+            "robust=0.5 beam. Returns arcsec and milliarcsec plus the nominal band(s) containing the frequency."
         ),
         function=agent._calc_tool_fn("calculate_beam"),
         parameters={
@@ -3028,26 +3121,58 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(Tool(
         name="calculate_alma_sensitivity",
         description=(
-            "Estimate ALMA continuum and spectral line sensitivity using "
-            "the radiometer equation. Returns noise level in mJy/beam and "
-            "uJy/beam for given band, bandwidth, and integration time. "
-            "Includes Tsys scaling for weather (PWV). Use when the user "
-            "asks about ALMA sensitivity, noise levels, or integration "
-            "time estimates."
+            "Estimate ALMA point-source sensitivity with the Technical Handbook radiometer "
+            "equation (eq. 9.8 for the 12-m/7-m Arrays, eq. 9.11 for Total Power): "
+            "quantization 0.96 and correlator 0.88 efficiencies, Table 9.3 aperture "
+            "efficiencies, N(N-1) baselines, default 43/10/3 antennas. Returns continuum "
+            "(and optional line) rms in mJy/beam and uJy/beam with every assumption stated. "
+            "Bands 1-10; array '12m'|'7m'|'TP'. The official ALMA Sensitivity Calculator "
+            "remains authoritative for proposals (real Tsys from PWV octile + elevation)."
         ),
         function=agent._calc_tool_fn("calculate_alma_sensitivity"),
         parameters={
             "type": "object",
             "properties": {
-                "band":             {"type": "integer", "description": "ALMA band number (3-10)."},
-                "bandwidth_ghz":    {"type": "number",  "description": "Total continuum bandwidth in GHz. Default 7.5."},
-                "t_integration_s":  {"type": "number",  "description": "On-source integration time in seconds. Default 60."},
-                "n_antennas":       {"type": "integer", "description": "Number of antennas. Default 50."},
-                "n_polarizations":  {"type": "integer", "description": "Number of polarizations (1 or 2). Default 2."},
+                "band":             {"type": "integer", "description": "ALMA band number (1-10)."},
+                "bandwidth_ghz":    {"type": "number",  "description": "Bandwidth per polarization in GHz. Default 7.5 (continuum)."},
+                "t_integration_s":  {"type": "number",  "description": "On-source integration time in seconds (no overheads). Default 60."},
+                "n_antennas":       {"type": "integer", "description": "Number of antennas. Default 43 (12-m), 10 (7-m), 3 (TP) per the Handbook."},
+                "n_polarizations":  {"type": "integer", "description": "1 (single) or 2 (dual/full polarization). Default 2."},
                 "channel_width_khz":{"type": "number",  "description": "Spectral channel width in kHz (for line sensitivity). Optional."},
-                "pwv_mm":           {"type": "number",  "description": "Precipitable water vapor in mm. Default 1.0."},
+                "pwv_mm":           {"type": "number",  "description": "Precipitable water vapor in mm (coarse Tsys scaling). Default 1.0."},
+                "array":            {"type": "string",  "enum": ["12m", "7m", "TP"], "description": "Array: '12m' (default), '7m' or 'TP' (single-dish sqrt(N) form)."},
+                "frequency_ghz":    {"type": "number",  "description": "Observing frequency in GHz (default: the band's Table 9.3 frequency)."},
+                "robust_weighting_factor": {"type": "number", "description": "w_r >= 1 (1.0 natural; ~1.1-1.2 for Briggs robust 0.5). Default 1.0."},
+                "shadowing_fraction": {"type": "number", "description": "Fraction of shadowed antennas f_s in [0,1) (compact configs / ACA at low elevation). Default 0."},
+                "tsys_k":           {"type": "number",  "description": "Override the representative Tsys with a known value (e.g. from the ASC)."},
             },
             "required": ["band"]
+        },
+        category="analysis"
+    ))
+
+    agent.tool_registry.register(Tool(
+        name="calculate_doppler_shift",
+        description=(
+            "Convert between rest frequency, observed (sky) frequency, redshift and velocity "
+            "with an explicit Doppler convention (radio | optical | relativistic) and reference-"
+            "frame label (LSRK default; ALMA native visibilities are TOPO per execution block). "
+            "Give rest_frequency_ghz plus one of observed_frequency_ghz / redshift / velocity_kms "
+            "(or observed + redshift/velocity to recover the rest frequency). Use before any "
+            "line-coverage or channel-width-to-velocity statement."
+        ),
+        function=agent._calc_tool_fn("calculate_doppler_shift"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "rest_frequency_ghz":     {"type": "number", "description": "Rest frequency in GHz (e.g. 230.538 for CO 2-1)."},
+                "observed_frequency_ghz": {"type": "number", "description": "Observed/sky frequency in GHz."},
+                "redshift":               {"type": "number", "description": "Redshift z."},
+                "velocity_kms":           {"type": "number", "description": "Velocity in km/s (positive = receding)."},
+                "convention":             {"type": "string", "enum": ["radio", "optical", "relativistic"], "description": "Doppler convention. Default radio."},
+                "frame":                  {"type": "string", "description": "Frame label for disclosure (LSRK default, TOPO, BARY)."},
+            },
+            "required": []
         },
         category="analysis"
     ))
@@ -3066,7 +3191,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         parameters={
             "type": "object",
             "properties": {
-                "target":      {"type": "string", "description": "Target name (e.g., 'M87', 'NGC 1068')."},
+                "target":      {"type": "string", "description": "Target name (e.g., 'M87', 'IC 342')."},
                 "ra":          {"type": "number", "description": "RA in degrees (alternative to target)."},
                 "dec":         {"type": "number", "description": "Dec in degrees (alternative to target)."},
                 "survey":      {"type": "string", "description": "Sky survey: 'DSS2 Red', '2MASS-J', 'WISE 3.4', etc. Default 'DSS2 Red'."},
@@ -3082,11 +3207,13 @@ def register_tools(agent: "QuasarAgent") -> None:
     agent.tool_registry.register(Tool(
         name="list_alma_files",
         description=(
-            "List all deliverable files (images, cubes, continuum maps) for a "
-            "given ALMA MOUS UID via the DataLink protocol. Returns filenames, "
-            "sizes, and direct access URLs.  Use after a search to discover "
-            "which data products (e.g. *pbcor.fits) are available for download "
-            "or remote FITS header inspection."
+            "Enumerate a MOUS's DataLink inventory, typed: direct files (FITS products incl. pbcor/pb/mask "
+            "and calibrator images, product tars possibly split _001_of_00N, the auxiliary tar with "
+            "scripts/caltables/QA, README, per-EB raw ASDM tars), service descriptors, and nested DataLink "
+            "entries; sizes from content_length (unknown when absent). An EMPTY table means no links are "
+            "visible under anonymous access (proprietary), NOT an invalid UID (that returns a not_found "
+            "fault). Accepts uid://A001/X/X or uid___A001_X_X. Use after a search, before "
+            "inspect_fits_header/render_fits_image; the delivery never contains a calibrated MS."
         ),
         function=agent._list_alma_files,
         parameters={

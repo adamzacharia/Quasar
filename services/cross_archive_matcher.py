@@ -88,20 +88,21 @@ def normalize_source_catalog(
 
 
 def alma_bulk_cone_adql(sources: Iterable[Dict[str, Any]], radius_arcsec: float, top: int = 5000) -> str:
+    from services.alma_science_queries import alma_cone_where
+
     radius_deg = max(float(radius_arcsec), 0.1) / 3600.0
     conditions = []
     for source in sources:
-        conditions.append(
-            "CONTAINS(POINT('ICRS', s_ra, s_dec), "
-            f"CIRCLE('ICRS', {float(source['ra']):.8f}, {float(source['dec']):.8f}, {radius_deg:.8f})) = 1"
-        )
+        # Footprint-aware cone (INTERSECTS on s_region OR the representative
+        # point) so a mosaic covering the source is not missed (A-78).
+        conditions.append(alma_cone_where(float(source["ra"]), float(source["dec"]), radius_deg))
     where = " OR ".join(conditions) if conditions else "1 = 0"
     return f"""
 SELECT TOP {max(1, min(int(top or 5000), 20000))}
-       target_name, proposal_id, member_ous_uid, obs_publisher_did,
-       s_ra, s_dec, frequency, bandwidth, band_list, dataproduct_type,
+       target_name, proposal_id, member_ous_uid, asdm_uid, obs_publisher_did,
+       s_ra, s_dec, s_region, frequency, bandwidth, band_list, dataproduct_type,
        scientific_category, science_keyword, obs_title, pi_name,
-       t_exptime, s_resolution, obs_release_date
+       t_exptime, s_resolution, obs_release_date, data_rights
 FROM ivoa.obscore
 WHERE {where}
 ORDER BY proposal_id
