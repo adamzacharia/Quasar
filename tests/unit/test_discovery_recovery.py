@@ -32,23 +32,50 @@ class _Result:
                                    requests.HTTPError(response=NS(status_code=503)),
                                    RuntimeError('JDBC PoolExhaustedException')])
 def test_tap_retry_rotates_mirror_and_keeps_maxrec(monkeypatch, failure):
+    # Budget hierarchy (2026-09-21): one query may try at most
+    # DEFAULT_MAX_ATTEMPTS (2) mirrors at DEFAULT_ATTEMPT_TIMEOUT_S (40 s)
+    # each, so its worst case (~81 s) stays strictly below the 150 s guard.
+    # The old policy — a 120 s floor x 3 mirrors — was inverted against it.
     monkeypatch.setattr(AlmaTapService, '_cooldown', {})
+    monkeypatch.delenv('ALMA_TAP_TIMEOUT_SECONDS', raising=False)
+    monkeypatch.delenv('ALMA_TAP_MAX_ATTEMPTS', raising=False)
+    from services.host_breaker import HostBreaker
+    HostBreaker.reset()
     calls, delays = [], []
     def factory(url, session):
-        assert session._default_timeout >= 120
+        assert session._default_timeout == AlmaTapService.DEFAULT_ATTEMPT_TIMEOUT_S
+        assert session._default_timeout * AlmaTapService.DEFAULT_MAX_ATTEMPTS < 150
         def search(query, maxrec):
             calls.append((url, query, maxrec))
-            if len(calls) < 3:
+            if len(calls) < 2:
                 raise failure
             return _Result(pd.DataFrame([{'value': 42}]))
         return NS(search=search)
     monkeypatch.setattr('pyvo.dal.TAPService', factory)
     monkeypatch.setattr('integrations.alma_tap.time.sleep', delays.append)
     result = AlmaTapService().search('SELECT TOP 1 * FROM ivoa.obscore', maxrec=27)
-    assert [c[0] for c in calls] == list(ALMA_TAP_MIRRORS)
+    assert [c[0] for c in calls] == list(ALMA_TAP_MIRRORS[:2])
     assert all(c[2] == 27 for c in calls)
-    assert delays == [1, 2]
-    assert result.quasar_tap_url == ALMA_TAP_MIRRORS[-1]
+    assert delays == [1]
+    assert result.quasar_tap_url == ALMA_TAP_MIRRORS[1]
+    assert result.quasar_attempts == 2
+
+
+def test_tap_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(AlmaTapService, '_cooldown', {})
+    from services.host_breaker import HostBreaker
+    HostBreaker.reset()
+    calls = []
+    def factory(url, session):
+        def search(query, maxrec):
+            calls.append(url)
+            raise requests.ReadTimeout('read timed out')
+        return NS(search=search)
+    monkeypatch.setattr('pyvo.dal.TAPService', factory)
+    monkeypatch.setattr('integrations.alma_tap.time.sleep', lambda s: None)
+    with pytest.raises(RuntimeError, match='ALMA TAP query failed'):
+        AlmaTapService().search('SELECT TOP 1 * FROM ivoa.obscore')
+    assert len(calls) == AlmaTapService.DEFAULT_MAX_ATTEMPTS
 
 
 def test_tap_does_not_retry_invalid_query(monkeypatch):
@@ -290,7 +317,11 @@ def test_total_evidence_and_hard_partial_are_bounded():
     assert len(partial) <= 50000 and json.loads(partial)['partial']
 
 
-def test_failed_queries_can_retry_and_polling_is_not_cached():
+def test_identical_call_after_a_failure_is_not_reexecuted_but_a_changed_one_is():
+    # UI benchmark 2026-09-22 (L06): re-issuing the SAME failed call (or one
+    # that only re-labels a plot) burns the budget; the runner now answers it
+    # from the ledger and tells the model to change the approach. A retry with
+    # DIFFERENT arguments (the corrected call the prompt asks for) still runs.
     responses=_Responses([_events(1,tool='query_archive'),_events(2,tool='query_archive'),_events(3,text='Done.')])
     agent,executed=_tool_agent(responses)
     def run(*a,**kw):
@@ -298,11 +329,42 @@ def test_failed_queries_can_retry_and_polling_is_not_cached():
         return {'success':False,'error':'502 temporary'} if len(executed)==1 else {'success':True,'rows':[42]}
     agent._execute_tool_with_progress=run
     agent.stream_response_api('hello there',conversation_id='retry-error')
+    assert len(executed)==1
+    repeat=json.loads(responses.calls[2]['input'][0]['output'])
+    assert repeat['identical_call_failed'] and '502 temporary' in repeat['error'] and 'Change the approach' in repeat['error']
+    # A corrected retry (different args) is executed.
+    rounds=[_events(1,tool='query_archive'),_events(2,tool='query_archive'),_events(3,text='Done.')]
+    rounds[1][-1].response.output[0].arguments='{"x": 2}'
+    responses=_Responses(rounds)
+    agent,executed=_tool_agent(responses)
+    agent._execute_tool_with_progress=run
+    executed.clear()
+    agent.stream_response_api('hello there',conversation_id='retry-error-2')
     assert len(executed)==2
+
+
+def test_polling_tools_are_never_cached():
     responses=_Responses([_events(n,tool='query_job_status') for n in range(3)]+[_events(4,text='Done.')])
     agent,executed=_tool_agent(responses)
     agent.stream_response_api('hello there',conversation_id='poll')
     assert len(executed)==3
+
+
+def test_cosmetic_only_reissue_of_a_failed_plot_call_is_refused():
+    """L06 pattern: same CMD query, new title each time, every one a timeout."""
+    rounds=[]
+    for n,title in enumerate(['White dwarfs','White dwarf CMD (retry)','WD CMD attempt 3'],start=1):
+        ev=_events(n,tool='datalab_color_magnitude_diagram')
+        ev[-1].response.output[0].arguments=json.dumps({'catalog':'gaia_dr3','radius':2.0,'title':title})
+        rounds.append(ev)
+    rounds.append(_events(4,text='Done.'))
+    responses=_Responses(rounds)
+    agent,executed=_tool_agent(responses)
+    agent._execute_tool_with_progress=lambda *a,**kw: executed.append(kw) or {'success':False,'error':'Read timed out.'}
+    agent.stream_response_api('hello there',conversation_id='cosmetic')
+    assert len(executed)==1, 'only the first call may run; re-labelled repeats are refused'
+    for call in responses.calls[2:4]:
+        assert json.loads(call['input'][0]['output'])['identical_call_failed']
 
 
 def test_soft_finalization_retains_history_for_followup(monkeypatch):
@@ -590,7 +652,11 @@ def test_link_guard_recognises_urls_inside_json_encoded_tool_outputs():
     assert agent._strip_unverified_urls(text, sources=[evidence]) == text
     fabricated = text + '\nSee also https://example.invalid/made-up'
     cleaned = agent._strip_unverified_urls(fabricated, sources=[evidence])
-    assert 'made-up' not in cleaned and url in cleaned and 'Removed 1 external link' in cleaned
+    body, _, notice = cleaned.partition('> 🔗 Removed')
+    # The fabricated link is gone from the body; the notice names EXACTLY what
+    # was removed (UI benchmark 2026-09-22 D13/D14: counts that did not match).
+    assert 'made-up' not in body and url in body
+    assert notice.startswith(' 1 external link') and '`https://example.invalid/made-up`' in notice
 
 
 def _inventory_rows():

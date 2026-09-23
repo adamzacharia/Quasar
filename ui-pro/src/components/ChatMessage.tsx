@@ -3,6 +3,9 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import { prepareAnswerMarkdown } from "../lib/answer-markdown.js";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, Send, X } from "lucide-react";
@@ -814,7 +817,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     Red Team TAC Critique
                                 </div>
                             )}
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{
                                 code({ className, children, ...props }) {
                                     const match = /language-(\w+)/.exec(className || "");
                                     const code = String(children).replace(/\n$/, "");
@@ -884,7 +887,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                 img() {
                                     return null;
                                 },
-                            }}>{displayContent.replace(/!\[([^\]]*)\]\([^)]+\)/g, '')}</ReactMarkdown>
+                            }}>{prepareAnswerMarkdown(displayContent)}</ReactMarkdown>
                         </div>
                     )}
 

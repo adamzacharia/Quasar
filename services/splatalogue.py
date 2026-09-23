@@ -432,13 +432,17 @@ class SplatalogueClient:
         self,
         *,
         session: Optional[requests.Session] = None,
-        timeout_seconds: float = 240.0,
+        # 2026-09-21 budget hierarchy: one attempt (15 s submit + 60 s poll
+        # deadline + 15 s poll + 30 s non-threaded fallback = 120 s) must fit
+        # under the 150 s tool guard with headroom; per-request retries are
+        # clamped to the tool's remaining budget (services/http_budget_hook.py).
+        timeout_seconds: float = 60.0,
         max_retries: Optional[int] = None,
         backoff_base_seconds: Optional[float] = None,
         backoff_max_seconds: Optional[float] = None,
-        submit_timeout: float = 30.0,
-        poll_timeout: float = 30.0,
-        non_threaded_timeout: float = 60.0,
+        submit_timeout: float = 15.0,
+        poll_timeout: float = 15.0,
+        non_threaded_timeout: float = 30.0,
     ):
         self.session = session or requests.Session()
         self.timeout_seconds = timeout_seconds

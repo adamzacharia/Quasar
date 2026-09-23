@@ -552,9 +552,14 @@ class SelectCatalogRowsInput(_In):
     # Optional like the diagram tools: defaults to the catalog's primary table
     # (live P6 burned a round on a pydantic "Field required" for `table`).
     table: Optional[str] = None
-    ra: float
-    dec: float
-    radius_deg: float
+    # Cone (ra/dec/radius_deg) OR an indexed key (key_column/key_value, e.g.
+    # fieldid = 169 on SMASH tables — UI benchmark 2026-09-22 L07 used a dummy
+    # q3c_radial_query(ra, dec, 0, 0, 5) cone to reach a field).
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    radius_deg: Optional[float] = None
+    key_column: Optional[str] = None
+    key_value: Optional[Any] = None
     columns: Optional[List[str]] = None
     # None = the caller made no row-budget choice; the builder applies the
     # platform default (500) and FLAGS it (platform_row_cap + warning + SQL
@@ -877,10 +882,21 @@ class SelectCatalogRows(BaseCapability):
                     inp.catalog, table,
                     color_cut=inp.color_cut, value_cuts=merged_cuts, morphology=inp.morphology,
                 )
-            sql, meta = datalab_query_builders.build_cone_select(
-                inp.catalog, table, ra=inp.ra, dec=inp.dec, radius_deg=inp.radius_deg,
-                columns=inp.columns, limit=inp.limit, predicates=predicates,
-            )
+            if inp.key_column:
+                # select_by_key: an indexed equality bound instead of a cone.
+                if inp.key_value is None:
+                    raise ValueError("key_value is required with key_column")
+                sql, meta = datalab_query_builders.build_key_select(
+                    inp.catalog, table, key_column=str(inp.key_column), key_value=inp.key_value,
+                    columns=inp.columns, limit=inp.limit, predicates=predicates,
+                )
+            else:
+                if inp.ra is None or inp.dec is None or inp.radius_deg is None:
+                    raise ValueError("Provide ra, dec and radius_deg for a cone, or key_column + key_value (e.g. fieldid = 169) for a key select.")
+                sql, meta = datalab_query_builders.build_cone_select(
+                    inp.catalog, table, ra=inp.ra, dec=inp.dec, radius_deg=inp.radius_deg,
+                    columns=inp.columns, limit=inp.limit, predicates=predicates,
+                )
             if quality_note:
                 meta.setdefault("warnings", []).append(quality_note)
             # Orders-of-magnitude morphology-threshold conflations (e.g.
@@ -1053,12 +1069,13 @@ class DensityAggregate(BaseCapability):
             # capability mutates it without ever touching `self` on the agent.
             timeout_tables = ctx.service("datalab_agg_timeout_tables")
             table_key = f"{inp.catalog}.{inp.table}".lower()
-            skip_sync = has_cone and float(inp.radius_deg) >= 2.0 and table_key in timeout_tables
+            skip_sync = has_cone and (float(inp.radius_deg) >= 5.0 or
+                                      (float(inp.radius_deg) >= 2.0 and table_key in timeout_tables))
             sync_result: Optional[ToolResult] = None
             if skip_sync:
                 out: Dict[str, Any] = {
                     "success": False,
-                    "error": "sync skipped: earlier aggregate on this table timed out",
+                    "error": "sync skipped: wide cone or earlier aggregate on this table timed out",
                 }
             else:
                 sync_result = execute_datalab_sql(
@@ -1273,12 +1290,20 @@ class SedPlot(BaseCapability):
 
 
 class LssWedgeInput(_In):
-    result_id: str
+    result_id: Optional[str] = None
+    # SDSS Great Wall default (UI benchmark 2026-09-22 L13: a 5 deg cone at Dec +30 was used instead).
+    ra_min: float = 150.0
+    ra_max: float = 220.0
+    dec_min: float = 0.0
+    dec_max: float = 5.0
+    z_min: float = 0.0
+    z_max: float = 0.1
+    limit: int = Field(default=5000, ge=1, le=5000)
     ra_col: Optional[str] = None
     dec_col: Optional[str] = None
     z_col: str = "z"
     class_col: Optional[str] = None
-    pie_slice: bool = False
+    pie_slice: bool = True
     title: str = "Data Lab large-scale structure wedge"
 
 
@@ -1290,7 +1315,19 @@ class LssWedge(BaseCapability):
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
 
     def run(self, inp, ctx) -> ToolResult:
-        return _run_analysis_plot("lss_wedge", inp.model_dump(), ctx)
+        params = inp.model_dump()
+        selection = {k: params.pop(k) for k in ("ra_min", "ra_max", "dec_min", "dec_max", "z_min", "z_max", "limit")}
+        if not inp.result_id:
+            try:
+                sql, meta = datalab_orchestration.build_wedge_selection(**selection)
+                queried = execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+                out = queried.to_native()
+                if not out.get("success") or not out.get("result_id"):
+                    return queried
+                params["result_id"] = out["result_id"]
+            except Exception as exc:
+                return datalab_error(exc)
+        return _run_analysis_plot("lss_wedge", params, ctx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2436,6 +2473,31 @@ class DensityVetting(BaseCapability):
                                 "user explicitly asked for a region this large; otherwise shrink "
                                 "the radius (≤2.5°) or ask the user.",
                     })
+            if radius_deg >= 5.0:
+                # A multi-tile density scan plus cutouts cannot fit one sync call.
+                # Capture concrete services/owner before the request context expires.
+                client = ctx.service("datalab_client")
+                store = ctx.result_store
+                image_service = ctx.service("datalab_image_service")
+                owner = str(ctx.user_id) if ctx.user_id else None
+                def _job(cancel_check):
+                    if cancel_check():
+                        return {"success": False, "status": "canceled"}
+                    return datalab_orchestration.density_then_cutouts(
+                        inp.catalog, inp.table, ra_f, dec_f, radius_deg, step_deg=step_deg,
+                        color_cut=inp.color_cut, value_cuts=inp.value_cuts, morphology=inp.morphology,
+                        top_n=top_n, fov_deg=fov_deg, band=band, client=client,
+                        result_store=store, image_service=image_service, owner_id=owner,
+                    )
+                job_id = ctx.service("datalab_job_service").start(
+                    "density_vetting", _job,
+                    params={"catalog": inp.catalog, "table": inp.table, "ra": ra_f, "dec": dec_f, "radius_deg": radius_deg},
+                    **_job_owner_kwargs(ctx),
+                )
+                return ToolResult(success=True, native={
+                    "success": True, "job_id": job_id, "job_kind": "local", "status": "queued",
+                    "note": "Bounded tiled density scan and cutout vetting queued. Poll datalab_job_status once, then obtain the actual candidate evidence with datalab_job_results. Queuing is not a completed scientific result.",
+                })
             out = datalab_orchestration.density_then_cutouts(
                 inp.catalog, inp.table, ra_f, dec_f, radius_deg, step_deg=step_deg,
                 color_cut=inp.color_cut, value_cuts=inp.value_cuts, morphology=inp.morphology,
@@ -2805,3 +2867,16 @@ __all__ = [
     "SaveResult", "ListMyTables", "LoadMyTable", "XmatchUserList",
     "DensityVetting", "TiledSearch", "ExportNotebook",
 ]
+
+
+# One-shot Data Lab tools (capabilities/datalab_tools.py, UI benchmark 2026-09-22
+# L06-L11, L15) register through the same CAPABILITIES list so the agent's
+# _datalab_tool_fn / _datalab_image_tool_fn wiring finds them by name. Imported
+# last: datalab_tools imports helpers defined above in this module.
+import sys as _sys  # noqa: E402
+
+if "capabilities.datalab_tools" not in _sys.modules:
+    # datalab_tools self-registers into CAPABILITIES at the end of its import.
+    # When IT is being imported first it is already (partially) in sys.modules
+    # and will register itself once it finishes -- no circular import either way.
+    import capabilities.datalab_tools  # noqa: E402,F401

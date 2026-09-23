@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import requests
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
@@ -44,35 +45,57 @@ class SiaSearchResult:
 
 
 class _TimeoutSession:
-    """Small requests.Session wrapper that gives PyVO calls a default timeout.
+    """Small requests.Session wrapper that gives PyVO calls a bounded timeout
+    and routes them through the host breaker.
 
-    get/post MUST be overridden here, not just request(): pyvo calls
-    ``session.get(...)``, and __getattr__ hands back the REAL session's bound
-    method — whose internal ``self.request`` is the real session's too — so a
-    request()-only override never ran and the timeout was dead config
-    (dl-sia-timeout-never-applied).
+    PyVO calls ``session.get`` / ``session.post`` directly (not ``request``),
+    so all three entry points are overridden (dl-sia-timeout-never-applied).
+    The timeout is ``min(default, remaining tool budget)``
+    (services/tool_budgets.py); an open datalab.noirlab.edu breaker
+    (services/host_breaker.py) refuses the call in milliseconds.
     """
 
     def __init__(self, timeout: float):
-        import requests
-
         self._session = requests.Session()
         self.timeout = float(timeout)
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name):
         return getattr(self._session, name)
 
-    def request(self, method: str, url: str, **kwargs: Any):
-        kwargs.setdefault("timeout", self.timeout)
-        return self._session.request(method, url, **kwargs)
+    def _send(self, sender, url, **kwargs):
+        from services.host_breaker import HostBreaker, host_of
+        from services.http_budget_hook import suppressed
+        from services.tool_budgets import bounded_timeout
 
-    def get(self, url: str, **kwargs: Any):
-        kwargs.setdefault("timeout", self.timeout)
-        return self._session.get(url, **kwargs)
+        host = host_of(url)
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            timeout = self.timeout
+        kwargs["timeout"] = bounded_timeout(float(timeout), label=f"SIA {host}")
+        # The URL, not the bare host: an SIA 502 burst opens
+        # datalab.noirlab.edu/sia only, never the SQL service (/query).
+        HostBreaker.check(url)
+        try:
+            with suppressed():
+                response = sender(url, **kwargs)
+        except requests.RequestException as exc:
+            HostBreaker.record_failure(url, exc)
+            raise
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status in (502, 503, 504):
+            HostBreaker.record_failure(url, status=status)
+        else:
+            HostBreaker.record_success(url)
+        return response
 
-    def post(self, url: str, **kwargs: Any):
-        kwargs.setdefault("timeout", self.timeout)
-        return self._session.post(url, **kwargs)
+    def request(self, method, url, **kwargs):
+        return self._send(lambda u, **kw: self._session.request(method, u, **kw), url, **kwargs)
+
+    def get(self, url, **kwargs):
+        return self._send(self._session.get, url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self._send(self._session.post, url, **kwargs)
 
 
 class DatalabSiaClient:
@@ -83,7 +106,10 @@ class DatalabSiaClient:
         self.timeout = (
             float(timeout)
             if timeout is not None
-            else float(os.getenv("DATALAB_SIA_TIMEOUT_SECONDS", "60"))
+            # 30 s (was 60): Data Lab SIA answers in 2-5 s; two endpoints are
+            # tried per search and the result must leave room for the tile
+            # download under a 150 s tool guard (services/tool_budgets.py).
+            else float(os.getenv("DATALAB_SIA_TIMEOUT_SECONDS", "30"))
         )
 
     def search(

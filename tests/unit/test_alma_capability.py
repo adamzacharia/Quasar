@@ -353,9 +353,15 @@ def test_query_alma_unknown_type_and_missing_cycle():
 
 
 def test_query_alma_redshifted_lines_provenance_and_state(monkeypatch):
+    # The LEGACY row-pull path: reached when the server-side aggregate is not
+    # available (this fake search service has no TAP client). Rows must carry
+    # science_observation='T' + an extragalactic category to count (the
+    # redshifted-line summary rejects calibration / solar-system rows).
     tap_df = pd.DataFrame([{
-        "proposal_id": "2023.1.00010.S", "target_name": "z galaxy",
-        "frequency_support": "172.8..173.1GHz", "band_list": "5",
+        "proposal_id": "2023.1.00010.S", "target_name": "z galaxy", "member_ous_uid": "uid://A001/X1/X1",
+        "asdm_uid": "uid://A002/X1/X1", "frequency_support": "172.8..173.1GHz", "band_list": "5",
+        "science_observation": "T", "scientific_category": "Galaxy evolution", "science_keyword": "Starburst galaxies",
+        "scan_intent": "TARGET",
     }])
     captured = {}
 
@@ -377,7 +383,8 @@ def test_query_alma_redshifted_lines_provenance_and_state(monkeypatch):
     assert out["provenance"]["adql"].startswith("SELECT TOP")
     assert out["provenance"]["tap_url"] == "https://almascience.nrao.edu/tap"
     assert state.last_run_result["tool_name"] == "query_alma_science_archive"
-    # The redshifted-line prefilter is the em_min/em_max wavelength overlap
+    assert any("fell back to a TOP-capped row pull" in w for w in out["warnings"])
+    # The legacy prefilter is the em_min/em_max wavelength overlap
     # (skill ADQL pattern), not frequency +/- bandwidth/2 (A-16/A-46).
     assert "em_min" in captured["where"] and "em_max" in captured["where"]
     assert "bandwidth" not in captured["where"]

@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from core.retry import _is_retryable as _retry_is_retryable
 from core.retry import with_retry
+from core.harmony_filter import HarmonyStreamFilter
 from core.langfuse_integration import get_langfuse, _safe_serialize
 from services.secret_redaction import redact_secrets
 
@@ -1835,6 +1836,11 @@ class ResponsesShim:
                 f"[PROVIDER] tacc stream finish_reason={finish_reason!r} "
                 f"output_chars={len(output_text)} reasoning_chars={len(reasoning_content)} "
                 f"tool_calls={len(completed_items)}"
+                + (
+                    f" harmony_tokens_stripped={st.harmony.dropped_tokens}"
+                    if st.harmony.dropped_tokens
+                    else ""
+                )
             )
         yield StreamEvent(
             type="response.completed",
@@ -1880,6 +1886,10 @@ class ResponsesShim:
             reasoning_content="",
             usage_obj=None,
             finish_reason=None,
+            # Strips gpt-oss harmony control markup that leaks into `content`
+            # (live 2026-09-21: the raw text of a tool call the same round also
+            # issued structurally). output_text only ever holds the cleaned text.
+            harmony=HarmonyStreamFilter(),
         )
 
     def _iter_tacc_stream(self, stream, st):
@@ -1931,15 +1941,27 @@ class ResponsesShim:
             if isinstance(tool_deltas, dict):
                 tool_deltas = [tool_deltas]
 
+            # Content may carry leaked harmony markup — the `<|channel|>commentary
+            # to=functions.X <|constrain|>json<|message|>{...}` text of a tool call
+            # (observed live 2026-09-21 alongside the structured tool_calls delta
+            # of the same round). Only the cleaned text is user-visible; a leaked
+            # `analysis` body is chain of thought and goes to the Thinking box.
+            visible_text = ""
+            if delta.content:
+                visible_text, leaked_reasoning = st.harmony.feed(delta.content)
+                if leaked_reasoning:
+                    st.reasoning_content += leaked_reasoning
+                    yield StreamEvent(type="response.reasoning_summary_text.delta", delta=leaked_reasoning)
+
             # If we were streaming reasoning but it has now stopped, emit done event
             if not st.reasoning_done_emitted:
-                if delta.content or tool_deltas:
+                if visible_text or tool_deltas:
                     yield StreamEvent(type="response.reasoning_summary_text.done")
                     st.reasoning_done_emitted = True
 
-            if delta.content:
-                st.output_text += delta.content
-                yield StreamEvent(type="response.output_text.delta", delta=delta.content)
+            if visible_text:
+                st.output_text += visible_text
+                yield StreamEvent(type="response.output_text.delta", delta=visible_text)
 
             if tool_deltas:
                 for tc in tool_deltas:
@@ -1983,6 +2005,34 @@ class ResponsesShim:
                             delta=tc.function.arguments,
                             item=fc,
                         )
+
+        # End of stream: release a held-back partial token / close an unterminated
+        # harmony span (the leaked tool-call text ends at the JSON — its <|call|>
+        # stop token never reaches `content`).
+        visible_text, leaked_reasoning = st.harmony.flush()
+        if leaked_reasoning:
+            st.reasoning_content += leaked_reasoning
+            yield StreamEvent(type="response.reasoning_summary_text.delta", delta=leaked_reasoning)
+        if visible_text:
+            if not st.reasoning_done_emitted:
+                yield StreamEvent(type="response.reasoning_summary_text.done")
+                st.reasoning_done_emitted = True
+            st.output_text += visible_text
+            yield StreamEvent(type="response.output_text.delta", delta=visible_text)
+        if st.harmony.dropped_calls:
+            structural = sorted({fc.name for fc in st.function_calls.values() if fc.name})
+            for dropped in st.harmony.dropped_calls:
+                name = dropped.get("name") or "?"
+                verdict = (
+                    "also issued structurally this round"
+                    if name in structural
+                    else f"NOT issued structurally this round (structural calls: {structural or 'none'})"
+                )
+                print(
+                    f"[PROVIDER] tacc content leaked harmony tool-call markup for functions.{name} "
+                    f"({len(dropped.get('payload', ''))} payload chars) — stripped from the visible text; "
+                    f"{verdict}"
+                )
 
     def _chat_messages_for_input(self, prev_id, instructions: str, input_data, json_mode: bool = False) -> list:
         """Resolve the message list for a chat-completions round.

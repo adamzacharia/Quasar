@@ -12,6 +12,7 @@ Registered agent tools:
     - get_mast_products()  (file-level product listing)
 """
 
+import os
 import threading
 import uuid
 
@@ -37,11 +38,54 @@ from integrations.simbad_resolver import _resolve_simbad_cached
 # threads+sockets without bound.
 _DOWNLOAD_SLOTS = threading.BoundedSemaphore(4)
 
+MAST_HOST = "mast.stsci.edu"
+
+
+def _mast_query_timeout_default() -> float:
+    raw = os.getenv("MAST_QUERY_TIMEOUT_SECONDS", "").strip()
+    try:
+        return max(3.0, float(raw)) if raw else 30.0
+    except ValueError:
+        return 30.0
+
+
+MAST_QUERY_TIMEOUT_S = _mast_query_timeout_default()
+
+
+def _mast_query(fn, *args, **kwargs):
+    """Run one astroquery.mast metadata call bounded and breaker-guarded.
+
+    astroquery's own MAST timeout is 600 s per call (conf.timeout) — under a
+    150 s tool guard a single slow query, let alone one per source in a
+    cross-match loop, made the guard the ONLY thing that could end the tool
+    (live 2026-09-21 AM-H-01). The call runs on a daemon worker joined with
+    ``min(MAST_QUERY_TIMEOUT_SECONDS, remaining tool budget)``
+    (services/tool_budgets.py); on expiry the worker is abandoned and a
+    TimeoutError is raised, which — like a refused / reset connection — opens
+    the MAST host breaker (services/host_breaker.py) so the next MAST call in
+    the turn fails in milliseconds instead of waiting again.
+    """
+    from services.host_breaker import HostBreaker
+    from services.tool_budgets import bounded_timeout, call_bounded
+
+    HostBreaker.check(MAST_HOST)
+    timeout = bounded_timeout(MAST_QUERY_TIMEOUT_S, minimum=3.0, label="MAST query")
+    try:
+        result = call_bounded(
+            lambda: fn(*args, **kwargs), timeout,
+            label="MAST query", thread_name="quasar-mast-query",
+        )
+    except Exception as exc:
+        HostBreaker.record_failure(MAST_HOST, exc)
+        raise
+    HostBreaker.record_success(MAST_HOST)
+    return result
+
 
 class MASTClient:
     """
     Deep query client for MAST archive (JWST, HST, TESS, Kepler).
-    
+
     Wraps astroquery.mast.Observations to provide:
     - Target name search with mission/instrument filters
     - Positional cone search
@@ -52,11 +96,11 @@ class MASTClient:
     # Standard MAST missions
     SUPPORTED_MISSIONS = ["JWST", "HST", "TESS", "Kepler", "K2",
                           "GALEX", "IUE", "FUSE", "Swift"]
-    
+
     # JWST instruments
     JWST_INSTRUMENTS = ["NIRCAM", "NIRSPEC", "MIRI", "NIRISS", "FGS"]
-    
-    # HST instruments  
+
+    # HST instruments
     HST_INSTRUMENTS = ["ACS", "WFC3", "COS", "STIS", "NICMOS", "WFPC2"]
 
     def __init__(self):
@@ -68,69 +112,69 @@ class MASTClient:
                          max_results: int = 500) -> pd.DataFrame:
         """
         Search MAST by target name with optional mission/instrument filters.
-        
+
         Args:
             target: Astronomical target name (e.g., 'M87', 'Carina Nebula')
             mission: Filter by mission (e.g., 'JWST', 'HST')
             instrument: Filter by instrument (e.g., 'NIRCAM', 'ACS')
             radius: Search radius (e.g., '30s' for 30 arcsec)
             max_results: Maximum number of results
-            
+
         Returns:
             DataFrame of matching observations
         """
         if not MAST_AVAILABLE:
             print("[MAST] ERROR: astroquery.mast not available")
             return pd.DataFrame()
-        
+
         try:
             print(f"[MAST] Searching for '{target}'"
                   f"{f' [{mission}]' if mission else ''}"
                   f"{f' [{instrument}]' if instrument else ''}")
-            
+
             # Build criteria dict
             criteria = {}
             if mission:
                 criteria["obs_collection"] = mission.upper()
             if instrument:
                 criteria["instrument_name"] = instrument.upper()
-            
+
             if criteria:
                 # Use query_criteria with target coordinates
                 ra, dec = _resolve_simbad_cached(target)
                 if ra is None:
                     print(f"[MAST] Could not resolve target '{target}' via SIMBAD")
                     return pd.DataFrame()
-                
+
                 from astropy.coordinates import SkyCoord
                 import astropy.units as u
                 coord = SkyCoord(ra=ra, dec=dec, unit="deg")
-                
+
                 # Parse radius
                 radius_val = self._parse_radius(radius)
-                
-                obs = Observations.query_criteria(
+
+                obs = _mast_query(Observations.query_criteria,
                     coordinates=coord,
                     radius=radius_val,
                     **criteria
                 )
             else:
                 # Simple target query
-                obs = Observations.query_object(target, radius=radius)
-            
+                obs = _mast_query(Observations.query_object, target, radius=radius)
+
             if obs is None or len(obs) == 0:
                 print(f"[MAST] No results found for '{target}'")
                 return pd.DataFrame()
-            
+
             df = obs.to_pandas()
-            
+
             # Limit results
             if len(df) > max_results:
                 df = df.head(max_results)
-            
+
             print(f"[MAST] Found {len(df)} observations")
             return self._standardize_columns(df)
-            
+
         except Exception as e:
             print(f"[MAST] Search error: {e}")
             import traceback
@@ -142,7 +186,7 @@ class MASTClient:
                            max_results: int = 500) -> pd.DataFrame:
         """
         Cone search by RA/Dec with optional mission/instrument filters.
-        
+
         Args:
             ra: Right Ascension in degrees (ICRS)
             dec: Declination in degrees (ICRS)
@@ -153,42 +197,44 @@ class MASTClient:
         """
         if not MAST_AVAILABLE:
             return pd.DataFrame()
-        
+
         try:
             from astropy.coordinates import SkyCoord
             import astropy.units as u
-            
+
             coord = SkyCoord(ra=ra, dec=dec, unit="deg")
             radius = radius_arcmin * u.arcmin
-            
+
             criteria = {}
             if mission:
                 criteria["obs_collection"] = mission.upper()
             if instrument:
                 criteria["instrument_name"] = instrument.upper()
-            
+
             print(f"[MAST] Cone search: RA={ra:.4f}, Dec={dec:.4f}, "
                   f"radius={radius_arcmin}'")
-            
-            obs = Observations.query_criteria(
+
+            obs = _mast_query(Observations.query_criteria,
                 coordinates=coord,
                 radius=radius,
                 **criteria
             )
-            
+
             if obs is None or len(obs) == 0:
                 return pd.DataFrame()
-            
+
             df = obs.to_pandas()
             if len(df) > max_results:
                 df = df.head(max_results)
-            
+
             print(f"[MAST] Found {len(df)} observations")
             return self._standardize_columns(df)
-            
+
         except Exception as e:
             print(f"[MAST] Position search error: {e}")
-            return pd.DataFrame()
+            out = pd.DataFrame()
+            out.attrs["error"] = f"{type(e).__name__}: {e}"
+            return out
 
     def search_by_criteria(self, mission: str = None, instrument: str = None,
                            proposal_id: str = None, filters: str = None,
@@ -197,7 +243,7 @@ class MASTClient:
                            max_results: int = 500) -> pd.DataFrame:
         """
         Advanced criteria-based search with rich filtering.
-        
+
         Args:
             mission: Mission name (JWST, HST, etc.)
             instrument: Instrument name
@@ -210,10 +256,10 @@ class MASTClient:
         """
         if not MAST_AVAILABLE:
             return pd.DataFrame()
-        
+
         try:
             criteria = {}
-            
+
             if mission:
                 criteria["obs_collection"] = mission.upper()
             if instrument:
@@ -229,27 +275,27 @@ class MASTClient:
                 criteria["radius"] = "3s"  # Default radius for name search
             if date_range and len(date_range) == 2:
                 criteria["t_min"] = [date_range[0], date_range[1]]
-            
+
             if not criteria:
                 print("[MAST] No search criteria provided")
                 return pd.DataFrame()
-            
+
             criteria_str = ", ".join(f"{k}={v}" for k, v in criteria.items())
             print(f"[MAST] Criteria search: {criteria_str}")
-            
-            obs = Observations.query_criteria(**criteria)
-            
+
+            obs = _mast_query(Observations.query_criteria, **criteria)
+
             if obs is None or len(obs) == 0:
                 print("[MAST] No results found")
                 return pd.DataFrame()
-            
+
             df = obs.to_pandas()
             if len(df) > max_results:
                 df = df.head(max_results)
-            
+
             print(f"[MAST] Found {len(df)} observations")
             return self._standardize_columns(df)
-            
+
         except Exception as e:
             print(f"[MAST] Criteria search error: {e}")
             import traceback
@@ -261,40 +307,40 @@ class MASTClient:
                          extension: str = None) -> pd.DataFrame:
         """
         Get file-level product list for observations.
-        
+
         Args:
             observations: DataFrame from a previous MAST search
             productType: Filter by type ('SCIENCE', 'CALIBRATION', 'PREVIEW')
             extension: Filter by file extension ('fits', 'jpg', etc.)
-            
+
         Returns:
             DataFrame with file-level product info (filenames, sizes, URLs)
         """
         if not MAST_AVAILABLE or observations.empty:
             return pd.DataFrame()
-        
+
         try:
             from astropy.table import Table
-            
+
             # Convert back to astropy table for MAST API
             obs_table = Table.from_pandas(observations)
-            
-            products = Observations.get_product_list(obs_table)
-            
+
+            products = _mast_query(Observations.get_product_list, obs_table)
+
             if products is None or len(products) == 0:
                 return pd.DataFrame()
-            
+
             df = products.to_pandas()
-            
+
             # Apply filters
             if productType:
                 df = df[df["productType"].str.upper() == productType.upper()]
             if extension:
                 df = df[df["productFilename"].str.endswith(f".{extension}")]
-            
+
             print(f"[MAST] Found {len(df)} data products")
             return df
-            
+
         except Exception as e:
             print(f"[MAST] Product list error: {e}")
             return pd.DataFrame()
@@ -423,7 +469,7 @@ class MASTClient:
                           max_files: int = 10) -> Dict[str, Any]:
         """
         Download FITS files and data products from MAST.
-        
+
         Args:
             products: DataFrame from get_product_list (preferred)
             observations: DataFrame from search (will get products first)
@@ -431,13 +477,13 @@ class MASTClient:
             productType: Filter by type: 'SCIENCE', 'CALIBRATION', 'PREVIEW'
             extension: Filter by extension: 'fits', 'jpg', etc.
             max_files: Maximum number of files to download (safety limit)
-            
+
         Returns:
             Dict with download paths, file count, and total size
         """
         if not MAST_AVAILABLE:
             return {"success": False, "error": "astroquery.mast not available"}
-        
+
         import os
         base_dir = download_dir or os.path.join(
             os.path.expanduser("~"), "quasar_data", "mast"
@@ -473,23 +519,23 @@ class MASTClient:
 
             # Convert to astropy table for MAST API
             prod_table = Table.from_pandas(products)
-            
+
             print(f"[MAST] Downloading {len(products)} files to {download_dir}")
-            
+
             # L9: wall-clock-bounded from outside — astroquery's downloader
             # has no per-transfer deadline of its own.
             manifest = self._download_products_bounded(prod_table, download_dir)
-            
+
             if manifest is None:
                 return {"success": False, "error": "Download returned no results"}
-            
+
             manifest_df = manifest.to_pandas()
             downloaded = manifest_df[manifest_df["Status"] == "COMPLETE"] if "Status" in manifest_df.columns else manifest_df
-            
+
             paths = list(downloaded["Local Path"].values) if "Local Path" in downloaded.columns else []
-            
+
             print(f"[MAST] Downloaded {len(downloaded)} files")
-            
+
             return {
                 "success": True,
                 "downloaded_files": len(downloaded),
@@ -498,7 +544,7 @@ class MASTClient:
                 "file_paths": paths[:20],  # Limit paths in response
                 "note": f"Downloaded {len(downloaded)} files to {download_dir}"
             }
-            
+
         except TimeoutError as e:
             # L9: structured timeout — core/runner.py keys step closure and
             # SSE deadline exclusion on timeout: True
@@ -523,10 +569,10 @@ class MASTClient:
     def _parse_radius(self, radius_str: str):
         """Parse radius string like '30s', '1m', '0.5d' into astropy quantity."""
         import astropy.units as u
-        
+
         if isinstance(radius_str, (int, float)):
             return radius_str * u.deg
-        
+
         radius_str = str(radius_str).strip().lower()
         if radius_str.endswith("s"):
             return float(radius_str[:-1]) * u.arcsec
@@ -547,7 +593,7 @@ class MASTClient:
         """
         if df.empty:
             return df
-        
+
         # Rename key columns for consistency
         rename_map = {
             "s_ra": "s_ra",
@@ -564,14 +610,14 @@ class MASTClient:
             "t_min": "t_min",
             "t_max": "t_max",
         }
-        
-        df = df.rename(columns={k: v for k, v in rename_map.items() 
+
+        df = df.rename(columns={k: v for k, v in rename_map.items()
                                 if k in df.columns and k != v})
-        
+
         # Ensure telescope column exists
         if "telescope" not in df.columns and "obs_collection" in df.columns:
             df["telescope"] = df["obs_collection"]
         elif "telescope" not in df.columns:
             df["telescope"] = "MAST"
-        
+
         return df

@@ -764,6 +764,14 @@ export function ChatArea() {
                         onUsage: (usage) => {
                             if (usage?.totalTokens > 0) updateLastAssistantUsage(usage.totalTokens, usage.durationMs, ownerFor());  // UI-01
                         },
+                        onFinalText: (finalText: string) => {
+                            // The backend's post-processed answer (fabricated-link guard,
+                            // answer verifier, prose hygiene) replaces the streamed text so
+                            // the screen shows exactly what is persisted (UI benchmark
+                            // 2026-09-22: "Removed 1 link" while the link stayed visible).
+                            accumulated = finalText;
+                            updateLastAssistantMessage(accumulated, ownerFor());
+                        },
                         onComplete: () => {
                             // UI-01: the thinking rail + global streaming flag belong to
                             // the ACTIVE conversation. After a switch the rail was reset

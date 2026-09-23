@@ -172,6 +172,34 @@ def filter_by_scan_intent(results: pd.DataFrame, scan_intent: Optional[Any]) -> 
     return results[mask].copy(), label
 
 
+def _server_side_runner(ctx: CallContext, prov_state: Dict[str, Any], executed: List[str]):
+    """``run_query(adql) -> DataFrame`` for services/alma_server_side.py: the
+    budgeted ALMA TAP service, every executed query appended to ``executed``
+    and mirrored into the provenance state (the Show-query panel shows them
+    all), byte columns decoded, truncation flagged."""
+    from services.alma_server_side import AGG_MAXREC
+
+    search_service = ctx.service("search_service")
+    service = search_service.alminer_client._get_tap_service()
+
+    def run(query: str) -> pd.DataFrame:
+        executed.append(query)
+        prov_state["query"] = "\n\n".join(executed)
+        prov_state["url"] = prov_state.get("url") or _ALMA_TAP_URL
+        try:
+            res = service.search(query, maxrec=AGG_MAXREC)
+        except TypeError:
+            res = service.search(query)
+        prov_state["url"] = getattr(res, "quasar_tap_url", prov_state["url"]) or _ALMA_TAP_URL
+        df = res.to_table().to_pandas()
+        for column in df.select_dtypes(include=["object"]):
+            df[column] = df[column].map(lambda v: v.decode("utf-8") if isinstance(v, bytes) else v)
+        df.attrs["truncated"] = bool(len(df) >= AGG_MAXREC or getattr(res, "query_status", "") == "OVERFLOW")
+        return df
+
+    return run
+
+
 def _tap_obscore_dataframe(
     where_clause: str,
     *,
@@ -557,6 +585,24 @@ class SearchByTarget(BaseCapability):
             else:
                 _log(f"[FILTER] Ignoring unrecognized band={band}")
 
+        # Structured filters go INTO the ALMA ADQL (band tokens, spatial_resolution,
+        # science_observation) so the TOP cap applies after them (UI benchmark
+        # 2026-09-22, D16: "Band 6 observations of M83" was whatever Band 6 fell
+        # in the first 100 unfiltered rows). The pandas post-filters below stay
+        # as a no-op safety net (and for the ALminer fallback, which cannot
+        # filter server-side).
+        if facility_label == "ALMA":
+            if band_list_input:
+                _svc_kw["band"] = list(band_list_input)
+            if max_resolution is not None:
+                try:
+                    if float(max_resolution) > 0:
+                        _svc_kw["max_resolution"] = float(max_resolution)
+                except (TypeError, ValueError):
+                    pass
+            if scan_intent and str(scan_intent).strip().upper() in {"TARGET", "SCIENCE"}:
+                _svc_kw["science_only"] = True
+
         # ── Safety: ignore near-zero/zero min values (LLM default filling) ──
         # The LLM often fills 0 for optional params despite being told not to.
         # A value of 0 for resolution/frequency/exptime means "no filter".
@@ -909,13 +955,26 @@ class SearchByTarget(BaseCapability):
             if isinstance(_dr, dict) and not _dr.get("applied", True):
                 warnings_out.append(f"date_range {_dr.get('requested')!r} NOT applied: {_dr.get('reason')}")
             truncated = bool(_frame_attr(results, "truncated", False))
+            _total_count = _frame_attr(results, "total_count")
+            _total_mous = _frame_attr(results, "total_mous")
             if truncated:
-                warnings_out.append(f"Row cap reached ({max_results}); more rows exist for this target.")
+                if isinstance(_total_count, int):
+                    warnings_out.append(
+                        f"Row cap reached: the archive holds {_total_count} matching rows"
+                        + (f" ({_total_mous} MOUS)" if isinstance(_total_mous, int) else "")
+                        + f" for this target and filters; showing {len(results)}. Say 'N rows total, showing M', never 'N observations'."
+                    )
+                else:
+                    warnings_out.append(f"Row cap reached ({max_results}); more rows exist for this target.")
+            _filters_in_adql = _frame_attr(results, "filters_in_adql") or {}
             out = {
                 "success": True,
                 "total_results": len(results),
                 **summary,
                 "truncated": truncated,
+                "total_count": _total_count if isinstance(_total_count, int) else None,
+                "total_mous": _total_mous if isinstance(_total_mous, int) else None,
+                "filters_in_adql": _filters_in_adql,
                 "public_only": public_only,
                 "footprint_mode": (_frame_attr(results, "quasar_cone") or {}).get("footprint_mode"),
                 "filters_applied": filter_parts,
@@ -1686,43 +1745,83 @@ class QueryAlmaScienceArchive(BaseCapability):
         query_summary = ""
         publications: Optional[List[Dict[str, str]]] = None
         df = pd.DataFrame()
+        # Server-side aggregation (services/alma_server_side.py, UI benchmark
+        # 2026-09-22 D09/D10/D11/D21/D22): the named query types compute their
+        # per-project answer at the ALMA TAP server (GROUP BY / DISTINCT /
+        # HAVING, one bounded query per cycle or per line) instead of pulling a
+        # TOP-capped row sliver and post-filtering. When the server rejects an
+        # aggregate the legacy pull runs and the answer says so.
+        _ss = None
+        _ss_queries: List[str] = []
+        _science_only_default = True if inp.science_only in (None, False, True) and not (str(inp.science_only).lower() in {"false", "0", "no"} and inp.science_only is not False) else True
+        _science_only = False if (isinstance(inp.science_only, str) and inp.science_only.lower() in {"false", "0", "no"}) else True
+
+        def _server_side(fn, *args, **kwargs):
+            """Try the server-side computation; on failure fall back (caller
+            handles) after recording why."""
+            run_query = _server_side_runner(ctx, prov_state, _ss_queries)
+            return fn(run_query, *args, **kwargs)
+
         try:
             if query_type == "cycle_solar_projects":
                 if cycle is None:
                     return _native({"success": False, "error": "cycle is required"})
-                # scientific_category = 'Sun' is the primary predicate; the text
-                # fallbacks are word-anchored and exclude Sunyaev-Zel'dovich (G-06).
-                where = f"{project_prefix_where(int(cycle))} AND {solar_where()}"
-                df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
-                before = int(len(df))
-                df = exclude_sunyaev(df)
-                if before - int(len(df)):
-                    warnings.append(f"Dropped {before - int(len(df))} Sunyaev-Zel'dovich row(s) matched by the text fallback.")
-                result_df = summarize_projects(df)
+                from services.alma_server_side import solar_projects_server_side
+
+                try:
+                    _ss = _server_side(solar_projects_server_side, int(cycle), science_only=_science_only)
+                    result_df = _ss.frame
+                    warnings.extend(_ss.notes)
+                except Exception as _ss_err:
+                    warnings.append(f"Server-side aggregation failed ({type(_ss_err).__name__}: {str(_ss_err)[:120]}); fell back to a TOP-capped row pull.")
+                    _ss = None
+                    # scientific_category = 'Sun' is the primary predicate; the text
+                    # fallbacks are word-anchored and exclude Sunyaev-Zel'dovich (G-06).
+                    where = f"{project_prefix_where(int(cycle))} AND {solar_where()}"
+                    if _science_only:
+                        where += " AND science_observation = 'T'"
+                    df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
+                    before = int(len(df))
+                    df = exclude_sunyaev(df)
+                    if before - int(len(df)):
+                        warnings.append(f"Dropped {before - int(len(df))} Sunyaev-Zel'dovich row(s) matched by the text fallback.")
+                    result_df = summarize_projects(df)
+                    warnings.append(cycle_periods_disclosure(int(cycle)))
                 source = f"ALMA Cycle {cycle} solar projects"
                 mode = "cycle_solar_projects"
-                warnings.append(cycle_periods_disclosure(int(cycle)))
                 query_summary = (
-                    f"Cycle {cycle} projects with scientific_category 'Sun' or word-anchored Sun/solar terms in "
-                    "target, keyword or title (Sunyaev-Zel'dovich excluded); grouped by proposal_id with "
-                    "rows/MOUS/EB counts."
+                    f"Cycle {cycle} SCIENCE observations (science_observation='T') with scientific_category 'Sun' or "
+                    "word-anchored Sun/solar terms in target, keyword or title (Sunyaev-Zel'dovich excluded); "
+                    "counted per proposal_id at the server (distinct MOUS / EBs / rows)."
                 )
 
             elif query_type == "cycle_array_combo_projects":
                 if cycle is None:
                     return _native({"success": False, "error": "cycle is required"})
                 required_arrays = arrays or ["12m", "7m", "TP"]
-                df = _tap_obscore_dataframe(project_prefix_where(int(cycle)), max_results=max_results, ctx=ctx)
-                result_df = projects_with_array_combo(df, required_arrays)
+                from services.alma_server_side import array_combo_projects_server_side
+
+                try:
+                    _ss = _server_side(array_combo_projects_server_side, int(cycle), required_arrays, science_only=_science_only)
+                    result_df = _ss.frame
+                    warnings.extend(_ss.notes)
+                except Exception as _ss_err:
+                    warnings.append(f"Server-side aggregation failed ({type(_ss_err).__name__}: {str(_ss_err)[:120]}); fell back to a TOP-capped row pull.")
+                    _ss = None
+                    df = _tap_obscore_dataframe(project_prefix_where(int(cycle)), max_results=max_results, ctx=ctx)
+                    result_df = projects_with_array_combo(df, required_arrays)
+                    warnings.append(cycle_periods_disclosure(int(cycle)))
+                    warnings.append(
+                        "Array membership is inferred heuristically from antenna_arrays name prefixes "
+                        "(DV/DA = 12-m, CM = 7-m, PM = Total Power) and schedblock_name suffixes; the archive "
+                        "delivers per-MOUS data and has not combined the arrays."
+                    )
                 source = f"ALMA Cycle {cycle} array combo projects"
                 mode = "cycle_array_combo_projects"
-                warnings.append(cycle_periods_disclosure(int(cycle)))
-                warnings.append(
-                    "Array membership is inferred heuristically from antenna_arrays name prefixes "
-                    "(DV/DA = 12-m, CM = 7-m, PM = Total Power) and schedblock_name suffixes; the archive "
-                    "delivers per-MOUS data and has not combined the arrays."
+                query_summary = (
+                    f"Cycle {cycle} projects using ALL of {', '.join(required_arrays)}: one DISTINCT proposal_id query per array "
+                    "at the server (antenna names DV/DA = 12 m, CM = 7 m, PM = TP), intersected; counts per proposal_id via GROUP BY."
                 )
-                query_summary = f"Cycle {cycle} projects grouped by proposal_id requiring arrays {', '.join(required_arrays)}."
 
             elif query_type == "high_resolution_band_data":
                 if not target and (inp.ra is None or inp.dec is None):
@@ -1811,43 +1910,92 @@ class QueryAlmaScienceArchive(BaseCapability):
                         ")"
                     )
                 where = " AND ".join(where_parts)
-                df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
-                result_df = projects_covering_all_lines(df, required_lines, z=0.0)
+                from services.alma_server_side import line_set_projects_server_side
+
+                try:
+                    _ss = _server_side(
+                        line_set_projects_server_side, required_lines, band=band, science_only=_science_only,
+                        cycle=int(cycle) if cycle is not None else None, topic_filter=topic,
+                    )
+                    result_df = _ss.frame
+                    warnings.extend(_ss.notes)
+                except Exception as _ss_err:
+                    warnings.append(f"Server-side aggregation failed ({type(_ss_err).__name__}: {str(_ss_err)[:120]}); fell back to a TOP-capped row pull.")
+                    _ss = None
+                    df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
+                    result_df = projects_covering_all_lines(df, required_lines, z=0.0)
                 source = f"ALMA Band {requested_band} projects covering {', '.join(required_lines)}"
                 mode = "line_set_projects"
                 query_summary = (
-                    f"Band {requested_band} rows grouped by proposal_id; retained projects covering all requested "
-                    f"rest-frame lines: {', '.join(required_lines)}."
+                    f"Band {requested_band or 'any'} SCIENCE spectral windows covering each of {', '.join(required_lines)} "
+                    "(frequency ± bandwidth/2 contains the rest frequency, computed at the server per line, GROUP BY MOUS); "
+                    "a MOUS must cover every line; aggregated per proposal_id."
                 )
 
             elif query_type == "redshifted_line_projects":
                 if redshift_min is None or redshift_max is None:
                     raise ValueError("redshift_min and redshift_max are required")
                 z_min, z_max = float(redshift_min), float(redshift_max)
-                where, line_names = _redshifted_line_where(rest_species or "CO", z_min, z_max, science_category)
-                df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
-                result_df = redshifted_line_projects(df, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max)
+                from services.alma_science_queries import UnsupportedSpecies
+                from services.alma_server_side import redshifted_line_projects_server_side
+
+                # A named species without a rest frequency is an explicit
+                # failure, never a silent CO substitution (guard CX-29).
+                try:
+                    line_names_for_species(rest_species or "CO")
+                except UnsupportedSpecies as _us:
+                    return _native({"success": False, "status": "unsupported_species", "error": str(_us),
+                                    "rest_species": rest_species})
+
+                try:
+                    _ss = _server_side(
+                        redshifted_line_projects_server_side, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max,
+                        science_category=str(science_category or ""), cycle=int(cycle) if cycle is not None else None,
+                    )
+                    result_df = _ss.frame
+                    warnings.extend(_ss.notes)
+                    line_names = [w["transition"] for w in _ss.extras.get("windows", [])]
+                except Exception as _ss_err:
+                    warnings.append(f"Server-side aggregation failed ({type(_ss_err).__name__}: {str(_ss_err)[:120]}); fell back to a TOP-capped row pull.")
+                    _ss = None
+                    where, line_names = _redshifted_line_where(rest_species or "CO", z_min, z_max, science_category)
+                    df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
+                    result_df = redshifted_line_projects(df, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max)
                 source = f"ALMA {rest_species or 'CO'} redshifted line projects z={z_min:g}-{z_max:g}"
                 mode = "redshifted_line_projects"
                 if require_same_project is False:
                     warnings.append("require_same_project=False is accepted for API compatibility; this summary is still grouped by proposal_id.")
                 query_summary = (
-                    f"Frequency-containment query for {', '.join(line_names)} shifted to z={z_min:g}-{z_max:g}, "
-                    "restricted to extragalactic science categories unless science_category is supplied."
+                    f"SCIENCE spectral windows (science_observation='T') overlapping the observed windows of {', '.join(line_names)} "
+                    f"for z={z_min:g}-{z_max:g}, extragalactic categories unless science_category is supplied; counted per "
+                    "proposal_id at the server, one query per cycle. The z range reported is coverage-compatible, not a measured redshift."
                 )
 
             elif query_type == "bandwidth_switching_candidates":
-                where = project_prefix_where(int(cycle)) if cycle is not None else "proposal_id IS NOT NULL"
-                df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
-                result_df = bandwidth_switching_candidates(df)
+                from services.alma_server_side import BWSW_THRESHOLD_MHZ, bandwidth_switching_server_side
+
+                try:
+                    _ss = _server_side(bandwidth_switching_server_side, cycle=int(cycle) if cycle is not None else None)
+                    result_df = _ss.frame
+                    warnings.extend(_ss.notes)
+                except Exception as _ss_err:
+                    warnings.append(f"Server-side aggregation failed ({type(_ss_err).__name__}: {str(_ss_err)[:120]}); fell back to a TOP-capped row pull and the diagnostic heuristic.")
+                    _ss = None
+                    where = project_prefix_where(int(cycle)) if cycle is not None else "proposal_id IS NOT NULL"
+                    df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
+                    result_df = bandwidth_switching_candidates(df)
+                    if cycle is None:
+                        warnings.append("No cycle given: the TOP-capped fetch scans the whole archive from the lowest project codes upward and is certainly incomplete.")
+                    warnings.append("Bandwidth Switching likelihood is inferred from public spectral setup metadata; it is not proof of calibration intent.")
                 source = "ALMA bandwidth-switching calibration candidates" + (f" Cycle {cycle}" if cycle is not None else "")
                 mode = "bandwidth_switching_candidates"
                 if cycle is not None:
                     warnings.append(cycle_periods_disclosure(int(cycle)))
-                else:
-                    warnings.append("No cycle given: the TOP-capped fetch scans the whole archive from the lowest project codes upward and is certainly incomplete.")
-                warnings.append("Bandwidth Switching likelihood is inferred from public spectral setup metadata; it is not proof of calibration intent.")
-                query_summary = "Projects scored by spectral-window count, bandwidth diversity, tuning diversity, and calibration-like metadata."
+                query_summary = (
+                    f"Science MOUS whose aggregate spectral-window bandwidth is below the Handbook BWSW threshold ({BWSW_THRESHOLD_MHZ:g} MHz, "
+                    "narrow FDM-only setups): server-side GROUP BY MOUS HAVING MAX(bandwidth) < threshold per cycle, exact aggregate from the "
+                    "SPW list; grouped per proposal_id."
+                )
 
             elif query_type == "sensitivity_search":
                 if inp.sensitivity_mjy is None:
@@ -1923,6 +2071,20 @@ class QueryAlmaScienceArchive(BaseCapability):
             if trunc["truncated"]:
                 warnings.append(trunc["warning"])
             raw_counts = aggregate_counts(df)
+            if _ss is not None:
+                # Server-side path: the counts ARE the aggregate (no row pull).
+                raw_counts = {
+                    "rows": int(pd.to_numeric(result_df.get("n_rows", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not result_df.empty and "n_rows" in result_df else 0,
+                    "n_mous": int(pd.to_numeric(result_df.get("n_mous", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not result_df.empty and "n_mous" in result_df else None,
+                    "n_eb": int(pd.to_numeric(result_df.get("n_eb", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not result_df.empty and "n_eb" in result_df else None,
+                    "n_projects": int(result_df["proposal_id"].nunique()) if not result_df.empty and "proposal_id" in result_df else 0,
+                    "computed": "server-side aggregate",
+                }
+                if not _ss.complete:
+                    raw_counts["count_is_lower_bound"] = True
+                    warnings.append("INCOMPLETE: " + _ss.completeness_note() + " Report counts as lower bounds.")
+                else:
+                    warnings.append("Completeness: " + _ss.completeness_note())
             if result_df.attrs.get("ungroupable_rows"):
                 warnings.append(f"{result_df.attrs['ungroupable_rows']} archive rows lack a MOUS identifier; counts are partial.")
             provenance = {
@@ -1948,7 +2110,7 @@ class QueryAlmaScienceArchive(BaseCapability):
                 "success": True,
                 "mode": mode,
                 "count": len(result_df),
-                "partial": bool(trunc["truncated"] or result_df.attrs.get("partial")),
+                "partial": bool(trunc["truncated"] or result_df.attrs.get("partial") or (_ss is not None and not _ss.complete)),
                 "ungroupable_rows": result_df.attrs.get("ungroupable_rows", 0),
                 "unique_projects": unique_projects,
                 "rows_fetched": trunc["rows_fetched"],
@@ -1973,11 +2135,52 @@ class QueryAlmaScienceArchive(BaseCapability):
                 # observation↔paper graph alongside the per-project table.
                 out["publications"] = publications
                 out["n_publications"] = len(publications)
+            if _ss is not None:
+                out["status"] = "ok" if _ss.complete else "partial"
+                out["computation"] = "server-side"
+                out["completeness"] = _ss.completeness_note()
+                out["scanned"] = _ss.scanned
+                out["not_scanned"] = list(_ss.unscanned)
+                out["executed_queries"] = len(_ss.queries)
+                out["method"] = _ss.extras.get("method")
+                for key in ("rest_frequencies_ghz", "lines", "mous_per_line", "windows", "threshold_mhz", "citation",
+                            "projects_in_window", "per_array_project_counts", "matching_projects", "cycles_scanned"):
+                    if key in _ss.extras:
+                        out[key] = _ss.extras[key]
+                if "matching_projects" in _ss.extras:
+                    # D11: the headline number is the MATCHING count, never the window count.
+                    out["n_projects_in_window"] = _ss.extras.get("projects_in_window")
+                    out["unique_projects"] = int(_ss.extras["matching_projects"])
+                    out["headline_count_note"] = (
+                        f"{out['unique_projects']} project(s) used ALL requested arrays; {out['n_projects_in_window']} projects "
+                        "exist in the cycle window. Report the former as the answer."
+                    )
+                elif mode == "line_set_projects":
+                    out["headline_count_note"] = f"{unique_projects} project(s) have at least one MOUS covering every requested line."
+                elif mode == "redshifted_line_projects":
+                    out["headline_count_note"] = (
+                        f"{unique_projects} project(s) with science SPWs coverage-compatible with the requested lines at z="
+                        f"{float(redshift_min):g}-{float(redshift_max):g}; this is spectral coverage, not measured redshifts."
+                    )
+                elif mode == "bandwidth_switching_candidates":
+                    out["headline_count_note"] = f"{unique_projects} project(s) have MOUS below the BWSW aggregate-bandwidth threshold ({_ss.extras.get('threshold_mhz'):g} MHz)."
+                elif mode == "cycle_solar_projects":
+                    out["headline_count_note"] = f"{unique_projects} project(s) with science observations of the Sun in this cycle."
             return _native(out)
         except Exception as e:
             import traceback
             logger.error("ALMA science query failed: %s\n%s", e, traceback.format_exc())
             return _native({"success": False, "error": str(e), "partial": True, "query_type": query_type})
+
+
+def _host_from_breaker_text(text: str) -> str:
+    """Extract the host from a stringified HostCircuitOpen ("circuit breaker
+    open for <host> (retry in N s): ...")."""
+    marker = "circuit breaker open for "
+    idx = str(text or "").find(marker)
+    if idx < 0:
+        return ""
+    return str(text)[idx + len(marker):].split(" ", 1)[0].strip("(),;:")
 
 
 def _match_cross_archive_sources_impl(
@@ -1991,18 +2194,52 @@ def _match_cross_archive_sources_impl(
     max_alma_rows: int = 5000,
     max_mast_results_per_source: int = 80,
     require_all_archives: Any = False,
+    alma_mode: str = "bulk_then_points",
 ) -> Dict[str, Any]:
     """Cross-match a built-in or inline source catalog against archives.
 
-    The legacy method body, verbatim — shared by MatchCrossArchiveSources and
-    MatchPerseusProtostarsAlmaJwst (which called the method directly).
-    search_service is fetched inside the ALMA branch's try (guard CX-04): the
-    legacy touched self.search_service only there, so a degraded agent still
-    gets normalize_source_catalog's typed error / the MAST-only path."""
+    Shared by MatchCrossArchiveSources and MatchPerseusProtostarsAlmaJwst.
+    search_service is fetched inside the ALMA phase's try (guard CX-04): a
+    degraded agent still gets normalize_source_catalog's typed error / the
+    MAST-only path.
+
+    Budget contract (2026-09-21, live AM-H-01): this tool used to run one
+    footprint-aware bulk ALMA query with 3 x 120 s mirror attempts and then
+    N sequential MAST queries at astroquery's 600 s default -- 310 s of ALMA
+    failure plus MAST, under a 150 s tool guard, so the guard ALWAYS fired
+    and the model re-called the tool (then its sibling) for 450 s of dead
+    time. Now:
+
+    * the ALMA and MAST phases run CONCURRENTLY under the tool's inner
+      deadline (services/tool_budgets.py), each network call sized to what
+      is left;
+    * ALMA tries the footprint-aware bulk query first (INTERSECTS s_region OR
+      point -- catches mosaics), and if that fails or times out -- live
+      2026-09-21 every mirror timed it out at 60 s while a single point cone
+      answered in ~20 s -- falls back to bounded per-source point cones,
+      disclosed as footprint_mode "point_only";
+    * MAST queries stop as soon as the budget is spent or the MAST host
+      breaker opens, and the sources not queried are named in
+      archive_errors;
+    * the tool always returns BEFORE the guard: partial results are
+      success True + partial True; an outage with zero matches stays a
+      loud failure (CAP-04).
+    """
+    import threading
+
+    from services.host_breaker import HostCircuitOpen
+    from services.tool_budgets import (
+        Deadline,
+        adopt_deadline,
+        current_deadline,
+        inner_ceiling_seconds,
+    )
+
     prov_state = ctx.service("alma_tap_provenance")
     requested_archives = {str(a).upper() for a in (archives or ["ALMA", "JWST"])}
     radius_arcsec = max(0.5, min(float(radius_arcsec or 5.0), 60.0))
-    requested_mast_missions = sorted(requested_archives & {"JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"})
+    mast_missions = {"JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"}
+    requested_mast_missions = sorted(requested_archives & mast_missions)
     try:
         catalog_label, source_catalog = normalize_source_catalog(
             catalog_name=catalog_name,
@@ -2012,42 +2249,251 @@ def _match_cross_archive_sources_impl(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
+    # Under the tool guard the worker thread carries the inner deadline; a
+    # direct call (scripts, tests) gets a standalone one equal to the guard
+    # ceiling so the contract is identical everywhere.
+    # When the guard is disabled (QUASAR_TOOL_TIMEOUT_SECONDS=0 or a per-tool
+    # 0 override) inner_ceiling_seconds() is None and there is deliberately no
+    # deadline at all — legacy inline behaviour (guard CX-06).
+    _ceiling = inner_ceiling_seconds("match_cross_archive_sources")
+    deadline = current_deadline() or Deadline(
+        _ceiling if _ceiling is not None else float("inf"), label="cross-match"
+    )
+    started = time.monotonic()
+    lock = threading.Lock()
     archive_errors: List[str] = []
-    alma_df = pd.DataFrame()
-    alma_matches = pd.DataFrame()
+    # Structured outage signals for the runner/model (guard CX-01): hosts whose
+    # breaker refused us this call, and whether the deadline cut work short.
+    dead_hosts: List[str] = []
+    dead_retry: Dict[str, float] = {}
+    exhausted: List[str] = []
+    alma_box: Dict[str, Any] = {"df": pd.DataFrame(), "mode": None, "queried": 0, "done": False}
     mast_by_source: Dict[str, pd.DataFrame] = {}
-    if "ALMA" in requested_archives:
+
+    def _note(msg: str) -> None:
+        with lock:
+            archive_errors.append(msg)
+
+    def _dead(host: str, retry_after: float = 0.0) -> None:
+        with lock:
+            if host and host not in dead_hosts:
+                dead_hosts.append(host)
+                dead_retry[host] = float(retry_after or 0.0)
+
+    # -- ALMA phase (helper thread) -------------------------------------
+    def _alma_phase() -> None:
+        adopt_deadline(deadline)
         try:
             search_service = ctx.service("search_service")
             service = search_service.alminer_client._get_tap_service()
+            standardize = getattr(search_service.alminer_client, "_standardize_columns", None)
             query = alma_bulk_cone_adql(source_catalog, radius_arcsec=radius_arcsec, top=max_alma_rows)
-            prov_state["query"] = query
             prov_state["url"] = "https://almascience.nrao.edu/tap"
-            alma_result = service.search(query)
-            alma_df = alma_result.to_table().to_pandas()
-            if hasattr(search_service.alminer_client, "_standardize_columns"):
-                alma_df = search_service.alminer_client._standardize_columns(alma_df)
-            alma_matches = attach_nearest_source(alma_df, source_catalog, radius_arcsec=radius_arcsec)
-        except Exception as e:
-            import traceback
-            logger.error("ALMA cross-match query failed: %s\n%s", e, traceback.format_exc())
-            archive_errors.append(f"ALMA TAP failed: {e}")
 
-    if {"MAST", "JWST", "HST", "TESS", "KEPLER", "K2", "GALEX", "SWIFT"} & requested_archives:
-        mission = requested_mast_missions[0] if len(requested_mast_missions) == 1 else None
-        for source in source_catalog:
+            class _SkipBulk(Exception):
+                """alma_mode='point_only': the N-way INTERSECTS(s_region) bulk
+                query times out on every mirror (UI benchmark 2026-09-22 D18,
+                293 s) while point cones answer in 2-5 s -- go straight to them."""
+
             try:
-                mast_by_source[source["source_name"]] = ctx.service("mast_client").search_by_position(
+                if str(alma_mode or "").lower() in {"point_only", "points", "point"}:
+                    raise _SkipBulk("per-source point cones requested")
+                prov_state["query"] = query
+                result = service.search(query)
+                df = result.to_table().to_pandas()
+                with lock:
+                    alma_box.update(df=df, mode="intersects_or_point", queried=len(source_catalog))
+            except HostCircuitOpen as exc:
+                _dead(exc.host, exc.retry_after)
+                _note(f"ALMA TAP unreachable ({exc.host}): {exc.reason[:120]}")
+                return
+            except Exception as exc:
+                bulk_err = f"{type(exc).__name__}: {str(exc)[:160]}"
+                skipped_bulk = isinstance(exc, _SkipBulk)
+                if not skipped_bulk:
+                    logger.warning(
+                        "ALMA bulk footprint cross-match failed (%s); falling back to per-source point cones",
+                        bulk_err,
+                    )
+                # Per-source point cones: cheap for the archive, individually
+                # bounded, and each answered source counts even if later ones
+                # run out of budget.
+                from services.alma_science_queries import alma_cone_where
+
+                frames: List[pd.DataFrame] = []
+                not_queried: List[str] = []
+                failed: List[str] = []
+                radius_deg = radius_arcsec / 3600.0
+                # Point cones run 4 at a time under CHILD deadlines of the tool
+                # deadline (services/alma_server_side.run_concurrently): live
+                # 2026-09-23 D18 ran them one by one and 3 of 12 sources ran out
+                # of budget. Each answered source counts even if a later batch
+                # is cut short.
+                from services.alma_server_side import run_concurrently
+
+                def _cone_query(source: Dict[str, Any]) -> str:
+                    cone = alma_cone_where(float(source["ra"]), float(source["dec"]), radius_deg, footprint=False)
+                    return (
+                        "SELECT TOP 2000 target_name, proposal_id, member_ous_uid, asdm_uid, obs_publisher_did, "
+                        "s_ra, s_dec, s_region, frequency, bandwidth, band_list, dataproduct_type, "
+                        "scientific_category, science_keyword, obs_title, pi_name, t_exptime, s_resolution, "
+                        f"obs_release_date, data_rights FROM ivoa.obscore WHERE {cone}"
+                    )
+
+                pending = list(enumerate(source_catalog))
+                host_down = False
+                while pending and not host_down:
+                    if deadline.remaining() < 8.0:
+                        not_queried.extend(src["source_name"] for _, src in pending)
+                        with lock:
+                            if "ALMA point cones" not in exhausted:
+                                exhausted.append("ALMA point cones")
+                        break
+                    batch, pending = pending[:4], pending[4:]
+                    queries = [_cone_query(src) for _, src in batch]
+                    if not prov_state.get("query"):
+                        prov_state["query"] = queries[0]  # the first executed cone stands for the batch
+                    outs = run_concurrently(
+                        [(lambda q=q: service.search(q).to_table().to_pandas()) for q in queries],
+                        wall_seconds=max(1.0, deadline.remaining() - 2.0),
+                    )
+                    for (idx, source), out in zip(batch, outs):
+                        if isinstance(out, HostCircuitOpen):
+                            _dead(out.host, out.retry_after)
+                            _note(
+                                f"ALMA TAP unreachable ({out.host}) after {alma_box['queried']} sources: "
+                                f"{out.reason[:100]}"
+                            )
+                            host_down = True
+                            not_queried.append(source["source_name"])
+                        elif isinstance(out, BaseException):
+                            if isinstance(out, TimeoutError) and "not finished within the budget" in str(out):
+                                not_queried.append(source["source_name"])
+                                with lock:
+                                    if "ALMA point cones" not in exhausted:
+                                        exhausted.append("ALMA point cones")
+                            else:
+                                failed.append(f"{source['source_name']}: {type(out).__name__}: {str(out)[:80]}")
+                        else:
+                            frames.append(out)
+                            with lock:
+                                alma_box["queried"] += 1
+                    if host_down:
+                        not_queried.extend(src["source_name"] for _, src in pending)
+                        pending = []
+                prov_state["note"] = (
+                    "-- Executed as ONE point cone per source (CONTAINS(POINT(s_ra, s_dec), CIRCLE(...))), "
+                    f"{alma_box['queried']} of {len(source_catalog)} sources queried -- mosaics whose centre lies "
+                    "outside the cone are NOT captured."
+                    if skipped_bulk else
+                    "-- Footprint-aware bulk query above failed; executed as per-source point cones "
+                    "(CONTAINS(POINT(s_ra, s_dec), CIRCLE(...))) -- mosaics whose centre lies outside "
+                    "the cone are NOT captured."
+                )
+                good = [f for f in frames if f is not None and not f.empty]
+                df = pd.concat(good, ignore_index=True) if good else pd.DataFrame()
+                with lock:
+                    alma_box.update(df=df, mode="point_only")
+                if not skipped_bulk:
+                    _note(f"ALMA footprint (INTERSECTS) bulk query failed: {bulk_err}; fell back to per-source point cones")
+                if failed:
+                    _note("ALMA point-cone queries failed for " + "; ".join(failed[:4]) + (" ..." if len(failed) > 4 else ""))
+                if not_queried:
+                    _note(
+                        f"ALMA not queried for {len(not_queried)} source(s) -- tool budget exhausted: "
+                        + ", ".join(not_queried[:6]) + (" ..." if len(not_queried) > 6 else "")
+                    )
+            with lock:
+                df = alma_box["df"]
+            if df is not None and not df.empty and callable(standardize):
+                df = standardize(df)
+                with lock:
+                    alma_box["df"] = df
+        except Exception as exc:
+            import traceback
+            logger.error("ALMA cross-match phase failed: %s\n%s", exc, traceback.format_exc())
+            _note(f"ALMA TAP failed: {exc}")
+        finally:
+            with lock:
+                alma_box["done"] = True
+
+    alma_thread: Optional[threading.Thread] = None
+    if "ALMA" in requested_archives:
+        alma_thread = threading.Thread(target=_alma_phase, name="quasar-xmatch-alma", daemon=True)
+        alma_thread.start()
+
+    # -- MAST phase (this thread) ---------------------------------------
+    mast_requested = bool(({"MAST"} | mast_missions) & requested_archives)
+    if mast_requested:
+        mission = requested_mast_missions[0] if len(requested_mast_missions) == 1 else None
+        mast_client = ctx.service("mast_client")
+        not_queried: List[str] = []
+        host_down: Optional[str] = None
+        for source in source_catalog:
+            name = source["source_name"]
+            if host_down is not None or deadline.remaining() < 3.0:
+                not_queried.append(name)
+                mast_by_source[name] = pd.DataFrame()
+                if host_down is None:
+                    with lock:
+                        if "MAST queries" not in exhausted:
+                            exhausted.append("MAST queries")
+                continue
+            try:
+                frame = mast_client.search_by_position(
                     float(source["ra"]),
                     float(source["dec"]),
                     radius_arcmin=radius_arcsec / 60.0,
                     mission=mission,
                     max_results=max_mast_results_per_source,
                 )
-            except Exception as e:
-                logger.error("MAST cross-match query failed for %s: %s", source["source_name"], e)
-                archive_errors.append(f"MAST query failed for {source['source_name']}: {e}")
-                mast_by_source[source["source_name"]] = pd.DataFrame()
+                err = (getattr(frame, "attrs", None) or {}).get("error")
+                if err:
+                    if "HostCircuitOpen" in str(err) or "circuit breaker open" in str(err):
+                        host_down = str(err)
+                        _dead(_host_from_breaker_text(str(err)) or "mast.stsci.edu")
+                    _note(f"MAST query failed for {name}: {str(err)[:160]}")
+                mast_by_source[name] = frame if frame is not None else pd.DataFrame()
+            except HostCircuitOpen as exc:
+                host_down = str(exc)
+                _dead(exc.host, exc.retry_after)
+                _note(f"MAST unreachable ({exc.host}): {exc.reason[:120]}")
+                mast_by_source[name] = pd.DataFrame()
+            except Exception as exc:
+                logger.error("MAST cross-match query failed for %s: %s", name, exc)
+                _note(f"MAST query failed for {name}: {exc}")
+                mast_by_source[name] = pd.DataFrame()
+        if not_queried:
+            why = "MAST host unreachable (circuit open)" if host_down else "tool budget exhausted"
+            _note(
+                f"MAST not queried for {len(not_queried)} source(s) -- {why}: "
+                + ", ".join(not_queried[:6]) + (" ..." if len(not_queried) > 6 else "")
+            )
+
+    # -- join the ALMA phase with whatever budget is left ---------------
+    alma_finished = True
+    if alma_thread is not None:
+        _left = deadline.remaining()
+        if _left == float("inf"):
+            alma_thread.join()
+        else:
+            alma_thread.join(max(0.0, _left))
+        with lock:
+            alma_finished = bool(alma_box["done"])
+        if not alma_finished:
+            with lock:
+                exhausted.append("ALMA phase")
+            _note(
+                f"ALMA phase did not finish within the tool budget ({deadline.seconds:.0f} s) -- "
+                f"{alma_box['queried']} of {len(source_catalog)} sources answered; the rest were abandoned"
+            )
+    with lock:
+        alma_df = alma_box["df"] if alma_box["df"] is not None else pd.DataFrame()
+        footprint_mode = alma_box["mode"]
+    alma_matches = (
+        attach_nearest_source(alma_df, source_catalog, radius_arcsec=radius_arcsec)
+        if not alma_df.empty else pd.DataFrame()
+    )
 
     summary = summarize_cross_archive_matches(
         source_catalog,
@@ -2056,23 +2502,42 @@ def _match_cross_archive_sources_impl(
         sorted(requested_archives),
         require_all_archives=bool(require_all_archives),
     )
+    elapsed = round(time.monotonic() - started, 1)
+    with lock:
+        dead = list(dead_hosts)
+        budget_exhausted = bool(exhausted)
     # Outage honesty (scan CAP-04): when archives errored AND nothing matched,
     # "0 matches, success" would let an outage masquerade as a real empty
     # cross-match. Fail loudly instead; partial results stay success+partial.
     if archive_errors and len(summary) == 0:
-        return {
+        out_fail: Dict[str, Any] = {
             "success": False,
             "mode": "cross_archive_source_match",
             "catalog_name": catalog_label,
             "archives": sorted(requested_archives),
             "sources_tested": len(source_catalog),
             "archive_errors": archive_errors,
+            "footprint_mode": footprint_mode,
+            "elapsed_seconds": elapsed,
+            "dead_hosts": dead,
+            "budget_exhausted": budget_exhausted,
             "error": (
-                "Every archive query failed before any match could be made — this is "
-                "an archive/service outage, not a confirmed 'no counterparts' result: "
+                "Every archive query failed before any match could be made -- this is "
+                "an archive/service outage or budget exhaustion, not a confirmed 'no counterparts' result: "
                 + "; ".join(archive_errors[:3])
             ),
         }
+        # Structured signals the runner keys on (guard CX-01): a refused host
+        # makes this an infrastructure failure the identical re-call cache
+        # must not re-execute; a deadline cut is a timeout-class result.
+        if dead:
+            out_fail["infrastructure_failure"] = True
+            out_fail["circuit_breaker"] = True
+            out_fail["host"] = dead[0]
+            out_fail["retry_after_seconds"] = int(round(max(dead_retry.values() or [0.0])))
+        if budget_exhausted:
+            out_fail["timeout"] = True
+        return out_fail
     ctx.service("set_last_search_results")(summary)
     ctx.service("set_last_run_result")({
         "type": "data",
@@ -2084,8 +2549,9 @@ def _match_cross_archive_sources_impl(
         "partial": bool(archive_errors),
     })
 
-    return {
+    out: Dict[str, Any] = {
         "success": True,
+        "partial": bool(archive_errors),
         "mode": "cross_archive_source_match",
         "catalog_name": catalog_label,
         "archives": sorted(requested_archives),
@@ -2094,9 +2560,28 @@ def _match_cross_archive_sources_impl(
         "radius_arcsec": radius_arcsec,
         "alma_rows": len(alma_df) if alma_df is not None else 0,
         "archive_errors": archive_errors,
+        "elapsed_seconds": elapsed,
         "results": summary.head(100).to_dict("records") if not summary.empty else [],
         "note": "Full cross-match table is shown in the UI data card with sky coordinates.",
+        # Partial results keep success=True (real data came back) but carry the
+        # outage/budget signals so an IDENTICAL re-call is answered from this
+        # result instead of re-running (core/runner.py _result_is_dead_end).
+        "dead_hosts": dead,
+        "budget_exhausted": budget_exhausted,
     }
+    if dead:
+        out["note"] += (
+            f" Archive host(s) unreachable during this call: {', '.join(dead)} — the affected side is"
+            " incomplete; re-running this exact call will not help until the host recovers."
+        )
+    if footprint_mode:
+        out["footprint_mode"] = footprint_mode
+        if footprint_mode == "point_only":
+            out["note"] += (
+                " ALMA matched on representative pointing centres only (footprint query unavailable): "
+                "mosaics covering a source without a pointing centre inside the cone are not counted."
+            )
+    return out
 
 
 class MatchCrossArchiveSourcesInput(_In):

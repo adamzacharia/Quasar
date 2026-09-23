@@ -11,6 +11,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
+from services.host_breaker import guarded_request
+from services.tool_budgets import bounded_timeout
+
 from services import plotting
 
 
@@ -212,7 +215,12 @@ class HipsImageService:
         plotting_service: Optional[plotting.PlottingService] = None,
     ):
         self.base_url = str(base_url or os.getenv("HIPS2FITS_BASE_URL") or HIPS2FITS_DEFAULT_BASE_URL)
-        self.timeout = float(timeout if timeout is not None else _env_float("HIPS2FITS_TIMEOUT", 45.0))
+        # 30 s: a healthy hips2fits answers a 512 px cutout in 1-5 s; tools that
+        # fetch several layers (RGB composite = 3) must still fit the 150 s
+        # guard with headroom. Each request is further clamped to the running
+        # tool's remaining budget (services/tool_budgets.py) and goes through
+        # the CDS host breaker (services/host_breaker.py).
+        self.timeout = float(timeout if timeout is not None else _env_float("HIPS2FITS_TIMEOUT", 30.0))
         self.plotting_service = plotting_service or plotting.PlottingService()
 
     def cutout(
@@ -513,7 +521,10 @@ class HipsImageService:
         # anomalous and must not balloon memory.
         max_bytes = MAX_FITS_LAYER_MB * 1024 * 1024
         try:
-            response = requests.get(self.base_url, params=params, timeout=self.timeout, stream=True)
+            response = guarded_request(
+                "GET", self.base_url, params=params,
+                timeout=bounded_timeout(self.timeout, label="hips2fits FITS"), stream=True,
+            )
         except requests.RequestException as exc:
             raise HipsImageError(f"hips2fits FITS request failed: {exc}") from exc
         try:
@@ -594,7 +605,10 @@ class HipsImageService:
             raise HipsImageError("VLASS covers Dec > -40 deg only; choose a northern target or another radio survey.")
         params = self._params(survey_id, ra, dec, fov_deg, width, stretch=stretch)
         try:
-            response = requests.get(self.base_url, params=params, timeout=self.timeout)
+            response = guarded_request(
+                "GET", self.base_url, params=params,
+                timeout=bounded_timeout(self.timeout, label="hips2fits PNG"),
+            )
         except requests.RequestException as exc:
             raise HipsImageError(f"hips2fits request failed: {exc}") from exc
         status = int(getattr(response, "status_code", 0) or 0)

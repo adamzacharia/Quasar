@@ -12,9 +12,9 @@ class _FakeAx:
 
 
 def test_wd_locus_classifies_both_sides():
-    # line y = 11.5 + 5*x. At x=0 line=11.5; at x=1 line=16.5.
+    # line y = 9.625 + 3.25*x. At x=0 line=9.625; at x=1 line=12.875.
     x = pd.Series([0.0, 0.0, 0.0, 1.0])
-    y = pd.Series([13.0, 15.0, 10.0, 20.0])  # WD: 13,15 (>11.5), 20 (>16.5) = 3; other: 10 = 1
+    y = pd.Series([13.0, 15.0, 9.0, 20.0])  # WD: 13,15 (>9.625), 20 (>12.875) = 3; other: 9 = 1
     info = _overlay_locus(_FakeAx(), "wd", x, y)
     assert info is not None
     assert info["n_wd_candidates"] == 3
@@ -41,3 +41,14 @@ def test_ignores_nonfinite_points():
     info = _overlay_locus(_FakeAx(), "white_dwarf", x, y)
     assert info["n_wd_candidates"] == 1
     assert info["n_other"] == 0
+
+
+
+def test_realistic_hr_diagram_points():
+    # A 0.3 BP-RP white dwarf at M_G 12.5 is a candidate; a K dwarf (1.0, 6.0) and
+    # an M dwarf (3.0, 12.0) are main sequence (the old line rejected the white
+    # dwarf too: L06, UI benchmark 2026-09-23).
+    x = pd.Series([0.3, 1.0, 3.0])
+    y = pd.Series([12.5, 6.0, 12.0])
+    info = _overlay_locus(_FakeAx(), "wd", x, y)
+    assert info["n_wd_candidates"] == 1 and info["n_other"] == 2

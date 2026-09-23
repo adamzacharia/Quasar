@@ -75,7 +75,7 @@ def xmatch_dataframe(
     dec_column: str = "dec",
     radius_arcsec: float = 5.0,
     selection: str = "best",
-    timeout: float = 120.0,
+    timeout: float = 90.0,
     url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upload ``frame`` and crossmatch it against ``catalog``.
@@ -118,7 +118,13 @@ def xmatch_dataframe(
     }
     files = {"cat1": ("upload.csv", csv_payload.encode("utf-8"), "text/csv")}
     try:
-        resp = requests.post(url or XMATCH_SYNC_URL, data=data, files=files, timeout=float(timeout))
+        from services.host_breaker import guarded_request
+        from services.tool_budgets import bounded_timeout
+
+        resp = guarded_request(
+            "POST", url or XMATCH_SYNC_URL, data=data, files=files,
+            timeout=bounded_timeout(float(timeout), minimum=2.0, label="CDS xmatch"),
+        )
     except requests.RequestException as exc:
         raise CdsXmatchError(f"CDS X-Match request failed: {exc}") from exc
     body = resp.text or ""

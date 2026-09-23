@@ -18,11 +18,19 @@ warnings.filterwarnings('ignore')
 
 
 class _TimeoutHTTPSession(requests.Session):
-    """requests.Session that enforces a default timeout on every request.
+    """requests.Session that enforces a bounded timeout and the host breaker
+    on every request.
 
     pyvo issues requests without a timeout, which can hang indefinitely on
     slow or filtered networks. Injecting this session guarantees every TAP
     HTTP call fails fast instead of blocking the agent.
+
+    Budget hierarchy (services/tool_budgets.py): the per-request timeout is
+    ``min(default, remaining tool budget)`` so a retry loop can never outlast
+    the outer tool guard; once the budget is spent the next request raises
+    ``BudgetExhausted`` immediately. Host breaker (services/host_breaker.py):
+    a mirror that refused / reset / timed out is refused in milliseconds
+    for every caller until its cooldown expires.
     """
 
     def __init__(self, timeout: float = 30.0):
@@ -30,8 +38,40 @@ class _TimeoutHTTPSession(requests.Session):
         self._default_timeout = timeout
 
     def request(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", self._default_timeout)
-        return super().request(method, url, **kwargs)
+        from services.host_breaker import HostBreaker, host_of
+        from services.tool_budgets import bounded_timeout
+
+        host = host_of(url)
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            timeout = self._default_timeout
+        label = f"TAP {host}"
+        if isinstance(timeout, tuple):
+            # None elements are unbounded in requests: clamp them too (CX-05).
+            timeout = tuple(
+                bounded_timeout(float(t) if t is not None else self._default_timeout, label=label)
+                for t in timeout
+            )
+        else:
+            timeout = bounded_timeout(float(timeout), label=label)
+        kwargs["timeout"] = timeout
+        # The URL (not the bare host): SOFT failures (read timeout, 502/504)
+        # are scoped to the service path, so a dead /sia never skips /tap.
+        HostBreaker.check(url)
+        from services.http_budget_hook import suppressed
+
+        try:
+            with suppressed():
+                response = super().request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            HostBreaker.record_failure(url, exc)
+            raise
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status in (502, 503, 504):
+            HostBreaker.record_failure(url, status=status)
+        else:
+            HostBreaker.record_success(url)
+        return response
 
 
 def _sanitize_adql(value: str) -> str:

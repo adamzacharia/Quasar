@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import importlib
 import math
 import uuid
@@ -50,7 +51,13 @@ class SparclSpectraService:
         except Exception as exc:
             raise RuntimeError(f"SparCL unavailable: pip install sparclclient. Underlying error: {exc}") from exc
         try:
-            self._client = client_cls()
+            # SparclClient defaults to a 90-minute read timeout; a spectrum
+            # lookup answers in seconds, and the tool guard is 150 s.
+            _read_timeout = float(os.getenv("SPARCL_READ_TIMEOUT_SECONDS", "60") or 60)
+            try:
+                self._client = client_cls(read_timeout=_read_timeout)
+            except TypeError:
+                self._client = client_cls()
         except Exception as exc:
             raise RuntimeError(f"SparCL client initialization failed: {exc}") from exc
         return self._client

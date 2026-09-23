@@ -158,6 +158,63 @@ def build_cone_select(
     return sql, _flag_platform_cap(meta, row_limit, cap_reason)
 
 
+def build_key_select(
+    catalog: str,
+    table: str,
+    *,
+    key_column: str,
+    key_value: Any,
+    columns: Optional[Sequence[str]] = None,
+    limit: Optional[int] = None,
+    predicates: Optional[Sequence[str]] = None,
+    default_limit: int = DEFAULT_ROW_LIMIT,
+) -> Tuple[str, Dict[str, Any]]:
+    """Select rows by an indexed KEY (``fieldid = 169`` on SMASH tables) with
+    NO cone: the UI benchmark's L07 used ``q3c_radial_query(ra, dec, 0, 0, 5)``
+    as a dummy cone to reach a field. The key column must be a registered,
+    indexed bound column of the table."""
+    info = _table_info(catalog, table)
+    indexed = set(indexed_bound_columns_for(info))
+    if key_column not in (info.get("columns") or []):
+        raise ValueError(f"unknown column {key_column!r} for {info['qualified_name']}")
+    if indexed and key_column not in indexed:
+        raise ValueError(
+            f"{key_column!r} is not an indexed bound column of {info['qualified_name']} "
+            f"(indexed: {', '.join(sorted(indexed))}); a key select on it would scan the table."
+        )
+    row_limit, cap_reason = _resolve_limit(limit, default=default_limit)
+    select_cols = _select_columns(info, columns)
+    if isinstance(key_value, (int, float)) and not isinstance(key_value, bool):
+        literal = _num(float(key_value)) if isinstance(key_value, float) else str(int(key_value))
+    else:
+        text = str(key_value).replace("'", "''")
+        literal = f"'{text}'"
+    where_parts = [f"{key_column} = {literal}"]
+    for pred in (predicates or []):
+        text = str(pred).strip()
+        if text:
+            where_parts.append(f"({text})")
+    sql = (
+        f"SELECT {select_cols}\n"
+        f"FROM {info['qualified_name']}\n"
+        f"WHERE " + "\n  AND ".join(where_parts) + "\n"
+        + _limit_clause(row_limit, cap_reason)
+    )
+    meta = _meta("key_select", info, spatial_bound=False, row_limit=row_limit, key_column=key_column)
+    meta["indexed_key"] = True
+    return sql, _flag_platform_cap(meta, row_limit, cap_reason)
+
+
+def indexed_bound_columns_for(info: Dict[str, Any]) -> List[str]:
+    """Indexed key columns for a described table (registry-backed)."""
+    from services import datalab_registry as reg
+
+    try:
+        return list(reg.indexed_bound_columns(info["catalog"], info["table"]))
+    except Exception:
+        return []
+
+
 def build_rectangular_region_select(
     catalog: str,
     table: str,

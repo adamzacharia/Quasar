@@ -215,11 +215,16 @@ class SearchService:
                         facility: Optional[str] = None,
                         date_range: Optional[str] = None,
                         max_results: int = 100,
-                        public_only: bool = False) -> pd.DataFrame:
+                        public_only: bool = False,
+                        band: Any = None,
+                        max_resolution: Optional[float] = None,
+                        science_only: bool = False) -> pd.DataFrame:
         """Search by target name. Routes to NRAO TAP for VLA/VLBA/GBT, else ALMA.
 
         ``public_only`` adds ``data_rights = 'Public'`` (advertised control,
-        A-06); ``date_range`` is applied client-side on t_min/t_max MJD (A-34)."""
+        A-06); ``date_range`` is applied client-side on t_min/t_max MJD (A-34);
+        ``band`` / ``max_resolution`` / ``science_only`` go into the ALMA ADQL
+        so the row cap applies after them (UI benchmark 2026-09-22, D16)."""
         if self.is_nrao_facility(facility):
             client = self.nrao_client
             if client is None:
@@ -236,10 +241,14 @@ class SearchService:
                 return _errored_frame(f"NRAO TAP target search failed: {e}")
 
         try:
-            df = _call_with_optional_kwargs(
-                self.alminer_client.search_by_target, target_name,
-                public=bool(public_only), max_results=max_results,
-            )
+            _kw: Dict[str, Any] = {"public": bool(public_only), "max_results": max_results}
+            if band is not None:
+                _kw["band"] = band
+            if max_resolution is not None:
+                _kw["max_resolution_arcsec"] = float(max_resolution)
+            if science_only:
+                _kw["science_only"] = True
+            df = _call_with_optional_kwargs(self.alminer_client.search_by_target, target_name, **_kw)
         except Exception as e:
             logger.warning("ALminer target search failed: %s", e)
             return _errored_frame(f"ALMA archive target search failed: {e}")

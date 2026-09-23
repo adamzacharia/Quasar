@@ -87,7 +87,8 @@ def normalize_source_catalog(
     )
 
 
-def alma_bulk_cone_adql(sources: Iterable[Dict[str, Any]], radius_arcsec: float, top: int = 5000) -> str:
+def alma_bulk_cone_adql(sources: Iterable[Dict[str, Any]], radius_arcsec: float, top: int = 5000,
+                        *, footprint: bool = True) -> str:
     from services.alma_science_queries import alma_cone_where
 
     radius_deg = max(float(radius_arcsec), 0.1) / 3600.0
@@ -95,7 +96,8 @@ def alma_bulk_cone_adql(sources: Iterable[Dict[str, Any]], radius_arcsec: float,
     for source in sources:
         # Footprint-aware cone (INTERSECTS on s_region OR the representative
         # point) so a mosaic covering the source is not missed (A-78).
-        conditions.append(alma_cone_where(float(source["ra"]), float(source["dec"]), radius_deg))
+        conditions.append(alma_cone_where(float(source["ra"]), float(source["dec"]), radius_deg,
+                                          footprint=footprint))
     where = " OR ".join(conditions) if conditions else "1 = 0"
     return f"""
 SELECT TOP {max(1, min(int(top or 5000), 20000))}

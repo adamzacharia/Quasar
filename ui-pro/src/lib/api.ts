@@ -127,6 +127,10 @@ export interface StreamCallbacks {
     }) => void;
     onDownloadProgress?: (data: { filename: string; downloaded_bytes: number; total_bytes: number | null; speed_kbps: number; percent: number | null; eta_seconds?: number | null; phase?: string }) => void;
     onComplete: (fullResponse: string) => void;
+    /** The backend's post-processed answer (fabricated-link guard, answer
+     *  verifier, prose hygiene) when it differs from the streamed tokens; the
+     *  caller replaces the streamed content so the UI matches what is persisted. */
+    onFinalText?: (finalText: string) => void;
     /** UI-03: the stream ended WITHOUT [DONE] or an error event (backend
      *  crash, proxy cut). The partial text is passed so the caller can keep
      *  it but must mark the turn degraded, never render it as complete. */
@@ -293,6 +297,12 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             lastMeaningfulEventAt = Date.now();
                             if (parsed.type === "token") {
                                 await emitToken(parsed.content);
+                            } else if (parsed.type === "final_text" && typeof parsed.content === "string") {
+                                // The backend's post-processed answer (guards, verifier,
+                                // prose hygiene) replaces the streamed text so the UI shows
+                                // exactly what is persisted.
+                                fullText = parsed.content;
+                                callbacks.onFinalText?.(parsed.content);
                             } else if (parsed.type === "run_meta") {
                                 provider = parsed.provider || "";
                                 inactivityLimitMs = Math.max(

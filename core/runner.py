@@ -14,6 +14,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from core.harmony_filter import strip_harmony_markup
 from core.llm_client import detect_provider
 from core.logger import logger
 from core.retry import _compute_delay as _retry_compute_delay
@@ -21,7 +22,14 @@ from core.retry import _is_retryable as _retry_is_retryable
 from services.usage_quota_service import QuotaExceededError
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
-from core.turn_recovery import partial_tool_answer, serialize_tool_result, tool_call_key
+from core.turn_recovery import (
+    canonical_tool_call_key,
+    partial_tool_answer,
+    serialize_tool_result,
+    tool_call_key,
+    tool_result_failure_reason,
+)
+from services import tool_budgets as _tool_budgets
 # DUAL_SOURCE_SCAFFOLD: referenced at the RAG-context branch — its absence
 # made every documentation-grounded query NameError into a misleading
 # provider-error message (scan CAR-2). Conductor: its absence made the whole
@@ -79,7 +87,119 @@ def _result_indicates_timeout(result) -> bool:
     state "error" so the SSE layer never counts them as deadline-extending
     progress. Anything else — including non-dict results — is not a timeout.
     """
-    return isinstance(result, dict) and result.get("timeout") is True
+    if not isinstance(result, dict):
+        return False
+    # A host-breaker fast-fail (services/host_breaker.py) is the same kind of
+    # non-progress: the archive is down, nothing was fetched, and the SSE
+    # deadline must not be extended for it.
+    return result.get("timeout") is True or result.get("infrastructure_failure") is True
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A non-negative seconds value from the environment; NaN/inf/negative or
+    unparsable values fall back to ``default`` (0 = disabled by convention)."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except ValueError:
+        value = float(default)
+    if not math.isfinite(value) or value < 0:
+        value = float(default)
+    return value
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(float(raw)) if raw else int(default)
+    except ValueError:
+        value = int(default)
+    return max(minimum, value)
+
+
+# The forced final round when the tool budget of a turn is spent. The model
+# must summarise -- never invent -- what the collected results support.
+TOOL_BUDGET_FINAL_NOTE = (
+    "[SYSTEM CONTINUATION] The tool budget for this turn is spent ({reason}). Answer the user NOW, "
+    "in the output format they asked for, using ONLY the tool results collected above. Structure it as: "
+    "(1) what was tried -- the queries/tools, in plain language, no internal tool names; "
+    "(2) what succeeded and the concrete results obtained (numbers, tables, cards); "
+    "(3) what failed or stayed incomplete and why (timeout, service outage, empty result, row cap); "
+    "(4) the single most useful next step the user can ask for. "
+    "Do not call more tools. Do not claim results, figures, or counts you do not have."
+)
+
+
+def _turn_bound(target, label: str, turn, agent=None):
+    """Wrap a background-thread target so it runs under the turn: an unbounded
+    identity deadline registered on the turn's cancellation token (Stop /
+    disconnect / hard cap refuse its next request) and the token on the
+    thread's TLS so guarded tool calls it makes inherit it (guard CX-07)."""
+    def _run():
+        deadline = _tool_budgets.make_identity_deadline(f"bg:{label}", turn=turn)
+        _tool_budgets.adopt_deadline(deadline)
+        if agent is not None and turn is not None:
+            try:
+                agent._tls.turn_cancellation = turn
+            except Exception:
+                pass
+        try:
+            target()
+        except _tool_budgets.TurnCancelled as exc:
+            print(f"[TURN CANCEL] background {label} stopped: {exc}")
+        finally:
+            _tool_budgets.end_tool_deadline()
+
+    return _run
+
+
+def _tool_budgets_auto_wait() -> float:
+    from services.host_breaker import HostBreaker
+
+    return HostBreaker.auto_wait_seconds()
+
+
+def _result_is_dead_end(result) -> bool:
+    """True when re-issuing the IDENTICAL tool call this turn cannot improve on
+    ``result``: it timed out, was refused by a host breaker, met an unreachable
+    archive host part-way (``dead_hosts``), or was cut by the tool budget
+    (``budget_exhausted``). Used by the exact-call cache in the tool loop
+    (guard CX-01: a partial cross-match with useful MAST rows but a dead ALMA
+    host keeps success=True — it IS progress for the SSE deadline — yet an
+    identical re-call would only burn the budget again)."""
+    if not isinstance(result, dict):
+        return False
+    if _result_indicates_timeout(result):
+        return True
+    if result.get("dead_hosts"):
+        return True
+    return result.get("budget_exhausted") is True
+
+
+def _web_event_payload(payload: Dict[str, Any], *, keep_images: bool) -> Dict[str, Any]:
+    """Copy of a web payload for the source-card event. Image tiles on a
+    non-imagery (knowledge / policy / data) answer are noise (UI benchmark
+    2026-09-22, D03): they are dropped on EVERY web path -- the parallel
+    supplement, LLM-initiated web tools and the Conductor (guard CX-30)."""
+    out = dict(payload or {})
+    if not keep_images and out.get("images"):
+        print(f"[WEB SEARCH] Suppressed {len(out.get('images') or [])} image tile(s) on a non-imagery answer")
+        out["images"] = []
+    return out
+
+
+def _is_short_breaker_skip(result) -> bool:
+    """A host-breaker skip whose circuit re-opens within the auto-wait window:
+    the identical call MAY be re-issued once after the cooldown, so the
+    exact-call cache must defer it to the canonical ledger (which enforces the
+    once-per-turn rule) instead of refusing it as a dead end."""
+    if not isinstance(result, dict) or not result.get("circuit_breaker"):
+        return False
+    try:
+        retry = float(result.get("retry_after_s", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < retry <= _tool_budgets_auto_wait()
 
 
 def _maybe_failover_model(agent, selected_model: str, on_status=None, attachments=None) -> str:
@@ -169,7 +289,192 @@ def _maybe_failover_model(agent, selected_model: str, on_status=None, attachment
         return selected_model
 
 
-def stream_response_api(
+def stream_response_api(agent, *args, **kwargs):
+    """Run one chat turn (:func:`_stream_response_api_impl`) and, however it
+    ends, finish the turn: cancel its token so any background thread or
+    abandoned worker still bound to it stops issuing requests, and release the
+    token from the agent's run registry (guard CX-07 / CX-12)."""
+    try:
+        return _stream_response_api_impl(agent, *args, **kwargs)
+    finally:
+        try:
+            _turn = getattr(agent._tls, "turn_cancellation", None)
+            if _turn is not None and not _turn.cancelled:
+                _live = _turn.cancel("turn finished")
+                if _live:
+                    print(f"[TURN EXIT] cancelled {_live} still-running worker(s)/background thread(s) at turn end")
+            agent._end_response_run(kwargs.get("run_token"))
+            # Pooled threads outlive the turn: a later direct tool call on this
+            # thread must not inherit a cancelled token or a spent soft deadline.
+            agent._tls.turn_cancellation = None
+            agent._tls.turn_soft_deadline = None
+        except Exception as _fin_err:  # pragma: no cover - never mask the turn's own result
+            print(f"[TURN EXIT] turn finalisation failed (non-fatal): {_fin_err}")
+
+
+def _finalize_answer_text(
+    agent,
+    output_text: str,
+    *,
+    on_token=None,
+    user_query: str = "",
+    url_sources: Optional[List[str]] = None,
+    all_tool_results: Optional[List[Any]] = None,
+    had_tool_calls: bool = False,
+) -> str:
+    """Post-process a final answer, identically for the standard tool loop
+    and the Conductor return (guard CX-24: the Conductor path used to skip all
+    of it): figure-claim correction / "shown below" -> "above", inline image
+    markdown removal, the fabricated-link guard, prose hygiene, and the
+    answer-versus-trace verifier. Each note appended here is also streamed via
+    ``on_token``; the SSE layer then replaces the streamed text with the
+    returned text (``final_text``)."""
+    # 7b. Claim-vs-artifact guard — models (esp. gpt-oss-120b) sometimes assert
+    # that a plot/data card "is displayed above" when nothing visual was emitted
+    # this turn (2026-07-04 live test P3/P6/P7/P9/P15). Append an explicit,
+    # user-visible correction instead of letting the fabrication stand.
+    _visual_artifact_types = {"image", "plotly", "data", "conductor_result", "notebook"}
+
+    def _is_visual_artifact(rr: Any) -> bool:
+        return isinstance(rr, dict) and rr.get("type") in _visual_artifact_types
+
+    _turn_visuals = [
+        rr for rr in (getattr(agent, "_accumulated_run_results", None) or [])
+        if _is_visual_artifact(rr)
+    ]
+    if _is_visual_artifact(agent.last_run_result):
+        _turn_visuals.append(agent.last_run_result)
+    # The claim must be about a FIGURE: the phrase ("shown above") and
+    # a figure noun in the same sentence, outside code. "Astroquery +
+    # TAP (as shown above)" on a pure-code answer fired the banner on
+    # the UI benchmark 2026-09-22 (D14).
+    _artifact_claim_re = re.compile(
+        r"(?:display|shown|attach|plott|render|generat|embedd)\w*\s+(?:above|below|here|inline|in\s+the\s+ui)"
+        r"|(?:data\s+cards?|cutouts?|figures?|plots?|images?|diagrams?|maps?|histograms?|thumbnails?)\s+"
+        r"(?:above|below|shown|displayed|attached|already\s+generated)"
+        r"|see\s+the\s+(?:plot|figure|image|cmd|diagram|cutout|map|data\s+cards?)",
+        re.IGNORECASE,
+    )
+    _figure_noun_re = re.compile(
+        r"\b(?:plot|plots|figure|figures|image|images|diagram|diagrams|cmd|ccd|map|maps|cutout|cutouts|"
+        r"histogram|histograms|thumbnail|thumbnails|chart|charts|panel|panels|light\s*curve|sed|"
+        r"data\s+cards?|cards?|visuali[sz]ation|graph|graphs|scatter|overlay|composite|footprint)\b",
+        re.IGNORECASE,
+    )
+
+    def _claims_a_figure(text: str) -> bool:
+        prose = re.sub(r"```.*?```", " ", text, flags=re.S)
+        prose = re.sub(r"`[^`\n]*`", " ", prose)
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", prose):
+            if _artifact_claim_re.search(sentence) and _figure_noun_re.search(sentence):
+                return True
+        return False
+
+    if output_text and _turn_visuals:
+        # Cards stream as their own bubbles DURING the tool rounds, so
+        # they sit ABOVE the final prose; "shown below" is wrong even
+        # when the card exists (UI benchmark 2026-09-22, L03/L13/L14).
+        _fixed_direction = re.sub(
+            r"\b(shown|displayed|attached|rendered|plotted|presented|embedded|included|appears?)\s+below\b",
+            r"\1 above",
+            output_text,
+            flags=re.IGNORECASE,
+        )
+        if _fixed_direction != output_text:
+            print("[GUARD] Rewrote 'shown below' → 'shown above' (cards render above the prose)")
+            output_text = _fixed_direction
+    if output_text and not _turn_visuals and _claims_a_figure(output_text):
+        _artifact_correction = (
+            "\n\n> ⚠️ Correction: no plot, image, or data card was actually generated in "
+            "this turn, so references above to a displayed figure are inaccurate. Ask me "
+            "to run the corresponding one-shot plotting tool (e.g. "
+            "datalab_color_magnitude_diagram, datalab_sed_plot, datalab_lss_wedge) to "
+            "produce the real figure."
+        )
+        output_text += _artifact_correction
+        if on_token:
+            on_token(_artifact_correction)
+        print("[GUARD] Claim-vs-artifact correction appended (no visual artifact this turn)")
+
+    # 7c-pre. Inline image markdown is banned outright (NO IMAGE URLS
+    # rule): a non-URL src like ![CMD 1](dlr_013e8bd2…) renders as a
+    # broken image (live P15), and real figures attach as cards. Keep
+    # the alt text, drop the image syntax.
+    if output_text and "![" in output_text:
+        _n_imgs = len(re.findall(r"!\[[^\]]*\]\([^)]*\)", output_text))
+        if _n_imgs:
+            output_text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", output_text)
+            print(f"[GUARD] Stripped {_n_imgs} inline markdown image(s) from the answer")
+
+    # 7c. Fabricated-link guard — strip external URLs that no tool, web
+    # search, or documentation context produced this turn (live P3: the
+    # scaffold induced invented blog/StackExchange/PDF links).
+    try:
+        output_text = agent._strip_unverified_urls(
+            output_text,
+            sources=list(url_sources or []),
+            on_token=on_token,
+            user_query=user_query,
+        )
+    except Exception as _url_guard_err:
+        print(f"[GUARD] URL guard failed (non-fatal): {_url_guard_err}")
+
+    # 7d. Prose hygiene — internal tool identifiers / JSON argument
+    # dumps / orphan image placeholders out of the user-facing text
+    # (they stay in the Show-query panels). UI benchmark 2026-09-22:
+    # D06, D07, D09, D12, D18 and most DataLab answers.
+    try:
+        from core.prose_hygiene import humanize_prose
+
+        _registered_names = [t.name for t in agent.tool_registry.list_tools()]
+        _clean_text = humanize_prose(output_text, _registered_names)
+        if _clean_text != output_text:
+            print(f"[HYGIENE] Rewrote internal identifiers in the answer ({len(output_text)} → {len(_clean_text)} chars)")
+            output_text = _clean_text
+    except Exception as _hyg_err:
+        print(f"[HYGIENE] prose hygiene failed (non-fatal): {_hyg_err}")
+
+    # 7e. Answer-versus-trace verifier (core/answer_verifier.py): the
+    # prose must match what the tools ran. Deterministic; on violation
+    # a visible "Verification" block lists each unsupported claim —
+    # nothing is rewritten, because a rewrite would have to invent.
+    if had_tool_calls and output_text:
+        try:
+            from core.answer_verifier import build_trace_summary, format_verification_block, verify_answer
+
+            _rr_for_verify = list(getattr(agent, "_accumulated_run_results", None) or [])
+            if isinstance(agent.last_run_result, dict) and agent.last_run_result not in _rr_for_verify:
+                _rr_for_verify.append(agent.last_run_result)
+            _extra_sql = []
+            _prov_state = getattr(agent, "_alma_tap_provenance_state", None) or {}
+            if isinstance(_prov_state, dict) and _prov_state.get("query"):
+                _extra_sql.append(str(_prov_state["query"]))
+            _trace_summary = build_trace_summary(
+                list(all_tool_results or []),
+                list(getattr(agent, "_accumulated_tool_trace", None) or []),
+                _rr_for_verify,
+                extra_sql=_extra_sql,
+            )
+            _verify_report = verify_answer(output_text, _trace_summary)
+            print(
+                f"[VERIFY] unsupported_claims={len(_verify_report.unsupported)} "
+                f"checked={_verify_report.checked} cards={len(_trace_summary.cards)} "
+                f"sql={len(_trace_summary.sql_texts)} timed_out_phases={len(_trace_summary.timed_out_phases)}"
+            )
+            if not _verify_report.ok:
+                for _claim in _verify_report.unsupported[:8]:
+                    print(f"[VERIFY]   {_claim.kind}: {_claim.text[:120]!r}")
+                _verify_block = format_verification_block(_verify_report)
+                output_text += _verify_block
+                if on_token:
+                    on_token(_verify_block)
+        except Exception as _verify_err:
+            print(f"[VERIFY] verifier failed (non-fatal): {_verify_err}")
+
+    return output_text
+
+
+def _stream_response_api_impl(
     agent,
     query,
     message_placeholder=None,
@@ -230,6 +535,8 @@ def stream_response_api(
         if _history_recovery_attempted and _prior_deadline != "__unset__":
             _turn_deadline = _prior_deadline
             _turn_hard_seconds = getattr(agent._tls, "turn_hard_seconds", 0.0)
+            _turn_cancel = getattr(agent._tls, "turn_cancellation", None)
+            _turn_soft_deadline = getattr(agent._tls, "turn_soft_deadline", None)
         else:
             agent._tls.tool_timeout_breaker = {}
             try:
@@ -240,11 +547,34 @@ def stream_response_api(
             # explicitly, instead of silently never-firing comparisons (CX-07).
             if not math.isfinite(_turn_hard_seconds) or _turn_hard_seconds <= 0:
                 _turn_hard_seconds = 0.0
+            _turn_started = time.monotonic()
             _turn_deadline = (
-                (time.monotonic() + _turn_hard_seconds) if _turn_hard_seconds else None
+                (_turn_started + _turn_hard_seconds) if _turn_hard_seconds else None
             )
             agent._tls.turn_deadline = _turn_deadline
             agent._tls.turn_hard_seconds = _turn_hard_seconds
+            # Per-turn TOOL budget (UI benchmark 2026-09-22, D19/L06: 7-minute
+            # tool loops ended in a spinner, never a message). Tool rounds must
+            # stop by QUASAR_TURN_TOOL_BUDGET_SECONDS (default 300 s) after the
+            # turn started -- then ONE forced final round writes the answer
+            # from what was collected. 0 disables (the 30 %-before-hard-cap
+            # soft deadline still applies).
+            _tool_budget_s = _env_seconds("QUASAR_TURN_TOOL_BUDGET_SECONDS", 300.0)
+            _soft_candidates = []
+            if _turn_deadline is not None:
+                _soft_candidates.append(_turn_deadline - 0.3 * _turn_hard_seconds)
+            if _tool_budget_s > 0:
+                _soft_candidates.append(_turn_started + _tool_budget_s)
+            _turn_soft_deadline = min(_soft_candidates) if _soft_candidates else None
+            agent._tls.turn_soft_deadline = _turn_soft_deadline
+            agent._tls.turn_started = _turn_started
+            # Per-turn cancellation token: every tool worker's deadline is
+            # registered on it, and cancel_response_run (client disconnect /
+            # Stop / SSE ceiling) or the hard-cap exit below fires it so
+            # detached workers stop issuing network requests (2026-09-22, L06).
+            _turn_cancel = _tool_budgets.TurnCancellation(label=f"conv {str(conversation_id)[:12]}")
+            agent._tls.turn_cancellation = _turn_cancel
+            agent._begin_response_run(conversation_id, selected_model, run_token, turn_cancellation=_turn_cancel)
         """
         Stream a response using OpenAI Responses API with:
         - Native conversation state (via previous_response_id)
@@ -376,7 +706,7 @@ def stream_response_api(
                     except Exception as _e:
                         _web_result_holder["error"] = str(_e)
 
-                _web_thread = threading.Thread(target=_bg_web_search_researcher, daemon=True)
+                _web_thread = threading.Thread(target=_turn_bound(_bg_web_search_researcher, "web", _turn_cancel, agent), daemon=True)
                 _web_thread.start()
 
                 # Thread 2: Targeted email search
@@ -390,7 +720,7 @@ def stream_response_api(
                     except Exception as _e:
                         _email_result_holder["error"] = str(_e)
 
-                _email_thread = threading.Thread(target=_bg_email_search, daemon=True)
+                _email_thread = threading.Thread(target=_turn_bound(_bg_email_search, "email", _turn_cancel, agent), daemon=True)
                 _email_thread.start()
             else:
                 msg = "Searching the web in parallel"
@@ -412,7 +742,7 @@ def stream_response_api(
                     except Exception as _e:
                         _web_result_holder["error"] = str(_e)
 
-                _web_thread = threading.Thread(target=_bg_web_search, daemon=True)
+                _web_thread = threading.Thread(target=_turn_bound(_bg_web_search, "web", _turn_cancel, agent), daemon=True)
                 _web_thread.start()
 
         # 1. Smart RAG — only search documentation for queries that likely
@@ -525,6 +855,20 @@ def stream_response_api(
         )
         if _is_cross_archive_source_match_query or _is_archive_overlay_query:
             _should_rag = False
+
+        # One-shot tool intents with no routing before the 2026-09-22 UI
+        # benchmark (D08 public bands, D13-D15 code, D17 archive URL, D20 ALMA
+        # bibliography): core/oneshot_routing.py. RAG stays as decided above --
+        # a code or bibliography answer still benefits from the documentation.
+        try:
+            from core.oneshot_routing import detect_oneshot_intent
+
+            _oneshot_intent = detect_oneshot_intent(_user_query)
+        except Exception as _oneshot_err:
+            print(f"[ROUTING] one-shot intent detection failed (non-fatal): {_oneshot_err}")
+            _oneshot_intent = None
+        if _oneshot_intent:
+            print(f"[ROUTING] one-shot intent -> {_oneshot_intent['tool']} {_oneshot_intent.get('args')}")
 
         # Imagery requests ("show me a color image of M31 from DECam") must end
         # in a fresh tool-produced image (hips_cutout & co.), never a text-only
@@ -672,7 +1016,7 @@ def stream_response_api(
                     except Exception as _e:
                         _web_result_holder["error"] = str(_e)
 
-                _web_thread = threading.Thread(target=_bg_web_search_researcher, daemon=True)
+                _web_thread = threading.Thread(target=_turn_bound(_bg_web_search_researcher, "web", _turn_cancel, agent), daemon=True)
                 _web_thread.start()
 
                 # Thread 2: Targeted email/contact search
@@ -686,8 +1030,22 @@ def stream_response_api(
                     except Exception as _e:
                         _email_result_holder["error"] = str(_e)
 
-                _email_thread = threading.Thread(target=_bg_email_search, daemon=True)
+                _email_thread = threading.Thread(target=_turn_bound(_bg_email_search, "email", _turn_cancel, agent), daemon=True)
                 _email_thread.start()
+
+        # How-to / reference questions about ALMA and its tooling must reach
+        # the documentation even when they also look like an archive fetch
+        # ("How do I use Astroquery to find ALMA observations of M83?"). The
+        # override only ever turns RAG ON; tools still run (core/rag_routing.py).
+        if not _should_rag:
+            try:
+                from core.rag_routing import documentation_rag_override
+
+                if documentation_rag_override(_user_query):
+                    print("[RAG] how-to / reference question about ALMA tooling — documentation search forced on")
+                    _should_rag = True
+            except Exception as _rag_route_err:
+                print(f"[RAG] override check failed (non-fatal): {_rag_route_err}")
 
         if _should_rag:
             try:
@@ -857,7 +1215,7 @@ def stream_response_api(
                             except Exception as _e:
                                 _web_result_holder["error"] = str(_e)
 
-                        _web_thread = threading.Thread(target=_bg_web_search_rag, daemon=True)
+                        _web_thread = threading.Thread(target=_turn_bound(_bg_web_search_rag, "web-rag", _turn_cancel, agent), daemon=True)
                         _web_thread.start()
 
                 if on_status:
@@ -926,8 +1284,11 @@ def stream_response_api(
         # E.g. "How many papers has Paola Caselli published?" matches both
         # _is_paper_query (contains 'papers') and _is_researcher_query,
         # but should route to lookup_researcher, not search_papers.
+        _oneshot_tool = (_oneshot_intent or {}).get("tool")
         if _is_openalex_query:
             pass  # handled below
+        elif _oneshot_tool == "alma_bibliography":
+            full_input += _oneshot_intent["directive"]
         elif _is_paper_query:
             paper_directive = (
                 "\n\nMANDATORY INSTRUCTION: The user is asking for papers/publications. "
@@ -997,39 +1358,26 @@ def stream_response_api(
                 )
             full_input += product_directive
         elif _is_archive_overlay_query:
-            full_input += (
-                "\n\nMANDATORY INSTRUCTION: The user is asking for a real archive image overlay. "
-                "You MUST call `overlay_archive_images` now. Use the user's named region/source as `region`; "
-                "if they provided explicit coordinates, pass `ra_deg` and `dec_deg`. Use base_archive='MAST', "
-                "base_collection='JWST', and contour_archive='ALMA' unless the user specified another MAST collection. "
-                "Do NOT describe the workflow without calling the tool."
-            )
+            from core.oneshot_routing import overlay_directive
+
+            full_input += overlay_directive(_user_query)
         elif _is_cross_archive_source_match_query:
-            route_text = json.dumps(_cross_archive_route) if _cross_archive_route else '{"catalog_name":"perseus_protostars","archives":["ALMA","JWST"],"radius_arcsec":5,"require_all_archives":true}'
-            full_input += (
-                "\n\nMANDATORY INSTRUCTION: The user is asking for cross-archive source locations. "
-                "You MUST call `match_cross_archive_sources` now using these exact arguments: "
-                f"{route_text}. Do NOT answer from memory. Do NOT retry by describing another plan; "
-                "if one archive fails, summarize the tool's partial table and archive_errors."
-            )
+            from core.oneshot_routing import cross_archive_directive
+
+            full_input += cross_archive_directive(_cross_archive_route)
         elif _is_alma_science_archive_query:
-            route_text = json.dumps(_alma_science_route) if _alma_science_route else "{}"
-            science_directive = (
-                "\n\nMANDATORY INSTRUCTION: The user is asking a live ALMA Science Archive count/filter/diagnostic question. "
-                "You MUST call `query_alma_science_archive` now. Map the request as follows: "
-                "Cycle Sun/solar projects -> query_type='cycle_solar_projects'; "
-                "Cycle array combo with 12m/7m/total power -> query_type='cycle_array_combo_projects' and arrays=['12m','7m','TP']; "
-                "Target observations with band/resolution constraints -> query_type='high_resolution_band_data'; "
-                "Required molecular lines -> query_type='line_set_projects'; "
-                "A redshift interval and rest species -> query_type='redshifted_line_projects'; "
-                "Bandwidth Switching -> query_type='bandwidth_switching_candidates'. "
-                f"Explicit constraints extracted from the user: {route_text}. "
-                "Supply the user's target or coordinates, ALL requested bands as a list, resolution ceiling, "
-                "public_only and science_only. Do not substitute narrower constraints. Target searches resolve "
-                "coordinates and use a positional cone; results have one row per member_ous_uid. "
-                "Do NOT answer from memory or documentation context."
-            )
-            full_input += science_directive
+            from core.oneshot_routing import census_directive
+
+            full_input += census_directive(_alma_science_route)
+        elif _oneshot_tool and _oneshot_tool.startswith("datalab_"):
+            full_input += _oneshot_intent["directive"]
+        elif _oneshot_tool in {"alma_archive_link", "alma_public_band_status", "code_recipe"}:
+            full_input += _oneshot_intent["directive"]
+            if rag_context:
+                full_input += (
+                    "\n[SYSTEM NOTE: documentation context is provided above -- use it (with its citations) for "
+                    "explanation; the tool result is authoritative for URLs, archive state and code.]"
+                )
         elif rag_context:
             # Knowledge query with RAG context — explicitly prevent search_papers
             knowledge_directive = (
@@ -1149,7 +1497,7 @@ def stream_response_api(
                     finally:
                         _done.set()
 
-                t = threading.Thread(target=_run_conductor, daemon=True)
+                t = threading.Thread(target=_turn_bound(_run_conductor, "conductor", _turn_cancel, agent), daemon=True)
                 t.start()
                 _done.wait(timeout=300)   # wait up to 5 min for complex queries
 
@@ -1222,7 +1570,7 @@ def stream_response_api(
 
                             # Emit web_sources event for frontend source cards + image grid
                             if on_event:
-                                web_event_payload = dict(web_data)
+                                web_event_payload = _web_event_payload(web_data, keep_images=bool(_is_imagery_request))
                                 if tavily_answer:
                                     web_event_payload["answer"] = "\n".join(
                                         part for part in [
@@ -1246,13 +1594,24 @@ def stream_response_api(
 
                     # Companion notebook attachment has been disabled for Conductor tasks as per requirements.
 
-                    # NO IMAGE URLS rule applies here too — this return bypasses
-                    # the standard-path 7c-pre guard below (T6.2 Conductor hole).
-                    if conductor_answer and "![" in conductor_answer:
-                        _n_imgs = len(re.findall(r"!\[[^\]]*\]\([^)]*\)", conductor_answer))
-                        if _n_imgs:
-                            conductor_answer = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", conductor_answer)
-                            print(f"[GUARD] Stripped {_n_imgs} inline markdown image(s) from the Conductor answer")
+                    # Same post-processing as the standard path (guard CX-24):
+                    # figure-claim correction, inline-image removal, link guard,
+                    # prose hygiene and the answer-versus-trace verifier. The
+                    # sub-agents' tool calls are merged into this request's trace.
+                    _conductor_trace = list(getattr(agent, "_accumulated_tool_trace", None) or [])
+                    conductor_answer = _finalize_answer_text(
+                        agent,
+                        conductor_answer,
+                        on_token=on_token,
+                        user_query=_user_query,
+                        url_sources=[
+                            rag_context or "",
+                            json.dumps(_web_result_holder.get("data"), default=str) if _web_result_holder.get("data") else "",
+                            json.dumps(_conductor_trace, default=str) if _conductor_trace else "",
+                        ],
+                        all_tool_results=[],
+                        had_tool_calls=bool(_conductor_trace),
+                    )
 
                     return safe_assistant_text(conductor_answer)
                 # Conductor returned None → not complex enough, fall through to standard path
@@ -1294,9 +1653,20 @@ def stream_response_api(
             _round_offset = 0          # physical rounds consumed by re-samples
             _resample_note = None
             _seen_tool_calls = {}
+            # Canonical-call ledger for the repeated-call detector: key ->
+            # {"result_str", "failed", "reason", "at", "retried"}. Catches
+            # re-issues that only re-label a plot / re-space a query, and any
+            # identical call after a failure (UI benchmark 2026-09-22: L06, D19).
+            _canon_seen: Dict[Any, Dict[str, Any]] = {}
             _duplicate_rounds = 0
             _finalize_next = False
-            _soft_deadline = (_turn_deadline - 0.3 * _turn_hard_seconds) if _turn_deadline else None
+            _turn_exit_reason = None
+            # Tool rounds end at the per-turn soft deadline (min of 30 % before
+            # the hard cap and QUASAR_TURN_TOOL_BUDGET_SECONDS after turn start)
+            # or after QUASAR_MAX_TOOL_ROUNDS logical rounds -- then ONE forced
+            # final round composes the answer from what was collected.
+            _soft_deadline = _turn_soft_deadline
+            _max_tool_rounds = _env_int("QUASAR_MAX_TOOL_ROUNDS", 8)
             # Per-round stream retries: a mid-stream death (httpx.ReadTimeout
             # while a reasoning model is byte-silent, connection reset,
             # transient 5xx) re-issues ONLY the affected round this many times
@@ -1330,12 +1700,16 @@ def stream_response_api(
                 # the void.
                 if _round > 0 and not agent._response_run_active(conversation_id, selected_model, run_token):
                     print("[STREAM] Run no longer active (cancelled/timed out) — ending the tool loop")
+                    if _turn_cancel is not None:
+                        _turn_cancel.cancel("run no longer active")
                     break
                 if _turn_deadline is not None and time.monotonic() > _turn_deadline:
                     print(
                         f"[STREAM] Turn exceeded its {_turn_hard_seconds:.0f}s hard cap — "
                         "self-terminating before the next round"
                     )
+                    if _turn_cancel is not None:
+                        _turn_cancel.cancel(f"turn hard cap {_turn_hard_seconds:.0f}s")
                     break
                 _eff_round = _round - _round_offset  # logical round (re-samples repeat a round)
                 _round_prev_last_id = last_id        # pre-round history state for re-sampling
@@ -1343,6 +1717,7 @@ def stream_response_api(
                     _is_archive_fetch or _is_paper_query or _is_openalex_query
                     or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
+                    or bool(_oneshot_intent)
                 )
                 request_kwargs = {
                     "model": selected_model,
@@ -1356,15 +1731,34 @@ def stream_response_api(
                     "user_id": user_id,
                     "session_id": conversation_id,
                 }
+                if _turn_exit_reason is None and _eff_round > 0:
+                    if _eff_round >= _max_tool_rounds:
+                        _turn_exit_reason = f"max tool rounds reached ({_max_tool_rounds})"
+                    elif _soft_deadline is not None and time.monotonic() >= _soft_deadline:
+                        _elapsed = time.monotonic() - getattr(agent._tls, "turn_started", _soft_deadline)
+                        _turn_exit_reason = f"tool time budget reached ({_elapsed:.0f}s)"
+                    elif _duplicate_rounds >= 2:
+                        _turn_exit_reason = "two rounds of only repeated tool calls"
+                    elif _finalize_next:
+                        _turn_exit_reason = "token budget / tool budget reached"
+                    if _turn_exit_reason:
+                        print(
+                            f"[TURN EXIT] reason={_turn_exit_reason} rounds={_eff_round} "
+                            f"elapsed={time.monotonic() - getattr(agent._tls, 'turn_started', time.monotonic()):.0f}s "
+                            "— forcing the final answer round"
+                        )
                 _finalizing = (_finalize_next or _duplicate_rounds >= 2 or _round == _max_rounds - 1
+                               or _eff_round >= _max_tool_rounds
                                or (_soft_deadline is not None and time.monotonic() >= _soft_deadline))
                 if _finalizing:
                     print("[RECOVERY] Tool-loop budget reached — composing final answer")
-                    _final_note = (
-                        "[SYSTEM CONTINUATION] Time to answer now. Use the collected tool results, "
-                        "preserve the user's requested output format, and disclose incomplete results. "
-                        "Do not call more tools."
-                    )
+                    _final_note = TOOL_BUDGET_FINAL_NOTE.format(reason=_turn_exit_reason or "tool budget reached")
+                    if on_status:
+                        try:
+                            on_status("Tool budget reached — composing the final answer from collected results", "running")
+                            on_status("Tool budget reached — composing the final answer from collected results", "completed")
+                        except Exception:
+                            pass
                     _pending = request_kwargs["input"]
                     request_kwargs.update(
                         tool_choice="none",  # keep the schemas: tool_use/tool_result history needs them (Anthropic 400s without)
@@ -1389,7 +1783,7 @@ def stream_response_api(
                 if not _finalizing and _eff_round == 0 and (
                     _is_archive_fetch or _is_data_product_triage_query or _is_alma_science_archive_query
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
-                    or _is_imagery_request or _is_radio_sed_query
+                    or _is_imagery_request or _is_radio_sed_query or bool(_oneshot_intent)
                 ):
                     request_kwargs["tool_choice"] = "required"
                     # First attempt: emulated (auto + nudge) so the model keeps its natural
@@ -1723,6 +2117,8 @@ def stream_response_api(
                         break
                     if _turn_deadline is not None and time.monotonic() > _turn_deadline:
                         print("[STREAM] Turn hard cap reached mid-batch — skipping remaining tool calls")
+                        if _turn_cancel is not None:
+                            _turn_cancel.cancel(f"turn hard cap {_turn_hard_seconds:.0f}s (mid-batch)")
                         break
                     tool_name = fc["name"]
                     try:
@@ -1743,6 +2139,98 @@ def stream_response_api(
                                 "note": "You already ran this; use its result or change approach. This call was not re-executed.",
                                 "previous_result": cached,
                             })
+                            agent._record_tool_trace(tool_name, args, result_str)
+                            tool_results.append({"type": "function_call_output", "call_id": fc["call_id"], "output": result_str})
+                            continue
+                        if isinstance(cached, dict) and _result_is_dead_end(cached) and not _is_short_breaker_skip(cached):
+                            # The IDENTICAL call already timed out or hit a dead
+                            # host this turn (live 2026-09-21 AM-H-01: the model
+                            # re-issued the same cross-match 4 s after its 150 s
+                            # timeout and paid another 150 s). Re-running it can
+                            # only burn the budget again — answer from the cached
+                            # failure in milliseconds instead.
+                            print(f"[TOOL CALL] {tool_name} repeated with identical args after a timeout/outage/budget cut — not re-executed")
+                            step_label = agent._tool_status_label(tool_name, args)
+                            if on_status:
+                                on_status(step_label, "running")
+                                on_status(f"{step_label} skipped — identical call timed out this turn", "error")
+                            result_str = serialize_tool_result({
+                                **cached,
+                                "repeated_call": True,
+                                "note": (
+                                    "This exact call already failed this turn for a timeout / outage reason and was "
+                                    "NOT re-executed. Do not retry it; answer with the data you have, state the "
+                                    "outage plainly, or use a tool on a different service."
+                                ),
+                            })
+                            agent._record_tool_trace(tool_name, args, result_str)
+                            tool_results.append({"type": "function_call_output", "call_id": fc["call_id"], "output": result_str})
+                            continue
+                    # Repeated-call detector (canonical args: cosmetic keys
+                    # such as title/label dropped, whitespace/case normalised).
+                    # An identical call after a FAILURE is never re-executed
+                    # (L06: five ~70 s ReadTimeouts on the same CMD query with
+                    # new titles); an identical call after a SUCCESS gets the
+                    # cached result (the card is already on screen). A skip
+                    # refused by an open breaker with a short retry_after_s
+                    # may be re-issued ONCE after the cooldown.
+                    _canon_key = canonical_tool_call_key(tool_name, args)
+                    _canon_prior = None if _polling else _canon_seen.get(_canon_key)
+                    if _canon_prior is not None:
+                        _allow_retry = False
+                        if _canon_prior.get("failed"):
+                            try:
+                                _cached_obj = json.loads(_canon_prior["result_str"])
+                            except (ValueError, TypeError):
+                                _cached_obj = {}
+                            _retry_s = float((_cached_obj or {}).get("retry_after_s", 0) or 0) if isinstance(_cached_obj, dict) else 0.0
+                            if (
+                                isinstance(_cached_obj, dict)
+                                and _cached_obj.get("circuit_breaker")
+                                and 0 < _retry_s <= _tool_budgets_auto_wait()
+                                and time.monotonic() - _canon_prior.get("at", 0.0) >= _retry_s
+                                and not _canon_prior.get("retried")
+                            ):
+                                _canon_prior["retried"] = True
+                                _allow_retry = True
+                                print(f"[TOOL CALL] {tool_name} re-issued after the {_retry_s:.0f}s breaker cooldown — allowed once")
+                        if not _allow_retry:
+                            _round_duplicates += 1
+                            step_label = agent._tool_status_label(tool_name, args)
+                            if _canon_prior.get("failed"):
+                                _why = str(_canon_prior.get("reason") or "it failed")[:300]
+                                print(f"[TOOL CALL] {tool_name} repeated (canonically identical) after a failure — not re-executed: {_why[:120]}")
+                                if on_status:
+                                    on_status(step_label, "running")
+                                    on_status(f"{step_label} skipped — identical call already failed this turn", "error")
+                                result_str = serialize_tool_result({
+                                    "success": False,
+                                    "repeated_call": True,
+                                    "identical_call_failed": True,
+                                    "error": (
+                                        f"identical call already failed this turn: {_why}; it was NOT re-executed. "
+                                        "Change the approach — different arguments (a narrower region, another table or "
+                                        "column, fewer rows), a different tool, or answer with what you have and say what failed."
+                                    ),
+                                })
+                            else:
+                                print(f"[TOOL CALL] {tool_name} repeated (canonically identical) after a success — served from this turn's cache")
+                                if on_status:
+                                    on_status(step_label, "running")
+                                    on_status(f"{step_label} skipped — identical call already ran this turn", "completed")
+                                try:
+                                    _prev_obj = json.loads(_canon_prior["result_str"])
+                                except (ValueError, TypeError):
+                                    _prev_obj = {"text": _canon_prior["result_str"][:4000]}
+                                result_str = serialize_tool_result({
+                                    "repeated_call": True,
+                                    "note": (
+                                        "An identical call (only cosmetic arguments such as title/labels differed) already "
+                                        "succeeded this turn; its result and any card are already shown. This call was NOT "
+                                        "re-executed — use the previous result or change the approach."
+                                    ),
+                                    "previous_result": _prev_obj,
+                                })
                             agent._record_tool_trace(tool_name, args, result_str)
                             tool_results.append({"type": "function_call_output", "call_id": fc["call_id"], "output": result_str})
                             continue
@@ -1869,9 +2357,14 @@ def stream_response_api(
                                             # Send the result directly (not just index) so the
                                             # event-loop thread doesn't read thread-local state.
                                             _payload = json.dumps({"_eager_result": True, "_idx": _new_idx, "_inline": True})
-                                            on_status(f"__data_ready__{_payload}", "ready")
-                                            # Stash inline data for the SSE handler to pick up
+                                            # Stash the inline data FIRST: the SSE handler
+                                            # (ui-pro/api/sse.py) stashes __eager_data__ and
+                                            # the NEXT __data_ready__ consumes it. The old
+                                            # ready-then-data order left a single-card tool's
+                                            # figure un-emitted until after the prose and
+                                            # shifted multi-card tools by one (UI 2026-09-23 L06/L07).
                                             on_status(f"__eager_data__{json.dumps(_new_rc, default=str)}", "data")
+                                            on_status(f"__data_ready__{_payload}", "ready")
                             elif _primary_run_result is not None:
                                 # Tool didn't accumulate — add last_run_result ourselves
                                 _rc = (
@@ -1888,16 +2381,16 @@ def stream_response_api(
                                 # end-of-turn emission never ran).
                                 if on_status and isinstance(_rc, dict) and _rc.get("type") in ("data", "papers", "image"):
                                     _payload = json.dumps({"_eager_result": True, "_idx": len(agent._accumulated_run_results) - 1, "_inline": True})
-                                    on_status(f"__data_ready__{_payload}", "ready")
                                     on_status(f"__eager_data__{json.dumps(_rc, default=str)}", "data")
+                                    on_status(f"__data_ready__{_payload}", "ready")
                             if _auto_paper_result and _auto_paper_result.get("papers"):
                                 _paper_rc = _auto_paper_result.copy()
                                 _paper_rc["_result_id"] = id(_auto_paper_result)
                                 agent._accumulated_run_results.append(_paper_rc)
                                 if on_status:
                                     _payload = json.dumps({"_eager_result": True, "_idx": len(agent._accumulated_run_results) - 1, "_inline": True})
-                                    on_status(f"__data_ready__{_payload}", "ready")
                                     on_status(f"__eager_data__{json.dumps(_paper_rc, default=str)}", "data")
+                                    on_status(f"__data_ready__{_payload}", "ready")
                             # Record tool calls for session memory
                             agent.session_memory.record_tool_calls(1)
 
@@ -1912,7 +2405,9 @@ def stream_response_api(
                                 "web_research_status",
                             } and isinstance(result, dict) and result.get("success"):
                                 _web_tool_results.append(result)
-                                web_event = agent._build_web_sources_event(result)
+                                web_event = agent._build_web_sources_event(
+                                    _web_event_payload(result, keep_images=bool(_is_imagery_request))
+                                )
                                 if web_event:
                                     on_event(web_event)
                         except Exception as te:
@@ -1952,6 +2447,18 @@ def stream_response_api(
                                             result_obj=_trace_result_obj,
                                             provenance=_tool_sidecar)
                     _seen_tool_calls[_call_key] = result_str
+                    _fail_reason = tool_result_failure_reason(
+                        _trace_result_obj if _trace_result_obj is not None else result_str
+                    )
+                    _canon_seen[_canon_key] = {
+                        "result_str": result_str,
+                        "failed": _fail_reason is not None,
+                        "reason": _fail_reason,
+                        "at": time.monotonic(),
+                        # The one allowed breaker re-issue is per canonical call
+                        # per TURN: keep the marker across the overwrite (CX-14).
+                        "retried": bool((_canon_seen.get(_canon_key) or {}).get("retried")),
+                    }
                     tool_results.append({
                         "type": "function_call_output",
                         "call_id": fc["call_id"],
@@ -1972,6 +2479,8 @@ def stream_response_api(
                 or not agent._response_run_active(conversation_id, selected_model, run_token)
             ):
                 print("[STREAM] Turn expired/cancelled — skipping post-round composition")
+                if _turn_cancel is not None:
+                    _turn_cancel.cancel("turn expired/cancelled after the tool loop")
                 # A partial batch may leave unanswered calls at the provider
                 # head. Clear this run's state before a follow-up can inherit it.
                 agent.clear_response_state(conversation_id, selected_model, run_token)
@@ -1986,6 +2495,22 @@ def stream_response_api(
             if on_status:
                 on_status("Generating response", "running")
                 on_status("Generating response", "completed")
+
+            # gpt-oss harmony control markup (<|channel|>commentary
+            # to=functions.X <|constrain|>json<|message|>{…}) leaked into the
+            # text of a tool round (live 2026-09-21 via TACC). The TACC stream
+            # strips it as it arrives (core/llm_client.py); this final pass keeps
+            # any residue out of the persisted / returned answer and lets the
+            # empty-text fallbacks below compose a real answer when the leak was
+            # the only "text" of the turn.
+            if output_text and "<|" in output_text:
+                _scrubbed = strip_harmony_markup(output_text)
+                if _scrubbed != output_text:
+                    print(
+                        f"[STREAM] Stripped {len(output_text) - len(_scrubbed)} chars of "
+                        "harmony control markup from the final text"
+                    )
+                    output_text = _scrubbed
 
             _has_rich_tool_output = bool(
                 getattr(agent, "_accumulated_run_results", None) or agent.last_run_result
@@ -2063,7 +2588,9 @@ def stream_response_api(
 
                     # Emit web_sources event for frontend source cards + image grid
                     if on_event:
-                        web_event_payload = dict(web_data)
+                        web_event_payload = _web_event_payload(
+                            web_data, keep_images=bool(_is_imagery_request) and _web_search_reason != "rag_supplement"
+                        )
                         if tavily_answer:
                             web_event_payload["answer"] = "\n".join(
                                 part for part in [
@@ -2079,68 +2606,21 @@ def stream_response_api(
                     print(f"[WEB SEARCH] Parallel web search failed: {_web_result_holder['error']}")
 
 
-            # 7b. Claim-vs-artifact guard — models (esp. gpt-oss-120b) sometimes assert
-            # that a plot/data card "is displayed above" when nothing visual was emitted
-            # this turn (2026-07-04 live test P3/P6/P7/P9/P15). Append an explicit,
-            # user-visible correction instead of letting the fabrication stand.
-            _visual_artifact_types = {"image", "plotly", "data", "conductor_result", "notebook"}
-
-            def _is_visual_artifact(rr: Any) -> bool:
-                return isinstance(rr, dict) and rr.get("type") in _visual_artifact_types
-
-            _turn_visuals = [
-                rr for rr in (getattr(agent, "_accumulated_run_results", None) or [])
-                if _is_visual_artifact(rr)
-            ]
-            if _is_visual_artifact(agent.last_run_result):
-                _turn_visuals.append(agent.last_run_result)
-            _artifact_claim_re = re.compile(
-                r"(?:display|shown|attach|plott|render|generat)\w*\s+(?:above|below|here|in\s+the\s+ui)"
-                r"|(?:data\s+cards?|cutouts?|figures?|plots?|images?|diagrams?)\s+"
-                r"(?:above|below|shown|displayed|attached|already\s+generated)"
-                r"|see\s+the\s+(?:plot|figure|image|cmd|diagram|cutout|data\s+cards?)",
-                re.IGNORECASE,
+            output_text = _finalize_answer_text(
+                agent,
+                output_text,
+                on_token=on_token,
+                user_query=_user_query,
+                url_sources=[
+                    rag_context or "",
+                    json.dumps(_web_tool_results, default=str) if _web_tool_results else "",
+                    json.dumps(_web_result_holder.get("data"), default=str)
+                    if _web_result_holder.get("data") else "",
+                    json.dumps(_all_tool_results, default=str) if _all_tool_results else "",
+                ],
+                all_tool_results=_all_tool_results,
+                had_tool_calls=_had_tool_calls,
             )
-            if output_text and not _turn_visuals and _artifact_claim_re.search(output_text):
-                _artifact_correction = (
-                    "\n\n> ⚠️ Correction: no plot, image, or data card was actually generated in "
-                    "this turn, so references above to a displayed figure are inaccurate. Ask me "
-                    "to run the corresponding one-shot plotting tool (e.g. "
-                    "datalab_color_magnitude_diagram, datalab_sed_plot, datalab_lss_wedge) to "
-                    "produce the real figure."
-                )
-                output_text += _artifact_correction
-                if on_token:
-                    on_token(_artifact_correction)
-                print("[GUARD] Claim-vs-artifact correction appended (no visual artifact this turn)")
-
-            # 7c-pre. Inline image markdown is banned outright (NO IMAGE URLS
-            # rule): a non-URL src like ![CMD 1](dlr_013e8bd2…) renders as a
-            # broken image (live P15), and real figures attach as cards. Keep
-            # the alt text, drop the image syntax.
-            if output_text and "![" in output_text:
-                _n_imgs = len(re.findall(r"!\[[^\]]*\]\([^)]*\)", output_text))
-                if _n_imgs:
-                    output_text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", output_text)
-                    print(f"[GUARD] Stripped {_n_imgs} inline markdown image(s) from the answer")
-
-            # 7c. Fabricated-link guard — strip external URLs that no tool, web
-            # search, or documentation context produced this turn (live P3: the
-            # scaffold induced invented blog/StackExchange/PDF links).
-            try:
-                output_text = agent._strip_unverified_urls(
-                    output_text,
-                    sources=[
-                        rag_context or "",
-                        json.dumps(_web_tool_results, default=str) if _web_tool_results else "",
-                        json.dumps(_web_result_holder.get("data"), default=str)
-                        if _web_result_holder.get("data") else "",
-                        json.dumps(_all_tool_results, default=str) if _all_tool_results else "",
-                    ],
-                    on_token=on_token,
-                )
-            except Exception as _url_guard_err:
-                print(f"[GUARD] URL guard failed (non-fatal): {_url_guard_err}")
 
             # 8. Update long-term memory — only for authenticated users
             output_text = safe_assistant_text(output_text)

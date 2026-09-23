@@ -26,6 +26,8 @@ import numpy as np
 from services import datalab_query_builders as builders
 from services import datalab_sql_policy as policy
 
+DATALAB_TILE_QUERY_SECONDS = 40.0
+
 MAX_TILES = int(os.getenv("DATALAB_MAX_TILES", "64"))
 DEFAULT_CANDIDATE_BUDGET = int(os.getenv("DATALAB_CANDIDATE_BUDGET", "50"))
 
@@ -59,12 +61,14 @@ def _run_builder_sql(
     result_store,
     owner_id: Optional[str] = None,
     async_fallback: bool = True,
+    timeout: Optional[float] = None,
 ):
     """Validate builder SQL through the governor, run it, and store the frame -> result_id."""
     from services import datalab_registry as registry
     registry.ensure_tap_schema_fresh(client)
     validated = policy.validate(sql, source="builder", meta=meta)
-    result = client.query(sql=validated.sql, fmt="pandas", async_fallback=async_fallback)
+    result = client.query(sql=validated.sql, fmt="pandas", async_fallback=async_fallback,
+                          **({"timeout": timeout} if timeout is not None else {}))
     trunc_warning = policy.limit_truncation_warning(
         len(result.dataframe), (validated.meta or {}).get("row_limit")
     )
@@ -477,16 +481,28 @@ def density_then_cutouts(
         "platform to bound the density-peak pool",
     )
     meta.setdefault("platform_row_caps", {})["candidate_budget"] = int(candidate_budget)
-    result_id, result = _run_builder_sql(
-        sql, meta, client=client, result_store=result_store, owner_id=owner_id
-    )
-    df = result.dataframe
+    if float(radius_deg) >= 5.0:
+        tiled = tiled_density_aggregate(
+            catalog, table, mode="grid", step_deg=step_deg,
+            ra=ra, dec=dec, radius_deg=radius_deg, predicates=predicates,
+            limit=candidate_budget, client=client, result_store=result_store,
+            owner_id=owner_id,
+        )
+        if not tiled.get("result_id"):
+            return tiled
+        result_id = tiled["result_id"]
+        df, _meta, _status = result_store.lookup(result_id)
+    else:
+        result_id, result = _run_builder_sql(
+            sql, meta, client=client, result_store=result_store, owner_id=owner_id
+        )
+        df = result.dataframe
     # The aggregate is ORDER BY source_count DESC. Greedily skip cells adjacent
     # to an already-accepted peak (2 of live P12's 5 "candidates" were neighbor
     # cells of the same clump), and flag peaks inside known MW objects.
     min_sep = 2.0 * float(step_deg)
     peaks: List[Dict[str, Any]] = []
-    notes: List[str] = []
+    notes: List[str] = list(tiled.get("warnings", [])) if float(radius_deg) >= 5.0 else []
     if quality_note:
         notes.append(quality_note)
     if morph_warning:
@@ -536,6 +552,7 @@ def density_then_cutouts(
     return {
         "success": bool(peaks) or not grid_timeout,
         "result_id": result_id,
+        **({k: tiled[k] for k in ("partial", "tiles_completed", "tiles_total", "coverage_summary") if k in tiled} if float(radius_deg) >= 5.0 else {}),
         "n_peaks": len(peaks),
         "peaks": peaks,
         "cutout_grid": grid,
@@ -618,21 +635,27 @@ def tiled_density_aggregate(
     )
     base_predicates = [str(p) for p in (predicates or [])] + [parent_bound]
 
-    max_tiles = int(os.getenv("DATALAB_TILED_AGG_MAX_TILES", "16"))
-    # Budget must leave room for the rest of the turn: the chat hard cap is
-    # 900s and a model may run 2+ aggregates (live DS-P8 attempt 1 died at the
-    # cap with a 360s budget: Galactic-center tiles all timed out serially).
-    if max_seconds is None:
-        max_seconds = float(os.getenv("DATALAB_TILED_AGG_MAX_SECONDS", "210"))
+    from services.tool_budgets import bounded_timeout, remaining_seconds, call_bounded, BudgetExhausted
+
+    # 2026-09-23 L08: 16 SERIAL tiles covered at most ~23 % of a 10-degree
+    # region (69 tiles of 2 deg) whatever the budget. Tiles now run
+    # ``DATALAB_TILED_AGG_CONCURRENCY`` at a time (default 4, each under a child
+    # deadline) and every tile of the footprint is attempted while the budget
+    # lasts (cap ``DATALAB_TILED_AGG_MAX_TILES``, default 128).
+    max_tiles = max(1, int(os.getenv("DATALAB_TILED_AGG_MAX_TILES", "128")))
+    concurrency = max(1, int(os.getenv("DATALAB_TILED_AGG_CONCURRENCY", "4")))
+    # Leave time to store and render partial results before the existing guard.
+    requested_budget = float(os.getenv("DATALAB_TILED_AGG_MAX_SECONDS", "120")) if max_seconds is None else float(max_seconds)
+    remaining = remaining_seconds()
+    max_seconds = min(requested_budget, 240.0, max(0.0, remaining - 8.0) if remaining is not None else 240.0)
     cell_margin = max(0.3, 2.0 * float(step_deg)) if mode_key == "grid" else 0.3
-    tile_r = float(tile_radius_deg or os.getenv("DATALAB_TILE_RADIUS_DEG", "5"))
+    tile_r = min(float(tile_radius_deg or os.getenv("DATALAB_TILE_RADIUS_DEG", "2")), 2.0)
     tile_r = min(tile_r, max(0.5, float(radius_deg) / 1.5))
-    # Coarsen until the tile count fits the cap (bigger tiles may time out per-tile,
-    # which the subdivision fallback below absorbs).
-    centers = _tile_cone_centers(radius_deg, tile_r, cell_margin)
-    while len(centers) > max_tiles and tile_r < float(radius_deg):
-        tile_r *= 1.5
-        centers = _tile_cone_centers(radius_deg, tile_r, cell_margin)
+    # Never enlarge expensive tiles to conceal the cap: report the unvisited
+    # footprint explicitly and retain the partial map from completed queries.
+    all_centers = _tile_cone_centers(radius_deg, tile_r, cell_margin)
+    tiles_total = len(all_centers)
+    centers = all_centers[:max_tiles]
 
     # Per-tile LIMIT truncation: each tile is ORDER BY source_count DESC, so a
     # tile that filled its row cap silently dropped its SPARSEST cells and the
@@ -649,6 +672,10 @@ def tiled_density_aggregate(
         limit, maximum=builders.MAX_ROW_LIMIT, default=builders.MAX_ROW_LIMIT
     )
 
+    import threading as _threading
+
+    _count_lock = _threading.Lock()
+
     def _run_tile(dx: float, dy: float, r: float) -> Optional[Any]:
         nonlocal tiles_truncated, effective_limit
         tdec = max(-89.5, min(89.5, float(dec) + dy))
@@ -658,69 +685,64 @@ def tiled_density_aggregate(
             ra=tra, dec=tdec, radius_deg=r, predicates=base_predicates, limit=limit,
         )
         validated = policy.validate(sql, source="builder", meta=meta)
-        result = client.query(sql=validated.sql, fmt="pandas", async_fallback=False)
+        left = max_seconds - (time.monotonic() - started)
+        if left < 1.0:
+            raise BudgetExhausted("Data Lab density tiling", left, 1.0)
+        seconds = bounded_timeout(min(DATALAB_TILE_QUERY_SECONDS, left, float(getattr(client, "timeout", DATALAB_TILE_QUERY_SECONDS))),
+                                  label="Data Lab density tile")
+        result = call_bounded(
+            lambda: client.query(sql=validated.sql, fmt="pandas", async_fallback=False, timeout=seconds),
+            seconds, label="Data Lab density tile",
+        )
         row_limit = (validated.meta or {}).get("row_limit")
         if policy.limit_truncation_warning(len(result.dataframe), row_limit):
-            tiles_truncated += 1
-            effective_limit = int(row_limit)
+            with _count_lock:
+                tiles_truncated += 1
+                effective_limit = int(row_limit)
         return result
 
     frames: List[Any] = []
     tiles_run = 0
     tile_errors = 0
     subdivided = 0
-    outer_tiles_done = 0
     started = time.monotonic()
     budget_stop = False
-    for (dx, dy) in centers:
-        # Early abort for hopeless regions (live DS-P8: every Galactic-center
-        # NSC tile timed out serially, even subdivided — each failed tile costs
-        # up to 5x the sync window). If the first 2 outer tiles produced no
-        # data at all, this tile size cannot work; fail fast with the hint.
-        if outer_tiles_done >= 2 and not frames:
-            break
-        if time.monotonic() - started > max_seconds:
-            budget_stop = True
-            break
-        try:
-            frames.append(_run_tile(dx, dy, tile_r).dataframe)
-            tiles_run += 1
-        except Exception as exc:  # noqa: BLE001 - a slow/broken tile must not kill the map
-            if "timed out" not in str(exc).lower():
-                tile_errors += 1
-                continue
-            # One level of subdivision: 4 half-area cones covering the tile
-            # (child radius tile_r/sqrt(2) is the exact cover; add the cell
-            # margin so seam cells stay fully contained in one child).
-            subdivided += 1
-            child_r = tile_r / math.sqrt(2.0) + cell_margin
-            for (cx, cy) in ((-0.5, -0.5), (-0.5, 0.5), (0.5, -0.5), (0.5, 0.5)):
-                if time.monotonic() - started > max_seconds:
-                    budget_stop = True
-                    break
-                try:
-                    frames.append(_run_tile(dx + cx * tile_r, dy + cy * tile_r, child_r).dataframe)
-                    tiles_run += 1
-                except Exception:  # noqa: BLE001
-                    tile_errors += 1
-            if budget_stop:
-                break
-        finally:
-            # The fail-fast check above reads this; it was never incremented,
-            # so the documented two-fruitless-outer-tiles abort was dead code
-            # and hopeless regions ran the whole wall budget.
-            outer_tiles_done += 1
+    errors: List[str] = []
+    from services.alma_server_side import run_concurrently
+    from services.host_breaker import HostCircuitOpen
 
+    breaker_open = False
+    for start in range(0, len(centers), concurrency):
+        left = max_seconds - (time.monotonic() - started)
+        if left < 2.0 or breaker_open:
+            budget_stop = budget_stop or left < 2.0
+            break
+        batch = centers[start:start + concurrency]
+        outs = run_concurrently([(lambda c=c: _run_tile(c[0], c[1], tile_r)) for c in batch], wall_seconds=left)
+        for out in outs:
+            if isinstance(out, BudgetExhausted):
+                budget_stop = True
+            elif isinstance(out, BaseException):  # A failed tile must not discard completed tiles.
+                tile_errors += 1
+                errors.append(str(out)[:300])
+                if isinstance(out, HostCircuitOpen):
+                    breaker_open = True
+            else:
+                frames.append(out.dataframe)
+                tiles_run += 1
+
+    partial = tiles_run < tiles_total or bool(tiles_truncated)
+    progress = f"{tiles_run} of {tiles_total} tiles completed"
     frames = [f for f in frames if f is not None and len(f)]
     if not frames:
-        raise RuntimeError(
-            f"Tiled density aggregate produced no data: {tiles_run} tiles ok, "
-            f"{tile_errors} failed. This field is too crowded for the anonymous 60s "
-            f"sync window even at {tile_r:.1f}° tiles. What works (live-verified): a "
-            "radius ≤2° cone on crowded fields, a BRIGHT magnitude cut (e.g. gmag < 18), "
-            "or a field away from the Galactic centre/plane (|b| > 5°). Get a working "
-            "map at radius 2° FIRST and render it, then widen if time permits."
-        )
+        return {
+            "success": tiles_run > 0, "rowcount": 0, "partial": partial,
+            "tiles_completed": tiles_run, "tiles_total": tiles_total,
+            "tiles_failed": tile_errors, "coverage_summary": progress,
+            "budget_exhausted": budget_stop, "tile_errors": errors,
+            "error": None if tiles_run else "No Data Lab density tiles completed; the bounded queries failed or exhausted their budget.",
+            "note": "No nonempty density cells were returned. Unvisited tiles are unknown, not zero density.",
+        }
     merged = pd.concat(frames, ignore_index=True)
     key_cols = ["healpix"] if mode_key == "healpix" else ["ra_bin", "dec_bin"]
     for col in key_cols:
@@ -742,6 +764,8 @@ def tiled_density_aggregate(
             "cost governance, not a science cut and not user-requested. Disclose the cap if any "
             "tile truncates."
         )
+    if partial:
+        warnings.append(f"Partial map: {progress}; unvisited pixels are unknown, not zero density. Overlapping cell counts are lower bounds where no complete tile covers the cell.")
     if budget_stop:
         warnings.append(
             f"Stopped at the {max_seconds:.0f}s tiling budget: {tiles_run} tile queries ran; "
@@ -783,6 +807,8 @@ def tiled_density_aggregate(
             "parent_cone": {"ra": float(ra), "dec": float(dec), "radius_deg": float(radius_deg)},
             "tile_radius_deg": tile_r,
             "tiles_run": tiles_run,
+            "tiles_completed": tiles_run, "tiles_total": tiles_total,
+            "partial": partial, "coverage_summary": progress,
             "tiles_failed": tile_errors,
             "tiles_subdivided": subdivided,
             "sync_timeout_fallback": True,
@@ -815,6 +841,9 @@ def tiled_density_aggregate(
         "table": info["table"],
         "tiled_fallback": True,
         "tiles_run": tiles_run,
+        "tiles_completed": tiles_run, "tiles_total": tiles_total,
+        "partial": partial, "coverage_summary": progress,
+        "budget_exhausted": budget_stop, "tile_errors": errors,
         "tiles_failed": tile_errors,
         "tile_radius_deg": round(tile_r, 3),
         "warnings": warnings,
@@ -824,13 +853,41 @@ def tiled_density_aggregate(
         ),
         "preview": preview,
         "note": (
-            "The single wide aggregate exceeded the Data Lab 60s sync window, so the cone was "
-            "auto-tiled into sub-cones and merged (identical semantics: every tile is also bounded "
-            "by the parent cone). Render THIS result_id with datalab_sky_density_map NOW, before "
+            "The wide aggregate was split into bounded sub-cones and merged; overlapping cell "
+            "counts are lower bounds when a full cell was not covered. Every tile is also bounded "
+            "by the parent cone. Render THIS result_id with datalab_sky_density_map NOW, before "
             "attempting any wider region — turns have a hard time budget and a rendered map beats "
             "an unrendered bigger one."
         ),
     }
+
+
+def build_wedge_selection(*, ra_min=150.0, ra_max=220.0, dec_min=0.0, dec_max=5.0,
+                          z_min=0.0, z_max=0.1, limit=5000):
+    """A bounded pilot spectroscopic slice; query must succeed before plotting.
+
+    The default equatorial strip is an analysis choice, not a catalogued wall
+    boundary. User-specified geometry is validated, never silently cropped.
+    """
+    bounds = [float(v) for v in (ra_min, ra_max, dec_min, dec_max, z_min, z_max)]
+    if not all(math.isfinite(v) for v in bounds):
+        raise ValueError("Wedge bounds must be finite")
+    r0, r1, d0, d1, z0, z1 = bounds
+    if not (0 <= r0 < r1 <= 360 and -90 <= d0 < d1 <= 90 and 0 <= z0 < z1 <= 10):
+        raise ValueError("Invalid RA, declination or redshift bounds")
+    if d1 - d0 > 5.0:
+        raise ValueError("A wedge requires a thin declination slice (at most 5 degrees); use the default 2.5 degree strip or provide narrower bounds")
+    row_limit = min(5000, max(1, int(limit)))
+    sql = (
+        "SELECT specobjid, ra, dec, z, class, zwarning FROM sdss_dr17.specobj "
+        "WHERE class = 'GALAXY' AND zwarning = 0 "
+        f"AND z BETWEEN {z0:g} AND {z1:g} "
+        f"AND ra BETWEEN {r0:g} AND {r1:g} AND dec BETWEEN {d0:g} AND {d1:g} "
+        f"LIMIT {row_limit}"
+    )
+    return sql, {"catalog": "sdss_dr17", "table": "specobj", "builder": "lss_wedge_selection",
+                 "row_limit": row_limit, "platform_row_cap": row_limit,
+                 "warnings": ["Bounded spectroscopic pilot; the default equatorial strip is an analysis choice. The row cap can omit galaxies; do not infer survey completeness."]}
 
 
 def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store,
@@ -944,6 +1001,8 @@ def _expr_diagram(
     overlay_locus=None,
     client, result_store, plotting, owner_id=None,
     default_limit=None,
+    pm_total_min=None,
+    tile_threshold_deg=None,
 ):
     """One-shot diagram with derived axes (e.g. a Gaia HR diagram:
     x = bp_rp, y = phot_g_mean_mag + 5*log10(parallax) - 10).
@@ -971,14 +1030,40 @@ def _expr_diagram(
     # NaN rows fail every expression anyway — exclude them server-side so they
     # don't consume the row budget.
     predicates = predicates + [f"{builders._column(info, c)} < 'Infinity'::float8" for c in cols]
+    if pm_total_min is not None:
+        # Total proper-motion floor IN THE SQL (datalab_selection_diagram, UI
+        # benchmark 2026-09-22 L06): squared components, registry-validated
+        # column names, a finite numeric threshold only.
+        pm_floor = float(pm_total_min)
+        if not math.isfinite(pm_floor) or pm_floor < 0:
+            raise ValueError("pm_total_min must be a finite, non-negative number (mas/yr)")
+        pmra_c, pmdec_c = builders._column(info, "pmra"), builders._column(info, "pmdec")
+        predicates = predicates + [
+            f"{pmra_c} < 'Infinity'::float8", f"{pmdec_c} < 'Infinity'::float8",
+            f"({pmra_c}*{pmra_c} + {pmdec_c}*{pmdec_c}) > {pm_floor * pm_floor:.6g}",
+        ]
     sql, meta = builders.build_cone_select(
         catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
         columns=select_cols, limit=limit, predicates=predicates,
         default_limit=(default_limit or builders.DEFAULT_ROW_LIMIT),
     )
-    rid, result = _run_builder_sql(
-        sql, meta, client=client, result_store=result_store, owner_id=owner_id
-    )
+    if tile_threshold_deg is not None and float(radius_deg) > float(tile_threshold_deg):
+        # Wide selective cones scan millions of rows for a few matches and blow
+        # Data Lab's 60 s sync window (UI benchmark 2026-09-23 L06: a 5-degree
+        # Gaia cone with parallax/RUWE/proper-motion cuts timed out every call).
+        # Split into sub-cones, each ALSO bounded by the parent cone, run them
+        # concurrently and merge.
+        rid, result, tile_note = _tiled_cone_select(
+            catalog, table, ra=ra, dec=dec, radius_deg=radius_deg, select_cols=select_cols,
+            predicates=predicates, limit=limit, default_limit=(default_limit or builders.DEFAULT_ROW_LIMIT),
+            tile_radius_deg=float(tile_threshold_deg), client=client, result_store=result_store,
+            owner_id=owner_id, base_meta=meta,
+        )
+    else:
+        tile_note = None
+        rid, result = _run_builder_sql(
+            sql, meta, client=client, result_store=result_store, owner_id=owner_id
+        )
     df = result.dataframe
     x = analysis._eval_expression(df, x_expr)
     y = analysis._eval_expression(df, y_expr)
@@ -988,6 +1073,8 @@ def _expr_diagram(
     warnings = list((meta or {}).get("warnings") or [])
     if morph_warning:
         warnings.append(morph_warning)
+    if tile_note:
+        warnings.append(tile_note)
     trunc = policy.limit_truncation_warning(len(df), (meta or {}).get("row_limit"))
     if trunc:
         warnings.append(
@@ -1030,6 +1117,85 @@ def _expr_diagram(
                             **({"platform_row_cap": int((meta or {})["platform_row_cap"])}
                                if (meta or {}).get("platform_row_cap") else {})},
                            _extra)
+
+
+class _TiledResult:
+    def __init__(self, dataframe, provenance):
+        self.dataframe = dataframe
+        self.provenance = provenance
+
+
+def _tiled_cone_select(
+    catalog, table, *, ra, dec, radius_deg, select_cols, predicates, limit, default_limit,
+    tile_radius_deg, client, result_store, owner_id=None, base_meta=None,
+):
+    """Row selection over a wide cone as concurrent sub-cone queries.
+
+    Every tile carries the parent q3c_radial_query bound too, so the union is
+    exactly the parent selection; rows are de-duplicated on the catalog's id
+    column (or ra/dec). Tiles run four at a time under child deadlines of the
+    tool deadline; a tile that fails or runs out of budget is reported, never
+    silently read as empty sky. Returns (result_id, result, note)."""
+    import pandas as pd
+
+    from services import datalab_registry as reg
+    from services.alma_server_side import run_concurrently
+    from services.tool_budgets import bounded_timeout, remaining_seconds
+
+    info = reg.describe_table(catalog, table)
+    ra_col, dec_col = info["ra_column"], info["dec_column"]
+    parent = f"q3c_radial_query({ra_col}, {dec_col}, {float(ra):.8g}, {float(dec):.8g}, {float(radius_deg):.8g})"
+    tile_r = max(0.5, float(tile_radius_deg))
+    centers = _tile_cone_centers(float(radius_deg), tile_r, cell_margin_deg=0.0)
+    max_tiles = max(1, int(os.getenv("DATALAB_TILED_SELECT_MAX_TILES", "24")))
+    centers = centers[:max_tiles]
+    queries = []
+    for dx, dy in centers:
+        tdec = max(-89.5, min(89.5, float(dec) + dy))
+        tra = (float(ra) + dx / _cosd(tdec)) % 360.0
+        sql_t, meta_t = builders.build_cone_select(
+            catalog, table, ra=tra, dec=tdec, radius_deg=tile_r, columns=select_cols, limit=limit,
+            predicates=list(predicates) + [parent], default_limit=default_limit,
+        )
+        validated = policy.validate(sql_t, source="builder", meta=meta_t)
+        queries.append((validated, meta_t))
+
+    def _one(validated):
+        seconds = bounded_timeout(float(getattr(client, "timeout", 60.0) or 60.0), minimum=3.0, label="Data Lab tile select")
+        return client.query(sql=validated.sql, fmt="pandas", async_fallback=False, timeout=seconds)
+
+    frames, failed, done, truncated = [], 0, 0, 0
+    for start in range(0, len(queries), 4):
+        left = remaining_seconds()
+        if left is not None and left < 10.0:
+            break
+        batch = queries[start:start + 4]
+        outs = run_concurrently([(lambda v=v: _one(v)) for v, _m in batch], wall_seconds=(left - 5.0) if left is not None else 120.0)
+        for (validated, meta_t), out in zip(batch, outs):
+            if isinstance(out, BaseException):
+                failed += 1
+                continue
+            done += 1
+            frames.append(out.dataframe)
+            if policy.limit_truncation_warning(len(out.dataframe), (validated.meta or {}).get("row_limit")):
+                truncated += 1
+    if not frames:
+        raise RuntimeError(f"all {len(queries)} Data Lab sub-cone queries failed or ran out of budget")
+    merged = pd.concat([f for f in frames if f is not None], ignore_index=True)
+    id_col = next((c for c in ("source_id", "id", "objid") if c in merged.columns), None)
+    merged = merged.drop_duplicates(subset=[id_col] if id_col else [ra_col, dec_col]).reset_index(drop=True)
+    total = len(queries)
+    note = (f"Wide cone split into {total} sub-cones of {tile_r:g} deg (each bounded by the parent cone): "
+            f"{done} completed" + (f", {failed} failed" if failed else "") + (f", {total - done - failed} not run (budget)" if total - done - failed else "")
+            + (f"; {truncated} sub-cone(s) hit the row cap" if truncated else "") + ".")
+    if done < total:
+        note += " The sample is PARTIAL: unqueried sub-cones are unknown, not empty."
+    provenance = {"validated_sql": queries[0][0].sql, "tiles_total": total, "tiles_completed": done, "tiles_failed": failed,
+                  "tile_radius_deg": tile_r, "parent_bound": parent}
+    store_meta = {**dict(base_meta or {}), "validated_sql": queries[0][0].sql, "provenance": provenance,
+                  **({"owner_id": str(owner_id)} if owner_id else {}), "warnings": [note]}
+    result_id = result_store.put(merged, store_meta)
+    return result_id, _TiledResult(merged, provenance), note
 
 
 def _valid_mag_mask(*series):
@@ -1281,6 +1447,7 @@ def color_magnitude_diagram(
     point_sources=False, morphology=None, value_cuts=None,
     x_expr=None, y_expr=None, overlay_locus=None,
     client=None, result_store=None, plotting_service=None, owner_id=None,
+    pm_total_min=None, tile_threshold_deg=None,
 ):
     """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted.
     Sentinel magnitudes are excluded server- and client-side; point_sources=True applies the
@@ -1300,7 +1467,8 @@ def color_magnitude_diagram(
             catalog, table, ra, dec, radius_deg,
             x_expr=str(x_expr), y_expr=str(y_expr), invert_y=True, prefix="datalab_cmd",
             limit=limit, title=title, point_sources=point_sources, morphology=morphology,
-            value_cuts=value_cuts, overlay_locus=overlay_locus,
+            value_cuts=value_cuts, overlay_locus=overlay_locus, pm_total_min=pm_total_min,
+            tile_threshold_deg=tile_threshold_deg,
             client=client, result_store=result_store, plotting=plotting,
             owner_id=owner_id, default_limit=CMD_SAMPLE_BUDGET,
         )

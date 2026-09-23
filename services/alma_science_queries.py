@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import date
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -32,7 +33,57 @@ LINE_REST_FREQ_GHZ: Dict[str, float] = {
     "CO(6-5)": 691.4730763,
     "CO(7-6)": 806.6518060,
     "CO(8-7)": 921.7997000,
+    # Dense-gas tracers (CDMS rest frequencies), low-J ladders.
+    "HCN(1-0)": 88.6316022,
+    "HCN(2-1)": 177.2611115,
+    "HCN(3-2)": 265.8864343,
+    "HCN(4-3)": 354.5054779,
+    "HCO+(1-0)": 89.1885247,
+    "HCO+(2-1)": 178.3750563,
+    "HCO+(3-2)": 267.5576259,
+    "HCO+(4-3)": 356.7342230,
+    "HNC(1-0)": 90.6635680,
+    "HNC(2-1)": 181.3247580,
+    "HNC(3-2)": 271.9811420,
+    "HNC(4-3)": 362.6303030,
+    "CS(2-1)": 97.9809533,
+    "CS(3-2)": 146.9690287,
+    "CS(5-4)": 244.9355565,
+    "CS(7-6)": 342.8828503,
+    # Atomic fine-structure lines of high-z work (laboratory rest
+    # frequencies, CDMS/JPL). Redshifted into the ALMA bands for z >~ 1-9.
+    "[CII]158um": 1900.536900,
+    "[NII]205um": 1461.131406,
+    "[NII]122um": 2459.380100,
+    "[OIII]88um": 3393.006244,
+    "[OIII]52um": 5785.879590,
+    "[OI]63um": 4744.777490,
+    "[OI]145um": 2060.068860,
+    "[CI](1-0)": 492.160651,
+    "[CI](2-1)": 809.341970,
 }
+
+# Bracketed / bare species tokens -> the transitions they mean (the router's
+# _SPECIES_RE recognises "[C II]", "CII", "[OIII]" ...; guard CX-29: they used
+# to fall back silently to the CO ladder while the answer said [C II]).
+FINE_STRUCTURE_SPECIES: Dict[str, List[str]] = {
+    "CII": ["[CII]158um"],
+    "NII": ["[NII]205um", "[NII]122um"],
+    "OIII": ["[OIII]88um", "[OIII]52um"],
+    "OI": ["[OI]63um", "[OI]145um"],
+    "CI": ["[CI](1-0)", "[CI](2-1)"],
+}
+
+
+class UnsupportedSpecies(ValueError):
+    """A named rest species with no rest-frequency entry: never substitute CO."""
+
+
+def _fine_structure_key(token: str) -> Optional[str]:
+    t = str(token or "").replace(" ", "").upper()
+    if t.startswith("[") and t.endswith("]"):
+        t = t[1:-1]
+    return t if t in FINE_STRUCTURE_SPECIES else None
 
 CO_LADDER_LINES = [
     "CO(1-0)",
@@ -241,9 +292,95 @@ def truncation_info(df: Optional[pd.DataFrame], max_results: int) -> Dict[str, A
         warning = (
             f"TAP fetch hit the TOP {cap} row cap (ordered by proposal_id, so the lowest "
             "project codes come first); counts and project lists below are INCOMPLETE. "
-            "Narrow the query (cycle, band, category) or raise max_results."
+            "Report derived counts as 'at least' (lower bounds), never as reliable totals. "
+            "Use server-side aggregation or exhaust pagination for exact counts."
         )
-    return {"rows_fetched": rows, "row_cap": cap, "truncated": truncated, "warning": warning}
+    return {"rows_fetched": rows, "row_cap": cap, "truncated": truncated,
+            "count_is_lower_bound": truncated, "warning": warning}
+
+
+def distinct_project_count_query(where_clause: str) -> str:
+    """Count projects at the server without a coverage-row TOP limit."""
+    return ("SELECT COUNT(DISTINCT proposal_id) AS n_projects FROM ivoa.obscore "
+            f"WHERE ({where_clause}) AND proposal_id IS NOT NULL")
+
+
+def public_band_inventory_query(as_of_date: Optional[str] = None) -> str:
+    """Distinct publicly accessible band tokens, optionally by release date.
+
+    A historical cut describes current records released by that date; it is
+    not a reconstruction of archive holdings or receiver capabilities then.
+    """
+    where = "data_rights = 'Public' AND band_list IS NOT NULL"
+    if as_of_date:
+        canonical = date.fromisoformat(as_of_date).isoformat()
+        where += f" AND obs_release_date < '{date.fromordinal(date.fromisoformat(canonical).toordinal() + 1).isoformat()}'"
+    return f"SELECT DISTINCT band_list FROM ivoa.obscore WHERE {where} ORDER BY band_list"
+
+
+def fetch_cycle_array_metadata(
+    fetch: Callable[[str], pd.DataFrame], cycle: int, *, page_size: int = 5000,
+    max_pages: int = 20,
+) -> pd.DataFrame:
+    """Exhaust DISTINCT array metadata with bounded, non-OFFSET keyset pages.
+
+    Fetch is the caller's existing budgeted TAP adapter. Four NULL partitions
+    avoid relying on service-specific NULL ordering or unsupported COALESCE.
+    Repeated EBs/SPWs collapse at the server. On any incomplete page stream,
+    preserve metadata already obtained and explicitly mark the count a bound.
+    Array membership remains the documented antenna/SB heuristic.
+    """
+    size = max(1, min(int(page_size), 20000))
+    columns = ("proposal_id", "antenna_arrays", "schedblock_name")
+    frames, queries = [], []
+    complete, error = True, ""
+    for antenna_null, sb_null in ((False, False), (False, True), (True, False), (True, True)):
+        parts = [project_prefix_where(cycle), "proposal_id IS NOT NULL"]
+        keys = ["proposal_id"]
+        for column, is_null in (("antenna_arrays", antenna_null), ("schedblock_name", sb_null)):
+            parts.append(f"{column} IS {'NULL' if is_null else 'NOT NULL'}")
+            if not is_null:
+                keys.append(column)
+        cursor = None
+        while True:
+            if len(queries) >= max_pages:
+                complete, error = False, "Pagination budget exhausted"
+                break
+            where = " AND ".join(parts)
+            if cursor is not None:
+                greater = []
+                for index, key in enumerate(keys):
+                    equal = [f"{keys[j]} = '{escape_adql(cursor[j])}'" for j in range(index)]
+                    greater.append("(" + " AND ".join(equal + [f"{key} > '{escape_adql(cursor[index])}'"]) + ")")
+                where += " AND (" + " OR ".join(greater) + ")"
+            query = (f"SELECT DISTINCT TOP {size} {', '.join(columns)} FROM ivoa.obscore "
+                     f"WHERE {where} ORDER BY {', '.join(keys)}")
+            queries.append(query)
+            try:
+                page = fetch(query)
+                if not set(columns).issubset(page.columns):
+                    raise ValueError("TAP response lacks array-count metadata columns")
+                if page.empty:
+                    if page.attrs.get("truncated"):
+                        raise ValueError("TAP returned an empty truncated page")
+                    break
+                new_cursor = tuple(as_text(page.iloc[-1][key]) for key in keys)
+                if cursor is not None and new_cursor <= cursor:
+                    raise ValueError("TAP pagination made no forward progress")
+                frames.append(page)
+                cursor = new_cursor
+                if len(page) < size and not page.attrs.get("truncated"):
+                    break
+            except Exception as exc:
+                complete, error = False, str(exc)
+                break
+        if not complete:
+            break
+    result = pd.concat(frames, ignore_index=True).drop_duplicates(list(columns)) if frames else pd.DataFrame(columns=columns)
+    result.attrs.update(truncated=not complete, count_is_lower_bound=not complete,
+                        pagination_complete=complete, pagination_queries=queries,
+                        pagination_error=error, metadata_grain="distinct project/antenna/SB combinations")
+    return result
 
 
 SPEED_OF_LIGHT_M_GHZ = 0.299792458  # metres * GHz
@@ -286,6 +423,42 @@ def alma_cone_where(ra: float, dec: float, radius_deg: float, *, footprint: bool
     return f"(INTERSECTS({circle}, s_region) = 1 OR {point})"
 
 
+def alma_cone_filters_where(
+    ra: float,
+    dec: float,
+    radius_deg: float,
+    *,
+    public: bool = True,
+    footprint: bool = True,
+    band: Any = None,
+    max_resolution_arcsec: Optional[float] = None,
+    science_only: bool = False,
+) -> str:
+    """Cone predicate PLUS the user's structured filters, all in ADQL.
+
+    UI benchmark 2026-09-22 (D16): "Band 6 observations of M83" ran a TOP 100
+    cone with no band filter and kept whatever Band 6 rows fell in the first
+    100 -- the band, resolution and science filters belong in the WHERE so the
+    row cap applies AFTER them.
+    """
+    where = alma_cone_where(ra, dec, radius_deg, footprint=footprint)
+    if public:
+        where += " AND data_rights = 'Public'"
+    bands = requested_bands(band) if band is not None else []
+    if band is not None and not bands:
+        raise ValueError("band must contain ALMA band numbers from 1 to 10")
+    if bands:
+        where += " AND (" + " OR ".join(band_token_where(b) for b in bands) + ")"
+    if max_resolution_arcsec is not None:
+        threshold = float(max_resolution_arcsec)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("max_resolution_arcsec must be finite and positive")
+        where += f" AND spatial_resolution <= {threshold:g}"
+    if science_only:
+        where += " AND science_observation = 'T'"
+    return where
+
+
 def alma_cone_adql(
     ra: float,
     dec: float,
@@ -295,13 +468,37 @@ def alma_cone_adql(
     top: Optional[int] = None,
     footprint: bool = True,
     columns: Sequence[str] = OBSCORE_BASE_COLUMNS,
+    band: Any = None,
+    max_resolution_arcsec: Optional[float] = None,
+    science_only: bool = False,
 ) -> str:
     """The cone query the ALMA client executes (and what provenance reports)."""
-    where = alma_cone_where(ra, dec, radius_deg, footprint=footprint)
-    if public:
-        where += " AND data_rights = 'Public'"
+    where = alma_cone_filters_where(
+        ra, dec, radius_deg, public=public, footprint=footprint, band=band,
+        max_resolution_arcsec=max_resolution_arcsec, science_only=science_only,
+    )
     top_clause = f"TOP {max(1, min(int(top), 20000))} " if top else ""
     return f"SELECT {top_clause}{', '.join(columns)} FROM ivoa.obscore WHERE {where}"
+
+
+def alma_cone_count_adql(
+    ra: float,
+    dec: float,
+    radius_deg: float,
+    *,
+    public: bool = True,
+    footprint: bool = True,
+    band: Any = None,
+    max_resolution_arcsec: Optional[float] = None,
+    science_only: bool = False,
+) -> str:
+    """Companion ``SELECT COUNT(*)`` for the same cone + filters, so a
+    TOP-capped result can say "N rows total, showing M"."""
+    where = alma_cone_filters_where(
+        ra, dec, radius_deg, public=public, footprint=footprint, band=band,
+        max_resolution_arcsec=max_resolution_arcsec, science_only=science_only,
+    )
+    return f"SELECT COUNT(*) AS total_rows, COUNT(DISTINCT member_ous_uid) AS total_mous FROM ivoa.obscore WHERE {where}"
 
 
 def science_cone_query(ra, dec, radius_arcsec=60.0, *, band=None,
@@ -612,6 +809,8 @@ def aggregate_counts(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
         rights = df["data_rights"].astype(str).str.strip().str.lower()
         counts["n_public_rows"] = int((rights == "public").sum())
         counts["n_proprietary_rows"] = int((rights == "proprietary").sum())
+    if df.attrs.get("count_is_lower_bound") or df.attrs.get("truncated"):
+        counts["count_is_lower_bound"] = True
     return counts
 
 
@@ -626,6 +825,8 @@ def counts_note(counts: Dict[str, Any]) -> str:
     if counts.get("n_projects") is not None:
         parts.append(f"{counts['n_projects']} project{'s' if counts['n_projects'] != 1 else ''}")
     note = ", ".join(parts)
+    if counts.get("count_is_lower_bound"):
+        note = "At least " + note + "; counts are lower bounds because the archive fetch is incomplete"
     if counts.get("n_proprietary_rows"):
         note += f"; {counts['n_proprietary_rows']} row(s) are proprietary (data_rights)"
     return note + ". Rows repeat per execution/field/spectral coverage; do not call rows observations."
@@ -786,6 +987,12 @@ def line_names_for_input(lines: Sequence[str]) -> List[str]:
         # compact token, not the original-case string, so lower/mixed-case
         # inputs with an explicit transition (e.g. 'co(1-0)') still resolve
         # against the all-uppercase LINE_REST_FREQ_GHZ keys.
+        fs = _fine_structure_key(compact)
+        if fs is not None and compact.upper() not in LINE_REST_FREQ_GHZ:
+            name = FINE_STRUCTURE_SPECIES[fs][0]
+            if name not in output:
+                output.append(name)
+            continue
         name = aliases.get(compact, compact)
         if name not in LINE_REST_FREQ_GHZ and f"{name}(2-1)" in LINE_REST_FREQ_GHZ:
             name = f"{name}(2-1)"
@@ -795,8 +1002,16 @@ def line_names_for_input(lines: Sequence[str]) -> List[str]:
 
 
 def line_names_for_species(species: Sequence[str] | str) -> List[str]:
+    """Transitions for the requested rest species. No species -> the CO
+    ladder (the documented default). A NAMED species with no rest-frequency
+    entry raises :class:`UnsupportedSpecies` -- it is never replaced by CO
+    while the answer keeps the requested label (guard CX-29)."""
     raw_items = [species] if isinstance(species, str) else list(species or [])
+    raw_items = [item for item in raw_items if as_text(item).strip()]
+    if not raw_items:
+        return CO_LADDER_LINES.copy()
     output: List[str] = []
+    unknown: List[str] = []
     for item in raw_items:
         compact = as_text(item).replace(" ", "").upper()
         if compact in {"CO", "12CO"}:
@@ -804,10 +1019,28 @@ def line_names_for_species(species: Sequence[str] | str) -> List[str]:
                 if name not in output:
                     output.append(name)
             continue
-        for name in line_names_for_input([compact]):
+        fs = _fine_structure_key(compact)
+        if fs is not None:
+            for name in FINE_STRUCTURE_SPECIES[fs]:
+                if name not in output:
+                    output.append(name)
+            continue
+        # A bare molecule name means its whole ladder (as for CO): a redshifted
+        # search must consider every transition that can land in a band.
+        ladder = [k for k in LINE_REST_FREQ_GHZ if k.upper().startswith(compact + "(")] if "(" not in compact else []
+        found = ladder or line_names_for_input([compact])
+        if not found:
+            unknown.append(as_text(item))
+        for name in found:
             if name not in output:
                 output.append(name)
-    return output or CO_LADDER_LINES.copy()
+    if unknown and not output:
+        supported = sorted({k.split("(")[0] for k in LINE_REST_FREQ_GHZ if not k.startswith("[")} | {f"[{k}]" for k in FINE_STRUCTURE_SPECIES})
+        raise UnsupportedSpecies(
+            f"rest species {', '.join(unknown)} has no rest-frequency entry in this tool "
+            f"(supported: {', '.join(supported)}); it was NOT replaced by CO -- give the rest frequency explicitly"
+        )
+    return output
 
 
 def annotate_line_coverage(df: pd.DataFrame, lines: Sequence[str], z: float = 0.0) -> pd.DataFrame:
@@ -836,17 +1069,27 @@ def projects_covering_all_lines(df: pd.DataFrame, lines: Sequence[str], z: float
     if annotated.empty:
         return pd.DataFrame()
     project_col = col(annotated, ["proposal_id", "project_code"])
-    if not project_col:
+    if not project_col or "member_ous_uid" not in annotated.columns:
         return pd.DataFrame()
     required = set(line_names_for_input(lines))
     rows: List[Dict[str, Any]] = []
-    for project, group in annotated.groupby(project_col, dropna=True):
+    # A proposal can contain unrelated targets and tunings. Preserve the
+    # MOUS and target context described in references/archive-query.md, row
+    # granularity: do not combine one target's CO with another's isotopologues.
+    annotated = annotated[annotated["member_ous_uid"].map(as_text).ne("")]
+    group_columns = [project_col, "member_ous_uid"]
+    if "target_name" in annotated:
+        group_columns.append("target_name")
+    for identity, group in annotated.groupby(group_columns, dropna=False):
+        project, mous = identity[:2]
         found = set()
         for value in group["covered_lines"].tolist():
             found.update(part.strip() for part in as_text(value).split(",") if part.strip())
         if required <= found:
             rows.append({
                 "proposal_id": as_text(project),
+                "member_ous_uid": as_text(mous),
+                "coverage_basis": "all requested lines within the same MOUS and target SPW set",
                 "covered_lines": ", ".join(sorted(found)),
                 "rows": int(len(group)),
                 "n_mous": _nunique(group, "member_ous_uid"),
@@ -860,6 +1103,58 @@ def projects_covering_all_lines(df: pd.DataFrame, lines: Sequence[str], z: float
     return pd.DataFrame(rows)
 
 
+_EXTRAGALACTIC_RE = re.compile(
+    r"galax(?:y|ies)|extragalactic|cosmolog|active galactic|\bAGN\b|\bSMG\b|quasar",
+    re.IGNORECASE,
+)
+_CALIBRATION_RE = re.compile(r"calibrat|bandpass|\bphase\b|\bflux\b|\bcheck\b", re.IGNORECASE)
+
+
+def extragalactic_science_where() -> str:
+    """Require science intent before the row cap; categories are proposal metadata."""
+    return (
+        "science_observation = 'T' AND ("
+        "LOWER(scientific_category) LIKE '%galax%' OR "
+        "LOWER(scientific_category) LIKE '%cosmolog%' OR "
+        "LOWER(scientific_category) LIKE '%active%' OR "
+        "LOWER(science_keyword) LIKE '%galax%' OR "
+        "LOWER(science_keyword) LIKE '%agn%' OR "
+        "LOWER(science_keyword) LIKE '%quasar%') "
+        "AND (scientific_category IS NULL OR LOWER(scientific_category) NOT LIKE '%solar system%') "
+        "AND (science_keyword IS NULL OR LOWER(science_keyword) NOT LIKE '%calibrat%') "
+        "AND (scientific_category IS NULL OR LOWER(scientific_category) NOT LIKE '%calibrat%')"
+    )
+
+
+def is_extragalactic_science_row(row: pd.Series) -> bool:
+    """Reject calibration/solar-system rows even under extragalactic proposals.
+
+    science_observation=T is documented in references/archive-query.md.
+    Missing science/classification metadata cannot establish target membership.
+    A proposal category alone never establishes a target redshift.
+    """
+    if as_text(row.get("science_observation")).lower() not in {"t", "true", "1"}:
+        return False
+    metadata = " ".join(as_text(row.get(k)) for k in ("scientific_category", "science_keyword"))
+    if _SOLAR_SYSTEM_RE.search(metadata) or _CALIBRATION_RE.search(metadata):
+        return False
+    intent = as_text(row.get("scan_intent"))
+    if _CALIBRATION_RE.search(intent) and "target" not in intent.lower():
+        return False
+    return bool(_EXTRAGALACTIC_RE.search(metadata))
+
+
+def redshifted_line_windows(rest_species: Sequence[str] | str, z_min: float, z_max: float) -> List[Dict[str, Any]]:
+    """Explicit per-transition nu_obs = nu_rest / (1 + z) intervals."""
+    z_lo, z_hi = sorted((float(z_min), float(z_max)))
+    if not all(math.isfinite(z) and z > -1 for z in (z_lo, z_hi)):
+        raise ValueError("Redshift bounds must be finite and greater than -1")
+    return [{"transition": name, "rest_frequency_ghz": LINE_REST_FREQ_GHZ[name],
+             "observed_min_ghz": LINE_REST_FREQ_GHZ[name] / (1 + z_hi),
+             "observed_max_ghz": LINE_REST_FREQ_GHZ[name] / (1 + z_lo)}
+            for name in line_names_for_species(rest_species)]
+
+
 def redshifted_line_projects(
     df: pd.DataFrame,
     *,
@@ -867,7 +1162,7 @@ def redshifted_line_projects(
     z_min: float = 1.0,
     z_max: float = 2.0,
 ) -> pd.DataFrame:
-    """Summarize projects whose spectral setup overlaps redshifted rest lines."""
+    """Return coverage-compatible science targets, never inferred source redshifts."""
     if df is None or df.empty:
         return pd.DataFrame()
     project_col = col(df, ["proposal_id", "project_code"])
@@ -876,17 +1171,20 @@ def redshifted_line_projects(
 
     z_lo = float(min(z_min, z_max))
     z_hi = float(max(z_min, z_max))
-    line_names = line_names_for_species(rest_species)
+    windows = redshifted_line_windows(rest_species, z_lo, z_hi)
     hit_rows: List[Dict[str, Any]] = []
 
     for _, row in df.iterrows():
-        intervals = observation_intervals_ghz(row)
+        if not is_extragalactic_science_row(row):
+            continue
+        # Representative frequency +/- total bandwidth can bridge SPW gaps.
+        # Missing actual SPW metadata is insufficient for this science claim.
+        intervals = parse_frequency_support_intervals(row.get("frequency_support"))
         if not intervals:
             continue
-        for line_name in line_names:
-            rest_freq = LINE_REST_FREQ_GHZ[line_name]
-            obs_min = rest_freq / (1.0 + z_hi)
-            obs_max = rest_freq / (1.0 + z_lo)
+        for window in windows:
+            line_name, rest_freq = window["transition"], window["rest_frequency_ghz"]
+            obs_min, obs_max = window["observed_min_ghz"], window["observed_max_ghz"]
             for lo, hi in intervals:
                 inter_lo = max(lo, obs_min)
                 inter_hi = min(hi, obs_max)
@@ -902,7 +1200,7 @@ def redshifted_line_projects(
                     "transition": line_name,
                     "rest_frequency_ghz": round(rest_freq, 6),
                     "observed_frequency_range_ghz": f"{inter_lo:.3f}-{inter_hi:.3f}",
-                    "inferred_redshift_range": f"{inferred_z_min:.3f}-{inferred_z_max:.3f}",
+                    "coverage_compatible_redshift_range": f"{inferred_z_min:.3f}-{inferred_z_max:.3f}",
                     "band_list": as_text(row.get("band_list")),
                     "pi_name": as_text(row.get("pi_name")),
                     "obs_title": as_text(row.get("obs_title")),
@@ -914,13 +1212,18 @@ def redshifted_line_projects(
         return pd.DataFrame()
 
     rows: List[Dict[str, Any]] = []
-    for project, group in hits.groupby("proposal_id", dropna=True):
+    for (project, target, mous), group in hits.groupby(["proposal_id", "target_name", "member_ous_uid"], dropna=False):
         rows.append({
             "proposal_id": as_text(project),
-            "target_name": first_nonempty(group["target_name"].tolist()),
+            "target_name": as_text(target),
+            "member_ous_uid": as_text(mous),
             "transitions": ", ".join(sorted(set(group["transition"].tolist()))),
             "observed_frequency_ranges_ghz": "; ".join(sorted(set(group["observed_frequency_range_ghz"].tolist()))[:8]),
-            "inferred_redshift_ranges": "; ".join(sorted(set(group["inferred_redshift_range"].tolist()))[:8]),
+            "coverage_compatible_redshift_ranges": "; ".join(sorted(set(group["coverage_compatible_redshift_range"].tolist()))[:8]),
+            "target_redshift": None,
+            "target_redshift_status": "unknown: no target redshift measurement supplied by ObsCore",
+            "redshift_interpretation": "coverage-compatible only; not evidence that the target lies in the requested redshift range",
+            "line_frequency_windows": windows,
             "rows": int(len(group)),
             "n_mous": _nunique(group[group["member_ous_uid"] != ""], "member_ous_uid"),
             "n_eb": _nunique(group[group["asdm_uid"] != ""], "asdm_uid"),

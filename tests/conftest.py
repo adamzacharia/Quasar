@@ -98,6 +98,26 @@ def dummy_config():
 # of 401 (the test_s3_s6_security.py flake). Clear both before every test.
 # Reads are defensive: a unit-only run that never loaded ui-pro just skips it.
 @pytest.fixture(autouse=True)
+def _reset_host_breaker_and_tool_deadline():
+    """services/host_breaker.py keeps PROCESS-WIDE per-host state and
+    services/tool_budgets.py a thread-local tool deadline. A test that drives a
+    fake host into an infrastructure failure (or a stray real DNS miss) must
+    not make every later test against that host fail fast — reset both
+    around each test."""
+    try:
+        from services.host_breaker import HostBreaker
+        from services.tool_budgets import end_tool_deadline
+    except Exception:  # pragma: no cover - modules absent in a partial checkout
+        yield
+        return
+    HostBreaker.reset()
+    end_tool_deadline()
+    yield
+    HostBreaker.reset()
+    end_tool_deadline()
+
+
+@pytest.fixture(autouse=True)
 def _reset_login_rate_limiters():
     def _clear(limiter):
         if limiter is None:

@@ -82,6 +82,24 @@ _LAB_SCIENCE_EMOJI_RE = re.compile(
 )
 
 
+
+def final_text_event(response_text: Optional[str], streamed_text: str, *, first_token: bool) -> Optional[Dict[str, Any]]:
+    """The SSE event that makes the client's copy of the answer equal the
+    persisted ``response_text`` -- or None when nothing needs sending.
+
+    * nothing streamed yet (``first_token``): the whole answer as one token;
+    * the post-processed answer differs from what streamed (guards, verifier,
+      prose hygiene): ``final_text`` carrying it -- INCLUDING an empty string
+      when post-processing removed everything (guard CX-31: that case used to
+      send nothing, leaving the streamed text on screen but not in the DB).
+    """
+    final = response_text or ""
+    if first_token:
+        return {"type": "token", "content": final} if final else None
+    if streamed_text and final.strip() != streamed_text.strip():
+        return {"type": "final_text", "content": final}
+    return None
+
 def _sanitize_assistant_text(text: str) -> str:
     return _LAB_SCIENCE_EMOJI_RE.sub("", text or "")
 
@@ -1269,6 +1287,13 @@ async def _stream_chat_response(
 
             first_token = True
             response_text = ""
+            # What the client has actually SEEN token by token. The runner's
+            # post-processing (fabricated-link guard, answer verifier, prose
+            # hygiene) only changes the "done" text; when that differs from
+            # the streamed text a `final_text` event replaces the client copy
+            # so the two never disagree again (UI benchmark 2026-09-22, D13/D14/
+            # D17: "Removed 1 link" while the link stayed on screen).
+            streamed_text = ""
             _rich_thinking_text = ""
             # Accumulators for rich UI events — persisted to Turso for history replay
             _rich_data_tables = []  # list of data tables (multi-target support)
@@ -1690,6 +1715,7 @@ async def _stream_chat_response(
                     # instead of vanishing on reload. The "done" payload
                     # replaces this with the agent's full sanitized text.
                     response_text += payload
+                    streamed_text += payload
                     data = json.dumps({"type": "token", "content": payload})
                     yield f"data: {data}\n\n"
                 if msg_type == "thought":
@@ -1954,9 +1980,9 @@ async def _stream_chat_response(
                         _rich_notebooks.append(_rich_notebook)
                         await asyncio.sleep(0.05)
 
-            if response_text and first_token:
-                data = json.dumps({"type": "token", "content": response_text})
-                yield f"data: {data}\n\n"
+            _tail_event = final_text_event(response_text, streamed_text, first_token=first_token)
+            if _tail_event is not None:
+                yield f"data: {json.dumps(_tail_event)}\n\n"
 
             # ── Persist assistant response + rich UI data to DB ─────
             # (UIAPI-07: shared with the timeout path — see _persist_assistant_turn.)

@@ -42,7 +42,7 @@ class OpenAlexService:
         self,
         api_key: Optional[str] = None,
         timeout: float = 12.0,
-        retry_attempts: int = 3,
+        retry_attempts: int = 2,  # was 3 — see integrations/ads_client.py
         session: Optional[requests.Session] = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENALEX_API_KEY", "")

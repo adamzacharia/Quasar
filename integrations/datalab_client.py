@@ -357,7 +357,11 @@ class DatalabClient:
         headers = {"Content-Type": "application/x-www-form-urlencoded", "X-DL-AuthToken": self.token}
         deadline = time.monotonic() + wall_seconds
         try:
-            resp = requests.get(url, headers=headers, timeout=(min(seconds, 15.0), seconds), stream=True)
+            from services.host_breaker import guarded_request
+            from services.tool_budgets import bounded_timeout
+
+            seconds = bounded_timeout(seconds, minimum=2.0, label="Data Lab TAP")
+            resp = guarded_request("GET", url, headers=headers, timeout=(min(seconds, 15.0), seconds), stream=True)
             chunks = []
             for chunk in resp.iter_content(chunk_size=65536):
                 if time.monotonic() > deadline:

@@ -37,6 +37,7 @@ from services.alma_science_queries import (
     LINE_REST_FREQ_GHZ,
     OBSCORE_BASE_COLUMNS,
     alma_cone_adql,
+    alma_cone_count_adql,
     aggregate_counts,
     counts_note,
     observation_windows_ghz,
@@ -78,10 +79,45 @@ def _is_footprint_rejection(exc: Exception) -> bool:
     return ("intersects" in text or "s_region" in text) and ("not supported" in text or "unsupported" in text or "syntax" in text or "unknown" in text or "error" in text)
 
 
+
+def run_bounded_source(fn, timeout: float):
+    """Run one archive source search bounded by ``timeout`` (itself clamped to
+    the running tool's remaining budget) on a worker that INHERITS the tool
+    deadline, so the TAP session / requests hook inside it stay bounded too
+    (guard CX-02: a bare thread saw no deadline and could outlive the tool).
+
+    Returns ``(df, error_text, timed_out)``; on expiry the worker is abandoned
+    with the same contract as the tool guard.
+    """
+    from services.tool_budgets import BudgetExhausted, bounded_timeout, call_bounded
+
+    try:
+        bound = bounded_timeout(float(timeout), minimum=2.0, label="ALMA source search")
+    except BudgetExhausted as exc:
+        return None, str(exc), True
+    try:
+        df = call_bounded(fn, bound, label="ALMA source search", thread_name="quasar-alma-source-search")
+    except TimeoutError as exc:
+        if "did not answer within" in str(exc):
+            return None, f"timed out after {bound:.0f} s", True
+        return None, str(exc) or exc.__class__.__name__, False
+    except Exception as exc:  # ImportError, network, parse
+        return None, str(exc) or exc.__class__.__name__, False
+    return df, None, False
+
+
 class ALminerClient:
     """Client for interacting with ALMA archive via ALminer + the ALMA TAP"""
 
-    SOURCE_TIMEOUT_S = 390
+    # Per-source bounds for _parallel_search (seconds). 2026-09-21: TAP was
+    # 390 s here — against an archive that answers a healthy cone in 2-40 s,
+    # a hung mirror cost 6.5 minutes of silence per call, under a 465 s guard.
+    # TAP now gets what AlmaTapService can spend (2 attempts x 40 s + backoff),
+    # ALminer 30 s; both are clamped again to the running tool's remaining
+    # budget (services/tool_budgets.py), so the tool guard is never the first
+    # thing to fire.
+    SOURCE_TIMEOUT_S = 85
+    ALMINER_TIMEOUT_S = 30
 
     def __init__(self):
         """Initialize ALminer client"""
@@ -105,12 +141,18 @@ class ALminerClient:
 
     # ── Target / cone search ────────────────────────────────────────────────
     def search_by_target(self, target_name: str, public: bool = True,
-                         max_results: Optional[int] = None) -> pd.DataFrame:
+                         max_results: Optional[int] = None, *, band: Any = None,
+                         max_resolution_arcsec: Optional[float] = None,
+                         science_only: bool = False) -> pd.DataFrame:
         """
         Search ALMA archive by target name.
         Strategy:
         1. Resolve name to RA/Dec via SIMBAD (cached)
         2. TAP footprint cone (INTERSECTS s_region OR point) then ALminer fallback
+
+        ``band`` / ``max_resolution_arcsec`` / ``science_only`` go INTO the ADQL
+        (UI benchmark 2026-09-22, D16), and a ``COUNT(*)`` companion records
+        ``total_count`` when the TOP cap truncates the result.
         """
         print(f"[ALMA] Starting search for '{target_name}'")
 
@@ -134,10 +176,12 @@ class ALminerClient:
         # (alminer.target(search_radius=1.0)); the old 0.05 deg (3 arcmin) pulled
         # in unrelated neighbours for compact targets.
         return self._parallel_search(ra_deg, dec_deg, radius=1.0 / 60, target_name=target_name,
-                                     public=public, max_results=max_results)
+                                     public=public, max_results=max_results, band=band,
+                                     max_resolution_arcsec=max_resolution_arcsec, science_only=science_only)
 
     def _parallel_search(self, ra: float, dec: float, radius: float = 0.05, target_name: str = "",
-                         public: bool = True, max_results: Optional[int] = None) -> pd.DataFrame:
+                         public: bool = True, max_results: Optional[int] = None, *, band: Any = None,
+                         max_resolution_arcsec: Optional[float] = None, science_only: bool = False) -> pd.DataFrame:
         """
         Primary-plus-fallback cone search: try TAP, then ALminer, SEQUENTIALLY.
         Each source is bounded by a per-source timeout on a daemon thread, so
@@ -150,34 +194,22 @@ class ALminerClient:
         """
         import threading
 
-        def _run_bounded(fn, timeout) -> Tuple[Optional[pd.DataFrame], Optional[str], bool]:
-            box: Dict[str, Any] = {}
-
-            def _target():
-                try:
-                    box["df"] = fn()
-                except Exception as exc:  # ImportError, network, parse
-                    box["err"] = exc
-
-            t = threading.Thread(target=_target, daemon=True)
-            t.start()
-            t.join(timeout)
-            if t.is_alive():
-                return None, f"timed out after {timeout} s", True
-            if "err" in box:
-                return None, str(box["err"]) or box["err"].__class__.__name__, False
-            return box.get("df"), None, False
+        _run_bounded = run_bounded_source
 
         cone_meta: Dict[str, Any] = {
             "ra": float(ra), "dec": float(dec), "radius_deg": float(radius),
             "public": bool(public), "footprint_mode": "intersects_or_point",
         }
+        _filters = {"band": band, "max_resolution_arcsec": max_resolution_arcsec, "science_only": bool(science_only)}
+        if band is not None or max_resolution_arcsec is not None or science_only:
+            cone_meta["filters"] = {k: v for k, v in _filters.items() if v not in (None, False)}
         top = _row_cap(max_results)
 
         def tap_search():
             print("[ALMA] TAP search starting...")
             service = self._get_tap_service()
-            query = alma_cone_adql(ra, dec, radius, public=public, top=top)
+            footprint = True
+            query = alma_cone_adql(ra, dec, radius, public=public, top=top, **_filters)
             try:
                 res = service.search(query, maxrec=top)
             except Exception as exc:
@@ -186,7 +218,8 @@ class ALminerClient:
                 # Service rejected the footprint predicate: point-only fallback,
                 # disclosed through attrs so provenance tells the truth.
                 print(f"[ALMA] TAP rejected INTERSECTS (falling back to point cone): {exc}")
-                query = alma_cone_adql(ra, dec, radius, public=public, top=top, footprint=False)
+                footprint = False
+                query = alma_cone_adql(ra, dec, radius, public=public, top=top, footprint=False, **_filters)
                 cone_meta["footprint_mode"] = "point_only"
                 res = service.search(query, maxrec=top)
             cone_meta["adql"] = query
@@ -194,6 +227,24 @@ class ALminerClient:
             df = res.to_table().to_pandas()
             df.attrs["truncated"] = bool(len(df) >= top or getattr(res, "query_status", "") == "OVERFLOW")
             df.attrs["row_cap"] = top
+            df.attrs["filters_in_adql"] = dict(cone_meta.get("filters") or {})
+            if df.attrs["truncated"]:
+                # The cap hit: ask the server how many rows/MOUS the SAME cone
+                # and filters hold, so the caller can say "N total, showing M".
+                count_query = alma_cone_count_adql(ra, dec, radius, public=public, footprint=footprint, **_filters)
+                try:
+                    from services.tool_budgets import remaining_seconds
+
+                    left = remaining_seconds()
+                    if left is None or left >= 8.0:
+                        cres = service.search(count_query, maxrec=5)
+                        cdf = cres.to_table().to_pandas()
+                        if not cdf.empty:
+                            df.attrs["total_count"] = int(cdf.iloc[0]["total_rows"])
+                            df.attrs["total_mous"] = int(cdf.iloc[0]["total_mous"])
+                            cone_meta["count_adql"] = count_query
+                except Exception as count_exc:  # the count is a courtesy, never a failure
+                    print(f"[ALMA] COUNT(*) companion failed: {count_exc}")
             return df
 
         def alminer_search():
@@ -204,6 +255,8 @@ class ALminerClient:
             df = _alminer.conesearch(ra, dec, search_radius=radius, public=public, print_targets=False)
             cone_meta.setdefault("footprint_mode", "point_only")
             cone_meta["adql"] = alma_cone_adql(ra, dec, radius, public=public, footprint=False)
+            if cone_meta.get("filters"):
+                cone_meta["note_filters"] = "alminer.conesearch cannot apply band/resolution filters; they are applied client-side."
             cone_meta["url"] = ALMA_TAP_URL
             cone_meta["note"] = (
                 "-- Reproducible equivalent of the executed alminer.conesearch"
@@ -217,7 +270,7 @@ class ALminerClient:
         failures: List[str] = []
         empty_frames: List[pd.DataFrame] = []
         for name, fn in (("TAP", tap_search), ("ALminer", alminer_search)):
-            df, err, timed_out = _run_bounded(fn, self.SOURCE_TIMEOUT_S if name == "TAP" else 60)
+            df, err, timed_out = _run_bounded(fn, self.SOURCE_TIMEOUT_S if name == "TAP" else self.ALMINER_TIMEOUT_S)
             if df is None:
                 failures.append(f"{name}: {err}")
                 print(f"[ALMA] {name} failed: {err}")

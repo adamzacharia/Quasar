@@ -29,6 +29,7 @@ from openai import OpenAI
 from core.llm_client import LLMClient, detect_provider
 
 from core.logger import logger, log_tool
+import services.tool_budgets as _tool_budgets
 from services.ads_auto_link import build_exact_project_paper_links
 from services.citation_verifier import append_citation_warning
 from services.evidence_quality import annotate_web_source_evidence, rank_web_sources
@@ -295,6 +296,48 @@ The Section 2 disclaimer applies ONLY when Section 1 used the documentation cont
 
 If ONLY documentation context is available (no web results), still cite sources inline and add the documentation disclaimer.
 If ONLY web results are available (no documentation), present them with links and note they are from the web."""
+
+
+_HOST_OPEN_MARKER = "circuit breaker open for "
+
+
+def _annotate_infrastructure_failure(tool_name: str, result):
+    """Recognise a host-breaker refusal that a capability stringified into
+    ``{"success": False, "error": "..."}`` and restore the structure the
+    runner/SSE/model rely on (``infrastructure_failure``, ``host``,
+    ``affected_tools``, ``retry_after_seconds``). Module-level so the guard
+    keeps working on bare test agents that borrow ``_execute_tool_guarded``."""
+    if not isinstance(result, dict) or result.get("success", True):
+        return result
+    if result.get("infrastructure_failure"):
+        if not result.get("affected_tools") and result.get("host"):
+            result = dict(result)
+            result["affected_tools"] = [
+                t for t in _tool_budgets.tools_for_host(str(result["host"])) if t != tool_name
+            ]
+        return result
+    text = str(result.get("error") or "")
+    idx = text.find(_HOST_OPEN_MARKER)
+    if idx < 0:
+        return result
+    tail = text[idx + len(_HOST_OPEN_MARKER):]
+    host = tail.split(" ", 1)[0].strip("(),;:")
+    retry = 0
+    m = re.search(r"retry in (\d+) s", tail)
+    if m:
+        retry = int(m.group(1))
+    from services.host_breaker import HostCircuitOpen, structured_error
+
+    reason = tail.split("):", 1)[1].strip() if "):" in tail else tail
+    enriched = structured_error(
+        HostCircuitOpen(host, retry, reason[:200]),
+        tool_name=tool_name,
+        affected_tools=_tool_budgets.tools_for_host(host),
+    )
+    merged = dict(result)
+    merged.update(enriched)
+    return merged
+
 
 class QuasarAgent:
     """Main AI agent for radio astronomy operations"""
@@ -839,11 +882,37 @@ class QuasarAgent:
         with self._conv_ids_lock:
             return self._conv_response_ids.get(self._response_state_key(conversation_id, model))
 
-    def _begin_response_run(self, conversation_id: str, model: str, run_token: Optional[str]) -> None:
+    def _begin_response_run(
+        self,
+        conversation_id: str,
+        model: str,
+        run_token: Optional[str],
+        turn_cancellation=None,
+    ) -> None:
+        """Mark ``run_token`` as the live run for this conversation/model and
+        (optionally) register the turn's cancellation token so
+        :meth:`cancel_response_run` can stop the turn's detached tool workers."""
+        if not run_token:
+            return
+        key = self._response_state_key(conversation_id, model)
+        with self._conv_ids_lock:
+            self._conv_run_tokens[key] = run_token
+            if turn_cancellation is not None:
+                # Keyed by the RUN TOKEN (unique per run), not by the model: the
+                # SSE layer cancels with the model the client REQUESTED, while a
+                # health failover registers the run under the model actually
+                # used (guard CX-08). The entry remembers that state key.
+                if not hasattr(self, "_turn_cancellations"):
+                    self._turn_cancellations = {}
+                self._turn_cancellations[run_token] = (key, turn_cancellation)
+
+    def _end_response_run(self, run_token: Optional[str]) -> None:
+        """Release a finished turn's cancellation token (guard CX-12: completed
+        turns used to stay in the map forever)."""
         if not run_token:
             return
         with self._conv_ids_lock:
-            self._conv_run_tokens[self._response_state_key(conversation_id, model)] = run_token
+            getattr(self, "_turn_cancellations", {}).pop(run_token, None)
 
     def _response_run_active(self, conversation_id: str, model: str, run_token: Optional[str]) -> bool:
         if not run_token:
@@ -890,11 +959,26 @@ class QuasarAgent:
                 pass
 
     def cancel_response_run(self, conversation_id: str, model: str, run_token: str) -> None:
-        """Invalidate a timed-out run so its worker cannot restore stale state."""
+        """Invalidate a timed-out / disconnected / stopped run so its worker
+        cannot restore stale state, and cancel the turn's tool workers so they
+        stop issuing network requests (services/tool_budgets.TurnCancellation)."""
         key = self._response_state_key(conversation_id, model)
         with self._conv_ids_lock:
+            _entry = getattr(self, "_turn_cancellations", {}).get(run_token) if run_token else None
+            if _entry is not None:
+                # The run registered under the model it actually used (failover).
+                key = _entry[0]
             if self._conv_run_tokens.get(key) != run_token:
                 return
+            getattr(self, "_turn_cancellations", {}).pop(run_token, None)
+        if _entry is not None:
+            try:
+                _entry[1].cancel("run cancelled: client disconnect / stop / deadline")
+            except Exception as cancel_err:  # pragma: no cover - never break the cancel path
+                logger.warning(f"[TURN CANCELLED] token cancel failed: {cancel_err}")
+            # state key = "conversation|provider|model"
+            _parts = str(key).split("|", 2)
+            model = _parts[2] if len(_parts) == 3 and _parts[2] else model
         self.clear_response_state(conversation_id, model, run_token)
         with self._conv_ids_lock:
             if self._conv_run_tokens.get(key) == run_token:
@@ -911,6 +995,12 @@ class QuasarAgent:
                 for k in keys[:len(keys) // 2]:
                     self._conv_response_ids.pop(k, None)
                     self._conv_run_tokens.pop(k, None)
+            # Turn tokens whose run is no longer live (guard CX-12).
+            _tc = getattr(self, "_turn_cancellations", None)
+            if _tc:
+                live = set(self._conv_run_tokens.values())
+                for tok in [t for t in _tc if t not in live]:
+                    _tc.pop(tok, None)
 
     # Backward-compatible property so legacy code (e.g. reset_conversation_state)
     # still works.  In production, prefer _get/_set_response_id with a conv_id.
@@ -993,6 +1083,38 @@ ARTIFACT HONESTY (hard rule):
 - If a plotting/query tool failed or was never called, say plainly that no figure was produced and
   what you would run next. NEVER describe the appearance/features of a figure that does not exist,
   and NEVER invent counts, coordinates, or table contents you did not retrieve this turn.
+- UNSUPPORTED CLAIMS ARE FLAGGED: after you answer, a deterministic verifier compares every selection
+  cut you state (e.g. "class_star > 0.5", "16 < G < 20"), every count ("30 projects"), every "shown
+  above/below" and every null result with the queries and tool results of THIS turn, and appends a
+  visible "Verification" block listing each mismatch. State only cuts that are in the executed SQL/ADQL
+  (the tool result and the Show-query panel show it), counts that a tool returned, and figures that
+  were attached. If an archive phase timed out or was skipped, say the result is UNKNOWN — never "none".
+- Cards render ABOVE your text: refer to figures and tables as "above", never "below".
+- Describe tools in plain language ("the Data Lab density scan"), never by internal identifiers such as
+  datalab_density_vetting, and never paste raw JSON arguments into the answer.
+
+ONE-SHOT TOOLS (prefer them — each answers a whole question in one call, with the cuts in its result):
+- ALMA archive: alma_project_census (per-project counts computed AT THE SERVER: Sun projects in a cycle,
+  projects using 12m+7m+TP, line sets such as 12CO/13CO/C18O in the same MOUS, redshifted-line coverage,
+  bandwidth-switching setups), alma_source_summary (a target's MOUS with band/resolution filters in the
+  query + total count), alma_public_band_status (bands with public data, as of a date), alma_archive_link
+  (verified ASA/TAP URLs — never compose an archive URL yourself), alma_bibliography (papers that used ALMA
+  data), cross_archive_match (ALMA + JWST/HST per source), archive_overlay (ALMA contours on JWST/HST),
+  code_recipe (tested astroquery/pyvo/ALMiner code — never improvise API names), alma_reference (Handbook
+  tables and documentation passages with citations for bands, configurations, correlator, BWSW, policy,
+  data products, weblog, CASA version).
+- Data Lab: datalab_healpix_density_map (wide stellar density maps), datalab_stream_selection (proper-motion
+  + CMD stream stars), datalab_selection_diagram (HR/CMD with Gaia quality presets and absolute magnitudes),
+  datalab_target_class_summary (n(z) + sky footprint of a bitmask class), datalab_satellite_search
+  (dwarf-satellite candidates with significance, CMDs and cutouts). datalab_select_catalog_rows also
+  selects by an indexed key (key_column='fieldid', key_value=169) — never use a dummy cone for that.
+- OPEN-ENDED REGIONS: when the user leaves the region open, choose a validated field (LMC/SMC, a known
+  satellite, or the tool's preset: lmc, smc, sgr_stream, anticenter, delve_south) — never the Galactic
+  Centre or a pole. Density scans keep their default point-source and blue/old-population colour cuts.
+  "The SDSS Great Wall" means RA 150–220°, Dec 0–5°, z ≤ 0.1.
+- SERVICE COOLDOWNS: if a tool result says a service circuit is open with retry_after_s ≤ 30, you MAY
+  re-issue that exact call ONCE (the platform waits for the cooldown first); with a longer cooldown, do
+  not retry — answer with what you have and say which service was unavailable.
 
 GUIDELINES:
 - **ACTION OVER CHATTER**: If the user asks for data/search/plots, **IMMEDIATELY** call the appropriate tool. Answering a data, catalog, imagery, or plotting request with generic how-to instructions, an SQL sketch, or a description of what one COULD do — instead of actually calling the tools — is UNACCEPTABLE.
@@ -1114,6 +1236,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     def _register_tools(self):
         """Register available tools with the agent using OpenAI Schemas"""
+        # Process-wide budget/breaker safety net for every requests-based
+        # transport a tool may use (services/http_budget_hook.py). Idempotent.
+        try:
+            from services.http_budget_hook import install as _install_http_budget_hook
+            _install_http_budget_hook()
+        except Exception as _hook_err:  # pragma: no cover - never block agent start
+            logger.warning(f"[BUDGET] http budget hook not installed: {_hook_err}")
         from core.tool_registrations import register_tools
         register_tools(self)
 
@@ -1813,10 +1942,13 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 model=synthesis_model,
                 instructions=system_prompt,
                 input=user_prompt,
-                max_output_tokens=200,
+                # 200 tokens cut a 2-4 sentence summary mid-word ("… begins
+                # when", UI benchmark 2026-09-22 D03); 450 is ample for four
+                # sentences and the trailing fragment is trimmed below anyway.
+                max_output_tokens=450,
                 temperature=0.2,
             )
-            summary = resp.output_text.strip()
+            summary = self._trim_dangling_sentence(resp.output_text.strip())
             if "NO_RELEVANT_INFO" in summary.upper():
                 # Web results don't answer the question — suppress the
                 # "From the Web" section entirely rather than appending a
@@ -1831,6 +1963,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # Fallback to raw Tavily answer
         return safe_assistant_text(web_data.get("answer", "").strip())
 
+    @staticmethod
+    def _trim_dangling_sentence(text: str) -> str:
+        """Drop an unfinished trailing sentence from a provider-truncated
+        summary (keeps at least the first complete sentence)."""
+        t = str(text or "").rstrip()
+        if not t or t[-1] in ".!?…\"')]}":
+            return t
+        cut = max(t.rfind(". "), t.rfind("! "), t.rfind("? "), t.rfind(".\n"), t.rfind("!\n"), t.rfind("?\n"))
+        if cut <= 0:
+            return t if t.endswith(".") else t + "…"
+        return t[: cut + 1].rstrip()
+
     # A backslash never belongs to a URL: the evidence blob is JSON-encoded
     # tool output (json.dumps of already-serialised results), so every URL in
     # it is followed by an escaped quote (`...SIZE=0.1\"`). Including the
@@ -1842,9 +1986,191 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     def _normalize_url(url: str) -> str:
         return str(url or "").rstrip("\\").rstrip(".,;:!?'\")]}>").lower()
 
-    def _strip_unverified_urls(self, text: str, *, sources: List[str], on_token=None) -> str:
+    # Documentation / archive domains the model may cite from knowledge: these
+    # pages exist and are the RIGHT answer to "where is this documented" (UI
+    # benchmark 2026-09-22, D13/D14: astroquery ReadTheDocs and the ALMA TAP
+    # schema page were stripped as "fabricated"). Suffix match on the hostname.
+    _DOC_URL_HOST_WHITELIST = (
+        "astroquery.readthedocs.io", "almascience.org", "almascience.nrao.edu", "almascience.eso.org",
+        "almascience.nao.ac.jp", "help.almascience.org", "docs.astropy.org", "astropy.org", "datalab.noirlab.edu",
+        "pyvo.readthedocs.io", "alminer.readthedocs.io", "arxiv.org", "ui.adsabs.harvard.edu",
+        "casadocs.readthedocs.io", "casa.nrao.edu", "science.nrao.edu", "mast.stsci.edu", "archive.stsci.edu",
+        "simbad.cds.unistra.fr", "vizier.cds.unistra.fr", "aladin.cds.unistra.fr", "ivoa.net",
+    )
+    _URL_REQUEST_RE = re.compile(r"\b(?:urls?|links?|hyperlinks?|web\s+address(?:es)?|permalinks?|deep[- ]links?)\b", re.I)
+
+    @classmethod
+    def _url_host_whitelisted(cls, url: str) -> bool:
+        from services.host_breaker import host_of
+
+        host = host_of(url)
+        return bool(host) and any(host == s or host.endswith("." + s) for s in cls._DOC_URL_HOST_WHITELIST)
+
+    # Requested-link probes (guard CX-01..03): public Internet only, HEAD only,
+    # redirects followed by hand (each hop re-checked), all links probed
+    # concurrently under one wall-clock cap that also honours turn cancellation.
+    _LINK_PROBE_MAX = 12
+    _LINK_PROBE_TOTAL_S = 8.0
+    _LINK_PROBE_MAX_REDIRECTS = 3
+
+    @staticmethod
+    def _resolve_public_target(url: str) -> Tuple[bool, str, Optional[str]]:
+        """(ok, reason, pinned_ip): http(s) on a default port whose host
+        resolves ONLY to globally routable addresses -- never loopback,
+        private, link-local (cloud metadata), reserved or multicast (SSRF
+        guard). The returned address is the one the probe CONNECTS to, so a
+        second (rebinding) DNS answer can never be used (verify round 1)."""
+        import ipaddress
+        import socket
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return False, "malformed URL", None
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return False, "not an http(s) URL", None
+        if parts.username or parts.password:
+            return False, "credentials in URL", None
+        try:
+            port = parts.port
+        except ValueError:
+            return False, "bad port", None
+        if port not in (None, 80, 443):
+            return False, f"non-standard port {port}", None
+        host = parts.hostname.strip("[]").lower()
+        if host == "localhost" or host.endswith(".localhost") or host.endswith(".local") or host.endswith(".internal"):
+            return False, "local hostname", None
+        try:
+            infos = socket.getaddrinfo(host, port or (443 if parts.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+        except (socket.gaierror, UnicodeError, OSError):
+            return False, "DNS lookup failed", None
+        addrs = [info[4][0].split("%")[0] for info in infos]
+        if not addrs:
+            return False, "DNS lookup failed", None
+        for addr in addrs:
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                return False, "unparseable address", None
+            if getattr(ip, "ipv4_mapped", None):
+                ip = ip.ipv4_mapped
+            if not ip.is_global or ip.is_multicast:
+                return False, "non-public address", None
+        return True, "", addrs[0]
+
+    @classmethod
+    def _public_http_target(cls, url: str) -> Tuple[bool, str]:
+        ok, why, _ip = cls._resolve_public_target(url)
+        return ok, why
+
+    @staticmethod
+    def _head_once(url: str, ip: str, timeout: float) -> Tuple[int, Optional[str]]:
+        """One HEAD request to ``url`` over a connection PINNED to ``ip`` (the
+        validated address): Host header + TLS SNI / certificate check against
+        the URL's hostname, no environment proxies, no redirects, no retries."""
+        import urllib3
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        t = urllib3.Timeout(connect=timeout, read=timeout)
+        if parts.scheme == "https":
+            import certifi
+
+            pool = urllib3.HTTPSConnectionPool(ip, port, timeout=t, retries=False, server_hostname=host,
+                                               assert_hostname=host, cert_reqs="CERT_REQUIRED", ca_certs=certifi.where())
+        else:
+            pool = urllib3.HTTPConnectionPool(ip, port, timeout=t, retries=False)
+        try:
+            resp = pool.request("HEAD", path, headers={"Host": host, "User-Agent": "QuasarLinkCheck/1.0"},
+                                redirect=False, preload_content=False)
+            status, location = int(resp.status), resp.headers.get("Location")
+            resp.release_conn()
+            return status, location
+        finally:
+            pool.close()
+
+    @classmethod
+    def _head_verify_url(cls, url: str, timeout: float = 5.0, stop: Optional[threading.Event] = None) -> Tuple[bool, str]:
+        """Bounded liveness probe for a URL the user asked for: HEAD only (no
+        GET fallback -- a GET can have side effects), public targets only, the
+        connection pinned to the validated address, redirects followed
+        manually with every hop re-validated. ``stop`` (set when the probe
+        wall-clock cap passes or the turn is cancelled) ends the probe before
+        its next hop. 2xx/3xx-final counts as verified; a server that refuses
+        HEAD is reported as such."""
+        try:
+            from urllib.parse import urljoin
+
+            current = url
+            for _hop in range(cls._LINK_PROBE_MAX_REDIRECTS + 1):
+                if stop is not None and stop.is_set():
+                    return False, "probe stopped (time cap / turn cancelled)"
+                ok, why, ip = cls._resolve_public_target(current)
+                if not ok:
+                    return False, f"not probed: {why}"
+                status, location = cls._head_once(current, ip, timeout)
+                location = location if 300 <= status < 400 else None
+                if location:
+                    current = urljoin(current, location)
+                    continue
+                if 200 <= status < 400:
+                    return True, f"HTTP {status}"
+                if status in (403, 405, 501):
+                    return False, f"server reachable but refuses HEAD (HTTP {status}) -- open it to confirm"
+                return False, f"HTTP {status}"
+            return False, f"more than {cls._LINK_PROBE_MAX_REDIRECTS} redirects"
+        except Exception as exc:  # noqa: BLE001 - a probe never breaks the answer
+            return False, type(exc).__name__
+
+    def _verify_requested_urls(self, urls: List[str]) -> List[Tuple[str, bool, str]]:
+        """Probe every requested URL concurrently (at most ``_LINK_PROBE_MAX``;
+        the rest are labelled "not probed") under one wall-clock cap; stops
+        early when the turn is cancelled."""
+        import concurrent.futures as _cf
+
+        probe, rest = urls[: self._LINK_PROBE_MAX], urls[self._LINK_PROBE_MAX:]
+        cancel = getattr(self._tls, "turn_cancellation", None)
+        results: Dict[str, Tuple[bool, str]] = {}
+        stop = threading.Event()  # tells still-running probes not to start another hop
+        if probe and not (cancel is not None and cancel.cancelled):
+            pool = _cf.ThreadPoolExecutor(max_workers=min(6, len(probe)), thread_name_prefix="link-probe")
+            futs = {pool.submit(self._head_verify_url, u, 5.0, stop): u for u in probe}
+            deadline = time.monotonic() + self._LINK_PROBE_TOTAL_S
+            pending = set(futs)
+            try:
+                while pending and time.monotonic() < deadline:
+                    if cancel is not None and cancel.cancelled:
+                        break
+                    done, pending = _cf.wait(pending, timeout=min(0.25, max(0.0, deadline - time.monotonic())))
+                    for f in done:
+                        try:
+                            results[futs[f]] = f.result()
+                        except Exception as exc:  # noqa: BLE001
+                            results[futs[f]] = (False, type(exc).__name__)
+            finally:
+                stop.set()
+                for f in pending:
+                    f.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+        out: List[Tuple[str, bool, str]] = []
+        for u in probe:
+            ok, detail = results.get(u, (False, "probe did not finish in time" if not (cancel is not None and cancel.cancelled) else "turn cancelled"))
+            out.append((u, ok, detail))
+        for u in rest:
+            out.append((u, False, f"not probed (only the first {self._LINK_PROBE_MAX} links are checked)"))
+        return out
+
+    def _strip_unverified_urls(self, text: str, *, sources: List[str], on_token=None, user_query: str = "") -> str:
         """Strip external URLs that no tool, web search, or documentation context
-        returned this turn.
+        returned this turn -- except documentation-domain links (whitelist) and,
+        when the user explicitly ASKED for a URL/link, every link: those are
+        HEAD-verified and labelled instead of removed (D17: the one URL the user
+        asked for was stripped). The removal notice lists the exact URLs removed
+        (D13/D14: counts that did not match the page).
 
         The dual-source scaffold used to INDUCE gpt-oss into inventing links
         (live P3: a fake blog slug, stackexchange /q/123456, a fake schema PDF).
@@ -1861,13 +2187,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             for m in self._EXTERNAL_URL_RE.findall(str(blob))
         }
         removed: List[str] = []
+        user_wants_url = bool(self._URL_REQUEST_RE.search(str(user_query or "")))
+        to_verify: List[str] = []
 
         def _known(url: str) -> bool:
-            return self._normalize_url(url) in allowed
+            return self._normalize_url(url) in allowed or self._url_host_whitelisted(url)
 
         def _md_sub(match: "re.Match[str]") -> str:
             label, url = match.group(1), match.group(2)
             if _known(url):
+                return match.group(0)
+            if user_wants_url:
+                to_verify.append(url)
                 return match.group(0)
             removed.append(url)
             return label
@@ -1878,25 +2209,46 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             url = match.group(0)
             if _known(url):
                 return url
+            if user_wants_url:
+                to_verify.append(url)
+                return url
             # Keep trailing punctuation that the URL regex swallowed.
             tail = url[len(url.rstrip(".,;:!?'\")]}>")):]
             removed.append(url)
             return tail
 
         cleaned = self._EXTERNAL_URL_RE.sub(_bare_sub, cleaned)
-        if not removed:
-            return text
-        note = (
-            f"\n\n> 🔗 Removed {len(removed)} external link(s) that were not returned by "
-            "any tool, search, or documentation source in this turn (fabricated-link guard)."
-        )
+        note = ""
+        if to_verify:
+            seen: List[str] = []
+            for url in to_verify:
+                clean_url = url.rstrip(".,;:!?'\")]}>")
+                if clean_url in seen:
+                    continue
+                seen.append(clean_url)
+            lines = []
+            for url, ok, detail in self._verify_requested_urls(seen):
+                lines.append(f"> - `{url}` — {'verified (' + detail + ')' if ok else 'unverified (' + detail + ')'}")
+            note += "\n\n> 🔗 Link check (you asked for a URL, so nothing was removed):\n" + "\n".join(lines)
+            print(f"[GUARD] Checked {len(seen)} requested URL(s) instead of stripping: {seen[:5]}")
+        if removed:
+            unique_removed = list(dict.fromkeys(u.rstrip(".,;:!?'\")]}>") for u in removed))
+            listed = ", ".join(f"`{u}`" for u in unique_removed[:6])
+            if len(unique_removed) > 6:
+                listed += f", … (+{len(unique_removed) - 6})"
+            note += (
+                f"\n\n> 🔗 Removed {len(unique_removed)} external link(s) that were not returned by "
+                f"any tool, search, or documentation source in this turn (fabricated-link guard): {listed}"
+            )
+            print(f"[GUARD] Stripped {len(unique_removed)} unverified external URL(s): {unique_removed[:5]}")
+        if not note:
+            return text if not to_verify else cleaned
         cleaned += note
         if on_token:
             try:
                 on_token(note)
             except Exception:
                 pass
-        print(f"[GUARD] Stripped {len(removed)} unverified external URL(s): {removed[:5]}")
         return cleaned
 
     def _synthesize_web_tool_answer(self, query: str, web_results: List[Dict[str, Any]]) -> str:
@@ -2241,55 +2593,32 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     # expires the turn reclaims control and hands the model a structured
     # timeout error it can answer around. Set QUASAR_TOOL_TIMEOUT_SECONDS=0
     # to disable the guard entirely (legacy inline execution).
-    _TOOL_TIMEOUT_DEFAULT_SECONDS = 150.0
-    # Tools that legitimately run long (multi-step research, bulk downloads).
-    _TOOL_TIMEOUT_OVERRIDES: Dict[str, float] = {
-        "query_alma_science_archive": 390.0,
-        "advanced_search": 390.0,
-        "get_observation_details": 390.0,
-        "search_by_frequency": 390.0,
-        "search_by_target": 465.0,
-        "search_by_position": 465.0,
-        "web_research": 420.0,
-        "download_alma_data": 600.0,
-        # L9: bulk MAST FITS pulls (e.g. TESS lightcurves) legitimately run
-        # long — match download_alma_data; MASTClient's own wall bound
-        # (MAST_DOWNLOAD_WALL_SECONDS, default 480 s) fires first with the
-        # more specific error.
-        "download_mast_data": 600.0,
-        # Density vetting = density SQL PLUS an SIA cutout grid in one call;
-        # under NSC/archive load it cannot fit the 150 s default, and its
-        # abandonment is what tipped the 2026-08-04 production hang into the
-        # aggregate + per-peak-cutout grind (density report fix 10).
-        "datalab_density_vetting": 300.0,
-    }
+    #
+    # The guard tables live in services/tool_budgets.py — the single source of
+    # truth shared with the services, whose inner network budgets must stay
+    # STRICTLY BELOW these guards (tests/unit/test_tool_budget_hierarchy.py).
+    # The guard is the last resort; a tool that respects its budget returns
+    # its own structured partial result first. Class aliases kept for the
+    # existing call sites and tests.
+    _TOOL_TIMEOUT_DEFAULT_SECONDS = _tool_budgets.GUARD_DEFAULT_SECONDS
+    _TOOL_TIMEOUT_OVERRIDES: Dict[str, float] = _tool_budgets.GUARD_OVERRIDES
     # Same-tool timeouts in one turn before the guard fails further calls
     # instantly (the model retries timed-out calls despite the "Do NOT retry"
     # error text — live 2026-08-04 density repro — and each retry burns a
-    # full guard budget).
+    # full guard budget). Also counted per declared HOST, so a sibling tool
+    # on the same archive (live 2026-09-21: match_perseus_protostars_alma_jwst
+    # after two match_cross_archive_sources timeouts) does not get a fresh
+    # budget.
     _TOOL_TIMEOUT_BREAKER_TRIPS = 2
 
     @classmethod
     def _tool_timeout_seconds(cls, tool_name: str) -> Optional[float]:
-        """Resolve the wall-clock budget for one tool; None = no budget."""
-        raw = os.getenv("QUASAR_TOOL_TIMEOUT_SECONDS", "").strip()
-        try:
-            default = float(raw) if raw else cls._TOOL_TIMEOUT_DEFAULT_SECONDS
-        except ValueError:
-            default = cls._TOOL_TIMEOUT_DEFAULT_SECONDS
-        if default <= 0:
-            return None
-        budget = cls._TOOL_TIMEOUT_OVERRIDES.get(tool_name, default)
-        # Per-tool env override: QUASAR_TOOL_TIMEOUT_OVERRIDES="web_research=600,search_cadc=90"
-        for pair in os.getenv("QUASAR_TOOL_TIMEOUT_OVERRIDES", "").split(","):
-            name, sep, secs = pair.partition("=")
-            if sep and name.strip() == tool_name:
-                try:
-                    val = float(secs)
-                except ValueError:
-                    continue
-                budget = val if val > 0 else None
-        return budget
+        """Resolve the wall-clock budget for one tool; None = no budget.
+
+        Delegates to services.tool_budgets.guard_seconds (env precedence:
+        QUASAR_TOOL_TIMEOUT_OVERRIDES > code overrides >
+        QUASAR_TOOL_TIMEOUT_SECONDS > default)."""
+        return _tool_budgets.guard_seconds(tool_name)
 
     def _execute_tool_guarded(
         self,
@@ -2317,25 +2646,126 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             timeout_seconds if timeout_seconds is not None
             else self._tool_timeout_seconds(tool_name)
         )
-        deadline = getattr(getattr(self, "_tls", None), "turn_deadline", None)
-        hard_seconds = getattr(getattr(self, "_tls", None), "turn_hard_seconds", 0)
-        if deadline is not None and hard_seconds:
+        _tls = getattr(self, "_tls", None)
+        deadline = getattr(_tls, "turn_deadline", None)
+        hard_seconds = getattr(_tls, "turn_hard_seconds", 0)
+        # The runner's per-turn TOOL budget (QUASAR_TURN_TOOL_BUDGET_SECONDS,
+        # default 300 s; core/runner.py) is the tighter bound: no tool may be
+        # started with more time than is left before the forced final round.
+        _soft_deadline = getattr(_tls, "turn_soft_deadline", None)
+        if _soft_deadline is not None:
+            remaining = max(0.001, _soft_deadline - time.monotonic())
+            budget = min(budget, remaining) if budget is not None else remaining
+        elif deadline is not None and hard_seconds:
             remaining = max(0.001, deadline - 0.3 * hard_seconds - time.monotonic())
             budget = min(budget, remaining) if budget is not None else remaining
+        # Per-turn cancellation token (services/tool_budgets.TurnCancellation):
+        # fired by cancel_response_run (client gone / Stop / SSE ceiling) or the
+        # runner's hard-cap exit; every worker we start below checks it before
+        # each network request, so abandoned workers die with the turn.
+        _turn = getattr(_tls, "turn_cancellation", None)
+        if _turn is None:
+            # A thread without the runner's TLS (Conductor subtask executors,
+            # helper threads) still carries the turn through the deadline it
+            # adopted (verify round 1).
+            _cur_deadline = _tool_budgets.current_deadline()
+            _turn = getattr(_cur_deadline, "turn", None) if _cur_deadline is not None else None
+        if _turn is not None and _turn.cancelled:
+            return {
+                "success": False,
+                "cancelled": True,
+                "error": f"'{tool_name}' was not executed: the turn was cancelled ({_turn.reason or 'stopped'}).",
+            }
+
+        # Host circuit breaker (services/host_breaker.py): when EVERY remote
+        # host / service this tool is declared to depend on is currently open
+        # (refused / reset / SSL / repeated soft failures moments ago, from ANY
+        # tool), refuse before a worker even starts. The model's habit of
+        # retrying with a sibling tool against the same dead archive then
+        # costs milliseconds, and it gets a structured error naming the
+        # service and the affected tools. A SHORT cooldown (<=
+        # HOST_BREAKER_AUTO_WAIT_SECONDS, default 30 s) is waited out here
+        # instead -- the UI benchmark's L10 was told "retry in 20 s" and gave
+        # up; the platform can simply wait 20 s and probe.
+        _hosts = _tool_budgets.hosts_for(tool_name)
+        if budget is not None and _hosts:
+            from services.host_breaker import HostBreaker, HostCircuitOpen, structured_error
+
+            _open = HostBreaker.open_hosts(_hosts)
+            if _open and len(_open) >= len(set(_hosts)):
+                host, rec = _open[0]
+                _retry = float(rec.get("retry_after", 0.0) or 0.0)
+                _auto_wait = HostBreaker.auto_wait_seconds()
+                if 0.0 < _retry <= _auto_wait and budget - _retry >= 10.0 and not (
+                    _turn is not None and _turn.cancelled
+                ):
+                    logger.warning(
+                        f"[HOST BREAKER] {tool_name}: {host} circuit re-opens in {_retry:.0f}s — "
+                        f"waiting inside the turn instead of skipping (auto-wait ≤ {_auto_wait:.0f}s)"
+                    )
+                    if on_status is not None and step_label:
+                        try:
+                            on_status(f"{step_label} — waiting {int(round(_retry))}s for {host} to recover", "running")
+                        except Exception:
+                            pass
+                    _wait_until = time.monotonic() + _retry + 0.05
+                    while time.monotonic() < _wait_until:
+                        if _turn is not None and _turn.cancelled:
+                            break
+                        time.sleep(min(0.5, max(0.0, _wait_until - time.monotonic())))
+                    budget = max(0.001, budget - _retry)
+                    if on_status is not None and step_label:
+                        try:
+                            on_status(f"{step_label} — waiting {int(round(_retry))}s for {host} to recover", "completed")
+                        except Exception:
+                            pass
+                    if _turn is not None and _turn.cancelled:
+                        return {
+                            "success": False,
+                            "cancelled": True,
+                            "error": f"'{tool_name}' was not executed: the turn was cancelled ({_turn.reason or 'stopped'}).",
+                        }
+                    _open = HostBreaker.open_hosts(_hosts)
+                if _open and len(_open) >= len(set(_hosts)):
+                    host, rec = _open[0]
+                    logger.warning(
+                        f"[TOOL ⚡] {tool_name} skipped — host circuit open for {host} "
+                        f"({rec.get('reason', '')[:80]}; retry in {rec.get('retry_after', 0):.0f}s)"
+                    )
+                    if on_status is not None and step_label:
+                        try:
+                            on_status(
+                                f"{step_label} skipped — {host} unreachable (circuit open)",
+                                "error",
+                            )
+                        except Exception:
+                            pass
+                    return structured_error(
+                        HostCircuitOpen(host, rec.get("retry_after", 0.0), str(rec.get("reason", ""))),
+                        tool_name=tool_name,
+                        affected_tools=_tool_budgets.tools_for_host(host),
+                    )
 
         # Consecutive-timeout circuit breaker. Turn-scoped state lives on the
         # runner thread's TLS (reset per turn in core/runner.py); paths that
         # never set it (Conductor executor threads, bare test agents) get None
-        # and the breaker is simply disabled there.
+        # and the breaker is simply disabled there. Counted per tool name AND
+        # per declared host ("host:<name>" keys): a tool trips when its own
+        # count or the count of every host it depends on reaches the limit.
         _breaker = getattr(getattr(self, "_tls", None), "tool_timeout_breaker", None)
-        if (
-            budget is not None
-            and _breaker is not None
-            and _breaker.get(tool_name, 0) >= self._TOOL_TIMEOUT_BREAKER_TRIPS
-        ):
+        # getattr: bare test doubles built with __new__ may lack the class attr.
+        _trip_limit = getattr(self, "_TOOL_TIMEOUT_BREAKER_TRIPS", 2)
+        _trips = 0
+        if budget is not None and _breaker is not None:
+            _trips = _breaker.get(tool_name, 0)
+            if _trips < _trip_limit and _hosts:
+                _host_trips = [_breaker.get(f"host:{h}", 0) for h in _hosts]
+                if _host_trips and min(_host_trips) >= _trip_limit:
+                    _trips = min(_host_trips)
+        if _breaker is not None and _trips >= _trip_limit:
             logger.warning(
                 f"[TOOL ⏱] {tool_name} circuit breaker open "
-                f"({_breaker[tool_name]} timeouts this turn) — failing instantly"
+                f"({_trips} timeouts this turn) — failing instantly"
             )
             if on_status is not None and step_label:
                 try:
@@ -2343,7 +2773,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     # withhold its deadline extension for this status.
                     on_status(
                         f"{step_label} skipped — timed out "
-                        f"{_breaker[tool_name]} times this turn",
+                        f"{_trips} times this turn",
                         "completed",
                     )
                 except Exception:
@@ -2353,11 +2783,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "timeout": True,
                 "circuit_breaker": True,
                 "error": (
-                    f"CIRCUIT BREAKER: '{tool_name}' already timed out "
-                    f"{_breaker[tool_name]} times this turn, so this call was "
-                    "NOT executed. Do NOT call this tool again this turn; "
-                    "answer with the data you already have, or use a "
-                    "different tool."
+                    f"CIRCUIT BREAKER: '{tool_name}' (or a sibling tool on the same "
+                    f"archive) already timed out {_trips} times this turn, so this "
+                    "call was NOT executed. Do NOT call this tool again this turn; "
+                    "answer with the data you already have, or use a tool on a "
+                    "different service."
                 ),
             }
 
@@ -2371,9 +2801,27 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             interval = max(1.0 if heartbeat_seconds is None else 0.001, interval)
 
         if budget is None:
-            # Guard disabled — legacy inline execution (heartbeats aside).
+            # Guard disabled — legacy inline execution (heartbeats aside). The
+            # call still runs under an UNBOUNDED deadline that carries its
+            # identity and the turn cancellation (guard CX-06): Stop /
+            # disconnect refuses its next request, and repeated soft failures
+            # of this one call count once in the host breaker.
+            _prev_deadline = _tool_budgets.current_deadline()
+            _inline_deadline = _tool_budgets.make_identity_deadline(tool_name, turn=_turn)
+
+            def _run_inline():
+                _tool_budgets.adopt_deadline(_inline_deadline)
+                try:
+                    return tool.execute(**args)
+                except _tool_budgets.TurnCancelled as cancelled:
+                    return {"success": False, "cancelled": True, "error": f"'{tool_name}' stopped: {cancelled}"}
+                finally:
+                    _tool_budgets.end_tool_deadline()
+                    if _prev_deadline is not None:
+                        _tool_budgets.adopt_deadline(_prev_deadline)
+
             if on_status is None:
-                return tool.execute(**args)
+                return _run_inline()
             stopped = threading.Event()
 
             def emit_heartbeats():
@@ -2393,7 +2841,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             )
             heartbeat.start()
             try:
-                return tool.execute(**args)
+                return _run_inline()
             finally:
                 stopped.set()
                 heartbeat.join(timeout=min(1.0, interval))
@@ -2411,14 +2859,36 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         lock = threading.Lock()
         done = threading.Event()
         outcome: Dict[str, Any] = {}
+        # The inner deadline is built HERE (parent thread) so this thread keeps
+        # a handle: abandoning the worker below cancels it, and every network
+        # call the worker (or its helper threads) would still make is refused
+        # at once (services/http_budget_hook.py / bounded_timeout).
+        _tool_deadline = _tool_budgets.make_tool_deadline(tool_name, budget, turn=_turn)
 
         def run_tool():
             local: Dict[str, Any] = {}
             try:
                 set_langfuse_parent(parent_lf)
                 try:
-                    with reinstall_llm_request_context(parent_llm_ctx):
-                        local["result"] = tool.execute(**args)
+                    # Inner deadline for this tool's network calls: every
+                    # service timeout on this thread becomes
+                    # min(default, remaining) (services/tool_budgets.py), so
+                    # retry loops and per-item loops give up — with a
+                    # structured partial result — BEFORE the guard fires.
+                    _tool_budgets.adopt_deadline(_tool_deadline)
+                    try:
+                        with reinstall_llm_request_context(parent_llm_ctx):
+                            local["result"] = tool.execute(**args)
+                    except _tool_budgets.TurnCancelled as cancelled:
+                        # The turn ended while this tool ran: hand back a
+                        # structured stop instead of a traceback.
+                        local["result"] = {
+                            "success": False,
+                            "cancelled": True,
+                            "error": f"'{tool_name}' stopped: {cancelled}",
+                        }
+                    finally:
+                        _tool_budgets.end_tool_deadline()
                 except BaseException as exc:  # re-raised on the parent thread
                     local["exc"] = exc
                 try:
@@ -2487,6 +2957,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # responsive again — reset this tool's timeout streak.
             if _breaker is not None:
                 _breaker.pop(tool_name, None)
+                # A SUCCESSFUL completion also proves its declared hosts answer:
+                # clear their shared streaks too, so two non-consecutive host
+                # timeouts (with successes in between) cannot block every
+                # sibling tool (guard CX-11). A fast failure may come from a
+                # different host of a multi-host tool, so it clears nothing.
+                _res = outcome.get("result")
+                if "exc" not in outcome and not (isinstance(_res, dict) and _res.get("success") is False):
+                    for _h in _hosts or ():
+                        _breaker.pop(f"host:{_h}", None)
             # Merge the worker's TLS deltas into THIS thread's request state.
             # Conditional so a bare agent without `_tls` (delta collection
             # skipped above) never touches the properties here either.
@@ -2502,15 +2981,33 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             if alma.get("query") is not None or alma.get("url") is not None:
                 self._alma_tap_provenance_state.update(alma)
             if "exc" in outcome:
-                raise outcome["exc"]
-            return outcome.get("result")
+                exc = outcome["exc"]
+                from services.host_breaker import HostCircuitOpen, structured_error
 
+                if isinstance(exc, HostCircuitOpen):
+                    # A service refused by an open host breaker: hand the model
+                    # the structured fast-fail instead of a bare traceback.
+                    return structured_error(
+                        exc, tool_name=tool_name,
+                        affected_tools=_tool_budgets.tools_for_host(exc.host),
+                    )
+                raise exc
+            return _annotate_infrastructure_failure(tool_name, outcome.get("result"))
+
+        # Cancel the abandoned worker's deadline: it (and any helper thread
+        # that adopted a child of it) is refused at its next network request,
+        # so a detached worker can no longer hammer an archive for minutes
+        # after the guard gave up (UI benchmark 2026-09-22, L06).
+        if _tool_deadline is not None:
+            _tool_deadline.cancel(f"tool guard: {tool_name} exceeded its {budget:.0f}s budget")
         logger.warning(
             f"[TOOL ⏱] {tool_name} exceeded its {budget:.0f}s budget — "
-            "abandoned (the worker keeps running detached; its result is discarded)"
+            "abandoned (worker cancelled: it will not start new network requests; its result is discarded)"
         )
         if _breaker is not None:
             _breaker[tool_name] = _breaker.get(tool_name, 0) + 1
+            for _h in _tool_budgets.hosts_for(tool_name):
+                _breaker[f"host:{_h}"] = _breaker.get(f"host:{_h}", 0) + 1
         if on_status is not None and step_label:
             try:
                 # ui-pro/api/sse.py keys on the "timed out" phrase to withhold
@@ -3015,6 +3512,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 # stream_response_api takes effect on the next tool call.
                 "datalab_agg_timeout_tables": self._get_datalab_agg_timeout_tables(),
                 "datalab_job_poll_counts": self._get_datalab_job_poll_counts(),
+                # Multi-card tools (datalab_satellite_search: cutout grid + one
+                # CMD per candidate) append extra cards to the per-request
+                # accumulator; the runner streams each new one eagerly.
+                "append_run_result": lambda card: self._accumulated_run_results.append(card),
             },
             result_store=_lazy(self._get_datalab_result_store),
             user_id=(
@@ -3150,6 +3651,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 # on stdout; the capability itself never calls print().
                 "console_log": print,
                 "alma_tap_provenance": self._alma_tap_provenance_state,
+                # One-shot ALMA tools (capabilities/alma_tools.py): ADS for the
+                # ALMA bibliography, the documentation RAG for alma_reference.
+                "ads_client": getattr(self, "ads_client", None),
+                "rag_service": getattr(self, "rag_service", None),
             },
             user_id=getattr(getattr(self, "config", None), "user_id", None),
         )

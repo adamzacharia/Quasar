@@ -4,7 +4,21 @@ One source of truth for every archive client. Only SUCCESSFUL resolutions are
 memoized; a failed lookup raises internally so a transient SIMBAD outage never
 poisons the LRU with (None, None) for the process lifetime. (C16)
 """
+import os
 from functools import lru_cache
+
+SIMBAD_HOST = "simbad.cds.unistra.fr"
+
+
+def _simbad_timeout_default() -> float:
+    raw = os.getenv("SIMBAD_TIMEOUT_SECONDS", "").strip()
+    try:
+        return max(2.0, float(raw)) if raw else 10.0
+    except ValueError:
+        return 10.0
+
+
+SIMBAD_TIMEOUT_S = _simbad_timeout_default()
 
 
 class _SimbadUnresolved(Exception):
@@ -21,7 +35,26 @@ def _resolve_simbad_success_cached(target_name: str):
     from astropy.coordinates import SkyCoord
     import astropy.units as u
 
-    result = Simbad.query_object(target_name)
+    from services.host_breaker import HostBreaker
+    from services.tool_budgets import bounded_timeout, call_bounded
+
+    # Name resolution is a 1-2 s lookup when CDS is healthy; astroquery's
+    # default 60 s would eat almost half of a 150 s tool guard on its own.
+    # SIMBAD is served by CDS, so a dead CDS (live 2026-09-20: SSLError /
+    # ReadTimeout on alasky) fails the SECOND resolve of a turn instantly too.
+    HostBreaker.check(SIMBAD_HOST)
+    timeout = bounded_timeout(SIMBAD_TIMEOUT_S, minimum=2.0, label="SIMBAD resolve")
+    try:
+        # astroquery's Simbad.timeout is a server-side TAP execution duration,
+        # not an HTTP timeout, so the request is bounded from outside.
+        result = call_bounded(
+            lambda: Simbad.query_object(target_name), timeout,
+            label="SIMBAD resolve", thread_name="quasar-simbad-resolve",
+        )
+    except Exception as exc:
+        HostBreaker.record_failure(SIMBAD_HOST, exc)
+        raise
+    HostBreaker.record_success(SIMBAD_HOST)
     if result is None or len(result) == 0:
         raise _SimbadUnresolved(target_name)
 

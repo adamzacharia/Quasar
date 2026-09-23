@@ -66,6 +66,29 @@ from services.alma_science_queries import (
 logger = logging.getLogger(__name__)
 
 
+def _bounded_llm_call(fn):
+    """Run an in-tool LLM completion bounded by the tool budget.
+
+    The provider client's read timeout is 300-600 s (core/llm_client.py
+    _http_timeout) — longer than the 150 s tool guard, so an LLM pass inside a
+    literature tool could outlast the tool. The call runs on a bounded worker
+    (services/tool_budgets.py call_bounded) with
+    min(PAPERS_LLM_TIMEOUT_SECONDS, remaining tool budget); on expiry the
+    worker is abandoned and a TimeoutError surfaces as the tool's own error.
+    """
+    import os as _os
+
+    from services.tool_budgets import bounded_timeout, call_bounded
+
+    try:
+        default = float(_os.getenv("PAPERS_LLM_TIMEOUT_SECONDS", "60") or 60)
+    except ValueError:
+        default = 60.0
+    return call_bounded(fn, bounded_timeout(default, minimum=5.0, label="literature LLM pass"),
+                        label="literature LLM pass", thread_name="quasar-papers-llm")
+
+
+
 def _native(out: Dict[str, Any], *, ads_query: Optional[str] = None) -> ToolResult:
     """Wrap a legacy output dict as a byte-parity ToolResult.
 
@@ -596,13 +619,13 @@ IMPORTANT RULES:
 
             llm_client = ctx.services.get("llm_client")
             config = ctx.services.get("agent_config")
-            response = llm_client.responses.create(
+            response = _bounded_llm_call(lambda: llm_client.responses.create(
                 model=config.model,
                 instructions="You are a meticulous scientific literature analyst who produces rigorous, well-cited consensus evaluations.",
                 input=consensus_prompt,
                 temperature=0.1,
                 max_output_tokens=4000,
-            )
+            ))
 
             analysis = response.output_text.strip()
 
@@ -753,13 +776,13 @@ class ReproducePaperMethods(BaseCapability):
 
             llm_client = ctx.services.get("llm_client")
             config = ctx.services.get("agent_config")
-            response = llm_client.responses.create(
+            response = _bounded_llm_call(lambda: llm_client.responses.create(
                 model=config.model,
                 instructions="You are an expert radio astronomy data reduction specialist.",
                 input=prompt,
                 temperature=0.2,
                 max_output_tokens=4000
-            )
+            ))
 
             script = response.output_text.strip()
 

@@ -137,7 +137,9 @@ class VlassEpochService:
                  timeout: Optional[float] = None):
         self.tap_url = str(tap_url or os.getenv("CADC_TAP_SYNC_URL") or CADC_TAP_SYNC_URL)
         self.soda_url = str(soda_url or os.getenv("CADC_SODA_SYNC_URL") or CADC_SODA_SYNC_URL)
-        self.timeout = float(timeout if timeout is not None else _env_float("CADC_TAP_TIMEOUT", 90.0))
+        # 40 s (was 90): two CADC TAP queries plus one SODA cutout must fit the
+        # 150 s tool guard with headroom (services/tool_budgets.py).
+        self.timeout = float(timeout if timeout is not None else _env_float("CADC_TAP_TIMEOUT", 40.0))
 
     # ── CADC queries ─────────────────────────────────────────────────────
     def _tap_csv(self, adql: str):

@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────
 MAX_DOWNLOAD_MB = 150              # Reject files larger than this
-DOWNLOAD_TIMEOUT_S = 180           # Timeout for HTTP download
-HIPS2FITS_TIMEOUT_S = 45           # Shorter cap for hips2fits cutout URLs
+DOWNLOAD_TIMEOUT_S = 45            # Per-read HTTP timeout; tools fetching two files (+ a TAP lookup) must fit a 150 s guard
+HIPS2FITS_TIMEOUT_S = 30           # Shorter cap for hips2fits cutout URLs (matches services/hips_images.py)
 RENDERED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "rendered_images")
 os.makedirs(RENDERED_DIR, exist_ok=True)
 

@@ -1046,11 +1046,16 @@ def _eval_expression(frame: pd.DataFrame, expr: str) -> pd.Series:
     return pd.Series(value, index=frame.index)
 
 
+# White-dwarf / main-sequence separation in the Gaia HR diagram (M_G vs BP-RP).
+_WD_INTERCEPT = 9.625
+_WD_SLOPE = 3.25
+
+
 def _overlay_locus(ax: Any, name: str, x: pd.Series, y: pd.Series) -> Optional[Dict[str, Any]]:
     if name.lower() not in {"wd", "wd_sequence", "white_dwarf"} or x.empty:
         return None
     xs = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 80)
-    ys = 11.5 + 5.0 * xs
+    ys = _WD_INTERCEPT + _WD_SLOPE * xs
     yrange = (float(np.nanmin(y)), float(np.nanmax(y)))
     if yrange[0] > yrange[1]:
         yrange = (yrange[1], yrange[0])
@@ -1058,12 +1063,18 @@ def _overlay_locus(ax: Any, name: str, x: pd.Series, y: pd.Series) -> Optional[D
     if mask.any():
         ax.plot(xs[mask], ys[mask], color="#D55E00", lw=1.2, ls="--", label="WD locus")
         ax.legend(fontsize=8)
-    # Side-of-line classification (DECISION-03 default). The drawn line IS the WD
-    # locus y = 11.5 + 5.0*x; finite points on the FAINT side (larger magnitude,
-    # y > line) are white-dwarf candidates, the rest are main-sequence/other.
+    # Side-of-line classification. The drawn line separates the white-dwarf
+    # sequence from the main sequence in the Gaia HR diagram:
+    # M_G = 9.625 + 3.25*(BP-RP); finite points on the FAINT side (larger
+    # magnitude, y > line) are white-dwarf candidates, the rest are main-
+    # sequence/other. The previous line (intercept 11.5, slope 5.0,
+    # "DECISION-03") was too steep: it classified every star of a 5-degree
+    # high-proper-motion Gaia sample as main sequence while this cut finds 18
+    # WD candidates (UI benchmark 2026-09-23 L06; the same "0 candidates"
+    # answer was graded wrong in the 2026-09-21 API run).
     # Returned so the tool result can quote real counts and a model cannot call
     # the lower main sequence a "WD cooling track".
-    line_at_x = 11.5 + 5.0 * np.asarray(x, dtype=float)
+    line_at_x = _WD_INTERCEPT + _WD_SLOPE * np.asarray(x, dtype=float)
     y_arr = np.asarray(y, dtype=float)
     finite = np.isfinite(y_arr) & np.isfinite(line_at_x)
     is_wd = finite & (y_arr > line_at_x)
@@ -1072,10 +1083,10 @@ def _overlay_locus(ax: Any, name: str, x: pd.Series, y: pd.Series) -> Optional[D
     return {
         "n_wd_candidates": n_wd,
         "n_other": n_other,
-        "wd_locus_rule": "y = 11.5 + 5.0*x; faint side (y > line) = WD candidates",
+        "wd_locus_rule": f"y = {_WD_INTERCEPT} + {_WD_SLOPE}*x (M_G vs BP-RP); faint side (y > line) = WD candidates",
         "wd_locus_note": (
             f"{n_wd} point(s) lie on the faint side of the white-dwarf locus "
-            f"(y = 11.5 + 5.0*x) and are WD candidates; {n_other} point(s) lie on "
+            f"(y = {_WD_INTERCEPT} + {_WD_SLOPE}*x) and are WD candidates; {n_other} point(s) lie on "
             f"the bright/main-sequence side. Do NOT label the main-sequence points "
             f"a white-dwarf cooling track."
         ),

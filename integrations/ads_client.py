@@ -94,12 +94,36 @@ class ADSService:
         "property",
     ]
 
+    # Request policy shared by EVERY ADS call in this module (search, details,
+    # metrics, export, libraries): a 10 s timeout and 2 attempts with a 1 s
+    # backoff. services/tool_budgets.py reads the __init__ defaults (which are
+    # these constants) so the budget-hierarchy test sees live values;
+    # :meth:`worst_case_seconds` is the same arithmetic for callers.
+    DEFAULT_TIMEOUT_S = 10.0
+    # 2 attempts (was 3): a literature tool chains ADS + OpenAlex + an ALMA
+    # TAP lookup under a 150 s guard (services/tool_budgets.py).
+    DEFAULT_RETRY_ATTEMPTS = 2
+    # A 429 whose Retry-After exceeds this is reported at once instead of
+    # slept through (ADS quotas reset daily — a long Retry-After means "not
+    # this turn"). Also caps the 429 wait so one call never exceeds
+    # ``worst_case_seconds(1)``.
+    RATE_LIMIT_WAIT_CAP_S = 10.0
+    # ADS search ``rows`` hard maximum per request; also the most bibcodes
+    # one author-metrics request will aggregate.
+    METRICS_MAX_BIBCODES = 2000
+    # ADS export service formats (``POST /export/{format}``).
+    EXPORT_FORMATS = ("bibtex", "bibtexabs", "aastex", "endnote", "ris", "icarus", "mnras", "soph", "ads")
+    _METRICS_TYPES = ("basic", "citations", "indicators")
+    # biblib library ids are URL-safe tokens; anything else is refused before
+    # it can reach the path.
+    _LIBRARY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        timeout: float = 10.0,
-        retry_attempts: int = 3,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
         session: Optional[requests.Session] = None,
         user_agent: Optional[str] = None,
     ) -> None:
@@ -421,6 +445,503 @@ class ADSService:
                 
         return None
     
+    # ------------------------------------------------------------------
+    # Author / metrics / export / library backends (tool-facing)
+    # ------------------------------------------------------------------
+    # These back get_author_papers, get_paper_metrics, get_author_metrics,
+    # export_bibtex, list_ads_libraries, get_ads_library_papers,
+    # create_ads_library and add_to_ads_library (core/tool_registrations.py),
+    # which until 2026-09-21 called methods this class never defined and so
+    # raised AttributeError before any network call. Each is one or two bounded
+    # ADS requests through :meth:`_perform_request` (same 10 s x 2 policy as
+    # search_papers, tool-budget clamp, host circuit breaker) and returns a
+    # structured dict — ``{"success": False, "error": ...}`` on any ADS
+    # failure — so the model gets a specific message instead of a traceback.
+    # Response shapes probed live against api.adsabs.harvard.edu 2026-09-21:
+    # metrics keys carry spaces ("citation stats", "indicators"), an unknown
+    # bibcode answers HTTP 200 with an "Error" key, the export service answers
+    # {"msg", "export"}, the library list {"count", "libraries"}, and a
+    # library id that does not exist answers an HTML 500.
+
+    @classmethod
+    def worst_case_seconds(
+        cls,
+        calls: int = 1,
+        *,
+        timeout: Optional[float] = None,
+        retry_attempts: Optional[int] = None,
+    ) -> float:
+        """Worst-case sequential wall time of ``calls`` ADS requests.
+
+        Per call: ``attempts x timeout`` plus the backoff sleeps between
+        attempts (1 s, 2 s, ...). A 429 path is never longer: each 429 attempt
+        returns quickly and sleeps at most ``RATE_LIMIT_WAIT_CAP_S`` (= the
+        timeout). Defaults: 2 x 10 s + 1 s = 21 s per call.
+        """
+        t = cls.DEFAULT_TIMEOUT_S if timeout is None else float(timeout)
+        n = cls.DEFAULT_RETRY_ATTEMPTS if retry_attempts is None else max(1, int(retry_attempts))
+        backoff = sum(float(2 ** i) for i in range(n - 1))
+        return float(max(1, int(calls))) * (n * t + backoff)
+
+    def get_author_papers(
+        self,
+        author: str,
+        max_results: int = 20,
+        sort: str = "date desc",
+        refereed_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Papers by one author (``author:"Last, First"``), newest first."""
+        name = str(author or "").strip()
+        if not name:
+            return self._tool_error("An author name is required (use 'Last, First' form).")
+        query = f'author:"{self._escape_phrase(name)}"'
+        rows = self._clamp_int(max_results, default=20, lo=1, hi=200)
+        params: Dict[str, Union[str, int, List[str]]] = {
+            "q": query,
+            "fl": ",".join(self._DEFAULT_FIELDS),
+            "rows": rows,
+            "sort": str(sort or "date desc"),
+            "start": 0,
+        }
+        if refereed_only:
+            params["fq"] = ["property:refereed"]
+        try:
+            self._require_api_key()
+            data = self._perform_get("/search/query", params)
+        except ADSServiceError as exc:
+            logger.error("ADS author search failed for %r: %s", name, exc)
+            return self._tool_error(str(exc), author=name, query=query)
+        response = data.get("response", {}) if isinstance(data, dict) else {}
+        papers = self._format_papers(response.get("docs", []) or [])
+        num_found = self._clamp_int(response.get("numFound"), default=len(papers), lo=0, hi=10**9)
+        return {
+            "success": True,
+            "author": name,
+            "query": query,
+            "num_found": num_found,
+            "returned": len(papers),
+            "truncated": num_found > len(papers),
+            "refereed_only": bool(refereed_only),
+            "papers": papers,
+        }
+
+    def get_paper_metrics(self, bibcode: str) -> Dict[str, Any]:
+        """Citation / read / indicator metrics for one paper (``POST /metrics``)."""
+        code = str(bibcode or "").strip()
+        if not code:
+            return self._tool_error("A bibcode is required (e.g. '2018ApJ...869L..41A').")
+        try:
+            self._require_api_key()
+            data = self._perform_post("/metrics", {"bibcodes": [code], "types": list(self._METRICS_TYPES)})
+        except ADSServiceError as exc:
+            logger.error("ADS metrics failed for %s: %s", code, exc)
+            return self._tool_error(str(exc), bibcode=code)
+        problem = self._metrics_problem(data, [code])
+        if problem:
+            return self._tool_error(problem, bibcode=code)
+        out = {"success": True, "bibcode": code, "link": self._abs_link(code)}
+        out.update(self._summarise_metrics(data))
+        return out
+
+    def get_author_metrics(
+        self,
+        author: str,
+        max_papers: int = METRICS_MAX_BIBCODES,
+        refereed_only: bool = False,
+    ) -> Dict[str, Any]:
+        """h-index, i10, citations and reads for an author.
+
+        Two bounded calls: the author's bibcodes (``/search/query``, up to
+        ``METRICS_MAX_BIBCODES``) then ``POST /metrics`` over them. ``truncated``
+        is True when the author has more papers than were aggregated.
+        """
+        name = str(author or "").strip()
+        if not name:
+            return self._tool_error("An author name is required (use 'Last, First' form).")
+        query = f'author:"{self._escape_phrase(name)}"'
+        rows = self._clamp_int(max_papers, default=self.METRICS_MAX_BIBCODES, lo=1, hi=self.METRICS_MAX_BIBCODES)
+        params: Dict[str, Union[str, int, List[str]]] = {
+            "q": query,
+            "fl": "bibcode",
+            "rows": rows,
+            "sort": "date desc",
+            "start": 0,
+        }
+        if refereed_only:
+            params["fq"] = ["property:refereed"]
+        try:
+            self._require_api_key()
+            search = self._perform_get("/search/query", params)
+            response = search.get("response", {}) if isinstance(search, dict) else {}
+            bibcodes = [
+                str(doc.get("bibcode")).strip()
+                for doc in (response.get("docs", []) or [])
+                if isinstance(doc, dict) and doc.get("bibcode")
+            ]
+            num_found = self._clamp_int(response.get("numFound"), default=len(bibcodes), lo=0, hi=10**9)
+            if not bibcodes:
+                return self._tool_error(
+                    f"No ADS papers found for author {name!r}"
+                    + (" (refereed only)" if refereed_only else "")
+                    + " — check the 'Last, First' spelling.",
+                    author=name, query=query, num_found=0,
+                )
+            data = self._perform_post("/metrics", {"bibcodes": bibcodes, "types": list(self._METRICS_TYPES)})
+        except ADSServiceError as exc:
+            logger.error("ADS author metrics failed for %r: %s", name, exc)
+            return self._tool_error(str(exc), author=name, query=query)
+        problem = self._metrics_problem(data, bibcodes)
+        if problem:
+            return self._tool_error(problem, author=name, query=query)
+        out: Dict[str, Any] = {
+            "success": True,
+            "author": name,
+            "query": query,
+            "num_found": num_found,
+            "papers_considered": len(bibcodes),
+            "truncated": num_found > len(bibcodes),
+            "refereed_only": bool(refereed_only),
+        }
+        if out["truncated"]:
+            out["note"] = (
+                f"Metrics aggregate the {len(bibcodes)} most recent of {num_found} papers; "
+                "indicators for the full record may be higher."
+            )
+        out.update(self._summarise_metrics(data))
+        return out
+
+    def export_bibtex(
+        self,
+        bibcodes: Union[str, List[str]],
+        format: str = "bibtex",
+        max_authors: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Formatted citations for one or more bibcodes (``POST /export/{format}``)."""
+        codes = self._coerce_bibcodes(bibcodes)
+        fmt = str(format or "bibtex").strip().lower()
+        if not codes:
+            return self._tool_error("At least one ADS bibcode is required.")
+        if fmt not in self.EXPORT_FORMATS:
+            return self._tool_error(
+                f"Unsupported export format {fmt!r}; choose one of {', '.join(self.EXPORT_FORMATS)}.",
+                bibcodes=codes,
+            )
+        body: Dict[str, Any] = {"bibcode": codes}
+        if max_authors:
+            body["maxauthor"] = self._clamp_int(max_authors, default=0, lo=1, hi=500)
+        try:
+            self._require_api_key()
+            data = self._perform_post(f"/export/{fmt}", body)
+        except ADSServiceError as exc:
+            logger.error("ADS export (%s) failed: %s", fmt, exc)
+            return self._tool_error(str(exc), bibcodes=codes, format=fmt)
+        export = data.get("export") if isinstance(data, dict) else None
+        if not isinstance(export, str) or not export.strip():
+            return self._tool_error(
+                f"ADS export service returned no {fmt} entries for {', '.join(codes[:5])}.",
+                bibcodes=codes, format=fmt,
+            )
+        missing = [c for c in codes if c not in export]
+        out: Dict[str, Any] = {
+            "success": True,
+            "format": fmt,
+            "bibcodes": codes,
+            "count": len(codes),
+            "entries": len(re.findall(r"^@\w+\{", export, re.M)) if fmt.startswith("bibtex") else None,
+            "message": str(data.get("msg", "") or ""),
+            "bibtex": export,
+        }
+        if missing:
+            out["missing_bibcodes"] = missing
+        return out
+
+    def list_libraries(self) -> Dict[str, Any]:
+        """Personal ADS libraries of the account behind the configured token."""
+        try:
+            self._require_api_key()
+            data = self._perform_get("/biblib/libraries", {})
+        except ADSServiceError as exc:
+            logger.error("ADS library list failed: %s", exc)
+            return self._tool_error(str(exc))
+        raw = data.get("libraries") if isinstance(data, dict) else None
+        libraries = [self._format_library(lib) for lib in (raw or []) if isinstance(lib, dict)]
+        return {
+            "success": True,
+            "count": len(libraries),
+            "libraries": libraries,
+            "note": "Libraries belong to the ADS account whose API token Quasar is configured with.",
+        }
+
+    def get_library_papers(self, library_id: str, max_results: int = 50, start: int = 0) -> Dict[str, Any]:
+        """Papers in one library (``GET /biblib/libraries/{id}``).
+
+        biblib returns the bibcodes plus a Solr block for the requested ``fl``;
+        if that block is missing the bibcodes are resolved with one ordinary
+        search, so the result carries titles either way (2 bounded calls max).
+        """
+        lid = self._validate_library_id(library_id)
+        if lid is None:
+            return self._tool_error(
+                "A valid ADS library id is required (letters, digits, '-' and '_' only).",
+                library_id=str(library_id or ""),
+            )
+        rows = self._clamp_int(max_results, default=50, lo=1, hi=200)
+        offset = self._clamp_int(start, default=0, lo=0, hi=10**7)
+        params: Dict[str, Union[str, int, List[str]]] = {
+            "start": offset,
+            "rows": rows,
+            "fl": ",".join(self._DEFAULT_FIELDS),
+        }
+        try:
+            self._require_api_key()
+            data = self._perform_get(f"/biblib/libraries/{lid}", params)
+        except ADSServiceError as exc:
+            logger.error("ADS library %s fetch failed: %s", lid, exc)
+            return self._tool_error(self._library_hint(str(exc)), library_id=lid)
+        if not isinstance(data, dict):
+            return self._tool_error("ADS library service returned an unexpected payload.", library_id=lid)
+        documents = [str(b).strip() for b in (data.get("documents") or []) if b]
+        solr = data.get("solr") if isinstance(data.get("solr"), dict) else {}
+        solr_response = solr.get("response") if isinstance(solr.get("response"), dict) else {}
+        docs = solr_response.get("docs") or []
+        papers = self._format_papers([d for d in docs if isinstance(d, dict)]) if docs else []
+        if documents and not papers:
+            wanted = documents[:rows]
+            fallback_query = "bibcode:(" + " OR ".join(f'"{b}"' for b in wanted) + ")"
+            try:
+                papers = self.search_papers(fallback_query, max_results=len(wanted), sort="date desc")
+            except ADSServiceError as exc:
+                logger.warning("ADS library %s: bibcode resolution failed (%s); returning bibcodes only", lid, exc)
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        total = metadata.get("num_documents")
+        if not isinstance(total, int):
+            found = solr_response.get("numFound")
+            total = found if isinstance(found, int) else len(documents)
+        if metadata:
+            library = self._format_library({**metadata, "id": metadata.get("id", lid)})
+        else:
+            library = {"id": lid, "link": self._library_link(lid)}
+        return {
+            "success": True,
+            "library_id": lid,
+            "library": library,
+            "num_documents": int(total),
+            "start": offset,
+            "returned": len(papers) if papers else len(documents),
+            "bibcodes": documents,
+            "papers": papers,
+        }
+
+    def create_library(
+        self,
+        name: str,
+        description: str = "",
+        public: bool = False,
+        bibcodes: Optional[Union[str, List[str]]] = None,
+    ) -> Dict[str, Any]:
+        """Create a personal library (``POST /biblib/libraries``)."""
+        title = str(name or "").strip()
+        if not title:
+            return self._tool_error("A library name is required.")
+        codes = self._coerce_bibcodes(bibcodes)
+        body: Dict[str, Any] = {
+            "name": title,
+            "description": str(description or ""),
+            "public": self._as_bool(public),
+            "bibcode": codes,
+        }
+        try:
+            self._require_api_key()
+            data = self._perform_post("/biblib/libraries", body)
+        except ADSServiceError as exc:
+            logger.error("ADS create library %r failed: %s", title, exc)
+            return self._tool_error(str(exc), name=title)
+        if not isinstance(data, dict) or not data.get("id"):
+            return self._tool_error("ADS did not return an id for the new library.", name=title)
+        library = self._format_library(data)
+        return {
+            "success": True,
+            "library_id": str(data.get("id")),
+            "library": library,
+            "link": library["link"],
+            "bibcodes_added": len(codes),
+        }
+
+    def add_to_library(
+        self,
+        library_id: str,
+        bibcodes: Union[str, List[str]],
+        action: str = "add",
+    ) -> Dict[str, Any]:
+        """Add (or remove) bibcodes in a library (``POST /biblib/documents/{id}``)."""
+        lid = self._validate_library_id(library_id)
+        if lid is None:
+            return self._tool_error(
+                "A valid ADS library id is required (letters, digits, '-' and '_' only).",
+                library_id=str(library_id or ""),
+            )
+        codes = self._coerce_bibcodes(bibcodes)
+        act = str(action or "add").strip().lower()
+        if act not in {"add", "remove"}:
+            return self._tool_error(f"Unsupported library action {act!r}; use 'add' or 'remove'.", library_id=lid)
+        if not codes:
+            return self._tool_error("At least one ADS bibcode is required.", library_id=lid)
+        try:
+            self._require_api_key()
+            data = self._perform_post(f"/biblib/documents/{lid}", {"bibcode": codes, "action": act})
+        except ADSServiceError as exc:
+            logger.error("ADS %s to library %s failed: %s", act, lid, exc)
+            return self._tool_error(self._library_hint(str(exc)), library_id=lid, bibcodes=codes)
+        counter = "number_added" if act == "add" else "number_removed"
+        count = data.get(counter) if isinstance(data, dict) else None
+        return {
+            "success": True,
+            "library_id": lid,
+            "action": act,
+            "requested": len(codes),
+            counter: count if isinstance(count, int) else None,
+            "bibcodes": codes,
+            "link": self._library_link(lid),
+        }
+
+    # ── small helpers for the tool backends ─────────────────────────────
+    def _require_api_key(self) -> None:
+        if not self.api_key:
+            raise ADSServiceError(
+                "NASA ADS API key is not configured — set NASA_ADS_API_KEY (or SCIX_API_KEY) "
+                "to use the ADS author, metrics, export and library tools."
+            )
+
+    @staticmethod
+    def _tool_error(message: str, **context: Any) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"success": False, "error": message}
+        out.update({k: v for k, v in context.items() if v is not None})
+        return out
+
+    @staticmethod
+    def _escape_phrase(text: str) -> str:
+        return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _clamp_int(value: Any, *, default: int, lo: int, hi: int) -> int:
+        try:
+            if value is None or str(value).strip() == "":
+                number = int(default)
+            else:
+                number = int(float(value))
+        except (TypeError, ValueError):
+            number = int(default)
+        return max(lo, min(hi, number))
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "public"}
+        return bool(value)
+
+    @staticmethod
+    def _coerce_bibcodes(bibcodes: Any) -> List[str]:
+        if bibcodes is None:
+            return []
+        if isinstance(bibcodes, str):
+            items: List[Any] = re.split(r"[,;\s]+", bibcodes)
+        else:
+            try:
+                items = list(bibcodes)
+            except TypeError:
+                items = [bibcodes]
+        out: List[str] = []
+        seen = set()
+        for item in items:
+            code = str(item or "").strip()
+            if code and code not in seen:
+                seen.add(code)
+                out.append(code)
+        return out
+
+    def _validate_library_id(self, library_id: Any) -> Optional[str]:
+        lid = str(library_id or "").strip()
+        return lid if self._LIBRARY_ID_RE.match(lid) else None
+
+    @staticmethod
+    def _library_hint(message: str) -> str:
+        # Probed live 2026-09-21: biblib answers an HTML 500 for a library id
+        # that does not exist / is not readable with this token.
+        if "500" in message:
+            return message + " (ADS answers 500 for a library id that does not exist or is not accessible to this token)"
+        return message
+
+    @staticmethod
+    def _abs_link(bibcode: str) -> str:
+        return f"https://ui.adsabs.harvard.edu/abs/{bibcode}"
+
+    @staticmethod
+    def _library_link(library_id: str) -> str:
+        return f"https://ui.adsabs.harvard.edu/user/libraries/{library_id}"
+
+    def _format_library(self, lib: Dict[str, Any]) -> Dict[str, Any]:
+        lid = str(lib.get("id", "") or "")
+        num_documents = lib.get("num_documents")
+        if num_documents is None and isinstance(lib.get("bibcode"), list):
+            num_documents = len(lib["bibcode"])
+        return {
+            "id": lid,
+            "name": lib.get("name", ""),
+            "description": lib.get("description", ""),
+            "num_documents": num_documents,
+            "public": bool(lib.get("public", False)),
+            "permission": lib.get("permission"),
+            "owner": lib.get("owner"),
+            "date_created": lib.get("date_created"),
+            "date_last_modified": lib.get("date_last_modified"),
+            "link": self._library_link(lid) if lid else None,
+        }
+
+    @staticmethod
+    def _metrics_problem(data: Any, bibcodes: List[str]) -> Optional[str]:
+        """Reason the metrics payload is unusable, or None when it is fine."""
+        shown = ", ".join(bibcodes[:5]) + (" ..." if len(bibcodes) > 5 else "")
+        if not isinstance(data, dict):
+            return "ADS metrics service returned an unexpected payload."
+        if "Error" in data:
+            info = data.get("Error Info") or data.get("Error")
+            return f"ADS has no metrics for {shown}: {info}"
+        skipped = data.get("skipped bibcodes") or []
+        if bibcodes and all(code in skipped for code in bibcodes):
+            return f"ADS has no metrics for {shown} (bibcode not found)."
+        return None
+
+    @staticmethod
+    def _summarise_metrics(data: Dict[str, Any]) -> Dict[str, Any]:
+        basic = data.get("basic stats") or {}
+        cites = data.get("citation stats") or {}
+        cites_ref = data.get("citation stats refereed") or {}
+        ind = data.get("indicators") or {}
+        ind_ref = data.get("indicators refereed") or {}
+        return {
+            "number_of_papers": basic.get("number of papers"),
+            "total_citations": cites.get("total number of citations"),
+            "refereed_citations": cites.get("total number of refereed citations"),
+            "citing_papers": cites.get("number of citing papers"),
+            "self_citations": cites.get("number of self-citations"),
+            "total_reads": basic.get("total number of reads"),
+            "recent_reads": basic.get("recent number of reads"),
+            "total_downloads": basic.get("total number of downloads"),
+            "h_index": ind.get("h"),
+            "g_index": ind.get("g"),
+            "i10_index": ind.get("i10"),
+            "i100_index": ind.get("i100"),
+            "m_index": ind.get("m"),
+            "tori": ind.get("tori"),
+            "riq": ind.get("riq"),
+            "read10": ind.get("read10"),
+            "indicators_refereed": ind_ref,
+            "basic_stats": basic,
+            "citation_stats": cites,
+            "citation_stats_refereed": cites_ref,
+            "skipped_bibcodes": data.get("skipped bibcodes") or [],
+        }
+
     def _format_papers(self, papers: List[Dict]) -> List[Dict[str, Any]]:
         """Format raw ADS response to standardized format"""
         formatted = []
@@ -480,47 +1001,128 @@ class ADSService:
         timeout: Optional[float] = None,
         retry_attempts: Optional[int] = None,
     ) -> Dict[str, Any]:
+        return self._perform_request("GET", endpoint, params=params, timeout=timeout, retry_attempts=retry_attempts)
+
+    def _perform_post(
+        self,
+        endpoint: str,
+        json_body: Dict[str, Any],
+        *,
+        params: Optional[Dict[str, Union[str, int, List[str]]]] = None,
+        timeout: Optional[float] = None,
+        retry_attempts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._perform_request(
+            "POST", endpoint, params=params, json_body=json_body, timeout=timeout, retry_attempts=retry_attempts,
+        )
+
+    def _perform_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict[str, Union[str, int, List[str]]]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[float] = None,
+        retry_attempts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """One bounded ADS API call under the shared retry policy.
+
+        Every ADS request in this module goes through here so the 2026-09-21
+        latency rules apply uniformly (services/tool_budgets.py docstring):
+
+        * the timeout (default ``DEFAULT_TIMEOUT_S``) is clamped to the calling
+          tool's remaining budget (``bounded_timeout``); a call that cannot get
+          1 s is refused before it is sent, and a backoff sleep that would
+          outlast the budget is skipped in favour of the typed error;
+        * the host circuit breaker (services/host_breaker.py) is checked before
+          every attempt and fed every transport failure / gateway status, so
+          after ADS refuses, resets or times out once, the next literature call
+          in the turn fails in microseconds — ``HostCircuitOpen`` is left to
+          propagate: the tool guard turns it into the structured
+          INFRASTRUCTURE FAILURE result;
+        * the send runs under ``http_budget_hook.suppressed()`` so the
+          process-wide requests hook neither clamps nor records it twice;
+        * a 429 is retried only when ADS asks for at most
+          ``RATE_LIMIT_WAIT_CAP_S``; a longer Retry-After is reported at once.
+        """
+        from services.host_breaker import HostBreaker, host_of
+        from services.http_budget_hook import suppressed
+        from services.tool_budgets import BudgetExhausted, bounded_timeout
+
+        verb = str(method or "GET").upper()
         url = f"{self.base_url.rstrip('/')}{endpoint}"
+        host = host_of(url)
         headers = self._build_headers()
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        label = f"ADS {verb} {endpoint}"
         delay = 1.0
-        eff_timeout = self.timeout if timeout is None else timeout
+        base_timeout = float(self.timeout if timeout is None else timeout)
         eff_attempts = self.retry_attempts if retry_attempts is None else max(1, int(retry_attempts))
 
         for attempt in range(eff_attempts):
+            # Dead host / service (from ANY tool this turn): refuse instantly.
+            HostBreaker.check(url)
             try:
-                response = self.session.get(
-                    url, headers=headers, params=params, timeout=eff_timeout
-                )
+                eff_timeout = bounded_timeout(base_timeout, minimum=1.0, label=label)
+            except BudgetExhausted as exc:
+                raise ADSServiceError(f"{label} not sent: {exc}") from exc
+            try:
+                with suppressed():
+                    if verb == "GET":
+                        response = self.session.get(
+                            url, headers=headers, params=params, timeout=eff_timeout
+                        )
+                    elif verb == "POST":
+                        response = self.session.post(
+                            url, headers=headers, params=params, json=json_body, timeout=eff_timeout
+                        )
+                    else:
+                        response = self.session.request(
+                            verb, url, headers=headers, params=params, json=json_body, timeout=eff_timeout
+                        )
             except requests.Timeout as exc:
+                HostBreaker.record_failure(url, exc)
                 if attempt == eff_attempts - 1:
                     raise ADSServiceError("ADS request timed out") from exc
-                time.sleep(delay)
+                self._sleep_bounded(delay, label)
                 delay *= 2
                 continue
             except requests.RequestException as exc:
+                HostBreaker.record_failure(url, exc)
                 if attempt == eff_attempts - 1:
                     raise ADSServiceError(f"ADS request error: {exc}") from exc
-                time.sleep(delay)
+                self._sleep_bounded(delay, label)
                 delay *= 2
                 continue
 
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                wait_time = float(retry_after) if retry_after else delay
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status in (502, 503, 504):
+                HostBreaker.record_failure(url, status=status)
+                raise ADSServiceError(f"ADS API error {status}: {self._response_snippet(response)}")
+            HostBreaker.record_success(url)
+
+            if status == 429:
+                retry_after = self._retry_after_seconds(response)
+                wait_time = delay if retry_after is None else retry_after
+                if wait_time > self.RATE_LIMIT_WAIT_CAP_S:
+                    raise ADSServiceError(
+                        f"ADS rate limit reached (HTTP 429); ADS asks to retry after {wait_time:.0f} s"
+                    )
+                if attempt == eff_attempts - 1:
+                    raise ADSServiceError("ADS rate limit reached (HTTP 429); retries exhausted")
                 logger.warning(
                     "ADS rate limit hit (attempt %s); retrying in %.1f s",
                     attempt + 1,
                     wait_time,
                 )
-                time.sleep(wait_time)
-                delay = min(delay * 2, 30)
+                self._sleep_bounded(wait_time, label)
+                delay = min(delay * 2, self.RATE_LIMIT_WAIT_CAP_S)
                 continue
 
-            if response.status_code >= 400:
-                snippet = response.text.strip()[:500]
-                raise ADSServiceError(
-                    f"ADS API error {response.status_code}: {snippet or 'No details'}"
-                )
+            if status >= 400:
+                raise ADSServiceError(f"ADS API error {status}: {self._response_snippet(response)}")
 
             try:
                 return response.json()
@@ -528,6 +1130,45 @@ class ADSService:
                 raise ADSServiceError("ADS returned invalid JSON") from exc
 
         raise ADSServiceError("Exceeded retry attempts for ADS API")
+
+    def _sleep_bounded(self, seconds: float, label: str) -> None:
+        """Backoff that never outlasts the calling tool's remaining budget.
+
+        Outside a tool (scripts, the post-stream citation verifier) it is a
+        plain sleep. Inside one, a sleep that would leave less than 1 s for
+        the next attempt is replaced by the typed error so the tool returns
+        its own message before the guard fires.
+        """
+        from services.tool_budgets import remaining_seconds
+
+        remaining = remaining_seconds()
+        if remaining is not None and seconds + 1.0 > remaining:
+            raise ADSServiceError(
+                f"{label}: retry abandoned — tool budget nearly exhausted ({remaining:.1f} s left)"
+            )
+        time.sleep(seconds)
+
+    @staticmethod
+    def _retry_after_seconds(response: Any) -> Optional[float]:
+        try:
+            raw = (getattr(response, "headers", None) or {}).get("Retry-After")
+        except Exception:  # pragma: no cover - exotic fake responses
+            raw = None
+        if raw is None:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return None  # HTTP-date form: fall back to the backoff ladder
+
+    @staticmethod
+    def _response_snippet(response: Any) -> str:
+        text = str(getattr(response, "text", "") or "").strip()
+        if text.startswith("<"):
+            # biblib answers HTML error pages; keep the words, drop the tags.
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+        return text[:500] or "No details"
 
     def _build_headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": self.user_agent}
@@ -805,5 +1446,12 @@ Return JSON with exactly these keys:
         if not api_key:
             raise ADSQueryBuilderError("OPENAI_API_KEY not configured")
 
-        self._client = OpenAI(api_key=api_key)
+        # Budget hierarchy (2026-09-21): the SDK default is a 600 s timeout with
+        # 2 retries — under a 150 s tool guard the query-builder call alone
+        # could outlast the tool. Building an ADS query is a 2-5 s completion.
+        try:
+            _timeout = float(os.getenv("ADS_QUERY_BUILDER_TIMEOUT_SECONDS", "30") or 30)
+        except ValueError:
+            _timeout = 30.0
+        self._client = OpenAI(api_key=api_key, timeout=_timeout, max_retries=0)
         return self._client

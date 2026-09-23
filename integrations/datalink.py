@@ -498,7 +498,7 @@ class DataLinkClient:
             seen.add(endpoint)
             try:
                 url = f"{endpoint}?ID={mous_uid}"
-                resp = requests.get(url, timeout=60)
+                resp = requests.get(url, timeout=30)
                 if resp.status_code == 404:
                     return None, False, f"HTTP 404 from {endpoint} (NotFound)", transport_errors
                 resp.raise_for_status()

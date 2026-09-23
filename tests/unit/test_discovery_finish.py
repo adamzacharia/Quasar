@@ -107,8 +107,12 @@ def test_archive_query_transport_and_metadata_share_clamped_cap(monkeypatch,requ
     monkeypatch.setattr(client,'_get_tap_service',lambda:NS(search=search))
     if mode=='cone':frame=client.search_by_position(25,-10,max_results=requested)
     else:frame=client.search_by_frequency(80,110,max_results=requested)
-    assert len(calls)==1 and f'SELECT TOP {expected} ' in calls[0][0]
-    assert calls[0][1]==expected and frame.attrs['row_cap']==expected
+    # A truncated cone also issues ONE COUNT(*) companion (N rows total, showing M;
+    # UI benchmark 2026-09-22 D16) -- the row query is still the only row pull.
+    row_calls=[c for c in calls if not c[0].startswith('SELECT COUNT(*)')]
+    assert len(row_calls)==1 and f'SELECT TOP {expected} ' in row_calls[0][0]
+    assert len(calls)-len(row_calls)==(1 if mode=='cone' else 0)
+    assert row_calls[0][1]==expected and frame.attrs['row_cap']==expected
     assert frame.attrs['truncated']  # OVERFLOW applies even below the row cap.
 
 

@@ -383,7 +383,9 @@ def test_search_by_target_honours_public_only_and_date_range():
 
     ctx, state = _ctx(search_service=_Svc())
     out = _run(SearchByTarget(), ctx, target_name="M87", public_only=True, band="10", date_range="2019")
-    assert calls[0][2] == {"public_only": True} and calls[0][1] == "2019"
+    # band goes INTO the ADQL now (UI benchmark 2026-09-22, D16): the service
+    # call carries it alongside public_only.
+    assert calls[0][2] == {"public_only": True, "band": [10]} and calls[0][1] == "2019"
     assert out["success"] is True and out["total_results"] == 1      # band-to-band row kept for band 10
     assert out["public_only"] is True
     assert out["counts"] == {"rows": 1, "n_mous": 1, "n_eb": 1, "n_projects": 1, "n_public_rows": 1, "n_proprietary_rows": 0}

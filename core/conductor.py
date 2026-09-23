@@ -963,11 +963,23 @@ class Conductor:
             reinstall_llm_request_context,
         )
         _llm_ctx = get_llm_request_context()
+        # The Conductor thread runs under the turn's identity deadline
+        # (core/runner._turn_bound); executor threads start without it, so each
+        # subtask adopts a CHILD of it: same call identity and turn
+        # cancellation -- Stop / disconnect refuses the subtask's next request
+        # and its guarded tool calls see the cancelled turn (verify round 1).
+        from services import tool_budgets as _tb
+
+        _parent_deadline = _tb.current_deadline()
 
         def _with_request_ctx(fn):
             def _wrapped(*a, **k):
-                with reinstall_llm_request_context(_llm_ctx):
-                    return fn(*a, **k)
+                _tb.adopt_deadline(_parent_deadline.child(label="conductor-subtask") if _parent_deadline is not None else None)
+                try:
+                    with reinstall_llm_request_context(_llm_ctx):
+                        return fn(*a, **k)
+                finally:
+                    _tb.end_tool_deadline()
             return _wrapped
 
         # ── Route "compute" tasks to the sandbox executor ────────────────

@@ -42,8 +42,31 @@ class _TimeoutHTTPSession(requests.Session):
         self._default_timeout = timeout
 
     def request(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", self._default_timeout)
-        return super().request(method, url, **kwargs)
+        # Same contract as integrations/tap.py: timeout clamped to the running
+        # tool's remaining budget, transport failures open the host breaker.
+        from services.host_breaker import HostBreaker, host_of
+        from services.tool_budgets import bounded_timeout
+
+        host = host_of(url)
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            timeout = self._default_timeout
+        kwargs["timeout"] = bounded_timeout(float(timeout), label=f"VO {host}")
+        HostBreaker.check(url)  # URL: soft failures are scoped to the service path
+        from services.http_budget_hook import suppressed
+
+        try:
+            with suppressed():
+                response = super().request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            HostBreaker.record_failure(url, exc)
+            raise
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status in (502, 503, 504):
+            HostBreaker.record_failure(url, status=status)
+        else:
+            HostBreaker.record_success(url)
+        return response
 
 
 def _env_float(name: str, default: float) -> float:
@@ -68,13 +91,33 @@ def _run_with_deadline(fn: Callable[[], Any], seconds: float, label: str) -> Any
     from concurrent.futures import ThreadPoolExecutor
     from concurrent.futures import TimeoutError as _FuturesTimeout
 
+    from services.tool_budgets import adopt_deadline, current_deadline, end_tool_deadline
+
+    # The worker is a fresh thread: hand it a CHILD of the caller's tool
+    # deadline (guard CX-09) so its HTTP calls keep the budget clamp, the
+    # breaker call identity and the turn cancellation; an abandoned worker's
+    # child is cancelled so it cannot start another request.
+    parent = current_deadline()
+    child = parent.child(label=label) if parent is not None else None
+    if parent is not None:
+        seconds = max(0.5, min(float(seconds), parent.remaining()))
+
+    def _worker():
+        adopt_deadline(child)
+        try:
+            return fn()
+        finally:
+            end_tool_deadline()
+
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(fn)
+        future = executor.submit(_worker)
         try:
             return future.result(timeout=seconds)
         except _FuturesTimeout:
             future.cancel()
+            if child is not None:
+                child.cancel(f"{label}: abandoned after {seconds:g}s")
             raise _DeadlineExceeded(
                 f"{label} exceeded {seconds:g}s total; the service is responding too "
                 f"slowly — try another service or query it directly with vo_query."

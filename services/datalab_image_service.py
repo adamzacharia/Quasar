@@ -36,7 +36,13 @@ class DatalabImageService:
     def __init__(self, *, sia_client: Optional[DatalabSiaClient] = None, plotting_service: Optional[PlottingService] = None):
         self.sia_client = sia_client or DatalabSiaClient()
         self.plotting_service = plotting_service or PlottingService()
-        self.download_timeout = float(os.getenv("DATALAB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "180"))
+        # 45 s per tile (was 180 s — LARGER than the 150 s tool guard, so the
+        # guard always fired first and the service's own partial-grid /
+        # no-coverage handling never ran; live 2026-09-20 "timed out after
+        # 150s"). The per-call wall is 1.5x this and both are clamped to the
+        # running tool's remaining budget (services/tool_budgets.py), so a
+        # multi-band or multi-peak loop can never outlast the guard.
+        self.download_timeout = float(os.getenv("DATALAB_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "45"))
         self._hips_service = None  # lazy — only needed for in-survey color completion
 
     def _get_hips_service(self):
@@ -761,7 +767,12 @@ class DatalabImageService:
             _wall_env = 0.0
         if not _math.isfinite(_wall_env) or _wall_env <= 0:
             _wall_env = 0.0
-        return _wall_env or self.download_timeout * 1.5
+        from services.tool_budgets import bounded_timeout
+
+        # Clamped to the tool's remaining inner budget: raises BudgetExhausted
+        # (a TimeoutError) when < 2 s remain, so the caller records a timeout
+        # panel instead of starting a transfer the guard would have to kill.
+        return bounded_timeout(_wall_env or self.download_timeout * 1.5, minimum=2.0, label="Data Lab tile download")
 
     def _download_fits(self, url: str) -> str:
         """Download a Data Lab SIA FITS to a temp file, wall-clock bounded.
@@ -857,7 +868,10 @@ class DatalabImageService:
         # Read timeout capped at the wall budget too: an idle gap longer than
         # the wall is pointless to wait out, and it lets most abandoned
         # workers self-terminate instead of holding a slot (CX-31).
-        resp = requests.get(
+        from services.host_breaker import guarded_request
+
+        resp = guarded_request(
+            "GET",
             url,
             timeout=(
                 min(15.0, float(self.download_timeout), wall_seconds),

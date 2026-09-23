@@ -25,7 +25,8 @@ _SCIENCE_RE = re.compile(r"\bscience\W{1,4}(?:observations?|data|targets?|scans?
 # Species commonly requested by name in ALMA line searches (case-sensitive, matched on the raw prompt).
 _SPECIES_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:1[23]C(?:1[78])?O|C1[78]O|CO|HCO\+|H13CO\+|DCO\+|HCN|H13CN|DCN|HNC|HN13C|CS|13CS|C34S|SiO|"
-    r"N2H\+|N2D\+|CN|SO2|SO|H2O|NH3|NH2D|CH3OH|CH3CN|HC3N|H2CO|OCS|C2H|CCH|CH3CCH|HCOOCH3|CH3OCH3|CH\+|OH|HD)"
+    r"N2H\+|N2D\+|CN|SO2|SO|H2O|NH3|NH2D|CH3OH|CH3CN|HC3N|H2CO|OCS|C2H|CCH|CH3CCH|HCOOCH3|CH3OCH3|CH\+|OH|HD|"
+    r"\[?C\s?II\]?|\[?N\s?II\]?|\[?O\s?III\]?|\[?O\s?I\]?|\[?C\s?I\]?)"  # fine-structure lines of high-z work
     r"(?![A-Za-z0-9])"
 )
 
@@ -64,6 +65,29 @@ def route_alma_science_archive_query(agent: "QuasarAgent", query: str) -> Option
     cycle_match = re.search(r"\bcycle\s+(\d{1,2})\b", q)
     cycle = int(cycle_match.group(1)) if cycle_match else None
 
+    # Precedence (UI benchmark 2026-09-22, D22): the MOST specific signal wins.
+    # A redshift interval plus a rest-frame species is a redshifted-line query
+    # even when the prompt also says "spectral setup"; a list of >= 2 species
+    # is a line-set query; only the literal phrase "bandwidth switching" (or
+    # "spectral setup" with no species / redshift) is a BWSW candidate query.
+    z_match = re.search(
+        r"(?:\bz\s*[=~]?\s*|redshifts?\s+(?:of\s+|between\s+|from\s+)?(?:z\s*[=~]?\s*)?)"
+        r"(\d+(?:\.\d+)?)\s*(?:-|to|and|\u2013)\s*(?:z\s*[=~]?\s*)?(\d+(?:\.\d+)?)",
+        q,
+    )
+    species = list(dict.fromkeys(_SPECIES_RE.findall(raw)))
+    mentions_co = bool(re.search(r"\bco\b|carbon\s+monoxide", q))
+    if z_match and (mentions_co or species or re.search(r"rest\s+frequenc", q)):
+        rest = species[0] if species else "CO"
+        if mentions_co and "CO" in species:
+            rest = "CO"
+        return {
+            "query_type": "redshifted_line_projects",
+            "redshift_min": float(z_match.group(1)),
+            "redshift_max": float(z_match.group(2)),
+            "rest_species": rest,
+        }
+
     if cycle is not None and re.search(r"\b(?:sun|solar)\b", q):
         return {"query_type": "cycle_solar_projects", "cycle": cycle}
 
@@ -71,9 +95,18 @@ def route_alma_science_archive_query(agent: "QuasarAgent", query: str) -> Option
         return {"query_type": "cycle_array_combo_projects", "cycle": cycle, "arrays": ["12m", "7m", "TP"]}
 
     bands = _bands_from_prompt(q)
+    if "alma" in q and len(species) > 1 and re.search(r"\blines?\b|molecular|isotop|transitions?|same\s+project|observed", q):
+        args: Dict[str, Any] = {"query_type": "line_set_projects", "lines": species}
+        if bands:
+            args["band"] = bands
+        return args
+
     resolution = _RESOLUTION_RE.search(q)
-    if "alma" in q and bands and (resolution or re.search(r"high[-\s]?resolution", q)):
-        args: Dict[str, Any] = {"query_type": "high_resolution_band_data", "band": bands}
+    # "Band 7 ... better than 1 arcsec" is an ALMA request even without the
+    # word ALMA (D12: HH212 Band 7 continuum) -- numbered bands with arcsec
+    # resolution and archive intent are unambiguous.
+    if bands and (resolution or re.search(r"high[-\s]?resolution", q)) and ("alma" in q or resolution):
+        args = {"query_type": "high_resolution_band_data", "band": bands}
         if resolution:
             args["max_resolution_arcsec"] = float(resolution[1]) / (1000 if resolution[2] == "mas" else 1)
         if _PUBLIC_RE.search(q):
@@ -82,23 +115,7 @@ def route_alma_science_archive_query(agent: "QuasarAgent", query: str) -> Option
             args["science_only"] = True
         return args
 
-    species = list(dict.fromkeys(_SPECIES_RE.findall(raw)))
-    if "alma" in q and len(species) > 1 and re.search(r"\blines?\b|molecular|isotop|transitions?", q):
-        args = {"query_type": "line_set_projects", "lines": species}
-        if bands:
-            args["band"] = bands
-        return args
-
-    z_match = re.search(r"\bz\s*[=~]?\s*(\d+(?:\.\d+)?)\s*(?:-|to|\u2013)\s*(\d+(?:\.\d+)?)", q)
-    if z_match and re.search(r"\bco\b|carbon monoxide|rest frequenc", q):
-        return {
-            "query_type": "redshifted_line_projects",
-            "redshift_min": float(z_match.group(1)),
-            "redshift_max": float(z_match.group(2)),
-            "rest_species": "CO",
-        }
-
-    if re.search(r"bandwidth\s+switching|spectral\s+setup", q):
+    if re.search(r"bandwidth\s+switching", q) or (re.search(r"spectral\s+setup", q) and not species and not z_match):
         args = {"query_type": "bandwidth_switching_candidates"}
         if cycle is not None:
             args["cycle"] = cycle

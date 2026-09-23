@@ -194,7 +194,7 @@ class SpeciesMetadataCache:
             try:
                 import requests
 
-                response = requests.get(SPLATALOGUE_SPECIES_URL, timeout=30)
+                response = requests.get(SPLATALOGUE_SPECIES_URL, timeout=20)
                 response.raise_for_status()
                 payload = response.json()
                 records = []
@@ -412,7 +412,7 @@ class TargetResolver:
 
     @staticmethod
     def _future_result(
-        future: Any, service: str, *, timeout: float = 45
+        future: Any, service: str, *, timeout: float = 30
     ) -> Dict[str, Any]:
         if future is None:
             return {"service": service}
@@ -875,7 +875,10 @@ WHERE {where}
                         "FORMAT": "csv",
                         "QUERY": query,
                     },
-                    timeout=180,
+                    # 40 s per mirror (was 180): three mirrors are tried in
+                    # sequence under a 150 s tool guard; the requests-layer
+                    # hook clamps each to the tool's remaining budget.
+                    timeout=40,
                 )
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").lower()

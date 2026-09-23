@@ -1057,6 +1057,47 @@ def register_tools(agent: "QuasarAgent") -> None:
     for _cap in _ALMA_GUIDANCE_CAPS:
         agent.tool_registry.register(_build_schema_tool(_cap, _SchemaCallContext))
 
+    # ── One-shot ALMA-side tools (UI benchmark 2026-09-22, WP3) ────────────
+    # capabilities/alma_tools.py: each collapses a benchmark question to one
+    # call. They run under the ALMA context provider (search service, MAST,
+    # DataLink, resolver, ADS, documentation RAG) with the executed ADQL
+    # attached as provenance exactly like the migrated ALMA tools.
+    from capabilities.alma_tools import CAPABILITIES as _ALMA_ONE_SHOT_CAPS
+    for _cap in _ALMA_ONE_SHOT_CAPS:
+        _fn = _build_schema_tool(_cap, agent._alma_ctx_provider).function
+        _fn = agent._with_alma_tap_provenance(_fn)
+        agent.tool_registry.register(Tool(
+            name=_cap.name,
+            description=_cap.description,
+            function=_fn,
+            parameters=_cap.parameters_schema(),
+            category=_cap.category,
+        ))
+
+    # ── One-shot Data Lab tools (UI benchmark 2026-09-22, WP4) ─────────────
+    # capabilities/datalab_tools.py, appended to capabilities.datalab.CAPABILITIES;
+    # the image producers go through the image wrapper (card transport +
+    # base64 stripping), datalab_satellite_search attaches its cutout grid
+    # from the nested key like density_vetting does.
+    from capabilities.datalab_tools import CAPABILITIES as _DATALAB_ONE_SHOT_CAPS
+    _DATALAB_IMAGE_TOOLS = {"datalab_healpix_density_map", "datalab_stream_selection", "datalab_selection_diagram",
+                            "datalab_target_class_summary"}
+    for _cap in _DATALAB_ONE_SHOT_CAPS:
+        if _cap.name in _DATALAB_IMAGE_TOOLS:
+            _fn = agent._datalab_image_tool_fn(_cap.name)
+        else:
+            # datalab_satellite_search appends ALL its cards itself (matched-filter
+            # map, cutout grid, one CMD per candidate) and strips the heavy
+            # payloads from its result, so it needs no image wrapper.
+            _fn = agent._datalab_tool_fn(_cap.name)
+        agent.tool_registry.register(Tool(
+            name=_cap.name,
+            description=_cap.description,
+            function=_fn,
+            parameters=_cap.parameters_schema(),
+            category=_cap.category,
+        ))
+
     agent.tool_registry.register(Tool(
         name="datalab_describe_table",
         description="Describe a registered Data Lab catalog table, columns, region strategy, morphology hints, and citation.",
