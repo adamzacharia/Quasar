@@ -12,6 +12,9 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[2]
 _BENCH = _REPO / "Benchmark" / "datalabbench" / "run_datalabbench.py"
+# Benchmarks are local only (not in git): skip where the harness is absent.
+if not _BENCH.exists():
+    pytest.skip("Benchmark/ is local only", allow_module_level=True)
 
 
 @pytest.fixture(scope="module")

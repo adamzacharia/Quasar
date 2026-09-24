@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 BENCH_DIR = str(Path(__file__).resolve().parents[2] / "Benchmark" / "datalabbench")
+# Benchmarks are local only (not in git): skip where the harness is absent.
+if not Path(BENCH_DIR, "dlb_dataset_v1.py").exists():
+    pytest.skip("Benchmark/ is local only", allow_module_level=True)
 if BENCH_DIR not in sys.path:
     sys.path.insert(0, BENCH_DIR)
 

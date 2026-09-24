@@ -67,7 +67,7 @@ user_uploads/
 # ============================================
 tmp/
 tmp_*.py
-pytest_tmp_root/
+pytest_tmp_root*/
 scratch_*.py
 *.log
 *.log.mark
@@ -76,11 +76,14 @@ scratch_*.py
 # ============================================
 # Generated/runtime artifacts
 # ============================================
-# Benchmark run OUTPUTS only. The harness SOURCE (runners, datasets, question
-# sets, rubrics) is tracked so CI can run the DataLabBench scorer self-test and
-# the golden benchmark tests (tests/unit/test_benchmark_golden.py).
-/Benchmark/results/
-/Benchmark/datalabbench/results/
+# Benchmarks are local only (questions, goldens, rubrics, runs, grading keys).
+# The tests that read them skip when the folder is absent.
+/Benchmark/
+# Private paper and planning notes
+/docs/paper.md
+/docs/ml4ps_papers_and_latex_guide.md
+/docs/benchmark_and_visuals_guide.md
+/docs/research/
 /data/dag_cache.json
 /data/search_usage.json
 /poster/

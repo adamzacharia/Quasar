@@ -4,7 +4,10 @@ from dataclasses import asdict
 
 import pytest
 
-from Benchmark.run_benchmark import QUESTIONS, QuestionResult, score_golden
+# Benchmarks are local only (not in git): skip where the harness is absent.
+pytest.importorskip("Benchmark.run_benchmark", reason="Benchmark/ is local only")
+
+from Benchmark.run_benchmark import QUESTIONS, QuestionResult, score_golden  # noqa: E402
 
 
 pytestmark = pytest.mark.unit
