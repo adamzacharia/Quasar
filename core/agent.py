@@ -286,16 +286,16 @@ Present the main answer using the documentation context. Citations MUST be place
 Add this line right after your documentation answer, before the web section:
 "*📚 The above information is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies or changes.*"
 
-**SECTION 3 — Web Search Updates** (after the disclaimer — ONLY when web-search results were actually provided to you in this turn):
-Start with the heading "🌐 Updated Information from the Web:" and summarize what the provided web results contain. This section MUST:
-- Use ONLY facts and URLs that appear VERBATIM in the provided web results. NEVER invent, reconstruct, or guess a URL, blog post, forum thread, PDF, version number, or access date — a fabricated link is worse than no link.
-- If NO web results were provided this turn, or none are relevant, OMIT Section 3 entirely (no heading, no placeholder). It is always acceptable to present a documentation-only answer.
+**SECTION 3 — Current information from the web** (after the disclaimer — ONLY when a WEB EVIDENCE block with [W#] tags was provided to you in this turn):
+Add what the web evidence says that the documentation does not (newer rules, dates, deadlines), and cite each web fact INLINE with its tag right after the claim, e.g. "The deadline is <the date stated in the evidence> [W2]." This section MUST:
+- Use ONLY facts that appear in the WEB EVIDENCE excerpts, and ONLY tags that appear there. NEVER invent a tag, URL, version number or date. If web evidence and documentation disagree, say so and cite both.
+- If NO web evidence was provided this turn, or none is relevant, OMIT Section 3 entirely (no heading, no placeholder). It is always acceptable to present a documentation-only answer.
 
 IMPORTANT: The disclaimer (Section 2) MUST appear BETWEEN the documentation content and the web content. Never place the disclaimer after the web section.
 The Section 2 disclaimer applies ONLY when Section 1 used the documentation context — never attach it to answers built purely from live archive/catalog tools.
 
-If ONLY documentation context is available (no web results), still cite sources inline and add the documentation disclaimer.
-If ONLY web results are available (no documentation), present them with links and note they are from the web."""
+If ONLY documentation context is available (no web evidence), still cite sources inline and add the documentation disclaimer.
+If ONLY web evidence is available (no documentation), answer from it and cite each web fact with its [W#] tag."""
 
 
 _HOST_OPEN_MARKER = "circuit breaker open for "
@@ -1089,7 +1089,8 @@ ARTIFACT HONESTY (hard rule):
   visible "Verification" block listing each mismatch. State only cuts that are in the executed SQL/ADQL
   (the tool result and the Show-query panel show it), counts that a tool returned, and figures that
   were attached. If an archive phase timed out or was skipped, say the result is UNKNOWN — never "none".
-- Cards render ABOVE your text: refer to figures and tables as "above", never "below".
+- Figures and tables are shown as separate cards: refer to them as "the card" / "the figure card", never
+  "above" or "below" (their position depends on the view).
 - Describe tools in plain language ("the Data Lab density scan"), never by internal identifiers such as
   datalab_density_vetting, and never paste raw JSON arguments into the answer.
 
@@ -1106,11 +1107,12 @@ ONE-SHOT TOOLS (prefer them — each answers a whole question in one call, with 
 - Data Lab: datalab_healpix_density_map (wide stellar density maps), datalab_stream_selection (proper-motion
   + CMD stream stars), datalab_selection_diagram (HR/CMD with Gaia quality presets and absolute magnitudes),
   datalab_target_class_summary (n(z) + sky footprint of a bitmask class), datalab_satellite_search
-  (dwarf-satellite candidates with significance, CMDs and cutouts). datalab_select_catalog_rows also
+  (dwarf-satellite candidates with significance, CMDs and cutouts), datalab_sed_sample (galaxy-sample SEDs from
+  LS DR9 grz + forced W1/W2 in one table, cuts in the SQL). datalab_select_catalog_rows also
   selects by an indexed key (key_column='fieldid', key_value=169) — never use a dummy cone for that.
-- OPEN-ENDED REGIONS: when the user leaves the region open, choose a validated field (LMC/SMC, a known
-  satellite, or the tool's preset: lmc, smc, sgr_stream, anticenter, delve_south) — never the Galactic
-  Centre or a pole. Density scans keep their default point-source and blue/old-population colour cuts.
+- OPEN-ENDED REGIONS: when the user leaves the region open, choose a validated field (a known satellite, or
+  the tool's preset: south_gradient for wide stellar-density maps, smc, sgr_stream, delve_south; the LMC is
+  too dense for a full map in one turn) — never the Galactic Centre. Density scans keep their default point-source and blue/old-population colour cuts.
   "The SDSS Great Wall" means RA 150–220°, Dec 0–5°, z ≤ 0.1.
 - SERVICE COOLDOWNS: if a tool result says a service circuit is open with retry_after_s ≤ 30, you MAY
   re-issue that exact call ONCE (the platform waits for the cooldown first); with a longer cooldown, do
@@ -1178,11 +1180,12 @@ GUIDELINES:
 - **LIVE IMAGERY RULE**: Use `hips_cutout` or `hips_multiband_panel` for "show me", appearance, and multiwavelength postage-stamp questions; they are deeper and broader than `get_sky_image`. Use `datalab_color_image` / `datalab_image_cutout` when the user names a specific survey (DECam / Legacy Surveys / DES) — a "color image of survey X" must come from survey X. Use `vlass_cutout` for 3 GHz radio continuum imagery (Dec > -40 only). Use `search_ztf_alerts`, `ztf_light_curve`, and `ztf_stamps` for transients and variability. Use `ned_sed_plot` for literature SEDs. Use `sparcl_find_spectra` and `sparcl_plot_spectrum` for real DESI/SDSS optical spectra. MMU/Data Lab remain authoritative for catalog tables.
 - **RADIO SED RULE**: Use `radio_sed` for compact-source radio continuum SED or radio spectral-index questions; always repeat its flags and state that v1 uses TGSS/GLEAM/SUMSS/NVSS/FIRST catalog fluxes without resolution matching, flux-scale corrections, or image-plane photometry.
 - **SKY MONITOR RULE**: When the user wants ongoing watching ("keep an eye on", "alert me", "monitor"), use `monitor_add_target` then `monitor_check_now`; report only NEW alerts, and use `monitor_list_targets` / `monitor_remove_target` to manage the watchlist.
-- **VO DISCOVERY RULE**: When no built-in tool covers an archive/dataset, use the VO chain: `vo_find_services` -> `vo_list_tables` -> `vo_describe_table` -> `vo_adql_query` (SELECT-only). Always inspect the schema before writing ADQL, quote table names containing '/' or '+' in double quotes, and pass a keyword to `vo_list_tables` on big services like VizieR.
+- **VO DISCOVERY RULE**: When no built-in tool covers an archive/dataset, use the VO chain: `vo_find_services` -> `vo_list_tables` -> `vo_describe_table` -> `vo_adql_query` (SELECT-only). Always inspect the schema before writing ADQL, quote table names containing '/' or '+' in double quotes, and pass a keyword to `vo_list_tables` on big services like VizieR. For slow or heavy queries pass `mode='auto'` (or `'async'`) and follow the returned job with `vo_tap_job`; for images/cubes at a position on a generic SIA service (ALMA, CADC, or one found by `vo_find_services`) use `vo_image_search`. ESA Gaia, ESO and CADC have curated notes: `browse_schema('gaia'|'eso'|'cadc')`.
 - **VARIABILITY RULE**: For variability, use `search_space_lightcurves` / `plot_space_lightcurve` for TESS/Kepler availability and plots, and `period_search` for TESS/Kepler targets or ZTF oids; always report the FAP with any period.
 - **PULSAR CATALOG RULE**: Use `search_pulsars` / `pulsar_lookup` for pulsar catalogue or parameter questions (periods, DMs, S1400 fluxes, associations, name lookups, cone searches) instead of web search.
 - **SOLAR SYSTEM RULE**: Use `moving_object_check` when a transient could be a known asteroid/comet, and `solar_system_ephemeris` for planet/asteroid/comet positions, distances, magnitude, and visibility over a date range.
 - **DISTANCE RULE**: For distances: `gaia_distance` (stars, parallax), `ned_distance` (galaxies, redshift-independent), and `velocity_frame_distance` (flow-corrected Hubble distances) -- do not compute 1/parallax by hand.
+- **ARCHIVE TOOL RULE**: When a question names an archive or catalogue, query it with its dedicated tool before any web search, and report what that archive returned: X-ray missions (Chandra, XMM-Newton, Swift, NuSTAR, NICER, Suzaku, ROSAT) -> `heasarc_observations`; NASA Exoplanet Archive -> `exoplanet_archive`; SIMBAD values or "what is at these positions" -> `simbad_query`; Gaia DR3 sources, counts or variability -> `gaia_archive_query`; a published catalogue (VizieR, IRSA, HEASARC tables such as surveys or source lists) -> `catalog_find` then `catalog_query` (server-side COUNT with cuts); "how many X have a Y counterpart" -> `catalog_crossmatch`; Transient Name Server -> `tns_object`; ZTF detections of one object -> `ztf_object`; paper counts or a specific paper's bibcode/DOI -> `ads_search`. A tool error is not an empty result: never conclude that data do not exist from a failed call.
 - **MOC COVERAGE RULE**: Use `survey_coverage` / `survey_covers_position` before broad archive availability searches to check which surveys actually cover a position, especially for "is there data" or "which surveys observed X" questions; for exact archive IDs, product downloads, or if MOCServer fails, continue with the requested archive tool and report the preflight issue.
 - **GALACTIC EXTINCTION RULE**: Use `galactic_extinction` for E(B-V)/A_lambda whenever photometry, colors, or distance moduli need dereddening.
 - **RESPECT EXCLUSIONS**: If the user explicitly excludes a source (e.g. "non-ALMA", "not from ALMA", "only CADC"), do NOT call the excluded tool. Only call the tools the user actually wants.
@@ -1207,7 +1210,7 @@ GUIDELINES:
 - **DATA LAB NaN CONVENTION (CRITICAL for correctness)**: Data Lab tables store missing float values as NaN (not SQL NULL), and Postgres orders NaN ABOVE every real number — so a bare `col > x`, `col >= x`, or `col != x` cut silently ADMITS every missing-value row (e.g. `parallax_over_error > 5` alone returns thousands of rows that have NO astrometry). In datalab_sql_query, every one-sided lower-bound or not-equal cut on a nullable float column (parallax, pm, pmra, pmdec, parallax_over_error, mags, colors, snr_*, chi2, …) MUST carry a finiteness guard: `AND col < 'Infinity'` — e.g. `WHERE parallax_over_error > 5 AND parallax_over_error < 'Infinity' AND pm > 150 AND pm < 'Infinity'`. Cuts with an upper bound (`<`, `<=`, BETWEEN, two-sided ranges) are already NaN-safe. The structured value_cuts on datalab tools add this guard automatically — prefer them when possible.
 - **SURVEY COVERAGE CLAIMS**: Before claiming a catalog contains (or lacks) a target/region, check coverage. datalab_list_catalogs can now curate BY POSITION itself: pass `target` (or `ra`/`dec`) and it ranks known-covering catalogs first, labels unknown coverage 'coverage unverified for this position', and excludes known non-covering catalogs with reasons — prefer that over listing everything and guessing. Otherwise check the `footprint`/`coverage` fields from datalab_list_catalogs / datalab_describe_table, or call survey_covers_position for the exact position. NEVER list every catalog as covering a target — curate by footprint (e.g. the LMC is NOT covered by SDSS, DESI, LS DR9, or DES).
 - **DENSITY / SKY-DISTRIBUTION MAPS**: NEVER build a sky-density or overdensity map from a row-LIMITed pull (datalab_select_catalog_rows, datalab_sql_query rows, crossmatch rows) — capped results are storage-order, spatially clustered slices and the map will show one corner of the field. For "where do sources clump / density map / footprint" questions use `datalab_density_aggregate` (server-side GROUP BY counts EVERY row) or `datalab_density_vetting` (finds + ranks peaks). For a WHOLE survey field (e.g. "SMASH field 169"), bound the aggregate with the indexed value_cut `fieldid = N` and NO cone — never guess a cone center for a named field. For overdensity hunts, either use density_vetting or pass `matched_filter=true` to datalab_sky_density_map, and REPORT the detected peak RA/Dec coordinates in the answer — a map alone does not answer "where do they clump". If a result carries a "hit its row cap" warning, do not plot its sky distribution — rerun with an aggregate, and always relay the truncation to the user. If `datalab_density_vetting` times out, fall back to `datalab_density_aggregate` for the peaks and then ONE `datalab_cutout_grid` call for ALL peak cutouts — never one `datalab_image_cutout` per peak, and never retry the timed-out vetting call.
-- **DEFAULT QUALITY CUTS**: the Data Lab catalog tools automatically apply registry survey-quality cuts (DESI zpix: zwarn=0 + survey='main' + main_primary; DES: flags_g/r/i=0; SDSS specobj: zwarning=0) unless you pass your own cut on those columns — state the applied cuts when reporting counts. When the user implies an object CLASS on a spectroscopic catalog (galaxies/LRGs → spectype='GALAXY' on DESI zpix, class='GALAXY' on SDSS specobj; quasars → 'QSO'), ADD that class cut yourself.
+- **DEFAULT QUALITY CUTS**: the Data Lab catalog tools automatically apply registry survey-quality cuts (DESI zpix: zwarn=0 + zcat_primary, one best spectrum per target across all surveys; DES: flags_g/r/i=0; SDSS specobj: zwarning=0) unless you pass your own cut on those columns — state the applied cuts when reporting counts. When the user implies an object CLASS on a spectroscopic catalog (galaxies/LRGs → spectype='GALAXY' on DESI zpix, class='GALAXY' on SDSS specobj; quasars → 'QSO'), ADD that class cut yourself.
 - **SED SAMPLES**: `datalab_sed_plot` IS multi-object. For "SEDs of a sample / a few hundred objects", call it ONCE with `sample_n` (e.g. `{{"result_id": "dlr_...", "sample_n": 300}}`) — it overlays up to 300 SEDs with the per-band median highlighted. Use `row_index` only for ONE object; never claim the tool is single-object and never loop per row.
 - **RELAY TOOL WARNINGS**: if any tool result this turn contains a `warnings` field, a "no significant period", "truncated", "hit its row cap", or "partial coverage" note, you MUST repeat that caveat faithfully in your final answer. NEVER present a result as complete or significant when its own tool output says otherwise — report "no significant period (FAP=0.28)" rather than claiming a period was found, and state coverage gaps rather than describing a partial map as the full region.
 - **CROSSMATCH → MEMBER SELECTION**: For stream/cluster membership science (e.g. Pal 5 tidal tails), a raw positional crossmatch is only step one. Apply the science cuts server-side (value_cuts for proper-motion windows, color_cut for the population/CMD locus) and make the FINAL sky/CMD plots from the SELECTED member sample — never present the raw crossmatch as the result. State the exact cuts in your answer. For the ON-SKY plot, use the PM+CMD-SELECTED single-catalog rows over the FULL cone (e.g. the Gaia datalab_select_catalog_rows result), NOT a row-capped q3c_crossmatch result — the crossmatch LIMIT slices the sample to a spatial corner and the map then misses the cluster/stream entirely. Only claim the map shows the cluster/tails if the cluster center is actually within the plotted RA/Dec range.
@@ -2036,8 +2039,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             port = parts.port
         except ValueError:
             return False, "bad port", None
-        if port not in (None, 80, 443):
-            return False, f"non-standard port {port}", None
+        if port is not None and port != (443 if parts.scheme == "https" else 80):
+            return False, f"non-standard port {port} for {parts.scheme}", None
         host = parts.hostname.strip("[]").lower()
         if host == "localhost" or host.endswith(".localhost") or host.endswith(".local") or host.endswith(".internal"):
             return False, "local hostname", None
@@ -2112,6 +2115,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 ok, why, ip = cls._resolve_public_target(current)
                 if not ok:
                     return False, f"not probed: {why}"
+                if stop is not None and stop.is_set():  # cancelled during DNS
+                    return False, "probe stopped (time cap / turn cancelled)"
                 status, location = cls._head_once(current, ip, timeout)
                 location = location if 300 <= status < 400 else None
                 if location:
@@ -2332,12 +2337,65 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "Open the source cards below for the retrieved material."
         )
 
+    def _web_search_plan(
+        self,
+        queries: List[str],
+        *,
+        include_domains: Optional[List[str]] = None,
+        freshness: Optional[str] = None,
+        topic: Optional[str] = None,
+        want_images: bool = False,
+        on_search=None,
+    ) -> Dict[str, Any]:
+        """Planner-driven pre-pass search (web search redesign, Phase 2): the
+        plan's queries run in parallel, restricted to the domain pack plus one
+        unrestricted query (services.web_search_service.search_plan). When
+        nothing comes back, the plain single-query search of Phase 1 runs for
+        the first query so a turn never loses web because of the planner."""
+        queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
+        if not queries:
+            return {"success": False, "error": "no queries"}
+        ret_val: Optional[Dict[str, Any]] = None
+        try:
+            from services.web_search_service import WebSearchService
+
+            service = WebSearchService(browser_service=self.browser_service)
+            ret_val = service.search_plan(
+                queries,
+                include_domains=include_domains,
+                freshness=freshness,
+                topic=topic,
+                want_images=want_images,
+                on_search=on_search,
+            )
+        except Exception as e:
+            print(f"[SEARCH ROUTER] plan search failed: {e}. Falling back to the single-query search.")
+        if not ret_val or not ret_val.get("success"):
+            fallback = self._tavily_web_search(query=queries[0], max_results=10, search_depth="basic", want_images=want_images)
+            if isinstance(fallback, dict) and isinstance(ret_val, dict) and ret_val.get("searches"):
+                fallback = dict(fallback, searches=ret_val.get("searches"))
+            return fallback
+        return ret_val
+
     @log_tool
-    def _tavily_web_search(self, query: str, max_results: int = 10, search_depth: str = "basic") -> Dict[str, Any]:
+    def _tavily_web_search(
+        self,
+        query: str,
+        max_results: int = 10,
+        search_depth: str = "basic",
+        want_images: Optional[bool] = None,
+        include_domains: Optional[List[str]] = None,
+        freshness: Optional[str] = None,
+        topic: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Real-time web search routed dynamically between Brave, Tavily, and Exa.
         Returns source URLs + related images for ChatGPT-style inline display.
         Falls back to BrowserService if keys are unavailable.
+
+        ``want_images``: fetch image tiles (None = only for an explicit
+        picture request in the query; D7). ``include_domains`` / ``freshness``
+        / ``topic`` are planner hints (Phase 2), passed on only when given.
         """
         # ── Langfuse: create a child span for this tool call ──
         from core.llm_client import get_langfuse_parent
@@ -2357,10 +2415,19 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         try:
             from services.web_search_service import WebSearchService
             search_service = WebSearchService(browser_service=self.browser_service)
+            _hints = {}
+            if include_domains:
+                _hints["include_domains"] = list(include_domains)
+            if freshness:
+                _hints["freshness"] = freshness
+            if topic:
+                _hints["topic"] = topic
             ret_val = search_service.route_and_search(
                 query=query,
                 max_results=max_results,
-                search_depth=search_depth
+                search_depth=search_depth,
+                want_images=want_images,
+                **_hints,
             )
         except Exception as e:
             print(f"[SEARCH ROUTER] Router execution failed: {e}. Falling back to basic BrowserService.")
@@ -2515,6 +2582,16 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "moving_object_check": "Checking for moving objects (SkyBoT)",
             "gaia_distance": "Querying Gaia/Bailer-Jones distances",
             "ned_distance": "Fetching NED-D distances",
+            "heasarc_observations": "Searching HEASARC observation tables",
+            "exoplanet_archive": "Querying the NASA Exoplanet Archive",
+            "simbad_query": "Querying SIMBAD",
+            "gaia_archive_query": "Querying the Gaia DR3 archive",
+            "catalog_find": "Finding catalogues",
+            "catalog_query": "Querying catalogue",
+            "catalog_crossmatch": "Cross-matching catalogues",
+            "tns_object": "Looking up the Transient Name Server",
+            "ztf_object": "Fetching ALeRCE object summary",
+            "ads_search": "Searching NASA ADS",
             "velocity_frame_distance": "Computing velocity-frame corrections",
             "survey_coverage": "Checking sky coverage (MOCServer)",
             "survey_covers_position": "Checking survey footprint",
@@ -2563,6 +2640,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "vo_list_tables": "Listing TAP service tables",
             "vo_describe_table": "Inspecting table schema",
             "vo_adql_query": "Running ADQL on remote TAP service",
+            "vo_tap_job": "Checking async TAP job",
+            "vo_image_search": "Searching SIA image service",
             "vo_cone_search": "Running VO cone search",
             "sparcl_find_spectra": "Searching SparCL spectra",
             "sparcl_search_spectra": "Searching SparCL by constraints",
@@ -2642,6 +2721,20 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         are discarded so a stale archive result can never leak into a later
         round or another request.
         """
+        from core import bench_toolset as _bench
+
+        if not _bench.allowed(tool_name):
+            return {"success": False, "error": _bench.refusal(tool_name)}
+        # The user switched web search off for this turn (D1): no path may run
+        # a web tool, whatever tool list it was given.
+        from core import web_policy as _web_policy
+
+        if _web_policy.is_web_tool(tool_name) and not _web_policy.web_allowed():
+            return {
+                "success": False,
+                "web_search_disabled": True,
+                "error": f"'{tool_name}' was not executed: web search is switched off for this request.",
+            }
         budget = (
             timeout_seconds if timeout_seconds is not None
             else self._tool_timeout_seconds(tool_name)
@@ -2855,6 +2948,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
         parent_llm_ctx = get_llm_request_context()
         parent_lf = get_langfuse_parent()
+        # The worker's TLS starts empty: carry the per-turn user across, or
+        # user-scoped tools (async TAP job ownership, Data Lab ctx) silently
+        # fall back to the shared config.user_id (guard CX-01).
+        parent_user_id = getattr(getattr(self, "_tls", None), "current_user_id", None)
 
         lock = threading.Lock()
         done = threading.Event()
@@ -2869,6 +2966,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             local: Dict[str, Any] = {}
             try:
                 set_langfuse_parent(parent_lf)
+                if parent_user_id is not None and getattr(self, "_tls", None) is not None:
+                    self._tls.current_user_id = parent_user_id
                 try:
                     # Inner deadline for this tool's network calls: every
                     # service timeout on this thread becomes
@@ -3734,7 +3833,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "external_catalog_table_result": self._external_catalog_table_result,
                 "live_imagery_coordinates": self._live_imagery_coordinates,
             },
-            user_id=getattr(getattr(self, "config", None), "user_id", None),
+            # Per-turn user (async TAP jobs are owned by their submitter),
+            # falling back to the configured user like the Data Lab provider.
+            user_id=(
+                getattr(self._tls, "current_user_id", None)
+                or getattr(getattr(self, "config", None), "user_id", None)
+            ),
         )
 
     def _spectra_tool_fn(self, name: str):
@@ -3790,6 +3894,33 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             return self._datalab_attach_image_result(raw, caption)
 
         return _fn
+
+    def _catalogs_tool_fn(self, name: str):
+        """Return the capability-backed callable for an archive catalogue tool
+        (capabilities/catalogs.py; same shape as _spectra_tool_fn)."""
+        from capabilities.catalogs import CAPABILITIES as CATALOG_CAPABILITIES
+        from adapters.native import build_tool
+        cap = next((c for c in CATALOG_CAPABILITIES if c.name == name), None)
+        if cap is None:  # pragma: no cover - registration wiring guard
+            raise KeyError(f"No archive catalogue capability named '{name}'")
+        return build_tool(cap, self._catalogs_ctx_provider).function
+
+    def _catalogs_ctx_provider(self):
+        """Per-call CallContext for the archive catalogue tools. Clears
+        last_run_result (each call sets a fresh table card through the injected
+        helper); the service getter is injected so a failing constructor is a
+        caught, typed error inside the capability."""
+        from capabilities.base import CallContext
+        self.last_run_result = None
+        return CallContext(
+            services={
+                "get_archive_catalog_service": self._get_archive_catalog_service,
+                "external_catalog_table_result": self._external_catalog_table_result,
+                "live_imagery_coordinates": self._live_imagery_coordinates,
+                "ads_client": getattr(self, "ads_client", None),
+            },
+            user_id=getattr(getattr(self, "config", None), "user_id", None),
+        )
 
     def _viz_tool_fn(self, name: str):
         """Return the capability-backed callable for a migrated viz/FITS tool.
@@ -3998,6 +4129,14 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
             self._sparcl_spectra_service_instance = SparclSpectraService()
         return self._sparcl_spectra_service_instance
+
+    def _get_archive_catalog_service(self):
+        """Lazy ArchiveCatalogService (HEASARC / Exoplanet Archive / SIMBAD / Gaia / VizieR / TNS / ALeRCE)."""
+        if not hasattr(self, "_archive_catalog_service_instance"):
+            from services.archive_catalogs import ArchiveCatalogService
+
+            self._archive_catalog_service_instance = ArchiveCatalogService()
+        return self._archive_catalog_service_instance
 
     # NOTE: _datalab_list_catalogs / _datalab_describe_table / _datalab_cone_count /
     # _datalab_select_catalog_rows were migrated to capabilities/datalab.py and are
@@ -5652,7 +5791,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         """
         if user_id:
             self._tls.current_user_id = user_id
-        tool = self.tool_registry.get_tool(tool_name)
+        from core import bench_toolset as _bench
+
+        tool = self.tool_registry.get_tool(tool_name) if _bench.allowed(tool_name) else None
         if tool:
             try:
                 result = tool.execute(**kwargs)
@@ -5684,7 +5825,8 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     result_obj=err_payload,
                 )
                 return err_payload
-        return {"error": f"Unknown tool: '{tool_name}'. Available: {[t.name for t in self.tool_registry.list_tools()]}"}
+        return {"error": f"Unknown tool: '{tool_name}'. Available: "
+                         f"{_bench.filter_names(t.name for t in self.tool_registry.list_tools())}"}
 
     def process_query(self, query: str, user_id: str = "user") -> Tuple[Optional[Any], str, str]:
         """Process a user query and return (result, source_name, result_type)"""
@@ -5796,6 +5938,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             # ── Use _build_tools_for_responses_api() — reads from self.tool_registry
             # (self.tools does not exist; _build_tool_definitions() would crash)
             tools = self._build_tools_for_responses_api()
+            # The user's Web Search switch reaches sub-agents too (D1): the
+            # Conductor installs it on this executor thread.
+            from core import web_policy as _web_policy
+
+            if not _web_policy.web_allowed():
+                tools = _web_policy.strip_web_tools(tools)
 
             # ── Model selection: use the routed model if provided,
             # otherwise fall back to conductor_model (deepseek-v4-pro)
@@ -5854,9 +6002,26 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                     if on_status := getattr(self, "_last_on_status", None):
                         on_status(_status_label, "running")
                     _rr_before = self.last_run_result
+                    self._tls.last_dispatch_result = None
                     result = self._dispatch_tool_call(fn_name, fn_args)
                     if on_status:
                         on_status(_status_label, "completed")
+                    # Sub-agent web calls show source cards too (PLAN 1.4; they
+                    # showed none before). Images are dropped as on every
+                    # non-imagery web path.
+                    # The turn-scoped sink (installed by the Conductor on this thread),
+                    # never the process-wide _last_on_status: a concurrent turn could
+                    # have replaced that one (guard CX-01).
+                    _turn_sink = _web_policy.event_sink()
+                    if _turn_sink and _web_policy.is_web_tool(fn_name):
+                        _web_obj = getattr(self._tls, "last_dispatch_result", None)
+                        if isinstance(_web_obj, dict) and _web_obj.get("success"):
+                            try:
+                                _web_evt = self._build_web_sources_event({**_web_obj, "images": []})
+                                if _web_evt:
+                                    _turn_sink(f"__event__{json.dumps(_web_evt, default=str)}", "web_sources")
+                            except Exception as _web_evt_err:
+                                print(f"[CONDUCTOR] web source card failed (non-fatal): {_web_evt_err}")
 
                     # ── Capture image results IMMEDIATELY after each tool call ──
                     _conductor_image_result = (
@@ -6086,6 +6251,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 result = self._execute_tool_guarded(tool, args, tool_name=tool_name)
                 result, _sidecar = self._pop_provenance_sidecar(result)
                 result_obj = result
+                # The untruncated result, for callers that need more than the
+                # 8000-char string (Conductor web source cards).
+                self._tls.last_dispatch_result = result_obj
                 result_str = _json.dumps(result, default=str)[:8000]
             except Exception as e:
                 result_str = _json.dumps({"error": str(e)})
@@ -6101,9 +6269,9 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
     
     # ── Knowledge cutoff detection ──────────────────────────────────────────
 
-    # LLM training knowledge cutoff — GPT-4o data ends ~Oct 2024
-    _LLM_CUTOFF_YEAR = 2024
-    _LLM_CUTOFF_MONTH = 10   # October 2024
+    # LLM training knowledge cutoff: read per call from QUASAR_LLM_CUTOFF
+    # (YYYY-MM, default 2025-06) by core.router.llm_knowledge_cutoff(). The old
+    # hard-coded 2024-10 was GPT-4o's; the defaults are deepseek / gpt-oss now (D11).
 
     # ── Live-data query detection ───────────────────────────────────────
     # Queries served by QUASAR's built-in live-data tools — observation
@@ -6159,18 +6327,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         """Use the configured fast model to classify if a query requires web search."""
         try:
             # 1. Direct keyword override for policy/time-sensitive queries
+            # (the same phrases the runner checks BEFORE live-data suppression,
+            # core.router.policy_web_override; a bare "Cycle N" only counts here,
+            # after suppression, D6).
+            from core.router import llm_knowledge_cutoff, policy_web_override
+
             query_lower = query.lower()
-            policy_keywords = [
-                "proprietary period", "proprietary time", "deadline", "policy", "policies",
-                "guideline", "guidelines", "regulation", "regulations", "cycle 12", "cycle 13", "cycle 14",
-                "call for proposals", "call-for-proposals", "proposers guide", "proposer's guide"
-            ]
-            if any(kw in query_lower for kw in policy_keywords):
+            if policy_web_override(query) or re.search(r"\bcycle\s*1[2-9]\b", query_lower):
                 print(f"[WEB SEARCH DETECTION] Forcing web search due to policy keywords in query: '{query}'")
                 return True
 
             from core.llm_client import LLMClient
-            intent_model = os.getenv("QUASAR_WEB_INTENT_MODEL") or os.getenv("QUASAR_FAST_MODEL", "deepseek-v4-flash")
+            # Default gpt-oss-120b (open model on TACC), not QUASAR_FAST_MODEL:
+            # the DeepSeek fast model answers HTTP 402 on this deployment and
+            # the decision then failed closed on every call (D16, Phase 2).
+            intent_model = os.getenv("QUASAR_WEB_INTENT_MODEL") or "gpt-oss-120b"
             client = LLMClient(model=intent_model)
             
             # Get recent conversation history (e.g. last 2 turns / 4 messages) to provide context
@@ -6193,7 +6364,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "Reply with YES if the query:\n"
                 "1. Asks about recent astronomical events, discoveries, or news (e.g., 'latest news from JWST', 'recent coordinate changes of X', 'who won the Nobel prize in physics recently?').\n"
                 "2. Asks about current telescope operational status, schedules, or call-for-proposals deadlines (e.g., 'ALMA Cycle 14 deadlines', 'current status of GBT').\n"
-                "3. References dates, years, or events after 2024.\n"
+                f"3. References dates, years, or events after {llm_knowledge_cutoff()[0]}-{llm_knowledge_cutoff()[1]:02d}.\n"
                 "4. Requires highly specific or real-time web facts to answer accurately.\n"
                 "5. Asks about telescope rules, guidelines, policies, regulations, or proprietary periods that may change or be updated in real-time (e.g., 'What is the ALMA proprietary period?', 'HST public data policies').\n\n"
                 "Reply with NO if the query:\n"
@@ -6206,12 +6377,36 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "Reply with ONLY one word: YES or NO"
             )
             
-            resp = client.responses.create(
-                model=intent_model,
-                input=prompt,
-                temperature=0,
-                max_output_tokens=1024,
-            )
+            # Bounded (review P2-05): the Phase 1 DeepSeek call failed at once
+            # (HTTP 402); a live gpt-oss call on the turn thread needs a wall
+            # clock. QUASAR_WEB_INTENT_TIMEOUT (default 3.5 s); a timeout is
+            # "no web", as before.
+            _holder: Dict[str, Any] = {}
+
+            def _classify() -> None:
+                try:
+                    _holder["resp"] = client.responses.create(
+                        model=intent_model,
+                        input=prompt,
+                        temperature=0,
+                        max_output_tokens=1024,
+                    )
+                except Exception as _exc:  # noqa: BLE001 - reported below
+                    _holder["error"] = _exc
+
+            try:
+                _timeout = float(os.getenv("QUASAR_WEB_INTENT_TIMEOUT", "3.5") or 3.5)
+            except ValueError:
+                _timeout = 3.5
+            _worker = threading.Thread(target=_classify, name="web-intent", daemon=True)
+            _worker.start()
+            _worker.join(timeout=_timeout)
+            if _worker.is_alive():
+                print(f"[WEB SEARCH DETECTION] LLM classification timed out after {_timeout:.1f}s: no web")
+                return False
+            if "error" in _holder:
+                raise _holder["error"]
+            resp = _holder["resp"]
             ans = resp.output_text.strip().upper()
             is_needed = "YES" in ans
             print(f"[WEB SEARCH DETECTION] LLM classified query: '{query[:60]}...' -> {ans} (needed={is_needed})")
@@ -6237,6 +6432,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         model: Optional[str] = None,
         run_token: Optional[str] = None,
         _history_recovery_attempted: bool = False,
+        web_search_mode: Optional[str] = None,
     ) -> str:
         from core.runner import stream_response_api as _stream_impl
         return _stream_impl(
@@ -6246,6 +6442,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             plan_feedback_queue=plan_feedback_queue, on_thought=on_thought,
             web_search=web_search, model=model, run_token=run_token,
             _history_recovery_attempted=_history_recovery_attempted,
+            web_search_mode=web_search_mode,
         )
 
     
@@ -6262,7 +6459,11 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         tools = []
         
         # Convert from Chat Completions format to Responses API format
+        from core import bench_toolset as _bench
+
         for tool in self.tool_registry.list_tools():
+            if not _bench.allowed(tool.name):
+                continue  # benchmark arm allowlist (no-op unless configured)
             tools.append({
                 "type": "function",
                 "name": tool.name,
@@ -6271,7 +6472,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             })
         
         # Add MCP server connection if enabled
-        if self.config.enable_mcp and self.config.mcp_server_url:
+        if self.config.enable_mcp and self.config.mcp_server_url and not _bench.active():
             tools.append({
                 "type": "mcp",
                 "server_label": "alma",

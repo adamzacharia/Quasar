@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck, Globe } from "lucide-react";
+import type { WebSearchMode } from "../lib/types";
 
 interface AttachedFile {
     file: File;
@@ -10,7 +11,7 @@ interface AttachedFile {
 }
 
 interface ChatInputProps {
-    onSend: (message: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean; webSearch?: boolean }) => void;
+    onSend: (message: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean; webSearch?: boolean; webSearchMode?: WebSearchMode }) => void;
     onStop?: () => void;
     isStreaming: boolean;
     initialValue?: string;
@@ -20,16 +21,24 @@ interface ChatInputProps {
        hero→docked switch (and the visit counter is fetched only once). */
     grounded: boolean;
     onGroundedChange: (v: boolean) => void;
-    webSearch: boolean;
-    onWebSearchChange: (v: boolean) => void;
+    /** Web search mode (Phase 2): off | auto | always. Persisted by the parent. */
+    webSearchMode: WebSearchMode;
+    onWebSearchModeChange: (mode: WebSearchMode) => void;
     hitCount?: number | null;
 }
 
+const WEB_SEARCH_MODE_OPTIONS: { value: WebSearchMode; label: string; hint: string }[] = [
+    { value: "off", label: "Off", hint: "Never search the web" },
+    { value: "auto", label: "Auto", hint: "Search when the question needs current information" },
+    { value: "always", label: "Always", hint: "Search the web on every message" },
+];
+
 export function ChatInput({
     onSend, onStop, isStreaming, initialValue = "", variant = "docked",
-    grounded: groundedSummary, onGroundedChange, webSearch, onWebSearchChange, hitCount = null,
+    grounded: groundedSummary, onGroundedChange, webSearchMode, onWebSearchModeChange, hitCount = null,
 }: ChatInputProps) {
     const isHero = variant === "hero";
+    const webSearch = webSearchMode !== "off";
     const [value, setValue] = useState(initialValue);
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
     const [menuOpen, setMenuOpen] = useState(false);
@@ -91,7 +100,7 @@ export function ChatInput({
         e.preventDefault();
         const hasContent = value.trim() || attachments.length > 0;
         if (hasContent && !isStreaming) {
-            onSend(value.trim(), attachments.length > 0 ? attachments : undefined, { groundedSummary, webSearch });
+            onSend(value.trim(), attachments.length > 0 ? attachments : undefined, { groundedSummary, webSearch, webSearchMode });
             setValue("");
             setAttachments([]);
         }
@@ -250,29 +259,38 @@ export function ChatInput({
                                                 Summarizes only rows, counts, identifiers, coordinates, links, and explicit errors returned by tools in this run. It avoids outside background knowledge, guesses, and unstated counts.
                                             </div>
                                         </div>
-                                        <button
-                                            type="button"
-                                            role="menuitemcheckbox"
-                                            aria-checked={webSearch}
-                                            onClick={() => onWebSearchChange(!webSearch)}
-                                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
-                                        >
-                                            <span className="flex min-w-0 items-center gap-3">
+                                        {/* Web search mode (Phase 2): a segmented control instead of the
+                                            on/off switch. Persisted by ChatArea in localStorage. */}
+                                        <div className="rounded-lg px-3 py-2" role="group" aria-label="Web search mode" data-testid="web-search-mode">
+                                            <span className="flex min-w-0 items-center gap-3 text-sm text-slate-200">
                                                 <Globe className={`h-4 w-4 ${webSearch ? "text-cyan-300" : "text-slate-500"}`} />
                                                 <span>Web Search</span>
                                             </span>
-                                            <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
-                                                webSearch
-                                                    ? "border-cyan-400/50 bg-cyan-500/25"
-                                                    : "border-slate-700 bg-slate-900"
-                                            }`}>
-                                                <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
-                                                    webSearch
-                                                        ? "translate-x-4 bg-cyan-300"
-                                                        : "translate-x-1 bg-slate-500"
-                                                }`} />
-                                            </span>
-                                        </button>
+                                            <div className="mt-1.5 grid grid-cols-3 gap-0.5 rounded-lg border border-slate-700 bg-slate-900/70 p-0.5">
+                                                {WEB_SEARCH_MODE_OPTIONS.map((opt) => {
+                                                    const active = webSearchMode === opt.value;
+                                                    return (
+                                                        <button
+                                                            key={opt.value}
+                                                            type="button"
+                                                            role="menuitemradio"
+                                                            aria-checked={active}
+                                                            aria-label={`Web search ${opt.label}`}
+                                                            data-mode={opt.value}
+                                                            title={opt.hint}
+                                                            onClick={() => onWebSearchModeChange(opt.value)}
+                                                            className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${
+                                                                active
+                                                                    ? "bg-cyan-500/25 text-cyan-200 ring-1 ring-cyan-400/50"
+                                                                    : "text-slate-400 hover:bg-white/10 hover:text-slate-200"
+                                                            }`}
+                                                        >
+                                                            {opt.label}
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
                                     </div>
                                 )}
                             </div>

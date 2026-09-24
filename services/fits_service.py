@@ -222,6 +222,32 @@ def render_fits_image(
                 logger.warning(f"[FITS] Could not remove temp file still in use: {fits_path}")
 
 
+CONTOUR_SIGMAS = (3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0)
+
+
+def significance_contour_levels(data: Any, sigmas: Any = CONTOUR_SIGMAS) -> Dict[str, Any]:
+    """Contour levels at multiples of a robust noise estimate (1.4826 x MAD of
+    the finite pixels): positive levels ``sigmas`` x rms below the map maximum
+    and one negative -3 sigma level. Live 2026-09-23 D19: levels spread
+    linearly between the 30th and 99.5th percentile put most contours in the
+    noise, and a single ALMA pointing rendered as a filled disc."""
+    arr = np.asarray(data, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 16:
+        return {"rms": None, "positive": [], "negative": [], "sigmas": [], "peak_snr": None}
+    med = float(np.median(finite))
+    rms = 1.4826 * float(np.median(np.abs(finite - med)))
+    if not np.isfinite(rms) or rms <= 0:
+        rms = float(np.std(finite))
+    if not np.isfinite(rms) or rms <= 0:
+        return {"rms": None, "positive": [], "negative": [], "sigmas": [], "peak_snr": None}
+    peak = float(np.max(finite))
+    used = [float(k) for k in sigmas if med + k * rms < peak]
+    return {"rms": rms, "median": med, "positive": [med + k * rms for k in used],
+            "negative": [med - 3.0 * rms] if float(np.min(finite)) < med - 3.0 * rms else [],
+            "sigmas": used, "peak_snr": (peak - med) / rms}
+
+
 def overlay_fits_images(
     base_url: str,
     contour_url: str,
@@ -280,18 +306,31 @@ def overlay_fits_images(
             ax = fig.add_subplot(111, projection=base_wcs)
 
             # Base colorscale
-            ax.imshow(base_data, origin="lower", cmap=base_cmap, norm=norm)
+            im = ax.imshow(base_data, origin="lower", cmap=base_cmap, norm=norm)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+            cbar.set_label(f"{base_label} (image units; zscale, sqrt stretch)", color="white", fontsize=9)
+            cbar.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=7)
 
-            # Contour overlay
-            valid = cont_reproj[np.isfinite(cont_reproj)]
-            if len(valid) > 0:
-                vmin, vmax = np.nanpercentile(valid, [30, 99.5])
-                if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
-                    levels = np.linspace(vmin, vmax, contour_levels)
-                    ax.contour(
-                        cont_reproj, levels=levels, colors="cyan",
-                        linewidths=0.8, alpha=0.85, origin="lower",
-                    )
+            # Contour overlay at significance levels measured on the ORIGINAL
+            # contour map (the reprojected one is NaN outside its footprint).
+            # contour_levels = how many significance levels: the first N of
+            # 3, 5, 8, 13, 21, 34, 55, 89 sigma (guard CX-13).
+            n_levels = max(1, min(len(CONTOUR_SIGMAS), int(contour_levels or len(CONTOUR_SIGMAS))))
+            sig = significance_contour_levels(cont_data, CONTOUR_SIGMAS[:n_levels])
+            contour_note = "no contour: the contour map has no measurable noise"
+            if sig["rms"]:
+                if sig["positive"]:
+                    ax.contour(cont_reproj, levels=sig["positive"], colors="cyan", linewidths=0.9, alpha=0.9, origin="lower")
+                    contour_note = (f"{contour_label} contours at {', '.join(f'{k:g}' for k in sig['sigmas'])} sigma "
+                                    f"(sigma = {sig['rms']:.3g} map units, robust MAD)")
+                else:
+                    contour_note = f"{contour_label}: no emission >= 3 sigma (sigma = {sig['rms']:.3g}; peak {sig['peak_snr']:.1f} sigma)"
+                if sig["negative"]:
+                    ax.contour(cont_reproj, levels=sig["negative"], colors="cyan", linewidths=0.6, alpha=0.6,
+                               linestyles="dashed", origin="lower")
+            ax.text(0.01, 0.01, contour_note + ("; dashed = -3 sigma" if sig.get("negative") else ""),
+                    transform=ax.transAxes, color="cyan", fontsize=8, va="bottom", ha="left",
+                    bbox={"facecolor": "black", "alpha": 0.6, "edgecolor": "none", "pad": 2})
 
             ax.set_title(
                 f"{base_label} (color) + {contour_label} (contours)",
@@ -310,11 +349,13 @@ def overlay_fits_images(
                         facecolor=fig.get_facecolor())
             plt.close(fig)
 
-        caption = f"{base_label} (color) + {contour_label} (contours)"
+        caption = f"{base_label} (color) + {contour_label} (contours) | {contour_note}"
         return {
             "success": True,
             "image_path": f"/api/images/{img_name}",
             "caption": caption,
+            "contours": {"note": contour_note, "sigmas": sig.get("sigmas"), "rms": sig.get("rms"),
+                         "peak_snr": sig.get("peak_snr")},
         }
 
     except Exception as e:

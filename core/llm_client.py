@@ -688,9 +688,16 @@ class ResponsesShim:
             # nudge to server-enforced decoding (TACC) — set on re-samples after a
             # reasoning-only stop. Never forwarded to a provider SDK.
             strict_required = bool(kwargs.pop("tool_choice_strict", False))
+            # Per-call gpt-oss reasoning effort (low|medium|high) for short
+            # classification calls such as the web planner; overrides the
+            # process-wide QUASAR_GPT_OSS_REASONING. Never forwarded to a
+            # provider SDK (popped here, re-attached for the TACC shims only).
+            gpt_oss_reasoning = kwargs.pop("_gpt_oss_reasoning", None)
             if provider == "openai":
                 result = self._call_openai(kwargs, attachments=attachments)
             elif provider == "tacc":
+                if gpt_oss_reasoning:
+                    kwargs["_gpt_oss_reasoning"] = gpt_oss_reasoning
                 if stream:
                     kwargs["_tool_choice_strict"] = strict_required  # read by the TACC shims only
                     result = self._stream_tacc(kwargs, attachments=attachments)
@@ -1681,6 +1688,7 @@ class ResponsesShim:
         instructions = self._configure_gpt_oss_instructions(
             kwargs.get("instructions", ""),
             model,
+            effort=kwargs.get("_gpt_oss_reasoning"),
         )
         input_data = kwargs.get("input", "")
         temperature = kwargs.get("temperature", 0.7)
@@ -1750,6 +1758,7 @@ class ResponsesShim:
         instructions = self._configure_gpt_oss_instructions(
             kwargs.get("instructions", ""),
             model,
+            effort=kwargs.get("_gpt_oss_reasoning"),
         )
         input_data = kwargs.get("input", "")
         temperature = kwargs.get("temperature", 0.7)
@@ -2111,12 +2120,13 @@ class ResponsesShim:
     )
 
     @staticmethod
-    def _configure_gpt_oss_instructions(instructions: str, model: str) -> str:
-        """Set GPT-OSS reasoning effort using its supported system-message format."""
+    def _configure_gpt_oss_instructions(instructions: str, model: str, effort: Optional[str] = None) -> str:
+        """Set GPT-OSS reasoning effort using its supported system-message format.
+        ``effort`` (per call, low|medium|high) wins over QUASAR_GPT_OSS_REASONING."""
         if "gpt-oss" not in str(model or "").lower():
             return instructions
 
-        effort = os.getenv("QUASAR_GPT_OSS_REASONING", "high").strip().lower()
+        effort = str(effort or os.getenv("QUASAR_GPT_OSS_REASONING", "high")).strip().lower()
         if effort not in {"low", "medium", "high"}:
             logger.warning(
                 "Invalid QUASAR_GPT_OSS_REASONING=%r; defaulting to high.",

@@ -89,7 +89,7 @@ def manna_enabled() -> bool:
 # (MANNA's HTTP default is :8000, which collides with the backend). Pinned to
 # the release this integration was verified against — bump deliberately, not
 # whenever upstream publishes.
-_MANNA_DEFAULT_COMMAND = "uvx --from manna-mcp==0.7.0 manna --stdio"
+_MANNA_DEFAULT_COMMAND = "uvx --from manna-mcp==0.9.0 manna --stdio"
 
 
 def _split_command(command_line: str) -> List[str]:

@@ -6,6 +6,134 @@ import { ExternalLink, Globe, ChevronRight, ChevronUp, ShieldCheck } from "lucid
 import type { WebSource, WebImage } from "../lib/types";
 import { rankWebSources } from "../lib/evidence-quality";
 import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
+import { citationLabel, domainOf, sourceCardDomId, splitCitedSources } from "../lib/web-citations.js";
+
+function gridDomId(messageId: string): string {
+    return `web-grid-${String(messageId || "m").replace(/[^A-Za-z0-9_-]/g, "")}`;
+}
+
+/**
+ * Compact "N sources" strip shown above a grounded answer as soon as the web
+ * evidence exists (before the answer finishes). Clicking scrolls to the grid.
+ */
+export function WebSourcesStrip({ sources = [], messageId }: { sources?: WebSource[]; messageId: string }) {
+    const safe = sources.filter(isSafeWebSource);
+    if (safe.length === 0) return null;
+    const domains: string[] = [];
+    for (const s of safe) {
+        const d = s.domain || domainOf(s.url);
+        if (d && !domains.includes(d)) domains.push(d);
+    }
+    const jump = () => document.getElementById(gridDomId(messageId))?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return (
+        <button
+            type="button"
+            data-testid="web-sources-strip"
+            onClick={jump}
+            className="glass-control my-2 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs transition-colors hover:text-primary"
+            style={{ color: "var(--q-text-muted)" }}
+            title={domains.slice(0, 8).join(", ")}
+        >
+            <Globe className="h-3.5 w-3.5" />
+            <span className="flex -space-x-1">
+                {domains.slice(0, 5).map((d) => (
+                    <img
+                        key={d}
+                        src={getFavicon(`https://${d}`)}
+                        alt=""
+                        className="h-4 w-4 rounded-full ring-1 ring-black/20"
+                        style={{ background: "var(--q-glass-control)" }}
+                        onError={(e) => { (e.target as HTMLImageElement).style.visibility = "hidden"; }}
+                    />
+                ))}
+            </span>
+            <span style={{ color: "var(--q-text)" }}>{safe.length} source{safe.length === 1 ? "" : "s"}</span>
+        </button>
+    );
+}
+
+function EvidenceSourceCard({ source, messageId }: { source: WebSource; messageId: string }) {
+    const quality = source.evidenceQuality;
+    const domain = source.domain || getDomain(source.url);
+    return (
+        <a
+            id={source.id ? sourceCardDomId(messageId, source.id) : undefined}
+            data-source-id={source.id || undefined}
+            href={source.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={source.snippet || quality?.reason || source.title}
+            className="glass-control group flex items-start gap-2.5 rounded-lg p-2.5 transition-all duration-200 hover:scale-[1.01] data-[highlight=true]:ring-2 data-[highlight=true]:ring-cyan-400/80"
+        >
+            <span
+                className="mt-0.5 inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-md px-1 text-[10px] font-semibold"
+                style={{ color: "var(--q-text)", border: "1px solid var(--q-glass-border)" }}
+            >
+                {source.id ? citationLabel(source.id) : "·"}
+            </span>
+            <span className="min-w-0 flex-1">
+                <span className="block truncate text-xs font-medium group-hover:text-primary" style={{ color: "var(--q-text)" }}>
+                    {source.title || domain || "Untitled"}
+                </span>
+                <span className="mt-0.5 flex items-center gap-1 truncate text-[10px]" style={{ color: "var(--q-text-muted)" }}>
+                    <img
+                        src={getFavicon(source.url)}
+                        alt=""
+                        className="h-3 w-3 rounded-sm"
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                    />
+                    <span className="truncate">
+                        {domain}{source.publishedDate ? ` · ${source.publishedDate}` : ""}
+                        {quality?.label ? ` · ${quality.label}` : ""}
+                    </span>
+                </span>
+            </span>
+            <ExternalLink className="mt-0.5 h-3 w-3 shrink-0" style={{ color: "var(--q-text-muted)" }} />
+        </a>
+    );
+}
+
+/**
+ * Sources grid under a grounded answer: sources the answer cites first (with
+ * their citation number), the rest under a collapsed "Also consulted". When
+ * the answer cites nothing, every source is listed as consulted.
+ */
+export function WebEvidenceGrid({ sources = [], messageId }: { sources?: WebSource[]; messageId: string }) {
+    const safe = sources.filter(isSafeWebSource);
+    if (safe.length === 0) return null;
+    const { cited, uncited } = splitCitedSources(safe) as { cited: WebSource[]; uncited: WebSource[] };
+    const grid = "grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3";
+    return (
+        <div id={gridDomId(messageId)} data-testid="web-sources-card" className="my-3 space-y-2">
+            <div className="flex items-center gap-2 text-xs font-medium uppercase" style={{ color: "var(--q-text-muted)" }}>
+                <Globe className="h-3.5 w-3.5" />
+                <span>{cited.length ? "Sources cited" : "Sources consulted"}</span>
+                <span style={{ opacity: 0.6 }}>({cited.length || uncited.length})</span>
+            </div>
+            {cited.length > 0 ? (
+                <>
+                    <div className={grid}>
+                        {cited.map((s) => <EvidenceSourceCard key={s.id || s.url} source={s} messageId={messageId} />)}
+                    </div>
+                    {uncited.length > 0 && (
+                        <details className="group/also">
+                            <summary className="cursor-pointer select-none text-xs hover:text-primary" style={{ color: "var(--q-text-muted)" }}>
+                                Also consulted ({uncited.length})
+                            </summary>
+                            <div className={`${grid} mt-2`}>
+                                {uncited.map((s) => <EvidenceSourceCard key={s.id || s.url} source={s} messageId={messageId} />)}
+                            </div>
+                        </details>
+                    )}
+                </>
+            ) : (
+                <div className={grid}>
+                    {uncited.map((s) => <EvidenceSourceCard key={s.id || s.url} source={s} messageId={messageId} />)}
+                </div>
+            )}
+        </div>
+    );
+}
 
 interface WebSourcesCardProps {
     sources?: WebSource[];

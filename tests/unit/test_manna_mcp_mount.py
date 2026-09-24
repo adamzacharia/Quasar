@@ -67,7 +67,7 @@ def test_manna_stdio_default_pinned(monkeypatch):
     assert cfg["transport"] == "stdio"
     assert cfg["command"] == "uvx"
     # pinned to the verified release, not a floating latest
-    assert cfg["args"] == ["--from", "manna-mcp==0.7.0", "manna", "--stdio"]
+    assert cfg["args"] == ["--from", "manna-mcp==0.9.0", "manna", "--stdio"]
 
 
 def test_manna_url_selects_streamable_http(monkeypatch):
@@ -90,7 +90,7 @@ def test_manna_command_override(monkeypatch):
 def test_manna_windows_path_command_survives_split(monkeypatch):
     monkeypatch.setenv("QUASAR_ENABLE_MANNA", "1")
     monkeypatch.setenv(
-        "MANNA_MCP_COMMAND", r"C:\tools\uv\uvx.exe --from manna-mcp==0.7.0 manna --stdio"
+        "MANNA_MCP_COMMAND", r"C:\tools\uv\uvx.exe --from manna-mcp==0.9.0 manna --stdio"
     )
     import os as _os
     cfg = platform_mcp_servers()[0]

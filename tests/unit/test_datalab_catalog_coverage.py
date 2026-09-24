@@ -389,3 +389,22 @@ def test_note_states_registered_subset_and_names_scope_all():
     assert "17 registered catalogs" in note
     assert "NOT the full Data Lab schema set" in note
     assert "scope='all'" in note
+
+
+def test_lmc_coverage_summary_keeps_unverified_near_ir_catalogs_visible():
+    # UI bench 2026-09-23 L01: the answer dropped VHS (unverified at the LMC).
+    out = _run(ra=LMC_RA, dec=LMC_DEC)
+    summary = out["coverage_summary"]
+    assert "twomass" in summary["covered"]
+    unverified = {row["catalog"]: row for row in summary["coverage_unverified"]}
+    assert "vhs_dr5" in unverified and "VMC" in unverified["vhs_dr5"]["footprint"]
+    near_ir = summary["by_wavelength_regime"]["near-ir"]
+    assert "twomass" in near_ir and "vhs_dr5 (coverage unverified here)" in near_ir
+    assert "never drop" in summary["instruction"]
+    # DLB-100 F11: why each COVERED catalog covers the position.
+    feet = {row["catalog"]: row for row in summary["covered_footprints"]}
+    assert set(feet) == set(summary["covered"])
+    assert all(row["footprint"] or row["coverage_reason"] for row in feet.values())
+    assert "say WHY" in summary["instruction"]
+    # unfiltered listings carry no summary
+    assert "coverage_summary" not in _run()

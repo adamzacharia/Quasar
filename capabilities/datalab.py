@@ -545,6 +545,10 @@ class ConeCountInput(_In):
     ra: float
     dec: float
     radius_deg: float
+    # Optional cuts (ArchiveBench AB-D-57: a "good redshifts" count came back
+    # unfiltered because the count could not take a cut).
+    value_cuts: Optional[List[Dict[str, Any]]] = None
+    quality_cuts: bool = False
 
 
 class SelectCatalogRowsInput(_In):
@@ -758,6 +762,33 @@ class ListCatalogs(BaseCapability):
                         unverified_rows.append(row)
                 catalogs = covered_rows + unverified_rows
                 filters["position"] = {"ra": ra_f, "dec": dec_f, "label": label}
+                # UI bench 09-23 L01: the answer kept only the covered rows and
+                # silently dropped VHS (unverified at the LMC: VMC owns the inner
+                # tiles). State both groups and the regimes explicitly.
+                by_regime: Dict[str, List[str]] = {}
+                for row in catalogs:
+                    tag = row["catalog"] + ("" if row["coverage_status"] == "covered" else " (coverage unverified here)")
+                    for regime in row.get("wavelength_regime") or []:
+                        by_regime.setdefault(str(regime), []).append(tag)
+                coverage_summary = {
+                    "covered": [r["catalog"] for r in covered_rows],
+                    # WHY each covers the position, in the registry's own words
+                    # (DLB-01 C5: footprint reasoning for the covered catalogs too).
+                    "covered_footprints": [
+                        {"catalog": r["catalog"], "footprint": (r.get("coverage") or {}).get("notes") or r.get("footprint"),
+                         "coverage_reason": r.get("coverage_reason")}
+                        for r in covered_rows
+                    ],
+                    "coverage_unverified": [
+                        {"catalog": r["catalog"], "wavelength_regime": r.get("wavelength_regime") or [],
+                         "footprint": (r.get("coverage") or {}).get("notes") or r.get("footprint")}
+                        for r in unverified_rows
+                    ],
+                    "by_wavelength_regime": by_regime,
+                    "instruction": ("Report BOTH groups: a 'coverage unverified' catalog may still cover part of this "
+                                    "position -- list it as a possible source with its footprint caveat; never drop it. "
+                                    "For each covered catalog, say WHY it covers the position from `covered_footprints`."),
+                }
                 note_bits.append(
                     f"Ranked by registry footprint coverage at {label}: known-covering catalogs "
                     "first; entries marked 'coverage unverified for this position' have no registry "
@@ -784,6 +815,8 @@ class ListCatalogs(BaseCapability):
             }
             if filters:
                 native["filters"] = filters
+            if position is not None:
+                native["coverage_summary"] = coverage_summary
             if excluded_by_band:
                 native["excluded_by_band"] = excluded_by_band
             if excluded_by_coverage:
@@ -852,9 +885,19 @@ class ConeCount(BaseCapability):
 
     def run(self, inp, ctx) -> ToolResult:
         try:
+            cuts = [dict(vc) for vc in (inp.value_cuts or [])]
+            quality_note = None
+            if inp.quality_cuts:
+                cuts, quality_note = datalab_registry.merge_default_quality_cuts(inp.catalog, inp.table, cuts)
+            predicates = None
+            if cuts:
+                predicates = datalab_query_builders.build_catalog_predicates(
+                    inp.catalog, inp.table, value_cuts=cuts)
             sql, meta = datalab_query_builders.build_cone_count(
-                inp.catalog, inp.table, ra=inp.ra, dec=inp.dec, radius_deg=inp.radius_deg
+                inp.catalog, inp.table, ra=inp.ra, dec=inp.dec, radius_deg=inp.radius_deg, predicates=predicates
             )
+            if quality_note:
+                meta.setdefault("warnings", []).append(quality_note)
         except Exception as e:
             return datalab_error(e)
         return execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
@@ -1291,11 +1334,12 @@ class SedPlot(BaseCapability):
 
 class LssWedgeInput(_In):
     result_id: Optional[str] = None
-    # SDSS Great Wall default (UI benchmark 2026-09-22 L13: a 5 deg cone at Dec +30 was used instead).
+    # SDSS Great Wall default: the equatorial stripe (Gott et al. 2005) -- UI
+    # benchmark L13 used a 5 deg cone at Dec +30 (09-22) and a 30 deg cone (09-23).
     ra_min: float = 150.0
     ra_max: float = 220.0
-    dec_min: float = 0.0
-    dec_max: float = 5.0
+    dec_min: float = -1.25
+    dec_max: float = 1.25
     z_min: float = 0.0
     z_max: float = 0.1
     limit: int = Field(default=5000, ge=1, le=5000)
@@ -1309,7 +1353,9 @@ class LssWedgeInput(_In):
 
 class LssWedge(BaseCapability):
     name = "datalab_lss_wedge"
-    description = "Render a stored spectroscopic Data Lab result_id as a comoving LSS wedge."
+    description = ("Comoving large-scale-structure wedge (cosmic web). With NO result_id it selects SDSS DR17 galaxies itself "
+                   "(class GALAXY, zwarning 0) in a THIN slice -- default the SDSS Great Wall equatorial stripe RA 150-220, "
+                   "Dec -1.25..+1.25, z <= 0.1 -- thinned uniformly to the row cap; or renders a stored spectroscopic result_id.")
     category = "datalab"
     InputModel = LssWedgeInput
     annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
@@ -1317,9 +1363,22 @@ class LssWedge(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         params = inp.model_dump()
         selection = {k: params.pop(k) for k in ("ra_min", "ra_max", "dec_min", "dec_max", "z_min", "z_max", "limit")}
+        n_rows = None
         if not inp.result_id:
             try:
+                bounds = {k: v for k, v in selection.items() if k != "limit"}
+                try:
+                    csql, cmeta = datalab_orchestration.build_wedge_count(**bounds)
+                    _cid, counted = datalab_orchestration._run_builder_sql(
+                        csql, cmeta, client=ctx.service("datalab_client"), result_store=ctx.result_store,
+                        owner_id=(str(ctx.user_id) if ctx.user_id else None), async_fallback=False)
+                    n_rows = int(counted.dataframe.iloc[0]["n"])
+                    selection["thin"] = datalab_orchestration.wedge_thinning(n_rows, selection["limit"])
+                except Exception:
+                    n_rows = None  # count is an optimisation; the capped pull still runs
                 sql, meta = datalab_orchestration.build_wedge_selection(**selection)
+                if n_rows is not None:
+                    meta = {**meta, "slice_count": n_rows}
                 queried = execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
                 out = queried.to_native()
                 if not out.get("success") or not out.get("result_id"):
@@ -1327,7 +1386,20 @@ class LssWedge(BaseCapability):
                 params["result_id"] = out["result_id"]
             except Exception as exc:
                 return datalab_error(exc)
-        return _run_analysis_plot("lss_wedge", params, ctx)
+        res = _run_analysis_plot("lss_wedge", params, ctx)
+        native = getattr(res, "native", None)
+        if n_rows is not None and isinstance(native, dict) and native.get("success"):
+            # State the sampling outright: live the model called a 1-in-2
+            # thinned pull "the full slice" (UI 2026-09-24 run-2 L13).
+            k = int(selection.get("thin") or 1)
+            plotted = native.get("points")
+            native["sample"] = {
+                "galaxies_in_slice": n_rows, "thinning": k, "plotted": plotted,
+                "statement": (f"The slice holds {n_rows} galaxies; the plot shows "
+                              + (f"a uniform 1-in-{k} subsample ({plotted} plotted), so shell counts are about 1/{k} of the full slice."
+                                 if k > 1 else "all of them (no thinning).")),
+            }
+        return res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1470,6 +1542,9 @@ class ColorImage(BaseCapability):
                 q=float(inp.q), stretch=float(inp.stretch), title=caption,
             )
             result["_caption"] = caption
+            result.update(self.explain_outcome(result, catalog=inp.catalog, ra=ra_f, dec=dec_f, fov_deg=float(inp.fov_deg),
+                                               label=" ".join(str(x) for x in (inp.target_name, label) if x),
+                                               q=float(inp.q), stretch=float(inp.stretch)))
             return ToolResult(
                 success=bool(result.get("success")),
                 error=(None if result.get("success") else result.get("error")),
@@ -1477,6 +1552,72 @@ class ColorImage(BaseCapability):
             )
         except Exception as e:
             return datalab_error(e)
+
+    # Optical sizes of large galaxies a "centre" request needs a scale for:
+    # RC3 D25 major-axis diameters (de Vaucouleurs et al. 1991).
+    _D25_ARCMIN = {"m31": ("M31", 190.5), "andromeda": ("M31", 190.5), "ngc 224": ("M31", 190.5),
+                   "m33": ("M33", 70.8), "triangulum": ("M33", 70.8), "ngc 598": ("M33", 70.8)}
+    _WAVELENGTH_ORDER = ["u", "g", "r", "i", "z", "y"]
+
+    @classmethod
+    def explain_outcome(cls, result: Dict[str, Any], *, catalog: str, ra: float, dec: float, fov_deg: float,
+                        label: str, q: float, stretch: float) -> Dict[str, Any]:
+        """Facts the answer needs whatever the outcome (DLB-04 C4-C6): the bands
+        the SIA search found, a coverage reason grounded in that search, the FOV
+        rationale and the RGB band mapping. Nothing here asserts a survey
+        footprint the registry does not state."""
+        prov = result.get("provenance") or {}
+        found = (result.get("bands_used") or result.get("available_bands") or prov.get("healthy_bands")
+                 or prov.get("healthy_sia_bands") or [])
+        found = [b for b in cls._WAVELENGTH_ORDER if b in {str(x).lower() for x in found}] or list(found)
+        entry = datalab_registry.DATALAB_CATALOGS.get(str(catalog or "").strip().lower())
+        footprint = (entry or {}).get("footprint") if isinstance(entry, dict) else None
+        optical = [b for b in cls._WAVELENGTH_ORDER if b in {str(x).lower() for x in ((entry or {}).get("bands") or ["g", "r", "z"])}]
+        order = str(prov.get("lupton_rgb_order") or "")
+        if order and len(order.split(",")) == 3:
+            red, green, blue = order.split(",")
+            mapping_state = "used"
+        else:
+            trio = found if len(found) >= 3 and result.get("success") and not result.get("coverage_gap") else optical
+            red, green, blue = (trio[-1], trio[len(trio) // 2], trio[0]) if len(trio) >= 3 else ("z", "r", "g")
+            mapping_state = "used" if result.get("color_hips_completion") else "would be used"
+        rgb = {"red": red, "green": green, "blue": blue, "state": mapping_state,
+               "rule": "reddest band -> red, middle -> green, bluest -> blue",
+               "stretch": {"method": "Lupton et al. (2004) asinh (make_lupton_rgb)", "Q": q, "stretch": stretch}}
+        key = next((k for k in cls._D25_ARCMIN if k in str(label).lower()), None)
+        if key:
+            name, d25 = cls._D25_ARCMIN[key]
+            fov_rationale = (f"{fov_deg:g} deg ({fov_deg * 60:.0f} arcmin) field for the CENTRE of {name}: its optical disk "
+                             f"(RC3 D25 = {d25:.0f} arcmin, about {d25 / 60:.1f} deg) is {d25 / (fov_deg * 60):.0f} times wider, "
+                             "so this field isolates the bulge and nucleus rather than the whole galaxy.")
+        else:
+            fov_rationale = f"{fov_deg:g} deg ({fov_deg * 60:.0f} arcmin) field centred on the target."
+        out: Dict[str, Any] = {"bands_found": found, "rgb_mapping": rgb, "fov_rationale": fov_rationale}
+        if footprint:
+            out["footprint_note"] = footprint
+        if result.get("coverage_gap"):
+            reason = (f"The Data Lab SIA search at RA {ra:.4f}, Dec {dec:+.4f} returned usable {catalog} tiles only in "
+                      + (f"band(s) {', '.join(found)}" if found else "no band")
+                      + " at this position, and a colour composite needs three bands.")
+            if prov.get("color_hips_attempted"):
+                reason += f" The same survey's colour HiPS ({prov['color_hips_attempted']}) was tried and is blank here."
+            decam = str(catalog or "").lower().split("_")[0] in {"ls", "des", "delve", "decaps", "smash", "nsc"}
+            if dec > 30.0 and decam:
+                reason += (f" Dec {dec:+.1f} is far north for DECam, which observes from Cerro Tololo (latitude -30 deg), "
+                           "so this position lies at the northern edge of DECam survey coverage.")
+            reason += " This is a survey coverage gap, not a processing error."
+            out["coverage_reason"] = reason
+            out["alternatives"] = (
+                ([f"a single-band {'/'.join(found)} cutout from the same survey at this position (datalab_image_cutout)"] if found else [])
+                + ["a clearly labelled colour image from another survey, e.g. Pan-STARRS1 through hips2fits "
+                   "(hips_cutout with survey CDS/P/PanSTARRS/DR1/color-z-zg-g), only if the user accepts the switch"])
+            out["answer_guidance"] = ("Explain the outcome with `coverage_reason`, justify the field of view with `fov_rationale`, "
+                                      "say which bands would map to red/green/blue from `rgb_mapping`, and offer `alternatives` "
+                                      "without switching surveys unasked.")
+        else:
+            out["answer_guidance"] = ("Justify the field of view with `fov_rationale` and describe the band mapping and "
+                                      "stretch from `rgb_mapping`.")
+        return out
 
 
 _DEFAULT_MAX_GRID_PEAKS = 12
@@ -1945,9 +2086,45 @@ class ColorMagnitudeDiagram(BaseCapability):
             )
             if isinstance(out, dict):
                 out["_caption"] = inp.title or f"Color-magnitude diagram: {label}"
+                if out.get("success") and not (inp.x_expr or inp.y_expr) and radius_deg <= 0.8:
+                    out["features"] = self._population_features(inp.catalog, table, ra_f, dec_f, radius_deg, ctx)
+                    out["answer_guidance"] = ("State the depth (the bound applied and the turnover magnitude from `depth`) and "
+                                              "which CMD features are present from `features` (verdict, and turnoff / RGB / BHB "
+                                              "excess over the surrounding field). Do not claim features it did not find.")
             return ToolResult(success=bool(isinstance(out, dict) and out.get("success")), native=out)
         except Exception as e:
             return datalab_error(e)
+
+    @staticmethod
+    def _population_features(catalog, table, ra, dec, radius_deg, ctx) -> Dict[str, Any]:
+        """Old-population features in the cone vs a surrounding annulus
+        (1.5-2.5 x the radius): one server-side Hess aggregate (DLB-03 C6)."""
+        from services import cmd_population
+        from services import datalab_query_builders as builders
+        from services.tool_budgets import remaining_seconds
+
+        left = remaining_seconds()
+        if left is not None and left < 20.0:
+            return {"verdict": "not tested", "note": "skipped: tool budget nearly exhausted after the CMD query"}
+        try:
+            r_in = float(radius_deg)
+            annulus = (1.5 * r_in, min(2.5 * r_in, 2.0))
+            cuts, _note = datalab_registry.merge_default_quality_cuts(catalog, table, [])
+            predicates = builders.build_catalog_predicates(catalog, table, value_cuts=cuts,
+                                                           morphology=datalab_registry.point_source_cut(catalog, table))
+            test = cmd_population.run_population_test(
+                catalog, table, float(ra), float(dec), aperture_deg=r_in, annulus_deg=annulus, predicates=predicates,
+                client=ctx.service("datalab_client"), result_store=ctx.result_store,
+                owner_id=(str(ctx.user_id) if ctx.user_id else None),
+                timeout=(30.0 if left is None else max(5.0, min(30.0, left - 8.0))),
+            )
+        except Exception as exc:  # noqa: BLE001 - the CMD itself already succeeded
+            return {"verdict": "not tested", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        return {k: test[k] for k in ("verdict", "reason", "features_detected", "old_population_excess",
+                                     "old_population_significance", "aperture_deg", "annulus_deg", "method")} | {
+            "regions": {k: {kk: v[kk] for kk in ("n_aperture", "n_background_scaled", "excess", "significance")}
+                        for k, v in test["regions"].items()},
+        }
 
 
 class JobIdInput(_In):

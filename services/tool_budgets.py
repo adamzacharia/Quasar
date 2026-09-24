@@ -328,6 +328,17 @@ class Deadline:
             parent = parent._parent
         return (self.turn.reason if self.turn is not None else "") or "cancelled"
 
+    def child_until(self, seconds: float, *, label: str = "") -> "Deadline":
+        """A child that ends after ``seconds`` (or at this deadline's end,
+        whichever is first). Every bounded request on the helper then clamps
+        its timeout to that end, so an abandoned helper's IN-FLIGHT request
+        finishes by then too (guard 12894 CX-02/03), not only its next one."""
+        end = min(self._end, time.monotonic() + max(0.0, float(seconds)))
+        return Deadline(
+            max(0.0, end - self._start), label=label or self.label, turn=self.turn,
+            _parent=self, _start=self._start, _end=end, _token=self.token,
+        )
+
     def child(self, *, label: str = "") -> "Deadline":
         """A deadline for a helper worker: same end time, same call token and
         turn, but its OWN cancel flag -- so abandoning the helper stops the
@@ -678,6 +689,11 @@ SPLATALOGUE_HOSTS = ("splatalogue.online",)
 ALERCE_HOSTS = ("api.alerce.online",)
 VIZIER_HOSTS = ("vizier.cds.unistra.fr",)
 TAVILY_HOSTS = ("api.tavily.com",)
+# web_search routes across Brave, Exa and Tavily (services/web_search_service):
+# declaring all three means an open Tavily circuit no longer refuses the whole
+# tool while Brave or Exa could still answer -- the guard refuses a tool only
+# when EVERY declared host is open (D12).
+WEB_SEARCH_HOSTS = ("api.search.brave.com", "api.exa.ai") + TAVILY_HOSTS
 # Every ADS API call is under /v1 -> one service circuit (guard CX-10).
 ADS_HOSTS = ("api.adsabs.harvard.edu/v1",)
 OPENALEX_HOSTS = ("api.openalex.org",)
@@ -694,6 +710,11 @@ SVO_HOSTS = ("svo2.cab.inta-csic.es",)
 ATNF_HOSTS = ("www.atnf.csiro.au",)
 HF_HOSTS = ("huggingface.co",)
 NRAO_TAP_HOSTS = ("data-query.nrao.edu",)
+# Archive catalogue tools (capabilities/catalogs.py, 2026-09).
+HEASARC_HOSTS = ("heasarc.gsfc.nasa.gov",)
+EXOPLANET_HOSTS = ("exoplanetarchive.ipac.caltech.edu",)
+TAPVIZIER_HOSTS = ("tapvizier.cds.unistra.fr",)
+TNS_HOSTS = ("www.wis-tns.org",)
 
 # Tools whose transport is NOT requests-based and has no timeout of its own:
 # not even the requests-layer clamp applies; the outer guard is the only
@@ -927,9 +948,12 @@ def _declare_defaults() -> None:
     declare(
         ["datalab_describe_table", "datalab_cone_count", "datalab_select_catalog_rows", "datalab_q3c_crossmatch",
          "datalab_sql_query", "datalab_star_lightcurve", "datalab_color_color_diagram",
-         "datalab_color_magnitude_diagram", "datalab_tiled_search"],
+         "datalab_tiled_search"],
         _datalab_sql(1), DATALAB_HOSTS,
     )
+    # The CMD plus its population-feature test (one Hess aggregate, DLB-03).
+    declare_loop(["datalab_color_magnitude_diagram"], _datalab_sql(1), DATALAB_HOSTS,
+                 reason="the CMD SQL, then one population-test aggregate only when >= 20 s of budget remain (<= 30 s)")
     declare(["datalab_list_catalogs"], _merge(_datalab_sql(1), _simbad), DATALAB_HOSTS)
     declare(["datalab_sia_search"], _datalab_sia, DATALAB_SIA_HOSTS)
     declare_loop(["datalab_variable_candidates", "datalab_job_results", "datalab_density_aggregate"], _datalab_sql(1),
@@ -987,9 +1011,19 @@ def _declare_defaults() -> None:
     declare_deadline_only(["vo_find_services"], ("reg.g-vo.org",), reason="pyvo.registry.search() uses its own sessionless client")
     declare(["vo_list_tables"], _fixed("VO TAP x2 phases", 90.0))
     declare(["vo_describe_table"], _fixed("VO TAP x3 phases", 135.0))
-    declare(["vo_adql_query", "vo_cone_search"], _fixed("VO service", 45.0))
+    declare(["vo_cone_search"], _fixed("VO service", 45.0))
+    # mode=auto: a deadline-bounded sync attempt, then (budget permitting)
+    # submit POST + job GET + run POST; every request is clamped to the
+    # remaining tool budget by the VO session.
+    declare_loop(["vo_adql_query"], lambda: {"sync attempt (mode=auto, VO_AUTO_SYNC_TIMEOUT)": 20.0,
+                                             "each VO TAP request": 45.0}, reason=PHASES)
+    # status = job GET (+ optional UWS WAIT <= 20s); results = job GET + result
+    # download (<= VO_ASYNC_MAXREC_CAP rows); abort = job GET + phase POST.
+    declare_loop(["vo_tap_job"], _fixed("each VO UWS request", 45.0), reason=PHASES)
+    # SIA2 capabilities probe + query (+ SIA1 retry on a failed probe).
+    declare_loop(["vo_image_search"], _fixed("each VO SIA request", 45.0), reason=PHASES)
     # ── web ───────────────────────────────────────────────────────────
-    declare(["web_search"], _web_search, TAVILY_HOSTS)
+    declare(["web_search"], _web_search, WEB_SEARCH_HOSTS)
     declare(["web_extract_url"], _fixed("Tavily extract", 60.0), TAVILY_HOSTS)
     declare(["web_research_status"], _fixed("Tavily research status", 30.0), TAVILY_HOSTS)
     declare_deadline_only(["web_map_site", "web_crawl_site", "web_research"], TAVILY_HOSTS,
@@ -1033,9 +1067,33 @@ def _declare_defaults() -> None:
     declare(["datalab_selection_diagram"], _datalab_sql(1), DATALAB_HOSTS)
     declare_loop(["datalab_target_class_summary"], _datalab_sql(1), DATALAB_HOSTS,
                  reason="two server-side aggregates (n(z), footprint); each clamped")
+    declare_loop(["datalab_sed_sample"], _merge(_datalab_sql(1), _fixed("SVO FPS per filter (cached)", 30.0)),
+                 DATALAB_HOSTS + SVO_HOSTS,
+                 reason="one bounded LS DR9 cone select, then SVO effective wavelengths for the five filters (cached)")
     declare_loop(["datalab_satellite_search"], _merge(_datalab_sql(1), _datalab_sia, _datalab_tile),
                  DATALAB_SQL_HOSTS + DATALAB_SIA_HOSTS,
                  reason="tiled density scan, then one SIA + tile per peak and one CMD SQL per candidate; all clamped")
+    # ── Archive catalogue tools (capabilities/catalogs.py, 2026-09) ────
+    # integrations/archive_tap.py sizes every TAP POST with bounded_timeout
+    # (default 45 s), so each call is clamped to the remaining tool budget.
+    tap = _fixed("TAP query (ArchiveTapClient default, clamped)", 45.0)
+    declare_loop(["heasarc_observations"], _merge(_simbad, tap), HEASARC_HOSTS,
+                 reason="COUNT/SUM, row and public-count TAP queries in sequence; each clamped")
+    declare_loop(["exoplanet_archive"], tap, EXOPLANET_HOSTS,
+                 reason="TAP_SCHEMA lookups (cached) then 2 to 4 TAP queries; each clamped")
+    declare_loop(["simbad_query"], _merge(_simbad, tap), SIMBAD_HOSTS,
+                 reason="one TAP query per identifier (<= 25) or position (<= 50); each clamped")
+    declare_loop(["gaia_archive_query"], _merge(_simbad, tap), GAIA_HOSTS + SIMBAD_HOSTS,
+                 reason="SIMBAD cross-id queries, then Gaia source / cone / variability queries; each clamped")
+    declare_loop(["catalog_find"], _merge(_fixed("VizieR keyword search (astroquery, clamped by hook)", 60.0), tap),
+                 VIZIER_HOSTS + TAPVIZIER_HOSTS + HEASARC_HOSTS + IRSA_HOSTS,
+                 reason="one keyword search or TAP_SCHEMA query per service")
+    declare_loop(["catalog_query", "catalog_crossmatch"], _merge(_simbad, tap),
+                 TAPVIZIER_HOSTS + IRSA_HOSTS + HEASARC_HOSTS + GAIA_HOSTS + SIMBAD_HOSTS + EXOPLANET_HOSTS,
+                 reason="TAP_SCHEMA lookup, COUNT and row pull per catalogue (two catalogues for a cross-match)")
+    declare(["tns_object"], _fixed("TNS object page GET", 30.0), TNS_HOSTS)
+    declare(["ztf_object"], _merge(_simbad, _fixed("ALeRCE cone + object + probabilities", 80.0)), ALERCE_HOSTS)
+    declare(["ads_search"], _ads, ADS_HOSTS)
 
 
 _declare_defaults()

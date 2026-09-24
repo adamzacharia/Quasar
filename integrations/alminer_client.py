@@ -51,6 +51,31 @@ ALMA_AQ_URL = "https://almascience.nrao.edu/aq/"
 DEFAULT_ROW_CAP = 5000
 
 
+def alminer_filter_frame(df: pd.DataFrame, *, band: Any = None, max_resolution_arcsec: Optional[float] = None,
+                         science_only: bool = False) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply the cone filters to a full ALminer frame (it has no filter
+    arguments). Token band match on band_list (A-08); unknown columns are left
+    alone and simply not reported as applied."""
+    from services.alma_science_queries import requested_bands, row_matches_band
+
+    applied: List[str] = []
+    if df is None or df.empty:
+        return df, applied
+    bands = requested_bands(band) if band is not None else []
+    b_col = next((c for c in ("band_list", "Band", "band") if c in df.columns), None)
+    if bands and b_col:
+        df = df[df[b_col].apply(lambda x: row_matches_band(x, bands))]
+        applied.append(f"band {', '.join(bands)}")
+    r_col = next((c for c in ("spatial_resolution", "resolution") if c in df.columns), None)
+    if max_resolution_arcsec is not None and r_col:
+        df = df[pd.to_numeric(df[r_col], errors="coerce") <= float(max_resolution_arcsec)]
+        applied.append(f"resolution <= {float(max_resolution_arcsec):g} arcsec")
+    if science_only and "science_observation" in df.columns:
+        df = df[df["science_observation"].astype(str).str.upper().isin({"T", "TRUE", "1"})]
+        applied.append("science observations only")
+    return df, applied
+
+
 def _row_cap(value, default=DEFAULT_ROW_CAP):
     """Keep the query, transport and truncation metadata on the same limit."""
     return max(1, min(int(default if value is None else value), 20000))
@@ -105,6 +130,14 @@ def run_bounded_source(fn, timeout: float):
         return None, str(exc) or exc.__class__.__name__, False
     return df, None, False
 
+
+
+
+def alminer_public_flag(public: Optional[bool]) -> Optional[bool]:
+    """Map our ``public`` flag onto ALMiner's three-state one: ALMiner reads
+    True = public only, False = PROPRIETARY ONLY, None = both. Ours: True =
+    public only, False/None = no restriction."""
+    return True if public else None
 
 class ALminerClient:
     """Client for interacting with ALMA archive via ALminer + the ALMA TAP"""
@@ -252,7 +285,12 @@ class ALminerClient:
                 raise ImportError("alminer is not installed")
             import alminer as _alminer
             print("[ALMA] ALminer search starting...")
-            df = _alminer.conesearch(ra, dec, search_radius=radius, public=public, print_targets=False)
+            # ALMiner semantics (live 2026-09-23, D16): search_radius is in ARCMIN
+            # (our radius is degrees -- 1/60 deg was a 1-arcsec search), and
+            # public=False means PROPRIETARY ONLY (None = both). Our public=False
+            # means "do not restrict to public".
+            df = _alminer.conesearch(ra, dec, search_radius=float(radius) * 60.0, public=alminer_public_flag(public),
+                                     print_targets=False)
             cone_meta.setdefault("footprint_mode", "point_only")
             cone_meta["adql"] = alma_cone_adql(ra, dec, radius, public=public, footprint=False)
             if cone_meta.get("filters"):
@@ -260,11 +298,18 @@ class ALminerClient:
             cone_meta["url"] = ALMA_TAP_URL
             cone_meta["note"] = (
                 "-- Reproducible equivalent of the executed alminer.conesearch"
-                f"(public={public}) call; alminer's internal ADQL is not captured byte-exactly."
+                f"(public={alminer_public_flag(public)}) call; alminer's internal ADQL is not captured byte-exactly."
             )
             df = df if df is not None else pd.DataFrame()
+            # Filter BEFORE the cap: capping first kept the first `top` rows of
+            # ALL bands and then filtered them client-side (D16 re-run: 100 ->
+            # 28 Band 6 rows while the cone held many more).
+            df, applied = alminer_filter_frame(df, **_filters)
+            if applied:
+                cone_meta["note_filters"] = f"alminer.conesearch has no band/resolution arguments; {', '.join(applied)} applied to the full result before the {top}-row cap."
             capped = df.head(top).copy()
-            capped.attrs.update(row_cap=top, truncated=len(df) >= top)
+            capped.attrs.update(row_cap=top, truncated=len(df) > top, total_count=len(df),
+                                filters_in_adql={})
             return capped
 
         failures: List[str] = []
@@ -306,15 +351,20 @@ class ALminerClient:
         )
 
     def search_by_position(self, ra: float, dec: float, radius: float = 1.0 / 60, public: bool = True,
-                           max_results: Optional[int] = None) -> pd.DataFrame:
+                           max_results: Optional[int] = None, *, band: Any = None,
+                           max_resolution_arcsec: Optional[float] = None, science_only: bool = False) -> pd.DataFrame:
         """
         Search ALMA archive by position (cone search over footprints).
         Default radius 1 arcmin = ALminer's documented default search radius.
         radius is in degrees (default ~1 arcmin)
         """
         try:
+            # Filters go INTO the TAP ADQL and are applied to the full ALminer
+            # frame before the row cap (D16 re-run: Band 6 was filtered after
+            # a 100-row all-band cap).
             return self._parallel_search(float(ra), float(dec), radius=float(radius),
-                                         public=public, max_results=max_results)
+                                         public=public, max_results=max_results, band=band,
+                                         max_resolution_arcsec=max_resolution_arcsec, science_only=science_only)
         except Exception as e:
             print(f"[ALMA] Position search error: {e}")
             return _errored_frame(f"ALMA position search failed: {e}")
@@ -331,7 +381,7 @@ class ALminerClient:
         try:
             search_dict = {key: value if isinstance(value, list) else [str(value)]
                            for key, value in keywords.items()}
-            df = alminer.keysearch(search_dict, public=public, print_targets=False)
+            df = alminer.keysearch(search_dict, public=alminer_public_flag(public), print_targets=False)
             if df is None:
                 return pd.DataFrame()
             return self._standardize_columns(df)

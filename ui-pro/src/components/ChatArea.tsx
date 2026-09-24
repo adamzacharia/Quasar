@@ -13,11 +13,21 @@ import type { ResearchGraph } from "./ObservationPaperGraph";
 import { DownloadProgress } from "./DownloadProgress";
 import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
-import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSource } from "../lib/types";
+import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSearchMode, WebSource } from "../lib/types";
 import { normalizeEvidenceQuality } from "../lib/evidence-quality";
 import { normalizeHipsImageMeta } from "../lib/hips-imagery";
 import { PREFILL_PROMPT_EVENT } from "../lib/prompt-dispatch";
 import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
+import {
+    hasEvidenceIds,
+    normalizeWebSource as normalizeCitedSource,
+    webSourcesForTurn,
+    webSourcesMessageView,
+    normalizeWebDecision,
+    normalizeWebSearchMode,
+} from "../lib/web-citations.js";
+
+const WEB_SEARCH_MODE_KEY = "quasar-web-search-mode";
 import { buildObservationPaperGraph } from "../lib/research-graph";
 import { useAuthStore, verifyAuth } from "../lib/auth-store";
 import { shouldBlockSend, unratedBlocks, nudgeText } from "../lib/eval-mode";
@@ -31,6 +41,7 @@ export function ChatArea() {
     const {
         messages, addMessage, mergeWebSourcesMessage, updateLastAssistantMessage, updateLastAssistantThinking,
         updateLastAssistantRunMeta, updateLastAssistantUsage, updateLastAssistantToolTrace,
+        setLastAssistantWebDecision,
         isStreaming, setStreaming,
         toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -66,7 +77,29 @@ export function ChatArea() {
     // Composer options + visit counter live here (not in ChatInput) so they
     // persist across the hero→docked switch and the hit endpoint fires once.
     const [grounded, setGrounded] = useState(false);
-    const [webSearch, setWebSearch] = useState(true);
+    // Web search mode (Phase 2): off | auto | always, remembered per browser.
+    // Read after mount so the server-rendered markup matches the first client
+    // render; every localStorage access is wrapped (private mode, blocked
+    // storage, quota) and falls back to "auto".
+    const [webSearchMode, setWebSearchModeState] = useState<WebSearchMode>("auto");
+    useEffect(() => {
+        try {
+            const stored = window.localStorage.getItem(WEB_SEARCH_MODE_KEY);
+            // eslint-disable-next-line react-hooks/set-state-in-effect
+            setWebSearchModeState(normalizeWebSearchMode(stored) as WebSearchMode);
+        } catch {
+            /* storage unavailable: keep "auto" */
+        }
+    }, []);
+    const setWebSearchMode = useCallback((mode: WebSearchMode) => {
+        const clean = normalizeWebSearchMode(mode) as WebSearchMode;
+        setWebSearchModeState(clean);
+        try {
+            window.localStorage.setItem(WEB_SEARCH_MODE_KEY, clean);
+        } catch {
+            /* storage unavailable: the choice lives for this page only */
+        }
+    }, []);
     const [hitCount, setHitCount] = useState<number | null>(null);
     useEffect(() => {
         const controller = new AbortController();
@@ -258,6 +291,7 @@ export function ChatArea() {
         provider?: unknown;
         image_provider?: unknown;
         search_type?: unknown;
+        replace?: unknown;
     }) => {
         const isWebSource = (source: WebSource | null): source is WebSource => source !== null;
         const isWebImage = (image: WebImage | null): image is WebImage => image !== null;
@@ -288,7 +322,11 @@ export function ChatArea() {
             const item = source as Record<string, unknown>;
             const url = normalizeUrl(item.url || item.link || item.href || item.source_url || "");
             if (!url) return null;
-            const normalized = {
+            // Grounded evidence fields (id, cited, date, domain, provider)
+            // ride along; normalizeCitedSource keeps them (web search redesign).
+            const evidence = normalizeCitedSource(item) || {};
+            const normalized: WebSource = {
+                ...evidence,
                 title: String(item.title || item.name || titleFromUrl(url)).trim(),
                 url,
                 snippet: String(item.snippet || item.content || item.text || item.description || "").trim(),
@@ -348,6 +386,7 @@ export function ChatArea() {
             imageProvider: String(data.image_provider || "").trim(),
             searchType: String(data.search_type || "").trim(),
             query: String(data.query || "").trim(),
+            replace: Boolean(data.replace),
         };
     }, []);
 
@@ -360,7 +399,7 @@ export function ChatArea() {
         setStreaming(false);
     }, [attachThinkingToLastMessage, setStreaming]);
 
-    const handleSend = useCallback(async (text: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean; webSearch?: boolean }) => {
+    const handleSend = useCallback(async (text: string, attachments?: AttachedFile[], options?: { groundedSummary?: boolean; webSearch?: boolean; webSearchMode?: WebSearchMode }) => {
         const hasContent = text.trim() || (attachments && attachments.length > 0);
         if (!hasContent || isStreaming) return;
 
@@ -482,16 +521,8 @@ export function ChatArea() {
                     }
                 }, controller.signal);  // S5 auth rides the httpOnly cookie (credentials: "include")
             } else {
-                // Standard workflow
-                let accumulatedWebSources: {
-                    sources: WebSource[];
-                    images: WebImage[];
-                    provider?: string;
-                    imageProvider?: string;
-                    searchType?: string;
-                    query?: string;
-                } | null = null;
-
+                // Standard workflow. Web sources attach to the turn as they
+                // arrive (onWebSources), so nothing is buffered for the end.
                 await sendChatMessage(
                     {
                         message: messageWithContext,
@@ -501,11 +532,18 @@ export function ChatArea() {
                         attachments: attachments?.map(a => a.file),
                         grounded_summary: Boolean(options?.groundedSummary),
                         web_search: options?.webSearch !== false,
+                        // Phase 2: the explicit mode wins server-side; the boolean stays
+                        // for older backends (true = auto, false = off).
+                        web_search_mode: options?.webSearchMode ? normalizeWebSearchMode(options.webSearchMode) : undefined,
                     },
                     {
                         onToken: (token: string) => {
                             accumulated += token;
                             updateLastAssistantMessage(accumulated, ownerFor());
+                        },
+                        onWebDecision: (decision) => {
+                            const clean = normalizeWebDecision(decision);
+                            if (clean) setLastAssistantWebDecision(clean, ownerFor());  // UI-01
                         },
                         onThought: (thought: string) => {
                             accumulatedThought += thought;
@@ -696,23 +734,12 @@ export function ChatArea() {
                             const normalized = normalizeWebSourcesPayload(data);
                             if (normalized.sources.length === 0 && normalized.images.length === 0) return;
 
-                            if (!accumulatedWebSources) {
-                                accumulatedWebSources = {
-                                    sources: normalized.sources,
-                                    images: normalized.images,
-                                    provider: normalized.provider,
-                                    imageProvider: normalized.imageProvider,
-                                    searchType: normalized.searchType,
-                                    query: normalized.query,
-                                };
-                            } else {
-                                accumulatedWebSources.sources = [...accumulatedWebSources.sources, ...normalized.sources];
-                                accumulatedWebSources.images = [...accumulatedWebSources.images, ...normalized.images];
-                                if (normalized.provider) accumulatedWebSources.provider = normalized.provider;
-                                if (normalized.imageProvider) accumulatedWebSources.imageProvider = normalized.imageProvider;
-                                if (normalized.searchType) accumulatedWebSources.searchType = normalized.searchType;
-                                if (normalized.query) accumulatedWebSources.query = normalized.query;
-                            }
+                            // Attach to the CURRENT turn right away: the sources strip
+                            // shows while the answer is still being written (web search
+                            // redesign 1.7). The server re-sends the merged list on every
+                            // event, so the merge is idempotent; `replace` (the final,
+                            // post-answer listing) carries the cited flags.
+                            mergeWebSourcesMessage(normalized, ownerFor());
                         },
                         onDownloadProgress: (data) => {
                             setDownloadProgress(data);
@@ -779,11 +806,6 @@ export function ChatArea() {
                             // stream — a finished background stream must touch neither.
                             if (ownerIsActive()) attachThinkingToLastMessage();
 
-                            // Merge web sources now that text generation is complete
-                            if (accumulatedWebSources) {
-                                mergeWebSourcesMessage(accumulatedWebSources, ownerFor());
-                            }
-
                             if (ownerIsActive()) setStreaming(false);
                             // Reload conversation list from server so new/updated chats appear in sidebar
                             if (isAuthenticated) {
@@ -795,9 +817,6 @@ export function ChatArea() {
                         // presenting the truncated text as a clean completion.
                         onIncomplete: (partialText: string) => {
                             if (ownerIsActive()) attachThinkingToLastMessage();
-                            if (accumulatedWebSources) {
-                                mergeWebSourcesMessage(accumulatedWebSources, ownerFor());
-                            }
                             updateLastAssistantMessage(
                                 (partialText.trim() ? partialText + "\n\n" : "") +
                                 "⚠️ *The response ended unexpectedly — this answer may be incomplete.*",
@@ -847,10 +866,6 @@ export function ChatArea() {
                             }
 
                             // Merge web sources on error too if they were retrieved
-                            if (accumulatedWebSources) {
-                                mergeWebSourcesMessage(accumulatedWebSources, ownerFor());
-                            }
-
                             if (ownerIsActive()) setStreaming(false);  // UI-01
                         },
                     },
@@ -992,7 +1007,18 @@ export function ChatArea() {
                                 return -1;
                             })();
 
+                            // Grounded web evidence (ids W1..Wn): the answer's own
+                            // message renders the sources strip, the [W#] chips and
+                            // the cited-first grid, so the separate sources block of
+                            // that turn is hidden once the turn has an answer message.
                             return messages.map((msg, i) => {
+                                const webForTurn = msg.role === "assistant" && msg.type === "text"
+                                    ? (webSourcesForTurn(messages, i) as WebSource[]) : [];
+                                const groundedWeb = hasEvidenceIds(webForTurn);
+                                // web image tiles still render from the sources message (guard CX-20)
+                                const webView = webSourcesMessageView(messages, i);
+                                if (webView === "hide") return null;
+                                if (webView === "images-only") msg = { ...msg, webSources: [] };
                                 const isLastAssistant = isStreaming && i === lastTextAssistantIdx;
                                 // Task execution state persists AFTER streaming ends
                                 // so the widget auto-collapses instead of vanishing.
@@ -1021,6 +1047,7 @@ export function ChatArea() {
                                         taskExecutionState={execState}
                                         observationGraph={turnGraphs[msg.id]}
                                         reportPrompt={reportPrompt}
+                                        turnWebSources={msg.type === "text" && groundedWeb ? webForTurn : undefined}
                                     />
                                 );
                             });
@@ -1074,7 +1101,7 @@ export function ChatArea() {
                 <ChatInput
                     onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
                     grounded={grounded} onGroundedChange={setGrounded}
-                    webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
+                    webSearchMode={webSearchMode} onWebSearchModeChange={setWebSearchMode} hitCount={hitCount}
                 />
               </>
             ) : (
@@ -1089,7 +1116,7 @@ export function ChatArea() {
                         <ChatInput
                             variant="hero" onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
                             grounded={grounded} onGroundedChange={setGrounded}
-                            webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
+                            webSearchMode={webSearchMode} onWebSearchModeChange={setWebSearchMode} hitCount={hitCount}
                         />
                     )}
                 />
@@ -1097,7 +1124,7 @@ export function ChatArea() {
                     <ChatInput
                         onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
                         grounded={grounded} onGroundedChange={setGrounded}
-                        webSearch={webSearch} onWebSearchChange={setWebSearch} hitCount={hitCount}
+                        webSearchMode={webSearchMode} onWebSearchModeChange={setWebSearchMode} hitCount={hitCount}
                     />
                 )}
               </>

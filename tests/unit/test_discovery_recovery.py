@@ -725,3 +725,47 @@ def test_failed_mirror_is_tried_last_until_its_cooldown_expires(monkeypatch):
         AlmaTapService().search('SELECT nope FROM ivoa.obscore')
     assert AlmaTapService._cooldown == {}
 
+
+
+@pytest.mark.parametrize('public,expected', [(False, None), (None, None), (True, True)])
+def test_alminer_fallback_uses_arcmin_radius_and_alminers_three_state_public_flag(monkeypatch, public, expected):
+    """Live 2026-09-23 D16: the ALMiner fallback passed public=False (ALMiner:
+    PROPRIETARY ONLY) and a radius in degrees (ALMiner: arcmin -> a 1-arcsec
+    search), so M83 Band 6 returned only two proprietary Cycle-2025 projects."""
+    def bad(query, *, maxrec):
+        raise RuntimeError('transport unavailable')
+    seen = {}
+    monkeypatch.setattr(ALminerClient, '_get_tap_service', lambda self: NS(search=bad))
+    monkeypatch.setattr('integrations.alminer_client.ALMINER_AVAILABLE', True)
+    monkeypatch.setattr('integrations.alminer_client.alminer.conesearch',
+                        lambda ra, dec, **k: seen.update(k) or pd.DataFrame())
+    ALminerClient().search_by_position(204.2538, -29.8658, radius=1.0 / 60, public=public)
+    assert abs(seen['search_radius'] - 1.0) < 1e-9, seen  # 1 arcmin, not 1 arcsec
+    assert seen['public'] is expected
+
+
+def test_alminer_fallback_filters_by_band_before_the_row_cap(monkeypatch):
+    """D16 re-run 2026-09-23: the fallback kept the first 100 rows of ALL bands
+    and filtered Band 6 afterwards (100 -> 28), hiding most Band 6 datasets."""
+    def bad(query, *, maxrec):
+        raise RuntimeError('transport unavailable')
+    rows = pd.DataFrame({
+        'band_list': ['3'] * 150 + ['6'] * 60 + ['5 6'] * 5,
+        'spatial_resolution': [0.5] * 215,
+        'member_ous_uid': [f'uid://A001/X1/X{i}' for i in range(215)],
+    })
+    monkeypatch.setattr(ALminerClient, '_get_tap_service', lambda self: NS(search=bad))
+    monkeypatch.setattr('integrations.alminer_client.ALMINER_AVAILABLE', True)
+    monkeypatch.setattr('integrations.alminer_client.alminer.conesearch', lambda ra, dec, **k: rows.copy())
+    out = ALminerClient().search_by_position(204.2538, -29.8658, radius=0.05, public=True, max_results=100, band=6)
+    bands = out['band_list'] if 'band_list' in out.columns else out['Band']
+    assert len(out) == 65 and all('6' in str(b).split() for b in bands)
+    assert out.attrs.get('truncated') is False
+
+
+def test_alminer_filter_frame_reports_what_it_applied():
+    from integrations.alminer_client import alminer_filter_frame
+    df = pd.DataFrame({'band_list': ['6', '7', '6'], 'spatial_resolution': [0.3, 0.3, 2.0], 'science_observation': ['T', 'T', 'F']})
+    out, applied = alminer_filter_frame(df, band=6, max_resolution_arcsec=1.0, science_only=True)
+    assert len(out) == 1 and applied == ['band 6', 'resolution <= 1 arcsec', 'science observations only']
+    assert alminer_filter_frame(df)[1] == []

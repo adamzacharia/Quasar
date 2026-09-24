@@ -147,6 +147,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
                     "mag_auto_g", "mag_auto_r", "mag_auto_i", "mag_auto_z",
                     "mag_auto_g_dered", "mag_auto_r_dered", "mag_auto_i_dered", "mag_auto_z_dered",
                     "magerr_auto_g", "magerr_auto_r", "magerr_auto_i", "magerr_auto_z",
+                    "fluxerr_auto_g", "fluxerr_auto_r", "fluxerr_auto_i", "fluxerr_auto_z",
                     "flags_g", "flags_r", "flags_i", "flags_z",
                     "spread_model_g", "spread_model_r", "spread_model_i", "spread_model_z",
                     "spreaderr_model_r",
@@ -297,6 +298,7 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
                 "columns": [
                     "targetid", "mean_fiber_ra", "mean_fiber_dec",
                     "z", "zerr", "zwarn", "spectype", "desi_target", "survey", "main_primary",
+                    "zcat_primary",
                 ],
                 "ra_column": "mean_fiber_ra",
                 "dec_column": "mean_fiber_dec",
@@ -747,21 +749,65 @@ _POINT_SOURCE_CUTS = {
 # tools unless the caller supplies its own cut on the same column. Live P11:
 # DESI LRG counts without zwarn/survey/main_primary were verified 11-27%
 # inflated per redshift bin; DES colors without flags stretched CCD axes.
+# 2026-09-24: the survey='main' + main_primary pair also DROPPED every target
+# observed only in SV (live, COSMOS 0.3 deg: 826 rows kept of 3284 distinct
+# zwarn=0 targets). zcat_primary is DESI's cross-survey dedup flag: exactly one
+# row per targetid (3284 = COUNT(DISTINCT targetid)), so it keeps the
+# duplicate protection without the survey bias (ArchiveBench AB-D-32).
 _DEFAULT_QUALITY_CUTS: Dict[str, List[Dict[str, Any]]] = {
     "desi_dr1.zpix": [
         {"column": "zwarn", "op": "=", "value": 0},
-        {"column": "survey", "op": "=", "value": "main"},
-        {"column": "main_primary", "op": "=", "value": "true"},
+        {"column": "zcat_primary", "op": "=", "value": "true"},
     ],
     "des_dr1.main": [
         {"column": "flags_g", "op": "=", "value": 0},
         {"column": "flags_r", "op": "=", "value": 0},
         {"column": "flags_i", "op": "=", "value": 0},
+        # A zero/negative flux error marks a failed measurement (DES DR1 CCD
+        # reference query; DataLabBench DLB-05 C7).
+        {"column": "fluxerr_auto_g", "op": ">", "value": 0},
+        {"column": "fluxerr_auto_r", "op": ">", "value": 0},
+        {"column": "fluxerr_auto_i", "op": ">", "value": 0},
     ],
     "sdss_dr17.specobj": [
         {"column": "zwarning", "op": "=", "value": 0},
     ],
 }
+
+
+# Magnitude window for colour-colour diagrams: keeps saturated (bright) and
+# noise-dominated (faint) sources off the colour axes. Applied by the CCD tool
+# only, never to counts or row pulls; a caller cut on the column wins.
+_CCD_MAG_WINDOWS: Dict[str, Dict[str, Any]] = {
+    "des_dr1.main": {"column": "mag_auto_i", "min": 16.0, "max": 23.0},
+}
+
+
+# Faint depth bound for colour-magnitude diagrams when the caller gives none:
+# beyond it the photometry is noise-dominated and the star/galaxy split fails
+# (NSC DR2: g, r < 24, the DataLabBench DLB-03 reference convention).
+_CMD_DEPTH_BOUNDS: Dict[str, float] = {
+    "nsc_dr2.object": 24.0,
+}
+
+
+def cmd_depth_bound(catalog: str, table: str) -> Optional[float]:
+    """Registered faint magnitude bound for CMDs of a table, or None."""
+    try:
+        qualified = describe_table(catalog, table)["qualified_name"]
+    except (KeyError, ValueError):
+        return None
+    return _CMD_DEPTH_BOUNDS.get(qualified)
+
+
+def ccd_magnitude_window(catalog: str, table: str) -> Optional[Dict[str, Any]]:
+    """Registered CCD magnitude window for a table (a copy), or None."""
+    try:
+        qualified = describe_table(catalog, table)["qualified_name"]
+    except (KeyError, ValueError):
+        return None
+    window = _CCD_MAG_WINDOWS.get(qualified)
+    return dict(window) if window else None
 
 
 def default_quality_cuts(catalog: str, table: str) -> List[Dict[str, Any]]:
@@ -1807,6 +1853,10 @@ TABLE_PROFILE_INFO: Dict[str, Dict[str, Any]] = {
             "magerr_auto_r": ("float", "mag", "uncertainty", "AUTO r magnitude uncertainty."),
             "magerr_auto_i": ("float", "mag", "uncertainty", "AUTO i magnitude uncertainty."),
             "magerr_auto_z": ("float", "mag", "uncertainty", "AUTO z magnitude uncertainty."),
+            "fluxerr_auto_g": ("float", None, "uncertainty", "AUTO g flux uncertainty; fluxerr_auto_<b> > 0 drops failed measurements."),
+            "fluxerr_auto_r": ("float", None, "uncertainty", "AUTO r flux uncertainty."),
+            "fluxerr_auto_i": ("float", None, "uncertainty", "AUTO i flux uncertainty."),
+            "fluxerr_auto_z": ("float", None, "uncertainty", "AUTO z flux uncertainty."),
             "flags_g": ("integer", None, "quality", "SExtractor flags in g; flags_<b> = 0 selects clean photometry."),
             "flags_r": ("integer", None, "quality", "SExtractor flags in r."),
             "flags_i": ("integer", None, "quality", "SExtractor flags in i."),
@@ -1922,6 +1972,7 @@ TABLE_PROFILE_INFO: Dict[str, Dict[str, Any]] = {
             "desi_target": ("integer", None, "category", "Targeting bitmask (LRG bit 0, ELG bit 1, QSO bit 2, BGS_ANY 60, MWS_ANY 61)."),
             "survey": ("string", None, "category", "Survey phase; survey = 'main' for the main survey."),
             "main_primary": ("boolean", None, "quality", "True for the primary main-survey spectrum of the target."),
+            "zcat_primary": ("boolean", None, "quality", "True for the ONE best spectrum of each target across all surveys (sv1/sv2/sv3/main/special): deduplicates without dropping SV-only fields."),
         },
     },
     "sdss_dr17.specobj": {
@@ -2268,7 +2319,7 @@ _PROFILE_PITFALLS = [
     },
     {
         "id": "desi_quality",
-        "summary": "DESI zpix reliability cuts: zwarn = 0 AND survey = 'main' AND main_primary; object class via spectype ('GALAXY'|'QSO'|'STAR')",
+        "summary": "DESI zpix cuts: zwarn = 0 AND zcat_primary (one spectrum per target, all surveys; survey='main' drops SV-only fields); class via spectype",
         "applies_to": [{"kind": "table", "ref": "desi_dr1.zpix"}],
     },
     {
@@ -2280,6 +2331,33 @@ _PROFILE_PITFALLS = [
         "id": "vhs_naming",
         "summary": "the VHS DR5 relation is vhs_dr5.vhs_cat_v3 with coordinates ra2000/dec2000 (not ra/dec); JHKs are Vega",
         "applies_to": [{"kind": "table", "ref": "vhs_dr5.vhs_cat_v3"}],
+    },
+    {
+        # Error-hint channel + live audit (verified 2026-09-24): Data Lab's TAP
+        # hands ADQL geometry to PostgreSQL untranslated, and the resulting
+        # "function point(...) does not exist" never suggests q3c.
+        "id": "adql_geometry_unsupported",
+        "summary": "Data Lab TAP rejects ADQL CONTAINS/POINT/CIRCLE ('function point(...) does not exist'): use q3c_radial_query(ra, dec, ra0, dec0, r_deg) = 't'",
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+        "error_triggers": ["CONTAINS(", "POINT(", "CIRCLE(", "INTERSECTS(", "function point"],
+        "audit": {
+            "expect": "error",
+            "endpoint_id": "datalab_tap",
+            "adql": ("SELECT TOP 3 ra, dec FROM smash_dr2.object WHERE "
+                     "1=CONTAINS(POINT('ICRS',ra,dec),CIRCLE('ICRS',185.43,-31.99,0.2))"),
+            "error_contains": "does not exist",
+        },
+    },
+    {
+        "id": "q3c_cone_works",
+        "summary": "cones on Data Lab tables: q3c_radial_query(ra, dec, ra0, dec0, radius_deg) = 't' uses the spatial index",
+        "applies_to": [{"kind": "archive", "ref": "datalab"}],
+        "audit": {
+            "expect": "nonempty",
+            "endpoint_id": "datalab_tap",
+            "adql": ("SELECT TOP 3 ra, dec FROM smash_dr2.object WHERE "
+                     "q3c_radial_query(ra, dec, 185.43, -31.99, 0.2) = 't'"),
+        },
     },
     {
         "id": "expansion_live_schema",

@@ -197,12 +197,33 @@ class DistanceService:
 
         response = requests.get(NED_DISTANCE_ENDPOINT, params={"name": target}, timeout=self.timeout)
         response.raise_for_status()
-        tables = pd.read_html(response.text)
-        for table in tables:
-            columns = list(getattr(table, "columns", []))
-            if _find_ned_column(columns, "modulus") or _find_ned_column(columns, "mpc"):
-                return table
+        import io
+
+        tables = pd.read_html(io.StringIO(response.text))
+        return _pick_ned_measurement_table(tables, target)
+
+
+def _pick_ned_measurement_table(tables: Sequence[Any], target: str) -> Any:
+    """Choose the per-measurement NED-D table, not the summary-statistics one.
+
+    The nDistance page leads with a small summary table (mean / median / std
+    of the moduli per method) that also has a modulus column; taking the first
+    such table reported 5 "measurements" for a galaxy with over a hundred
+    (ArchiveBench AB-D-29). The measurement table is the one that carries
+    per-row provenance (a refcode and/or method column); among those, the
+    largest wins. Only when no table has provenance columns does the largest
+    distance table stand in."""
+    with_distance = []
+    for table in tables:
+        columns = list(getattr(table, "columns", []))
+        if _find_ned_column(columns, "modulus") or _find_ned_column(columns, "mpc"):
+            has_ref = bool(_find_ned_column(columns, "refcode"))
+            has_method = bool(_find_ned_column(columns, "method"))
+            with_distance.append((has_ref, has_method, len(table), table))
+    if not with_distance:
         raise ValueError(f"NED returned no distance table for {target!r}")
+    with_distance.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    return with_distance[0][3]
 
 
 def _gaia_adql(ra: float, dec: float, radius_deg: float, max_rows: int) -> str:

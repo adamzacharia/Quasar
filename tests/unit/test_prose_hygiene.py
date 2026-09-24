@@ -103,3 +103,27 @@ def test_code_is_protected_from_global_cleanups():
     assert "x = Tap()\n~~~\nstill = code()" in out
     assert "``tricky `inline` ()``" in out
     assert "Line one  \nline two" in out and "`datalab_sql_query`" not in out
+
+
+
+def test_article_doubling_across_a_humanised_code_span_is_collapsed():
+    """UI 2026-09-23 D07: "Use the `list_alma_files` tool" read "Use the the
+    ALMA file listing tool" -- the doubling only exists after the join."""
+    from core.prose_hygiene import humanize_prose
+
+    out = humanize_prose("Use the `list_alma_files` tool, then the `inspect_fits_header` tool and `x = f()`.",
+                         ["list_alma_files", "inspect_fits_header"])
+    assert "the the" not in out.lower()
+    assert "Use the ALMA file listing, then the inspect FITS header step and `x = f()`." == out
+
+
+def test_a_determiner_absorbs_the_labels_article_across_emphasis_and_adjectives():
+    """UI re-run 2026-09-23: "The **the archive image overlay** call" (D19) and
+    "in a new the ALMA position search" (D16)."""
+    from core.prose_hygiene import humanize_prose
+
+    names = ["archive_overlay", "search_by_position"]
+    assert humanize_prose("The **archive_overlay** call was able to locate it.", names) == "The **archive image overlay** was able to locate it."
+    assert humanize_prose("Set it in a new search_by_position call.", names) == "Set it in a new ALMA position search call."
+    assert humanize_prose("archive_overlay found it. search_by_position too.", names) == "The archive image overlay found it. The ALMA position search too."
+    assert "\x01" not in humanize_prose("I used search_by_position.", names)

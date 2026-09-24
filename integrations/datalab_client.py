@@ -104,6 +104,36 @@ class DatalabClient:
 
     _AS_MATERIALIZED_RE = re.compile(r"\bAS\s+(?:NOT\s+)?MATERIALIZED\b", re.IGNORECASE)
 
+    _SPECIAL_FLOAT_CAST_RE = re.compile(
+        r"'(Infinity|-Infinity|NaN)'\s*::\s*(?:float8|float4|double\s+precision|real|numeric)\b", re.IGNORECASE
+    )
+
+    # Single-quoted literals ('' escapes) AND PostgreSQL dollar-quoted strings
+    # ($$...$$ / $tag$...$tag$): both are opaque tokens (CX-12 verify).
+    # ... and double-quoted identifiers ("col 'x'") (CX-17 verify 2).
+    _SQL_STRING_LITERAL_RE = re.compile(r"\$(\w*)\$.*?\$\1\$|\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'", re.S)
+    _CAST_SUFFIX_RE = re.compile(r"\s*::\s*(?:float8|float4|double\s+precision|real|numeric)\b", re.IGNORECASE)
+
+    @classmethod
+    def _strip_special_float_casts(cls, text: str) -> str:
+        """Drop `::float8`-style casts that follow a WHOLE special-float literal
+        ('Infinity', '-Infinity', 'NaN'). Quote-aware (guard CX-12): a string
+        literal that merely contains such text is one token and is never
+        rewritten."""
+        out: List[str] = []
+        pos = 0
+        for m in cls._SQL_STRING_LITERAL_RE.finditer(text):
+            if m.start() < pos:
+                continue
+            out.append(text[pos:m.end()])
+            pos = m.end()
+            if m.group(0).startswith("'") and m.group(0)[1:-1].lower() in ("infinity", "-infinity", "nan"):
+                cast = cls._CAST_SUFFIX_RE.match(text, pos)
+                if cast:
+                    pos = cast.end()
+        out.append(text[pos:])
+        return "".join(out)
+
     @classmethod
     def strip_materialized_for_async(cls, query_text: str) -> str:
         """Drop PostgreSQL `AS [NOT] MATERIALIZED` CTE fences for async jobs.
@@ -117,6 +147,12 @@ class DatalabClient:
         """
 
         text = str(query_text or "")
+        # JSQLParser also rejects the PostgreSQL `::` cast ("Lexical error ...
+        # Encountered ':'" -- live 2026-09-23, the NaN guards
+        # `col < 'Infinity'::float8`). A bare special-float literal is
+        # coerced to the column's float type by PostgreSQL, so
+        # `col < 'Infinity'` keeps the exact semantics (NaN and +inf excluded).
+        text = cls._strip_special_float_casts(text)
         if "materialized" not in text.lower():
             return text
         parts = text.split("'")

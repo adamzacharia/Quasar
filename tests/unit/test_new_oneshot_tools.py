@@ -340,10 +340,15 @@ def test_stream_selection_sql_carries_pm_window_and_cmd_mask_and_passes_the_poli
         cmd_mask={"color_min": 0.1, "color_max": 0.9, "g_min": 16, "g_max": 23}, match_arcsec=1.0, small_limit=50000, limit=5000,
     )
     assert "AND pmra BETWEEN -3.7000 AND -1.7000" in sql and "AND pmdec BETWEEN -3.6000 AND -1.6000" in sql
-    assert "WHERE (big.gmag - big.rmag) BETWEEN 0.100 AND 0.900" in sql and "big.gmag BETWEEN 16.000 AND 23.000" in sql
-    assert "big.class_star > 0.5" in sql and "MATERIALIZED" in sql and "q3c_join" in sql
-    # The PM window sits INSIDE the Gaia CTE (before its ORDER BY), the mask after the join.
-    assert sql.index("pmra BETWEEN") < sql.index("ORDER BY q3c_dist(ra, dec") < sql.index("q3c_join") < sql.index("big.gmag - big.rmag")
+    assert "WHERE (big_gmag - big_rmag) BETWEEN 0.100 AND 0.900" in sql and "big_gmag BETWEEN 16.000 AND 23.000" in sql
+    assert "big_class_star > 0.5" in sql and sql.count("AS MATERIALIZED") == 2 and "q3c_join" in sql
+    # JOIN-FIRST (live 2026-09-23 L09: > 90 s -> 3-4 s): the PM window sits INSIDE
+    # the Gaia CTE, the index join in its OWN materialized CTE, the CMD mask on
+    # the joined set -- never in the join's WHERE.
+    assert sql.index("pmra BETWEEN") < sql.index("ORDER BY q3c_dist(ra, dec") < sql.index("q3c_join") \
+        < sql.index("SELECT * FROM m") < sql.index("big_gmag - big_rmag")
+    join_cte = sql[sql.index("m AS MATERIALIZED"):sql.index("SELECT * FROM m")]
+    assert "gmag" not in join_cte.split("q3c_join")[1], "no photometric predicate beside the index join"
     validated = datalab_sql_policy.validate(sql, source="builder", meta=meta)
     assert "pmra BETWEEN" in validated.sql and meta["stream_selection"]["cmd_mask"]["g_max"] == 23
 
@@ -535,3 +540,92 @@ def test_satellite_aperture_peaks_find_a_dwarf_beside_a_brighter_smooth_host():
     peaks = datalab_tools.SatelliteSearch.aperture_peaks(df, step, max_candidates=5)
     assert abs(peaks[0]["ra"] - 80.9) < 1e-3 and abs(peaks[0]["dec"] - 0.3) < 1e-3
     assert len(peaks) <= 5
+
+
+def test_satellite_search_custom_wide_region_is_gated_before_any_query(monkeypatch):
+    from services import datalab_orchestration as orch
+
+    def _boom(*a, **k):
+        raise AssertionError("no scan may run before confirmation")
+
+    monkeypatch.setattr(orch, "tiled_density_aggregate", _boom)
+    monkeypatch.setattr(orch, "_run_builder_sql", _boom)
+    cap = datalab_tools.SatelliteSearch()
+    out = cap.run(cap.InputModel(survey="delve", region={"ra": 30.0, "dec": -50.0, "radius": 5.0}), CallContext()).to_native()
+    assert out["status"] == "needs_confirmation" and out["scanned"] is False
+    assert out["sky_area"]["area_deg2"] == pytest.approx(math.pi * 25.0)
+
+
+def test_satellite_search_preset_area_is_reported_not_gated(monkeypatch):
+    from services import datalab_orchestration as orch
+
+    seen = {}
+
+    def _tiled(*a, **k):
+        seen["scanned"] = True
+        return {"result_id": None, "error": "stop here"}
+
+    monkeypatch.setattr(orch, "tiled_density_aggregate", _tiled)
+    cap = datalab_tools.SatelliteSearch()
+    out = cap.run(cap.InputModel(survey="delve", preset="delve_south"), CallContext(services={"datalab_client": object()})).to_native()
+    # The 5 deg preset exceeds the unconfirmed cap but is curated: it scans
+    # once, with no "re-call with confirm=true" round trip.
+    assert seen.get("scanned") is True and out.get("status") != "needs_confirmation"
+
+
+def test_bright_star_verdict_uses_the_legacy_surveys_mask_radius():
+    cand = {"ra": 30.0, "dec": -50.0}
+    verdict = datalab_tools.SatelliteSearch.bright_star_verdict
+    assert datalab_tools.SatelliteSearch.bright_star_mask_radius_deg(8.0) * 60 == pytest.approx(1.89, abs=0.02)
+    inside = pd.DataFrame({"ra": [30.0], "dec": [-50.02], "g": [8.2]})        # 1.2' < 1.77' mask
+    assert "G = 8.2" in verdict(cand, inside) and "artefact" in verdict(cand, inside)
+    # Hydra II (live): a G = 8.1 star 5.3' away must NOT veto a real dwarf.
+    assert verdict(cand, pd.DataFrame({"ra": [30.0], "dec": [-50.0883], "g": [8.1]})) is None
+    assert verdict(cand, pd.DataFrame({"ra": [30.0], "dec": [-50.02], "g": [10.5]})) is None   # 1.2' > 0.82'
+    assert verdict(cand, pd.DataFrame({"ra": [30.0], "dec": [-50.008], "g": [10.5]})) is not None
+    assert verdict(cand, pd.DataFrame()) is None
+
+
+def test_legacy_mask_verdict_flags_sga_galaxies_and_reports_coverage():
+    verdict = datalab_tools.SatelliteSearch.legacy_mask_verdict
+    # Live L15 values (2026-09-23): the 4.8 sigma peak vs a clean peak / outside LS.
+    covered, note = verdict({"n": 763, "n_galaxy": 10, "n_bright": 0})
+    assert covered and "large galaxy" in note
+    assert verdict({"n": 957, "n_galaxy": 0, "n_bright": 0}) == (True, None)
+    assert verdict({"n": 0, "n_galaxy": float("nan"), "n_bright": float("nan")}) == (False, None)
+    assert "bright-star mask" in verdict({"n": 300, "n_galaxy": 0, "n_bright": 5})[1]
+
+
+def test_wedge_selection_thins_uniformly_instead_of_truncating_in_storage_order():
+    from services import datalab_orchestration as orch
+
+    # Live 2026-09-23: 17 162 galaxies in RA 150-220 / Dec 0-5 / z <= 0.1; a
+    # bare LIMIT 5000 covered only RA 150-172.
+    assert orch.wedge_thinning(17162, 5000) == 4 and orch.wedge_thinning(4999, 5000) == 1 and orch.wedge_thinning(None, 5000) == 1
+    sql, meta = orch.build_wedge_selection(thin=2)
+    assert "MOD(fiberid, 2) = 0" in sql and "dec BETWEEN -1.25 AND 1.25" in sql and meta["thinning"] == 2
+    assert "MOD(" not in orch.build_wedge_selection()[0]
+    csql, cmeta = orch.build_wedge_count()
+    assert csql.startswith("SELECT COUNT(*) AS n FROM sdss_dr17.specobj") and cmeta["aggregate"]
+    with pytest.raises(ValueError):
+        orch.build_wedge_selection(dec_min=0, dec_max=10)
+
+
+def test_satellite_search_output_says_which_ranks_were_vetted():
+    import inspect
+
+    src = inspect.getsource(datalab_tools.SatelliteSearch.run)
+    # every ranked row carries its evidence cards; the summary names the ranks
+    assert '"evidence_cards"' in src and '"vetting_summary": vetting_summary' in src
+    assert "has NOT been vetted" in src
+
+
+def test_satellite_search_reports_phase_timings():
+    """L15 re-run 2 (2026-09-23) spent ~283 s with no way to tell which Data
+    Lab phase was slow; the result now carries per-phase seconds."""
+    import inspect
+
+    src = inspect.getsource(datalab_tools.SatelliteSearch.run)
+    assert '"phase_seconds": phase_s' in src
+    for key in ('"density"', '"map_peaks_screen"', '"cutouts"', '"cmds"'):
+        assert key in src

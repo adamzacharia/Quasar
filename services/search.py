@@ -184,7 +184,8 @@ class SearchService:
     def cone_search(self, ra: float, dec: float, radius: float,
                    facility: Optional[str] = None,
                    max_results: int = 100,
-                   public: bool = False) -> pd.DataFrame:
+                   public: bool = False,
+                   band: Any = None) -> pd.DataFrame:
         """Perform cone search. Routes to NRAO TAP for VLA/VLBA/GBT, else the ALMA
         footprint cone (TAP INTERSECTS/point union, ALminer fallback)."""
         if self.is_nrao_facility(facility):
@@ -206,6 +207,7 @@ class SearchService:
             return _call_with_optional_kwargs(
                 self.alminer_client.search_by_position, ra, dec, radius,
                 public=bool(public), max_results=max_results,
+                **({"band": band} if band is not None else {}),
             )
         except Exception as e:
             logger.warning("ALminer position search failed: %s", e)
@@ -341,6 +343,11 @@ class SearchService:
             "matched_as": matched_as,
             "counts": counts,
             "summary": counts_note(counts),
+            # PI and title were queried but never returned, so the model invented a
+            # PI (ArchiveBench AB-D-48). obs_creator_name is blanked to "ALMA" by
+            # the archive; pi_name is the real PI.
+            "pi_names": sorted(df["pi_name"].dropna().astype(str).unique().tolist())[:10] if "pi_name" in df.columns else [],
+            "project_titles": sorted(df["obs_title"].dropna().astype(str).unique().tolist())[:10] if "obs_title" in df.columns else [],
             "proposal_ids": sorted(df["proposal_id"].dropna().astype(str).unique().tolist())[:20] if "proposal_id" in df.columns else [],
             "member_ous_uids": sorted(df["member_ous_uid"].dropna().astype(str).unique().tolist())[:20] if "member_ous_uid" in df.columns else [],
             "asdm_uids": sorted(df["asdm_uid"].dropna().astype(str).unique().tolist())[:50] if "asdm_uid" in df.columns else [],

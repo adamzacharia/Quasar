@@ -130,6 +130,7 @@ SPECIAL_LABELS: Dict[str, str] = {
     "datalab_selection_diagram": "the selection diagram",
     "datalab_target_class_summary": "the target-class summary",
     "datalab_satellite_search": "the satellite search",
+    "datalab_sed_sample": "the SED sample builder",
 }
 
 _ACRONYMS = {"sql", "adql", "tap", "sia", "cmd", "sed", "rgb", "hips", "qa2", "mous", "ads", "mast", "ned", "vo",
@@ -163,7 +164,8 @@ _CODE_SPLIT_RE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]*`)", re.S)
 
 
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)(?:.+?)(?<!`)\1(?!`)")
+# A CommonMark code span may cross a single line break, never a blank line.
+_INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)(?:[^\n]|\n(?![ \t]*\n))+?(?<!`)\1(?!`)")
 
 
 def _split_inline(text: str) -> List[Tuple[bool, str]]:
@@ -234,10 +236,15 @@ _IMAGE_PLACEHOLDER_RE = re.compile(r"!\[([^\]\n]*)\](?!\()")
 _BR_RE = re.compile(r"<br\s*/?>", re.I)
 
 
+_CITATION_PLACEHOLDER_RE = re.compile(r"\s?【\s*(?:citation|cite|source|sources|ref|reference)s?\s*】", re.I)
+
+
 def strip_image_placeholders(text: str) -> str:
     """Drop ``![alt]`` tokens left behind once an image URL was stripped
     (L15: ``![CMD 1]`` in table cells). ``![alt](url)`` is handled upstream."""
-    return _IMAGE_PLACEHOLDER_RE.sub("", text or "")
+    out = _IMAGE_PLACEHOLDER_RE.sub("", text or "")
+    # Empty citation placeholders (UI 2026-09-23 D05: a trailing "【citation】").
+    return _CITATION_PLACEHOLDER_RE.sub("", out)
 
 
 def strip_br_tags(text: str) -> str:
@@ -267,6 +274,15 @@ def find_internal_identifiers(text: str, tool_names: Iterable[str]) -> List[str]
     return found
 
 
+_LABEL_MARK = "\x01"
+
+
+def _mark_label(label: str) -> str:
+    """Tag a humanised label's leading "the" so the join-time pass can drop it
+    after a determiner; the mark never survives humanize_prose."""
+    return _LABEL_MARK + label if label.startswith("the ") else label
+
+
 def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: bool = True) -> str:
     """Rewrite ``text`` for the user (see module docstring). Code untouched."""
     if not text:
@@ -282,7 +298,7 @@ def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: boo
             # humanise it. Fenced blocks and real code spans stay untouched.
             m = re.fullmatch(r"`\s*(?:functions\.)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^()\n]*\))?\s*`", seg)
             if m and m.group(1) in names:
-                pieces.append(humanize_tool_name(m.group(1)))
+                pieces.append(_mark_label(humanize_tool_name(m.group(1))))
                 continue
             # Protected: a placeholder through the global clean-ups below, so
             # `<br>` or `Client()` inside code is never rewritten (guard CX-25).
@@ -295,15 +311,9 @@ def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: boo
                 label = humanize_tool_name(m.group("name"))
                 # "the X step(args)" -> "the X step"; a following "tool"/"call"
                 # word would read doubled ("the X step tool"), so swallow it.
-                return label
+                return _mark_label(label)
 
             s = rx.sub(_sub, s)
-            s = re.sub(r"\b(the [^.\n]{2,60}?(?:step|query|search|lookup|diagram|map|plot|cutout|match|check|fold|listing|"
-                       r"vetting|aggregate|count|selection|description|image|grid|panel|composite|overlay|triage|download|"
-                       r"census|summary|status|builder|recipe|table|curve|wedge|resolution))\s+(?:tool|function|call)\b", r"\1", s)
-            # Article doubling: "the the X" / "The the X" / "a the X"
-            s = re.sub(r"\b(?:the|a|an)\s+(the\s+)", r"\1", s, flags=re.I)
-            s = re.sub(r"\bThe the\b", "The", s)
         if drop_json_dumps:
             def _json_sub(m: "re.Match[str]") -> str:
                 blob = m.group(0)
@@ -315,6 +325,23 @@ def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: boo
         s = strip_image_placeholders(s)
         pieces.append(s)
     out = "".join(pieces)
+    # Joined-text clean-ups (code is masked): a humanised code-span tool name
+    # joins the prose around it, so "Use the `list_alma_files` tool" only reads
+    # "Use the the ALMA file listing tool" AFTER the join (UI 2026-09-23 D07).
+    # A determiner already in the prose absorbs the label's own "the", also
+    # across emphasis or up to two adjectives: "The **the archive image
+    # overlay**" / "a new the ALMA position search" (UI re-run 2026-09-23 D19, D16).
+    out = re.sub(r"\b(the|a|an|this|that|another|each|any|your|our|its|their)\s+((?:[A-Za-z-]+\s+){0,2}?)"
+                 r"((?:\*\*|__|\*|_)?)" + _LABEL_MARK + r"the\s+", r"\1 \2\3", out, flags=re.I)
+    # A label that opens a sentence is capitalised ("archive_overlay found it").
+    out = re.sub(r"(^|[.!?]\s+|\n[ \t>*-]*)((?:\*\*|__|\*|_)?)" + _LABEL_MARK + r"the ", r"\1\2The ", out)
+    out = out.replace(_LABEL_MARK, "")
+    out = re.sub(r"\b(the [^.\n\x00]{2,60}?(?:step|query|search|lookup|diagram|map|plot|cutout|match|check|fold|listing|"
+                 r"vetting|aggregate|count|selection|description|image|grid|panel|composite|overlay|triage|download|"
+                 r"census|summary|status|builder|recipe|table|curve|wedge|resolution|services?|lookup)(?:\*\*|__|\*|_)?)\s+(?:tool|function|call|service)s?\b",
+                 r"\1", out, flags=re.I)
+    out = re.sub(r"\b(?:the|a|an)\s+(the\s+)", r"\1", out, flags=re.I)
+    out = re.sub(r"\bThe the\b", "The", out)
     out = strip_br_tags(out)
     # Collapse doubled pointers / leftover empty call parentheses.
     out = re.sub(rf"(?:{re.escape(_PANEL_POINTER)}\s*){{2,}}", _PANEL_POINTER + " ", out)

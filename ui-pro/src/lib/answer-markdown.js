@@ -19,7 +19,8 @@
 
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
-const INLINE_CODE_RE = /(?<!`)(`+)(?!`)(?:.+?)(?<!`)\1(?!`)/g;
+// A CommonMark code span may cross a single line break, never a blank line.
+const INLINE_CODE_RE = /(?<!`)(`+)(?!`)(?:[^\n]|\n(?![ \t]*\n))+?(?<!`)\1(?!`)/g;
 
 /** Known tool-name prefixes -> service label. Mirrors core/prose_hygiene.py. */
 const PREFIX_LABELS = [
@@ -183,9 +184,60 @@ export function stripBrTags(text) {
     )).join("\n");
 }
 
-/** Drop `![alt]` tokens that have no `(url)` part. */
+const SUB_MAP = { "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+    "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎", a: "ₐ", e: "ₑ", o: "ₒ", x: "ₓ", h: "ₕ", k: "ₖ", l: "ₗ", m: "ₘ",
+    n: "ₙ", p: "ₚ", s: "ₛ", t: "ₜ", i: "ᵢ", r: "ᵣ", u: "ᵤ", v: "ᵥ", j: "ⱼ" };
+const SUP_MAP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+    "+": "⁺", "-": "⁻", "−": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", n: "ⁿ", i: "ⁱ" };
+
+/**
+ * `T<sub>sys</sub>` / `cm<sup>-2</sup>` literals (the renderer does not allow raw
+ * HTML) -> Unicode sub/superscripts when every character maps, else `T_sys` / `cm^-2`.
+ * UI benchmark 2026-09-23 D01.
+ */
+export function convertSubSup(text) {
+    const conv = (body, map, marker) => {
+        const chars = [...String(body)];
+        return chars.every((c) => map[c] !== undefined) ? chars.map((c) => map[c]).join("") : `${marker}${body}`;
+    };
+    return String(text || "")
+        .replace(/<sub>([^<>\n]{1,24})<\/sub>/gi, (_, b) => conv(b, SUB_MAP, "_"))
+        .replace(/<sup>([^<>\n]{1,24})<\/sup>/gi, (_, b) => conv(b, SUP_MAP, "^"));
+}
+
+/**
+ * Literal `<ul><li>a</li><li>b</li></ul>` (the renderer shows raw HTML as text;
+ * UI benchmark 2026-09-23 D03, a table cell): inside a table row the items become
+ * "• a · • b" on one line (a newline would break the row), elsewhere markdown bullets.
+ */
+export function convertHtmlLists(text) {
+    const t = String(text || "");
+    if (!/<\/?(?:ul|ol|li)\b/i.test(t)) return t;
+    return t.split("\n").map((line) => {
+        if (!/<\/?(?:ul|ol|li)\b/i.test(line)) return line;
+        if (line.trimStart().startsWith("|")) {
+            return line
+                .replace(/<\/?(?:ul|ol)\s*>/gi, "")
+                .replace(/<li\s*>/gi, "• ")
+                .replace(/<\/li\s*>\s*(?=•|<li|\s*\|)/gi, " ")
+                .replace(/<\/li\s*>/gi, " · ")
+                .replace(/\s+·\s+(?=\|)/g, " ")
+                .replace(/\s{2,}/g, " ");
+        }
+        return line
+            .replace(/<\/?(?:ul|ol)\s*>/gi, "\n")
+            .replace(/<li\s*>/gi, "\n- ")
+            .replace(/<\/li\s*>/gi, "")
+            .replace(/\n{3,}/g, "\n\n");
+    }).join("\n");
+}
+
+/** Drop `![alt]` tokens that have no `(url)` part, and empty citation
+ * placeholders such as `【citation】` / `【source】` (D05, 2026-09-23). */
 export function stripImagePlaceholders(text) {
-    return String(text || "").replace(/!\[([^\]\n]*)\](?!\()/g, "");
+    return String(text || "")
+        .replace(/!\[([^\]\n]*)\](?!\()/g, "")
+        .replace(/\s?【\s*(?:citation|cite|source|sources|ref|reference)s?\s*】/gi, "");
 }
 
 /**
@@ -207,25 +259,54 @@ export function normalizeMathDelimiters(text) {
  * Replace internal tool identifiers in prose with plain language. Code is
  * left alone. `knownNames` (optional) adds exact names beyond the generic shape.
  */
+/** Tag a humanised label's leading "the" (dropped after a determiner). */
+function markLabel(label) {
+    return label.startsWith("the ") ? "\u0001" + label : label;
+}
+
 export function humanizeToolIdentifiers(text, knownNames = []) {
     const known = new Set((knownNames || []).map((n) => String(n)));
     const INLINE_TOOL_RE = /^`\s*(?:functions\.)?([a-z]+_[a-z0-9_]+)\s*(?:\([^()\n]*\))?\s*`$/;
-    return splitCode(text).map(([isCode, seg]) => {
+    const joined = splitCode(text).map(([isCode, seg]) => {
         if (isCode) {
             // A code span holding ONLY a tool identifier is a tool name, not code.
             const m = INLINE_TOOL_RE.exec(seg);
-            if (m && (known.has(m[1]) || new RegExp(TOOL_IDENT_RE.source).test(m[1]))) return humanizeToolName(m[1]);
+            if (m && (known.has(m[1]) || new RegExp(TOOL_IDENT_RE.source).test(m[1]))) return markLabel(humanizeToolName(m[1]));
             return seg;
         }
-        let s = seg.replace(TOOL_IDENT_RE, (m, name) => humanizeToolName(name));
+        let s = seg.replace(TOOL_IDENT_RE, (m, name) => markLabel(humanizeToolName(name)));
         if (known.size) {
             const alt = [...known].sort((a, b) => b.length - a.length).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-            if (alt) s = s.replace(new RegExp(`(?<![\\w.])(?:${alt})(?:\\((?:[^()\\n]|\\([^()\\n]*\\))*\\))?(?![\\w])`, "g"), (m) => humanizeToolName(m.replace(/\(.*$/s, "")));
+            if (alt) s = s.replace(new RegExp(`(?<![\\w.])(?:${alt})(?:\\((?:[^()\\n]|\\([^()\\n]*\\))*\\))?(?![\\w])`, "g"), (m) => markLabel(humanizeToolName(m.replace(/\(.*$/s, ""))));
         }
-        s = s.replace(/\b(the [^.\n]{2,60}?(?:step|query|search|lookup|diagram|map|plot|cutout|match|check|fold|listing|vetting|aggregate|count|selection|description|image|grid|panel|composite|overlay|triage|download|resolution|curve|wedge))\s+(?:tool|function|call)\b/g, "$1");
-        s = s.replace(/\b(?:the|a|an)\s+(the\s+)/gi, "$1").replace(/\bThe the\b/g, "The");
         return s;
     }).join("");
+    // Joined-text clean-ups with code masked: a humanised code-span tool name
+    // joins the prose around it ("Use the `list_alma_files` tool" -> "Use the the
+    // ALMA file listing tool" only exists AFTER the join; UI 2026-09-23 D07).
+    // A determiner in the prose absorbs the label's own "the", also across
+    // emphasis or up to two adjectives ("The **the archive image overlay**",
+    // "a new the ALMA position search"; UI re-run 2026-09-23 D19, D16).
+    return outsideCode(joined, (prose) => prose
+        .replace(/\b(the|a|an|this|that|another|each|any|your|our|its|their)\s+((?:[A-Za-z-]+\s+){0,2}?)((?:\*\*|__|\*|_)?)\u0001the\s+/gi, "$1 $2$3")
+        .replace(/(^|[.!?]\s+|\n[ \t>*-]*)((?:\*\*|__|\*|_)?)\u0001the /g, "$1$2The ")
+        .replace(/\u0001/g, "")
+        .replace(/\b(the [^.\n\u0000]{2,60}?(?:step|query|search|lookup|diagram|map|plot|cutout|match|check|fold|listing|vetting|aggregate|count|selection|description|image|grid|panel|composite|overlay|triage|download|resolution|curve|wedge|services?)(?:\*\*|__|\*|_)?)\s+(?:tool|function|call|service)s?\b/gi, "$1")
+        .replace(/\b(?:the|a|an)\s+(the\s+)/gi, "$1")
+        .replace(/\bThe the\b/g, "The"));
+}
+
+/**
+ * Extra attributes for a link inside an assistant answer (D8). External
+ * http(s) links open in a new tab without handing the opener to the target
+ * page; in-page anchors (GFM footnotes `#fn-1`, `#user-content-...`) and
+ * relative links stay in the same tab.
+ */
+export function answerLinkAttributes(href) {
+    const h = String(href || "").trim();
+    // http(s) and protocol-relative ("//host/path", guard CX-05) links are external.
+    if (!/^(?:https?:)?\/\/[^/]/i.test(h)) return {};
+    return { target: "_blank", rel: "noopener noreferrer" };
 }
 
 /** Full render-time preparation for an assistant answer. Code is never changed. */
@@ -236,6 +317,8 @@ export function prepareAnswerMarkdown(text, options = {}) {
         let p = prose.replace(/!\[([^\]]*)\]\([^)]+\)/g, "");   // banned inline images
         p = stripImagePlaceholders(p);
         p = stripBrTags(p);
+        p = convertSubSup(p);
+        p = convertHtmlLists(p);
         return normalizeMathDelimiters(p);
     });
     if (options.humanizeTools !== false) t = humanizeToolIdentifiers(t, options.toolNames || []);

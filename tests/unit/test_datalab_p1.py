@@ -687,7 +687,7 @@ def test_cutout_falls_through_broken_tiles(monkeypatch):
 
     monkeypatch.setattr(service, "_load_image", fake_load)
     monkeypatch.setattr(service, "_cutout_image", lambda image, **kw: image)
-    monkeypatch.setattr(service, "_render_single_band", lambda data, wcs, title: {"base64_png": "abc", "web_url": "/p.png"})
+    monkeypatch.setattr(service, "_render_single_band", lambda data, wcs, title, mark=None: {"base64_png": "abc", "web_url": "/p.png"})
 
     out = service.cutout(10.0, 41.0, 0.05, band="r")
     assert out["success"] is True and out.get("coverage_gap") is not True

@@ -91,6 +91,9 @@ def test_line_coverage_and_project_line_set():
     assert len(annotated) == 4
     assert list(grouped["proposal_id"]) == ["2023.1.00001.S"]
     assert "C18O(2-1)" in grouped.iloc[0]["covered_lines"]
+    # no member_ous_uid column: the grain falls back to project + target and
+    # says so -- never a silent empty frame read as "0 projects"
+    assert "no MOUS column" in grouped.iloc[0]["coverage_basis"]
 
 
 def test_frequency_support_parser_drives_line_coverage():
@@ -125,11 +128,16 @@ def test_redshifted_co_projects_summarize_project_hits():
             "target_name": "z galaxy",
             "frequency_support": "172.8..173.1GHz",
             "band_list": "5",
+            # WP2 (2026-09-23): only science rows with extragalactic metadata count
+            "science_observation": "T",
+            "scientific_category": "Galaxy evolution",
         },
         {
             "proposal_id": "2023.1.00011.S",
             "target_name": "foreground",
             "frequency_support": "30.0..31.0GHz",
+            "science_observation": "T",
+            "scientific_category": "Galaxy evolution",
         },
     ])
 
@@ -137,7 +145,8 @@ def test_redshifted_co_projects_summarize_project_hits():
 
     assert list(result["proposal_id"]) == ["2023.1.00010.S"]
     assert "CO(3-2)" in result.iloc[0]["transitions"]
-    assert "1." in result.iloc[0]["inferred_redshift_ranges"]
+    # coverage-compatible z ranges, never an inferred source redshift (WP2)
+    assert "1." in result.iloc[0]["coverage_compatible_redshift_ranges"]
 
 
 def test_target_identifiers_are_left_to_resolver():

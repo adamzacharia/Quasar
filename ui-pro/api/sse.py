@@ -34,6 +34,7 @@ from services.evidence_quality import (
 )
 from services.block_identity import BlockIdAllocator
 from services.content_safety import is_safe_web_image, is_safe_web_source
+from services.web_evidence import canonicalize_url
 from services.model_pricing import TurnCostAccumulator, estimate_cost
 from services.feedback_snapshot_service import FeedbackToolTrace
 
@@ -201,11 +202,24 @@ def _merge_web_items(existing: List[Dict[str, Any]], incoming: List[Dict[str, An
     return merged
 
 
-def _merge_web_sources(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _merge_web_sources(
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    *,
+    replace: bool = False,
+) -> List[Dict[str, Any]]:
+    """Merge a ``web_sources`` event into the turn's source list.
+
+    Grounded web evidence (web search redesign, Phase 1) carries ``id``
+    ("W3"), ``cited``, ``published_date``, ``domain`` and ``provider``; those
+    fields survive the merge, and the backend's order (cited first, in answer
+    order) is kept instead of re-ranking by domain tier. ``replace`` (the final
+    post-answer listing) replaces the list. Legacy sources without ids keep
+    the old quality ranking."""
     merged: List[Dict[str, Any]] = []
     by_url: Dict[str, int] = {}
 
-    for item in [*(existing or []), *(incoming or [])]:
+    for item in [*([] if replace else (existing or [])), *(incoming or [])]:
         if not isinstance(item, dict):
             continue
         if not is_safe_web_source(item):
@@ -213,13 +227,18 @@ def _merge_web_sources(existing: List[Dict[str, Any]], incoming: List[Dict[str, 
         url = _normalize_web_url(item.get("url") or item.get("link") or item.get("href") or item.get("source_url"))
         if not url:
             continue
-        key = url.lower().rstrip("/")
+        # The registry's canonical key: host case / www. / tracking params do
+        # not matter, path case and the remaining query do (guard CX-21:
+        # /Case and /case, ?id=1 and ?id=2 are different pages).
+        key = canonicalize_url(url) or url.lower().rstrip("/")
         clean = annotate_web_source_evidence({**item, "url": url})
         if key in by_url:
             current = merged[by_url[key]]
-            for field in ("title", "snippet", "description"):
+            for field in ("title", "snippet", "description", "id", "published_date", "domain", "provider"):
                 if not current.get(field) and clean.get(field):
                     current[field] = clean[field]
+            if clean.get("cited"):
+                current["cited"] = True
             current["evidenceQuality"] = choose_better_evidence_quality(
                 current.get("evidenceQuality"),
                 clean.get("evidenceQuality"),
@@ -228,6 +247,8 @@ def _merge_web_sources(existing: List[Dict[str, Any]], incoming: List[Dict[str, 
         by_url[key] = len(merged)
         merged.append(clean)
 
+    if any(isinstance(s, dict) and s.get("id") for s in merged):
+        return merged
     return rank_web_sources(merged)
 
 
@@ -1145,6 +1166,7 @@ async def _stream_chat_response(
             model=requested_model,
             grounded_summary=request.grounded_summary,
             web_search=request.web_search,
+            web_search_mode=getattr(request, "web_search_mode", None),
         )
 
         _chat_start_time = _time.perf_counter()
@@ -1235,6 +1257,7 @@ async def _stream_chat_response(
                                 web_search=request.web_search,
                                 model=requested_model,
                                 run_token=run_id,
+                                web_search_mode=getattr(request, "web_search_mode", None),
                             )
                         finally:
                             # Clean up the plan feedback queue. UIAPI-08:
@@ -1319,6 +1342,7 @@ async def _stream_chat_response(
             _rich_web_image_provider = ""
             _rich_web_search_type = ""
             _rich_web_query = ""
+            _rich_web_decision = None   # web_decision event (Phase 2 badge), persisted for reload
             _rich_thinking = []
             _eagerly_emitted = set()  # indices of data cards already emitted during streaming
             _pending_eager_data = []
@@ -1415,6 +1439,8 @@ async def _stream_chat_response(
                         rich_meta["webSearchType"] = _rich_web_search_type
                     if _rich_web_query:
                         rich_meta["webQuery"] = _rich_web_query
+                    if _rich_web_decision:
+                        rich_meta["webDecision"] = _rich_web_decision
                     if _rich_thinking:
                         rich_meta["thinkingSteps"] = _rich_thinking
                     if _rich_thinking_text:
@@ -1629,10 +1655,17 @@ async def _stream_chat_response(
                                             _plan_feedback_queues[new_key] = _pfq
                                         _pfq_key[0] = new_key
                                         print(f"[HITL] Re-keyed plan feedback queue: {str(old_key[0])[:20]}... → {new_cid[:20]}...")
+                                if event_parsed.get("type") == "web_decision":
+                                    _rich_web_decision = {
+                                        k: event_parsed.get(k)
+                                        for k in ("mode", "need_web", "reason", "queries", "source", "planner_ms", "domain_pack", "freshness", "follow_up")
+                                        if k in event_parsed
+                                    }
                                 if event_parsed.get("type") == "web_sources":
                                     _rich_web_sources = _merge_web_sources(
                                         _rich_web_sources,
                                         event_parsed.get("sources") or [],
+                                        replace=bool(event_parsed.get("replace")),
                                     )
                                     _rich_web_images = _merge_web_items(
                                         _rich_web_images,

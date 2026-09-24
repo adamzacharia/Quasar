@@ -73,3 +73,42 @@ def test_all_tiles_failing_is_an_infrastructure_failure():
                                        match_arcsec=1.0, small_limit=50000, limit=5000, meta={})
     assert out["success"] is False and out["status"] == "infrastructure_failure" and "502" in out["error"]
     assert not store.saved
+
+
+class _AsyncStreamClient(_Client):
+    token = "real.user.token"
+
+    def __init__(self, states):
+        super().__init__()
+        self.states = list(states)
+        self.submitted = []
+
+    def submit(self, *, sql=None, adql=None, timeout=None):
+        self.submitted.append(sql)
+        return "jobS"
+
+    def status(self, jobid):
+        return self.states.pop(0) if self.states else "EXECUTING"
+
+    def results(self, jobid, *, fmt="pandas", query_text=None):
+        from integrations.datalab_client import DatalabResult
+        return DatalabResult.from_dataframe(pd.DataFrame({"source_id": [1, 2, 3], "ra": [229.0] * 3, "dec": [-0.1] * 3}), {})
+
+    def abort(self, jobid):
+        return "ABORTED"
+
+
+def test_whole_field_join_runs_as_one_async_job_when_a_login_token_exists(monkeypatch):
+    import services.datalab_orchestration as orch
+
+    monkeypatch.setenv("DATALAB_STREAM_ASYNC", "1")  # opt-in: the async queue was too slow live (2026-09-23)
+    monkeypatch.setattr(orch.time, "sleep", lambda s: None)
+    sql, meta = StreamSelection.build_sql(229.018, -0.124, 5.0, pm=PM, cmd_mask=MASK, match_arcsec=1.0, small_limit=50000, limit=5000)
+    client, store = _AsyncStreamClient(["EXECUTING", "COMPLETED"]), _Store()
+    out = StreamSelection()._run_async(_ctx(client, store), sql, meta)
+    assert out["success"] and out["rowcount"] == 3 and "async job (jobS" in out["warnings"][0]
+    assert "pmra BETWEEN -3.5000 AND -2.0000" in client.submitted[0] and not client.sql, "no sync tiles"
+    assert store.saved[0][1]["provenance"]["jobid"] == "jobS"
+    # anonymous token -> the caller falls back to sub-cones
+    anon = StreamSelection()._run_async(_ctx(_Client(), _Store()), sql, meta)
+    assert anon.get("async_unavailable") is True

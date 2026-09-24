@@ -295,7 +295,7 @@ def _build_code_cell(agent_type: str, description: str, result) -> str:
         code = f"# Step: {description}\n"
         code += "import pyvo\n\n"
         code += "# Query CADC TAP service\n"
-        code += "tap = pyvo.dal.TAPService('https://ws.cadc-cccs.hia-iha.nrc-cnrc.gc.ca/argus')\n"
+        code += "tap = pyvo.dal.TAPService('https://ws.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/argus')\n"
         if target and target != "TARGET_NAME":
             code += f"query = \"SELECT TOP 20 * FROM caom2.Observation WHERE target_name='{target}'\"\n"
         else:

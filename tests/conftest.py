@@ -30,6 +30,16 @@ if PROJECT_ROOT not in sys.path:
 # This has to happen before anything imports services.db.
 os.environ["QUASAR_FORCE_LOCAL_DB"] = "1"
 
+# ── Never let tests start the Langfuse client ────────────────────
+# The same load_dotenv() copies real LANGFUSE_* keys, and get_langfuse() then
+# starts background ingestion threads; at interpreter exit Langfuse's atexit
+# flush blocks forever in queue.join(), so a larger run printed "N passed" and
+# never exited (the Codex guard sat 40 min on it, 2026-09-23). Empty strings
+# are a HARD set: load_dotenv() never overrides a key that already exists.
+# Tests that exercise tracing monkeypatch get_langfuse themselves.
+os.environ["LANGFUSE_SECRET_KEY"] = ""
+os.environ["LANGFUSE_PUBLIC_KEY"] = ""
+
 # ── Set dummy env vars for offline testing ───────────────────────
 # These prevent ImportError / KeyError during module import.
 # They are NOT valid keys — no real API calls should be made in unit tests.

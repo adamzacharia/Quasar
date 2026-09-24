@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist, WebImage, WebSource } from "./types";
+import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist, WebDecision, WebImage, WebSource } from "./types";
 import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
 import {
     fetchConversations as apiFetchConversations,
@@ -19,6 +19,7 @@ import {
     updateLastAssistantThinking as updateAssistantThinking,
 } from "./chat-message-updaters";
 import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
+import { hasEvidenceIds, mergeTurnWebSources } from "./web-citations.js";
 import { registerSessionScrubber } from "./auth-store";
 import { currentAuthGeneration } from "./auth-generation";
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
@@ -70,6 +71,7 @@ interface ChatStore {
         imageProvider?: string;
         searchType?: string;
         query?: string;
+        replace?: boolean;
     }, ownerConversationId?: string | null) => void;
     updateLastAssistantMessage: (content: string, ownerConversationId?: string | null) => void;
     updateLastAssistantThinking: (thinking: string, ownerConversationId?: string | null) => void;
@@ -77,6 +79,8 @@ interface ChatStore {
     markLastAssistantRunFailed: (errorCode?: string, ownerConversationId?: string | null) => void;
     updateLastAssistantToolTrace: (calls: import("./api").ToolTraceCall[], ownerConversationId?: string | null) => void;
     updateLastAssistantUsage: (totalTokens: number, durationMs?: number, ownerConversationId?: string | null) => void;
+    /** Phase 2: stamp the turn's web_decision on its text message (badge). */
+    setLastAssistantWebDecision: (decision: WebDecision, ownerConversationId?: string | null) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -239,11 +243,18 @@ function mergeWebSourcesIntoMessages(
         imageProvider?: string;
         searchType?: string;
         query?: string;
+        replace?: boolean;
     },
 ): Message[] | null {
     const incomingSources = payload.sources || [];
     const incomingImages = payload.images || [];
     if (incomingSources.length === 0 && incomingImages.length === 0) return null;
+    // Grounded web evidence (ids W1..Wn): keep ids / cited flags / registry
+    // order, and let the final post-answer listing (replace) win.
+    const mergeSources = (existing: WebSource[]) =>
+        (payload.replace || hasEvidenceIds(incomingSources) || hasEvidenceIds(existing))
+            ? (mergeTurnWebSources(existing, incomingSources, { replace: payload.replace }) as WebSource[])
+            : mergeWebSources(existing, incomingSources);
 
     const next = [...messages];
     let lastUserIdx = -1;
@@ -266,7 +277,7 @@ function mergeWebSourcesIntoMessages(
         const existing = next[existingIdx];
         next[existingIdx] = {
             ...existing,
-            webSources: mergeWebSources(existing.webSources || [], incomingSources),
+            webSources: mergeSources(existing.webSources || []),
             webImages: mergeWebImages(existing.webImages || [], incomingImages),
             webProvider: mergeLabel(existing.webProvider, payload.provider),
             webImageProvider: mergeLabel(existing.webImageProvider, payload.imageProvider),
@@ -280,7 +291,7 @@ function mergeWebSourcesIntoMessages(
             content: "",
             type: "web_sources",
             timestamp: new Date(),
-            webSources: mergeWebSources([], incomingSources),
+            webSources: mergeSources([]),
             webImages: mergeWebImages([], incomingImages),
             webProvider: payload.provider,
             webImageProvider: payload.imageProvider,
@@ -409,6 +420,9 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     }
     if (meta.runMeta && typeof meta.runMeta === "object") {
         base.runMeta = meta.runMeta as Message["runMeta"];
+    }
+    if (meta.webDecision && typeof meta.webDecision === "object") {
+        base.webDecision = meta.webDecision as WebDecision;
     }
     // Raw request provenance (Feature 1) — without this the exact queries are
     // dropped on history replay, which is the whole point of persisting them.
@@ -784,6 +798,26 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         // pin one run's provenance onto another conversation's last answer.
         // When the owner is no longer active, patch the owner's stored copy
         // (the persisted rich_meta.toolTrace re-asserts it on reload too).
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, stamp);
+        }
+        const messages = stamp(state.messages);
+        if (!messages) return {};
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
+        };
+    }),
+
+    setLastAssistantWebDecision: (decision, ownerConversationId) => set((state) => {
+        const stamp = (messages: Message[]): Message[] | null => {
+            const index = findLastAssistantTextIndex(messages);
+            if (index < 0) return null;
+            const next = [...messages];
+            next[index] = { ...next[index], webDecision: decision };
+            return next;
+        };
+        // UI-01: a switched-away stream's decision stamps the OWNER's turn.
         if (isOwnerRouted(state, ownerConversationId)) {
             return patchOwnerConversation(state, ownerConversationId, stamp);
         }

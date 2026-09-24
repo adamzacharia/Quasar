@@ -323,14 +323,14 @@ def test_default_quality_cuts_merge_and_override():
     from services import datalab_registry as reg
     merged, note = reg.merge_default_quality_cuts("desi_dr1", "zpix", None)
     cols = [c["column"] for c in merged]
-    assert cols == ["zwarn", "survey", "main_primary"]
+    assert cols == ["zwarn", "zcat_primary"]
     assert "zwarn" in note and "Override" in note
     # A caller cut on zwarn suppresses THAT default only.
     merged2, note2 = reg.merge_default_quality_cuts(
         "desi_dr1", "zpix", [{"column": "zwarn", "op": "<", "value": 5}]
     )
     cols2 = [c["column"] for c in merged2]
-    assert cols2 == ["zwarn", "survey", "main_primary"] and merged2[0]["value"] == 5
+    assert cols2 == ["zwarn", "zcat_primary"] and merged2[0]["value"] == 5
     assert "zwarn" not in note2
     # Catalogs with no registered defaults pass through untouched.
     merged3, note3 = reg.merge_default_quality_cuts("gaia_dr3", "gaia_source", None)
@@ -339,8 +339,7 @@ def test_default_quality_cuts_merge_and_override():
     from services import datalab_query_builders as B
     preds = B.build_catalog_predicates("desi_dr1", "zpix", value_cuts=merged)
     assert "zwarn = 0" in preds[0]
-    assert preds[1] == "survey = 'main'"
-    assert preds[2] == "main_primary = 'true'"
+    assert preds[1] == "zcat_primary = 'true'"
 
 
 def test_policy_injects_default_quality_cuts_into_expert_sql():
@@ -356,7 +355,7 @@ def test_policy_injects_default_quality_cuts_into_expert_sql():
         "FROM desi_dr1.zpix WHERE zwarn = 0 GROUP BY z_bin ORDER BY z_bin"
     )
     v = policy.validate(sql, source="expert")
-    assert "survey = 'main'" in v.sql and "main_primary = 'true'" in v.sql
+    assert "zcat_primary = 'true'" in v.sql and "survey" not in v.sql
     assert "AND (zwarn = 0)" in v.sql  # original condition parenthesized
     assert v.sql.count("zwarn") == 1   # mentioned column is never overridden
     assert any("Auto-applied desi_dr1.zpix" in w for w in v.warnings)
@@ -366,7 +365,7 @@ def test_policy_injects_default_quality_cuts_into_expert_sql():
         "SELECT spectype, COUNT(*) AS n FROM desi_dr1.zpix GROUP BY spectype",
         source="expert",
     )
-    assert "WHERE zwarn = 0 AND survey = 'main' AND main_primary = 'true'" in v2.sql
+    assert "WHERE zwarn = 0 AND zcat_primary = 'true'" in v2.sql
     assert v2.sql.index("WHERE") < v2.sql.index("GROUP BY")
 
     # Plain string literals are safe (the scrub is offset-preserving): a model
@@ -377,7 +376,7 @@ def test_policy_injects_default_quality_cuts_into_expert_sql():
         "WHERE spectype = 'GALAXY' GROUP BY spectype",
         source="expert",
     )
-    assert "survey = 'main'" in v3.sql and "AND (spectype = 'GALAXY')" in v3.sql
+    assert "zcat_primary = 'true'" in v3.sql and "AND (spectype = 'GALAXY')" in v3.sql
 
     # Escaped quotes and comments make offsets unreliable -> no injection.
     v3b = policy.validate(
@@ -385,20 +384,20 @@ def test_policy_injects_default_quality_cuts_into_expert_sql():
         "WHERE spectype = 'GAL''AXY' GROUP BY spectype",
         source="expert",
     )
-    assert "survey" not in v3b.sql
+    assert "zcat_primary" not in v3b.sql
     v3c = policy.validate(
         "SELECT spectype, COUNT(*) AS n FROM desi_dr1.zpix -- note\n"
         "GROUP BY spectype",
         source="expert",
     )
-    assert "survey" not in v3c.sql
+    assert "zcat_primary" not in v3c.sql
 
     # Builder SQL merges defaults upstream — the policy leaves it alone.
     v4 = policy.validate(
         "SELECT spectype, COUNT(*) AS n FROM desi_dr1.zpix GROUP BY spectype",
         source="builder",
     )
-    assert "survey" not in v4.sql
+    assert "zcat_primary" not in v4.sql
 
     # NaN rewrite + quality injection COMPOSE: the 'Infinity' literals the NaN
     # guard introduces must not disqualify the injection that follows.
@@ -409,7 +408,7 @@ def test_policy_injects_default_quality_cuts_into_expert_sql():
         source="expert",
     )
     assert "z >= 0.4 AND z < 'Infinity'::float8" in v5.sql
-    assert "survey = 'main'" in v5.sql and "main_primary = 'true'" in v5.sql
+    assert "zcat_primary = 'true'" in v5.sql
 
 
 def test_known_mw_object_veto():

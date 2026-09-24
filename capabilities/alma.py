@@ -386,14 +386,23 @@ class SearchByPosition(BaseCapability):
 
         try:
             public_only = bool(inp.public_only) and str(inp.public_only).lower() not in {"false", "0", "no"}
+            # ALMA: the band goes into the cone query itself (TAP ADQL / full
+            # ALminer frame before the cap); the post-filter below is idempotent.
+            _band_kw = {"band": band} if facility_label == "ALMA" and band is not None else {}
+
+            def _cone(**extra):
+                try:
+                    return search_service.cone_search(ra, dec, radius, facility, max_results, **extra, **_band_kw)
+                except TypeError as exc:
+                    # a service without the band keyword (older facade / fakes)
+                    if not _band_kw or "band" not in str(exc):
+                        raise
+                    return search_service.cone_search(ra, dec, radius, facility, max_results, **extra)
+
             if facility_label == "ALMA" and public_only:
-                results = search_service.cone_search(
-                    ra, dec, radius, facility, max_results, public=True
-                )
+                results = _cone(public=True)
             else:
-                results = search_service.cone_search(
-                    ra, dec, radius, facility, max_results
-                )
+                results = _cone()
             # Request-local: this capability owns ra/dec/radius, so the exact
             # obscore cone is reconstructable without touching shared client
             # state (avoids the singleton cross-request race, CX-36). Prefer
@@ -1947,10 +1956,28 @@ class QueryAlmaScienceArchive(BaseCapability):
                     return _native({"success": False, "status": "unsupported_species", "error": str(_us),
                                     "rest_species": rest_species})
 
+                # A target / position narrows the scan to a cone (ArchiveBench
+                # AB-D-51: the target was ignored and 666 projects came back
+                # all-sky), and explicit `lines` narrow the transitions.
+                species_arg: Any = list(lines) if lines else (rest_species or "CO")
+                cone_where = ""
+                if target or (inp.ra is not None and inp.dec is not None):
+                    c_ra, c_dec = inp.ra, inp.dec
+                    if c_ra is None or c_dec is None:
+                        resolved = ctx.service("resolve_target")(normalize_target_alias(target))
+                        if not resolved.get("success"):
+                            raise ValueError(f"Could not resolve target: {target}")
+                        c_ra, c_dec = resolved.get("ra_deg"), resolved.get("dec_deg")
+                    r_deg = float(inp.radius_arcsec or 60.0) / 3600.0
+                    cone_where = (f"1=CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {float(c_ra)!r}, "
+                                  f"{float(c_dec)!r}, {r_deg!r}))")
+                    warnings.append(f"restricted to a {float(inp.radius_arcsec or 60.0):g} arcsec cone around "
+                                    f"{target or (c_ra, c_dec)}")
                 try:
                     _ss = _server_side(
-                        redshifted_line_projects_server_side, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max,
+                        redshifted_line_projects_server_side, rest_species=species_arg, z_min=z_min, z_max=z_max,
                         science_category=str(science_category or ""), cycle=int(cycle) if cycle is not None else None,
+                        extra_where=cone_where, skip_category=bool(cone_where),
                     )
                     result_df = _ss.frame
                     warnings.extend(_ss.notes)
@@ -1959,6 +1986,8 @@ class QueryAlmaScienceArchive(BaseCapability):
                     warnings.append(f"Server-side aggregation failed ({type(_ss_err).__name__}: {str(_ss_err)[:120]}); fell back to a TOP-capped row pull.")
                     _ss = None
                     where, line_names = _redshifted_line_where(rest_species or "CO", z_min, z_max, science_category)
+                    if cone_where:
+                        where = f"({where}) AND {cone_where}"
                     df = _tap_obscore_dataframe(where, max_results=max_results, ctx=ctx)
                     result_df = redshifted_line_projects(df, rest_species=rest_species or "CO", z_min=z_min, z_max=z_max)
                 source = f"ALMA {rest_species or 'CO'} redshifted line projects z={z_min:g}-{z_max:g}"

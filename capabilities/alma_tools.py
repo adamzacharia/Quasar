@@ -1110,8 +1110,21 @@ class CodeRecipe(BaseCapability):
                     if ":" in line:
                         k, _, v = line.partition(":")
                         meta[k.strip().lower()] = v.strip()
-            recipes.append({"task": key, "library": lib, "file": f"docs/recipes/{path.name}", "code": text,
-                            "last_tested": meta.get("last_tested"), "tested_against": meta.get("tested_against"), "notes": meta.get("notes")})
+            # The user-facing snippet is the RUNNABLE code only: the metadata
+            # docstring stays in its own fields. Live 2026-09-23 D15: the model
+            # re-typed the docstring header and dropped its closing quotes, so
+            # the displayed pyvo snippet would not even parse (and it leaked a
+            # tests/ path). A short leading comment keeps the provenance.
+            code = text[header.end():].lstrip("\n") if header else text
+            # The header states what THIS recipe was tested against (the
+            # DataLink recipe is not a TAP recipe; guard CX-14).
+            against = str(meta.get("tested_against") or "").split(" and recorded responses")[0].strip()
+            code = (f"# ALMA archive recipe ({lib}; last tested {meta.get('last_tested') or 'n/a'}"
+                    + (f" against {against}" if against else "") + ")\n" + code.rstrip() + "\n")
+            recipes.append({"task": key, "library": lib, "file": f"docs/recipes/{path.name}", "code": code,
+                            "last_tested": meta.get("last_tested"), "tested_against": meta.get("tested_against"),
+                            "library_requirement": meta.get("library"),
+                            "notes": meta.get("notes")})
         if not recipes:
             return _native({"success": False, "status": "coverage_gap", "error": f"no curated recipe for library={lib} task={inp.task!r}",
                             "available": sorted(p.name for p in RECIPES_DIR.glob("*.py")) if RECIPES_DIR.exists() else []})
@@ -1122,7 +1135,8 @@ class CodeRecipe(BaseCapability):
                 "pyvo": "https://pyvo.readthedocs.io/en/latest/dal/index.html#tap",
                 "alminer": "https://alminer.readthedocs.io/en/latest/",
             }[lib],
-            "note": "Return the snippet VERBATIM in a code block; do not rename functions. API names in these files are the tested ones.",
+            "note": ("Return each `code` VERBATIM in a ```python block (it is complete and runnable); do not rename functions or "
+                     "re-type any metadata. API names in these files are the tested ones."),
         })
 
 

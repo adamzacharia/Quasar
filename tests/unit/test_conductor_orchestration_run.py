@@ -79,7 +79,8 @@ class _FakeRecovery:
 # ---------------------------------------------------------------------------
 def test_orchestration_run_field_contract():
     names = [f.name for f in dataclasses.fields(OrchestrationRun)]
-    assert names == ["dag", "workflow_memory", "lf_trace", "notebook"]
+    # web_search: the per-turn Web Search switch (web search redesign D1).
+    assert names == ["dag", "workflow_memory", "lf_trace", "notebook", "web_search"]
 
     run = OrchestrationRun(dag=TaskDAG(), workflow_memory=WorkflowMemory())
     assert run.lf_trace is None            # default, no underscore

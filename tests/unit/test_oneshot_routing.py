@@ -106,6 +106,12 @@ DLB_TEXT = {
             "photometry. Give me magnitude vs wavelength."),
     "L11": ("From the DESI DR1 redshift catalog, select luminous red galaxies (LRG target class) between z = 0.4 and 0.8, and "
             "show their redshift distribution and sky footprint."),
+    "L12": ("Search NSC DR2 for the densest stellar clump within 1° of the Hydra II dwarf region, then pull DECam image "
+            "cutouts of the top few candidate locations so I can eyeball them."),
+    "L13": ("Select galaxies from SDSS/BOSS in a thin redshift slice and make a cone/wedge plot to show the cosmic web — pick "
+            "a region like the SDSS Great Wall."),
+    "L14": ("I have a candidate variable star at RA = 185.4311, Dec = −31.9953 (an RR Lyrae in the Hydra II field). Find its "
+            "multi-epoch SMASH photometry, phase-fold the light curve to get the period, and pull an image cutout of the field."),
     "L15": ("I want to discover new Milky Way satellite dwarf-galaxy candidates. Devise and carry out a search strategy using "
             "Data Lab's deep imaging catalogs, and give me a ranked list of candidate positions with supporting CMDs and image cutouts."),
 }
@@ -115,11 +121,15 @@ DLB_TEXT = {
     "qid,tool,expected",
     [
         ("L06", "datalab_selection_diagram", {"ra": 60.0, "dec": -50.0, "radius_deg": 5.0, "overlay_locus": "white_dwarf",
-                                              "abs_mag_from_parallax": True, "pm_total_min_mas_yr": 50.0}),
+                                              "abs_mag_from_parallax": True, "pm_total_min_mas_yr": 100.0,
+                                              "abs_mag_min": 10.0}),
         ("L07", "datalab_satellite_search", {"smash_field": 169}),
-        ("L08", "datalab_healpix_density_map", {"catalog": "nsc_dr2", "preset": "lmc"}),
+        ("L08", "datalab_healpix_density_map", {"catalog": "nsc_dr2", "preset": "south_gradient"}),
         ("L09", "datalab_stream_selection", {"cluster_name": "Palomar 5"}),
+        ("L10", "datalab_sed_sample", {"ra": 194.95, "dec": 27.98, "radius_deg": 1.0}),
         ("L11", "datalab_target_class_summary", {"target_class": "LRG", "z_range": [0.4, 0.8]}),
+        ("L12", "datalab_satellite_search", {"survey": "nsc", "preset": "hydra2"}),
+        ("L13", "datalab_lss_wedge", {}),
         ("L15", "datalab_satellite_search", {"survey": "delve", "preset": "delve_south"}),
     ],
 )
@@ -131,15 +141,48 @@ def test_datalab_questions_route_to_their_oneshot_tool(qid, tool, expected):
     assert f"`{tool}`" in route["directive"] and "MANDATORY" in route["directive"]
 
 
-def test_datalab_routing_leaves_sed_questions_and_named_regions_alone():
-    assert detect_oneshot_intent(DLB_TEXT["L10"]) is None
+def test_sed_sample_route_does_not_hijack_the_benchmark_question_lists():
+    """DLB-100 F7: only L10 routes to datalab_sed_sample; no domain question does."""
+    import json
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parents[2] / "tmp" / "latency-repro-2026-09-21" / "screenshots"
+    if not (base / "datalab_questions.json").exists():
+        pytest.skip("benchmark question lists not present in this checkout")
+    for name in ("datalab_questions.json", "domain_questions.json"):
+        for q in json.loads((base / name).read_text(encoding="utf-8")):
+            route = detect_oneshot_intent(q["question"])
+            is_sed = bool(route and route["tool"] == "datalab_sed_sample")
+            assert is_sed == q["stem"].startswith("L10"), q["stem"]
+    ned = detect_oneshot_intent("Plot the SED of NGC 1068 from NED photometry")
+    assert ned is None or ned["tool"] != "datalab_sed_sample"
+    # a sample without the word "red" gets no colour cut
+    plain = detect_oneshot_intent("Make SEDs of 200 galaxies near RA = 150, Dec = 2 from Legacy Surveys DR9 with WISE W1/W2")
+    assert plain["args"]["gr_min"] is None and plain["args"]["limit"] == 200
+
+
+def test_datalab_routing_leaves_named_regions_alone():
     route = detect_oneshot_intent("Show a HEALPix stellar density map of the anticenter from NSC DR2")
     assert route["args"] == {"catalog": "nsc_dr2", "preset": "anticenter"}
     assert "clarifying" not in route["directive"]
-    # open-ended regions default to the LMC preset and must say so, not ask
+    # open-ended regions default to the south_gradient preset and must say so, not ask
     assert "Do NOT ask a clarifying question" in detect_oneshot_intent(DLB_TEXT["L08"])["directive"]
     # the strategy must be stated for the open-ended discovery question
     assert "STATE THE STRATEGY" in detect_oneshot_intent(DLB_TEXT["L15"])["directive"]
     # ALMA questions never take a Data Lab route
     assert detect_oneshot_intent("Which ALMA projects observed a stellar density peak in the LMC?") is None or \
         not detect_oneshot_intent("Which ALMA projects observed a stellar density peak in the LMC?")["tool"].startswith("datalab_")
+
+
+def test_hydra_ii_light_curve_question_is_not_a_clump_search():
+    route = detect_oneshot_intent(DLB_TEXT["L14"])
+    assert route is None or route["tool"] != "datalab_satellite_search"
+    # the L13 wedge must be built by the tool itself (no cone row pull first)
+    assert "WITHOUT a result_id" in detect_oneshot_intent(DLB_TEXT["L13"])["directive"]
+
+
+def test_l01_catalog_coverage_question_routes_to_an_unfiltered_listing():
+    route = detect_oneshot_intent("Which Data Lab catalogs cover the Large Magellanic Cloud, and which of those include "
+                                  "near-infrared photometry? List the relevant table names.")
+    assert route["tool"] == "datalab_list_catalogs" and route["args"] == {"target": "LMC"}
+    assert "NO band filter" in route["directive"]

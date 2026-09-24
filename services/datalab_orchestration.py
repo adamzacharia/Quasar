@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -585,6 +586,201 @@ def _tile_cone_centers(radius_deg: float, tile_radius_deg: float, cell_margin_de
     return centers
 
 
+ASYNC_MIN_POLL_SECONDS = 15.0
+
+
+def run_async_sql(
+    validated_sql: str,
+    *,
+    client: Any,
+    max_seconds: float = 240.0,
+    poll_seconds: float = 5.0,
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Submit ONE already-validated query as a Data Lab async job and poll it
+    until it completes, errors, the budget runs out (bounded by the tool
+    deadline) or the turn is cancelled (the job is then aborted). Returns
+    ``{"state": COMPLETED|ERROR|ABORTED|RUNNING|CANCELLED|UNAVAILABLE, "jobid",
+    "elapsed_s", "result"?, "error"?}``. Needs a login token."""
+    from integrations.datalab_client import ANON_TOKEN
+    from services.tool_budgets import is_cancelled, remaining_seconds
+
+    if getattr(client, "token", ANON_TOKEN) == ANON_TOKEN:
+        return {"state": "UNAVAILABLE", "error": "async jobs need a Data Lab login token"}
+    # The async parser gets a rewritten statement (MATERIALIZED / ::casts
+    # stripped): that EXECUTED text is what provenance must show (CX-16).
+    executed_sql = validated_sql
+    _strip = getattr(client, "strip_materialized_for_async", None)
+    if callable(_strip):
+        try:
+            executed_sql = str(_strip(validated_sql))
+        except Exception:
+            executed_sql = validated_sql
+    left = remaining_seconds()
+    budget = min(float(max_seconds), max(0.0, left - 10.0) if left is not None else float(max_seconds))
+    # Never submit a server job that cannot be polled or was already cancelled (CX-12).
+    if is_cancelled():
+        return {"state": "CANCELLED", "executed_sql": executed_sql, "error": "turn cancelled before submission"}
+    # A zero/negative budget can never poll: refuse it outright (CX-12 verify:
+    # max_seconds=0 submitted a job and returned RUNNING without one poll).
+    if float(max_seconds) <= 0 or budget <= 0 or budget < min(ASYNC_MIN_POLL_SECONDS, float(max_seconds)):
+        return {"state": "SKIPPED", "executed_sql": executed_sql,
+                "error": f"only {budget:.0f} s of tool budget left: not enough to submit and poll an async job"}
+    started = time.monotonic()
+    jobid = str(client.submit(sql=validated_sql))
+    state, status_errors = "", 0
+    # Every distinct status seen while polling, with its time since submission.
+    history: List[Dict[str, Any]] = [{"t_s": 0.0, "state": "SUBMITTED"}]
+
+    def _emit(event: Dict[str, Any]) -> None:
+        # Callers watching from another thread learn the job id and each
+        # status as they happen, even if this poller is later abandoned.
+        if on_event is not None:
+            try:
+                on_event(dict(event, jobid=jobid))
+            except Exception:  # noqa: BLE001 - reporting must never break polling
+                pass
+
+    _emit(history[0])
+    while time.monotonic() - started < budget:
+        if is_cancelled():
+            try:
+                client.abort(jobid)
+            except Exception:
+                pass
+            return {"state": "CANCELLED", "jobid": jobid, "status_history": history, "elapsed_s": round(time.monotonic() - started, 1),
+                    "executed_sql": executed_sql, "error": "turn cancelled; async job aborted"}
+        try:
+            state = str(client.status(jobid) or "").upper()
+            status_errors = 0
+            if state and state != history[-1]["state"]:
+                history.append({"t_s": round(time.monotonic() - started, 1), "state": state})
+                _emit(history[-1])
+        except Exception as exc:
+            # A transport error must not lose the submitted job id (CX-15).
+            status_errors += 1
+            state = ""
+            if status_errors >= 3:
+                return {"state": "UNKNOWN", "jobid": jobid, "status_history": history, "elapsed_s": round(time.monotonic() - started, 1),
+                        "executed_sql": executed_sql,
+                        "error": f"async job {jobid}: status polling failed 3 times ({type(exc).__name__})",
+                        "note": f"The job may still be running server-side; fetch it with datalab_job_results jobid={jobid}."}
+        if state in ("COMPLETED", "ERROR", "ABORTED"):
+            break
+        time.sleep(max(0.5, min(float(poll_seconds), budget - (time.monotonic() - started))))
+    elapsed = round(time.monotonic() - started, 1)
+    if state == "COMPLETED":
+        try:
+            result = client.results(jobid, query_text=validated_sql)
+        except Exception as exc:
+            return {"state": "RESULT_ERROR", "jobid": jobid, "status_history": history, "elapsed_s": elapsed, "executed_sql": executed_sql,
+                    "error": f"async job {jobid} completed but fetching its results failed: {type(exc).__name__}: {str(exc)[:160]}",
+                    "note": f"Fetch it with datalab_job_results jobid={jobid}."}
+        return {"state": "COMPLETED", "jobid": jobid, "status_history": history, "elapsed_s": elapsed, "executed_sql": executed_sql, "result": result}
+    if state == "ERROR":
+        try:
+            detail = str(client.error(jobid))[:200]
+        except Exception:
+            detail = ""
+        return {"state": "ERROR", "jobid": jobid, "status_history": history, "elapsed_s": elapsed, "executed_sql": executed_sql,
+                "error": f"async job {jobid} ERROR: {detail}"}
+    return {"state": state or "RUNNING", "jobid": jobid, "status_history": history, "elapsed_s": elapsed, "executed_sql": executed_sql,
+            "error": f"async job {jobid} {state or 'still running'} after {elapsed:.0f}s",
+            "note": f"The job keeps running server-side; fetch it with datalab_job_results jobid={jobid}."}
+
+
+def abort_async_job(client: Any, jobid: Optional[str]) -> str:
+    """Best-effort abort of a server-side job before a synchronous fallback
+    re-runs the same scan (guard CX-09: an UNKNOWN job may still be running)."""
+    if not jobid:
+        return "no job"
+    try:
+        client.abort(str(jobid))
+        return "abort requested"
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return f"abort failed ({type(exc).__name__})"
+
+
+def async_density_aggregate(
+    catalog: str,
+    table: str,
+    *,
+    mode: str = "healpix",
+    step_deg: float = 0.1,
+    healpix_column: Optional[str] = None,
+    ra: float,
+    dec: float,
+    radius_deg: float,
+    predicates: Optional[Sequence[str]] = None,
+    max_cells: int = 20000,
+    max_seconds: float = 240.0,
+    poll_seconds: float = 5.0,
+    client: Any = None,
+    result_store: Any = None,
+    owner_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """ONE density aggregate over the whole cone as a Data Lab ASYNC job
+    (needs a login token; anonymous tokens cannot poll jobs). Dense wide
+    regions never finish in the 60 s sync window whatever the tiling -- live
+    2026-09-23: even a 0.5 deg HEALPix tile at the LMC centre timed out, while
+    the whole 20x20 deg LMC aggregate completed as one async job in 199 s.
+    Polls until done or ``max_seconds`` (bounded by the tool deadline and
+    stopped by turn cancellation). Same return shape as
+    :func:`tiled_density_aggregate`; a job still running at the budget is
+    reported with its ``jobid`` (fetch later with datalab_job_results)."""
+    from integrations.datalab_client import ANON_TOKEN
+    from services import datalab_registry as reg
+
+    client = client or _default_client()
+    result_store = result_store or _default_result_store()
+    if getattr(client, "token", ANON_TOKEN) == ANON_TOKEN:
+        return {"success": False, "async_unavailable": True, "error": "async jobs need a Data Lab login token"}
+    mode_key = str(mode or "healpix").strip().lower()
+    info = reg.describe_table(catalog, table)
+    sql, meta = builders.build_density_aggregate(
+        catalog, table, mode=mode_key, step_deg=step_deg, healpix_column=healpix_column,
+        ra=ra, dec=dec, radius_deg=radius_deg, predicates=list(predicates or []), limit=max_cells, max_cells=max_cells,
+    )
+    validated = policy.validate(sql, source="builder", meta=meta)
+    job = run_async_sql(validated.sql, client=client, max_seconds=max_seconds, poll_seconds=poll_seconds)
+    jobid, elapsed, state = job.get("jobid"), float(job.get("elapsed_s") or 0.0), job["state"]
+    executed_sql = job.get("executed_sql") or validated.sql
+    if state != "COMPLETED":
+        return {"success": False, "jobid": jobid, "job_state": state, "elapsed_s": elapsed,
+                "budget_exhausted": state in ("RUNNING", "SKIPPED", "EXECUTING", "QUEUED", "PENDING"),
+                "error": ("turn cancelled; async job aborted" if state == "CANCELLED" else job.get("error")),
+                "note": job.get("note", "")}
+    result = job["result"]
+    frame = result.dataframe
+    row_limit = int((validated.meta or {}).get("row_limit") or max_cells)
+    truncated = frame is not None and len(frame) >= row_limit
+    hp_meta = None
+    if mode_key == "healpix":
+        want = str(healpix_column or "").strip().lower()
+        hp_entry = next((h for h in (info.get("healpix_columns") or []) if h.get("name") == want), None)
+        if hp_entry:
+            hp_meta = {"column": want, "nside": hp_entry.get("nside"), "scheme": hp_entry.get("scheme")}
+    warnings = [f"Whole region aggregated server-side as one Data Lab async job ({jobid}, {elapsed:.0f} s)."]
+    if truncated:
+        warnings.append(f"The aggregate filled its {row_limit}-cell cap: the SPARSEST cells were dropped (ORDER BY count DESC).")
+    store_meta = {
+        "builder": "density_aggregate_async", "catalog": info["catalog"], "table": info["table"],
+        "tool_name": "datalab_density_aggregate", "validated_sql": executed_sql, "warnings": warnings,
+        **({"owner_id": str(owner_id)} if owner_id else {}),
+        "provenance": {
+            "catalog": info["catalog"], "table": info["table"], "mode": f"{mode_key}_async", "jobid": jobid,
+            "validated_sql": executed_sql, "parent_cone": {"ra": float(ra), "dec": float(dec), "radius_deg": float(radius_deg)},
+            "partial": bool(truncated), "elapsed_s": round(elapsed, 1),
+            **({"limit_truncated": True, "row_limit": row_limit} if truncated else {}),
+            **({"healpix": hp_meta} if hp_meta else {}),
+        },
+    }
+    result_id = result_store.put(frame, store_meta)
+    return {"success": True, "result_id": result_id, "rowcount": int(len(frame)), "partial": bool(truncated),
+            "tiles_completed": 1, "tiles_total": 1, "coverage_summary": "whole region in one async job",
+            "warnings": warnings, "jobid": jobid, "elapsed_s": round(elapsed, 1), "sql_example": executed_sql}
+
+
 def tiled_density_aggregate(
     catalog: str,
     table: str,
@@ -609,6 +805,7 @@ def tiled_density_aggregate(
     client: Any = None,
     result_store: Any = None,
     owner_id: Optional[str] = None,
+    max_cells: Optional[int] = None,
 ) -> Dict[str, Any]:
     """P8 fallback: a wide density aggregate that beats the Data Lab 60s sync window
     by tiling the parent cone into overlapping sub-cones, each ALSO bounded by the
@@ -668,8 +865,12 @@ def tiled_density_aggregate(
     # platform chose it (limit=None default or clamped), the final provenance
     # must record platform_row_cap ALWAYS — not only when a tile happens to
     # truncate (guard CX-07). User-passed in-range limits stay unflagged.
+    # ``max_cells`` raises the per-tile cell cap for fine grids: a 2-degree
+    # tile at 0.05-degree cells is ~5000 cells, so 9 of 21 L15 tiles filled the
+    # 5000 cap and dropped their sparsest cells (live 2026-09-24).
+    cell_cap = int(max_cells) if max_cells else builders.MAX_ROW_LIMIT
     per_tile_limit, tile_cap_reason = builders._resolve_limit(
-        limit, maximum=builders.MAX_ROW_LIMIT, default=builders.MAX_ROW_LIMIT
+        limit, maximum=cell_cap, default=cell_cap
     )
 
     import threading as _threading
@@ -683,6 +884,7 @@ def tiled_density_aggregate(
         sql, meta = builders.build_density_aggregate(
             catalog, table, mode=mode_key, step_deg=step_deg, healpix_column=healpix_column,
             ra=tra, dec=tdec, radius_deg=r, predicates=base_predicates, limit=limit,
+            **({"max_cells": cell_cap} if max_cells else {}),
         )
         validated = policy.validate(sql, source="builder", meta=meta)
         left = max_seconds - (time.monotonic() - started)
@@ -862,13 +1064,7 @@ def tiled_density_aggregate(
     }
 
 
-def build_wedge_selection(*, ra_min=150.0, ra_max=220.0, dec_min=0.0, dec_max=5.0,
-                          z_min=0.0, z_max=0.1, limit=5000):
-    """A bounded pilot spectroscopic slice; query must succeed before plotting.
-
-    The default equatorial strip is an analysis choice, not a catalogued wall
-    boundary. User-specified geometry is validated, never silently cropped.
-    """
+def _wedge_bounds(ra_min, ra_max, dec_min, dec_max, z_min, z_max):
     bounds = [float(v) for v in (ra_min, ra_max, dec_min, dec_max, z_min, z_max)]
     if not all(math.isfinite(v) for v in bounds):
         raise ValueError("Wedge bounds must be finite")
@@ -877,27 +1073,68 @@ def build_wedge_selection(*, ra_min=150.0, ra_max=220.0, dec_min=0.0, dec_max=5.
         raise ValueError("Invalid RA, declination or redshift bounds")
     if d1 - d0 > 5.0:
         raise ValueError("A wedge requires a thin declination slice (at most 5 degrees); use the default 2.5 degree strip or provide narrower bounds")
-    row_limit = min(5000, max(1, int(limit)))
-    sql = (
-        "SELECT specobjid, ra, dec, z, class, zwarning FROM sdss_dr17.specobj "
-        "WHERE class = 'GALAXY' AND zwarning = 0 "
+    return (
+        "FROM sdss_dr17.specobj WHERE class = 'GALAXY' AND zwarning = 0 "
         f"AND z BETWEEN {z0:g} AND {z1:g} "
         f"AND ra BETWEEN {r0:g} AND {r1:g} AND dec BETWEEN {d0:g} AND {d1:g} "
-        f"LIMIT {row_limit}"
     )
+
+
+# Default slice: the SDSS equatorial stripe (Dec -1.25..+1.25, 2.5 deg thick)
+# over RA 150-220 at z <= 0.1 -- where Gott et al. (2005) identified the SDSS
+# Great Wall (z ~ 0.07-0.08).
+WEDGE_DEFAULT = {"ra_min": 150.0, "ra_max": 220.0, "dec_min": -1.25, "dec_max": 1.25, "z_min": 0.0, "z_max": 0.1}
+
+
+def build_wedge_count(*, ra_min=150.0, ra_max=220.0, dec_min=-1.25, dec_max=1.25, z_min=0.0, z_max=0.1):
+    """COUNT(*) of the wedge slice, so the pull can be thinned uniformly."""
+    sql = "SELECT COUNT(*) AS n " + _wedge_bounds(ra_min, ra_max, dec_min, dec_max, z_min, z_max).rstrip()
+    return sql, {"catalog": "sdss_dr17", "table": "specobj", "builder": "lss_wedge_count", "aggregate": True, "row_limit": 1}
+
+
+def wedge_thinning(n_rows: Optional[int], limit: int) -> int:
+    """Smallest k with ceil(n / k) <= limit (1 = no thinning)."""
+    try:
+        n = int(n_rows or 0)
+    except (TypeError, ValueError):
+        return 1
+    lim = max(1, int(limit))
+    return max(1, -(-n // lim))
+
+
+def build_wedge_selection(*, ra_min=150.0, ra_max=220.0, dec_min=-1.25, dec_max=1.25,
+                          z_min=0.0, z_max=0.1, limit=5000, thin=1):
+    """A bounded spectroscopic slice; query must succeed before plotting.
+
+    The default equatorial strip is an analysis choice, not a catalogued wall
+    boundary. User-specified geometry is validated, never silently cropped.
+    ``thin`` = k keeps a uniform 1-in-k subsample (MOD(fiberid, k) = 0): a bare
+    LIMIT returns rows in storage (plate) order, and live the 5 000-row cap of
+    the RA 150-220 slice covered only RA 150-172 (2026-09-23).
+    """
+    where = _wedge_bounds(ra_min, ra_max, dec_min, dec_max, z_min, z_max)
+    row_limit = min(5000, max(1, int(limit)))
+    k = max(1, int(thin or 1))
+    sql = "SELECT specobjid, ra, dec, z, class, zwarning " + where + (f"AND MOD(fiberid, {k}) = 0 " if k > 1 else "") + f"LIMIT {row_limit}"
+    warnings = ["Bounded spectroscopic pilot; the default equatorial strip is an analysis choice. The row cap can omit galaxies; do not infer survey completeness."]
+    if k > 1:
+        warnings.append(f"Uniform 1-in-{k} subsample (MOD(fiberid, {k}) = 0) so the {row_limit}-row cap spans the whole slice "
+                        "instead of the first plates in storage order.")
     return sql, {"catalog": "sdss_dr17", "table": "specobj", "builder": "lss_wedge_selection",
-                 "row_limit": row_limit, "platform_row_cap": row_limit,
-                 "warnings": ["Bounded spectroscopic pilot; the default equatorial strip is an analysis choice. The row cap can omit galaxies; do not infer survey completeness."]}
+                 "row_limit": row_limit, "platform_row_cap": row_limit, "thinning": k,
+                 "warnings": warnings}
 
 
 def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols, limit, client, result_store,
                        point_sources=False, morphology=None, extra_value_cuts=None, owner_id=None,
-                       default_limit=None):
+                       default_limit=None, extra_select=None):
     """Cone-select the magnitude (+extra) columns for a diagram and return (result_id, df, magcols).
 
     ``limit=None`` means the caller made NO row-budget choice: the plotting
     budget ``default_limit`` is applied by the builder as a PLATFORM cap and
-    flagged as such (platform_row_cap + warning + SQL comment, RE-B1)."""
+    flagged as such (platform_row_cap + warning + SQL comment, RE-B1).
+    ``extra_select`` are trusted, builder-made SELECT expressions (e.g. the
+    star/galaxy CASE column) appended to the column list."""
     from services import datalab_registry as reg
     magcols = {b: reg.mag_column(catalog, table, b) for b in bands}
     info = reg.describe_table(catalog, table)
@@ -930,10 +1167,14 @@ def _diagram_dataframe(catalog, table, ra, dec, radius_deg, *, bands, extra_cols
     sql, meta = builders.build_cone_select(catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
                                            columns=cols, limit=limit, predicates=predicates,
                                            default_limit=(default_limit or builders.DEFAULT_ROW_LIMIT))
+    extras = [str(e).strip() for e in (extra_select or []) if str(e or "").strip()]
+    if extras:
+        sql = sql.replace("\nFROM ", ", " + ", ".join(extras) + "\nFROM ", 1)
     result_id, result = _run_builder_sql(
         sql, meta, client=client, result_store=result_store, owner_id=owner_id
     )
     meta = dict(meta or {})
+    meta["value_cuts_applied"] = [dict(vc) for vc in value_cuts]
     meta["point_source_cut_applied"] = ps_applied
     meta["morphology"] = morph_cut
     # The -5/50 cuts above are sentinel removal, NOT survey science — annotate
@@ -1003,6 +1244,7 @@ def _expr_diagram(
     default_limit=None,
     pm_total_min=None,
     tile_threshold_deg=None,
+    abs_mag_cut=None,
 ):
     """One-shot diagram with derived axes (e.g. a Gaia HR diagram:
     x = bp_rp, y = phot_g_mean_mag + 5*log10(parallax) - 10).
@@ -1030,6 +1272,12 @@ def _expr_diagram(
     # NaN rows fail every expression anyway — exclude them server-side so they
     # don't consume the row budget.
     predicates = predicates + [f"{builders._column(info, c)} < 'Infinity'::float8" for c in cols]
+    # Magnitude columns in the expressions get the same sentinel guard as the
+    # band diagrams (-5 < mag < 50): NSC pads missing photometry with 99, which
+    # stretched a 2026-09-24 L03 CMD to g - r = -80..80 and g = 100.
+    mag_cols = [c for c in cols if re.search(r"mag", c, re.I)]
+    if mag_cols:
+        predicates = predicates + builders._sentinel_mag_predicates(catalog, table, mag_cols)
     if pm_total_min is not None:
         # Total proper-motion floor IN THE SQL (datalab_selection_diagram, UI
         # benchmark 2026-09-22 L06): squared components, registry-validated
@@ -1042,6 +1290,16 @@ def _expr_diagram(
             f"{pmra_c} < 'Infinity'::float8", f"{pmdec_c} < 'Infinity'::float8",
             f"({pmra_c}*{pmra_c} + {pmdec_c}*{pmdec_c}) > {pm_floor * pm_floor:.6g}",
         ]
+    if abs_mag_cut is not None:
+        # Absolute-magnitude floor IN THE SQL: (m + 5 log10(parallax) - 10) > M
+        # with parallax in mas (Postgres LOG = base 10). DLB-06 C5 expects an
+        # explicit abs G > ~10 cut for white-dwarf candidates.
+        mag_c = builders._column(info, str(abs_mag_cut[0]))
+        plx_c = builders._column(info, "parallax")
+        m_min = float(abs_mag_cut[1])
+        if not math.isfinite(m_min):
+            raise ValueError("abs_mag_cut threshold must be finite")
+        predicates = predicates + [f"{plx_c} > 0", f"({mag_c} + 5 * LOG({plx_c}) - 10) > {m_min:g}"]
     sql, meta = builders.build_cone_select(
         catalog, table, ra=ra, dec=dec, radius_deg=radius_deg,
         columns=select_cols, limit=limit, predicates=predicates,
@@ -1101,10 +1359,30 @@ def _expr_diagram(
     plot_title = title or f"{catalog}.{table} — {y_expr} vs {x_expr}"
     ax.set_title(plot_title)
     fig.tight_layout()
-    plotly_spec = _plotly_scatter_spec(
-        [("selected", x[finite].tolist(), y[finite].tolist())],
-        x_label=x_expr, y_label=y_expr, title=plot_title, invert_y=invert_y,
-    )
+    if _locus_info:
+        # The interactive card must show what the PNG shows (UI 2026-09-24
+        # L06: the answer described a locus line and highlighted candidates
+        # the card did not have): WD candidates as their own trace + the line.
+        xv, yv = np.asarray(x[finite], dtype=float), np.asarray(y[finite], dtype=float)
+        is_wd = yv > (analysis._WD_INTERCEPT + analysis._WD_SLOPE * xv)
+        plotly_spec = _plotly_scatter_spec(
+            [("main sequence / other", xv[~is_wd].tolist(), yv[~is_wd].tolist())],
+            x_label=x_expr, y_label=y_expr, title=plot_title, invert_y=invert_y,
+        )
+        plotly_spec["data"].append({"type": "scatter", "mode": "markers", "name": f"WD candidates (n={int(is_wd.sum())})",
+                                    "x": [round(float(v), 4) for v in xv[is_wd]], "y": [round(float(v), 4) for v in yv[is_wd]],
+                                    "marker": {"size": 5, "opacity": 0.9, "color": "#D55E00"}})
+        if xv.size:
+            lx = [float(np.nanmin(xv)), float(np.nanmax(xv))]
+            plotly_spec["data"].append({"type": "scatter", "mode": "lines", "name": "WD locus",
+                                        "x": lx, "y": [analysis._WD_INTERCEPT + analysis._WD_SLOPE * v for v in lx],
+                                        "line": {"dash": "dash", "color": "#D55E00", "width": 1.2}})
+        plotly_spec["layout"]["showlegend"] = True
+    else:
+        plotly_spec = _plotly_scatter_spec(
+            [("selected", x[finite].tolist(), y[finite].tolist())],
+            x_label=x_expr, y_label=y_expr, title=plot_title, invert_y=invert_y,
+        )
     _extra = {"rowcount": int(len(df)), "x": x_expr, "y": y_expr,
               "points": int(finite.sum()), "morphology": morph_cut,
               "warnings": warnings,
@@ -1338,6 +1616,30 @@ def _split_groups(split_col, s, finite, split_threshold):
     )
 
 
+def _split_case_sql(split_col, split_threshold) -> str:
+    """The star/galaxy split as a SQL CASE column ``morph`` ('star' | 'galaxy';
+    NULL = no morphology data), so the executed query carries the split.
+    Same conventions as _split_groups: ext_coadd categories, class_star high =
+    star, spread_model-style two-sided |s| <= t = star."""
+    col = str(split_col or "").strip().lower()
+    if not re.match(r"^[a-z_][a-z0-9_]*$", col):
+        raise ValueError(f"Invalid split column {split_col!r}")
+    if col == "ext_coadd":
+        return ("CASE WHEN ext_coadd IN (0, 1) THEN 'star' WHEN ext_coadd IN (2, 3) THEN 'galaxy' "
+                "END AS morph")
+    t = float(split_threshold)
+    if builders._morph_family(col) == "class_star":
+        return f"CASE WHEN {col} > {t:g} THEN 'star' WHEN {col} IS NOT NULL THEN 'galaxy' END AS morph"
+    return (f"CASE WHEN {col} BETWEEN {-abs(t):g} AND {abs(t):g} THEN 'star' "
+            f"WHEN {col} IS NOT NULL THEN 'galaxy' END AS morph")
+
+
+def _describe_cut(vc) -> str:
+    val = vc.get("value")
+    lit = f"'{val}'" if isinstance(val, str) else f"{val:g}" if isinstance(val, float) else str(val)
+    return f"{vc.get('column')} {vc.get('op')} {lit}"
+
+
 def color_color_diagram(
     catalog, table, ra, dec, radius_deg, *,
     x_bands=("g", "r"), y_bands=("r", "i"),
@@ -1382,11 +1684,24 @@ def color_color_diagram(
         )
 
     bands = list(dict.fromkeys([*x_bands, *y_bands]))
+    # Registered CCD magnitude window (DES: 16 < mag_auto_i < 23), unless the
+    # caller already cut that column (DLB-05 C7: flags, fluxerr AND a window).
+    value_cuts = [dict(vc) for vc in (value_cuts or [])]
+    window = reg.ccd_magnitude_window(catalog, table)
+    window_note = None
+    if window and str(window["column"]).lower() not in {str(vc.get("column", "")).lower() for vc in value_cuts}:
+        value_cuts += [{"column": window["column"], "op": ">", "value": window["min"]},
+                       {"column": window["column"], "op": "<", "value": window["max"]}]
+        window_note = (f"Magnitude window {window['min']:g} < {window['column']} < {window['max']:g} "
+                       "(drops saturated and noise-dominated sources from the colour axes); "
+                       "override with your own value_cut on that column.")
+    split_sql = _split_case_sql(split_col, split_threshold) if split_col else None
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands,
         extra_cols=[split_col] if split_col else [], limit=limit, client=client, result_store=result_store,
         point_sources=point_sources, morphology=morphology, extra_value_cuts=value_cuts,
         owner_id=owner_id, default_limit=CCD_SAMPLE_BUDGET,
+        extra_select=[split_sql] if split_sql else None,
     )
     df = result.dataframe
     _ps_applied = bool(_meta.get("point_source_cut_applied"))
@@ -1404,6 +1719,10 @@ def color_color_diagram(
     if split_col and split_col in df.columns:
         s = pd.to_numeric(df[split_col], errors="coerce")
         groups, split_note = _split_groups(split_col, s, finite, split_threshold)
+        if "morph" in df.columns:
+            # The executed SQL classified each row: use the server's column.
+            morph = df["morph"].astype(str).str.strip().str.lower()
+            groups = [("stars", finite & (morph == "star")), ("galaxies", finite & (morph == "galaxy"))]
         fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0))
         for ax, (label, mask) in zip(axes, groups):
             ax.scatter(x[mask], y[mask], s=6, alpha=0.4, edgecolors="none")
@@ -1423,6 +1742,11 @@ def color_color_diagram(
     fig.tight_layout()
     plotly_spec = _plotly_scatter_spec(panels, x_label=xl, y_label=yl, title=plot_title)
     ps_applied = bool(_meta.get("point_source_cut_applied"))
+    cuts_applied = [_describe_cut(vc) for vc in (_meta.get("value_cuts_applied") or [])]
+    if split_sql:
+        cuts_applied.append(f"star/galaxy split in the SQL: {split_sql}")
+    if _meta.get("morphology"):
+        cuts_applied.append(f"morphology cut: {_meta['morphology']}")
     return _render_diagram(plotting, fig, "datalab_ccd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
                             "auto_validity_filters": _meta.get("auto_validity_filters"),
@@ -1432,9 +1756,12 @@ def color_color_diagram(
                                if _meta.get("platform_row_cap") else {})},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "split_col": split_col,
                             "split_threshold": split_threshold,
+                            "split_sql": split_sql,
+                            "cuts_applied": cuts_applied,
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
                             "populations": populations,
                             "warnings": list(_meta.get("warnings") or [])
+                            + ([window_note] if window_note else [])
                             + ([split_note] if split_note else [])
                             + ([split_deviation_warning] if split_deviation_warning else []),
                             "excluded_invalid_mags": int(len(df) - int(finite.sum())),
@@ -1447,7 +1774,7 @@ def color_magnitude_diagram(
     point_sources=False, morphology=None, value_cuts=None,
     x_expr=None, y_expr=None, overlay_locus=None,
     client=None, result_store=None, plotting_service=None, owner_id=None,
-    pm_total_min=None, tile_threshold_deg=None,
+    pm_total_min=None, tile_threshold_deg=None, abs_mag_cut=None,
 ):
     """P3: one-shot color-magnitude diagram (mag_band vs blue-red color), magnitude axis inverted.
     Sentinel magnitudes are excluded server- and client-side; point_sources=True applies the
@@ -1467,13 +1794,27 @@ def color_magnitude_diagram(
             catalog, table, ra, dec, radius_deg,
             x_expr=str(x_expr), y_expr=str(y_expr), invert_y=True, prefix="datalab_cmd",
             limit=limit, title=title, point_sources=point_sources, morphology=morphology,
-            value_cuts=value_cuts, overlay_locus=overlay_locus, pm_total_min=pm_total_min,
+            value_cuts=value_cuts, overlay_locus=overlay_locus, pm_total_min=pm_total_min, abs_mag_cut=abs_mag_cut,
             tile_threshold_deg=tile_threshold_deg,
             client=client, result_store=result_store, plotting=plotting,
             owner_id=owner_id, default_limit=CMD_SAMPLE_BUDGET,
         )
     mag_band = mag_band or blue_band
     bands = list(dict.fromkeys([blue_band, red_band, mag_band]))
+    from services import datalab_registry as reg
+    # Registered faint depth bound (NSC: g, r < 24) on every plotted band the
+    # caller did not already cut (DLB-03 C6: "magnitude limits ~g,r < 24").
+    value_cuts = [dict(vc) for vc in (value_cuts or [])]
+    depth_bound = reg.cmd_depth_bound(catalog, table)
+    depth_cuts: List[str] = []
+    if depth_bound is not None:
+        cut_cols = {str(vc.get("column", "")).lower() for vc in value_cuts}
+        for b in bands:
+            col = reg.mag_column(catalog, table, b)
+            if col.lower() not in cut_cols:
+                value_cuts.append({"column": col, "op": "<", "value": float(depth_bound)})
+                depth_cuts.append(f"{col} < {depth_bound:g}")
+                cut_cols.add(col.lower())
     rid, result, magcols, _meta = _diagram_dataframe(
         catalog, table, ra, dec, radius_deg, bands=bands, extra_cols=[], limit=limit,
         client=client, result_store=result_store, point_sources=point_sources,
@@ -1499,6 +1840,40 @@ def color_magnitude_diagram(
         [(label, color[finite].tolist(), mag[finite].tolist())],
         x_label=xl, y_label=yl, title=plot_title, invert_y=True,
     )
+    # Depth of the plotted sample: the bound applied and where the magnitude
+    # histogram turns over (completeness starts to fall).
+    mags = mag[finite].to_numpy(dtype=float) if hasattr(mag[finite], "to_numpy") else np.asarray(mag[finite], dtype=float)
+    # A capped sample (storage-order LIMIT) cannot measure depth, and a peak
+    # counts as a turnover only if the counts really fall fainter (guard CX-07).
+    turnover, depth_note = None, "too few points to measure the depth"
+    capped = bool(_meta.get("row_limit")) and len(df) >= int(_meta.get("row_limit") or 0)
+    if capped:
+        depth_note = (f"The plotted sample hit its row cap ({int(_meta['row_limit'])} rows, storage order), so its magnitude "
+                      "histogram does not measure the catalogue depth"
+                      + (f"; the faint limit here is the bound applied ({', '.join(depth_cuts)})." if depth_cuts else "."))
+    elif mags.size >= 50:
+        hist, edges = np.histogram(mags, bins=np.arange(np.floor(mags.min()), np.ceil(mags.max()) + 0.25, 0.25))
+        if hist.size >= 8:
+            # Smoothed counts; a turnover needs the peak in the fainter 60 %
+            # of the range and the three faintest bins at <= half the peak
+            # (number counts rise to the completeness limit, then fall).
+            sm = np.convolve(hist.astype(float), np.ones(3) / 3.0, mode="same")
+            i = int(np.argmax(sm))
+            tail = sm[-3:]
+            if i >= int(0.4 * sm.size) and i < sm.size - 3 and float(tail.mean()) <= 0.5 * float(sm[i]):
+                turnover = round(float(0.5 * (edges[i] + edges[i + 1])), 2)
+                depth_note = (f"The {mag_band}-band counts peak at {mag_band} ~ {turnover:g} and fall below half that peak "
+                              "fainter: the sample is incomplete beyond it.")
+            elif depth_cuts:
+                depth_note = (f"No turnover within the plotted range: the faint limit here is the bound applied "
+                              f"({', '.join(depth_cuts)}).")
+            else:
+                # No faint bound of ours: say only what the histogram shows (CX-07 verify).
+                depth_note = "No turnover within the plotted range: this sample does not show where the catalogue becomes incomplete."
+    depth = {"bound_applied": depth_cuts or None,
+             "bound_source": ("registry default (no caller cut on these bands)" if depth_cuts else
+                              "caller cuts / none registered"),
+             "turnover_mag": turnover, "sample_capped": capped, "note": depth_note}
     return _render_diagram(plotting, fig, "datalab_cmd", rid,
                            {**(getattr(result, "provenance", {}) or {}), "catalog": catalog, "table": table,
                             "auto_validity_filters": _meta.get("auto_validity_filters"),
@@ -1508,6 +1883,8 @@ def color_magnitude_diagram(
                                if _meta.get("platform_row_cap") else {})},
                            {"rowcount": int(len(df)), "x": xl, "y": yl, "points": int(finite.sum()),
                             "point_sources": ps_applied, "morphology": _meta.get("morphology"),
+                            "depth": depth,
+                            "cuts_applied": [_describe_cut(vc) for vc in (_meta.get("value_cuts_applied") or [])],
                             "warnings": list(_meta.get("warnings") or []),
                             "excluded_invalid_mags": int(len(df) - int(finite.sum())),
                             "plotly_spec": plotly_spec})

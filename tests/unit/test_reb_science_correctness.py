@@ -767,8 +767,10 @@ def test_cutout_grid_mixed_timeouts_carry_panel_timeouts_and_warning():
     calls = {"n": 0}
 
     def fake_search(ra, dec, fov, **kwargs):
+        # Panels are fetched concurrently: key the timeout on the position,
+        # not on call order.
         calls["n"] += 1
-        if calls["n"] == 1:
+        if ra == 10.0:
             raise TimeoutError("simulated FITS wall-clock timeout")
         return {"coverage_gap": True, "rows": [], "used_endpoint": "sia"}
 

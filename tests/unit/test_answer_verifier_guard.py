@@ -167,3 +167,20 @@ def test_equality_on_an_echoed_tool_parameter_is_supported_but_not_an_inequality
     ts = build_trace_summary([], [_trace("datalab_healpix_density_map", {"catalog": "nsc_dr2", "preset": "ngp"}, out)], [])
     assert not verify_answer("The map uses HEALPix nside = 256.", ts).by_kind("cut")
     assert verify_answer("Only cells with nside > 256 were kept.", ts).by_kind("cut")
+
+
+
+def test_caps_are_not_result_counts():
+    """Live 2026-09-23 D15: "selects up to 200 rows" described a code sample."""
+    ts = build_trace_summary([{"output": json.dumps({"success": True, "rowcount": 12})}], [], [])
+    assert not verify_answer("The query selects up to 200 rows and returns at most 5000 rows.", ts).by_kind("count")
+    assert verify_answer("The query returned 200 rows.", ts).by_kind("count")
+
+
+
+def test_numbers_inside_object_names_are_not_counts():
+    """Live 2026-09-23 L09: "isolate a large sample of Palomar 5 members" was
+    flagged as the count "5 members"."""
+    ts = build_trace_summary([{"output": json.dumps({"success": True, "n_selected": 8656})}], [], [])
+    assert not verify_answer("The cuts isolate Palomar 5 members; NGC 1333 protostars and Terzan 5 stars too.", ts).by_kind("count")
+    assert verify_answer("We found 42 members.", ts).by_kind("count")

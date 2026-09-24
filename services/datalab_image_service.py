@@ -7,7 +7,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -220,6 +220,7 @@ class DatalabImageService:
         catalog: Optional[str] = None,
         endpoint: Optional[str] = None,
         title: Optional[str] = None,
+        mark_center: bool = True,
     ) -> Dict[str, Any]:
         search = self.search(ra, dec, fov_deg, catalog=catalog, endpoint=endpoint)
         if search.get("coverage_gap"):
@@ -268,9 +269,12 @@ class DatalabImageService:
                 "provenance": dict(search.get("provenance") or {}),
             }
         cut = self._cutout_image(image, ra=ra, dec=dec, fov_deg=fov_deg)
-        render = self._render_single_band(cut.data, cut.wcs, title or f"Data Lab {band}-band cutout")
+        render = self._render_single_band(cut.data, cut.wcs, title or f"Data Lab {band}-band cutout",
+                                          mark=(ra, dec) if mark_center else None)
         self._cleanup_paths([image.path])
-        extra = {"selected_rows": {band_key: self._row_provenance(row)}, "source_url": image.source_url}
+        extra = {"selected_rows": {band_key: self._row_provenance(row)}, "source_url": image.source_url,
+                 **({"target_marked": {"ra": float(ra), "dec": float(dec), "marker": "reticle at the requested position"}}
+                    if mark_center else {})}
         if dl_errors:
             extra["skipped_broken_tiles"] = dl_errors
         return self._image_result(render, search, bands=[band_key], provenance_extra=extra)
@@ -658,47 +662,85 @@ class DatalabImageService:
         n = len(parsed)
         cols = int(math.ceil(math.sqrt(n)))
         rows = int(math.ceil(n / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 3.0 * rows), squeeze=False)
         panels: List[Dict[str, Any]] = []
         any_image = False
+        band_key = str(band).lower()
 
-        for idx, peak in enumerate(parsed):
+        def _fetch(peak: Dict[str, Any]) -> Dict[str, Any]:
+            """SIA search + tile download + cutout for one panel (worker thread;
+            no plotting here, matplotlib stays on the calling thread)."""
+            search = self.search(peak["ra"], peak["dec"], fov_deg, catalog=catalog, endpoint=endpoint)
+            chosen = self.deepest_by_band(search.get("rows") or [], [band]) if not search.get("coverage_gap") else {}
+            if search.get("coverage_gap") or band_key not in chosen:
+                return {"gap": True, "used_endpoint": search.get("used_endpoint")}
+            image = self._load_image(chosen[band_key]["row"], ra=peak["ra"], dec=peak["dec"], fov_deg=fov_deg)
+            try:
+                cut = self._cutout_image(image, ra=peak["ra"], dec=peak["dec"], fov_deg=fov_deg)
+                if self._is_degenerate(cut.data):
+                    raise ValueError("empty/degenerate tile at this peak (all-NaN or constant)")
+                data = np.array(cut.data, dtype=float)
+            finally:
+                self._cleanup_paths([image.path])
+            return {"gap": False, "data": data, "selected_row": self._row_provenance(chosen[band_key]["row"]),
+                    "used_endpoint": search.get("used_endpoint")}
+
+        # Panels are fetched CONCURRENTLY (live 2026-09-23: ~20 s per SIA
+        # cutout serially ate L15's vetting budget), each batch bounded by a
+        # per-panel wall clock; a panel that does not finish is a timeout gap.
+        from services.alma_server_side import run_concurrently
+        from services.tool_budgets import remaining_seconds
+
+        try:
+            workers = max(1, int(os.getenv("DATALAB_CUTOUT_GRID_WORKERS", "4") or 4))
+        except ValueError:  # guard CX-14: a malformed value must not break the grid
+            workers = 4
+        try:
+            panel_seconds = float(os.getenv("DATALAB_CUTOUT_PANEL_SECONDS", "45") or 45)
+        except ValueError:
+            panel_seconds = 45.0
+        fetched: List[Any] = []
+        for start in range(0, n, workers):
+            batch = parsed[start:start + workers]
+            left = remaining_seconds()
+            wall = panel_seconds if left is None else min(panel_seconds, max(0.0, left - 5.0))
+            if left is not None and left - 5.0 < 2.0:
+                fetched.extend(TimeoutError("tool budget exhausted before this panel was fetched") for _ in batch)
+                continue
+            fetched.extend(run_concurrently([(lambda p=p: _fetch(p)) for p in batch], wall_seconds=wall))
+
+        fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 3.0 * rows), squeeze=False)
+        for idx, (peak, got) in enumerate(zip(parsed, fetched)):
             ax = axes[idx // cols][idx % cols]
             label = peak.get("label") or f"{peak['ra']:.4f}, {peak['dec']:.4f}"
             panel = {"label": label, "ra": peak["ra"], "dec": peak["dec"], "coverage_gap": False}
-            try:
-                search = self.search(peak["ra"], peak["dec"], fov_deg, catalog=catalog, endpoint=endpoint)
-                chosen = self.deepest_by_band(search.get("rows") or [], [band]) if not search.get("coverage_gap") else {}
-                if search.get("coverage_gap") or str(band).lower() not in chosen:
-                    panel["coverage_gap"] = True
-                    ax.text(0.5, 0.5, "No coverage", ha="center", va="center", transform=ax.transAxes)
-                    ax.set_xticks([])
-                    ax.set_yticks([])
+            if isinstance(got, BaseException) or got.get("gap"):
+                if isinstance(got, BaseException):
+                    # An operational failure did NOT establish a coverage gap
+                    # (guard CX-04): it is reported as not checked.
+                    panel["coverage_gap"] = False
+                    panel["not_checked"] = True
+                    panel["error"] = str(got)
+                    if _is_timeout_error(got):
+                        # Tracked so an all-timeouts grid can honor the runner's
+                        # timeout contract instead of closing as a completion
+                        # (verify CX-27).
+                        panel["timeout"] = True
+                    label_text = "Timed out (not checked)" if panel.get("timeout") else "Fetch failed (not checked)"
                 else:
-                    image = self._load_image(chosen[str(band).lower()]["row"], ra=peak["ra"], dec=peak["dec"], fov_deg=fov_deg)
-                    cut = self._cutout_image(image, ra=peak["ra"], dec=peak["dec"], fov_deg=fov_deg)
-                    if self._is_degenerate(cut.data):
-                        self._cleanup_paths([image.path])
-                        raise ValueError("empty/degenerate tile at this peak (all-NaN or constant)")
-                    finite = np.asarray(cut.data, dtype=float)
-                    finite = finite[np.isfinite(finite)]
-                    norm = ImageNormalize(finite, interval=ZScaleInterval(), stretch=AsinhStretch())
-                    ax.imshow(cut.data, origin="lower", cmap="gray", norm=norm)
-                    any_image = True
-                    panel["selected_row"] = self._row_provenance(chosen[str(band).lower()]["row"])
-                    self._cleanup_paths([image.path])
-                panel["used_endpoint"] = search.get("used_endpoint")
-            except Exception as exc:  # noqa: BLE001 - one bad panel should not kill the grid
-                panel["coverage_gap"] = True
-                panel["error"] = str(exc)
-                if _is_timeout_error(exc):
-                    # Tracked so an all-timeouts grid can honor the runner's
-                    # timeout contract instead of closing as a completion
-                    # (verify CX-27).
-                    panel["timeout"] = True
-                ax.text(0.5, 0.5, "No coverage", ha="center", va="center", transform=ax.transAxes)
+                    panel["coverage_gap"] = True
+                    panel["used_endpoint"] = got.get("used_endpoint")
+                    label_text = "No coverage"
+                ax.text(0.5, 0.5, label_text, ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([])
                 ax.set_yticks([])
+            else:
+                data = got["data"]
+                finite = data[np.isfinite(data)]
+                norm = ImageNormalize(finite, interval=ZScaleInterval(), stretch=AsinhStretch())
+                ax.imshow(data, origin="lower", cmap="gray", norm=norm)
+                any_image = True
+                panel["selected_row"] = got["selected_row"]
+                panel["used_endpoint"] = got.get("used_endpoint")
             ax.set_title(str(label), fontsize=9)
             panels.append(panel)
 
@@ -736,7 +778,10 @@ class DatalabImageService:
             "used_endpoint": endpoint,
             "source_service": "NOIRLab Astro Data Lab (SIA)",  # guard CX-13
             "bands_used": [str(band).lower()] if any_image else [],
-            "coverage_gap": not any_image,
+            # A gap only when every panel's SIA search established one (CX-04).
+            "coverage_gap": (not any_image) and all(p.get("coverage_gap") for p in panels),
+            **({"panels_not_checked": sum(1 for p in panels if p.get("not_checked"))}
+               if any(p.get("not_checked") for p in panels) else {}),
             "panels": panels,
             "provenance": {"fov_deg": fov_deg, "band": band, "catalog": catalog},
         }
@@ -1000,7 +1045,7 @@ class DatalabImageService:
             return True
         return float(np.max(finite)) == float(np.min(finite))
 
-    def _render_single_band(self, data: Any, wcs: Any, title: str) -> Dict[str, Any]:
+    def _render_single_band(self, data: Any, wcs: Any, title: str, mark: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
         plt = self.plotting_service._apply_style(dark=False)
         from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
 
@@ -1013,6 +1058,22 @@ class DatalabImageService:
         finite = arr[np.isfinite(arr)]
         norm = ImageNormalize(finite, interval=ZScaleInterval(), stretch=AsinhStretch())
         ax.imshow(arr, origin="lower", cmap="gray", norm=norm)
+        if mark is not None:
+            # A reticle (four ticks with a gap) at the requested position, so
+            # the target star is identifiable in the field (DLB-14 C8).
+            try:
+                if wcs is not None:
+                    px, py = wcs.world_to_pixel_values(float(mark[0]), float(mark[1]))
+                else:
+                    px, py = (arr.shape[1] - 1) / 2.0, (arr.shape[0] - 1) / 2.0
+                gap, length = 0.03 * arr.shape[1], 0.08 * arr.shape[1]
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ax.plot([px + dx * gap, px + dx * (gap + length)], [py + dy * gap, py + dy * (gap + length)],
+                            color="#ff3b30", lw=1.6)
+                ax.set_xlim(-0.5, arr.shape[1] - 0.5)
+                ax.set_ylim(-0.5, arr.shape[0] - 0.5)
+            except Exception:  # noqa: BLE001 - the marker is an annotation only
+                pass
         ax.set_title(title)
         fig.tight_layout()
         return self.plotting_service._save_and_encode(fig, f"datalab_cutout_{uuid.uuid4().hex[:10]}")

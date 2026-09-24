@@ -26,11 +26,14 @@ The load-bearing decisions:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
-ArchiveSlug = Literal["datalab", "alma", "ads_openalex", "sia_hips", "vo", "splatalogue"]
+ArchiveSlug = Literal[
+    "datalab", "alma", "ads_openalex", "sia_hips", "vo", "splatalogue", "gaia", "eso", "cadc"
+]
 
 ScalarType = Literal[
     "integer", "float", "decimal", "string", "boolean", "datetime", "array", "object"
@@ -234,6 +237,77 @@ class ProfileRef(StrictModel):
     ref: str
 
 
+AuditExpect = Literal[
+    "ok", "error", "empty", "nonempty", "columns_present", "columns_absent", "column_units",
+    "manual",
+]
+
+
+class PitfallAudit(StrictModel):
+    """How the live audit runner (scripts/audit_archive_profiles.py) re-checks
+    a pitfall's claim against the real archive, so a note that goes stale is
+    caught instead of silently misleading the model. Idea from MANNA's
+    ``Audit`` (NSF-Simons CosmicAI, MIT).
+
+    * ``ok`` / ``empty`` / ``nonempty``: run ``adql`` on ``endpoint_id``.
+    * ``error``: ``adql`` must FAIL with a server message containing
+      ``error_contains`` (a network failure is UNREACHABLE, never a pass).
+    * ``columns_present`` / ``columns_absent``: every name in ``columns`` is
+      (not) listed for ``table`` in TAP_SCHEMA (absent also requires the
+      table itself to be listed).
+    * ``column_units``: each column in ``units`` is listed for ``table`` with
+      exactly that TAP_SCHEMA unit string.
+    * ``manual``: no single probe can check it; ``reason`` says why.
+    """
+
+    expect: AuditExpect
+    endpoint_id: Optional[str] = None
+    adql: Optional[str] = None
+    table: Optional[str] = None
+    columns: Tuple[str, ...] = ()
+    units: Dict[str, str] = Field(default_factory=dict)
+    error_contains: Optional[str] = None
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> "PitfallAudit":
+        if self.expect == "manual":
+            if not self.reason:
+                raise ValueError("a manual audit needs a reason")
+            if self.adql or self.endpoint_id or self.table or self.columns or self.units:
+                raise ValueError("a manual audit carries no probe")
+            return self
+        if self.expect == "column_units":
+            if not (self.endpoint_id and self.table and self.units):
+                raise ValueError("a column_units audit needs endpoint_id, table and units")
+            if self.adql or self.columns:
+                raise ValueError("a column_units audit builds its own TAP_SCHEMA query")
+            for name in (self.table, *self.units):
+                if not re.fullmatch(r"[A-Za-z0-9_.]+", name):
+                    raise ValueError(f"audit identifier {name!r} must be a plain table/column name")
+            return self
+        if self.units:
+            raise ValueError("units belong to column_units audits only")
+        if not self.endpoint_id:
+            raise ValueError(f"a {self.expect!r} audit needs endpoint_id")
+        if self.expect in ("columns_present", "columns_absent"):
+            if not (self.table and self.columns):
+                raise ValueError(f"a {self.expect!r} audit needs table and columns")
+            if self.adql:
+                raise ValueError("a columns audit builds its own TAP_SCHEMA query; drop adql")
+            for name in (self.table, *self.columns):
+                if not re.fullmatch(r"[A-Za-z0-9_.]+", name):
+                    raise ValueError(f"audit identifier {name!r} must be a plain table/column name")
+        else:
+            if not self.adql:
+                raise ValueError(f"a {self.expect!r} audit needs adql")
+            if self.table or self.columns:
+                raise ValueError("table/columns belong to columns_* audits only")
+        if (self.expect == "error") != bool(self.error_contains):
+            raise ValueError("error_contains is required for, and only for, expect='error'")
+        return self
+
+
 class Pitfall(StrictModel):
     id: str
     # Single-line prompt wording. The 160-char ceiling is load-bearing: with
@@ -244,12 +318,33 @@ class Pitfall(StrictModel):
     detail: Optional[str] = None      # fuller browse_schema explanation
     applies_to: Tuple[ProfileRef, ...] = Field(min_length=1)
     prompt_rank: Optional[int] = None
+    # Live re-check of the claim (optional; see PitfallAudit).
+    audit: Optional[PitfallAudit] = None
+    # Error-hint channel: when a vo_* TAP call against this archive FAILS and
+    # one of these whole-token patterns (case-insensitive) occurs in the
+    # submitted ADQL or the server's error text, ``summary`` rides the
+    # failure as a hint. Costs nothing until it fires.
+    error_triggers: Tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _rank_positive(self) -> "Pitfall":
         if self.prompt_rank is not None and self.prompt_rank < 1:
             raise ValueError("prompt_rank must be a positive integer")
+        if any(not t.strip() for t in self.error_triggers):
+            raise ValueError("error_triggers entries must be nonblank")
         return self
+
+    def fires_on(self, *texts: str) -> bool:
+        """Whether any trigger occurs in ``texts`` as a whole token (so "TOP"
+        never matches "DESKTOP"; "LOWER(" still matches "lower(name)")."""
+        haystack = " ".join(t for t in texts if t).lower()
+        for trigger in self.error_triggers:
+            t = trigger.strip().lower()
+            left = r"(?<![a-z0-9_])" if t[0].isalnum() or t[0] == "_" else ""
+            right = r"(?![a-z0-9_])" if t[-1].isalnum() or t[-1] == "_" else ""
+            if re.search(left + re.escape(t) + right, haystack):
+                return True
+        return False
 
 
 class ToolInvocation(StrictModel):
@@ -298,6 +393,10 @@ class UnitConvention(StrictModel):
 class ArchiveProfile(StrictModel):
     archive: ArchiveSlug
     aliases: Tuple[str, ...] = ()
+    # Hostnames that serve the SAME endpoint paths (mirrors), e.g. the ALMA
+    # regional archives. Used only to recognise an endpoint URL as this
+    # archive's (error hints); endpoints themselves stay single-URL.
+    mirror_hosts: Tuple[str, ...] = ()
     description: str
     scope_note: Literal["Canonical/common fields and parameters; not exhaustive."] = (
         "Canonical/common fields and parameters; not exhaustive."
@@ -368,8 +467,16 @@ class ArchiveProfile(StrictModel):
                 if not ok:
                     raise ValueError(f"{owner}: unresolved {r.kind} ref {r.ref!r}")
 
+        tap_endpoint_ids = {e.id for e in self.endpoints if e.protocol == "tap"}
         for pitfall in self.pitfalls:
             _check_profile_refs(f"pitfall {pitfall.id!r}", pitfall.applies_to)
+            audit = pitfall.audit
+            if audit is not None and audit.endpoint_id is not None:
+                if audit.endpoint_id not in tap_endpoint_ids:
+                    raise ValueError(
+                        f"pitfall {pitfall.id!r}: audit endpoint_id {audit.endpoint_id!r} "
+                        "is not a TAP endpoint of this profile"
+                    )
         for convention in self.unit_conventions:
             _check_profile_refs(f"unit_convention {convention.id!r}", convention.applies_to)
         return self

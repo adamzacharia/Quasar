@@ -82,7 +82,11 @@ class BrowserService:
         """
         try:
             self._ensure_browser()
-            search_url = f"https://duckduckgo.com/?q={query.replace(' ', '+')}&ia=web"
+            # quote_plus: "&", "#", "?" and non-ASCII in the query used to
+            # corrupt the DuckDuckGo URL (D10).
+            from urllib.parse import quote_plus
+
+            search_url = f"https://duckduckgo.com/?q={quote_plus(str(query or ''))}&ia=web"
             self._page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
             self._page.wait_for_timeout(1500)  # Let JS render
 

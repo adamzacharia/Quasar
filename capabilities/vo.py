@@ -37,6 +37,26 @@ from capabilities.base import BaseCapability, ToolResult
 logger = logging.getLogger(__name__)
 
 
+def _with_error_hints(out: Dict[str, Any], access_url: Any, adql: Any) -> Dict[str, Any]:
+    """Attach curated archive hints to a FAILED TAP call (the error-hint
+    channel of services/archive_profiles). Silent unless a pitfall's
+    error_triggers fire on the submitted ADQL or the server's message."""
+    if not isinstance(out, dict) or out.get("success"):
+        return out
+    try:
+        from services.archive_profiles import error_hints
+
+        hints = error_hints(str(access_url or ""), str(adql or ""),
+                            str(out.get("error") or ""), str(out.get("job_error") or ""))
+    except Exception:  # grounding must never turn a failure into a crash
+        hints = []
+    if hints:
+        out = dict(out)
+        joined = " | ".join(hints)
+        out["hint"] = f"{out['hint']} | {joined}" if out.get("hint") else joined
+    return out
+
+
 def _native(out: Dict[str, Any]) -> ToolResult:
     """Wrap a legacy output dict as a byte-parity ToolResult."""
     ok = bool(isinstance(out, dict) and out.get("success"))
@@ -177,6 +197,7 @@ class VoAdqlQueryInput(_In):
     access_url: Optional[str]
     adql: Optional[str]
     max_rows: Optional[int] = 200
+    mode: Optional[str] = "sync"
 
 
 class VoAdqlQuery(BaseCapability):
@@ -194,9 +215,13 @@ class VoAdqlQuery(BaseCapability):
         table_result = ctx.service("external_catalog_table_result")
         access_url, adql, max_rows = inp.access_url, inp.adql, inp.max_rows
         try:
-            result = get_service().run_adql(access_url, adql, max_rows=max_rows)
-            if not result.get("success"):
-                return _native(result)
+            result = get_service().run_adql(access_url, adql, max_rows=max_rows,
+                                            mode=inp.mode or "sync",
+                                            owner=getattr(ctx, "user_id", None))
+            # A failure, or an async job handle (no rows yet), passes through;
+            # an auto-mode job that finished carries rows and gets a card.
+            if not result.get("success") or (result.get("job_url") and "rows" not in result):
+                return _native(_with_error_hints(result, access_url, adql))
             rows = result.get("rows") or []
             columns = list(result.get("columns") or [])
             warnings = list(result.get("warnings") or [])
@@ -211,6 +236,148 @@ class VoAdqlQuery(BaseCapability):
                 tool_name="vo_adql_query",
                 warnings=warnings,
                 provenance=result.get("provenance", {}),
+            ))
+        except Exception as e:
+            return _native({"success": False, "error": str(e)})
+
+
+class VoTapJobInput(_In):
+    job_url: Optional[str]
+    action: Optional[str] = "status"
+    max_rows: Optional[int] = 200
+    wait_seconds: Optional[float] = 0
+
+
+class VoTapJob(BaseCapability):
+    name = "vo_tap_job"
+    description = (
+        "Manage an async TAP job started by vo_adql_query(mode='async'|'auto'): "
+        "action='status' (phase + error), 'results' (fetch the rows once COMPLETED), "
+        "or 'abort'."
+    )
+    category = "archive"
+    InputModel = VoTapJobInput
+    annotations = {"read_only": False, "cost": "network"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        get_service = ctx.service("get_vo_registry_service")
+        table_result = ctx.service("external_catalog_table_result")
+        action = str(inp.action or "status").strip().lower()
+        try:
+            service = get_service()
+            owner = getattr(ctx, "user_id", None)
+            if action == "status":
+                status = service.job_status(inp.job_url, wait_seconds=inp.wait_seconds, owner=owner)
+                if status.get("job_error"):
+                    # A failed job reports success=True (the status call worked);
+                    # hint on its error text as if the query itself had failed.
+                    prov = status.get("provenance") or {}
+                    hinted = _with_error_hints(
+                        {"success": False, "error": status["job_error"]},
+                        prov.get("endpoint") or inp.job_url, prov.get("query"))
+                    if hinted.get("hint"):
+                        status = dict(status, hint=hinted["hint"])
+                return _native(status)
+            if action == "abort":
+                return _native(service.job_abort(inp.job_url, owner=owner))
+            if action != "results":
+                return _native({"success": False,
+                                "error": "action must be 'status', 'results' or 'abort'."})
+            result = service.job_results(inp.job_url, max_rows=inp.max_rows, owner=owner)
+            if not result.get("success"):
+                prov = result.get("provenance") or {}
+                return _native(_with_error_hints(result, prov.get("endpoint") or inp.job_url,
+                                                 prov.get("query")))
+            rows = result.get("rows") or []
+            columns = list(result.get("columns") or [])
+            warnings = list(result.get("warnings") or [])
+            if len(columns) > 12:
+                columns = columns[:12]
+                warnings.append("Displaying the first 12 of the result's columns.")
+            prov = result.get("provenance", {})
+            return _native(table_result(
+                rows,
+                columns=columns or ["result"],
+                source=f"TAP async: {prov.get('endpoint') or inp.job_url}",
+                filter_label=(prov.get("adql") or inp.job_url or "")[:120],
+                tool_name="vo_tap_job",
+                warnings=warnings,
+                provenance=prov,
+            ))
+        except Exception as e:
+            return _native({"success": False, "error": str(e)})
+
+
+class VoImageSearchInput(_In):
+    access_url: Optional[str] = None
+    archive: Optional[str] = None
+    target_name: Optional[str] = None
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    radius_deg: Optional[float] = 0.05
+    waveband: Optional[str] = None
+    calib_level: Optional[int] = None
+    dataproduct_type: Optional[str] = None
+    collection: Optional[str] = None
+    max_rows: Optional[int] = 100
+
+
+class VoImageSearch(BaseCapability):
+    name = "vo_image_search"
+    description = (
+        "Find images/cubes at a sky position on any SIA service (SIA 2.0, SIA 1.0 fallback), "
+        "by archive (alma, cadc) or access_url."
+    )
+    category = "archive"
+    InputModel = VoImageSearchInput
+    annotations = {"read_only": True, "cost": "network"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        get_service = ctx.service("get_vo_registry_service")
+        table_result = ctx.service("external_catalog_table_result")
+        resolve = ctx.service("live_imagery_coordinates")
+        try:
+            access_url = inp.access_url
+            if not access_url:
+                if not inp.archive:
+                    return _native({"success": False,
+                                    "error": "Pass access_url (an SIA service URL) or archive."})
+                from services.archive_profiles import sia_endpoint_for
+
+                access_url = sia_endpoint_for(inp.archive)
+                if not access_url:
+                    from services.archive_profiles import sia_archives
+
+                    return _native({"success": False,
+                                    "error": (f"No curated SIA service for archive {inp.archive!r}. "
+                                              f"Known: {', '.join(sia_archives()) or 'none'}; or "
+                                              "find one with vo_find_services(service_type='sia').")})
+            ra_f, dec_f, label = resolve(target_name=inp.target_name, ra=inp.ra, dec=inp.dec)
+            result = get_service().image_search(
+                access_url, ra_f, dec_f, radius_deg=inp.radius_deg, waveband=inp.waveband,
+                calib_level=inp.calib_level, dataproduct_type=inp.dataproduct_type,
+                collection=inp.collection, max_rows=inp.max_rows,
+            )
+            if not result.get("success"):
+                return _native(result)
+            rows = result.get("rows") or []
+            preferred = ["obs_collection", "instrument_name", "target_name", "dataproduct_type",
+                         "calib_level", "s_ra", "s_dec", "s_fov", "s_resolution", "em_min",
+                         "em_max", "t_exptime", "access_format", "access_url"]
+            columns = [c for c in preferred if any(c in r for r in rows)]
+            if not columns:
+                columns = list(result.get("columns") or [])[:12] or ["result"]
+            prov = result.get("provenance", {})
+            radius_label = float(prov.get("radius_deg", inp.radius_deg or 0.05))
+            return _native(table_result(
+                rows,
+                columns=columns,
+                source=f"{result.get('protocol', 'SIA')}: {access_url}",
+                filter_label=f"images at {label}, r={radius_label:g} deg"
+                             + (f" [{inp.waveband}]" if inp.waveband else ""),
+                tool_name="vo_image_search",
+                warnings=list(result.get("warnings") or []),
+                provenance=prov,
             ))
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -270,11 +437,13 @@ CAPABILITIES: List[BaseCapability] = [
     VoListTables(),
     VoDescribeTable(),
     VoAdqlQuery(),
+    VoTapJob(),
+    VoImageSearch(),
     VoConeSearch(),
 ]
 
 __all__ = [
     "CAPABILITIES",
     "VoFindServices", "VoListTables", "VoDescribeTable",
-    "VoAdqlQuery", "VoConeSearch",
+    "VoAdqlQuery", "VoTapJob", "VoImageSearch", "VoConeSearch",
 ]

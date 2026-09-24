@@ -107,14 +107,20 @@ def _cut_predicate(col: str, op: str, value: Any) -> str:
     return f"{col} {op} {rhs}"
 
 
-def build_cone_count(catalog: str, table: str, *, ra: float, dec: float, radius_deg: float) -> Tuple[str, Dict[str, Any]]:
+def build_cone_count(catalog: str, table: str, *, ra: float, dec: float, radius_deg: float,
+                     predicates: Optional[Sequence[str]] = None) -> Tuple[str, Dict[str, Any]]:
+    """COUNT(*) in a cone; ``predicates`` must come from build_catalog_predicates
+    (registry-validated), exactly like build_cone_select."""
     info = _table_info(catalog, table)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     _validate_sky(ra, dec, radius_deg)
+    where = f"q3c_radial_query({ra_col}, {dec_col}, {_num(ra)}, {_num(dec)}, {_num(radius_deg)})"
+    for pred in (predicates or []):
+        where += f"\n  AND {pred}"
     sql = (
         f"SELECT COUNT(*) AS row_count\n"
         f"FROM {info['qualified_name']}\n"
-        f"WHERE q3c_radial_query({ra_col}, {dec_col}, {_num(ra)}, {_num(dec)}, {_num(radius_deg)})"
+        f"WHERE {where}"
     )
     return sql, _meta("cone_count", info, spatial_bound=True, aggregate=True)
 
@@ -287,9 +293,14 @@ def build_density_aggregate(
     predicates: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
     field_bound: bool = False,
+    max_cells: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     info = _table_info(catalog, table)
-    row_limit, cap_reason = _resolve_limit(limit, maximum=MAX_ROW_LIMIT, default=MAX_ROW_LIMIT)
+    # ``max_cells``: a whole-region HEALPix map (one async job over a
+    # 10-degree cone is ~6000 nside-256 pixels) may exceed the 5000-row cell
+    # cap that per-tile sync queries use; the caller sizes it explicitly.
+    cap = int(max_cells) if max_cells else MAX_ROW_LIMIT
+    row_limit, cap_reason = _resolve_limit(limit, maximum=cap, default=cap)
     ra_col, dec_col = info["ra_column"], info["dec_column"]
     # Require an explicit region: an unbounded GROUP BY over a billion-row catalog
     # is a full-catalog scan. Give a cone, opt in explicitly with all_sky=True, or

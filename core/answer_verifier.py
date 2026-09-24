@@ -58,6 +58,9 @@ _COUNT_KEYS = (
     "results_count", "n_mous", "n_datasets", "n_execution_blocks", "n_eb", "rows_returned", "returned_rows",
     "hits", "n_hits", "num_projects", "project_count", "source_count", "n_candidates", "n_rows_total",
     "distinct_projects", "n_distinct_projects", "n_rows_returned",
+    # A preview size is a row count too (alma_project_census results_returned=60;
+    # UI 2026-09-24 D22 false flag "60 rows").
+    "results_returned", "returned_results",
 )
 _TIMEOUT_MARKERS = ("timed out", "timeout", "budget exhausted", "deadline", "did not answer within",
                     "circuit open", "circuit breaker", "unreachable", "infrastructure failure", "not executed",
@@ -83,7 +86,10 @@ class TraceSummary:
     result_texts: List[str] = field(default_factory=list)   # string leaves of tool results (notes, warnings, summaries)
     timed_out_archives: set = field(default_factory=set)    # archive names found in timed_out_phases (CX-20)
     keyed_counts: set = field(default_factory=set)          # (lower-case key, int) of every non-negative integer leaf
+    keyed_numbers: set = field(default_factory=set)         # (lower-case key, float) of every numeric result leaf
     query_arg_texts: List[str] = field(default_factory=list)  # arguments of DATA tools only (not documentation tools, CX-19)
+    # grain head ("project", "mou", ...) -> row counts of calls whose OWN SQL is at that grain (guard CX-10, 2026-09-24)
+    grain_counts: Dict[str, set] = field(default_factory=dict)
 
     # Normalised search corpora (computed lazily)
     _sql_norm: Optional[str] = None
@@ -194,6 +200,32 @@ def build_trace_summary(
         seen_sql.add(key)
         ts.sql_texts.append(s)
 
+    def record_grain(obj: Any, extra_sqls: Sequence[str] = ()) -> None:
+        """Attribute a call's row counts to an aggregate grain only when THAT
+        call's own SQL is at the grain (DISTINCT / GROUP BY on its key)."""
+        if isinstance(obj, str):
+            obj = _parse_maybe_json(obj)
+        if not isinstance(obj, dict) or obj.get("success") is False:
+            return
+        sqls = [str(obj[k]) for k in _SQL_KEYS if isinstance(obj.get(k), str)] + [str(x) for x in extra_sqls if x]
+        prov = obj.get("provenance")
+        if isinstance(prov, dict):
+            sqls += [str(prov[k]) for k in ("query", "adql", "sql", "validated_sql") if isinstance(prov.get(k), str)]
+        counts = set()
+        for k in ("rowcount", "row_count", "n_rows", "count", "total"):
+            v = obj.get(k)
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                counts.add(v)
+        rows = obj.get("rows") or obj.get("data")
+        if isinstance(rows, list):
+            counts.add(len(rows))
+        if not sqls or not counts:
+            return
+        for head, cols in _AGGREGATE_GRAINS.items():
+            pat = re.compile(rf"\b(?:distinct|group\s+by)\b[^;]{{0,200}}\b(?:{cols})\b")
+            if any(pat.search(_norm(q)) for q in sqls):
+                ts.grain_counts.setdefault(head, set()).update(counts)
+
     def add_number(v: Any) -> None:
         if isinstance(v, bool):
             return
@@ -271,6 +303,8 @@ def build_trace_summary(
             kl = key.lower()
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 add_number(value)
+                if kl and len(ts.keyed_numbers) < 20000:
+                    ts.keyed_numbers.add((kl, float(value)))
                 if kl and float(value).is_integer() and value >= 0:
                     ts.keyed_counts.add((kl, int(value)))
                 if kl in _COUNT_KEYS or kl.startswith(("n_", "num_", "count", "rowcount")) or kl.endswith(("_count", "count", "_total")):
@@ -286,11 +320,29 @@ def build_trace_summary(
                     if n is not None and n.is_integer():
                         ts.counts.add(int(n))
 
-    for item in tool_results or ():
+    # Outputs of FAILED calls (trace ok=False) substantiate nothing, however
+    # they reach us: via tool_results, roles or count pairs (CX-04 verify).
+    failed_outputs = {
+        rec.get("output") for rec in (tool_trace or ())
+        if isinstance(rec, dict) and rec.get("ok") is False and isinstance(rec.get("output"), str)
+    }
+
+    def _failed_item(item: Any) -> bool:
+        if isinstance(item, dict):
+            if item.get("ok") is False:
+                return True
+            out = item.get("output")
+            return isinstance(out, str) and out in failed_outputs
+        return isinstance(item, str) and item in failed_outputs
+
+    tool_results = [item for item in (tool_results or ()) if not _failed_item(item)]
+    for item in tool_results:
         if isinstance(item, dict) and "output" in item and isinstance(item.get("output"), str):
             ingest_result(item["output"])
+            record_grain(item["output"])
         else:
             ingest_result(item)
+            record_grain(item)
 
     for rec in tool_trace or ():
         if not isinstance(rec, dict):
@@ -321,10 +373,17 @@ def build_trace_summary(
             add_sql(req["text"])
         if isinstance(out, str):
             ingest_result(out)
+            rec_sqls = [rec.get("sql")] if isinstance(rec.get("sql"), str) else []
+            if isinstance(args, dict):
+                rec_sqls += [args[k] for k in _SQL_KEYS if isinstance(args.get(k), str)]
+            record_grain(out, rec_sqls)
 
     for rr in run_results or ():
         if not isinstance(rr, dict):
             continue
+        if rr.get("success") is False:
+            continue  # a failed result substantiates nothing (guard CX-11)
+        record_grain(rr)
         rtype = str(rr.get("type") or "")
         if rtype in ("image", "plotly", "data", "conductor_result", "notebook", "papers", "web_sources"):
             ts.cards.append({
@@ -373,6 +432,8 @@ def build_trace_summary(
         if isinstance(obj, str):
             obj = _parse_maybe_json(obj)
         if isinstance(obj, dict):
+            if obj.get("success") is False:
+                return  # a failed call substantiates nothing (CX-04 / CX-18)
             n_all = obj.get("n_projects", obj.get("projects_in_window"))
             n_match = obj.get("unique_projects", obj.get("matching_projects", obj.get("n_matching_projects")))
             if isinstance(n_all, int) and isinstance(n_match, int) and not isinstance(n_all, bool):
@@ -511,7 +572,27 @@ _COUNT_RE = re.compile(
 )
 # The number is NOT a result count when it directly follows one of these
 # ("Band 6", "Cycle 9", "top 5", "Table 2", "DR3").
-_COUNT_CONTEXT_SKIP_RE = re.compile(r"\b(?:band|cycle|top|first|dr|table|figure|fig\.?|step|section|phase|epoch|tier|row|rank|#)\s*[:#]?\s*$", re.I)
+_COUNT_CONTEXT_SKIP_RE = re.compile(
+    r"\b(?:band|cycle|top|first|dr|table|figure|fig\.?|step|section|phase|epoch|tier|row|rank|class|type|stage|#)\s*[:#]?\s*$"
+    # A CAP, not a result ("selects up to 200 rows", "at most 5000 rows";
+    # UI 2026-09-23 D15 described a code sample's TOP 200):
+    r"|\b(?:up\s+to|at\s+most|no\s+more\s+than|a\s+maximum\s+of|maximum\s+of|max(?:imum)?|limit(?:ed)?\s+(?:to|of|at)|capped\s+(?:at|to)|cap\s+of)\s*$"
+    # A distribution STATISTIC, not a result count ("median ≈ 282 sources per
+    # cell"; UI 2026-09-24 L08 false flag):
+    r"|\b(?:median|mean|average|typical|percentile|p\d{1,2})\s*(?:value\s+)?(?:of\s+|is\s+)?(?:≈|~|=|≃|about|around)?\s*$",
+    re.I,
+)
+# The number is part of an OBJECT NAME ("Palomar 5 members", "NGC 1333
+# protostars", "Terzan 5 stars"; UI 2026-09-23 L09) -- case-sensitive.
+_COUNT_OBJECT_NAME_RE = re.compile(
+    r"(?:\b(?:Palomar|Pal|NGC|IC|Messier|Terzan|Arp|Abell|ACO|Djorg|Liller|Ton|Whiting|Eridanus|Pyxis|Segue|Willman|"
+    r"Koposov|Kim|Laevens|Balbinot|Munoz|Draco|Hydra|Carina|Crater|Leo|Pisces|Reticulum|Horologium|Tucana|Grus|Phoenix|"
+    r"Columba|Pictor|Hercules|Sextans|Fornax|Sculptor|Bootes|Boötes|Ursa|Canes|Coma|Cetus|Aquarius|Indus|Virgo|"
+    r"HD|HR|HH|HIP|TYC|IRAS|UGC|PGC|ESO|SVS|IRS|HOPS|MMS|SMM|Oph|Per-emb|LDN|RCW|Cycle|Band|Field|field))\s*$"
+)
+# Survey-named star clusters (DES 1, DELVE 2, Gaia 1) carry one-digit numbers
+# only: "SDSS 19 galaxies" / "DES 250 stars" are counts (CX-11 verify).
+_SURVEY_CLUSTER_NAME_RE = re.compile(r"\b(?:DES|DELVE|Gaia)\s*$")
 
 _NULL_RESULT_RE = re.compile(
     r"\b(?:there\s+(?:are|is|were|was)\s+no\b|no\s+(?:sources?|objects?|observations?|projects?|matches|data|rows|results|protostars?|galaxies|stars)\s+"
@@ -619,6 +700,7 @@ _TOOL_FIGURE_KEYS: Dict[str, Tuple[str, ...]] = {
     "datalab_target_class_summary": ("histogram", "map", "footprint"),
     "datalab_stream_selection": ("map", "footprint", "scatter", "sky distribution", "cmd"),
     "datalab_satellite_search": ("cmd", "cutout", "image", "map"),
+    "datalab_sed_sample": ("sed",),
     "archive_overlay": ("image",),
     "overlay_archive_images": ("image",),
 }
@@ -687,6 +769,8 @@ def _target_roles(tool_results: Sequence[Any], run_results: Sequence[Any]) -> Tu
         if isinstance(obj, str):
             obj = _parse_maybe_json(obj)
         if isinstance(obj, dict):
+            if obj.get("success") is False:
+                return  # a failed call substantiates nothing (CX-04 / CX-18)
             for k in ("rows", "results", "observations", "data", "records", "items", "preview", "sample_rows", "matches"):
                 scan_rows(obj.get(k))
             for v in obj.values():
@@ -730,7 +814,7 @@ def _strip_code_blocks(text: str) -> str:
                 fence = None
             out.append("")
     t = "\n".join(out)
-    t = re.sub(r"(`+)(?!`).+?(?<!`)\1(?!`)", " ", t)  # inline spans of any backtick length
+    t = re.sub(r"(`+)(?!`)(?:[^\n]|\n(?![ \t]*\n))+?(?<!`)\1(?!`)", " ", t)  # inline spans (may cross one line break)
     return t
 
 
@@ -755,6 +839,28 @@ def _num_variants(token: str) -> List[str]:
         if s.startswith("-0."):
             out.append("-" + s[2:])
     return list(dict.fromkeys(v for v in out if v))
+
+
+def _corpus_has_rounded_radius(corpus: str, val: str, unit: str) -> bool:
+    """A stated radius is a ROUNDING of an executed one when some number in
+    the SQL / arguments (in degrees) rounds to it at the stated precision:
+    "0.1667 deg" for 0.1666667 (UI 2026-09-24 L02 false flag)."""
+    n = _clean_number(val)
+    if n is None:
+        return False
+    decimals = len(val.split(".", 1)[1]) if "." in val else 0
+    u = unit.lower()
+    scale = 1 / 60 if u.startswith(("arcmin", "′", "'")) else 1 / 3600 if u.startswith(("arcsec", "″", '"')) else 1.0
+    half = 0.5 * 10 ** (-decimals)
+    for tok in re.findall(r"(?<![\w.])\d+\.\d+|(?<![\w.])\d+", corpus):
+        try:
+            x = float(tok)
+        except ValueError:
+            continue
+        # compare in the stated unit: the corpus holds degrees
+        if abs(x / scale - n) <= half + 1e-12 and x != 0:
+            return True
+    return False
 
 
 def _corpus_has_number(corpus: str, token: str) -> bool:
@@ -833,6 +939,9 @@ def _predicate_values(corpus: str, start: int, end: int) -> Tuple[List[str], Opt
     m = re.search(rf"({_PRED_NUM})\s*(<=|<|>=|>)\s*\(?\s*$", head)  # 0.3 < col
     if m:
         values.append(m.group(1))
+        # "5 < parallax" states parallax > 5 (guard task-25bee13-9557 CX-01):
+        # a leading comparator reads reversed; with a trailing one it is a range.
+        direction = "between" if direction in (">", "<") else {"<": ">", "<=": ">", ">": "<", ">=": "<"}[m.group(2)]
     return values, direction
 
 
@@ -870,7 +979,28 @@ def _cut_supported(col: str, numbers: List[str], summary: TraceSummary, cmp: Opt
             keys = {v.replace(" ", "_") for v in _column_variants(col)}
             if any((k, int(val)) in summary.keyed_counts for k in keys):
                 return True
+    # An EQUALITY that reports a MEASURED result field, rounded as written
+    # ("frequency = 1.5415" <- best_frequency=1.54147...; UI 2026-09-24
+    # run-2 L14 false flag): a result value, not a selection cut.
+    if len(nums) == 1 and (cmp or "=").strip() in ("=", "==") and _result_field_matches(col, nums[0], summary):
+        return True
     return _stated_in_result_text(nums, summary)
+
+
+def _result_field_matches(col: str, num: str, summary: TraceSummary) -> bool:
+    val = _clean_number(num)
+    if val is None:
+        return False
+    t = num.replace(" ", "").replace(",", "")
+    decimals = len(t.split(".", 1)[1]) if "." in t else 0
+    names = {v.replace(" ", "_") for v in _column_variants(col) if len(v) >= 3}
+    for key, v in summary.keyed_numbers:
+        # The column must be a whole token of the key (best_frequency_per_day).
+        if not any(re.search(rf"(?:^|_){re.escape(n)}(?:_|$)", key) for n in names):
+            continue
+        if abs(round(v, decimals) - val) <= 0.5 * 10 ** (-decimals) + 1e-12:
+            return True
+    return False
 
 
 def _stated_in_result_text(nums: List[str], summary: TraceSummary, span: int = 80) -> bool:
@@ -914,14 +1044,116 @@ def _count_in_named_field(n: int, noun: str, summary: TraceSummary) -> bool:
     stem = _noun_stem(noun).replace(" ", "_")
     if len(stem) < 3:
         return False
-    return any(v == n and stem in k for k, v in summary.keyed_counts)
+    # The key must NAME the noun as a count (alma_projects, n_projects,
+    # projects_count) -- never an identifier (project_id=19; CX-02).
+    pat = re.compile(rf"(?:^|_){re.escape(stem)}(?:ies|y|es|s)?(?:_count|_total|_n)?$")
+    return any(v == n and pat.search(k) for k, v in summary.keyed_counts)
 
 
-def _row_cap_executed(n: int, noun: str, summary: TraceSummary) -> bool:
+_GENERIC_COUNT_NOUNS = frozenset({"", "row", "rows", "result", "results", "record", "records", "entry", "entries",
+                                  "point", "points", "count", "total", "n", "returned", "rowcount", "nrows"})
+
+
+def _count_key_noun(key: str) -> str:
+    k = re.sub(r"^(?:n_|num_|total_|count_of_|count_)", "", key.lower())
+    return re.sub(r"(?:_count|_total|count|_returned)$", "", k).strip("_")
+
+
+def _is_count_key(key: str) -> bool:
+    return key in _COUNT_KEYS or key.startswith(("n_", "num_", "count", "rowcount")) or key.endswith(("_count", "count", "_total"))
+
+
+def _count_field_supports(n: int, noun: str, summary: TraceSummary) -> bool:
+    """A COUNT-valued field carries n. A generic row count (rowcount,
+    len(rows)) may count any noun -- the query's grain is unknown -- but a
+    count field that names ANOTHER noun (n_observations=19) does not support
+    "19 projects" (CX-02)."""
+    if n not in summary.counts:
+        return False
+    keys = [k for k, v in summary.keyed_counts if v == n and _is_count_key(k)]
+    stem = _noun_stem(noun)
+
+    def _generic_supports() -> bool:
+        # A generic row count (rowcount, len(rows), unkeyed) counts ROWS; for
+        # the aggregate grains (projects, MOUS) it supports the noun only when
+        # an executed query is at that grain (DISTINCT / GROUP BY on the key):
+        # 19 observation rows are not "19 projects" (CX-02 verify).
+        head = next((h for h in _AGGREGATE_GRAINS if stem.startswith(h)), None)
+        if head is None:
+            return True
+        # Only a count from a call whose own SQL is at this grain (CX-10).
+        return n in summary.grain_counts.get(head, set())
+
+    if not keys:
+        return _generic_supports()
+    # A synonym key counts too: source_count=108444 supports "108 444 objects"
+    # (UI 2026-09-24 run-2 L11 false flag); groups never cross grains.
+    alts = _noun_alternatives(noun)
+    for k in keys:
+        named = _count_key_noun(k)
+        key_stem = _noun_stem(named.split("_")[-1])
+        if key_stem == stem or (len(key_stem) >= 3 and any(key_stem.startswith(a) for a in alts)):
+            return True
+        if named in _GENERIC_COUNT_NOUNS and _generic_supports():
+            return True
+    return False
+
+
+# Aggregate count grains: noun group head -> key columns that define it.
+_AGGREGATE_GRAINS = {
+    "project": r"proposal_id|project_code|project",
+    "proposal": r"proposal_id|project_code|project",
+    "programme": r"proposal_id|project_code|program\w*",
+    "program": r"proposal_id|project_code|program\w*",
+    "mou": r"member_ous_uid|group_ous_uid|mous",
+}
+
+
+_COUNT_SYNONYMS = (
+    ("row", "record", "observation", "entr", "result"),
+    ("project", "proposal", "programme", "program"),
+    ("source", "object", "star", "target", "detection"),
+    ("mou", "dataset", "data set"),
+)
+
+
+def _noun_alternatives(noun: str) -> Tuple[str, ...]:
+    stem = _noun_stem(noun)
+    for group in _COUNT_SYNONYMS:
+        if any(stem.startswith(g) or g.startswith(stem) for g in group):
+            return group
+    return (stem,)
+
+
+_CAP_CONTEXT_RE = re.compile(r"\b(?:limit\w*|cap(?:ped|s)?|at\s+most|up\s+to|maximum|max|truncat\w*|first)\b", re.I)
+
+
+_RESULT_VERB_RE = re.compile(r"\b(?:returned|returns|return|yield\w*|found|finds|gave|gives|contain\w*|retrieved|produced|matched|selected|has|have|had)\b", re.I)
+
+
+def _cap_qualifies(prefix: str) -> bool:
+    """True when the text just before the count (``prefix`` ends at the
+    number) qualifies it as a CAP: the last cap word comes after the last
+    result verb and within ~30 characters of the number."""
+    caps = list(_CAP_CONTEXT_RE.finditer(prefix))
+    if not caps:
+        return False
+    last_cap = caps[-1]
+    if len(prefix) - last_cap.end() > 30:
+        return False
+    verbs = list(_RESULT_VERB_RE.finditer(prefix))
+    return not verbs or verbs[-1].start() < last_cap.start()
+
+
+def _row_cap_executed(n: int, noun: str, summary: TraceSummary, context: str = "") -> bool:
     """"limited to 5 000 rows" describes the executed row CAP: a rows/records/
     entries count equal to an executed LIMIT / TOP / MAXREC (or a data tool's
     limit argument) is supported -- the only way SQL text may support a count."""
     if _noun_stem(noun) not in ("row", "record", "entr", "entrie"):
+        return False
+    # "the query returned 5000 rows" is a RESULT claim; only a cap described
+    # as a cap ("limited to", "capped at", "up to") is the executed LIMIT (CX-03).
+    if not _cap_qualifies(context or ""):
         return False
     sql = _norm(" \n ".join(summary.sql_texts))
     if re.search(rf"\b(?:limit|top|maxrec)\s*=?\s*{n}\b", sql):
@@ -930,8 +1162,31 @@ def _row_cap_executed(n: int, noun: str, summary: TraceSummary) -> bool:
     return bool(re.search(rf'"(?:limit|max_rows|maxrec|max_results|row_limit|top)"\s*:\s*{n}\b', args))
 
 
-def _count_stated_in_results(num_tok: str, summary: TraceSummary) -> bool:
-    nouns = "|".join(_COUNT_NOUNS)
+# Generic container nouns ("12 entries") carry no grain of their own: the tool
+# text stating the number next to ANY count noun ("4 of 12 sources") supports
+# them (UI 2026-09-24 D18 false flag).
+_GENERIC_ENTRY_STEMS = frozenset({"entr", "entrie", "record", "row", "item", "result"})
+
+
+def _key_paraphrased(n: int, summary: TraceSummary, prefix: str) -> bool:
+    """The prose right before the number paraphrases the KEY of a tool field
+    holding that value: "ALMA status unknown for 0 sources" <-
+    alma_status_unknown_for = 0 (UI 2026-09-24 D18 false flag). Needs at
+    least two of the key's words (3+ letters), all within the prefix."""
+    low = _norm(prefix)
+    for key, v in summary.keyed_counts:
+        if v != n:
+            continue
+        words = [w for w in re.split(r"[_\W]+", key) if len(w) >= 3]
+        if len(words) >= 2 and all(re.search(rf"\b{re.escape(w)}", low) for w in words):
+            return True
+    return False
+
+
+def _count_stated_in_results(num_tok: str, summary: TraceSummary, noun: Optional[str] = None) -> bool:
+    # The tool text must state the number next to the SAME noun (or a
+    # synonym): "19 observations" does not support "19 projects" (CX-02).
+    nouns = "|".join(rf"{re.escape(a)}\w*" for a in _noun_alternatives(noun)) if noun else "|".join(_COUNT_NOUNS)
     variants = [re.escape(v.lower()) for v in _num_variants(num_tok)]
     pat = re.compile(rf"(?<![\w.])(?:{'|'.join(variants)})(?![\w.])\s+(?:[a-z_-]+\s+){{0,2}}(?:{nouns})\b", re.I)
     return any(pat.search(_norm(leaf)) for leaf in summary.result_texts)
@@ -991,7 +1246,8 @@ def verify_answer(
                 candidates += [f"{n / 3600:g}", f"{n / 3600:.6f}", f"{n / 3600:.8f}", f"{n:g}"]
             else:
                 candidates += [f"{n:g}", f"{n:.1f}"]
-            if not any(_corpus_has_number(corpus, c) for c in candidates):
+            if not (any(_corpus_has_number(corpus, c) for c in candidates)
+                    or _corpus_has_rounded_radius(corpus, val, unit)):
                 report.unsupported.append(Claim("cut", m.group(0).strip(), "no executed query or tool argument uses this search radius"))
 
     if check_artifacts:
@@ -1035,14 +1291,16 @@ def verify_answer(
         for m in _COUNT_RE.finditer(prose):
             start = max(0, m.start() - 40)
             context = prose[start:m.end() + 20]
-            if _COUNT_CONTEXT_SKIP_RE.search(prose[start:m.start()]):
+            if _COUNT_CONTEXT_SKIP_RE.search(prose[start:m.start()]) or _COUNT_OBJECT_NAME_RE.search(prose[start:m.start()]):
+                continue
+            if _SURVEY_CLUSTER_NAME_RE.search(prose[start:m.start()]) and len(re.sub(r"\D", "", m.group("num"))) == 1:
                 continue
             num_tok = m.group("num")
             n = _clean_number(num_tok)
             if n is None:
                 continue
             noun = m.group("noun").lower()
-            key = (int(n), noun)
+            key = (int(n), noun, _cap_qualifies(prose[max(0, m.start() - 60):m.start()]))
             if key in seen_c:
                 continue
             seen_c.add(key)
@@ -1053,8 +1311,11 @@ def verify_answer(
             # own text stating that number next to a noun -- never by an arbitrary numeric leaf
             # (a dec of 30 is not "30 projects") or by SQL/argument text
             # (CX-16). 0 and 1 are checked too (CX-17).
-            supported = (int(n) in summary.counts or _count_in_named_field(int(n), noun, summary)
-                         or _count_stated_in_results(num_tok, summary) or _row_cap_executed(int(n), noun, summary))
+            supported = (_count_field_supports(int(n), noun, summary) or _count_in_named_field(int(n), noun, summary)
+                         or _count_stated_in_results(num_tok, summary, noun)
+                         or _row_cap_executed(int(n), noun, summary, prose[max(0, m.start() - 60):m.start()])
+                         or _key_paraphrased(int(n), summary, prose[max(0, m.start() - 60):m.start()])
+                         or (_noun_stem(noun) in _GENERIC_ENTRY_STEMS and _count_stated_in_results(num_tok, summary, None)))
             if not supported:
                 report.unsupported.append(Claim("count", m.group(0).strip(), "this number does not appear in any tool result"))
 
@@ -1111,24 +1372,60 @@ def verify_answer(
     return report
 
 
+def verify_web_citations(answer: str, registry: Any) -> VerificationReport:
+    """``web_citation_support`` (web search redesign 1.6): every number, date,
+    percentage and Cycle/Band/DR/version id in a sentence that cites web
+    evidence ([W#]) must appear in the cited excerpt(s). Deterministic; an
+    unsupported sentence becomes a ``web_citation`` finding (surfaced like
+    the other findings, never rewritten)."""
+    report = VerificationReport()
+    if not answer or registry is None:
+        return report
+    try:
+        from services.web_evidence import unsupported_citation_claims
+    except Exception:  # pragma: no cover - the module ships with the verifier
+        return report
+    prose = _strip_code_blocks(answer)
+    findings = unsupported_citation_claims(prose, registry)
+    report.checked["web_citation"] = len(findings)
+    for f in findings:
+        report.unsupported.append(Claim(
+            "web_citation", f["text"][:200],
+            f"not in cited source {f['ids']}: {f['missing']}",
+        ))
+    return report
+
+
 def format_verification_block(report: VerificationReport, *, max_items: int = 8) -> str:
     """The visible block appended to an answer with unsupported claims."""
     if report.ok:
         return ""
-    lines = ["", "", "> 🔍 **Verification** — the following statements are not supported by what the tools actually ran this turn:"]
+    web_only = all(c.kind == "web_citation" for c in report.unsupported)
+    if web_only:
+        header = "> 🔍 **Verification**: these cited statements contain numbers or dates that the cited web source does not show:"
+    else:
+        header = "> 🔍 **Verification** — the following statements are not supported by what the tools actually ran this turn:"
+    lines = ["", "", header]
     kinds = {
         "cut": "selection cut not in the executed query",
         "artifact": "figure/card claimed but none was attached",
         "count": "number not found in any tool result",
         "null_result": "null result stated while a phase timed out or was skipped",
+        "web_citation": "not in the cited web source",
     }
     for claim in report.unsupported[:max_items]:
         text = claim.text.replace("\n", " ").strip()
         if len(text) > 140:
             text = text[:137] + "…"
-        lines.append(f"> - {kinds.get(claim.kind, claim.kind)}: “{text}”")
+        line = f"> - {kinds.get(claim.kind, claim.kind)}: “{text}”"
+        if claim.kind == "web_citation" and claim.detail:
+            line += f" ({claim.detail})"
+        lines.append(line)
     if len(report.unsupported) > max_items:
         lines.append(f"> - … and {len(report.unsupported) - max_items} more")
     lines.append(">")  # ends the list so the closing sentence is its own paragraph
-    lines.append("> Treat these as unverified; the Show-query panels above show exactly what was executed.")
+    if web_only:
+        lines.append("> Open the numbered source chips to check these against the pages.")
+    else:
+        lines.append("> Treat these as unverified; the Show-query panels above show exactly what was executed.")
     return "\n".join(lines)

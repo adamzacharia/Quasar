@@ -107,6 +107,33 @@ class MASTClient:
         if not MAST_AVAILABLE:
             warnings.warn("astroquery.mast not installed. MAST queries will fail.")
 
+    @staticmethod
+    def _instrument_criterion(instrument: str) -> str:
+        """MAST instrument_name carries the mode ("NIRSPEC/SLIT", "MIRI/IMAGE",
+        "WFC3/UVIS"); a bare instrument must match the whole family, so it
+        becomes a wildcard. An explicit mode ("NIRSPEC/IFU") stays exact."""
+        value = str(instrument).strip().upper()
+        if value and "/" not in value and "*" not in value:
+            return value + "*"
+        return value
+
+    @staticmethod
+    def _to_mjd(value) -> float:
+        """ISO date/time (or an MJD number) -> MJD float."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            from astropy.time import Time
+            return float(Time(str(value).strip()).mjd)
+
+    @staticmethod
+    def _failed(message: str) -> pd.DataFrame:
+        """An empty frame that CARRIES its failure, so callers never mistake an
+        error (timeout, resolver miss, rejected criteria) for 'no data'."""
+        out = pd.DataFrame()
+        out.attrs["error"] = message
+        return out
+
     def search_by_target(self, target: str, mission: str = None,
                          instrument: str = None, radius: str = "30s",
                          max_results: int = 500) -> pd.DataFrame:
@@ -137,14 +164,15 @@ class MASTClient:
             if mission:
                 criteria["obs_collection"] = mission.upper()
             if instrument:
-                criteria["instrument_name"] = instrument.upper()
+                criteria["instrument_name"] = self._instrument_criterion(instrument)
 
             if criteria:
                 # Use query_criteria with target coordinates
                 ra, dec = _resolve_simbad_cached(target)
                 if ra is None:
                     print(f"[MAST] Could not resolve target '{target}' via SIMBAD")
-                    return pd.DataFrame()
+                    return self._failed(f"could not resolve target {target!r} to coordinates (SIMBAD); "
+                                        "retry with ra/dec or another name")
 
                 from astropy.coordinates import SkyCoord
                 import astropy.units as u
@@ -179,7 +207,7 @@ class MASTClient:
             print(f"[MAST] Search error: {e}")
             import traceback
             traceback.print_exc()
-            return pd.DataFrame()
+            return self._failed(f"{type(e).__name__}: {e}")
 
     def search_by_position(self, ra: float, dec: float, radius_arcmin: float = 1.0,
                            mission: str = None, instrument: str = None,
@@ -209,7 +237,7 @@ class MASTClient:
             if mission:
                 criteria["obs_collection"] = mission.upper()
             if instrument:
-                criteria["instrument_name"] = instrument.upper()
+                criteria["instrument_name"] = self._instrument_criterion(instrument)
 
             print(f"[MAST] Cone search: RA={ra:.4f}, Dec={dec:.4f}, "
                   f"radius={radius_arcmin}'")
@@ -240,19 +268,25 @@ class MASTClient:
                            proposal_id: str = None, filters: str = None,
                            target_name: str = None, dataproduct_type: str = None,
                            date_range: Tuple[str, str] = None,
-                           max_results: int = 500) -> pd.DataFrame:
+                           max_results: int = 500, ra: float = None, dec: float = None,
+                           radius: str = None, exptime_range: Tuple[Optional[float], Optional[float]] = None
+                           ) -> pd.DataFrame:
         """
         Advanced criteria-based search with rich filtering.
 
         Args:
             mission: Mission name (JWST, HST, etc.)
-            instrument: Instrument name
+            instrument: Instrument name (a bare name matches every mode)
             proposal_id: Specific proposal/program ID
             filters: Filter name (e.g., 'F200W', 'F444W')
             target_name: Target name (resolves to coordinates internally)
             dataproduct_type: 'image', 'spectrum', 'cube', etc.
             date_range: Tuple of (start_date, end_date) as ISO strings
+                (converted to MJD: MAST's t_min is an MJD)
             max_results: Maximum results
+            ra, dec: position for a cone (instead of target_name)
+            radius: cone radius, e.g. '30s' or '2m' (default 30 arcsec)
+            exptime_range: (min, max) exposure time in seconds; either may be None
         """
         if not MAST_AVAILABLE:
             return pd.DataFrame()
@@ -263,18 +297,26 @@ class MASTClient:
             if mission:
                 criteria["obs_collection"] = mission.upper()
             if instrument:
-                criteria["instrument_name"] = instrument.upper()
+                criteria["instrument_name"] = self._instrument_criterion(instrument)
             if proposal_id:
                 criteria["proposal_id"] = proposal_id
             if filters:
                 criteria["filters"] = filters
             if dataproduct_type:
                 criteria["dataproduct_type"] = dataproduct_type
-            if target_name:
+            if ra is not None and dec is not None:
+                from astropy.coordinates import SkyCoord
+                criteria["coordinates"] = SkyCoord(ra=float(ra), dec=float(dec), unit="deg")
+                criteria["radius"] = self._parse_radius(radius or "30s")
+            elif target_name:
                 criteria["objectname"] = target_name
-                criteria["radius"] = "3s"  # Default radius for name search
+                criteria["radius"] = self._parse_radius(radius or "30s")
             if date_range and len(date_range) == 2:
-                criteria["t_min"] = [date_range[0], date_range[1]]
+                criteria["t_min"] = [self._to_mjd(date_range[0]), self._to_mjd(date_range[1])]
+            if exptime_range and any(v is not None for v in exptime_range):
+                lo, hi = exptime_range
+                criteria["t_exptime"] = [float(lo) if lo is not None else 0.0,
+                                         float(hi) if hi is not None else 1.0e9]
 
             if not criteria:
                 print("[MAST] No search criteria provided")
@@ -300,7 +342,7 @@ class MASTClient:
             print(f"[MAST] Criteria search error: {e}")
             import traceback
             traceback.print_exc()
-            return pd.DataFrame()
+            return self._failed(f"{type(e).__name__}: {e}")
 
     def get_product_list(self, observations: pd.DataFrame,
                          productType: str = None,

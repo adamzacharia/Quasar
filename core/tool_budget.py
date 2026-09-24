@@ -25,13 +25,6 @@ logger = logging.getLogger(__name__)
 # Default per-result character limit (50KB — leaves room for ~10 results in 128K context)
 DEFAULT_MAX_CHARS_PER_RESULT = 50_000
 
-# Results from these tools are never truncated (small by nature)
-EXEMPT_TOOLS = {
-    "web_search",
-    "get_current_time",
-    "check_observation_status",
-}
-
 
 def _estimate_result_chars(result: Any) -> int:
     """Estimate character count of a tool result."""

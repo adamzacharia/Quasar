@@ -18,8 +18,10 @@ import os
 import re
 import json
 import time
+import tempfile
 import threading
 import requests
+import requests.adapters
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from services.content_safety import (
@@ -34,6 +36,151 @@ from services.content_safety import (
 USAGE_FILE = "./data/search_usage.json"
 MAX_FREE_LIMIT = 1000
 DEFAULT_MAX_RESULTS = 10
+# Usage counters kept in USAGE_FILE (per calendar month).
+_USAGE_KEYS = (
+    "brave_count", "exa_count", "tavily_count", "tavily_extract_count",
+    # map / crawl / research / research-status calls (guard CX-07)
+    "tavily_other_count",
+)
+# The pre-pass search, the image prefetch and the email search run on
+# separate threads and all bump the counters: one process-wide lock makes the
+# read-modify-write atomic (D10).
+_USAGE_LOCK = threading.RLock()
+
+# Image search only on an EXPLICIT request for pictures. Substring matching
+# sent "ALMA imaging pipeline update 2026", "map", "plot", "chart" and
+# "spectrum" questions to the image-only route (D4).
+_IMAGE_INTENT_RE = re.compile(
+    r"\b(?:images?|pictures?|photos?|photographs?)\s+of\b"
+    # "show me [a/some/the latest ...] images [of|from|taken ...]" -- the
+    # picture noun must END the object: followed by the end, punctuation or
+    # a word that introduces what is pictured. As a modifier ("show me how
+    # image metadata is stored", "image-processing techniques", "image
+    # registration steps") it is not a picture request (guard CX-02).
+    # Modifiers before the noun may be hyphenated ("high-resolution images");
+    # the noun itself must be followed by whitespace / punctuation, so
+    # "image-processing" never counts as the noun.
+    r"|\bshow\s+me\s+(?!how\b|what\b|why\b|where\b|when\b|which\b)(?:[\w'-]+\s+){0,4}?"
+    r"(?:images?|pictures?|photos?|photographs?)"
+    r"(?=\s*(?:$|[.,;:!?)])|\s+(?:of|from|for|showing|taken|by|that|which|in|at|with|near|around|"
+    # courtesy words and follow-up clauses ("... a picture please", "... images
+    # and explain them", "... an image then ...", verify round 2)
+    r"please|pls|and|then|so|too|also|now|here)\b)",
+    re.IGNORECASE,
+)
+# Exa (semantic / technical search) only for literature and documentation
+# lookups; "vs", "review", "research", "compare" sent CVs and news there (D4).
+_EXA_INTENT_RE = re.compile(r"\b(?:papers?|literature|documentation|handbook)\b", re.IGNORECASE)
+
+
+class _SkipBraveContext(Exception):
+    """Internal: a fresh Brave query skips the LLM Context endpoint (no freshness filter there)."""
+
+
+def wants_image_search(query: str) -> bool:
+    """True only for an explicit picture request ("image of", "photo of", "show me ... images")."""
+    return bool(_IMAGE_INTENT_RE.search(str(query or "")))
+
+
+def wants_exa_search(query: str, search_depth: str = "basic") -> bool:
+    """Exa for literature / documentation lookups or an explicit advanced search."""
+    return search_depth == "advanced" or bool(_EXA_INTENT_RE.search(str(query or "")))
+
+class _KillableAdapter(requests.adapters.HTTPAdapter):
+    """HTTPAdapter that records every socket its pools open, so ``kill()``
+    can shut them down from another thread and end a blocked request.
+
+    Plain sockets are recorded when created (``_new_conn``). For HTTPS the
+    TLS wrap detaches the raw socket, so shutting that one down would leave
+    the live TLS socket open (guard CX-06, round 4): each HTTPS connection
+    therefore uses its own TLS context whose ``sslsocket_class`` records the
+    TLS socket right before its handshake. Every socket that can carry the
+    request is recorded before any request byte is sent."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._socks: List[Any] = []
+        self._sock_lock = threading.Lock()
+        self._killed = False
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        import ssl as _ssl
+
+        from urllib3.connection import HTTPConnection, HTTPSConnection
+        from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+        from urllib3.util.ssl_ import create_urllib3_context, resolve_cert_reqs, resolve_ssl_version
+
+        track = self._track
+
+        class _TrackedSSLSocket(_ssl.SSLSocket):
+            def do_handshake(self, *args, **kwargs):  # type: ignore[override]
+                track(self)
+                return super().do_handshake(*args, **kwargs)
+
+        class _Conn(HTTPConnection):
+            def _new_conn(self):  # type: ignore[override]
+                return track(super()._new_conn())
+
+        class _SConn(HTTPSConnection):
+            def _new_conn(self):  # type: ignore[override]
+                return track(super()._new_conn())
+
+            def connect(self):  # type: ignore[override]
+                if self.ssl_context is None:
+                    # the same context urllib3 would build, plus the tracked
+                    # socket class; OS default certs only when requests gave
+                    # no CA bundle (urllib3's own rule for its default context)
+                    ctx = create_urllib3_context(
+                        ssl_version=resolve_ssl_version(self.ssl_version),
+                        ssl_minimum_version=self.ssl_minimum_version,
+                        ssl_maximum_version=self.ssl_maximum_version,
+                        cert_reqs=resolve_cert_reqs(self.cert_reqs),
+                    )
+                    if not (self.ca_certs or self.ca_cert_dir or self.ca_cert_data):
+                        ctx.load_default_certs()
+                    # only on a context built here: a context passed in may
+                    # be shared with other sessions and is never mutated
+                    ctx.sslsocket_class = _TrackedSSLSocket
+                    self.ssl_context = ctx
+                return super().connect()
+
+        class _Pool(HTTPConnectionPool):
+            ConnectionCls = _Conn
+
+        class _SPool(HTTPSConnectionPool):
+            ConnectionCls = _SConn
+
+        self.poolmanager.pool_classes_by_scheme = {"http": _Pool, "https": _SPool}
+
+    def _track(self, sock: Any) -> Any:
+        with self._sock_lock:
+            self._socks.append(sock)
+            killed = self._killed
+        if killed:
+            self._shutdown(sock)
+        return sock
+
+    @staticmethod
+    def _shutdown(sock: Any) -> None:
+        import socket as _socket
+
+        try:
+            sock.shutdown(_socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def kill(self) -> None:
+        with self._sock_lock:
+            self._killed = True
+            socks = list(self._socks)
+        for sock in socks:
+            self._shutdown(sock)
+
 
 class WebSearchService:
     """Intelligent router and rate-limiter for web search providers."""
@@ -102,6 +249,98 @@ class WebSearchService:
                 "details": response.text[:1000],
             }
         return response.json()
+
+    _TAVILY_BASE = "https://api.tavily.com"
+    _TAVILY_VERIFY: Any = True   # requests ``verify`` (tests point it at a local CA file)
+
+    def _tavily_post_bounded(self, endpoint: str, payload: Dict[str, Any], wall_s: float) -> Dict[str, Any]:
+        """POST with a hard wall-clock bound. ``requests`` timeouts apply per
+        socket read, so a server that trickles headers or body could outlive
+        them. The whole request (connect, headers, body) runs on a daemon
+        worker whose sockets are tracked (``_KillableAdapter``); at the
+        deadline the caller shuts those sockets down, which wakes a blocked
+        read and ends the worker, then returns a failure (guard CX-06). The
+        only unkillable window is a TCP connect still in progress, bounded by
+        the connect timeout (at most 3 s)."""
+        wall = max(0.5, float(wall_s))
+        deadline = time.monotonic() + wall
+        # the deadline kill bounds the total, so a read may use the whole wall
+        # clock (Tavily Extract often needs over 2 s before its first byte)
+        per_read = wall
+        timed_out = {"error": f"Tavily {endpoint} exceeded its {wall:.1f}s wall clock", "success": False}
+        session = requests.Session()
+        adapter = _KillableAdapter()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.trust_env = False  # no proxy managers: every socket goes through the tracked pools
+        cancelled = threading.Event()
+        box: Dict[str, Any] = {}
+        try:  # the worker keeps the caller's tool deadline (HTTP budget hook, turn cancel)
+            from services.tool_budgets import adopt_deadline, current_deadline
+            parent_deadline = current_deadline()
+        except Exception:
+            adopt_deadline, parent_deadline = None, None
+
+        def _work() -> None:
+            response = None
+            if adopt_deadline is not None and parent_deadline is not None:
+                adopt_deadline(parent_deadline)
+            try:
+                response = session.post(
+                    f"{self._TAVILY_BASE}/{endpoint.lstrip('/')}",
+                    headers={
+                        "Authorization": f"Bearer {self.tavily_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=(min(3.0, wall), per_read),
+                    stream=True,
+                    verify=self._TAVILY_VERIFY,
+                )
+                chunks: List[bytes] = []
+                for chunk in response.iter_content(chunk_size=16384):
+                    if cancelled.is_set() or time.monotonic() > deadline:
+                        box["result"] = dict(timed_out)
+                        return
+                    if chunk:
+                        chunks.append(chunk)
+                body = b"".join(chunks).decode("utf-8", errors="replace")
+                if response.status_code not in (200, 201, 202):
+                    box["result"] = {
+                        "success": False,
+                        "error": f"Tavily {endpoint} returned status code {response.status_code}",
+                        "details": body[:1000],
+                    }
+                    return
+                box["result"] = json.loads(body)
+            except BaseException as exc:  # reported to the caller, never raised on the worker
+                box["error"] = exc
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+
+        worker = threading.Thread(target=_work, name=f"tavily-{endpoint.strip('/')}", daemon=True)
+        worker.start()
+        worker.join(max(0.0, deadline - time.monotonic()))
+        if worker.is_alive():
+            cancelled.set()
+            adapter.kill()        # wakes a read blocked on headers or body
+            worker.join(0.2)      # the caller stays within wall_s + 0.2 s
+            try:
+                session.close()
+            except Exception:
+                pass
+            return dict(timed_out)
+        try:
+            session.close()
+        except Exception:
+            pass
+        if "error" in box:
+            raise box["error"]
+        return box.get("result") or dict(timed_out)
 
     def _tavily_get(self, endpoint: str, timeout: int = 30) -> Dict[str, Any]:
         """Call Tavily REST GET endpoints directly when an older SDK lacks a method."""
@@ -181,44 +420,68 @@ class WebSearchService:
     def _get_usage(self) -> Dict[str, Any]:
         """Load search usage from disk, resetting counts if a new month has started."""
         current_month = datetime.now().strftime("%Y-%m")
-        default_usage = {
-            "month": current_month,
-            "brave_count": 0,
-            "exa_count": 0
-        }
-        
-        if not os.path.exists(USAGE_FILE):
-            return default_usage
-            
-        try:
-            with open(USAGE_FILE, "r", encoding="utf-8") as f:
-                usage = json.load(f)
-            
-            # Reset monthly quota if calendar month has changed
-            if usage.get("month") != current_month:
-                usage = default_usage
-                self._save_usage(usage)
-            return usage
-        except Exception as e:
-            print(f"[SEARCH ROUTER] Failed to load usage file: {e}")
-            return default_usage
+        default_usage = {"month": current_month, **{key: 0 for key in _USAGE_KEYS}}
+
+        # The whole read + month-rollover reset runs under the (re-entrant)
+        # usage lock, so a concurrent increment cannot be overwritten by the
+        # reset (guard CX-06).
+        with _USAGE_LOCK:
+            if not os.path.exists(USAGE_FILE):
+                return default_usage
+            try:
+                with open(USAGE_FILE, "r", encoding="utf-8") as f:
+                    usage = json.load(f)
+
+                # Reset monthly quota if calendar month has changed
+                if not isinstance(usage, dict) or usage.get("month") != current_month:
+                    usage = default_usage
+                    self._save_usage(usage)
+                for key in _USAGE_KEYS:
+                    usage.setdefault(key, 0)
+                return usage
+            except Exception as e:
+                print(f"[SEARCH ROUTER] Failed to load usage file: {e}")
+                return default_usage
 
     def _save_usage(self, usage: Dict[str, Any]) -> None:
-        """Persist current monthly search usage to disk."""
+        """Persist current monthly search usage to disk atomically (temp file +
+        os.replace), so a concurrent reader never sees a half-written file."""
+        tmp_path = None
         try:
-            with open(USAGE_FILE, "w", encoding="utf-8") as f:
+            directory = os.path.dirname(os.path.abspath(USAGE_FILE)) or "."
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(prefix=".search_usage.", suffix=".tmp", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(usage, f, indent=4)
+            # Windows refuses os.replace for a moment while another handle (a
+            # reader, the indexer, antivirus) has the target open: retry briefly.
+            for attempt in range(8):
+                try:
+                    os.replace(tmp_path, USAGE_FILE)
+                    tmp_path = None
+                    break
+                except PermissionError:
+                    if attempt == 7:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
         except Exception as e:
             print(f"[SEARCH ROUTER] Failed to save usage file: {e}")
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _increment_usage(self, provider: str) -> None:
-        """Increment count for the given provider (brave or exa)."""
-        usage = self._get_usage()
-        if provider == "brave":
-            usage["brave_count"] = usage.get("brave_count", 0) + 1
-        elif provider == "exa":
-            usage["exa_count"] = usage.get("exa_count", 0) + 1
-        self._save_usage(usage)
+        """Increment the monthly count for brave / exa / tavily / tavily_extract."""
+        key = f"{provider}_count"
+        if key not in _USAGE_KEYS:
+            return
+        with _USAGE_LOCK:
+            usage = self._get_usage()
+            usage[key] = int(usage.get(key, 0) or 0) + 1
+            self._save_usage(usage)
 
     def _determine_exa_type(self, query: str) -> str:
         """Determine if Exa should use 'deep' or 'deep-reasoning' based on complexity."""
@@ -254,41 +517,77 @@ class WebSearchService:
         return "deep"
 
     def route_and_search(
-        self, 
-        query: str, 
+        self,
+        query: str,
         max_results: int = DEFAULT_MAX_RESULTS,
-        search_depth: str = "basic"
+        search_depth: str = "basic",
+        want_images: Optional[bool] = None,
+        include_domains: Optional[List[str]] = None,
+        freshness: Optional[str] = None,
+        topic: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Classify search intent and route to the optimal provider with fallbacks."""
+        """Classify search intent and route to the optimal provider with fallbacks.
+
+        ``want_images``: whether the answer will show image tiles. The runner
+        passes its imagery decision; ``None`` (tool calls) derives it from an
+        explicit picture request in the query. Tiles are fetched only when it
+        is true: the Tavily image prefetch used to fire on every Brave/Exa
+        search and the tiles were then dropped (D7).
+
+        Planner hints (web search redesign, Phase 2): ``include_domains``
+        restricts the search to a domain pack (Tavily only: Brave has no site
+        restriction, so a restricted query never falls back to Brave);
+        ``freshness`` (day|week|month|year) becomes Tavily ``time_range`` and
+        Brave ``freshness``; ``topic`` "news" selects Tavily's news index. With
+        no hints the routing is exactly Phase 1."""
         if is_explicit_query(query):
             return blocked_query_result(query)
 
-        q_lower = query.lower()
         try:
             max_results = max(1, min(int(max_results), 10))
         except (TypeError, ValueError):
             max_results = DEFAULT_MAX_RESULTS
-        
-        # 1. Image or Plot intent -> route to Image Search
-        if any(kw in q_lower for kw in ["image", "photo", "chart", "map", "plot", "spectrum"]):
+
+        image_request = wants_image_search(query)
+        want_images = image_request if want_images is None else bool(want_images)
+        domains = [str(d).strip() for d in (include_domains or []) if str(d).strip()]
+        from services.web_domain_packs import brave_freshness as _brave_fresh, tavily_time_range as _tv_range
+
+        time_range = _tv_range(freshness) if freshness else None
+        brave_fresh = _brave_fresh(freshness) if freshness else None
+        news_topic = "news" if str(topic or "").lower() == "news" else None
+
+        if domains:
+            # Restricted (domain pack) query: Tavily is the only provider that
+            # honours include_domains. No Brave fallback (it would ignore the
+            # restriction and the unrestricted companion query covers recall).
+            if not self.tavily_key:
+                return {"success": False, "error": "Tavily API key missing (domain-restricted search)"}
+            print(f"[SEARCH ROUTER] Routing to Tavily (include_domains={domains[:4]}{'…' if len(domains) > 4 else ''}) for: {query!r}")
+            res = self.search_tavily(
+                query,
+                max_results=max_results,
+                search_depth=search_depth,
+                include_images=False,
+                include_domains=domains,
+                time_range=time_range,
+                topic=news_topic,
+            )
+            return sanitize_web_payload(res) if res.get("success") else res
+
+        # 1. Explicit picture request -> Image Search
+        if image_request and want_images:
             print(f"[SEARCH ROUTER] Routed to Image Search for: {query!r}")
             return sanitize_web_payload(self.search_images(query, max_results=max_results))
-            
-        # 2. Advanced / deep technical / research intent -> route to Exa.
-        # Normal advanced search uses Exa deep; only very hard synthesis uses
-        # Exa deep-reasoning inside _determine_exa_type().
-        exa_intent = (
-            search_depth == "advanced"
-            or any(kw in q_lower for kw in [
-                "compare", "versus", "vs", "formula", "equations",
-                "papers", "documentation", "handbook", "innovations",
-                "architecture", "literature", "review", "research",
-                "academic",
-            ])
-        )
+
+        # 2. Literature / documentation lookups (or an explicit advanced
+        # search) -> Exa. Normal advanced search uses Exa deep; only very hard
+        # synthesis uses Exa deep-reasoning inside _determine_exa_type().
+        exa_intent = wants_exa_search(query, search_depth)
         # Exa/Brave return text-only results, so their image tiles come from a
         # separate Tavily call. It used to run SERIALLY after the text search
-        # (+2.7 s measured 2026-07-18); prefetch it concurrently instead.
+        # (+2.7 s measured 2026-07-18); prefetch it concurrently instead, and
+        # only when the answer will show images.
         usage = self._get_usage()
         exa_eligible = bool(
             exa_intent and self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT
@@ -299,7 +598,7 @@ class WebSearchService:
             and not self._brave_cooling_down()
         )
         img_thread, img_holder = (None, None)
-        if exa_eligible or brave_eligible:
+        if want_images and (exa_eligible or brave_eligible):
             img_thread, img_holder = self._start_image_prefetch(query)
 
         if exa_intent:
@@ -318,7 +617,7 @@ class WebSearchService:
         # 3. Fresh / Current / RAG fresh info -> route to Brave Search
         if brave_eligible:
             print(f"[SEARCH ROUTER] Routed to Brave (Primary) for: {query!r}")
-            res = self.search_brave(query, max_results=max_results)
+            res = self.search_brave(query, max_results=max_results, **({"freshness": brave_fresh} if brave_fresh else {}))
             if res.get("success"):
                 return sanitize_web_payload(
                     self._attach_prefetched_images(res, img_thread, img_holder)
@@ -338,7 +637,9 @@ class WebSearchService:
                 query,
                 max_results=max_results,
                 search_depth=search_depth,
-                include_images=img_thread is None,
+                include_images=bool(want_images) and img_thread is None,
+                **({"time_range": time_range} if time_range else {}),
+                **({"topic": news_topic} if news_topic else {}),
             )
             if res.get("success"):
                 if img_thread is not None:
@@ -360,8 +661,10 @@ class WebSearchService:
                 if img_thread is not None:
                     img_thread.join(timeout=4.0)
                     fallback_images = (img_holder or {}).get("images") or []
+                elif want_images and self.tavily_key:
+                    fallback_images = self._fetch_tavily_images(query)
                 else:
-                    fallback_images = self._fetch_tavily_images(query) if self.tavily_key else []
+                    fallback_images = []
                 return sanitize_web_payload({
                     "success": True,
                     "provider": "BrowserService (fallback)",
@@ -374,6 +677,156 @@ class WebSearchService:
                 return {"success": False, "error": f"Scraping fallback failed: {e}"}
                 
         return {"success": False, "error": "No search providers available or all quotas exceeded"}
+
+    def search_plan(
+        self,
+        queries: List[str],
+        *,
+        include_domains: Optional[List[str]] = None,
+        freshness: Optional[str] = None,
+        topic: Optional[str] = None,
+        want_images: bool = False,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        budget_s: Optional[float] = None,
+        on_search=None,
+    ) -> Dict[str, Any]:
+        """Run a planner's queries in parallel (web search redesign, Phase 2).
+
+        Every query runs restricted to ``include_domains`` (when the pack has
+        any) and the FIRST query also runs unrestricted for recall. All
+        searches start together on daemon threads and are joined within
+        ``budget_s`` (QUASAR_WEB_SEARCH_BUDGET, default 6 s); a late search is
+        dropped, never waited for. Returns ONE payload in the usual shape:
+        results of the restricted (official) searches first, then the
+        unrestricted ones, deduplicated by canonical URL, plus a ``searches``
+        list describing each search for the tool trace and the status steps.
+        ``on_search(kind, query, started)`` is called when a search starts /
+        finishes (kind = "start" | "done" | "late"), for the UI steps."""
+        from services.web_evidence import canonicalize_url
+
+        clean = []
+        for q in queries or []:
+            qq = re.sub(r"\s+", " ", str(q or "")).strip()
+            if qq and qq.lower() not in {c.lower() for c in clean}:
+                clean.append(qq)
+        clean = clean[:3]
+        if not clean:
+            return {"success": False, "error": "no queries"}
+        domains = [str(d).strip() for d in (include_domains or []) if str(d).strip()]
+        try:
+            budget = float(budget_s) if budget_s is not None else float(os.getenv("QUASAR_WEB_SEARCH_BUDGET", "6") or 6)
+        except ValueError:
+            budget = 6.0
+
+        jobs: List[Dict[str, Any]] = []
+        if domains:
+            for q in clean:
+                jobs.append({"query": q, "restricted": True})
+        jobs.append({"query": clean[0], "restricted": False})
+        if not domains:
+            for q in clean[1:]:
+                jobs.append({"query": q, "restricted": False})
+
+        def _run(job: Dict[str, Any]) -> None:
+            t0 = time.monotonic()
+            try:
+                # Freshness filters the UNRESTRICTED (recall) search only: official
+                # documents are evergreen and the currency ordering handles the
+                # version; a "month" filter on the official sites dropped the 2025
+                # JWST Cycle 5 pages the question was about (live 2026-09-24).
+                res = self.route_and_search(
+                    job["query"],
+                    max_results=max_results,
+                    search_depth="basic",
+                    want_images=bool(want_images) and not job["restricted"] and job["query"] == clean[0],
+                    include_domains=domains if job["restricted"] else None,
+                    freshness=None if job["restricted"] else freshness,
+                    topic=None if job["restricted"] else topic,
+                )
+            except Exception as exc:  # noqa: BLE001 - one search never kills the batch
+                res = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+            job["result"] = res
+            job["elapsed_s"] = round(time.monotonic() - t0, 2)
+            if on_search:
+                try:
+                    on_search("done", job["query"], job["restricted"], res)
+                except Exception:
+                    pass
+
+        threads = []
+        for job in jobs:
+            if on_search:
+                try:
+                    on_search("start", job["query"], job["restricted"], None)
+                except Exception:
+                    pass
+            th = threading.Thread(target=_run, args=(job,), name="quasar-web-plan-search", daemon=True)
+            job["thread"] = th
+            th.start()
+            threads.append(th)
+        deadline = time.monotonic() + budget
+        for th in threads:
+            th.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        images: List[Dict[str, Any]] = []
+        providers: List[str] = []
+        searches: List[Dict[str, Any]] = []
+        ordered = [j for j in jobs if j["restricted"]] + [j for j in jobs if not j["restricted"]]
+        for job in ordered:
+            res = job.get("result")
+            late = res is None
+            ok = bool(isinstance(res, dict) and res.get("success"))
+            n = 0
+            if ok:
+                for item in res.get("results") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    key = canonicalize_url(item.get("url") or "") or str(item.get("url") or "")
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    entry = dict(item)
+                    entry["_search_query"] = job["query"]
+                    entry["_restricted"] = bool(job["restricted"])
+                    merged.append(entry)
+                    n += 1
+                if not images and res.get("images"):
+                    images = list(res.get("images") or [])[:6]
+                prov = str(res.get("provider") or "")
+                if prov and prov not in providers:
+                    providers.append(prov)
+            if late and on_search:
+                try:
+                    on_search("late", job["query"], job["restricted"], None)
+                except Exception:
+                    pass
+            searches.append({
+                "query": job["query"],
+                "restricted": bool(job["restricted"]),
+                "domains": domains if job["restricted"] else [],
+                "ok": ok,
+                "late": late,
+                "n": n,
+                "provider": str((res or {}).get("provider") or "") if isinstance(res, dict) else "",
+                "elapsed_s": job.get("elapsed_s"),
+                "error": None if ok or late else str((res or {}).get("error") or "")[:200],
+            })
+        if not merged:
+            errors = "; ".join(x["error"] for x in searches if x.get("error")) or "no results"
+            return {"success": False, "error": errors, "query": clean[0], "searches": searches}
+        return sanitize_web_payload({
+            "success": True,
+            "provider": ", ".join(providers),
+            "query": clean[0],
+            "queries": clean,
+            "include_domains": domains,
+            "freshness": freshness or "any",
+            "results": merged[: max(max_results, 10) * 2],
+            "images": images,
+            "searches": searches,
+        })
 
     @staticmethod
     def _coerce_snippet(snippets: Any) -> str:
@@ -580,6 +1033,7 @@ class WebSearchService:
         response = self._tavily_post("search", payload, timeout=30)
         if isinstance(response, dict) and response.get("success") is False:
             return []
+        self._increment_usage("tavily")
         return self._collect_tavily_images(response, max_images=max_images)
 
     def _start_image_prefetch(self, query: str, max_images: int = 6):
@@ -633,8 +1087,11 @@ class WebSearchService:
     # unlike a 200 with empty results.
     _BRAVE_HARD_STATUSES = {401, 402, 403, 422, 429, 500, 502, 503, 504}
 
-    def search_brave(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> Dict[str, Any]:
-        """Perform search using Brave LLM Context (primary RAG) or Web Search."""
+    def search_brave(self, query: str, max_results: int = DEFAULT_MAX_RESULTS, freshness: Optional[str] = None) -> Dict[str, Any]:
+        """Perform search using Brave LLM Context (primary RAG) or Web Search.
+
+        ``freshness`` (Brave ``pd|pw|pm|py``, Phase 2): the LLM Context endpoint
+        has no freshness filter, so a fresh query goes straight to Web Search."""
         if is_explicit_query(query):
             return blocked_query_result(query)
         if not self.brave_key:
@@ -642,6 +1099,9 @@ class WebSearchService:
         if self._brave_cooling_down():
             return {"success": False, "error": "Brave circuit breaker open"}
         max_results = max(1, min(int(max_results), 10))
+        freshness = str(freshness or "").strip().lower() or None
+        if freshness not in (None, "pd", "pw", "pm", "py"):
+            freshness = None
 
         # Track failure modes across both endpoints; only a hard failure on
         # BOTH trips the breaker. Brave answers in ~2 s when healthy, so 5 s
@@ -660,6 +1120,8 @@ class WebSearchService:
         }
 
         try:
+            if freshness:
+                raise _SkipBraveContext()
             response = requests.get(url, headers=headers, params=params, timeout=5)
             if response.status_code == 200:
                 self._increment_usage("brave")
@@ -675,6 +1137,8 @@ class WebSearchService:
                     })
             elif response.status_code in self._BRAVE_HARD_STATUSES:
                 _hard_failures.append(f"llm/context HTTP {response.status_code}")
+        except _SkipBraveContext:
+            pass
         except Exception as e:
             _hard_failures.append(f"llm/context {type(e).__name__}")
             print(f"[SEARCH ROUTER] Brave LLM Context API call failed: {e}")
@@ -685,19 +1149,23 @@ class WebSearchService:
             web_response = requests.get(
                 web_url,
                 headers=headers,
-                params={"q": query, "count": min(max_results, 10), "safesearch": "strict"},
+                params={
+                    "q": query,
+                    "count": min(max_results, 10),
+                    "safesearch": "strict",
+                    "extra_snippets": "true",
+                    **({"freshness": freshness} if freshness else {}),
+                },
                 timeout=5,
             )
             if web_response.status_code == 200:
                 self._increment_usage("brave")
                 data = web_response.json()
-                results = []
-                for item in data.get("web", {}).get("results", []):
-                    results.append({
-                        "title": item.get("title", ""),
-                        "url": item.get("url", item.get("link", "")),
-                        "snippet": item.get("snippet", "")
-                    })
+                results = [
+                    self._brave_web_result(item)
+                    for item in ((data.get("web") or {}).get("results") or [])
+                    if isinstance(item, dict)
+                ]
                 return sanitize_web_payload({
                     "success": True,
                     "provider": "Brave Web Search",
@@ -716,6 +1184,32 @@ class WebSearchService:
 
         return {"success": False, "error": "Brave API request failed"}
 
+    @classmethod
+    def _brave_web_result(cls, item: Dict[str, Any]) -> Dict[str, str]:
+        """One Brave Web Search result in Quasar's shape. Brave's text field is
+        ``description`` (plus optional ``extra_snippets``), not ``snippet``;
+        reading ``snippet`` left every result empty, so the web summary had
+        nothing to work with and silently vanished (D3). ``page_age`` (ISO)
+        or ``age`` becomes ``published_date``."""
+        parts = [cls._coerce_snippet(item.get("description") or item.get("snippet") or "")]
+        extra = item.get("extra_snippets")
+        if isinstance(extra, list):
+            parts.extend(cls._coerce_snippet(x) for x in extra)
+        seen: List[str] = []
+        for part in parts:
+            clean = re.sub(r"</?strong>", "", str(part or "")).strip()
+            if clean and clean not in seen:
+                seen.append(clean)
+        result = {
+            "title": re.sub(r"</?strong>", "", str(item.get("title", "") or "")),
+            "url": item.get("url", item.get("link", "")) or "",
+            "snippet": "\n".join(seen),
+        }
+        published = item.get("page_age") or item.get("age") or ""
+        if published:
+            result["published_date"] = str(published)
+        return result
+
     def search_tavily(
         self,
         query: str,
@@ -723,8 +1217,15 @@ class WebSearchService:
         search_depth: str = "basic",
         include_images: bool = True,
         include_answer: bool = False,
+        include_domains: Optional[List[str]] = None,
+        time_range: Optional[str] = None,
+        topic: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Perform Tavily search with source and optional image metadata.
+
+        Phase 2 hints: ``include_domains`` (domain pack), ``time_range``
+        (day|week|month|year) and ``topic`` ("news") are sent only when given,
+        so the Phase 1 payload is unchanged otherwise.
 
         ``include_answer`` defaults OFF: Tavily's generated answer roughly
         doubled search latency (measured 7.2 s vs 3.4 s, 2026-07-18) and
@@ -746,6 +1247,13 @@ class WebSearchService:
             "include_images": include_images,
             "include_image_descriptions": include_images,
         }
+        domains = [str(d).strip() for d in (include_domains or []) if str(d).strip()]
+        if domains:
+            payload["include_domains"] = domains[:30]
+        if time_range in ("day", "week", "month", "year"):
+            payload["time_range"] = time_range
+        if str(topic or "").lower() in ("news", "finance"):
+            payload["topic"] = str(topic).lower()
 
         try:
             try:
@@ -757,15 +1265,19 @@ class WebSearchService:
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
+            self._increment_usage("tavily")
 
             response_results = response.get("results", []) if isinstance(response, dict) else []
             results = []
             for r in response_results:
-                results.append({
+                item = {
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
                     "snippet": r.get("content", "")
-                })
+                }
+                if r.get("published_date"):
+                    item["published_date"] = r.get("published_date")
+                results.append(item)
             images = self._collect_tavily_images(response, max_images=6)
             return sanitize_web_payload({
                 "success": True,
@@ -787,8 +1299,14 @@ class WebSearchService:
         include_images: bool = False,
         content_format: str = "markdown",
         max_content_chars: int = 12000,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Extract clean content from one or more URLs using Tavily Extract."""
+        """Extract clean content from one or more URLs using Tavily Extract.
+
+        ``timeout``: a hard wall-clock bound (seconds). Given, the REST
+        endpoint is called directly with a streamed, deadline-checked read
+        (``_tavily_post_bounded``), so a bounded caller (the web deep read)
+        never leaves a long request running behind it."""
         clean_urls = self._normalize_urls(urls)
         original_url_count = len(clean_urls)
         clean_urls = [url for url in clean_urls if not is_blocked_url(url)]
@@ -815,16 +1333,20 @@ class WebSearchService:
             kwargs["chunks_per_source"] = max(1, min(int(chunks_per_source), 5))
 
         try:
-            client = self._get_tavily_client()
             url_arg: Any = clean_urls[0] if len(clean_urls) == 1 else clean_urls
-            try:
-                response = client.extract(urls=url_arg, **kwargs)
-            except (AttributeError, TypeError):
-                payload = {"urls": url_arg, **kwargs}
-                response = self._tavily_post("extract", payload, timeout=60)
+            if timeout is not None:
+                response = self._tavily_post_bounded("extract", {"urls": url_arg, **kwargs}, wall_s=float(timeout))
+            else:
+                client = self._get_tavily_client()
+                try:
+                    response = client.extract(urls=url_arg, **kwargs)
+                except (AttributeError, TypeError):
+                    payload = {"urls": url_arg, **kwargs}
+                    response = self._tavily_post("extract", payload, timeout=60)
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
+            self._increment_usage("tavily_extract")
             response = self._truncate_result_content(response, max_content_chars)
             return sanitize_web_payload({
                 "success": True,
@@ -884,6 +1406,7 @@ class WebSearchService:
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
+            self._increment_usage("tavily_other")
             return sanitize_web_payload({
                 "success": True,
                 "provider": "Tavily Map",
@@ -951,6 +1474,7 @@ class WebSearchService:
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
+            self._increment_usage("tavily_other")
             response = self._truncate_result_content(response, max_content_chars)
             return sanitize_web_payload({
                 "success": True,
@@ -999,6 +1523,7 @@ class WebSearchService:
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
+            self._increment_usage("tavily_other")
 
             if not wait_for_completion or not isinstance(response, dict):
                 return sanitize_web_payload({
@@ -1056,6 +1581,7 @@ class WebSearchService:
 
             if isinstance(response, dict) and response.get("success") is False:
                 return response
+            self._increment_usage("tavily_other")
             response = self._truncate_result_content(response, max_content_chars)
             return sanitize_web_payload({
                 "success": response.get("status") != "failed",
@@ -1161,6 +1687,8 @@ class WebSearchService:
 
                 if isinstance(response, dict) and response.get("success") is False:
                     response = {}
+                else:
+                    self._increment_usage("tavily")
 
                 images = self._collect_tavily_images(response, max_images=max_results)
                 
@@ -1197,7 +1725,7 @@ class WebSearchService:
                 response = requests.get(
                     url,
                     headers=headers,
-                    params={"q": query, "count": 10, "safesearch": "strict"},
+                    params={"q": query, "count": 10, "safesearch": "strict", "extra_snippets": "true"},
                     timeout=10,
                 )
                 if response.status_code == 200:
@@ -1220,14 +1748,12 @@ class WebSearchService:
                                 image["sourceTitle"] = source_title
                             images.append(image)
                     
-                    results = []
-                    for item in data.get("web", {}).get("results", []):
-                        results.append({
-                            "title": item.get("title", ""),
-                            "url": item.get("url", ""),
-                            "snippet": item.get("snippet", "")
-                        })
-                        
+                    results = [
+                        self._brave_web_result(item)
+                        for item in ((data.get("web") or {}).get("results") or [])
+                        if isinstance(item, dict)
+                    ]
+
                     return sanitize_web_payload({
                         "success": True,
                         "provider": "Brave Images (extrapolated)",

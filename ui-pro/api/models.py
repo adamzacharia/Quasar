@@ -16,6 +16,10 @@ class ChatRequest(BaseModel):
     model: Optional[str] = "gpt-oss-120b"
     grounded_summary: bool = False
     web_search: bool = True
+    # Web search redesign, Phase 2 (PLAN 2.4): off | auto | always. When given it
+    # wins over the boolean switch (True = auto, False = off); absent = the
+    # boolean decides, so older clients keep working.
+    web_search_mode: Optional[str] = None
 
 
 class RegisterRequest(BaseModel):

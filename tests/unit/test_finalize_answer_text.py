@@ -45,3 +45,16 @@ def test_conductor_return_goes_through_the_finalizer():
     assert "_finalize_answer_text(" in conductor
     standard = src[src.index("# 7a. Append parallel web search results"):]
     assert "_finalize_answer_text(" in standard
+
+
+def test_card_direction_words_become_direction_free_when_a_card_exists():
+    """UI 2026-09-23 L03/L06: the live chat appends figure cards after the
+    answer bubble, so "shown above" was wrong; 2026-09-22 found "shown below"
+    wrong in another view. Direction-free wording is right in every view."""
+    agent = _agent([])
+    agent._accumulated_run_results = [{"type": "image", "image_url": "/plots/cmd.png", "caption": "CMD"}]
+    out = runner._finalize_answer_text(agent, "The CMD is shown above. The map (shown below) has 3 peaks.",
+                                       on_token=None, user_query="plot a CMD", url_sources=[], all_tool_results=[],
+                                       had_tool_calls=False)
+    assert "above" not in out and "below" not in out
+    assert "The CMD is shown in the card." in out and "(shown in the card)" in out

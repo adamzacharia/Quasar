@@ -20,6 +20,8 @@ PROFILE = ArchiveProfile.model_validate(
     {
         "archive": "alma",
         "aliases": ("alma_archive", "almascience"),
+        # Regional mirrors serve the same /tap, /sia2, /datalink paths.
+        "mirror_hosts": ("almascience.org", "almascience.eso.org", "almascience.nao.ac.jp"),
         "description": (
             "ALMA Science Archive: interferometric observations searched by target/position/"
             "frequency, deterministic science-query templates, DataLink file inventories, "
@@ -37,6 +39,12 @@ PROFILE = ArchiveProfile.model_validate(
                 "description": "ALMA DataLink (per-MOUS file enumeration): <mirror>/datalink/sync?ID=<uid>.",
                 "url": "https://almascience.nrao.edu/datalink/sync",
                 "protocol": "rest",
+            },
+            {
+                "id": "alma_sia2",
+                "description": "ALMA SIA 2.0 image/cube search (vo_image_search archive='alma'); access_url is a MOUS DataLink.",
+                "url": "https://almascience.nrao.edu/sia2",
+                "protocol": "sia",
             },
         ],
         "query_surfaces": [
@@ -235,6 +243,11 @@ PROFILE = ArchiveProfile.model_validate(
                 ),
                 "applies_to": [{"kind": "table", "ref": "ivoa.obscore"}],
                 "prompt_rank": 1,
+                # Live audits verified 2026-09-24 (scripts/audit_archive_profiles.py).
+                "audit": {"expect": "nonempty", "endpoint_id": "alma_tap",
+                          "adql": ("SELECT member_ous_uid, COUNT(*) AS n FROM ivoa.obscore WHERE "
+                                   "1=INTERSECTS(CIRCLE('ICRS',187.70593,12.39112,0.01), s_region) "
+                                   "GROUP BY member_ous_uid HAVING COUNT(*) > 1")},
             },
             {
                 "id": "units_and_footprints",
@@ -249,6 +262,10 @@ PROFILE = ArchiveProfile.model_validate(
                 "applies_to": [{"kind": "table", "ref": "ivoa.obscore"},
                                 {"kind": "surface", "ref": "raw_adql"}],
                 "prompt_rank": 2,
+                # The unit claims themselves, as TAP_SCHEMA publishes them (t_min is MJD, unit 'd').
+                "audit": {"expect": "column_units", "endpoint_id": "alma_tap", "table": "ivoa.obscore",
+                          "units": {"bandwidth": "Hz", "frequency": "GHz", "em_min": "m", "em_max": "m",
+                                    "velocity_resolution": "m/s", "t_min": "d"}},
             },
             {
                 "id": "qa2_and_datalink",
@@ -262,6 +279,9 @@ PROFILE = ArchiveProfile.model_validate(
                 "applies_to": [{"kind": "table", "ref": "ivoa.obscore"},
                                 {"kind": "surface", "ref": "file_inventory"}],
                 "prompt_rank": 3,
+                "audit": {"expect": "nonempty", "endpoint_id": "alma_tap",
+                          "adql": ("SELECT TOP 1 obs_id FROM ivoa.obscore WHERE "
+                                   "1=INTERSECTS(CIRCLE('ICRS',187.70593,12.39112,0.01), s_region) AND access_url LIKE '%datalink%'")},
             },
             {
                 "id": "minimal_parameters",
@@ -279,6 +299,8 @@ PROFILE = ArchiveProfile.model_validate(
                 "id": "band_list_tokens",
                 "summary": "band_list is space-delimited ('5 10' for band-to-band): match tokens, never bare substrings; confirm the science band from frequency_support",
                 "applies_to": [{"kind": "column", "ref": "ivoa.obscore:band_list"}],
+                "audit": {"expect": "nonempty", "endpoint_id": "alma_tap",
+                          "adql": "SELECT TOP 1 band_list FROM ivoa.obscore WHERE band_list LIKE '% %'"},
             },
             {
                 "id": "cycle_project_codes",

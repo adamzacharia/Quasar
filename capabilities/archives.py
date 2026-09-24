@@ -66,6 +66,142 @@ class _In(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+def _frame_error(df: Any) -> Optional[str]:
+    """The failure an archive client stored on an empty frame (MASTClient._failed,
+    IRSAClient), or None. Such a frame is an error, never 'no data'."""
+    try:
+        err = (getattr(df, "attrs", None) or {}).get("error")
+    except Exception:
+        return None
+    return str(err) if err else None
+
+
+def _nearest_rows(df: Any, n: int = 5, max_cols: int = 40) -> List[Dict[str, Any]]:
+    """The n rows nearest the search centre (df.attrs['center']) with their values,
+    JSON-safe, so the model can quote magnitudes instead of pointing at a card."""
+    import math
+    try:
+        center = (getattr(df, "attrs", None) or {}).get("center")
+        work = df.copy()
+        if center and "s_ra" in work.columns and "s_dec" in work.columns:
+            ra0, dec0 = float(center[0]), float(center[1])
+            d0 = math.radians(dec0)
+
+            def sep(r, d):
+                try:
+                    r1, d1 = math.radians(float(r)), math.radians(float(d))
+                    s = math.sin((d1 - d0) / 2) ** 2 + math.cos(d0) * math.cos(d1) * math.sin((r1 - math.radians(ra0)) / 2) ** 2
+                    return math.degrees(2 * math.asin(min(1.0, math.sqrt(s)))) * 3600.0
+                except (TypeError, ValueError):
+                    return float("inf")
+            work["sep_arcsec"] = [round(sep(r, d), 3) for r, d in zip(work["s_ra"], work["s_dec"])]
+            work = work.sort_values("sep_arcsec")
+        cols = (["sep_arcsec"] if "sep_arcsec" in work.columns else []) + \
+            [c for c in work.columns if c not in ("sep_arcsec",)][:max_cols]
+        rows = []
+        for _, rec in work.head(n).iterrows():
+            row = {}
+            for c in cols:
+                v = rec[c]
+                if hasattr(v, "item"):
+                    try:
+                        v = v.item()
+                    except (ValueError, AttributeError):
+                        pass
+                if isinstance(v, float) and not math.isfinite(v):
+                    v = None
+                if isinstance(v, bytes):
+                    v = v.decode("utf-8", "replace")
+                row[c] = v if isinstance(v, (int, float, str, bool)) or v is None else str(v)
+            rows.append(row)
+        return rows
+    except Exception:
+        logger.debug("nearest-row summary failed", exc_info=True)
+        return []
+
+
+def _mjd_iso(value: Any) -> Optional[str]:
+    try:
+        import math
+        v = float(value)
+        if not math.isfinite(v):
+            return None
+        from datetime import datetime, timedelta, timezone
+        return (datetime(1858, 11, 17, tzinfo=timezone.utc) + timedelta(days=v)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _mast_programs(df: Any, limit: int = 40) -> Dict[str, Any]:
+    """Per-program summary of a MAST observation table for the model (the UI card
+    has the rows; the model needs program ids, instruments, filters and dates)."""
+    out: Dict[str, Any] = {}
+    try:
+        import math
+        prog_col = "project_code" if "project_code" in df.columns else ("proposal_id" if "proposal_id" in df.columns else None)
+        if prog_col is None or df.empty:
+            return out
+        from datetime import datetime, timezone
+        now_mjd = (datetime.now(timezone.utc) - datetime(1858, 11, 17, tzinfo=timezone.utc)).total_seconds() / 86400.0
+        programs = []
+        for prog, grp in df.groupby(df[prog_col].astype(str), sort=False):
+            entry: Dict[str, Any] = {"program": prog, "n_obs": int(len(grp))}
+            for col, key in (("telescope", "missions"), ("instrument_name", "instruments"), ("filters", "filters"),
+                             ("dataproduct_type", "product_types"), ("target_name", "targets")):
+                if col in grp.columns:
+                    vals = sorted({str(v) for v in grp[col].dropna().tolist() if str(v).strip()})
+                    entry[key] = vals[:12]
+            if "t_min" in grp.columns:
+                tmins = [float(v) for v in grp["t_min"].dropna().tolist() if math.isfinite(float(v))]
+                if tmins:
+                    entry["first_obs_date"] = _mjd_iso(min(tmins))
+                    entry["last_obs_date"] = _mjd_iso(max(tmins))
+            if "t_exptime" in grp.columns:
+                try:
+                    entry["total_exptime_s"] = round(float(grp["t_exptime"].fillna(0).astype(float).sum()), 1)
+                except (TypeError, ValueError):
+                    pass
+            if "t_obs_release" in grp.columns:
+                rel = [float(v) for v in grp["t_obs_release"].dropna().tolist() if math.isfinite(float(v))]
+                if rel:
+                    entry["release_date"] = _mjd_iso(min(rel))
+                    entry["all_public"] = bool(max(rel) <= now_mjd)
+            elif "dataRights" in grp.columns:
+                entry["all_public"] = bool((grp["dataRights"].astype(str).str.upper() == "PUBLIC").all())
+            if "proposal_pi" in grp.columns:
+                pis = sorted({str(v) for v in grp["proposal_pi"].dropna().tolist() if str(v).strip()})
+                if pis:
+                    entry["pi"] = pis[0]
+            if "sequence_number" in grp.columns:
+                seq = sorted({int(v) for v in grp["sequence_number"].dropna().tolist()
+                              if str(v).strip() not in ("", "nan") and float(v) > 0})
+                if seq:
+                    entry["sequence_numbers"] = seq[:100]
+            programs.append(entry)
+        programs.sort(key=lambda e: (e.get("first_obs_date") or "9999"))
+        out["programs"] = programs[:limit]
+        out["n_programs"] = len(programs)
+        if len(programs) > limit:
+            out["programs_truncated"] = True
+        if "telescope" in df.columns and "sequence_number" in df.columns:
+            tess = df[df["telescope"].astype(str).str.upper() == "TESS"]
+            if not tess.empty:
+                sectors = sorted({int(v) for v in tess["sequence_number"].dropna().tolist() if float(v) > 0})
+                out["tess_sectors"] = sectors
+                if "t_exptime" in tess.columns:
+                    by_cad: Dict[str, List[int]] = {}
+                    for _, row in tess.iterrows():
+                        try:
+                            key = f"{float(row['t_exptime']):g}s"
+                            by_cad.setdefault(key, []).append(int(row["sequence_number"]))
+                        except (TypeError, ValueError):
+                            continue
+                    out["tess_sectors_by_exptime"] = {k: sorted(set(v)) for k, v in by_cad.items()}
+    except Exception:
+        logger.debug("MAST program summary failed", exc_info=True)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +254,13 @@ class SearchMast(BaseCapability):
             else:
                 return _native({"success": False, "error": "Provide target_name or (ra, dec) coordinates."})
 
+            failure = _frame_error(df)
+            if failure:
+                return _native({"success": False, "error": f"MAST search failed: {failure}",
+                                "note": "This is a failed query, not an empty result: the archive was not searched "
+                                        "successfully, so nothing can be concluded about what data exist."},
+                               provenance=prov)
+
             if df.empty:
                 note = f"No MAST observations found"
                 if target_name:
@@ -156,10 +299,12 @@ class SearchMast(BaseCapability):
                 "instruments": instr_summary,
                 "unique_targets": int(df["target_name"].nunique()) if "target_name" in df.columns else 0,
                 "unique_programs": int(df["project_code"].nunique()) if "project_code" in df.columns else 0,
+                **_mast_programs(df),
                 "note": (
                     f"Found {len(df)} MAST observations. "
                     f"Missions: {', '.join(f'{m} ({c})' for m, c in mission_summary.items())}. "
-                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                    "Per-program ids, instruments, filters and dates are in `programs`; state the ones the user "
+                    "asked for. The full table is shown in the UI."
                 )
             }, provenance=prov)
         except Exception as e:
@@ -176,6 +321,11 @@ class SearchMastByCriteriaInput(_In):
     dataproduct_type: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    radius: Optional[str] = None
+    min_exptime: Optional[float] = None
+    max_exptime: Optional[float] = None
 
 
 class SearchMastByCriteria(BaseCapability):
@@ -209,13 +359,25 @@ class SearchMastByCriteria(BaseCapability):
         )
         try:
             mast_client = ctx.services.get("mast_client")
+            extra: Dict[str, Any] = {}
+            if inp.ra is not None and inp.dec is not None:
+                extra.update(ra=inp.ra, dec=inp.dec)
+            if inp.radius:
+                extra["radius"] = inp.radius
+            if inp.min_exptime is not None or inp.max_exptime is not None:
+                extra["exptime_range"] = (inp.min_exptime, inp.max_exptime)
             df = mast_client.search_by_criteria(
                 mission=mission, instrument=instrument,
                 proposal_id=proposal_id, filters=filters,
                 target_name=target_name,
                 dataproduct_type=dataproduct_type,
-                date_range=date_range
+                date_range=date_range, **extra
             )
+
+            failure = _frame_error(df)
+            if failure:
+                return _native({"success": False, "error": f"MAST criteria search failed: {failure}",
+                                "note": "This is a failed query, not an empty result."}, provenance=prov)
 
             if df.empty:
                 criteria_parts = []
@@ -251,10 +413,11 @@ class SearchMastByCriteria(BaseCapability):
                 "instruments": instr_summary,
                 "filters_used": filter_summary,
                 "unique_targets": int(df["target_name"].nunique()) if "target_name" in df.columns else 0,
+                **_mast_programs(df),
                 "note": (
                     f"Found {len(df)} observations. "
                     f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
-                    f"Full data shown in UI table."
+                    "Per-program ids, instruments, filters and dates are in `programs`. Full data shown in UI table."
                 )
             }, provenance=prov)
         except Exception as e:
@@ -525,6 +688,13 @@ class SearchIrsa(BaseCapability):
             else:
                 return _native({"success": False, "error": "Provide target_name or (ra, dec) coordinates."})
 
+            failure = _frame_error(df)
+            if failure:
+                return _native({"success": False, "error": f"IRSA search failed: {failure}",
+                                "note": "This is a failed query, not an empty result. For a table IRSA does not "
+                                        "know, use catalog_find / catalog_query (VizieR, HEASARC, IRSA)."},
+                               provenance=prov)
+
             if df.empty:
                 note = f"No IRSA sources found"
                 if target_name:
@@ -549,9 +719,11 @@ class SearchIrsa(BaseCapability):
                 "total_results": len(df),
                 "catalog": catalog,
                 "columns": list(df.columns[:15]),  # First 15 columns for LLM context
+                "nearest_sources": _nearest_rows(df),
                 "note": (
                     f"Found {len(df)} sources in IRSA {catalog.upper()} catalog. "
-                    f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
+                    "The nearest sources' values are in `nearest_sources` (with sep_arcsec); state the values "
+                    "the user asked for. The full table is shown in the UI."
                 )
             }, provenance=prov)
         except Exception as e:

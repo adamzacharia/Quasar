@@ -30,8 +30,11 @@ for _p in (PROJECT_ROOT, UI_PRO):
 # The CI-guarded count in docs/TOOLS.md (kept in lockstep by
 # scripts/gen_tool_registry_doc.py --check). 140 at S27 planning time; 151
 # after the 2026-07 datalab/SX tool additions — see LEDGER S27 amendment;
-# 164 after the 2026-07 imaging/analysis tool expansion.
-EXPECTED_TOOL_COUNT = 167
+# 164 after the 2026-07 imaging/analysis tool expansion; 184 after the
+# 2026-09 additions (182 already in docs/TOOLS.md, + vo_tap_job and
+# vo_image_search from the MANNA-strengths port); 194 after the 10 archive
+# catalogue tools (capabilities/catalogs.py, ArchiveBench gap closing).
+EXPECTED_TOOL_COUNT = 194
 CAPABILITY_FAMILIES = ["datalab", "alma", "papers", "archives", "vo", "viz", "calc"]
 
 

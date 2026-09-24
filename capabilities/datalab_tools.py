@@ -16,6 +16,7 @@ left open, and returns ``status`` ok | partial | coverage_gap | infrastructure_f
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,7 @@ from pydantic import Field
 
 from capabilities.base import BaseCapability, CallContext, ToolResult
 from capabilities.datalab import _In, _resolve_coords, _run_analysis_plot, datalab_error, execute_datalab_sql
+from services import cmd_population
 from services import datalab_orchestration as orchestration
 from services import datalab_query_builders as builders
 from services import datalab_registry as registry
@@ -35,7 +37,15 @@ __all__ = ["CAPABILITIES", "REGION_PRESETS", "QUALITY_PRESETS"]
 # Validated reference fields for open-ended prompts (the Galactic Centre and
 # the poles are the worst possible defaults: L08 re-run, L13, L15).
 REGION_PRESETS: Dict[str, Dict[str, Any]] = {
-    "lmc": {"ra": 80.894, "dec": -69.756, "radius_deg": 10.0, "label": "Large Magellanic Cloud", "structure": "LMC disk/bar, 30 Doradus, tidal features"},
+    # Default for open-ended stellar-density requests (UI 2026-09-23 L08): a
+    # complete 10-degree nside-256 map in ~107 s live (69/69 tiles), with a
+    # latitude gradient toward the plane and the M79 globular cluster peak.
+    # The LMC is too dense for ANY in-budget map (a 0.5-degree sync tile at its
+    # centre times out; its async aggregate takes >= 199 s).
+    "south_gradient": {"ra": 75.0, "dec": -30.0, "radius_deg": 10.0,
+                       "label": "Southern intermediate-latitude field (RA 75, Dec -30; b ~ -26 to -46 deg)",
+                       "structure": "stellar-density gradient toward the Galactic plane; globular cluster M79 (NGC 1904)"},
+    "lmc": {"ra": 80.894, "dec": -69.756, "radius_deg": 10.0, "label": "Large Magellanic Cloud", "structure": "LMC disk/bar, 30 Doradus, tidal features (very dense: a full map may not finish within one turn)"},
     "smc": {"ra": 13.187, "dec": -72.829, "radius_deg": 6.0, "label": "Small Magellanic Cloud", "structure": "SMC bar/wing toward the LMC"},
     "magellanic_bridge": {"ra": 40.0, "dec": -73.0, "radius_deg": 10.0, "label": "Magellanic Bridge (between SMC and LMC)", "structure": "Bridge stellar population"},
     "sgr_stream": {"ra": 30.0, "dec": -15.0, "radius_deg": 10.0, "label": "Sagittarius stream (southern arm near RA 30, Dec -15)", "structure": "Sgr stream, MW halo gradient"},
@@ -174,7 +184,7 @@ class HealpixDensityMap(BaseCapability):
             if not hp_cols:
                 return _native({"success": False, "status": "coverage_gap", "error": f"{inp.catalog}.{table} has no precomputed HEALPix column; use datalab_density_aggregate mode='grid' instead."})
             chosen = next((h for h in hp_cols if int(h.get("nside", 0)) == int(inp.nside)), None) or min(hp_cols, key=lambda h: abs(int(h.get("nside", 0)) - int(inp.nside)))
-            ra, dec, radius, label, preset_used = _region(inp.region, inp.preset, fallback="lmc")
+            ra, dec, radius, label, preset_used = _region(inp.region, inp.preset, fallback="south_gradient")
             cuts = list(inp.cuts or [])
             applied: List[str] = []
             color_cut = None
@@ -196,15 +206,53 @@ class HealpixDensityMap(BaseCapability):
                 applied.append("cuts: " + _cut_text(cuts))
             predicates = builders.build_catalog_predicates(inp.catalog, table, color_cut=color_cut, value_cuts=cuts, morphology=morphology)
             budget_s = max(30.0, min(float(inp.wait_s), 240.0))
-            agg = orchestration.tiled_density_aggregate(
+            client = ctx.service("datalab_client")
+            display_sql = "-- run as concurrent sub-cones (each also bounded by this cone) or one async job\n" + builders.build_density_aggregate(
                 inp.catalog, table, mode="healpix", healpix_column=chosen["name"], ra=ra, dec=dec, radius_deg=radius,
-                predicates=predicates, max_seconds=budget_s, client=ctx.service("datalab_client"), result_store=ctx.result_store,
-                owner_id=_owner(ctx),
-            )
+                predicates=predicates, limit=None)[0]
+            agg: Dict[str, Any] = {}
+            async_note = None
+            # Wide regions: ONE async job over the whole cone when a login
+            # token allows it (dense fields such as the LMC never finish in the
+            # 60 s sync window, whatever the tiling); the concurrent sync tiling
+            # is the fallback (anonymous token, job error, or budget left).
+            if radius >= 3.0 and os.getenv("DATALAB_HEALPIX_ASYNC", "0").strip().lower() not in {"0", "false", "no", "off"}:
+                agg = orchestration.async_density_aggregate(
+                    inp.catalog, table, mode="healpix", healpix_column=chosen["name"], ra=ra, dec=dec, radius_deg=radius,
+                    predicates=predicates, max_seconds=budget_s, client=client, result_store=ctx.result_store, owner_id=_owner(ctx),
+                )
+                if not agg.get("result_id") and not agg.get("async_unavailable"):
+                    async_note = agg.get("error")
+            async_job = ({k: agg.get(k) for k in ("jobid", "job_state", "elapsed_s", "error", "note") if agg.get(k) is not None}
+                         if agg.get("jobid") and not agg.get("result_id") else None)
+            if not agg.get("result_id"):
+                from services.tool_budgets import remaining_seconds
+
+                left = remaining_seconds()
+                if agg.get("jobid") and agg.get("budget_exhausted"):
+                    agg = {**agg, "success": False}  # the budget is spent; report the running job
+                elif left is None or left > 30.0:
+                    if async_job and str(async_job.get("job_state") or "").upper() == "UNKNOWN":
+                        # The job may still be running: stop it before re-running
+                        # the same scan as sync tiles (guard CX-09).
+                        async_job["abort"] = orchestration.abort_async_job(client, async_job.get("jobid"))
+                    if async_job and str(async_job.get("abort") or "").startswith("abort failed"):
+                        # Never run the same scan twice: report the live job instead (CX-09 verify).
+                        agg = {**agg, "success": False, "budget_exhausted": False}
+                    else:
+                        agg = orchestration.tiled_density_aggregate(
+                            inp.catalog, table, mode="healpix", healpix_column=chosen["name"], ra=ra, dec=dec, radius_deg=radius,
+                            predicates=predicates, max_seconds=budget_s, client=client, result_store=ctx.result_store,
+                            owner_id=_owner(ctx),
+                        )
+                        if async_note:
+                            agg.setdefault("warnings", []).insert(0, f"Async whole-region job did not complete ({async_note}); fell back to sync tiling.")
         except Exception as e:
             return datalab_error(e)
         if not agg.get("result_id"):
-            out = {**_strip_heavy(agg), "success": False, "status": "infrastructure_failure" if agg.get("budget_exhausted") else "coverage_gap",
+            out = {**_strip_heavy(agg), **({"async_job": async_job} if async_job else {}), "success": False, "status": ("infrastructure_failure" if agg.get("budget_exhausted")
+                                                      else "job_state_unknown" if async_job and str(async_job.get("abort") or "").startswith("abort failed")
+                                                      else "coverage_gap"),
                    "error": agg.get("error") or "no density cells returned", "region": label, "cuts_applied": applied}
             return _native(out)
         caption = inp.title or f"{inp.catalog} stellar density, HEALPix nside {chosen['nside']} ({chosen['scheme']}), log counts — {label}"
@@ -227,6 +275,10 @@ class HealpixDensityMap(BaseCapability):
             "status": ("partial" if partial else "ok") if plot_native.get("success") else "infrastructure_failure",
             "result_id": agg["result_id"], "region": label, "preset": preset_used, "ra": ra, "dec": dec, "radius_deg": radius,
             "healpix_column": chosen["name"], "nside": chosen["nside"], "scheme": chosen.get("scheme"),
+            # The SQL that produced the map: the async job's executed text
+            # when it ran, else the representative per-tile statement (CX-16).
+            "validated_sql": (agg.get("sql_example") if agg.get("jobid") and agg.get("sql_example") else display_sql),
+            **({"async_job": async_job} if async_job else {}),
             "cuts_applied": applied, "cells": int(len(frame)) if frame is not None else None,
             "tiles_completed": agg.get("tiles_completed"), "tiles_total": agg.get("tiles_total"), "coverage_summary": agg.get("coverage_summary"),
             "partial": partial, "structure_notes": structure, "warnings": notes, "elapsed_s": round(time.perf_counter() - started, 1),
@@ -250,7 +302,11 @@ class HealpixDensityMap(BaseCapability):
             if sep <= radius + entry.get("radius_deg", 0):
                 notes.append(f"{entry['name']} ({entry['kind']}) lies in or at the edge of this region ({sep:.1f} deg from centre).")
         b = registry.galactic_latitude_deg(ra, dec)
-        notes.append(f"Region centre at Galactic latitude b = {b:.1f} deg; " + ("expect a strong disk gradient" if abs(b) < 30 else "high-latitude halo field, expect a smooth background"))
+        span = (abs(b) - radius, abs(b) + radius)
+        notes.append(f"Region centre at Galactic latitude b = {b:.1f} deg (|b| spans ~{max(span[0], 0):.0f}-{min(span[1], 90):.0f} deg); " + (
+            "expect a strong disk gradient" if abs(b) < 30 else
+            "expect a density gradient toward the Galactic plane across the field" if abs(b) - radius < 35 else
+            "high-latitude halo field, expect a smooth background"))
         if preset:
             notes.append(f"Preset '{preset}': {REGION_PRESETS[preset].get('structure', '')}")
         return notes
@@ -305,10 +361,33 @@ class StreamSelection(BaseCapability):
         except Exception as e:
             return datalab_error(e)
         if field_r > self._TILE_RADIUS_DEG:
-            # A 5-degree Gaia cone x NSC join returned HTTP 502 twice live
-            # (2026-09-23 L09): run it as concurrent sub-cones instead.
-            native = self._run_tiled(ctx, ra, dec, field_r, pm=pm, mask=mask, match_arcsec=float(inp.match_arcsec),
-                                     small_limit=int(inp.small_limit), limit=int(inp.limit), meta=meta)
+            # A 5-degree Gaia cone x NSC join returned HTTP 502 twice live and
+            # its 2-degree sync tiles timed out (2026-09-23 L09): run the whole
+            # field as ONE async job when a login token allows it, else (or on
+            # failure with budget left) as concurrent sub-cones.
+            native = self._run_async(ctx, sql, meta)
+            async_job = ({k: native.get(k) for k in ("jobid", "job_state", "error", "note") if native.get(k) is not None}
+                         if native.get("jobid") and not native.get("success") else None)
+            if not native.get("success"):
+                from services.tool_budgets import remaining_seconds
+
+                left = remaining_seconds()
+                if native.get("jobid") and native.get("budget_exhausted"):
+                    native = {**native, "success": False, "status": "partial"}
+                elif left is None or left > 30.0:
+                    if async_job and str(async_job.get("job_state") or "").upper() == "UNKNOWN":
+                        async_job["abort"] = orchestration.abort_async_job(ctx.service("datalab_client"), async_job.get("jobid"))
+                    note = native.get("error") if not native.get("async_unavailable") else None
+                    if async_job and str(async_job.get("abort") or "").startswith("abort failed"):
+                        # Never run the same join twice: report the live job instead (CX-09 verify).
+                        native = {**native, "success": False, "status": "partial"}
+                    else:
+                        native = self._run_tiled(ctx, ra, dec, field_r, pm=pm, mask=mask, match_arcsec=float(inp.match_arcsec),
+                                                 small_limit=int(inp.small_limit), limit=int(inp.limit), meta=meta)
+                        if note:
+                            native.setdefault("warnings", []).insert(0, f"Async whole-field job did not complete ({note}); fell back to sub-cones.")
+            if async_job:
+                native["async_job"] = async_job  # the job id / recovery hint survive the fallback (CX-15)
             sql = native.get("sql_example") or sql
         else:
             res = execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
@@ -326,6 +405,8 @@ class StreamSelection(BaseCapability):
             f"CMD mask {mask['color_min']:g} < g-r < {mask['color_max']:g}, {mask['g_min']:g} < g < {mask['g_max']:g}, class_star > 0.5 ({mask_source})",
         ]
         orientation = self._orientation(frame, ra, dec)
+        tails = self.tail_test(frame, ra, dec)
+        density_card = self.density_card(ctx, frame, ra, dec, tails, label)
         caption = (inp.title or f"{label}: stream-star candidates (Gaia DR3 PM window + NSC DR2 CMD mask)") + " | " + "; ".join(cuts_applied)
         try:
             plot = _run_analysis_plot("catalog_scatter", {
@@ -338,10 +419,20 @@ class StreamSelection(BaseCapability):
         out = dict(plot_native)
         out.update({
             "success": bool(plot_native.get("success")),
-            "status": "ok" if plot_native.get("success") else "infrastructure_failure",
+            "status": ("partial" if native.get("partial") else "ok") if plot_native.get("success") else "infrastructure_failure",
+            "partial": bool(native.get("partial")), "tiles_total": native.get("tiles_total"),
+            "tiles_completed": native.get("tiles_completed"),
             "result_id": result_id, "n_selected": n, "cluster": label, "ra": ra, "dec": dec, "field_deg": field_r * 2,
             "pm_window": pm, "pm_window_source": pm_source, "cmd_mask": mask, "cmd_mask_source": mask_source,
-            "cuts_applied": cuts_applied, "orientation": orientation, "sql": sql,
+            "cuts_applied": cuts_applied, "orientation": orientation, "tail_test": tails,
+            "density_map_card": bool(density_card),
+            # Why the query is shaped this way (DLB-09 C7).
+            "execution_model": (f"q3c execution model: the SMALL side (Gaia DR3 cone + proper-motion window) is reduced first "
+                                f"in a MATERIALIZED CTE, then joined with q3c_join to the BIG side, nsc_dr2.object, whose q3c "
+                                f"index serves each lookup, with a {float(inp.match_arcsec):g} arcsec match radius. Joining the "
+                                "other way round, or without materializing, makes Postgres scan the big catalog."),
+            "sql": sql,
+            **({"async_job": native["async_job"]} if native.get("async_job") else {}),
             "warnings": list(native.get("warnings") or []), "elapsed_s": round(time.perf_counter() - started, 1),
             "_caption": caption,
             "note": ("The plotted stars are exactly the rows returned by the SQL above (every cut is in the query). "
@@ -350,6 +441,31 @@ class StreamSelection(BaseCapability):
         return _native(out)
 
     _TILE_RADIUS_DEG = 2.0
+
+    def _run_async(self, ctx: CallContext, sql: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """The whole-field governed join as one Data Lab async job."""
+        from integrations.datalab_client import ANON_TOKEN
+        from services import datalab_sql_policy as policy
+
+        client = ctx.service("datalab_client")
+        if getattr(client, "token", ANON_TOKEN) == ANON_TOKEN or os.getenv("DATALAB_STREAM_ASYNC", "0").strip().lower() in {"0", "false", "no", "off"}:
+            return {"success": False, "async_unavailable": True}
+        validated = policy.validate(sql, source="builder", meta=meta)
+        job = orchestration.run_async_sql(validated.sql, client=client, max_seconds=200.0)
+        if job["state"] != "COMPLETED":
+            return {"success": False, "jobid": job.get("jobid"), "job_state": job["state"], "error": job.get("error"), "note": job.get("note", ""),
+                    "budget_exhausted": job["state"] in ("RUNNING", "SKIPPED", "EXECUTING", "QUEUED", "PENDING")}
+        executed_sql = job.get("executed_sql") or validated.sql
+        frame = job["result"].dataframe
+        note = f"Whole field joined server-side as one Data Lab async job ({job['jobid']}, {job['elapsed_s']:.0f} s)."
+        row_limit = int((validated.meta or {}).get("row_limit") or 0)
+        if row_limit and len(frame) >= row_limit:
+            note += f" The result filled its LIMIT {row_limit}: nearest-to-centre first, the count is a lower bound."
+        store_meta = {**dict(meta or {}), "validated_sql": executed_sql, "tool_name": self.name, "warnings": [note],
+                      "provenance": {"validated_sql": executed_sql, "jobid": job["jobid"], "mode": "async"},
+                      **({"owner_id": str(ctx.user_id)} if ctx.user_id else {})}
+        result_id = ctx.result_store.put(frame, store_meta)
+        return {"success": True, "result_id": result_id, "rowcount": int(len(frame)), "warnings": [note], "sql_example": executed_sql}
 
     def _run_tiled(self, ctx: CallContext, ra: float, dec: float, field_r: float, *, pm: Dict[str, float],
                    mask: Dict[str, float], match_arcsec: float, small_limit: int, limit: int, meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -410,31 +526,52 @@ class StreamSelection(BaseCapability):
     @classmethod
     def build_sql(cls, ra: float, dec: float, radius_deg: float, *, pm: Dict[str, float], cmd_mask: Dict[str, float],
                   match_arcsec: float, small_limit: int, limit: int, parent_bound: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
-        """The governed q3c cross-match with the PM window spliced into the Gaia
-        CTE and the CMD mask into the join, so every cut is in the executed SQL."""
-        sql, meta = builders.build_q3c_crossmatch(
+        """The q3c cross-match JOIN-FIRST: Gaia cone + PM window in a MATERIALIZED
+        CTE, the index join to NSC in a second MATERIALIZED CTE, and the CMD mask
+        applied to that joined set -- every cut is in the executed SQL.
+
+        Live 2026-09-23 (L09): with the photometric mask in the same WHERE as
+        the q3c_join, the planner abandoned the index join -- a 0.75-degree
+        field ran > 90 s (every 2-degree tile timed out); materialising the
+        join first answers 0.75 deg in 2.9 s and 2 deg in 4.3 s. The builder
+        still supplies the governed metadata."""
+        _sql, meta = builders.build_q3c_crossmatch(
             small_catalog="gaia_dr3", small_table="gaia_source", big_catalog="nsc_dr2", big_table="object",
             ra=ra, dec=dec, radius_deg=radius_deg, match_radius_arcsec=match_arcsec,
             small_columns=["source_id", "ra", "dec", "pmra", "pmdec", "parallax", "phot_g_mean_mag", "bp_rp"],
             big_columns=["id", "ra", "dec", "gmag", "rmag", "imag", "class_star"],
             small_limit=small_limit, limit=limit,
         )
-        pm_pred = (
-            f"  AND pmra BETWEEN {float(pm['pmra_min']):.4f} AND {float(pm['pmra_max']):.4f}\n"
-            f"  AND pmdec BETWEEN {float(pm['pmdec_min']):.4f} AND {float(pm['pmdec_max']):.4f}\n"
-            "  AND pmra < 'Infinity'::float8 AND pmdec < 'Infinity'::float8\n"
+        n = builders._num
+        ra_s, dec_s, r_s = n(ra), n(dec), n(radius_deg)
+        match_deg = float(match_arcsec) / 3600.0
+        bound = f"\n      AND {parent_bound}" if parent_bound else ""
+        sql = (
+            "WITH g AS MATERIALIZED (\n"
+            "    SELECT source_id, ra, dec, pmra, pmdec, parallax, phot_g_mean_mag, bp_rp\n"
+            "    FROM gaia_dr3.gaia_source\n"
+            f"    WHERE q3c_radial_query(ra, dec, {ra_s}, {dec_s}, {r_s})\n"
+            f"      AND pmra BETWEEN {float(pm['pmra_min']):.4f} AND {float(pm['pmra_max']):.4f}\n"
+            f"      AND pmdec BETWEEN {float(pm['pmdec_min']):.4f} AND {float(pm['pmdec_max']):.4f}\n"
+            "      AND pmra < 'Infinity'::float8 AND pmdec < 'Infinity'::float8"
+            f"{bound}\n"
+            f"    ORDER BY q3c_dist(ra, dec, {ra_s}, {dec_s})\n"
+            f"    LIMIT {int(small_limit)}\n"
+            "), m AS MATERIALIZED (\n"
+            "    SELECT g.*, big.id AS big_id, big.ra AS big_ra, big.dec AS big_dec, big.gmag AS big_gmag,\n"
+            "           big.rmag AS big_rmag, big.imag AS big_imag, big.class_star AS big_class_star\n"
+            "    FROM g\n"
+            "    JOIN nsc_dr2.object AS big\n"
+            f"      ON q3c_join(g.ra, g.dec, big.ra, big.dec, {n(match_deg)})\n"
+            ")\n"
+            "SELECT * FROM m\n"
+            f"WHERE (big_gmag - big_rmag) BETWEEN {float(cmd_mask['color_min']):.3f} AND {float(cmd_mask['color_max']):.3f}\n"
+            f"  AND big_gmag BETWEEN {float(cmd_mask['g_min']):.3f} AND {float(cmd_mask['g_max']):.3f}\n"
+            "  AND big_gmag < 'Infinity'::float8 AND big_rmag < 'Infinity'::float8\n"
+            "  AND big_class_star > 0.5\n"
+            f"ORDER BY q3c_dist(ra, dec, {ra_s}, {dec_s})\n"
+            f"LIMIT {int(limit)}"
         )
-        if parent_bound:
-            pm_pred += f"  AND {parent_bound}\n"
-        # Splice after the CTE's WHERE line (before ORDER BY).
-        sql = re.sub(r"(    WHERE q3c_radial_query\([^\n]*\n)", lambda m: m.group(1) + pm_pred, sql, count=1)
-        cmd_pred = (
-            f"WHERE (big.gmag - big.rmag) BETWEEN {float(cmd_mask['color_min']):.3f} AND {float(cmd_mask['color_max']):.3f}\n"
-            f"  AND big.gmag BETWEEN {float(cmd_mask['g_min']):.3f} AND {float(cmd_mask['g_max']):.3f}\n"
-            "  AND big.gmag < 'Infinity'::float8 AND big.rmag < 'Infinity'::float8\n"
-            "  AND big.class_star > 0.5\n"
-        )
-        sql = re.sub(r"(  ON q3c_join\([^\n]*\n)", lambda m: m.group(1) + cmd_pred, sql, count=1)
         meta = dict(meta)
         meta["stream_selection"] = {"pm_window": dict(pm), "cmd_mask": dict(cmd_mask), "point_source": "class_star > 0.5"}
         return sql, meta
@@ -480,6 +617,98 @@ class StreamSelection(BaseCapability):
                 "note": (f"selected stars are elongated along PA {pa:.0f} deg (axis ratio {ratio:.1f}) — the tail direction"
                          if ratio > 1.3 else "no strong elongation (axis ratio < 1.3): tails not evident in this selection")}
 
+    # Tail test geometry (deg): the cluster core is excluded, strips run from
+    # core_r to max_r on BOTH sides of the cluster.
+    _TAIL = {"core_r": 0.4, "max_r": 4.5, "half_width": 0.3, "pa_step": 5.0}
+
+    @classmethod
+    def tail_test(cls, frame: Optional[pd.DataFrame], ra0: float, dec0: float) -> Dict[str, Any]:
+        """Detect tidal tails as an excess of selected stars in a strip through
+        the cluster (both sides, core excluded) versus the same strip rotated
+        by 90 deg and versus the median over all position angles."""
+        cfg = cls._TAIL
+        if frame is None or frame.empty or not {"ra", "dec"} <= set(frame.columns):
+            return {"verdict": "not tested (no rows)"}
+        x = ((pd.to_numeric(frame["ra"], errors="coerce") - ra0 + 180.0) % 360.0 - 180.0) * math.cos(math.radians(dec0))
+        y = pd.to_numeric(frame["dec"], errors="coerce") - dec0
+        ok = np.isfinite(x) & np.isfinite(y)
+        x, y = np.asarray(x[ok], dtype=float), np.asarray(y[ok], dtype=float)
+        r = np.hypot(x, y)
+        keep = (r >= cfg["core_r"]) & (r <= cfg["max_r"])
+        x, y = x[keep], y[keep]
+        if x.size < 30:
+            return {"verdict": "not tested (too few stars outside the core)", "n_stars": int(x.size)}
+        pas = np.arange(0.0, 180.0, cfg["pa_step"])
+        counts = []
+        for pa in pas:
+            t = math.radians(pa)                                   # east of north: (sin, cos)
+            along = x * math.sin(t) + y * math.cos(t)
+            perp = -x * math.cos(t) + y * math.sin(t)
+            counts.append(int(((np.abs(perp) <= cfg["half_width"]) & (np.abs(along) >= cfg["core_r"])).sum()))
+        counts = np.asarray(counts, dtype=float)
+        i = int(np.argmax(counts))
+        best, bg = float(counts[i]), float(np.median(counts))
+        j = int((i + len(pas) // 2) % len(pas))
+        n_perp = float(counts[j])
+        sig_bg = (best - bg) / math.sqrt(max(bg, 1.0))
+        sig_perp = (best - n_perp) / math.sqrt(max(best + n_perp, 1.0))
+        detected = sig_bg >= 4.0 and sig_perp >= 3.0
+        return {
+            "verdict": (f"tail-like elongation detected along PA {pas[i]:.0f} deg" if detected
+                        else "no significant elongation: tails not recovered in this selection"),
+            "best_pa_deg_east_of_north": float(pas[i]), "n_in_best_strip": int(best),
+            "n_in_perpendicular_strip": int(n_perp), "median_strip_count": round(bg, 1),
+            "significance_vs_median": round(sig_bg, 1), "significance_vs_perpendicular": round(sig_perp, 1),
+            "trials": int(len(pas)),
+            "method": (f"stars {cfg['core_r']:g}-{cfg['max_r']:g} deg from the cluster, counted in a strip of half-width "
+                       f"{cfg['half_width']:g} deg through the cluster at each PA ({cfg['pa_step']:g} deg steps, both sides); "
+                       "significance of the best strip vs the median strip and vs the perpendicular strip (Poisson; "
+                       f"{len(pas)} trial angles, so treat ~3 sigma as marginal)."),
+        }
+
+    @classmethod
+    def density_card(cls, ctx: CallContext, frame: Optional[pd.DataFrame], ra0: float, dec0: float, test: Dict[str, Any],
+                     label: str) -> Optional[Dict[str, Any]]:
+        """Smoothed density map of the selected stars with the best strip axis."""
+        try:
+            from scipy.ndimage import gaussian_filter
+
+            from services.plotting import PlottingService
+            import uuid as _uuid
+
+            if frame is None or frame.empty:
+                return None
+            x = ((pd.to_numeric(frame["ra"], errors="coerce") - ra0 + 180.0) % 360.0 - 180.0) * math.cos(math.radians(dec0))
+            y = pd.to_numeric(frame["dec"], errors="coerce") - dec0
+            ok = np.isfinite(x) & np.isfinite(y)
+            lim = float(cls._TAIL["max_r"]) + 0.5
+            h, xe, ye = np.histogram2d(np.asarray(x[ok]), np.asarray(y[ok]), bins=int(2 * lim / 0.1), range=[[-lim, lim], [-lim, lim]])
+            sm = gaussian_filter(h, sigma=3.0)          # 0.3 deg
+            plotting = PlottingService()
+            plt = plotting._apply_style(dark=False)
+            fig, ax = plt.subplots(figsize=(5.4, 5.0))
+            im = ax.imshow(sm.T, origin="lower", extent=[xe[0], xe[-1], ye[0], ye[-1]], cmap="magma")
+            if test.get("best_pa_deg_east_of_north") is not None:
+                t = math.radians(float(test["best_pa_deg_east_of_north"]))
+                ax.plot([-lim * math.sin(t), lim * math.sin(t)], [-lim * math.cos(t), lim * math.cos(t)],
+                        ls="--", lw=1.0, color="cyan", label=f"best strip, PA {test['best_pa_deg_east_of_north']:.0f} deg")
+                ax.legend(fontsize=7, loc="upper right")
+            ax.invert_xaxis()
+            ax.set_xlabel("delta RA cos(Dec) (deg, east to the left)")
+            ax.set_ylabel("delta Dec (deg)")
+            ax.set_title(f"{label}: smoothed density of the selected stars (0.3 deg kernel)", fontsize=9)
+            fig.colorbar(im, ax=ax, label="stars per 0.1 deg cell (smoothed)")
+            fig.tight_layout()
+            saved = plotting._save_and_encode(fig, f"datalab_stream_density_{_uuid.uuid4().hex[:10]}")
+            card = _image_card_from_plot({"success": True, "image_base64": saved.get("base64_png"), "path": saved.get("web_url")},
+                                         f"{label}: smoothed density of the stream-selected stars with the tail test axis "
+                                         f"({test.get('verdict')})")
+            if card:
+                _append_card(ctx, card)
+            return card
+        except Exception:  # noqa: BLE001 - the scatter card still carries the result
+            return None
+
 
 # ═════════════════════════════════════════════════════════════════════════
 # 12. datalab_selection_diagram
@@ -497,6 +726,10 @@ class SelectionDiagramInput(_In):
     abs_mag_from_parallax: bool = False
     quality_preset: str = Field(default="gaia_astrometric", description="gaia_astrometric | gaia_high_pm | nsc_point_sources | none")
     pm_total_min_mas_yr: Optional[float] = Field(default=None, description="keep sqrt(pmra^2+pmdec^2) > this (mas/yr)")
+    abs_mag_min: Optional[float] = Field(default=None, description="with abs_mag_from_parallax: keep absolute magnitude > this IN THE SQL (e.g. 10 for white dwarfs)")
+    # Previously absent, so extra="ignore" silently DROPPED it while the answer
+    # claimed a star/galaxy cut (UI 2026-09-24 L03).
+    point_sources: bool = Field(default=False, description="apply the catalog's registered star/galaxy cut (e.g. NSC class_star > 0.5) in the SQL")
     overlay_locus: Optional[str] = Field(default=None, description="e.g. 'white_dwarf' to draw the WD sequence")
     limit: Optional[int] = None
     title: Optional[str] = None
@@ -531,11 +764,16 @@ class SelectionDiagram(BaseCapability):
             kwargs: Dict[str, Any] = dict(
                 x_expr=str(inp.x_expr), y_expr=y_expr, value_cuts=cuts, overlay_locus=inp.overlay_locus,
                 limit=(int(inp.limit) if inp.limit is not None else None), title=title,
+                point_sources=bool(inp.point_sources),
                 client=ctx.service("datalab_client"), result_store=ctx.result_store,
                 owner_id=_owner(ctx),
             )
             if pm_floor is not None:
                 kwargs["pm_total_min"] = pm_floor  # squared-component predicate built in the SQL
+            if inp.abs_mag_min is not None:
+                if not inp.abs_mag_from_parallax:
+                    return _native({"success": False, "error": "abs_mag_min needs abs_mag_from_parallax=true"})
+                kwargs["abs_mag_cut"] = (str(inp.y_expr or "phot_g_mean_mag"), float(inp.abs_mag_min))
             # Wide cones are split into 1.5-degree sub-cones run concurrently
             # (a 5-degree selective Gaia cone blows the 60 s sync window: L06).
             kwargs["tile_threshold_deg"] = 1.5
@@ -549,6 +787,11 @@ class SelectionDiagram(BaseCapability):
             applied.append("cuts: " + _cut_text(inp.cuts))
         if inp.pm_total_min_mas_yr is not None:
             applied.append(f"total proper motion > {float(inp.pm_total_min_mas_yr):g} mas/yr")
+        if inp.point_sources:
+            morph = (out.get("morphology") if isinstance(out, dict) else None)
+            applied.append(f"point sources: {morph}" if morph else "point sources requested but no registered star/galaxy cut for this table")
+        if inp.abs_mag_min is not None:
+            applied.append(f"absolute magnitude {inp.y_expr} + 5*log10(parallax) - 10 > {float(inp.abs_mag_min):g}")
         applied.append(f"x = {inp.x_expr}, y = {y_expr}" + (" (absolute magnitude from parallax)" if inp.abs_mag_from_parallax else ""))
         caption = title + " | " + "; ".join(applied)
         out.update({
@@ -700,6 +943,8 @@ class SatelliteSearchInput(_In):
     color_max: Optional[float] = Field(default=None, description="override the g-r colour window maximum (e.g. 0.5)")
     mag_min: Optional[float] = None
     mag_max: Optional[float] = None
+    confirm: bool = Field(default=False, description="true only after the user confirmed a CUSTOM region wider than the unconfirmed cap; presets need no confirmation")
+    radius_deg: Optional[float] = Field(default=None, description="override the preset's radius (deg), keeping its centre")
 
 
 class SatelliteSearch(BaseCapability):
@@ -709,7 +954,7 @@ class SatelliteSearch(BaseCapability):
         "aggregate of POINT SOURCES inside a colour-magnitude box (old/metal-poor by default; pass color_min/color_max for "
         "e.g. blue main-sequence stars) over a validated region or ONE SMASH field (smash_field=169 scans fieldid = 169), "
         "detects peaks and scores each by its star-count EXCESS over a local annulus background (aperture significance, "
-        "robust to field edges), flags known satellites/globulars as re-detections, and vets the top candidates with image "
+        "robust to field edges), flags known satellites/globulars as re-detections and peaks on large galaxies / bright stars (Legacy Surveys masks, Gaia DR3) as artefacts, and vets the top candidates with image "
         "cutouts and one CMD each. Returns the ranked table, the cuts applied and a density-map card. Region presets prefer clean "
         "deep fields (delve_south), never the poles. Target <= 150 s."
     )
@@ -743,7 +988,30 @@ class SatelliteSearch(BaseCapability):
                 field_cut = [{"column": "fieldid", "op": "=", "value": int(inp.smash_field)}]
             else:
                 ra, dec, radius, label, preset_used = _region(inp.region, inp.preset, fallback="delve_south")
+            curated_radius = radius
+            if inp.radius_deg is not None and inp.smash_field is None:
+                if float(inp.radius_deg) < 0.05:
+                    # Never silently enlarge the user's radius (CX-10 verify).
+                    return _native({"success": False, "status": "invalid_region",
+                                    "error": f"radius_deg={float(inp.radius_deg):g} is below the 0.05 deg minimum: a density "
+                                             "search needs several 0.05 deg cells plus a background annulus."})
+                radius = float(inp.radius_deg)
+                label = f"{label}, r={radius:g} deg"
             area = orchestration.confirm_cone_area(ra, dec, radius)
+            if area.get("needs_confirmation"):
+                if (preset_used is not None and radius <= curated_radius + 1e-9) or field_cut:
+                    # Curated presets / one SMASH field are validated, bounded
+                    # regions (tiled within the tool budget): report the area,
+                    # never ask for a second full call (L15 ran twice).
+                    area = {**area, "needs_confirmation": False, "message": "",
+                            "confirmed_by": f"curated region '{preset_used or label}' (validated, tiled within the tool budget)"}
+                elif not inp.confirm:
+                    # HITL gate BEFORE any fan-out: nothing is scanned yet.
+                    return _native({"success": False, "status": "needs_confirmation", "needs_confirmation": True,
+                                    "region": label, "sky_area": area, "scanned": False,
+                                    "message": area.get("message") or "confirm the sky area first",
+                                    "note": "No query has run yet. Confirm the area with the user (or use a preset such as delve_south), "
+                                            "then re-call with confirm=true."})
             morphology = registry.point_source_cut(catalog, table)
             g_col, r_col = registry.mag_column(catalog, table, "g"), registry.mag_column(catalog, table, "r")
             value_cuts: List[Dict[str, Any]] = list(field_cut)
@@ -771,24 +1039,57 @@ class SatelliteSearch(BaseCapability):
             predicates = builders.build_catalog_predicates(catalog, table, color_cut=color_cut, value_cuts=merged_cuts, morphology=morphology)
             step = max(0.01, float(inp.tile_deg))
             client, store = ctx.service("datalab_client"), ctx.result_store
+            display_sql = None
+            background_job = None
+            # Vetting (screen + cutouts + CMD tests) gets guaranteed time: the
+            # scan is capped at (remaining - reserve). On 2026-09-23 the scan
+            # used ~283 s and CMD vetting never started (L15 re-run 2).
+            left0 = remaining_seconds()
+            reserve = float(self._VET_RESERVE_S) if inp.vet else 0.0
+            if left0 is None:
+                scan_budget = None
+            else:
+                # The reserve is up to 90 s but never more than half of the
+                # usable time: with a short budget scan and vetting split it
+                # instead of one starving the other (guard CX-01).
+                reserve = min(reserve, max(0.0, 0.5 * (left0 - 8.0)))
+                scan_budget = max(5.0, left0 - reserve - 8.0)
             if radius >= 3.0:
+                # Representative whole-cone SQL for the Show-query panel (each
+                # tile runs this with its own sub-cone, bounded by this cone).
+                display_sql = "-- run as concurrent sub-cones, each also bounded by this cone\n" + builders.build_density_aggregate(
+                    catalog, table, mode="grid", step_deg=step, ra=ra, dec=dec, radius_deg=radius, predicates=predicates,
+                    limit=builders.MAX_ROW_LIMIT)[0]
+                # The whole region also goes to Data Lab as ONE background
+                # (async) job, polled while the sync tiles run; whichever
+                # finishes first is used, the other is dropped (L15 C4).
+                job_run = self._start_background_job(ctx, catalog, table, step=step, ra=ra, dec=dec, radius=radius,
+                                                     predicates=predicates, budget=scan_budget)
                 dens = orchestration.tiled_density_aggregate(catalog, table, mode="grid", step_deg=step, ra=ra, dec=dec, radius_deg=radius,
-                                                             predicates=predicates, client=client, result_store=store, owner_id=_owner(ctx))
+                                                             predicates=predicates, max_seconds=scan_budget,
+                                                             max_cells=self._TILE_MAX_CELLS,
+                                                             client=client, result_store=store, owner_id=_owner(ctx))
+                background_job, dens = self._finish_background_job(ctx, job_run, dens, reserve=reserve)
                 result_id = dens.get("result_id")
                 dens_notes = list(dens.get("warnings") or [])
                 partial = bool(dens.get("partial"))
+                if background_job and background_job.get("used"):
+                    display_sql = background_job.get("executed_sql") or display_sql
                 if not result_id:
                     return _native({"success": False, "status": "infrastructure_failure", "region": label, "cuts_applied": applied,
-                                    "error": dens.get("error") or "density scan returned no cells"})
+                                    "error": dens.get("error") or "density scan returned no cells",
+                                    **({"background_job": background_job} if background_job else {})})
             else:
                 sql, meta = builders.build_density_aggregate(catalog, table, mode="grid", step_deg=step, ra=ra, dec=dec,
                                                              radius_deg=radius, predicates=predicates, limit=builders.MAX_ROW_LIMIT)
                 result_id, _res = orchestration._run_builder_sql(sql, meta, client=client, result_store=store, owner_id=_owner(ctx))
                 dens_notes, partial = [], False
+                display_sql = sql
             if quality_note:
                 dens_notes.append(quality_note)
         except Exception as e:
             return datalab_error(e)
+        phase_s = {"density": round(time.perf_counter() - started, 1)}
         frame = _fetch_frame(ctx, result_id)
         bg_med, bg_sigma = self._background(frame)
         # -- density map card (log counts) ---------------------------------
@@ -829,7 +1130,23 @@ class SatelliteSearch(BaseCapability):
         for i, r in enumerate(ranked, start=1):
             r["rank"] = i
         top = ranked[: max(1, int(inp.top_n))]
-        # -- cutouts at the matched-filter peaks -----------------------------
+        # -- artefact screen: peaks on a large galaxy or a bright star ------
+        # Every shown peak and every peak that could count as a >= 5 sigma
+        # candidate is screened; an unscreened one never counts (CX-09).
+        if inp.vet:
+            to_screen = [r for r in ranked if not r["known_object"]
+                         and (r["rank"] <= len(top) or r["significance"] >= self._PEAKS["candidate_sigma"])]
+            if to_screen:
+                self._bright_star_screen(ctx, to_screen, dens_notes)
+        phase_s["map_peaks_screen"] = round(time.perf_counter() - started - sum(phase_s.values()), 1)
+        # -- vetting: CMD population tests + cutouts, run CONCURRENTLY -------
+        # The CMD test (Hess difference, one server-side aggregate per
+        # candidate) is the C7 evidence, so its queries start FIRST on helper
+        # threads; the cutout grid (itself 4 panels at a time) runs meanwhile
+        # on this thread; figures are rendered here, never on helpers.
+        cmd_cards: List[Dict[str, Any]] = []
+        vettable = ([r for r in top if not r.get("artefact")][: max(0, int(inp.cmd_candidates))] if inp.vet else [])
+        pop_jobs = self._start_population_tests(ctx, catalog, table, vettable, field_cut=field_cut)
         grid_slim = None
         if top and inp.vet:
             left = remaining_seconds()
@@ -848,50 +1165,435 @@ class SatelliteSearch(BaseCapability):
                     dens_notes.append(f"cutout grid failed: {type(exc).__name__}: {str(exc)[:120]}")
             else:
                 dens_notes.append("cutouts skipped: tool budget nearly exhausted")
-        # -- vetting: one CMD per top NEW candidate ---------------------------
-        cmd_cards = []
-        if inp.vet:
-            for cand in [r for r in top if not r["known_object"]][: max(0, int(inp.cmd_candidates))] or [r for r in top][:1]:
-                left = remaining_seconds()
-                if left is not None and left < 30:
-                    dens_notes.append("CMD vetting stopped early: tool budget nearly exhausted.")
-                    break
-                try:
-                    cmd = orchestration.color_magnitude_diagram(
-                        catalog, table, float(cand["ra"]), float(cand["dec"]), 0.1, blue_band="g", red_band="r", point_sources=True,
-                        value_cuts=list(field_cut) or None,
-                        title=f"CMD at peak #{cand['rank']} ({cand['ra']:.3f}, {cand['dec']:.3f}), r = 6 arcmin", limit=3000,
-                        client=client, result_store=store, owner_id=_owner(ctx),
-                    )
-                    card = _image_card_from_plot(cmd, f"Peak #{cand['rank']} CMD (g vs g-r, point sources, 6 arcmin): {cand['verdict']}")
-                    if card:
-                        _append_card(ctx, card)
-                        cmd_cards.append({"rank": cand["rank"], "n_stars": (cmd or {}).get("rowcount") or (cmd or {}).get("points")})
-                        cand["cmd"] = "CMD card attached: judge by a coherent main sequence / RGB, not by star counts alone"
-                except Exception as exc:
-                    cand["cmd"] = f"CMD failed: {type(exc).__name__}"
-        n_new = sum(1 for r in ranked if not r["known_object"] and r["significance"] >= self._PEAKS["candidate_sigma"])
+        phase_s["cutouts"] = round(time.perf_counter() - started - sum(phase_s.values()), 1)
+        for cand, got in self._join_population_tests(pop_jobs, dens_notes):
+            if isinstance(got, BaseException):
+                cand["cmd"] = f"CMD test failed: {type(got).__name__}"
+                cand["population_verdict"] = "not tested (query failed)"
+                continue
+            test = cmd_population.population_test(got["frame"], aperture_deg=got["aperture_deg"], annulus_deg=got["annulus_deg"])
+            cand["population_test"] = {k: test[k] for k in ("verdict", "reason", "old_population_excess",
+                                                              "old_population_significance", "features_detected", "n_aperture")}
+            cand["population_test"]["regions"] = {k: {kk: v[kk] for kk in ("n_aperture", "n_background_scaled", "excess", "significance")}
+                                                  for k, v in test["regions"].items()}
+            cand["population_verdict"] = test["verdict"]
+            if test["verdict"] == "field-like" and str(cand.get("verdict", "")).startswith("candidate"):
+                # A strong peak whose CMD shows no old population is not a
+                # satellite candidate (live L15 2026-09-24: a 5.0 sigma peak
+                # beside a bright-star mask, CMD field-like).
+                cand["verdict"] = (f"rejected by the CMD test: {cand['significance']} sigma density peak, but its CMD is "
+                                   "field-like (no old-population excess)")
+            try:
+                from services.plotting import PlottingService
+                import uuid as _uuid
+
+                plotting = PlottingService()
+                fig = cmd_population.hess_difference_figure(
+                    got["frame"], test, plotting=plotting,
+                    title=f"Peak #{cand['rank']} ({cand['ra']:.3f}, {cand['dec']:.3f}) CMD, {got['aperture_deg'] * 60:g} arcmin aperture")
+                saved = plotting._save_and_encode(fig, f"datalab_hess_{_uuid.uuid4().hex[:10]}")
+                card = _image_card_from_plot({"success": True, "image_base64": saved.get("base64_png"), "path": saved.get("web_url")},
+                                             f"Peak #{cand['rank']} CMD (g vs g-r, point sources; aperture and aperture minus scaled "
+                                             f"annulus): {test['verdict']}")
+                if card:
+                    _append_card(ctx, card)
+                    cmd_cards.append({"rank": cand["rank"], "n_stars": test["n_aperture"], "verdict": test["verdict"]})
+                    cand["cmd"] = f"CMD card attached; population test: {test['verdict']} ({test['reason']})"
+            except Exception as exc:
+                cand["cmd"] = f"CMD figure failed: {type(exc).__name__}; population test: {test['verdict']}"
+        phase_s["cmds"] = round(time.perf_counter() - started - sum(phase_s.values()), 1)
+        # Which ranks actually have evidence cards (L15 re-run claimed a CMD
+        # and a cutout for all ten peaks; only ranks 1-5 / 2-4 had them).
+        cutout_ranks = [r["rank"] for r in top] if grid_slim is not None else []
+        cmd_ranks = [c["rank"] for c in cmd_cards]
+        for r in ranked:
+            r["evidence_cards"] = [name for name, ranks in (("cutout", cutout_ranks), ("cmd", cmd_ranks)) if r["rank"] in ranks] or "none (not vetted)"
+        verdicts = "; ".join(f"#{c['rank']}: {c['verdict']}" for c in cmd_cards)
+        vetting_summary = (f"Cutout panels exist for ranks {cutout_ranks or 'none'}; CMD cards for ranks {cmd_ranks or 'none'}. "
+                           + (f"CMD population test per rank: {verdicts}. " if verdicts else "")
+                           + "Every other peak has NOT been vetted: do not say a CMD or cutout is attached for it.")
+        strong = [r for r in ranked if not r["known_object"] and not r.get("artefact") and r["significance"] >= self._PEAKS["candidate_sigma"]]
+        n_cmd_rejected = sum(1 for r in strong if r.get("population_verdict") == "field-like")
+        strong = [r for r in strong if r.get("population_verdict") != "field-like"]
+        # Only a SCREENED strong peak counts as new; vet=False skips the screen,
+        # so nothing unscreened is counted (CX-09 verify).
+        n_new = sum(1 for r in strong if r.get("artefact_screen"))
+        n_unscreened = len(strong) - n_new
+        if n_unscreened:
+            dens_notes.append(f"{n_unscreened} peak(s) >= {self._PEAKS['candidate_sigma']:g} sigma were not artefact-screened "
+                              + ("(vet=false skips the screen)" if not inp.vet else "(budget)")
+                              + " and are NOT counted as new candidates.")
         n_known = sum(1 for r in ranked if r["known_object"])
+        n_artefact = sum(1 for r in ranked if r.get("artefact"))
         out = {
             "success": True, "status": "partial" if partial else "ok", "survey": survey, "catalog": catalog, "table": table,
             "region": label, "preset": preset_used, "ra": ra, "dec": dec, "radius_deg": radius, "sky_area": area,
             "result_id": result_id, "cuts_applied": applied, "cell_size_deg": step,
+            # The executed density SQL (every cut is in it) for the Show-query panel.
+            "validated_sql": display_sql,
             "peak_detection": dict(self._PEAKS),
             "background": {"median_per_cell": round(bg_med, 1), "sigma_mad": round(bg_sigma, 2), "cells": int(len(frame)) if frame is not None else None},
-            "candidates": ranked, "n_candidates_over_5sigma": n_new, "n_known_objects": n_known,
+            "candidates": ranked, "n_candidates_over_5sigma": n_new, "n_known_objects": n_known, "n_artefacts": n_artefact,
+            "bright_star_screen": dict(self._BRIGHT_STAR),
             "headline": (f"{len(ranked)} peak(s) >= 3 sigma above the local background: {n_new} new candidate(s) >= 5 sigma, "
                          f"{n_known} known object(s) re-detected"
+                         + (f", {n_artefact} flagged as galaxy / bright-star artefacts" if n_artefact else "")
+                         + (f", {n_cmd_rejected} >= 5 sigma peak(s) rejected by a field-like CMD" if n_cmd_rejected else "")
                          + ("" if not ranked else f"; strongest: #1 at ({ranked[0]['ra']}, {ranked[0]['dec']}), "
-                            f"{ranked[0]['significance']} sigma, excess {ranked[0]['excess_stars']} stars"
+                            f"{ranked[0]['significance']} sigma, {ranked[0]['aperture_count']} stars in the aperture vs "
+                            f"{ranked[0]['background_in_aperture']} expected (excess {ranked[0]['excess_stars']})"
                             + (f" = {ranked[0]['known_object']}" if ranked[0]["known_object"] else ""))),
-            "cutout_grid": grid_slim, "cmd_cards": cmd_cards, "warnings": dens_notes,
-            "elapsed_s": round(time.perf_counter() - started, 1),
+            # How the significance is computed, in the user's units (L07 C6).
+            "method": self.method_summary(step),
+            **({"background_job": background_job} if background_job else {}),
+            "cutout_grid": grid_slim, "cmd_cards": cmd_cards, "vetting_summary": vetting_summary, "warnings": dens_notes,
+            "elapsed_s": round(time.perf_counter() - started, 1), "phase_seconds": phase_s,
             "note": ("Strategy: point-source selection + colour-magnitude box -> server-side density grid -> peaks scored by "
-                     "star-count excess over a local 0.25-0.6 deg annulus (significance uses the annulus variance, not just Poisson) -> known-object screening -> "
-                     "cutouts + CMD per candidate. A real satellite shows a coherent CMD sequence; a peak without one is a field "
+                     "star-count excess over a local 0.25-0.6 deg annulus (significance uses the annulus variance, not just Poisson) -> known-object and artefact (large-galaxy / bright-star mask) screening -> "
+                     "cutouts + a Hess-difference CMD test per candidate (aperture minus the area-scaled annulus, counted in "
+                     "old-population windows). A real satellite shows a coherent old population; a peak without one is a field "
                      "fluctuation or a background galaxy cluster."),
         }
         return _native(out)
+
+    # Seconds kept back from the scan for the artefact screen, the cutouts and
+    # the CMD tests (they run concurrently, ~20 s per SIA panel live).
+    _VET_RESERVE_S = 90.0
+    _ASYNC_MAX_CELLS = 40000
+    # Per sync tile: a 2-degree tile at 0.05-degree cells holds ~5000 cells.
+    _TILE_MAX_CELLS = 12000
+
+    @classmethod
+    def method_summary(cls, step: float) -> Dict[str, Any]:
+        """The detection method in plain units, for the answer (L07 C6)."""
+        ap = step * float(cls._PEAKS["aperture_cells_radius"])
+        a0 = max(float(cls._PEAKS["annulus_deg"][0]), 2.5 * step)
+        a1 = max(float(cls._PEAKS["annulus_deg"][1]), 6.0 * step)
+        return {
+            "cell_size_arcmin": round(step * 60.0, 2),
+            "aperture_radius_arcmin": round(ap * 60.0, 2),
+            "aperture": "the peak cell and its neighbours within that radius",
+            "background_annulus_arcmin": [round(a0 * 60.0, 1), round(a1 * 60.0, 1)],
+            "background_model": "a plane fitted to the annulus cells, evaluated over the aperture cells",
+            "significance": "sigma = (N_aperture - B_aperture) / sqrt(n_cells_aperture * var_annulus), "
+                            "var_annulus = max(variance of the annulus cell counts, background, 1)",
+            "thresholds_sigma": {"reported": cls._PEAKS["report_sigma"], "candidate": cls._PEAKS["candidate_sigma"]},
+            "min_separation_arcmin": round(max(float(cls._PEAKS["min_separation_deg"]), 3.0 * step) * 60.0, 1),
+        }
+
+    def _start_background_job(self, ctx: CallContext, catalog: str, table: str, *, step: float, ra: float, dec: float,
+                              radius: float, predicates: List[str], budget: Optional[float]) -> Optional[Dict[str, Any]]:
+        """Submit the whole-region density aggregate as ONE Data Lab async job
+        on a helper thread (polled there). Returns the handle, or a record of
+        why no job was submitted (anonymous token / disabled)."""
+        import threading
+
+        from integrations.datalab_client import ANON_TOKEN
+        from services import datalab_sql_policy as policy
+        from services.tool_budgets import Deadline, adopt_deadline, current_deadline
+
+        if os.getenv("DATALAB_SATELLITE_ASYNC", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return None
+        client = ctx.service("datalab_client")
+        if getattr(client, "token", ANON_TOKEN) == ANON_TOKEN:
+            return {"record": {"state": "UNAVAILABLE", "used": False,
+                               "note": "No background job: Data Lab async jobs need a login token and only the anonymous "
+                                       "token is configured, so the scan ran as synchronous tiles only."}}
+        try:
+            sql, meta = builders.build_density_aggregate(catalog, table, mode="grid", step_deg=step, ra=ra, dec=dec,
+                                                         radius_deg=radius, predicates=predicates,
+                                                         max_cells=self._ASYNC_MAX_CELLS)
+            # The async parser rejects SELECT aliases in GROUP BY / ORDER BY
+            # ("Column [ra_bin] does not exist", live 2026-09-24): group and
+            # order by the expressions themselves (same semantics).
+            sql = self.async_grid_sql(sql)
+            validated = policy.validate(sql, source="builder", meta=meta)
+        except Exception as exc:  # noqa: BLE001 - the sync tiles still run
+            return {"record": {"state": "NOT_SUBMITTED", "used": False, "note": f"background job not built: {type(exc).__name__}"}}
+        parent = current_deadline()
+        seconds = float(budget if budget is not None else 200.0)
+        child = parent.child(label="satellite-background-job") if parent is not None else Deadline(seconds, label="satellite-background-job")
+        box: Dict[str, Any] = {"meta": meta, "validated_sql": validated.sql}
+
+        def _on_event(event: Dict[str, Any]) -> None:
+            box["jobid"] = event.get("jobid")
+            box.setdefault("history", []).append({"t_s": event.get("t_s"), "state": event.get("state")})
+
+        def _worker() -> None:
+            adopt_deadline(child)
+            try:
+                box["job"] = orchestration.run_async_sql(validated.sql, client=client, max_seconds=seconds, poll_seconds=5.0,
+                                                         on_event=_on_event)
+            except BaseException as exc:  # noqa: BLE001 - reported in the record
+                box["job"] = {"state": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+        thread = threading.Thread(target=_worker, daemon=True, name="satellite-async-job")
+        thread.start()
+        return {"thread": thread, "deadline": child, "box": box, "started": time.monotonic()}
+
+    @staticmethod
+    def async_grid_sql(sql: str) -> str:
+        """Rewrite a grid density aggregate for the Data Lab async parser
+        (JSQLParser). Live 2026-09-24 on delve_dr3: GROUP BY on the SELECT
+        aliases fails ("Column [ra_bin] does not exist"), GROUP BY on the
+        ROUND() expressions fails (parse error at the parenthesis), a derived
+        table fails ("sub-select not supported in FROM clause"); positional
+        GROUP BY 1, 2 / ORDER BY 3 works (same semantics)."""
+        if "GROUP BY ra_bin, dec_bin" not in sql or "AS source_count" not in sql:
+            return sql
+        out = sql.replace("GROUP BY ra_bin, dec_bin", "GROUP BY 1, 2", 1)
+        return out.replace("ORDER BY source_count DESC", "ORDER BY 3 DESC", 1)
+
+    def _finish_background_job(self, ctx: CallContext, run: Optional[Dict[str, Any]], dens: Dict[str, Any], *,
+                               reserve: float) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Settle the race between the background job and the sync tiles:
+        complete tiles win at once (the job is aborted); partial tiles wait
+        for the job only inside the scan budget, never into the vetting
+        reserve. Returns (background_job record, density result to use)."""
+        from services.tool_budgets import remaining_seconds
+
+        if run is None:
+            return None, dens
+        if "record" in run:
+            return dict(run["record"]), dens
+        thread, box = run["thread"], run["box"]
+        tiles_ok = bool(dens.get("result_id")) and not dens.get("partial")
+        if not tiles_ok and thread.is_alive():
+            left = remaining_seconds()
+            # Outside a guarded tool (scripts) there is no deadline: allow 60 s.
+            wait = 60.0 if left is None else max(0.0, left - reserve - 10.0)
+            thread.join(wait)
+        job = box.get("job")
+        if job is None or thread.is_alive():
+            run["deadline"].cancel("sync tiles finished first" if tiles_ok else "scan budget spent")
+            thread.join(5.0)
+            job = box.get("job") or {"state": "ABORT REQUESTED (not confirmed)",
+                                     "note": "abort requested; the poller did not report back within 5 s"}
+        record = {k: job.get(k) for k in ("jobid", "state", "status_history", "elapsed_s", "error", "note") if job.get(k) is not None}
+        # The job id and status history as observed live, whatever the poller returned.
+        record.setdefault("jobid", box.get("jobid"))
+        if box.get("history") and len(box["history"]) >= len(record.get("status_history") or []):
+            record["status_history"] = list(box["history"])
+        record["elapsed_s"] = record.get("elapsed_s") or round(time.monotonic() - run["started"], 1)
+        record["used"] = False
+        if job.get("state") == "COMPLETED" and not tiles_ok:
+            frame = job["result"].dataframe
+            meta = dict(box["meta"])
+            executed = job.get("executed_sql") or box["validated_sql"]
+            row_limit = int(meta.get("row_limit") or self._ASYNC_MAX_CELLS)
+            truncated = frame is not None and len(frame) >= row_limit
+            store_meta = {**meta, "validated_sql": executed, "tool_name": self.name,
+                          "warnings": [f"Whole region aggregated as one Data Lab background job ({job.get('jobid')}, "
+                                       f"{float(job.get('elapsed_s') or 0):.0f} s)."],
+                          "provenance": {"validated_sql": executed, "jobid": job.get("jobid"), "mode": "grid_async",
+                                         **({"limit_truncated": True, "row_limit": row_limit} if truncated else {})},
+                          **({"owner_id": str(ctx.user_id)} if ctx.user_id else {})}
+            rid = ctx.result_store.put(frame, store_meta)
+            record.update({"used": True, "executed_sql": executed})
+            dens = {"success": True, "result_id": rid, "partial": bool(truncated),
+                    "warnings": list(dens.get("warnings") or []) + store_meta["warnings"]}
+            record["result_source"] = "background job (the sync tiles were partial)"
+        elif tiles_ok:
+            state_u = str(record.get("state", "")).upper()
+            if state_u.startswith("CANCELLED"):
+                # The poller sent the abort on OUR cancel (not a turn cancellation);
+                # the server's final state is not re-read, so say "requested".
+                record["state"] = "ABORT REQUESTED (sync tiles finished first)"
+                record.pop("error", None)
+                record["result_source"] = "synchronous tiles (finished first; an abort of the background job was sent)"
+            elif state_u == "COMPLETED":
+                record["result_source"] = "synchronous tiles (finished first; the completed background job was not needed)"
+            else:
+                record["result_source"] = f"synchronous tiles (finished first; background job state: {record.get('state')})"
+        else:
+            record["result_source"] = "synchronous tiles (partial; the background job did not finish in the scan budget)"
+        return record, dens
+
+    def _start_population_tests(self, ctx: CallContext, catalog: str, table: str, cands: List[Dict[str, Any]], *,
+                                field_cut: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Any, Dict[str, Any]]]:
+        """Start one Hess aggregate per candidate on helper threads."""
+        import threading
+
+        from services import datalab_sql_policy as policy
+        from services.tool_budgets import Deadline, adopt_deadline, current_deadline
+
+        if not cands:
+            return []
+        client = ctx.service("datalab_client")
+        morphology = registry.point_source_cut(catalog, table)
+        cuts, _note = registry.merge_default_quality_cuts(catalog, table, [dict(c) for c in field_cut])
+        predicates = builders.build_catalog_predicates(catalog, table, value_cuts=cuts, morphology=morphology)
+        parent = current_deadline()
+        jobs = []
+        for cand in cands:
+            box: Dict[str, Any] = {"aperture_deg": cmd_population.DEFAULT_APERTURE_DEG,
+                                   "annulus_deg": cmd_population.DEFAULT_ANNULUS_DEG}
+            # Ends at the join budget (60 s): the requests hook clamps the
+            # in-flight query to it, so an abandoned test stops (CX-03).
+            child = (parent.child_until(60.0, label=f"cmd-test-{cand.get('rank')}") if parent is not None
+                     else Deadline(60.0, label=f"cmd-test-{cand.get('rank')}"))
+            box["deadline"] = child
+
+            def _worker(c=cand, b=box, d=child) -> None:
+                adopt_deadline(d)
+                try:
+                    sql, meta = cmd_population.build_hess_aggregate(catalog, table, float(c["ra"]), float(c["dec"]),
+                                                                    predicates=predicates)
+                    validated = policy.validate(sql, source="builder", meta=meta)
+                    # 1.5 x timeout is the client's wall clock: keep it inside
+                    # the 60 s child deadline (CX-03 verify 2).
+                    from services.tool_budgets import remaining_seconds as _rem
+                    _left = _rem()
+                    tmo = 30.0 if _left is None else max(3.0, min(30.0, (_left - 2.0) / 1.5))
+                    res = client.query(sql=validated.sql, fmt="pandas", async_fallback=False, timeout=tmo)
+                    b["frame"] = getattr(res, "dataframe", None)
+                    b["sql"] = validated.sql
+                except BaseException as exc:  # noqa: BLE001 - reported per candidate
+                    b["error"] = exc
+
+            t = threading.Thread(target=_worker, daemon=True, name=f"cmd-test-{cand.get('rank')}")
+            t.start()
+            jobs.append((cand, t, box))
+        return jobs
+
+    @staticmethod
+    def _join_population_tests(jobs, notes: List[str]):
+        """Yield (candidate, result box | exception) as the tests finish,
+        bounded by the tool budget."""
+        from services.tool_budgets import remaining_seconds
+
+        for cand, thread, box in jobs:
+            left = remaining_seconds()
+            thread.join(60.0 if left is None else max(0.0, min(60.0, left - 12.0)))
+            if thread.is_alive():
+                # Stop the abandoned worker too (guard CX-03): its next bounded
+                # request sees the cancelled deadline.
+                if box.get("deadline") is not None:
+                    box["deadline"].cancel("CMD test abandoned at the join timeout")
+                notes.append(f"CMD test for peak #{cand.get('rank')} did not finish within the tool budget.")
+                cand["population_verdict"] = "not tested (budget)"
+                continue
+            if "error" in box:
+                yield cand, box["error"]
+            else:
+                yield cand, box
+
+    # Artefact screen. Primary: Legacy Surveys DR10 maskbits inside the peak
+    # aperture -- GALAXY (bit 12, Siena Galaxy Atlas large galaxies, whose HII
+    # regions / shredded wings count as point sources) and BRIGHT (bit 1,
+    # bright-star halos). Live 2026-09-23: the L15 4.8 sigma peak held 10
+    # GALAXY-masked sources in 0.03 deg, the other peaks and a control 0.
+    # Fallback outside the LS footprint: a Gaia DR3 star with G < `g_max`
+    # whose LS bright-star mask radius (1630 arcsec * 1.396**-G, DR9 recipe;
+    # ~1.9 arcmin at G = 8) contains the peak. A flat 6 arcmin rule falsely
+    # flagged Hydra II (G = 8.1 star 5.3 arcmin away).
+    _BRIGHT_STAR = {"legacy_surveys": {"table": "ls_dr10.tractor", "aperture_deg": 0.03, "min_masked": 3,
+                                       "bits": {"GALAXY": 4096, "BRIGHT": 2}},
+                    "catalog": "gaia_dr3.gaia_source", "search_deg": 0.1, "g_max": 13.0,
+                    "mask_radius_arcsec": "1630 * 1.396**(-G)"}
+
+    @staticmethod
+    def bright_star_mask_radius_deg(g: float) -> float:
+        return 1630.0 * 1.396 ** (-float(g)) / 3600.0
+
+    @classmethod
+    def legacy_mask_verdict(cls, row: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+        """(covered, artefact note) from one LS maskbits count row."""
+        if not row:
+            return False, None
+        try:
+            n = int(row.get("n") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return False, None
+        cfg = cls._BRIGHT_STAR["legacy_surveys"]
+
+        def _count(key: str) -> int:
+            try:
+                v = row.get(key)
+                return 0 if v is None or v != v else int(v)
+            except (TypeError, ValueError):
+                return 0
+
+        n_gal, n_bright = _count("n_galaxy"), _count("n_bright")
+        if n_gal >= cfg["min_masked"]:
+            return True, (f"likely artefact: overlaps a catalogued large galaxy (Legacy Surveys GALAXY mask on {n_gal} of {n} "
+                          "sources in the aperture; its HII regions / shredded wings count as point sources)")
+        if n_bright >= cfg["min_masked"]:
+            return True, f"likely artefact: inside a bright-star mask (Legacy Surveys BRIGHT on {n_bright} of {n} sources in the aperture)"
+        return True, None
+
+    @classmethod
+    def bright_star_verdict(cls, cand: Dict[str, Any], stars: Optional[pd.DataFrame]) -> Optional[str]:
+        """Artefact note for the brightest halo-rule match near `cand`, or None."""
+        if stars is None or stars.empty or not {"ra", "dec", "g"} <= set(stars.columns):
+            return None
+        cosd = math.cos(math.radians(float(cand["dec"])))
+        best = None
+        for _, s in stars.iterrows():
+            try:
+                g, sra, sdec = float(s["g"]), float(s["ra"]), float(s["dec"])
+            except (TypeError, ValueError):
+                continue
+            sep = math.hypot((sra - float(cand["ra"])) * cosd, sdec - float(cand["dec"]))
+            if g < cls._BRIGHT_STAR["g_max"] and sep <= cls.bright_star_mask_radius_deg(g):
+                if best is None or g < best[0]:
+                    best = (g, sep)
+        if best is None:
+            return None
+        return f"likely artefact: Gaia G = {best[0]:.1f} star {best[1] * 60:.1f} arcmin away (halo/spikes produce spurious point sources)"
+
+    def _bright_star_screen(self, ctx: CallContext, cands: List[Dict[str, Any]], notes: List[str]) -> None:
+        """Flag candidates on a large galaxy or a bright star: one small Legacy
+        Surveys maskbits aggregate per candidate, Gaia DR3 outside LS coverage."""
+        from services.tool_budgets import remaining_seconds
+
+        if ctx.result_store is None:
+            notes.append("artefact screen skipped: no result store")
+            return
+        ls = self._BRIGHT_STAR["legacy_surveys"]
+        g_limit = self._BRIGHT_STAR["g_max"]
+        client = ctx.service("datalab_client")
+
+        def _query(sql: str, catalog: str, table: str, builder: str, row_limit: int):
+            meta = builders._meta(builder, registry.describe_table(catalog, table), spatial_bound=True,
+                                  aggregate=builder.endswith("_mask"), row_limit=row_limit)
+            _rid, res = orchestration._run_builder_sql(sql, meta, client=client, result_store=ctx.result_store,
+                                                       owner_id=_owner(ctx), async_fallback=False)
+            return getattr(res, "dataframe", None)
+
+        for cand in cands:
+            left = remaining_seconds()
+            if left is not None and left < 60:
+                notes.append("artefact screen stopped early: tool budget nearly exhausted")
+                return
+            ra0, dec0 = float(cand["ra"]), float(cand["dec"])
+            covered = False
+            try:
+                sums = ", ".join(f"SUM(CASE WHEN (maskbits & {bit}) != 0 THEN 1 ELSE 0 END) AS n_{name.lower()}"
+                                 for name, bit in ls["bits"].items())
+                df = _query(f"SELECT COUNT(*) AS n, {sums}\nFROM {ls['table']}\n"
+                            f"WHERE q3c_radial_query(ra, dec, {ra0:.5f}, {dec0:.5f}, {ls['aperture_deg']:g})",
+                            "ls_dr10", "tractor", "artefact_screen_mask", 1)
+                covered, verdict = self.legacy_mask_verdict(df.iloc[0].to_dict() if df is not None and not df.empty else None)
+            except Exception as exc:
+                verdict = None
+                notes.append(f"Legacy Surveys mask screen failed at peak #{cand.get('rank')}: {type(exc).__name__}")
+            if not covered:
+                try:
+                    stars = _query("SELECT ra, dec, phot_g_mean_mag AS g\nFROM gaia_dr3.gaia_source\n"
+                                   f"WHERE q3c_radial_query(ra, dec, {ra0:.5f}, {dec0:.5f}, {self._BRIGHT_STAR['search_deg']:g})\n"
+                                   f"  AND phot_g_mean_mag < {g_limit:g}\nORDER BY phot_g_mean_mag\nLIMIT 20",
+                                   "gaia_dr3", "gaia_source", "artefact_screen_gaia", 20)
+                    verdict = self.bright_star_verdict(cand, stars)
+                except Exception as exc:
+                    notes.append(f"bright-star screen failed at peak #{cand.get('rank')}: {type(exc).__name__}")
+                    continue
+            cand["artefact_screen"] = "legacy_surveys_maskbits" if covered else "gaia_bright_stars"
+            if verdict:
+                cand["artefact"] = verdict
+                cand["verdict"] = verdict
 
     @staticmethod
     def _smash_field_extent(ctx: CallContext, fieldid: int) -> Tuple[float, float, float, str]:
@@ -924,7 +1626,12 @@ class SatelliteSearch(BaseCapability):
         if df.empty:
             return []
         cosd = math.cos(math.radians(float(df["dec_bin"].median())))
-        X, Y, N = df["ra_bin"].to_numpy() * cosd, df["dec_bin"].to_numpy(), df["source_count"].to_numpy(dtype=float)
+        # Unwrap RA about the circular mean so a region across RA 0/360 keeps
+        # its geometry (guard CX-06); reported positions use the raw ra_bin.
+        ra_rad = np.deg2rad(df["ra_bin"].to_numpy(dtype=float))
+        ref = float(np.rad2deg(np.arctan2(np.sin(ra_rad).mean(), np.cos(ra_rad).mean())))
+        ra_u = ((df["ra_bin"].to_numpy(dtype=float) - ref + 180.0) % 360.0) - 180.0 + ref
+        X, Y, N = ra_u * cosd, df["dec_bin"].to_numpy(), df["source_count"].to_numpy(dtype=float)
         ap_r = step * float(cls._PEAKS["aperture_cells_radius"])
         # The annulus/separation scale with the cell size so a coarse grid still
         # has a clean gap between aperture and background.
@@ -973,7 +1680,9 @@ class SatelliteSearch(BaseCapability):
             excess = float(N[ap].sum() - bg_ap)
             picked.append((x0, y0))
             out.append({"ra": round(float(df["ra_bin"].to_numpy()[idx]), 4), "dec": round(float(y0), 4),
-                        "peak_cell_count": int(N[idx]), "excess_stars": round(excess, 1), "background_per_cell": round(bg, 1),
+                        "peak_cell_count": int(N[idx]), "aperture_count": int(N[ap].sum()),
+                        "background_in_aperture": round(float(bg_ap), 1),
+                        "excess_stars": round(excess, 1), "background_per_cell": round(bg, 1),
                         "aperture_cells": n_ap, "annulus_cells": n_an, "significance": round(excess / math.sqrt(n_ap * var), 1)})
         return sorted(out, key=lambda o: -o["significance"])[: max(1, int(max_candidates))]
 
@@ -1004,12 +1713,114 @@ class SatelliteSearch(BaseCapability):
         return med, max(1.4826 * mad, math.sqrt(max(med, 1.0)))
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# 15. datalab_sed_sample
+# ═════════════════════════════════════════════════════════════════════════
+class SedSampleInput(_In):
+    ra: Optional[float] = None
+    dec: Optional[float] = None
+    target_name: Optional[str] = None
+    radius_deg: float = Field(default=1.0, description="cone radius (deg)")
+    gr_min: Optional[float] = Field(default=0.8, description="red cut: dered_mag_g - dered_mag_r > this (None = no g-r cut)")
+    rz_min: Optional[float] = Field(default=0.5, description="red cut: dered_mag_r - dered_mag_z > this (None = no r-z cut)")
+    snr_min: float = Field(default=5.0, description="S/N floor in g, r, z")
+    snr_wise_min: float = Field(default=3.0, description="S/N floor in the forced W1 and W2 photometry")
+    extended_only: bool = Field(default=True, description="type != 'PSF' (resolved sources: galaxies)")
+    limit: int = Field(default=300, ge=10, le=1000, description="sample size ('a few hundred')")
+    title: Optional[str] = None
+
+
+class SedSample(BaseCapability):
+    name = "datalab_sed_sample"
+    description = (
+        "ONE-CALL optical-to-mid-IR SEDs of a galaxy SAMPLE from Legacy Surveys DR9: ls_dr9.tractor carries dereddened "
+        "g/r/z AND forced unWISE W1/W2 in one table (no cross-catalog join). Cone + extended sources (type != 'PSF') + "
+        "S/N floors + a red colour cut + a LIMIT of a few hundred, IN THE SQL, then the SVO-backed magnitude-vs-wavelength "
+        "SED plot (log wavelength, inverted magnitudes, per-object curves plus the median). Use for 'SEDs of red galaxies "
+        "near <cluster> with LS grz + WISE W1/W2'."
+    )
+    category = "datalab"
+    InputModel = SedSampleInput
+    annotations = {"read_only": True, "cost": "moderate", "produces": "image"}
+
+    _CATALOG, _TABLE = "ls_dr9", "tractor"
+    _MAGS = ["dered_mag_g", "dered_mag_r", "dered_mag_z", "dered_mag_w1", "dered_mag_w2"]
+
+    @classmethod
+    def build_sql(cls, ra: float, dec: float, radius_deg: float, *, gr_min: Optional[float], rz_min: Optional[float],
+                  snr_min: float, snr_wise_min: float, extended_only: bool, limit: int) -> Tuple[str, Dict[str, Any], List[str]]:
+        cuts: List[Dict[str, Any]] = []
+        applied = [f"cone {radius_deg:g} deg around ({ra:.4f}, {dec:+.4f})"]
+        if extended_only:
+            cuts.append({"column": "type", "op": "!=", "value": "PSF"})
+            applied.append("extended sources: type != 'PSF'")
+        for b in ("g", "r", "z"):
+            cuts.append({"column": f"snr_{b}", "op": ">", "value": float(snr_min)})
+        for b in ("w1", "w2"):
+            cuts.append({"column": f"snr_{b}", "op": ">", "value": float(snr_wise_min)})
+        applied.append(f"S/N floors: snr_g, snr_r, snr_z > {snr_min:g}; snr_w1, snr_w2 > {snr_wise_min:g}")
+        predicates = builders.build_catalog_predicates(cls._CATALOG, cls._TABLE, value_cuts=cuts)
+        if gr_min is not None:
+            predicates += builders.build_catalog_predicates(
+                cls._CATALOG, cls._TABLE, color_cut={"bands": ["dered_mag_g", "dered_mag_r"], "min": float(gr_min)})
+            applied.append(f"red cut: dered_mag_g - dered_mag_r > {gr_min:g}")
+        if rz_min is not None:
+            predicates += builders.build_catalog_predicates(
+                cls._CATALOG, cls._TABLE, color_cut={"bands": ["dered_mag_r", "dered_mag_z"], "min": float(rz_min)})
+            applied.append(f"red cut: dered_mag_r - dered_mag_z > {rz_min:g}")
+        for col in cls._MAGS:
+            predicates.append(f"{col} < 'Infinity'::float8")
+        sql, meta = builders.build_cone_select(
+            cls._CATALOG, cls._TABLE, ra=ra, dec=dec, radius_deg=radius_deg,
+            columns=["ra", "dec", "type"] + cls._MAGS + ["snr_g", "snr_r", "snr_z", "snr_w1", "snr_w2"],
+            limit=int(limit), predicates=predicates,
+        )
+        applied.append(f"sample cap LIMIT {int(limit)}")
+        return sql, meta, applied
+
+    def run(self, inp, ctx) -> ToolResult:
+        started = time.perf_counter()
+        try:
+            ra, dec, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
+            sql, meta, applied = self.build_sql(float(ra), float(dec), float(inp.radius_deg), gr_min=inp.gr_min,
+                                                rz_min=inp.rz_min, snr_min=float(inp.snr_min),
+                                                snr_wise_min=float(inp.snr_wise_min), extended_only=bool(inp.extended_only),
+                                                limit=int(inp.limit))
+            queried = execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+            qn = queried.to_native() if hasattr(queried, "to_native") else {}
+            if not qn.get("success") or not qn.get("result_id"):
+                return queried
+            title = inp.title or f"Optical-to-mid-IR SEDs: {label} ({qn.get('rowcount', '?')} galaxies)"
+            plot = _run_analysis_plot("sed_plot", {"result_id": qn["result_id"], "sample_n": int(inp.limit), "title": title},
+                                      ctx, extra_services={"svo_client": "svo_fps_client"})
+            pn = plot.to_native() if hasattr(plot, "to_native") else {}
+        except Exception as e:
+            return datalab_error(e)
+        out = dict(pn)
+        rowcount = qn.get("rowcount")
+        out.update({
+            "success": bool(pn.get("success")),
+            "result_id": qn["result_id"], "n_selected": rowcount, "target": label, "ra": float(ra), "dec": float(dec),
+            "radius_deg": float(inp.radius_deg), "cuts_applied": applied,
+            "validated_sql": qn.get("validated_sql") or qn.get("sql") or sql,
+            "single_table": "ls_dr9.tractor carries dereddened g/r/z and forced unWISE W1/W2: no WISE catalogue join",
+            "elapsed_s": round(time.perf_counter() - started, 1),
+            "_caption": title + " | " + "; ".join(applied),
+            "note": ("Every cut is in the executed SQL. "
+                     + (f"The sample filled its LIMIT {int(inp.limit)}: it is a storage-order subset of the cone. "
+                        if isinstance(rowcount, int) and rowcount >= int(inp.limit) else "")
+                     + "Wavelengths are the SVO Filter Profile Service effective wavelengths of each filter."),
+        })
+        return _native(out)
+
+
 CAPABILITIES: List[BaseCapability] = [
     HealpixDensityMap(),
     StreamSelection(),
     SelectionDiagram(),
     TargetClassSummary(),
     SatelliteSearch(),
+    SedSample(),
 ]
 
 

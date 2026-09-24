@@ -179,14 +179,16 @@ def test_exa_routes_deep_reasoning_for_complex_questions(monkeypatch, isolated_u
     # 1. Tradeoffs example (strong reasoning word)
     WebSearchService().route_and_search(
         "Compare CASA tclean strategies for extended emission versus compact sources and explain parameter tradeoffs.",
-        max_results=5
+        max_results=5,
+        search_depth="advanced",  # D4: "compare" alone no longer routes to Exa
     )
     assert calls["search_type"] == "deep-reasoning"
 
     # 2. Risk/Competing example (strong reasoning word)
     WebSearchService().route_and_search(
         "Review competing ALMA calibration strategies for weak spectral line imaging and rank them by risk.",
-        max_results=5
+        max_results=5,
+        search_depth="advanced",  # D4: "review" alone no longer routes to Exa
     )
     assert calls["search_type"] == "deep-reasoning"
 
@@ -340,7 +342,7 @@ def test_route_enriches_brave_results_with_tavily_images(monkeypatch, isolated_u
     monkeypatch.setattr(WebSearchService, "search_brave", fake_search_brave)
     monkeypatch.setattr(WebSearchService, "_fetch_tavily_images", fake_fetch_images)
 
-    result = WebSearchService().route_and_search("current observatory policy", max_results=5)
+    result = WebSearchService().route_and_search("current observatory policy", max_results=5, want_images=True)
 
     assert result["success"] is True
     assert result["provider"] == "Brave LLM Context"
@@ -535,7 +537,7 @@ def test_route_skips_brave_and_prefetch_while_breaker_open(
     monkeypatch.setattr(WebSearchService, "search_tavily", fake_search_tavily)
     monkeypatch.setattr(WebSearchService, "_fetch_tavily_images", fake_fetch_images)
 
-    result = WebSearchService().route_and_search("current observatory policy", max_results=5)
+    result = WebSearchService().route_and_search("current observatory policy", max_results=5, want_images=True)
 
     assert result["provider"] == "Tavily"
     assert "brave" not in called, "breaker must skip Brave without calling it"
@@ -588,7 +590,7 @@ def test_brave_failure_reuses_prefetched_images_on_tavily_fallback(
     monkeypatch.setattr(WebSearchService, "search_tavily", fake_search_tavily)
     monkeypatch.setattr(WebSearchService, "_fetch_tavily_images", fake_fetch_images)
 
-    result = WebSearchService().route_and_search("current observatory policy", max_results=5)
+    result = WebSearchService().route_and_search("current observatory policy", max_results=5, want_images=True)
 
     assert result["provider"] == "Tavily"
     # The in-flight prefetch replaces the slow images+descriptions search mode…

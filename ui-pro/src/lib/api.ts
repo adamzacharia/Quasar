@@ -26,6 +26,8 @@ export interface ChatRequest {
     token?: string;  // auth token for personal RAG
     grounded_summary?: boolean;
     web_search?: boolean;
+    /** Phase 2: off | auto | always; wins over web_search when present. */
+    web_search_mode?: string;
 }
 
 export interface ChatRunMeta {
@@ -103,12 +105,26 @@ export interface StreamCallbacks {
         query: string;
     }) => void;
     onWebSources?: (data: {
-        sources: { title: string; url: string; snippet: string; evidenceQuality?: Record<string, unknown>; evidence_quality?: Record<string, unknown> }[];
+        sources: {
+            title: string; url: string; snippet: string;
+            evidenceQuality?: Record<string, unknown>; evidence_quality?: Record<string, unknown>;
+            // grounded web evidence (web search redesign, Phase 1)
+            id?: string; cited?: boolean; published_date?: string; domain?: string; provider?: string;
+        }[];
         images: { url: string; description: string; sourceUrl?: string; sourceTitle?: string }[];
         query: string;
         provider?: string;
         image_provider?: string;
         search_type?: string;
+        /** Final post-answer listing: replaces the turn's sources (cited flags set). */
+        replace?: boolean;
+        cited_ids?: string[];
+        phase?: string;
+    }) => void;
+    /** Phase 2: why the web was (not) searched this turn (one event per turn). */
+    onWebDecision?: (decision: {
+        mode?: string; need_web: boolean; reason?: string; queries?: string[]; source?: string;
+        planner_ms?: number | null; domain_pack?: string | null; freshness?: string | null; follow_up?: boolean;
     }) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
     onRunMeta?: (meta: ChatRunMeta) => void;
@@ -190,6 +206,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
             if (request.model) form.append("model", request.model);
             if (request.grounded_summary) form.append("grounded_summary", "true");
             form.append("web_search", request.web_search !== false ? "true" : "false");
+            if (request.web_search_mode) form.append("web_search_mode", request.web_search_mode);
             request.attachments.forEach(f => form.append("files", f));
             const headers: Record<string, string> = bearerOnlyHeaders(authToken);
             response = await fetch(`${API_BASE}/api/chat/upload`, { credentials: "include", method: "POST", headers, body: form, signal });
@@ -204,6 +221,7 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                     model: request.model,
                     grounded_summary: Boolean(request.grounded_summary),
                     web_search: request.web_search !== false,
+                    ...(request.web_search_mode ? { web_search_mode: request.web_search_mode } : {}),
                 }),
                 signal,
             });
@@ -356,6 +374,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onConversationMeta(parsed);
                         } else if (parsed.type === "usage" && callbacks.onUsage) {
                             callbacks.onUsage(parsed);
+                        } else if (parsed.type === "web_decision" && callbacks.onWebDecision) {
+                            callbacks.onWebDecision(parsed);
                         } else if (parsed.type === "web_sources" && callbacks.onWebSources) {
                             callbacks.onWebSources(parsed);
                         } else if (parsed.type === "download_progress" && callbacks.onDownloadProgress) {

@@ -115,7 +115,27 @@ export interface Message {
     webImageProvider?: string;      // provider used for image enrichment
     webSearchType?: string;         // provider-specific search mode, e.g. Exa deep
     webQuery?: string;              // original web query or URL
+    /** Why the web was (not) searched this turn (web search redesign, Phase 2). */
+    webDecision?: WebDecision;
     usageTokens?: number;           // provider-reported tokens used for this response
+}
+
+/** The + menu's web search mode (Phase 2): off = never, auto = the planner
+ *  decides, always = search every turn. The boolean `web_search` request
+ *  field stays for older clients (true = auto, false = off). */
+export type WebSearchMode = "off" | "auto" | "always";
+
+/** The `web_decision` SSE event: one per turn, rendered as a small badge. */
+export interface WebDecision {
+    mode?: WebSearchMode | string;
+    need_web: boolean;
+    reason?: string;
+    queries?: string[];
+    source?: "planner" | "deterministic" | string;
+    planner_ms?: number | null;
+    domain_pack?: string | null;
+    freshness?: string | null;
+    follow_up?: boolean;
 }
 
 export interface WebSource {
@@ -123,6 +143,13 @@ export interface WebSource {
     url: string;
     snippet: string;
     evidenceQuality?: EvidenceQuality;
+    /** Evidence id of the grounded pipeline ("W3"); cited inline as [W3]. */
+    id?: string;
+    /** True when the answer cites this source. */
+    cited?: boolean;
+    publishedDate?: string;
+    domain?: string;
+    provider?: string;
 }
 
 export interface EvidenceQuality {

@@ -182,13 +182,24 @@ def run_concurrently(fns: Sequence[Callable[[], Any]], *, wall_seconds: float = 
     did not finish holds a TimeoutError."""
     from services.tool_budgets import adopt_deadline, current_deadline
 
+    from services.tool_budgets import Deadline
+
     parent = current_deadline()
     if parent is not None:
         wall_seconds = min(wall_seconds, max(1.0, parent.remaining()))
     results: List[Any] = [TimeoutError("not finished within the budget")] * len(fns)
+    # One child deadline per worker, created here so an abandoned worker can
+    # be stopped individually: its next bounded request / is_cancelled() check
+    # sees the cancel (guard CX-02, 2026-09-24: timed-out cutout panels kept
+    # fetching). Outside a tool a standalone deadline plays the same role.
+    # Each worker's deadline ENDS at the wall clock (+2 s grace): the requests
+    # hook clamps every request's timeout to it, so an abandoned worker's
+    # in-flight request ends by then as well.
+    children = [parent.child_until(float(wall_seconds) + 2.0, label=f"concurrent-{i}") if parent is not None
+                else Deadline(max(1.0, float(wall_seconds)) + 2.0, label=f"concurrent-{i}") for i in range(len(fns))]
 
     def _worker(i: int, fn: Callable[[], Any]) -> None:
-        adopt_deadline(parent.child(label=f"concurrent-{i}") if parent is not None else None)
+        adopt_deadline(children[i])
         try:
             results[i] = fn()
         except BaseException as exc:  # noqa: BLE001 - reported per slot
@@ -200,10 +211,9 @@ def run_concurrently(fns: Sequence[Callable[[], Any]], *, wall_seconds: float = 
     end = time.monotonic() + wall_seconds
     for t in threads:
         t.join(max(0.0, end - time.monotonic()))
-    if parent is not None:
-        for t in threads:
-            if t.is_alive():
-                parent.child().cancel("concurrent ALMA query abandoned")  # marker only; children check the parent
+    for i, t in enumerate(threads):
+        if t.is_alive():
+            children[i].cancel("concurrent worker abandoned after its wall-clock budget")
     return results
 
 
@@ -547,6 +557,7 @@ def redshifted_line_projects_server_side(
     detail_projects: int = 40,
     min_seconds_per_cycle: float = 12.0,
     extra_where: str = "",
+    skip_category: bool = False,
 ) -> ServerSideResult:
     """Per-project counts of SCIENCE observations whose SPWs overlap the
     observed window of any requested transition for z in [z_min, z_max] --
@@ -557,7 +568,11 @@ def redshifted_line_projects_server_side(
     t0 = time.perf_counter()
     windows = redshift_windows(rest_species, z_min, z_max)
     win_where = "(" + " OR ".join(window_where(w["observed_min_ghz"], w["observed_max_ghz"]) for w in windows) + ")"
-    base = f"science_observation = 'T' AND {_extragalactic_where(science_category)} AND {win_where}" + (f" AND {extra_where}" if extra_where else "")
+    # A cone on one named target (extra_where) makes the extragalactic
+    # category filter unnecessary and risky (a category mislabel drops the
+    # target's own projects), so callers may skip it.
+    category = "" if skip_category and not science_category else f"{_extragalactic_where(science_category)} AND "
+    base = f"science_observation = 'T' AND {category}{win_where}" + (f" AND {extra_where}" if extra_where else "")
     cycles = [int(cycle)] if cycle is not None else all_cycles(newest_first=True)
 
     def _cycle_query(c: int) -> str:

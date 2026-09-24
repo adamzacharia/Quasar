@@ -925,6 +925,11 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "dataproduct_type": {"type": "string", "description": "'image', 'spectrum', 'cube', 'timeseries'"},
                 "start_date": {"type": "string", "description": "Start date for time filter (ISO format, e.g., '2022-07-01')"},
                 "end_date": {"type": "string", "description": "End date for time filter (ISO format, e.g., '2023-07-01')"},
+                "ra": {"type": "number", "description": "RA in degrees for a cone search (with dec; instead of target_name)."},
+                "dec": {"type": "number", "description": "Dec in degrees for a cone search."},
+                "radius": {"type": "string", "description": "Cone radius for target_name or ra/dec, e.g. '30s' (default), '2m' for extended targets."},
+                "min_exptime": {"type": "number", "description": "Minimum exposure time per observation in seconds."},
+                "max_exptime": {"type": "number", "description": "Maximum exposure time per observation in seconds."},
             },
             "required": []
         }
@@ -1081,7 +1086,7 @@ def register_tools(agent: "QuasarAgent") -> None:
     # from the nested key like density_vetting does.
     from capabilities.datalab_tools import CAPABILITIES as _DATALAB_ONE_SHOT_CAPS
     _DATALAB_IMAGE_TOOLS = {"datalab_healpix_density_map", "datalab_stream_selection", "datalab_selection_diagram",
-                            "datalab_target_class_summary"}
+                            "datalab_target_class_summary", "datalab_sed_sample"}
     for _cap in _DATALAB_ONE_SHOT_CAPS:
         if _cap.name in _DATALAB_IMAGE_TOOLS:
             _fn = agent._datalab_image_tool_fn(_cap.name)
@@ -1125,6 +1130,9 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "ra": {"type": "number", "description": "ICRS right ascension in degrees."},
                 "dec": {"type": "number", "description": "ICRS declination in degrees."},
                 "radius_deg": {"type": "number", "description": "Cone radius in degrees."},
+                "value_cuts": {"type": "array", "items": {"type": "object"},
+                               "description": "Optional cuts counted server-side, each {column, op, value} (op: = != < <= > >= between in), e.g. [{\"column\": \"zwarn\", \"op\": \"=\", \"value\": 0}]."},
+                "quality_cuts": {"type": "boolean", "description": "Also apply the catalogue's registered default quality cuts (e.g. DESI zwarn=0 + zcat_primary). Default false = raw count."},
             },
             "required": ["catalog", "table", "ra", "dec", "radius_deg"],
         },
@@ -1546,20 +1554,30 @@ def register_tools(agent: "QuasarAgent") -> None:
 
     agent.tool_registry.register(Tool(
         name="datalab_lss_wedge",
-        description="Render a stored spectroscopic Data Lab result_id as a comoving large-scale-structure wedge or 3D scatter plot.",
+        description=("Comoving large-scale-structure wedge (cosmic web). With NO result_id it selects SDSS DR17 galaxies "
+                     "itself (class GALAXY, zwarning 0) in a THIN slice -- default the SDSS Great Wall equatorial stripe "
+                     "RA 150-220, Dec -1.25..+1.25, z <= 0.1 (Dec span at most 5 deg) -- thinned uniformly to the row cap, "
+                     "Planck18 comoving distances, pie slice. Or pass a stored spectroscopic result_id to render it."),
         function=agent._datalab_image_tool_fn("datalab_lss_wedge"),
         parameters={
             "type": "object",
             "properties": {
-                "result_id": {"type": "string"},
+                "result_id": {"type": "string", "description": "optional: a stored spectroscopic result to render instead of the built-in SDSS slice"},
+                "ra_min": {"type": "number", "default": 150.0},
+                "ra_max": {"type": "number", "default": 220.0},
+                "dec_min": {"type": "number", "default": -1.25},
+                "dec_max": {"type": "number", "default": 1.25},
+                "z_min": {"type": "number", "default": 0.0},
+                "z_max": {"type": "number", "default": 0.1},
+                "limit": {"type": "integer", "default": 5000},
                 "ra_col": {"type": "string"},
                 "dec_col": {"type": "string"},
                 "z_col": {"type": "string", "default": "z"},
                 "class_col": {"type": "string"},
-                "pie_slice": {"type": "boolean", "default": False},
+                "pie_slice": {"type": "boolean", "default": True},
                 "title": {"type": "string"},
             },
-            "required": ["result_id"],
+            "required": [],
         },
         category="datalab",
     ))
@@ -3464,6 +3482,8 @@ def register_tools(agent: "QuasarAgent") -> None:
         category="archive"
     ))
 
+    _register_archive_catalog_tools(agent)
+
     agent.tool_registry.register(Tool(
         name="velocity_frame_distance",
         description="Convert a heliocentric velocity or redshift to GSR, Local Group, and CMB frames and give Hubble-flow distances (Planck18 H0) -- use for nearby-galaxy distances and flow corrections.",
@@ -3659,7 +3679,7 @@ def register_tools(agent: "QuasarAgent") -> None:
     ))
     agent.tool_registry.register(Tool(
         name="vo_adql_query",
-        description="Run a guarded SELECT-only ADQL query against any TAP service URL. On ADQL errors the server's message is returned - read it and fix the query.",
+        description="Run a guarded SELECT-only ADQL query against any TAP service URL. On ADQL errors the server's message is returned - read it and fix the query. For slow or heavy queries use mode='auto' (falls back to an async job on timeout) or mode='async', then vo_tap_job.",
         function=agent._vo_tool_fn("vo_adql_query"),
         parameters={
             "type": "object",
@@ -3667,8 +3687,48 @@ def register_tools(agent: "QuasarAgent") -> None:
                 "access_url": {"type": "string", "description": "TAP service base URL."},
                 "adql": {"type": "string", "description": "SELECT-only ADQL. Quote table names containing '/' or '+' in double quotes."},
                 "max_rows": {"type": "integer", "description": "Row cap (service cap also applies).", "default": 200},
+                "mode": {"type": "string", "enum": ["sync", "auto", "async"], "description": "sync (default): wait for rows. auto: sync first, resubmit as an async job if it times out. async: submit a job and return its job_url at once.", "default": "sync"},
             },
             "required": ["access_url", "adql"]
+        },
+        category="archive"
+    ))
+    agent.tool_registry.register(Tool(
+        name="vo_tap_job",
+        description="Check, fetch, or abort an async TAP job returned by vo_adql_query (mode='async' or 'auto'). Poll action='status' until COMPLETED, then action='results'.",
+        function=agent._vo_tool_fn("vo_tap_job"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "job_url": {"type": "string", "description": "The job_url returned by vo_adql_query."},
+                "action": {"type": "string", "enum": ["status", "results", "abort"], "description": "What to do with the job.", "default": "status"},
+                "max_rows": {"type": "integer", "description": "Rows to return for action='results'.", "default": 200},
+                "wait_seconds": {"type": "number", "description": "For action='status': wait up to this many seconds (max 20) for the job to change phase before answering.", "default": 0},
+            },
+            "required": ["job_url"]
+        },
+        category="archive"
+    ))
+    agent.tool_registry.register(Tool(
+        name="vo_image_search",
+        description="Find images or cubes covering a sky position on a generic IVOA SIA service (SIA 2.0, falls back to SIA 1.0), chosen by archive ('alma', 'cadc') or by access_url from vo_find_services(service_type='sia'). Returns image metadata and access URLs, not pixels. NOT for Data Lab (use datalab_sia_search), survey cutouts (hips_cutout) or ALMA science searches (search_by_target).",
+        function=agent._vo_tool_fn("vo_image_search"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "archive": {"type": "string", "description": "Curated archive with an SIA service: 'alma' or 'cadc'."},
+                "access_url": {"type": "string", "description": "SIA service base URL (overrides archive)."},
+                "target_name": {"type": "string", "description": "Target name to resolve."},
+                "ra": {"type": "number", "description": "RA in decimal degrees (ICRS)."},
+                "dec": {"type": "number", "description": "Dec in decimal degrees (ICRS)."},
+                "radius_deg": {"type": "number", "description": "Search radius in degrees, capped at 2.", "default": 0.05},
+                "waveband": {"type": "string", "enum": ["radio", "mm", "infrared", "optical", "uv", "xray"], "description": "Optional spectral regime (SIA 2.0 only)."},
+                "calib_level": {"type": "integer", "description": "Optional ObsCore calibration level (0 raw .. 3 science-ready; SIA 2.0 only)."},
+                "dataproduct_type": {"type": "string", "enum": ["image", "cube"], "description": "Optional product type (SIA 2.0 only)."},
+                "collection": {"type": "string", "description": "Optional obs_collection filter, e.g. 'JWST' on CADC (SIA 2.0 only)."},
+                "max_rows": {"type": "integer", "description": "Row cap, max 500.", "default": 100},
+            },
+            "required": []
         },
         category="archive"
     ))
@@ -3690,3 +3750,170 @@ def register_tools(agent: "QuasarAgent") -> None:
         },
         category="archive"
     ))
+
+
+# ── Archive catalogue tools (capabilities/catalogs.py, ArchiveBench gap closing 2026-09) ──
+_POS = {
+    "target_name": {"type": "string", "description": "Object name to resolve (SIMBAD/Sesame). Or give ra/dec."},
+    "ra": {"type": "number", "description": "Right ascension, decimal degrees (ICRS)."},
+    "dec": {"type": "number", "description": "Declination, decimal degrees (ICRS)."},
+}
+_CUTS = {
+    "anyOf": [{"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "object"}]}}, {"type": "string"}],
+    "description": "Column cuts: strings like 'Jmag < 14', 'parallax BETWEEN 19 AND 24', \"otype = 'QSO'\", or "
+                   "objects {column, op, value} (op: = != < <= > >= like between in 'is null' 'is not null').",
+}
+_ARCHIVE_CATALOG_SCHEMAS = {
+    "heasarc_observations": {
+        "type": "object",
+        "properties": {
+            "mission": {"type": "string", "enum": ["chandra", "xmm", "swift", "nustar", "nicer", "suzaku", "rosat"],
+                        "description": "HEASARC mission master table to search."},
+            **_POS,
+            "radius_arcmin": {"type": "number", "description": "Max pointing offset from the position. Default about half the field of view."},
+            "instrument": {"type": "string", "description": "Chandra: ACIS, ACIS-S, ACIS-I, HRC, HETG, LETG (combine e.g. 'ACIS-S/HETG'); XMM: pn, mos1, mos2, rgs, om; Swift: xrt, uvot, bat; ROSAT: PSPC, HRI."},
+            "public_only": {"type": "boolean", "description": "Only observations whose public date has passed."},
+            "start_date": {"type": "string", "description": "Earliest observation start, YYYY-MM-DD."},
+            "end_date": {"type": "string", "description": "Latest observation start, YYYY-MM-DD."},
+            "limit": {"type": "integer", "description": "Max ObsIDs listed (count/exposure always cover all), <= 500. Default 100."},
+        },
+        "required": ["mission"],
+    },
+    "exoplanet_archive": {
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["lookup", "census"], "description": "lookup = one planet or host; census = count/list with filters."},
+            "planet_name": {"type": "string", "description": "Planet designation for lookup, e.g. 'HD 209458 b'."},
+            "hostname": {"type": "string", "description": "Host star name for lookup (all its planets)."},
+            **{k: {"type": "number"} for k in ["max_distance_pc", "min_distance_pc", "min_host_teff_k", "max_host_teff_k",
+                                               "min_eq_temp_k", "max_eq_temp_k", "min_radius_earth", "max_radius_earth",
+                                               "min_mass_earth", "max_mass_earth", "min_period_days", "max_period_days"]},
+            "min_disc_year": {"type": "integer"}, "max_disc_year": {"type": "integer"},
+            "discovery_facility": {"type": "string", "description": "Substring of disc_facility, e.g. 'TESS', 'Kepler'."},
+            "discovery_method": {"type": "string", "description": "e.g. Transit, Radial Velocity, Imaging, Microlensing."},
+            "cuts": {**_CUTS, "description": "Extra pscomppars column cuts, e.g. 'sy_snum = 1'."},
+            "columns": {"type": "array", "items": {"type": "string"}, "description": "pscomppars columns to list (census)."},
+            "count_only": {"type": "boolean"},
+            "limit": {"type": "integer", "description": "Max rows listed in census (count covers all). Default 200."},
+            "order_by": {"type": "string"},
+        },
+        "required": [],
+    },
+    "simbad_query": {
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["lookup", "cone", "positions"]},
+            "identifiers": {"type": "array", "items": {"type": "string"}, "description": "Names/identifiers to look up (<= 25)."},
+            "identifier": {"type": "string", "description": "A single identifier to look up."},
+            **_POS,
+            "radius_arcsec": {"type": "number", "description": "Cone radius (cone, default 60) or match radius (positions, default 5)."},
+            "positions": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]},
+                          "description": "Positions for mode='positions': 'ra, dec' strings in decimal degrees, [ra, dec] pairs or {ra, dec, label} (<= 50)."},
+            "otype": {"type": "string", "description": "Restrict a cone to one SIMBAD object type code (e.g. 'QSO', 'PN')."},
+            "limit": {"type": "integer"},
+        },
+        "required": [],
+    },
+    "gaia_archive_query": {
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["source", "cone", "variability"]},
+            **_POS,
+            "source_id": {"type": "string", "description": "Gaia DR3 source_id."},
+            "radius_arcsec": {"type": "number", "description": "Cone radius (required for mode='cone'; up to 18000)."},
+            "cuts": {**_CUTS, "description": "gaia_source column cuts, e.g. 'parallax BETWEEN 1 AND 2', 'phot_g_mean_mag < 17', 'ruwe < 1.4'."},
+            "columns": {"type": "array", "items": {"type": "string"}},
+            "count_only": {"type": "boolean"},
+            "limit": {"type": "integer"},
+            "variability_table": {"type": "string", "description": "rrlyrae, cepheid, eclipsing_binary, long_period_variable, summary, classifier, short_timescale, rotation_modulation, planetary_transit, agn."},
+            "order_by": {"type": "string"},
+        },
+        "required": [],
+    },
+    "catalog_find": {
+        "type": "object",
+        "properties": {
+            "keywords": {"type": "string", "description": "Survey/catalogue name, author or topic words."},
+            "services": {"type": "array", "items": {"type": "string", "enum": ["vizier", "heasarc", "irsa"]}},
+            "limit": {"type": "integer"},
+        },
+        "required": ["keywords"],
+    },
+    "catalog_query": {
+        "type": "object",
+        "properties": {
+            "service": {"type": "string", "enum": ["vizier", "irsa", "heasarc", "gaia", "simbad", "exoplanet"]},
+            "table": {"type": "string", "description": "Exact table name on that service (e.g. from catalog_find)."},
+            **_POS,
+            "radius_arcsec": {"type": "number", "description": "Cone radius when a position/target is given (<= 18000)."},
+            "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to list (default: the first 15 plus RA/Dec)."},
+            "cuts": _CUTS,
+            "count_only": {"type": "boolean", "description": "Only the archive's COUNT."},
+            "limit": {"type": "integer", "description": "Max rows listed (<= 5000). Default 100."},
+            "order_by": {"type": "string"},
+            "descending": {"type": "boolean"},
+        },
+        "required": ["service", "table"],
+    },
+    "catalog_crossmatch": {
+        "type": "object",
+        "properties": {
+            "left_service": {"type": "string", "enum": ["vizier", "irsa", "heasarc", "gaia", "simbad", "exoplanet"]},
+            "left_table": {"type": "string", "description": "The catalogue whose sources are counted as matched / total."},
+            "right_service": {"type": "string", "enum": ["vizier", "irsa", "heasarc", "gaia", "simbad", "exoplanet"]},
+            "right_table": {"type": "string"},
+            **_POS,
+            "radius_arcsec": {"type": "number", "description": "Search cone radius (<= 10800)."},
+            "match_radius_arcsec": {"type": "number", "description": "Match radius (<= 600)."},
+            "left_cuts": _CUTS,
+            "right_cuts": _CUTS,
+            "max_rows_per_side": {"type": "integer", "description": "Row cap per side (<= 50000, default 20000)."},
+        },
+        "required": ["left_service", "left_table", "right_service", "right_table", "radius_arcsec", "match_radius_arcsec"],
+    },
+    "tns_object": {
+        "type": "object",
+        "properties": {"name": {"type": "string", "description": "TNS designation, e.g. 'SN 2024abc' or '2024abc'."}},
+        "required": ["name"],
+    },
+    "ztf_object": {
+        "type": "object",
+        "properties": {
+            "oid": {"type": "string", "description": "ZTF object id, e.g. ZTF18aaaaaaa."},
+            **_POS,
+            "radius_arcsec": {"type": "number", "description": "Search radius for the nearest object (default 5)."},
+        },
+        "required": [],
+    },
+    "ads_search": {
+        "type": "object",
+        "properties": {
+            "author": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "'Last, First' (or a list; all must be authors)."},
+            "first_author": {"type": "string"},
+            "bibstem": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Journal abbreviation(s): ApJ, ApJL, ApJS, AJ, MNRAS, A&A, Nature, Sci, NatAs, PASP, ARA&A."},
+            "year_from": {"type": "integer"}, "year_to": {"type": "integer"},
+            "title_words": {"type": "string", "description": "Words that must all appear in the title (quote a phrase to keep it together)."},
+            "abstract_words": {"type": "string"},
+            "full_text": {"type": "string"},
+            "doi": {"type": "string"}, "bibcode": {"type": "string"},
+            "refereed": {"type": "boolean"},
+            "extra_query": {"type": "string", "description": "Optional raw ADS query clause AND-ed with the rest."},
+            "sort": {"type": "string", "enum": ["date", "oldest", "citations", "relevance"]},
+            "rows": {"type": "integer", "description": "Papers listed (numFound is always the full count). Default 25."},
+        },
+        "required": [],
+    },
+}
+
+
+def _register_archive_catalog_tools(agent: "QuasarAgent") -> None:
+    from capabilities.catalogs import CAPABILITIES as _CATALOG_CAPS
+
+    for cap in _CATALOG_CAPS:
+        agent.tool_registry.register(Tool(
+            name=cap.name,
+            description=cap.description,
+            function=agent._catalogs_tool_fn(cap.name),
+            parameters=_ARCHIVE_CATALOG_SCHEMAS[cap.name],
+            category=cap.category,
+        ))

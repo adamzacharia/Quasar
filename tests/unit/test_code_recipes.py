@@ -86,3 +86,23 @@ def test_recipes_run_live(name):
     path = next(p for p in RECIPES if p.name == name)
     ns: dict = {}
     exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), ns)  # noqa: S102 - the recipes ARE the code under test
+
+
+def test_code_recipe_returns_runnable_code_without_the_metadata_docstring():
+    """Live 2026-09-23 D15: the model re-typed the recipe's metadata docstring
+    and dropped its closing quotes, so the displayed snippet did not parse. The
+    tool now returns only runnable code (provenance in separate fields)."""
+    import ast
+
+    from capabilities.alma_tools import CodeRecipe
+    from capabilities.base import CallContext
+
+    cap = CodeRecipe()
+    for lib, task in (("astroquery", "query by object name"), ("pyvo", "ADQL via TAP"), ("alminer", "target search")):
+        out = cap.run(cap.InputModel(library=lib, task=task), CallContext())
+        out = out.to_native() if hasattr(out, "to_native") else out
+        assert out["success"], (lib, out)
+        for r in out["recipes"]:
+            ast.parse(r["code"])
+            assert '"""' not in r["code"].split("\n", 3)[1] and "tests/unit" not in r["code"]
+            assert r["last_tested"]

@@ -34,8 +34,21 @@ class _FakeVoService:
         self.calls.append(("describe_table", access_url, table_name))
         return dict(self.result)
 
-    def run_adql(self, access_url, adql, max_rows):
+    def run_adql(self, access_url, adql, max_rows, mode="sync", owner=None):
         self.calls.append(("run_adql", access_url, adql, max_rows))
+        self.modes = getattr(self, "modes", []) + [mode]
+        return dict(self.result)
+
+    def job_status(self, job_url, wait_seconds=0, owner=None):
+        self.calls.append(("job_status", job_url))
+        return dict(self.result)
+
+    def job_results(self, job_url, max_rows, owner=None):
+        self.calls.append(("job_results", job_url, max_rows))
+        return dict(self.result)
+
+    def job_abort(self, job_url, owner=None):
+        self.calls.append(("job_abort", job_url))
         return dict(self.result)
 
     def cone_search(self, access_url, ra, dec, radius_deg, max_rows):

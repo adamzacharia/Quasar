@@ -17,7 +17,7 @@ Consumers:
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from services.archive_profiles.schema import ArchiveProfile
 
@@ -90,11 +90,76 @@ def prompt_index_lines() -> List[str]:
     return lines
 
 
+def _split(url: str):
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url or "").strip())
+    except ValueError:
+        return "", ""
+    return (parts.hostname or "").lower().rstrip("."), (parts.path or "").rstrip("/").lower()
+
+
+def profile_for_endpoint(url: str) -> Optional[ArchiveProfile]:
+    """The profile whose TAP/SIA endpoint serves ``url`` (same host, or a
+    declared mirror host, and the endpoint path as a path prefix). Longest
+    path match wins; None for an archive Quasar has no profile for."""
+    host, path = _split(url)
+    if not host:
+        return None
+    best: Optional[ArchiveProfile] = None
+    best_len = -1
+    for profile in PROFILES.values():
+        hosts_for_profile = {h.lower() for h in profile.mirror_hosts}
+        for endpoint in profile.endpoints:
+            if endpoint.protocol not in ("tap", "sia"):
+                continue
+            ep_host, ep_path = _split(str(endpoint.url))
+            if host != ep_host and host not in hosts_for_profile:
+                continue
+            if path == ep_path or path.startswith(ep_path + "/"):
+                if len(ep_path) > best_len:
+                    best, best_len = profile, len(ep_path)
+    return best
+
+
+def error_hints(url: str, *texts: str) -> List[str]:
+    """Summaries of the pitfalls whose ``error_triggers`` fire on ``texts``
+    (the submitted ADQL and the server error) for the archive serving
+    ``url``. Empty for unknown archives or when nothing fires."""
+    profile = profile_for_endpoint(url)
+    if profile is None:
+        return []
+    return [p.summary for p in profile.pitfalls if p.error_triggers and p.fires_on(*texts)]
+
+
+def sia_endpoint_for(archive: str) -> Optional[str]:
+    """The profile's SIA service URL for a slug or alias, or None. Resolves
+    through ``canonical_slug`` but never raises for an unknown archive."""
+    try:
+        profile = get_profile(archive)
+    except KeyError:
+        return None
+    for endpoint in profile.endpoints:
+        if endpoint.protocol == "sia":
+            return str(endpoint.url).rstrip("/")
+    return None
+
+
+def sia_archives() -> List[str]:
+    """Slugs whose profile declares an SIA endpoint (vo_image_search archives)."""
+    return sorted(slug for slug in PROFILES if sia_endpoint_for(slug))
+
+
 __all__ = [
     "ArchiveProfile",
     "PROFILES",
     "canonical_slug",
     "get_profile",
     "list_profiles",
+    "error_hints",
+    "profile_for_endpoint",
     "prompt_index_lines",
+    "sia_archives",
+    "sia_endpoint_for",
 ]

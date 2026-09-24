@@ -5,19 +5,21 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { prepareAnswerMarkdown } from "../lib/answer-markdown.js";
+import { answerLinkAttributes, prepareAnswerMarkdown } from "../lib/answer-markdown.js";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, Send, X } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
-import type { Message } from "../lib/types";
+import type { Message, WebSource } from "../lib/types";
 import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { DataTableCard } from "./DataTableCard";
 import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
-import { WebSourcesCard } from "./WebSourcesCard";
+import { WebEvidenceGrid, WebSourcesCard, WebSourcesStrip } from "./WebSourcesCard";
+import { WebCitationChip } from "./WebCitationChip";
+import { citationIdFromHref, tokenizeWebCitations, webDecisionLabel, webDecisionTitle } from "../lib/web-citations.js";
 import { HipsImageCard } from "./HipsImageCard";
 import { PlotlyCard } from "./PlotlyCard";
 import { QueryProvenance } from "./QueryProvenance";
@@ -507,12 +509,25 @@ interface ChatMessageProps {
     taskExecutionState?: TaskExecutionState | null;
     observationGraph?: ResearchGraph;
     reportPrompt?: string;
+    /** Grounded web evidence of this turn (sources with W# ids): renders the
+     *  sources strip, the inline [W#] chips and the cited-first grid. */
+    turnWebSources?: WebSource[];
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt, turnWebSources }: ChatMessageProps) {
     const isUser = message.role === "user";
     const displayContent = isUser ? message.content : safeAssistantWebText(message.content);
     const hasContent = !!displayContent;
+    // Grounded web evidence of this turn: [W#] in the answer become chips that
+    // point at these sources; ids the turn does not have stay plain text.
+    const webEvidence = (!isUser && message.type === "text" && turnWebSources) ? turnWebSources : [];
+    const webEvidenceById: Record<string, WebSource> = {};
+    for (const s of webEvidence) if (s.id) webEvidenceById[s.id] = s;
+    const answerMarkdown = isUser || !hasContent
+        ? ""
+        : (webEvidence.length > 0
+            ? tokenizeWebCitations(prepareAnswerMarkdown(displayContent), Object.keys(webEvidenceById))
+            : prepareAnswerMarkdown(displayContent));
     const hasThinkingSteps = !!thinkingSteps?.length;
     const hasThinking = hasThinkingSteps || !!message.thinking;
     const thinkingIsRunning = thinkingStatus === "running" && !hasContent;
@@ -808,6 +823,12 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         <TaskExecutionWidget state={taskExecutionState} />
                     )}
 
+                    {/* Grounded web evidence: "N sources" strip ABOVE the answer, shown
+                        as soon as the evidence exists (before the answer is done). */}
+                    {webEvidence.length > 0 && (
+                        <WebSourcesStrip sources={webEvidence} messageId={message.id} />
+                    )}
+
                     {/* Content — rendered BELOW thinking */}
                     {hasContent && (
                         <div className={`prose-answer text-slate-200 prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent ${message.type === 'critique' ? 'border-l-4 border-red-500 pl-4 py-1 bg-red-950/10 rounded-r-xl' : ''}`}>
@@ -856,9 +877,16 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     return <h6>{renderAnswerText(children)}</h6>;
                                 },
                                 a({ children, ...props }) {
+                                    // [W#] web citations were tokenized into #web-cite-W# links:
+                                    // render them as citation chips.
+                                    const citeId = citationIdFromHref(props.href);
+                                    if (citeId && webEvidenceById[citeId]) {
+                                        return <WebCitationChip citationId={citeId} source={webEvidenceById[citeId]} messageId={message.id} />;
+                                    }
                                     // Spread remaining props so GFM footnote anchors keep their
                                     // id / data-footnote-* / aria-* attributes (and href/title).
-                                    return <a {...props}>{renderAnswerText(children)}</a>;
+                                    // External links open in a new tab with rel=noopener (D8).
+                                    return <a {...props} {...answerLinkAttributes(props.href)}>{renderAnswerText(children)}</a>;
                                 },
                                 table({ children }) {
                                     return (
@@ -887,17 +915,37 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                 img() {
                                     return null;
                                 },
-                            }}>{prepareAnswerMarkdown(displayContent)}</ReactMarkdown>
+                            }}>{answerMarkdown}</ReactMarkdown>
                         </div>
                     )}
 
                     {showAnswerBuffer && <AnswerBuffer phase={answerBufferPhase} />}
+
+                    {/* Sources grid under a grounded answer: cited first (numbered),
+                        the rest under a collapsed "Also consulted". */}
+                    {webEvidence.length > 0 && (
+                        <WebEvidenceGrid sources={webEvidence} messageId={message.id} />
+                    )}
 
                     {/* Raw request provenance for this turn's tool calls (Feature 1).
                         Card-level blocks (e.g. DataTableCard) show their own single
                         request; this is the turn-wide audit surface. */}
                     {!isStreaming && (
                         <QueryProvenance calls={message.toolTrace} label="Show query" />
+                    )}
+
+                    {/* Phase 2: why the web was (not) searched this turn. One small badge,
+                        rendered once the answer is in; hover shows the real queries. */}
+                    {hasContent && !isStreaming && message.webDecision && (
+                        <div
+                            data-testid="web-decision-badge"
+                            title={webDecisionTitle(message.webDecision)}
+                            className="mt-2 inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px]"
+                            style={{ color: "var(--q-text-muted)", border: "1px solid var(--q-glass-border)" }}
+                        >
+                            <IconWebGlobe className="h-3 w-3" />
+                            <span>{webDecisionLabel(message.webDecision)}</span>
+                        </div>
                     )}
 
                     {/* Live token estimate while the answer is still streaming */}

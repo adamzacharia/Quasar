@@ -55,6 +55,7 @@ async def chat_with_files(
     model: Optional[str] = Form("gpt-oss-120b"),
     grounded_summary: bool = Form(False),
     web_search: bool = Form(True),
+    web_search_mode: Optional[str] = Form(None),
     files: PyList[UploadFile] = File(default=[]),
     authorization: Optional[str] = Header(None),
     http_request: Request = None,
@@ -204,6 +205,7 @@ async def chat_with_files(
         model=selected_model,
         grounded_summary=grounded_summary,
         web_search=web_search,
+        web_search_mode=web_search_mode,
     )
     return await _stream_chat_response(
         req, authorization=auth_header, attachment_context=attachment_context,

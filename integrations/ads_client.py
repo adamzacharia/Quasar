@@ -1183,22 +1183,115 @@ class ADSService:
         sort: Optional[str],
         filters: Optional[List[str]],
     ) -> Dict[str, Any]:
-        """Fallback query builder when the LLM builder fails."""
-        term = question.strip().replace('"', "")
-        if not term:
-            query = "*:*"
-        else:
-            # Use keyword: (ADS controlled vocabulary) + title: + abstract: + plain text
-            # for better precision without causing SolrException
-            query = (
-                f'keyword:"{term}" OR title:"{term}" OR abstract:"{term}" OR "{term}"'
-            )
+        """Fallback query builder when the LLM builder fails.
+
+        The old fallback quoted the WHOLE question as one phrase
+        (keyword:"<sentence>" OR title:"<sentence>" ...), which matches almost
+        nothing, so every fielded request returned 0 papers whenever the
+        builder model was unavailable (ArchiveBench AB-D-58..60). This one pulls
+        out the structure a question usually carries (a year range, a journal,
+        a person's name, 'refereed') into ADS fields and AND-s the remaining
+        topic words.
+        """
+        query = heuristic_ads_query(question)
         return {
             "query": query,
             "rows": max(1, default_rows),
             "sort": sort or "score desc",
             "filters": filters or ["property:refereed"],
         }
+
+
+_HEURISTIC_JOURNALS = (
+    ("astrophysical journal letters", "ApJL"), ("astrophysical journal supplement", "ApJS"),
+    ("astrophysical journal", "ApJ"), ("astronomical journal", "AJ"), ("monthly notices", "MNRAS"),
+    ("astronomy and astrophysics", "A&A"), ("astronomy & astrophysics", "A&A"), ("nature astronomy", "NatAs"),
+    ("annual review of astronomy", "ARA&A"), ("publications of the astronomical society of the pacific", "PASP"),
+)
+_HEURISTIC_JOURNAL_ABBR = {"apjl": "ApJL", "apjs": "ApJS", "apj": "ApJ", "mnras": "MNRAS", "a&a": "A&A",
+                           "aj": "AJ", "pasp": "PASP", "natas": "NatAs", "ara&a": "ARA&A"}
+_HEURISTIC_STOP = {
+    "a", "an", "the", "of", "in", "on", "for", "to", "and", "or", "by", "with", "from", "at", "as", "is", "are",
+    "was", "were", "be", "been", "has", "have", "had", "do", "does", "did", "how", "many", "much", "what", "which",
+    "who", "whom", "when", "where", "why", "that", "this", "these", "those", "there", "their", "its", "it", "me",
+    "give", "list", "find", "show", "tell", "papers", "paper", "articles", "article", "publications", "published",
+    "publish", "refereed", "peer", "reviewed", "journal", "between", "since", "after", "before", "inclusive",
+    "year", "years", "first", "reported", "report", "any", "all", "some", "about", "into", "please", "can", "you",
+    "i", "my", "our", "we", "bibcode", "bibcodes", "doi", "dois", "also", "than", "more", "most", "recent",
+}
+_NAME_PARTICLES = {"van", "von", "de", "der", "den", "da", "di", "du", "del", "la", "le", "st"}
+
+
+def heuristic_ads_query(question: str) -> str:
+    """Turn a natural-language literature question into a fielded ADS query
+    without an LLM: year range -> year:[a TO b], journal name -> bibstem:,
+    a capitalised personal name -> author:"Last, First", everything else ->
+    abs:(w1 AND w2 ...). Falls back to *:* only for an empty question."""
+    import re as _re
+
+    text = str(question or "").replace('"', " ").strip()
+    if not text:
+        return "*:*"
+    parts: List[str] = []
+    low = text.lower()
+    # years
+    m = _re.search(r"\b((?:19|20)\d{2})\s*(?:-|–|to|and|through|until)\s*((?:19|20)\d{2})\b", low)
+    if m:
+        parts.append(f"year:[{m.group(1)} TO {m.group(2)}]")
+        text = text[:m.start()] + " " + text[m.end():]
+    else:
+        m = _re.search(r"\b(?:since|after|from)\s+((?:19|20)\d{2})\b", low)
+        if m:
+            parts.append(f"year:[{m.group(1)} TO *]")
+            text = text[:m.start()] + " " + text[m.end():]
+        else:
+            m = _re.search(r"\b(?:in|during)\s+((?:19|20)\d{2})\b", low) or \
+                _re.search(r"(?<![\w\-])((?:19|20)\d{2})(?![\w\-])", low)
+            if m:
+                parts.append(f"year:{m.group(1)}")
+                text = text[:m.start()] + " " + text[m.end():]
+    # journals
+    low = text.lower()
+    for phrase, stem in _HEURISTIC_JOURNALS:
+        idx = low.find(phrase)
+        if idx >= 0:
+            parts.append(f'bibstem:"{stem}"')
+            text = text[:idx] + " " + text[idx + len(phrase):]
+            low = text.lower()
+            break
+    else:
+        for tok in _re.findall(r"[A-Za-z&]+", text):
+            stem = _HEURISTIC_JOURNAL_ABBR.get(tok.lower())
+            if stem and (tok.isupper() or tok in ("ApJ", "ApJL", "ApJS", "A&A", "NatAs")):
+                parts.append(f'bibstem:"{stem}"')
+                text = _re.sub(r"\b" + _re.escape(tok) + r"\b", " ", text, count=1)
+                break
+    # a personal name: 2-4 capitalised tokens (particles allowed), not the first word of the sentence
+    tokens = _re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
+    name = None
+    for i in range(1, len(tokens)):
+        run = []
+        j = i
+        while j < len(tokens) and (tokens[j][0].isupper() or tokens[j].lower() in _NAME_PARTICLES) and \
+                tokens[j].lower() not in _HEURISTIC_STOP:
+            run.append(tokens[j])
+            j += 1
+        caps = [t for t in run if t[0].isupper()]
+        if 2 <= len(run) <= 4 and len(caps) >= 2 and run[0][0].isupper() and run[-1][0].isupper() \
+                and not any(t.isupper() and len(t) > 1 for t in run):
+            name = run
+            break
+    if name:
+        first, last = name[0], " ".join(name[1:])
+        parts.append(f'author:"{last}, {first}"')
+        for t in name:
+            text = _re.sub(r"\b" + _re.escape(t) + r"\b", " ", text, count=1)
+    words = [w for w in _re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\.]*", text)
+             if w.lower() not in _HEURISTIC_STOP and len(w) > 1]
+    words = list(dict.fromkeys(words))[:8]
+    if words:
+        parts.append("abs:(" + " AND ".join(words) + ")")
+    return " AND ".join(parts) if parts else "*:*"
 
 
 class ADSQueryBuilder:

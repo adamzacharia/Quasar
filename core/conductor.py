@@ -258,6 +258,7 @@ class OrchestrationRun:
     workflow_memory: "WorkflowMemory"
     lf_trace: Any = None
     notebook: Any = None
+    web_search: bool = True   # the user's Web Search switch for this turn (D1)
 
 
 class Conductor:
@@ -410,16 +411,20 @@ class Conductor:
         plan_feedback_queue: Optional[stdlib_queue.Queue] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        web_search: bool = True,
     ) -> tuple[Optional[str], Optional["OrchestrationRun"]]:
         """
         Main entry point for complex query orchestration.
+
+        ``web_search``: the user's Web Search switch for this turn. When off,
+        sub-agents get no web tools (D1).
 
         Returns ``(final_answer, run)``, or ``(None, None)`` if the query
         isn't complex enough for DAG orchestration.
         """
         status_fn = on_status or self.on_status
         event_fn = on_event or self.on_event
-        run = OrchestrationRun(dag=TaskDAG(), workflow_memory=WorkflowMemory())
+        run = OrchestrationRun(dag=TaskDAG(), workflow_memory=WorkflowMemory(), web_search=bool(web_search))
 
         # Step 1: Decompose query into DAG (with cache lookup #14)
         self._emit_status("Analyzing query complexity and building execution plan", "running", status_fn)
@@ -971,12 +976,20 @@ class Conductor:
         from services import tool_budgets as _tb
 
         _parent_deadline = _tb.current_deadline()
+        # The Web Search switch rides into the executor thread too: sub-agents
+        # build their own tool list there (D1).
+        from core import web_policy as _web_policy
+
+        _web_ok = bool(getattr(run, "web_search", True))
+        # ...and so does the turn's own event sink (source cards of sub-agent
+        # web calls must reach THIS turn's stream, guard CX-01).
+        _event_sink = _web_policy.event_sink()
 
         def _with_request_ctx(fn):
             def _wrapped(*a, **k):
                 _tb.adopt_deadline(_parent_deadline.child(label="conductor-subtask") if _parent_deadline is not None else None)
                 try:
-                    with reinstall_llm_request_context(_llm_ctx):
+                    with reinstall_llm_request_context(_llm_ctx), _web_policy.web_scope(_web_ok, _event_sink):
                         return fn(*a, **k)
                 finally:
                     _tb.end_tool_deadline()

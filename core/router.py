@@ -4,6 +4,7 @@ class-level regex/cutoff constants that remain on QuasarAgent. Byte-parity: bodi
 former method bodies, with attribute accesses rewritten onto the agent parameter."""
 from __future__ import annotations
 
+import os
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -210,6 +211,48 @@ def is_live_data_query(agent: "QuasarAgent", query: str) -> bool:
     )
 
 
+_DEFAULT_LLM_CUTOFF = (2025, 6)
+
+# Policy / deadline phrases that need the CURRENT published rules. They win
+# over the live-data suppression: "Cycle 13 proprietary period for archive
+# data" was suppressed by the bare words "data"/"archive" before the policy
+# keywords were ever consulted (D6). A bare "Cycle 13" is NOT here: "find ALMA
+# Cycle 12 observations of M87" is an archive query.
+_POLICY_OVERRIDE_RE = re.compile(
+    r"\b(?:proprietary\s+(?:period|time)s?|deadlines?|polic(?:y|ies)|guidelines?|regulations?|"
+    r"call[-\s]for[-\s]proposals?|proposers?['’]?s?\s+guide|"
+    r"proposal\s+(?:rules?|requirements?|limits?|eligibility)|eligibility\s+rules?|"
+    # Phase 2 (WebBench POL-05 / POL-06): access-period and schedule questions are
+    # policy questions too; "data" in them used to trip the live-data suppression
+    r"exclusive[-\s]access(?:\s+periods?)?|data\s+rights|access\s+periods?|embargo(?:\s+periods?)?|"
+    r"large\s+programs?\s+threshold|"
+    r"cycle\s*\d{1,2}\s+(?:science\s+)?(?:observ\w*\s+)?(?:start|starts|begin\w*|end|ends|schedule|dates?|timeline)|"
+    r"(?:configuration|array)\s+(?:schedule|plans?)|(?:observing|semester)\s+schedule)\b",
+    re.IGNORECASE,
+)
+
+
+def policy_web_override(query: str) -> bool:
+    """True when the query asks about a policy, deadline or proposal rule that
+    changes over time: web search runs even if the query also mentions data."""
+    return bool(_POLICY_OVERRIDE_RE.search(str(query or "")))
+
+
+def llm_knowledge_cutoff() -> tuple:
+    """(year, month) of the chat models' training cutoff, from QUASAR_LLM_CUTOFF
+    ("YYYY-MM" or "YYYY"); default 2025-06. Read per call so an env change
+    needs no restart. A malformed value falls back to the default."""
+    raw = (os.getenv("QUASAR_LLM_CUTOFF") or "").strip()
+    m = re.fullmatch(r"((?:19|20)\d\d)(?:-(\d{1,2}))?", raw)
+    if not m:
+        return _DEFAULT_LLM_CUTOFF
+    year = int(m.group(1))
+    month = int(m.group(2)) if m.group(2) else 12
+    if not 1 <= month <= 12:
+        return _DEFAULT_LLM_CUTOFF
+    return (year, month)
+
+
 def detect_beyond_cutoff(agent: "QuasarAgent", query: str) -> Optional[str]:
     """
     Check if a query references dates or time periods beyond the LLM's
@@ -233,11 +276,13 @@ def detect_beyond_cutoff(agent: "QuasarAgent", query: str) -> Optional[str]:
     if agent._is_live_data_query(_q):
         return None
 
+    cutoff_year, cutoff_month = llm_knowledge_cutoff()
+
     # 1. Explicit year mentions beyond cutoff
     year_matches = re.findall(r'\b(20[2-9]\d)\b', query)
     for ym in year_matches:
         y = int(ym)
-        if y > agent._LLM_CUTOFF_YEAR:
+        if y > cutoff_year:
             return query  # whole query is the search string
 
     # 2. Month+Year combos in cutoff year but after cutoff month
@@ -257,9 +302,9 @@ def detect_beyond_cutoff(agent: "QuasarAgent", query: str) -> Optional[str]:
         _q,
     ):
         m_name, m_year = match.group(1), int(match.group(2))
-        if m_year > agent._LLM_CUTOFF_YEAR:
+        if m_year > cutoff_year:
             return query
-        if m_year == agent._LLM_CUTOFF_YEAR and month_names[m_name] > agent._LLM_CUTOFF_MONTH:
+        if m_year == cutoff_year and month_names[m_name] > cutoff_month:
             return query
 
     # 3. Selective freshness keywords — only high-confidence temporal phrases

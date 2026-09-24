@@ -345,32 +345,66 @@ def sky_density_map(
         applied_log = bool(log_scale) and _log_norm(pix_values) is not None
         fig = plt.figure(figsize=(6.0, 4.0))
         used_healpy = _try_healpy_plot(fig, frame, healpix_col, count_col, int(nside), order, title, applied_log)
+        geometry = "healpy"
+        color_limits = None
         if not used_healpy:
             ax = fig.add_subplot(111)
-            ra, dec = _healpix_centers(frame[healpix_col], int(nside), order)
             values = pix_values
-            norm = _log_norm(values) if applied_log else None
+            # Robust colour limits (2nd-98th percentile of the positive counts):
+            # one cluster pixel (M79, L08 2026-09-23) otherwise sets the top of
+            # the scale and flattens the disc gradient into one colour.
+            norm = _robust_log_norm(values) if applied_log else None
             if norm is not None:
                 # Zero/NaN/negative pixels have no log — mask them to the
                 # background rather than flooring them to the min color, which
                 # would paint surveyed-but-empty pixels as low-density sources.
                 values = np.where(np.isfinite(values) & (values > 0), values, np.nan)
-            sc = ax.scatter(ra, dec, c=values, s=20, cmap="viridis", edgecolors="none", norm=norm)
+                color_limits = {"vmin": round(float(norm.vmin), 3), "vmax": round(float(norm.vmax), 3),
+                                "rule": "2nd-98th percentile of the positive pixel counts"}
             cb_label = count_col if count_col in frame.columns else "count"
             if norm is not None:
                 cb_label += " (log scale)"
-            fig.colorbar(sc, ax=ax, label=cb_label)
+            try:
+                # True pixel geometry: each HEALPix pixel drawn as its own
+                # boundary polygon (DLB-08 C6), not a scatter of centres.
+                from matplotlib.collections import PolyCollection
+                from matplotlib.ticker import FuncFormatter
+
+                verts, _ref = _healpix_polygons(frame[healpix_col], int(nside), order)
+                coll = PolyCollection(verts, array=np.asarray(values, dtype=float), cmap="viridis", norm=norm,
+                                      edgecolors="face", linewidths=0.2)
+                ax.add_collection(coll)
+                allv = np.concatenate([v for v in verts]) if len(verts) else np.zeros((1, 2))
+                ax.set_xlim(float(allv[:, 0].max()), float(allv[:, 0].min()))   # RA increases to the left
+                ax.set_ylim(float(allv[:, 1].min()), float(allv[:, 1].max()))
+                ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v % 360.0:g}"))
+                cos_dec = max(0.2, math.cos(math.radians(float(np.nanmedian(allv[:, 1])))))
+                ax.set_aspect(1.0 / cos_dec, adjustable="box")
+                fig.colorbar(coll, ax=ax, label=cb_label, extend="both" if norm is not None else "neither")
+                geometry = "healpix_polygons"
+            except Exception:  # noqa: BLE001 - fall back to the centre scatter
+                ra, dec = _healpix_centers(frame[healpix_col], int(nside), order)
+                sc = ax.scatter(ra, dec, c=values, s=20, cmap="viridis", edgecolors="none", norm=norm)
+                fig.colorbar(sc, ax=ax, label=cb_label)
+                ax.invert_xaxis()
+                geometry = "pixel_centres"
             ax.set_xlabel("RA (deg)")
             ax.set_ylabel("Dec (deg)")
-            ax.invert_xaxis()
             ax.set_title(title)
             ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        extra = {"mode": "healpix", "nside": int(nside), "order": order, "log_scale": applied_log, "peaks": peaks}
+        extra = {"mode": "healpix", "nside": int(nside), "order": order, "log_scale": applied_log, "peaks": peaks,
+                 "pixel_geometry": geometry, **({"color_limits": color_limits} if color_limits else {})}
         trunc = _truncation_warnings(res.provenance)
         if trunc:
             _stamp_truncation_caption(fig, trunc)
             extra["warnings"] = trunc
+        if geometry == "healpix_polygons":
+            # The UI renders the interactive spec INSTEAD of the PNG when one
+            # exists, and a marker scatter cannot draw pixel polygons: the
+            # 2026-09-24 L08 card still showed pixel centres with M79 setting
+            # the colour scale. Ship the PNG (true pixels, robust limits) only.
+            return _plot_result(plotting, fig, "datalab_density", result_id, res.provenance, extra=extra)
         spec_ra, spec_dec = _healpix_centers(frame[healpix_col], int(nside), order)
         spec_vals = np.asarray(pix_values, dtype=float)
         spec_ok = np.isfinite(spec_vals) & ((spec_vals > 0) if applied_log else np.ones(len(spec_vals), bool))
@@ -663,8 +697,57 @@ def period_fold(
             ),
             "points": int(len(t_v)),
             "band": band_applied,
+            "shape": (light_curve_shape(phase, mag_v, period_days=best_period) if period_significant
+                      else {"classification": "not assessed (no significant period)"}),
         },
     )
+
+
+def light_curve_shape(phase: Any, mag: Any, *, period_days: Optional[float] = None, n_bins: Optional[int] = None) -> Dict[str, Any]:
+    """Shape of a folded light curve (DLB-14 C8: "sawtooth if visible").
+
+    Median magnitude per phase bin (0.05 wide with >= 100 epochs, else 0.1);
+    maximum light = the brightest bin, minimum light = the faintest. The rise
+    fraction is the phase interval from minimum to maximum light going forward:
+    RRab stars brighten in ~0.1-0.2 of the cycle and fade slowly (a sawtooth),
+    RRc stars are near-sinusoidal (rise ~0.4-0.5)."""
+    ph = np.asarray(phase, dtype=float) % 1.0
+    m = np.asarray(mag, dtype=float)
+    ok = np.isfinite(ph) & np.isfinite(m)
+    ph, m = ph[ok], m[ok]
+    # 0.05-phase bins when there are enough epochs (a 0.1 bin blurs a
+    # 0.15-phase rise); 0.1 bins otherwise.
+    n_bins = int(n_bins or (20 if ph.size >= 100 else 10))
+    if ph.size < max(20, 2 * n_bins):
+        return {"classification": "not assessed (too few epochs)", "points": int(ph.size)}
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(ph, edges) - 1, 0, n_bins - 1)
+    med = np.array([np.nanmedian(m[idx == i]) if np.any(idx == i) else np.nan for i in range(n_bins)])
+    if np.isnan(med).any():
+        good = ~np.isnan(med)
+        med[~good] = np.interp(np.flatnonzero(~good), np.flatnonzero(good), med[good], period=n_bins)
+    smooth = med
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    i_max, i_min = int(np.argmin(smooth)), int(np.argmax(smooth))      # magnitudes: small = bright
+    rise = float((centres[i_max] - centres[i_min]) % 1.0)
+    amplitude = float(np.nanpercentile(m, 95) - np.nanpercentile(m, 5))
+    dev = m - np.nanmean(m)
+    skew = float(np.nanmean(dev ** 3) / max(np.nanstd(m) ** 3, 1e-12))
+    p = float(period_days) if period_days else None
+    if rise <= 0.3 and amplitude >= 0.3:
+        cls = f"RRab-like sawtooth: fast rise (~{rise:.2f} of the phase) and slow decline, amplitude ~{amplitude:.2f} mag"
+        if p is not None and not (0.4 <= p <= 0.95):
+            cls += f" (but the {p:.3f} d period is outside the usual RRab range 0.4-0.95 d)"
+    elif 0.3 < rise <= 0.6 and 0.15 <= amplitude <= 0.8:
+        cls = f"near-sinusoidal (rise ~{rise:.2f} of the phase, amplitude ~{amplitude:.2f} mag), RRc-like"
+        if p is not None and not (0.2 <= p <= 0.5):
+            cls += f" (but the {p:.3f} d period is outside the usual RRc range 0.2-0.5 d)"
+    else:
+        cls = f"not a classic RR Lyrae shape (rise ~{rise:.2f} of the phase, amplitude ~{amplitude:.2f} mag)"
+    return {"classification": cls, "rise_fraction": round(rise, 2), "amplitude_mag": round(amplitude, 2),
+            "phase_of_maximum_light": round(float(centres[i_max]), 2), "phase_of_minimum_light": round(float(centres[i_min]), 2),
+            "magnitude_skewness": round(skew, 2), "bins": n_bins,
+            "method": "median magnitude per phase bin; amplitude = 5th-95th percentile range"}
 
 
 def _period_fold_plotly_spec(freq, power, best_frequency, phase, mag_v, dy, order, mag_col, *, title):
@@ -954,8 +1037,55 @@ def lss_wedge(
     spec["layout"]["yaxis"]["scaleanchor"] = "x"
     return _plot_result(
         plotting, fig, "datalab_lss", result_id, res.provenance,
-        extra={"points": int(mask.sum()), "pie_slice": bool(pie_slice), "plotly_spec": spec},
+        extra={"points": int(mask.sum()), "pie_slice": bool(pie_slice), "plotly_spec": spec,
+               "radial_density": radial_density_profile(dist, z_v)},
     )
+
+
+def radial_density_profile(dist_mpc: Any, z: Any, *, bin_mpc: float = 10.0, window_bins: int = 9,
+                           min_count: int = 20) -> Dict[str, Any]:
+    """Where along the line of sight the slice is densest (DLB-13: the model
+    guessed the wall distance). Counts per ``bin_mpc`` comoving shell, and the
+    overdensity of each shell against a running mean of its neighbours, which
+    divides out the smooth selection function of a flux-limited sample."""
+    d = np.asarray(dist_mpc, dtype=float)
+    zz = np.asarray(z, dtype=float)
+    ok = np.isfinite(d) & np.isfinite(zz)
+    d, zz = d[ok], zz[ok]
+    if d.size < min_count:
+        return {"note": "too few galaxies for a radial profile"}
+    edges = np.arange(np.floor(d.min() / bin_mpc) * bin_mpc, d.max() + bin_mpc, bin_mpc)
+    counts, _ = np.histogram(d, bins=edges)
+    k = max(3, int(window_bins) | 1)
+    # Normalised running mean (no zero padding past the slice ends), and no
+    # shell within half a window of either end is eligible: the z cut makes
+    # the last shells look overdense against the empty space beyond (live
+    # 2026-09-24: 410-420 Mpc at z = 0.095 beat the 350-360 Mpc wall).
+    smooth = np.convolve(counts, np.ones(k), mode="same") / np.convolve(np.ones_like(counts, dtype=float), np.ones(k), mode="same")
+    over = np.where(smooth > 0, counts / np.maximum(smooth, 1e-9), 0.0)
+    half = k // 2
+    interior = np.zeros(counts.size, dtype=bool)
+    interior[half:max(half, counts.size - half)] = True
+
+    def _shell(i: int) -> Dict[str, Any]:
+        sel = (d >= edges[i]) & (d < edges[i + 1])
+        zs = zz[sel]
+        return {"distance_mpc": [round(float(edges[i]), 0), round(float(edges[i + 1]), 0)],
+                "z_range": [round(float(zs.min()), 4), round(float(zs.max()), 4)] if zs.size else None,
+                "galaxies": int(counts[i]), "overdensity_vs_neighbours": round(float(over[i]), 2)}
+
+    eligible = np.where((counts >= min_count) & interior)[0]
+    raw_i = int(np.argmax(counts))
+    over_i = int(eligible[np.argmax(over[eligible])]) if eligible.size else raw_i
+    top = sorted(eligible.tolist(), key=lambda i: -over[i])[:3]
+    return {
+        "bin_mpc": bin_mpc,
+        "densest_shell_raw": _shell(raw_i),
+        "most_overdense_shell": _shell(over_i),
+        "top_overdense_shells": [_shell(i) for i in top],
+        "note": ("Raw counts per comoving shell follow the survey's selection function; the overdensity against a "
+                 f"{k * bin_mpc:g} Mpc running mean isolates walls. Quote these distances instead of reading them off the plot."),
+    }
 
 
 def _get_result(result_id: str, result_store: Any = None):
@@ -1203,6 +1333,43 @@ def _try_healpy_plot(fig: Any, frame: pd.DataFrame, healpix_col: str, count_col:
         **kwargs,
     )
     return True
+
+
+def _robust_log_norm(values: np.ndarray, lo_pct: float = 2.0, hi_pct: float = 98.0) -> Any:
+    """LogNorm between the lo-hi percentiles of the positive finite values
+    (falls back to the full positive range for tiny or flat maps)."""
+    from matplotlib.colors import LogNorm
+
+    arr = np.asarray(values, dtype=float)
+    pos = arr[np.isfinite(arr) & (arr > 0)]
+    if pos.size < 20:
+        return _log_norm(arr)
+    vmin, vmax = float(np.percentile(pos, lo_pct)), float(np.percentile(pos, hi_pct))
+    if not (vmax > vmin > 0):
+        return _log_norm(arr)
+    return LogNorm(vmin=vmin, vmax=vmax, clip=False)
+
+
+def _healpix_polygons(pixels: Iterable[Any], nside: int, order: str, step: int = 1) -> tuple[list, float]:
+    """Boundary polygons (RA, Dec in deg) of each HEALPix pixel, unwrapped in
+    RA around the map's circular-mean RA so a map across RA = 0/360 stays
+    contiguous. Returns (list of (k, 2) vertex arrays, reference RA)."""
+    try:
+        from astropy_healpix import HEALPix
+        import astropy.units as u
+    except ImportError as exc:
+        raise ImportError("astropy-healpix is required for HEALPix pixel polygons") from exc
+    hp = HEALPix(nside=int(nside), order="nested" if str(order).lower().startswith("nest") else "ring")
+    pix = np.asarray(pd.to_numeric(pd.Series(pixels), errors="coerce"), dtype=float)
+    pix = np.where(np.isfinite(pix), pix, 0).astype(np.int64)
+    lon, lat = hp.boundaries_lonlat(pix, step=int(step))
+    lon_d = np.asarray(lon.to_value(u.deg), dtype=float).reshape(len(pix), -1)
+    lat_d = np.asarray(lat.to_value(u.deg), dtype=float).reshape(len(pix), -1)
+    clon, _clat = hp.healpix_to_lonlat(pix)
+    c = np.deg2rad(np.asarray(clon.to_value(u.deg), dtype=float))
+    ref = float(np.rad2deg(np.arctan2(np.sin(c).mean(), np.cos(c).mean()))) % 360.0 if len(c) else 0.0
+    lon_u = ((lon_d - ref + 180.0) % 360.0) - 180.0 + ref
+    return [np.column_stack([lon_u[i], lat_d[i]]) for i in range(len(pix))], ref
 
 
 def _healpix_centers(pixels: Iterable[Any], nside: int, order: str) -> tuple[np.ndarray, np.ndarray]:

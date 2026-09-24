@@ -1034,7 +1034,9 @@ def line_names_for_species(species: Sequence[str] | str) -> List[str]:
         for name in found:
             if name not in output:
                 output.append(name)
-    if unknown and not output:
+    # ANY named species without a rest frequency fails the request -- a mixed
+    # "CO and XYZ" must not silently search CO only (guard CX-05).
+    if unknown:
         supported = sorted({k.split("(")[0] for k in LINE_REST_FREQ_GHZ if not k.startswith("[")} | {f"[{k}]" for k in FINE_STRUCTURE_SPECIES})
         raise UnsupportedSpecies(
             f"rest species {', '.join(unknown)} has no rest-frequency entry in this tool "
@@ -1069,19 +1071,28 @@ def projects_covering_all_lines(df: pd.DataFrame, lines: Sequence[str], z: float
     if annotated.empty:
         return pd.DataFrame()
     project_col = col(annotated, ["proposal_id", "project_code"])
-    if not project_col or "member_ous_uid" not in annotated.columns:
+    if not project_col:
         return pd.DataFrame()
     required = set(line_names_for_input(lines))
     rows: List[Dict[str, Any]] = []
     # A proposal can contain unrelated targets and tunings. Preserve the
     # MOUS and target context described in references/archive-query.md, row
     # granularity: do not combine one target's CO with another's isotopologues.
-    annotated = annotated[annotated["member_ous_uid"].map(as_text).ne("")]
-    group_columns = [project_col, "member_ous_uid"]
+    # Without a member_ous_uid column the grain falls back to project + target
+    # (stated in coverage_basis) -- never a silent empty result, which would
+    # read as "0 projects" (bf4e790 fixtures; full suite 2026-09-23).
+    has_mous = "member_ous_uid" in annotated.columns
+    if has_mous:
+        annotated = annotated[annotated["member_ous_uid"].map(as_text).ne("")]
+    group_columns = [project_col] + (["member_ous_uid"] if has_mous else [])
     if "target_name" in annotated:
         group_columns.append("target_name")
+    basis = ("all requested lines within the same MOUS and target SPW set" if has_mous
+             else "all requested lines within the same project and target (no MOUS column in the input)")
     for identity, group in annotated.groupby(group_columns, dropna=False):
-        project, mous = identity[:2]
+        identity = identity if isinstance(identity, tuple) else (identity,)
+        project = identity[0]
+        mous = identity[1] if has_mous else ""
         found = set()
         for value in group["covered_lines"].tolist():
             found.update(part.strip() for part in as_text(value).split(",") if part.strip())
@@ -1089,7 +1100,7 @@ def projects_covering_all_lines(df: pd.DataFrame, lines: Sequence[str], z: float
             rows.append({
                 "proposal_id": as_text(project),
                 "member_ous_uid": as_text(mous),
-                "coverage_basis": "all requested lines within the same MOUS and target SPW set",
+                "coverage_basis": basis,
                 "covered_lines": ", ".join(sorted(found)),
                 "rows": int(len(group)),
                 "n_mous": _nunique(group, "member_ous_uid"),

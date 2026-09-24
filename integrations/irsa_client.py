@@ -30,6 +30,13 @@ except ImportError:
 from integrations.simbad_resolver import _resolve_simbad_cached
 
 
+def _failed(message: str) -> pd.DataFrame:
+    """An empty frame that carries its failure (read by capabilities/archives.py)."""
+    out = pd.DataFrame()
+    out.attrs["error"] = message
+    return out
+
+
 class IRSAClient:
     """
     Query IRSA catalog services for infrared survey sources.
@@ -86,7 +93,7 @@ class IRSAClient:
             ra, dec = _resolve_simbad_cached(target)
             if ra is None:
                 print(f"[IRSA] Could not resolve target '{target}' via SIMBAD")
-                return pd.DataFrame()
+                return _failed(f"could not resolve target {target!r} to coordinates (SIMBAD)")
             
             return self.search_by_position(
                 ra, dec, radius_arcsec=radius_arcsec,
@@ -97,7 +104,7 @@ class IRSAClient:
             print(f"[IRSA] Target search error: {e}")
             import traceback
             traceback.print_exc()
-            return pd.DataFrame()
+            return _failed(f"{type(e).__name__}: {e}")
 
     def search_by_position(self, ra: float, dec: float, radius_arcsec: float = 30.0,
                            catalog: str = "allwise_p3as_psd",
@@ -134,7 +141,9 @@ class IRSAClient:
             
             if result is None or len(result) == 0:
                 print("[IRSA] No results found")
-                return pd.DataFrame()
+                empty = pd.DataFrame()
+                empty.attrs["center"] = (float(ra), float(dec))
+                return empty
             
             df = result.to_pandas()
             
@@ -142,13 +151,16 @@ class IRSAClient:
                 df = df.head(max_results)
             
             print(f"[IRSA] Found {len(df)} sources")
-            return self._standardize_columns(df, catalog)
+            out = self._standardize_columns(df, catalog)
+            out.attrs["center"] = (float(ra), float(dec))
+            return out
             
         except Exception as e:
             print(f"[IRSA] Position search error: {e}")
             import traceback
             traceback.print_exc()
-            return pd.DataFrame()
+            # An error (e.g. "unknown table") is not an empty result (ArchiveBench AB-D-38).
+            return _failed(f"{type(e).__name__}: {e}")
 
     def _resolve_catalog(self, catalog: str) -> str:
         """Resolve catalog aliases to IRSA catalog names."""

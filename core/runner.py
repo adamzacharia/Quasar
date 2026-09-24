@@ -37,6 +37,8 @@ from services import tool_budgets as _tool_budgets
 # except (scan CAR-1). Both were dropped in the S14 extraction from agent.py.
 from core.agent import DUAL_SOURCE_SCAFFOLD, _run_result_is_new, _unescape_tool_args
 from core.conductor import Conductor
+from core.router import policy_web_override as _policy_web_override
+from core import web_planner as _web_planner
 from services.citation_verifier import append_citation_warning
 from services.content_safety import FILTER_NOTICE, is_explicit_query, safe_assistant_text
 from services.secret_redaction import redact_secrets
@@ -188,6 +190,130 @@ def _web_event_payload(payload: Dict[str, Any], *, keep_images: bool) -> Dict[st
     return out
 
 
+# Explicit "search the web" request.
+_EXPLICIT_WEB_RE = re.compile(
+    r"\b(?:use web\s*search|search the web|web\s*search|internet search|google it|tavily|online search)\b"
+)
+# Explicit "do NOT search the web" (D5): the apostrophe is optional and may be
+# straight or curly; "don't search the web" used to miss the negation and then
+# match _EXPLICIT_WEB_RE, so the forbidden search ran.
+_NO_WEB_RE = re.compile(
+    r"\b(?:don['’]?t|do\s+not|without|no)\s+"
+    r"(?:(?:search(?:ing)?|use|using|look(?:ing)?\s+(?:it\s+)?up\s+on)\s+)?"
+    r"(?:the\s+)?(?:web|internet|online)(?:\s+search(?:es|ing)?)?\b"
+    r"|\boffline\s+only\b"
+)
+# Same imagery phrasing as the round-0 tool forcing below; the pre-pass needs
+# it earlier to decide whether web image tiles are wanted (D7).
+_IMAGERY_REQUEST_RE = re.compile(
+    r"\b(?:show|display|make|create|generate|render|get|give)\b.*"
+    r"\b(?:image|images|imagery|cutouts?|postage\s*stamps?|picture|pictures)\b"
+)
+
+
+def _explicit_no_web_requested(query_lower: str) -> bool:
+    return bool(_NO_WEB_RE.search(query_lower or ""))
+
+
+_LEGACY_RESEARCHER_RE = re.compile(
+    r'\b(?:who is|who\'s|tell me about|look up|profile of|'
+    r'where does .+ work|what does .+ (?:research|study|work on)|'
+    r'what (?:topics?|areas?|fields?) does .+ (?:research|study|work)|'
+    r'how many papers has .+ (?:published|written|authored)|'
+    r'which institution|h-index|orcid|'
+    r'.+\'s research|.+\'s h.index|.+\'s publications?)\b'
+)
+_LEGACY_RESEARCHER_EXCLUDE_RE = re.compile(r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b')
+
+
+def _researcher_query(agent, user_query: str) -> bool:
+    """Is this a question about a PERSON (OpenAlex profile + researcher web
+    search)? With the planner on, core.web_planner.looks_like_researcher_query
+    (D15: a person-like subject is required, so "Tell me about the Square
+    Kilometre Array" no longer runs a researcher search). Planner off = the
+    Phase 1 regex exactly."""
+    live_re = getattr(agent, "_LIVE_DATA_KEYWORDS_RE", None)
+    if _web_planner.planner_enabled():
+        return _web_planner.looks_like_researcher_query(user_query, live_re)
+    bare_lower = str(user_query or "").lower()
+    return bool(
+        _LEGACY_RESEARCHER_RE.search(bare_lower)
+        and not _LEGACY_RESEARCHER_EXCLUDE_RE.search(bare_lower)
+        and not (live_re is not None and live_re.search(bare_lower))
+    )
+
+
+def _normalize_web_mode(web_search_mode, web_search: bool) -> str:
+    """off | auto | always. The explicit mode wins; the boolean switch maps
+    True -> auto and False -> off (backward compatible, PLAN 2.4)."""
+    mode = str(web_search_mode or "").strip().lower()
+    if mode in ("off", "auto", "always"):
+        return mode
+    return "auto" if web_search else "off"
+
+
+_GROUNDED_WEB_NOTE = (
+    "\n\n[SYSTEM NOTE: Web evidence for this question is in the WEB EVIDENCE block above. "
+    "Use it (together with any tool results) and cite each web fact with its [W#] tag. "
+    "Do NOT call the `web_search` tool again for this same question.]"
+)
+
+
+def _inject_web_evidence(full_input: str, query: str, registry, prepass, *, evidence_query: str,
+                         wait_s: Optional[float] = None):
+    """Join the pre-pass web search (bounded: QUASAR_WEB_EVIDENCE_WAIT counted
+    from when the pre-pass STARTED) and, when its evidence is ready, put the
+    WEB EVIDENCE block right before the user's message in the model input.
+
+    Returns ``(full_input, block)``; ``block`` is "" when the evidence was not
+    ready in time (or there is none) and ``full_input`` is then unchanged, so
+    the caller keeps the legacy behaviour exactly (PLAN 1.3)."""
+    t_join = time.monotonic()
+    ready = prepass.wait(wait_s)
+    block = registry.render_prompt_block(query=evidence_query) if ready else ""
+    print(
+        f"[WEB EVIDENCE] pre-pass ready={ready} items={len(registry)} "
+        f"injected={len(registry.injected_ids) if block else 0} "
+        f"deep_read={sum(1 for ev in registry.items() if ev.deep_read)} "
+        f"waited={time.monotonic() - t_join:.1f}s since_start={time.monotonic() - prepass.started:.1f}s"
+    )
+    if not block:
+        return full_input, ""
+    registry.injected = True
+    user_marker = f"\n\nUser: {query}"
+    if user_marker in full_input:
+        full_input = full_input.replace(user_marker, f"\n\n{block}{user_marker}", 1)
+    else:
+        full_input += "\n\n" + block
+    return full_input + _GROUNDED_WEB_NOTE, block
+
+
+def _join_web_thread(thread, timeout: float) -> bool:
+    """Join a web worker; True when it FINISHED within ``timeout`` (D9: the old
+    code closed the step as "completed" even when the join timed out)."""
+    if thread is None:
+        return True
+    thread.join(timeout=timeout)
+    return not thread.is_alive()
+
+
+def _close_web_step(on_status, open_label: str, finished: bool, waited_s: float) -> None:
+    """Close the pre-pass web step with the EXACT label it opened with (the UI
+    matches steps by text). A timed-out join closes it as a failure and adds a
+    visible note instead of claiming completion (D9)."""
+    if not on_status:
+        return
+    label = open_label or "Searching the web in parallel"
+    if finished:
+        on_status(label, "completed")
+        return
+    on_status(label, "error")
+    note = f"Web search timed out after {waited_s:.0f}s: answered without web results"
+    on_status(note, "running")
+    on_status(note, "completed")
+    print(f"[WEB SEARCH] Pre-pass web search still running after {waited_s:.0f}s: closed as timed out")
+
+
 def _is_short_breaker_skip(result) -> bool:
     """A host-breaker skip whose circuit re-opens within the auto-wait window:
     the identical call MAY be re-issued once after the cooldown, so the
@@ -308,6 +434,10 @@ def stream_response_api(agent, *args, **kwargs):
             # thread must not inherit a cancelled token or a spent soft deadline.
             agent._tls.turn_cancellation = None
             agent._tls.turn_soft_deadline = None
+            # ...nor this turn's Web Search switch (core.web_policy).
+            from core import web_policy as _web_policy
+
+            _web_policy.set_web_allowed(None)
         except Exception as _fin_err:  # pragma: no cover - never mask the turn's own result
             print(f"[TURN EXIT] turn finalisation failed (non-fatal): {_fin_err}")
 
@@ -321,14 +451,16 @@ def _finalize_answer_text(
     url_sources: Optional[List[str]] = None,
     all_tool_results: Optional[List[Any]] = None,
     had_tool_calls: bool = False,
+    web_registry: Any = None,
 ) -> str:
     """Post-process a final answer, identically for the standard tool loop
     and the Conductor return (guard CX-24: the Conductor path used to skip all
     of it): figure-claim correction / "shown below" -> "above", inline image
-    markdown removal, the fabricated-link guard, prose hygiene, and the
-    answer-versus-trace verifier. Each note appended here is also streamed via
-    ``on_token``; the SSE layer then replaces the streamed text with the
-    returned text (``final_text``)."""
+    markdown removal, web citation cleanup ([W#] ids that exist this turn;
+    gpt-oss "【…】" markers), the fabricated-link guard, prose hygiene, and
+    the answer-versus-trace verifier (plus the web citation support check).
+    Each note appended here is also streamed via ``on_token``; the SSE layer
+    then replaces the streamed text with the returned text (``final_text``)."""
     # 7b. Claim-vs-artifact guard — models (esp. gpt-oss-120b) sometimes assert
     # that a plot/data card "is displayed above" when nothing visual was emitted
     # this turn (2026-07-04 live test P3/P6/P7/P9/P15). Append an explicit,
@@ -371,17 +503,32 @@ def _finalize_answer_text(
         return False
 
     if output_text and _turn_visuals:
-        # Cards stream as their own bubbles DURING the tool rounds, so
-        # they sit ABOVE the final prose; "shown below" is wrong even
-        # when the card exists (UI benchmark 2026-09-22, L03/L13/L14).
-        _fixed_direction = re.sub(
-            r"\b(shown|displayed|attached|rendered|plotted|presented|embedded|included|appears?)\s+below\b",
-            r"\1 above",
-            output_text,
-            flags=re.IGNORECASE,
+        # Card position is a UI layout detail: the live chat appends figure
+        # cards AFTER the assistant bubble (ChatArea addMessage) whatever
+        # their arrival time, while other views order blocks differently --
+        # "above" (2026-09-22) and "below" were each wrong somewhere (UI
+        # 2026-09-23 L03/L06). Direction-free wording is right everywhere.
+        def _direction_free(seg: str) -> str:
+            seg = re.sub(
+                r"\b(shown|displayed|attached|rendered|plotted|presented|embedded|included|appears?)\s+(?:above|below)\b",
+                r"\1 in the card",
+                seg,
+                flags=re.IGNORECASE,
+            )
+            seg = re.sub(r"\((?:shown|see|displayed)\s+(?:above|below)\)", "(see the card)", seg, flags=re.IGNORECASE)
+            # "See the CMD above" / "the cutout grid below": drop the direction
+            # (tables are NOT included -- a markdown table IS in the text; CX-14).
+            return re.sub(
+                r"\b((?:the|this|that|these|those)\s+(?:[\w-]+\s+){0,3}?(?:card|figure|plot|image|map|diagram|CMD|grid|cutouts?|panels?|chart|wedge|histogram)s?)\s+(?:above|below)\b",
+                r"\1", seg, flags=re.IGNORECASE)
+
+        # Prose only: fenced blocks and inline code are never rewritten (CX-14 verify).
+        from core.prose_hygiene import _split_code as _split_code_segments
+        _fixed_direction = "".join(
+            seg if is_code else _direction_free(seg) for is_code, seg in _split_code_segments(output_text)
         )
         if _fixed_direction != output_text:
-            print("[GUARD] Rewrote 'shown below' → 'shown above' (cards render above the prose)")
+            print("[GUARD] Rewrote 'shown above/below' → 'shown in the card' (card position depends on the view)")
             output_text = _fixed_direction
     if output_text and not _turn_visuals and _claims_a_figure(output_text):
         _artifact_correction = (
@@ -405,6 +552,27 @@ def _finalize_answer_text(
         if _n_imgs:
             output_text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", output_text)
             print(f"[GUARD] Stripped {_n_imgs} inline markdown image(s) from the answer")
+
+    # 7c-cite. Web citations (PLAN 1.5, D14): gpt-oss's own "【…】" markers
+    # become [W#] / a plain link / nothing (glued to a URL they made the link
+    # guard strip REAL links), then every [W#] group keeps only ids that exist
+    # in this turn's evidence registry. Runs after the harmony scrub (the
+    # runner strips harmony markup before calling this) and outside code.
+    if output_text:
+        try:
+            from services.web_evidence import clean_citations, normalize_native_citation_markers
+
+            _normalized = normalize_native_citation_markers(output_text)
+            if _normalized != output_text:
+                print("[WEB CITE] normalized gpt-oss citation markers")
+                output_text = _normalized
+            if web_registry is not None and "[" in output_text:
+                # only ids the model was actually shown are valid (guard CX-08)
+                output_text, _cited, _removed = clean_citations(output_text, web_registry.citable_ids())
+                if _removed:
+                    print(f"[WEB CITE] removed {len(_removed)} unknown citation id(s): {_removed[:8]}")
+        except Exception as _cite_err:
+            print(f"[WEB CITE] citation cleanup failed (non-fatal): {_cite_err}")
 
     # 7c. Fabricated-link guard — strip external URLs that no tool, web
     # search, or documentation context produced this turn (live P3: the
@@ -438,6 +606,77 @@ def _finalize_answer_text(
     # prose must match what the tools ran. Deterministic; on violation
     # a visible "Verification" block lists each unsupported claim —
     # nothing is rewritten, because a rewrite would have to invent.
+    _web_report = None
+    if output_text and web_registry is not None and len(web_registry):
+        # 7e-web. web_citation_support (PLAN 1.6): numbers / dates / ids in a
+        # sentence citing [W#] must appear in the cited excerpt(s).
+        try:
+            from core.answer_verifier import verify_web_citations
+
+            _web_report = verify_web_citations(output_text, web_registry)
+            print(f"[VERIFY] web_citation unsupported={len(_web_report.unsupported)}")
+            for _claim in _web_report.unsupported[:6]:
+                print(f"[VERIFY]   web_citation: {_claim.text[:100]!r} ({_claim.detail[:80]})")
+        except Exception as _wv_err:
+            print(f"[VERIFY] web citation check failed (non-fatal): {_wv_err}")
+            _web_report = None
+        # 7e-revise (Phase 2, QUASAR_WEB_REVISE): one bounded rewrite of ONLY the
+        # unsupported sentences (remove the value or move it to the id that
+        # supports it, never add facts), then the check runs again so the
+        # Verification block lists only what remains.
+        _web_unsupported_before = len(_web_report.unsupported) if _web_report is not None else 0
+        _revise_info: Dict[str, Any] = {"attempted": 0, "revised": 0, "skipped": "no findings"}
+        if _web_report is not None and not _web_report.ok:
+            try:
+                from core.web_revise import revise_enabled as _revise_enabled, revise_unsupported as _revise
+
+                if _revise_enabled():
+                    _revised_text, _revise_info = _revise(
+                        output_text, web_registry,
+                        turn_deadline=getattr(getattr(agent, "_tls", None), "turn_deadline", None),
+                    )
+                    if _revised_text != output_text:
+                        output_text = _revised_text
+                        from core.answer_verifier import verify_web_citations as _verify_again
+
+                        _web_report = _verify_again(output_text, web_registry)
+                        print(f"[VERIFY] web_citation unsupported after revise={len(_web_report.unsupported)}")
+                else:
+                    _revise_info = {"attempted": 0, "revised": 0, "skipped": "QUASAR_WEB_REVISE off"}
+            except Exception as _rev_err:
+                print(f"[WEB REVISE] failed (non-fatal): {_rev_err}")
+        # The unsupported-claim count per answer goes into the tool trace so
+        # WebBench can grade it (Phase 2, part C).
+        try:
+            from services.web_evidence import find_citations as _fc
+
+            _citable_ids = set(web_registry.citable_ids())
+            _check_summary = {
+                "cited_ids": [c for c in _fc(output_text) if c in _citable_ids],
+                "evidence_items": len(web_registry),
+                "unsupported_before": _web_unsupported_before,
+                "unsupported_after": len(_web_report.unsupported) if _web_report is not None else 0,
+                "revise": _revise_info,
+                "unsupported": [
+                    {"text": c.text[:200], "detail": c.detail[:200]} for c in (_web_report.unsupported if _web_report is not None else [])
+                ][:12],
+            }
+            agent._record_tool_trace(
+                "web_citation_check",
+                {"source": "answer verifier", "check": "web_citation_support"},
+                json.dumps(_check_summary, default=str)[:8000],
+                result_obj=_check_summary,
+            )
+        except Exception as _trace_err:
+            print(f"[VERIFY] web citation trace record failed (non-fatal): {_trace_err}")
+    if _web_report is not None and not _web_report.ok and not (had_tool_calls and output_text):
+        from core.answer_verifier import format_verification_block as _fmt_block
+
+        _web_block = _fmt_block(_web_report)
+        output_text += _web_block
+        if on_token:
+            on_token(_web_block)
+        _web_report = None  # surfaced
     if had_tool_calls and output_text:
         try:
             from core.answer_verifier import build_trace_summary, format_verification_block, verify_answer
@@ -461,6 +700,10 @@ def _finalize_answer_text(
                 f"checked={_verify_report.checked} cards={len(_trace_summary.cards)} "
                 f"sql={len(_trace_summary.sql_texts)} timed_out_phases={len(_trace_summary.timed_out_phases)}"
             )
+            if _web_report is not None and not _web_report.ok:
+                # one Verification block for tool AND web citation findings
+                _verify_report.unsupported.extend(_web_report.unsupported)
+                _web_report = None
             if not _verify_report.ok:
                 for _claim in _verify_report.unsupported[:8]:
                     print(f"[VERIFY]   {_claim.kind}: {_claim.text[:120]!r}")
@@ -470,6 +713,14 @@ def _finalize_answer_text(
                     on_token(_verify_block)
         except Exception as _verify_err:
             print(f"[VERIFY] verifier failed (non-fatal): {_verify_err}")
+        if _web_report is not None and not _web_report.ok:
+            # the tool verifier failed before it could merge the web findings
+            from core.answer_verifier import format_verification_block as _fmt_block
+
+            _web_block = _fmt_block(_web_report)
+            output_text += _web_block
+            if on_token:
+                on_token(_web_block)
 
     return output_text
 
@@ -490,6 +741,7 @@ def _stream_response_api_impl(
     model=None,
     run_token=None,
     _history_recovery_attempted=False,
+    web_search_mode=None,
 ):
         # Assign a unique conversation_id if none provided (isolates anonymous
         # concurrent requests so they never share OpenAI response state).
@@ -630,59 +882,332 @@ def _stream_response_api_impl(
         # 2026-07-18: "searching the web in parallel · 24s" long after the
         # search finished).
         _web_status_open_label = None
+        # Web search redesign, Phase 1 (QUASAR_WEB_GROUNDED, default on): every
+        # web result of this turn becomes numbered evidence W1..Wn in ONE
+        # registry (pre-pass, researcher email search, the model's own web
+        # tools). The main model gets the evidence BEFORE it writes and cites
+        # it inline as [W#]; flag off = the legacy "From the Web" appendix.
+        from services import web_evidence as _web_evidence
+
+        _web_registry = _web_evidence.EvidenceRegistry(query=_user_query) if _web_evidence.grounded_enabled() else None
+        _web_prepass = None        # PrepassEvidence of the running pre-pass search
+        _web_grounded = False      # evidence block injected into the model input
+        _web_step_closed = False   # the pre-pass status step was already closed
+        _web_listing_pending = False  # numbered listing waiting for the Conductor decision
+        _web_listing_images = None
+        agent._tls.web_registry = _web_registry
+
+        def _prepass_search(search_query, *, want_images, plan_job=None, reason=None):
+            """Body of every pre-pass web thread: (Phase 2) wait for the planner
+            if it is still running, search its queries against the domain pack
+            plus one unrestricted query, order the evidence by authority,
+            register carried follow-up evidence, then deep-read the top pages
+            within QUASAR_WEB_DEEP_READ_BUDGET. Planner off: the Phase 1 single
+            search. Never raises."""
+            try:
+                plan = _web_plan
+                if plan is None and plan_job is not None:
+                    _t_plan = time.monotonic()
+                    plan = plan_job.wait()
+                    if _web_prepass is not None:
+                        # the planner wait is credited to the evidence budget
+                        _web_prepass.credit(min(time.monotonic() - _t_plan, _web_planner.planner_timeout_seconds()))
+                _web_result_holder["plan"] = plan
+                use_plan = plan is not None and _web_planner.planner_enabled()
+                from services import web_domain_packs as _packs
+
+                person = reason == "researcher_supplement"
+                if use_plan:
+                    queries = [q for q in plan.queries if q] or [search_query]
+                    pack = "researcher" if person else plan.domain_pack
+                    if pack == _packs.DEFAULT_PACK and not person:
+                        pack = _packs.infer_pack(search_query)
+                    freshness = plan.freshness
+                    deep_query = " ".join(dict.fromkeys([plan.primary_query(search_query), *plan.entity_terms()]))
+                    entities = plan.entities
+                    follow_up = bool(plan.follow_up)
+                    _emit_web_decision(True, reason if reason not in (None, "planner") else plan.reason, queries, plan, "planner")
+                else:
+                    queries = [search_query]
+                    pack = _packs.infer_pack(search_query, person=person) if _web_planner.planner_enabled() else _packs.DEFAULT_PACK
+                    freshness = "any"
+                    deep_query = _user_query
+                    entities = None
+                    follow_up = _web_planner.looks_like_follow_up(_user_query)
+                    _emit_web_decision(True, reason or "web search", queries, None, "deterministic")
+                # Follow-up: the previous turn's cited pages come back as this
+                # turn's evidence (new ids), so the answer can cite them again.
+                if (
+                    _web_registry is not None
+                    and _web_planner.planner_enabled()
+                    and _web_planner.carry_evidence_enabled()
+                    and follow_up
+                    and _carried_state.get("evidence")
+                ):
+                    carried = _web_registry.add_carried(_carried_state["evidence"][:8])   # same cap as the store (P2-21)
+                    if carried:
+                        print(f"[WEB EVIDENCE] carried {len(carried)} page(s) from the previous turn: {[ev.id for ev in carried]}")
+
+                _late_labels = set()
+
+                def _on_search(kind, q, restricted, res):
+                    if not on_status:
+                        return
+                    label = f'Searching the web: "{q[:90]}"' + (" (official sites)" if restricted else "")
+                    if kind == "start":
+                        on_status(label, "running")
+                    elif kind == "done":
+                        if label in _late_labels:
+                            return   # closed as late already; a later finish must not flip it (P2-16)
+                        on_status(label, "completed" if isinstance(res, dict) and res.get("success") else "error")
+                    else:
+                        _late_labels.add(label)
+                        on_status(label, "error")
+
+                if _web_planner.planner_enabled() and callable(getattr(agent, "_web_search_plan", None)):
+                    data = agent._web_search_plan(
+                        queries,
+                        include_domains=_packs.pack_domains(pack),
+                        freshness=None if freshness == "any" else freshness,
+                        topic="news" if (pack == "transients" and freshness in ("day", "week", "month")) else None,
+                        want_images=bool(want_images),
+                        on_search=_on_search,
+                    )
+                else:
+                    data = agent._tavily_web_search(
+                        query=search_query,
+                        max_results=10,
+                        search_depth="basic",
+                        want_images=want_images,
+                    )
+                _web_result_holder["data"] = data
+                if _web_prepass is not None and isinstance(data, dict) and data.get("success"):
+                    _web_prepass.record_search(data, origin="prepass", query=queries[0])
+                    if _web_planner.planner_enabled() and _web_registry is not None:
+                        # Authority first, then the current cycle / document,
+                        # then relevance (PLAN 2.2 + the light part of 3.2).
+                        ordered = _packs.order_evidence(_web_registry.items(), pack=pack, query=_user_query, entities=entities)
+                        if _web_registry.reorder(ordered):
+                            _web_prepass.items = [ev for ev in ordered if ev.origin == "prepass"]
+                    if _web_evidence.deep_read_enabled():
+                        # this search's own top results, in its order (guard CX-09)
+                        # the pages deep_read will really attempt (no PDFs, no blocked hosts; P2-16)
+                        targets = [ev for ev in _web_prepass.items if not ev.deep_read and not _web_evidence._skip_deep_read(ev.url)][:3]
+                        label = f"Reading {len(targets)} page{'s' if len(targets) != 1 else ''}" if targets else ""
+                        if label and on_status and _web_planner.planner_enabled():
+                            on_status(label, "running")
+                        n_read = _web_evidence.deep_read(_web_registry, deep_query, candidates=_web_prepass.items)
+                        if label and on_status and _web_planner.planner_enabled():
+                            on_status(label, "completed" if n_read or not targets else "error")
+            except Exception as _e:
+                _web_result_holder["error"] = str(_e)
+            finally:
+                if _web_prepass is not None:
+                    _web_prepass.finish()
+
+        def _emit_registry_sources(cited_ids=(), *, replace=False, phase="retrieved", images=None):
+            """web_sources event built from the registry: ids, cited flags,
+            dates, domains; ``replace`` marks the final post-answer listing."""
+            if _web_registry is None or not len(_web_registry):
+                return
+            evt = {
+                "type": "web_sources",
+                "sources": _web_registry.to_sse_sources(list(cited_ids)),
+                "images": list(images or []),
+                "query": _web_search_query or _user_query,
+                "provider": ", ".join(dict.fromkeys(ev.provider for ev in _web_registry.items() if ev.provider)),
+                "image_provider": "",
+                "search_type": "",
+                "phase": phase,
+                "replace": bool(replace),
+            }
+            if replace:
+                evt["cited_ids"] = list(cited_ids)
+            on_event(evt)
 
         _uq = _user_query.lower()
         # Detect explicit request to search the web
-        _explicit_web_search = bool(re.search(
-            r'\b(?:use web\s*search|search the web|web\s*search|internet search|google it|tavily|online search)\b',
-            _uq
-        ))
-        # Detect explicit request NOT to search the web
-        _explicit_no_web = bool(re.search(
-            r'\b(?:no web search|dont search the web|dont use web search|without web search|no internet search)\b',
-            _uq
-        )) or not web_search or "[GROUNDED_SUMMARY_MODE]" in query
+        _explicit_web_search = bool(_EXPLICIT_WEB_RE.search(_uq))
+        # Web search mode (PLAN 2.4): off | auto | always. The boolean switch
+        # still works (True = auto, False = off).
+        _web_mode = _normalize_web_mode(web_search_mode, web_search)
+        from core import bench_toolset as _bench_ts
+
+        if _bench_ts.active():
+            # Benchmark allowlist arm: the automatic web pre-pass never runs;
+            # web tools are reachable only as allowlisted tool calls (guard CX-13).
+            _web_mode = "off"
+        # Detect explicit request NOT to search the web (checked first, D5),
+        # the UI switch / mode, and GROUNDED mode.
+        _explicit_no_web = (
+            _explicit_no_web_requested(_uq)
+            or _web_mode == "off"
+            or "[GROUNDED_SUMMARY_MODE]" in query
+        )
+        # Web is off for the WHOLE turn when any of the three says so: the
+        # model gets no web tools and every thread of this turn (tool guard,
+        # Conductor sub-agents) refuses them, not only the pre-pass (D1;
+        # guard CX-01: an explicit "don't search the web" or GROUNDED mode with
+        # the switch on used to leave the web tools callable).
+        _web_allowed_turn = not _explicit_no_web
+        from core import web_policy as _web_policy
+
+        _web_policy.set_web_allowed(_web_allowed_turn)
+        if _bench_ts.active():
+            # Benchmark allowlist arm (guard CX-13): the pre-pass stays off
+            # (_web_allowed_turn is False), but an allowlisted web TOOL must
+            # still be executable, so the execution policy follows the allowlist.
+            _web_policy.set_web_allowed(any(
+                _web_policy.is_web_tool(_n) and _bench_ts.allowed(_n) for _n in agent.tool_registry.names()
+            ))
+        # Image tiles only for an imagery request (D7): no Tavily image
+        # prefetch for text answers. An explicit picture request ("search the
+        # web for an image of M87") counts too (guard CX-04).
+        from services.web_search_service import wants_image_search as _wants_image_search
+
+        _want_web_images = bool(_IMAGERY_REQUEST_RE.search(_uq)) or _wants_image_search(_uq)
 
         # Skip web search for live-data and paper queries — archives, alerts,
         # catalogs, imagery, spectra, photometry all hit dedicated live
         # databases (ALMA/CADC, ALeRCE, Data Lab, SparCL, NED, ...), not the web.
         _is_archive_or_paper = agent._is_live_data_query(_uq)
 
-        # Detect OpenAlex-targeted researcher query (copied from below for early execution)
+        # Detect OpenAlex-targeted researcher query (copied from below for early
+        # execution). Planner on: a person-like subject is required (D15).
         _bare_lower = _user_query.lower()
-        _is_researcher_query = bool(re.search(
-            r'\b(?:who is|who\'s|tell me about|look up|profile of|'
-            r'where does .+ work|what does .+ (?:research|study|work on)|'
-            r'what (?:topics?|areas?|fields?) does .+ (?:research|study|work)|'
-            r'how many papers has .+ (?:published|written|authored)|'
-            r'which institution|h-index|orcid|'
-            r'.+\'s research|.+\'s h.index|.+\'s publications?)\b',
-            _bare_lower,
-        )) and not bool(re.search(
-            r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b',
-            _bare_lower,
-        )) and not agent._LIVE_DATA_KEYWORDS_RE.search(_bare_lower)
+        _is_researcher_query = _researcher_query(agent, _user_query)
 
         _web_search_query = None
+        # Phase 2 planner (QUASAR_WEB_PLANNER): one JSON call that decides
+        # need_web for the undecided case and rewrites the queries (follow-ups
+        # resolved from the conversation), picks a domain pack and freshness.
+        # It starts now so the deterministic checks and the pre-pass thread
+        # overlap it; it fails closed to the deterministic path.
+        _planner_job = None
+        _web_plan = None
+        _carried_state = {"evidence": [], "entities": []}
+        _planner_on = bool(_web_planner.planner_enabled() and not _explicit_no_web and agent._has_web_provider_key())
+        if _planner_on:
+            try:
+                # keyed by user AND conversation (P2-08: an anonymous caller must
+                # not recall another user's pages by guessing a conversation id)
+                _carry_key = f"{user_id or 'anonymous'}|{conversation_id}"
+                _carried_state = _web_planner.conversation_web_memory(agent).recall(_carry_key)
+                _hist = []
+                try:
+                    _hist = [
+                        {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+                        for m in (agent.memory.get_last_n_turns(_web_planner.HISTORY_TURNS) or [])
+                        if isinstance(m, dict)
+                    ]
+                    if _hist and _hist[-1]["role"] == "user" and _hist[-1]["content"].strip() == _user_query.strip():
+                        _hist = _hist[:-1]
+                except Exception:
+                    _hist = []
+                # PLAN 2.1 named SessionMemory.get_context() as an input, but that
+                # object is process-wide (one agent per process): its summary is
+                # whichever user's thread ran last (review P2-01). The planner sees
+                # this conversation's history and entities only.
+                _session_ctx = ""
+                from core.router import llm_knowledge_cutoff as _llm_cutoff
+                from datetime import date as _date
 
+                _planner_ctx = _web_planner.PlannerContext(
+                    history=_hist,
+                    session_context=_session_ctx,
+                    entities=list(_carried_state.get("entities") or []),
+                    today=_date.today(),
+                    cutoff=_llm_cutoff(),
+                    web_mode=_web_mode,
+                )
+                _planner_job = _web_planner.PlannerJob(_user_query, _planner_ctx).start()
+            except Exception as _plan_err:
+                print(f"[WEB PLANNER] could not start (non-fatal): {_plan_err}")
+                _planner_job = None
+
+        _web_decision_sent = False
+
+        def _emit_web_decision(need_web, reason, queries=(), plan=None, source="deterministic", force=False):
+            """ONE web_decision event per turn (PLAN 2.4): the badge under the
+            answer. Only with the planner on (Phase 1 had no such event).
+            ``force``: the model's own web tool ran after a "skipped" decision;
+            the badge is corrected once (the UI keeps the latest event)."""
+            nonlocal _web_decision_sent
+            if (_web_decision_sent and not force) or not _web_planner.planner_enabled():
+                return
+            _web_decision_sent = True
+            evt = {
+                "type": "web_decision",
+                "mode": _web_mode,
+                "need_web": bool(need_web),
+                "reason": str(reason or "")[:160],
+                "queries": [str(q)[:200] for q in list(queries or [])[:3]],
+                "source": source,
+                "planner_ms": int(round(plan.elapsed_s * 1000)) if plan is not None else None,
+                "domain_pack": plan.domain_pack if plan is not None else None,
+                "freshness": plan.freshness if plan is not None else None,
+                "follow_up": bool(plan.follow_up) if plan is not None else False,
+            }
+            try:
+                on_event(evt)
+            except Exception:
+                pass
+
+        _web_decision_tool_fixed = False
+        _no_web_reason = None
         if not _explicit_no_web:
-            if _explicit_web_search:
+            if _web_mode == "always":
+                _web_search_query = _user_query
+                _web_search_reason = "always"
+            elif _explicit_web_search:
                 _web_search_query = _user_query
                 _web_search_reason = "explicit"
             elif _is_researcher_query:
                 _web_search_query = _user_query
                 _web_search_reason = "researcher_supplement"
+            elif agent._has_web_provider_key() and _policy_web_override(_user_query):
+                # Policy / deadline questions need the current rules even when
+                # they mention data or archives (D6).
+                _web_search_query = _user_query
+                _web_search_reason = "policy"
             elif not _is_archive_or_paper:
                 # Check standard year/cutoff/freshness matches
                 _cutoff_match = agent._detect_beyond_cutoff(_user_query)
                 if _cutoff_match:
                     _web_search_query = _cutoff_match
                     _web_search_reason = "cutoff"
-                else:
-                    # Run deepseek-v4-flash intent classification fallback
+                elif _planner_job is not None:
+                    # The planner decides the undecided case (bounded wait; a
+                    # timeout or bad output fails closed: no web this turn).
+                    _web_plan = _planner_job.wait()
+                    if _web_plan is not None and _web_plan.need_web:
+                        _web_search_query = _web_plan.primary_query(_user_query) or _user_query
+                        _web_search_reason = "planner"
+                    elif _web_plan is not None:
+                        _no_web_reason = _web_plan.reason or "answered without the web"
+                    else:
+                        _no_web_reason = "web planner unavailable"
+                elif not _web_planner.planner_enabled():
+                    # Phase 1 path: the YES/NO intent classifier
                     if agent._has_web_provider_key() and agent._detect_web_search_needed_via_llm(_user_query):
                         _web_search_query = _user_query
                         _web_search_reason = "intent_detection"
+            else:
+                _no_web_reason = "archive or paper tools answer this"
+        elif _web_mode == "off":
+            _no_web_reason = "web search is off"
+        elif "[GROUNDED_SUMMARY_MODE]" in query:
+            _no_web_reason = "grounded mode"
+        else:
+            _no_web_reason = "you asked not to search the web"
+
+        if not _web_search_query:
+            if _web_plan is None and _planner_job is not None and not _explicit_no_web and _no_web_reason is None:
+                _no_web_reason = "no current information needed"
+            _emit_web_decision(
+                False, _no_web_reason or "no current information needed", (),
+                _web_plan, "planner" if _web_plan is not None else "deterministic",
+            )
 
         if _web_search_query:
             if _web_search_reason == "researcher_supplement":
@@ -690,22 +1215,13 @@ def _stream_response_api_impl(
                 if on_status:
                     on_status(_web_status_open_label, "running")
                 # Extract the person's name for targeted search
-                _person_name = re.sub(
-                    r'\b(?:who is|who\'s|tell me about|look up|profile of)\b',
-                    '', _user_query, flags=re.IGNORECASE,
-                ).strip().strip('?').strip()
+                _person_name = _web_planner.researcher_name(_user_query)
 
                 # Thread 1: General context search
                 def _bg_web_search_researcher():
-                    try:
-                        _web_result_holder["data"] = agent._tavily_web_search(
-                            query=_user_query,
-                            max_results=10,
-                            search_depth="basic",
-                        )
-                    except Exception as _e:
-                        _web_result_holder["error"] = str(_e)
+                    _prepass_search(_user_query, want_images=False, plan_job=_planner_job, reason="researcher_supplement")
 
+                _web_prepass = _web_evidence.PrepassEvidence(_web_registry) if _web_registry is not None else None
                 _web_thread = threading.Thread(target=_turn_bound(_bg_web_search_researcher, "web", _turn_cancel, agent), daemon=True)
                 _web_thread.start()
 
@@ -716,6 +1232,7 @@ def _stream_response_api_impl(
                             query=f"{_person_name} email contact professor astronomy",
                             max_results=3,
                             search_depth="basic",
+                            want_images=False,
                         )
                     except Exception as _e:
                         _email_result_holder["error"] = str(_e)
@@ -728,19 +1245,20 @@ def _stream_response_api_impl(
                     msg = "⚡ Time period beyond training knowledge cutoff detected — searching the web in parallel"
                 elif _web_search_reason == "intent_detection":
                     msg = "🌐 Query requires real-time information — searching the web in parallel"
+                elif _web_search_reason == "planner":
+                    msg = "🌐 Query needs current information: searching the web in parallel"
+                elif _web_search_reason == "always":
+                    msg = "🌐 Web search always on: searching the web in parallel"
+                elif _web_search_reason == "policy":
+                    msg = "🌐 Policy or deadline question: searching the web for the current rules"
                 _web_status_open_label = msg
                 if on_status:
                     on_status(msg, "running")
 
                 def _bg_web_search():
-                    try:
-                        _web_result_holder["data"] = agent._tavily_web_search(
-                            query=_web_search_query,
-                            max_results=10,
-                            search_depth="basic",
-                        )
-                    except Exception as _e:
-                        _web_result_holder["error"] = str(_e)
+                    _prepass_search(_web_search_query, want_images=_want_web_images, plan_job=_planner_job, reason=_web_search_reason)
+
+                _web_prepass = _web_evidence.PrepassEvidence(_web_registry) if _web_registry is not None else None
 
                 _web_thread = threading.Thread(target=_turn_bound(_bg_web_search, "web", _turn_cancel, agent), daemon=True)
                 _web_thread.start()
@@ -829,7 +1347,17 @@ def _stream_response_api_impl(
             _should_rag = False
 
         _alma_science_route = agent._route_alma_science_archive_query(_user_query)
-        _is_alma_science_archive_query = bool(_alma_science_route) or bool(
+        # A census is an ALMA count / list request. A policy question is never a
+        # census (review P2-12) UNLESS it also asks to count or list ("list ALMA
+        # solar observations whose proprietary period has ended", review P2-31).
+        _census_intent = bool(re.search(
+            r"\b(?:how\s+many|number\s+of|count|list|find|search|show|which)\b.*"
+            r"\b(?:projects?|observations?|datasets?|mous|targets?|sources?|fields?|data)\b",
+            _query_lower,
+        ))
+        _is_alma_science_archive_query = (
+            bool(_alma_science_route) and (_census_intent or not _policy_web_override(_user_query))
+        ) or bool(
             re.search(
                 r"\b(?:cycle\s+\d{1,2}|observed\s+the\s+sun|solar\s+projects?|"
                 r"12m|7m|total\s+power|high[-\s]?resolution|"
@@ -837,6 +1365,20 @@ def _stream_response_api_impl(
                 _query_lower,
             )
             and re.search(r"\b(?:alma|archive|projects?|observations?|band\s*\d|data|co|continuum)\b", _query_lower)
+            # "What is the proprietary period for ALMA Cycle 13 data?" is a
+            # policy question, not an archive census: the forced
+            # alma_project_census call added 20 s and an off-topic block
+            # (WebBench POL-01, Phase 2 item E).
+            and not _policy_web_override(_user_query)
+            # A census is an ALMA count / filter request. "HST ... Cycle 34 data"
+            # and "when does Cycle 13 observing start" matched on "cycle N" plus
+            # a bare "data" / "alma" (WebBench POL-05, POL-06).
+            and re.search(r"\balma\b", _query_lower)
+            and re.search(
+                r"\b(?:how\s+many|number\s+of|count|list|find|search|show|which|what)\b.*"
+                r"\b(?:projects?|observations?|datasets?|mous|targets?|sources?|fields?|data)\b",
+                _query_lower,
+            )
         )
         if _is_alma_science_archive_query:
             _should_rag = False
@@ -863,7 +1405,10 @@ def _stream_response_api_impl(
         try:
             from core.oneshot_routing import detect_oneshot_intent
 
-            _oneshot_intent = detect_oneshot_intent(_user_query)
+            from core import bench_toolset as _bench
+
+            # A benchmark allowlist arm must not be steered to native tools.
+            _oneshot_intent = None if _bench.active() else detect_oneshot_intent(_user_query)
         except Exception as _oneshot_err:
             print(f"[ROUTING] one-shot intent detection failed (non-fatal): {_oneshot_err}")
             _oneshot_intent = None
@@ -959,19 +1504,8 @@ def _stream_response_api_impl(
         # (enriched query) because the enrichment wrapper may contain ALMA
         # terms that would falsely trigger the exclusion regex.
         _bare_lower = _user_query.lower()
-        _is_researcher_query = bool(re.search(
-            r'\b(?:who is|who\'s|tell me about|look up|profile of|'
-            r'where does .+ work|what does .+ (?:research|study|work on)|'
-            r'what (?:topics?|areas?|fields?) does .+ (?:research|study|work)|'
-            r'how many papers has .+ (?:published|written|authored)|'
-            r'which institution|h-index|orcid|'
-            r'.+\'s research|.+\'s h.index|.+\'s publications?)\b',
-            _bare_lower,
-        )) and not bool(re.search(
-            # Exclude ALMA instrument/process questions (only in the BARE query)
-            r'\b(?:correlator|band\s?\d|pipeline|calibrat|antenna|baseline)\b',
-            _bare_lower,
-        )) and not agent._LIVE_DATA_KEYWORDS_RE.search(_bare_lower)
+        # Same decision as the early pre-pass check above (D15 with the planner on).
+        _is_researcher_query = _researcher_query(agent, _user_query)
         _is_trend_query = bool(re.search(
             r'\b(?:interest in .+ growing|publication trend|research trend|'
             r'how much research|how many papers on|papers per year|'
@@ -993,29 +1527,27 @@ def _stream_response_api_impl(
             #   1. General context search (bio, news, awards, personal page)
             #   2. Targeted email/contact search (faculty page, directory)
             # Both run concurrently with zero extra latency.
-            if _is_researcher_query and _web_thread is None and agent._has_web_provider_key():
+            # D1: this second researcher path ignored the UI switch, an explicit
+            # "no web" and GROUNDED mode (the first path above was guarded).
+            if (
+                _is_researcher_query
+                and not _explicit_no_web
+                and _web_thread is None
+                and agent._has_web_provider_key()
+            ):
                 _web_search_reason = "researcher_supplement"
                 _web_status_open_label = "Searching the web for researcher profile"
                 if on_status:
                     on_status(_web_status_open_label, "running")
 
                 # Extract the person's name from the query for targeted searches
-                _person_name = re.sub(
-                    r'\b(?:who is|who\'s|tell me about|look up|profile of)\b',
-                    '', _user_query, flags=re.IGNORECASE,
-                ).strip().strip('?').strip()
+                _person_name = _web_planner.researcher_name(_user_query)
 
                 # Thread 1: General context search
                 def _bg_web_search_researcher():
-                    try:
-                        _web_result_holder["data"] = agent._tavily_web_search(
-                            query=_user_query,
-                            max_results=10,
-                            search_depth="basic",
-                        )
-                    except Exception as _e:
-                        _web_result_holder["error"] = str(_e)
+                    _prepass_search(_user_query, want_images=False, plan_job=_planner_job, reason="researcher_supplement")
 
+                _web_prepass = _web_evidence.PrepassEvidence(_web_registry) if _web_registry is not None else None
                 _web_thread = threading.Thread(target=_turn_bound(_bg_web_search_researcher, "web", _turn_cancel, agent), daemon=True)
                 _web_thread.start()
 
@@ -1026,6 +1558,7 @@ def _stream_response_api_impl(
                             query=f"{_person_name} email contact professor astronomy",
                             max_results=3,
                             search_depth="basic",
+                            want_images=False,
                         )
                     except Exception as _e:
                         _email_result_holder["error"] = str(_e)
@@ -1176,16 +1709,19 @@ def _stream_response_api_impl(
                     # - Policy/proposal questions that change over time
                     # - Queries explicitly asking for latest/recent/current info
                     _needs_web_supplement = False
-                    if _web_thread is None and agent._has_web_provider_key():
+                    # With the planner on, the planner IS the freshness decision
+                    # (PLAN 2.1 folds the RAG supplement in): a turn it decided
+                    # against never searches here (review P2-04, the badge said
+                    # "skipped" while this supplement searched).
+                    if (
+                        _web_thread is None
+                        and agent._has_web_provider_key()
+                        and not (_web_planner.planner_enabled() and _web_decision_sent)
+                    ):
                         _uq = _user_query.lower()
 
-                        # Check if the user explicitly requested NOT to use web search
-                        _explicit_no_web = bool(re.search(
-                            r'\b(?:no web search|dont search the web|dont use web search|without web search|no internet search)\b',
-                            _uq
-                        )) or not web_search or "[GROUNDED_SUMMARY_MODE]" in query
-
-                        if _explicit_no_web:
+                        # the turn-level switch / mode / GROUNDED decision (P2-14)
+                        if not _web_allowed_turn:
                             _needs_web_supplement = False
                         else:
                             # Trigger web search only if the query asks for fresh/current info
@@ -1206,15 +1742,9 @@ def _stream_response_api_impl(
                             on_status(_web_status_open_label, "running")
 
                         def _bg_web_search_rag():
-                            try:
-                                _web_result_holder["data"] = agent._tavily_web_search(
-                                    query=_user_query,
-                                    max_results=10,
-                                    search_depth="basic",
-                                )
-                            except Exception as _e:
-                                _web_result_holder["error"] = str(_e)
+                            _prepass_search(_user_query, want_images=False)
 
+                        _web_prepass = _web_evidence.PrepassEvidence(_web_registry) if _web_registry is not None else None
                         _web_thread = threading.Thread(target=_turn_bound(_bg_web_search_rag, "web-rag", _turn_cancel, agent), daemon=True)
                         _web_thread.start()
 
@@ -1238,12 +1768,24 @@ def _stream_response_api_impl(
                 print(f"[WARNING] mem0 search failed: {e}")
         
         # 3. Build tools list
-        tools = agent._build_tools_for_responses_api()
+        # `or []`: an allowlist that matches nothing yields no tools, not a crash (guard CX-10).
+        tools = agent._build_tools_for_responses_api() or []
         disabled_web_note = ""
-        if not web_search:
+        _has_web_tool = any(str(t.get("name", "")).startswith("web_") for t in tools)
+        if _bench_ts.active():
+            # The allowlist already decided which web tools exist; only tell
+            # the model when none do.
+            _strip_web = False
+            _needs_web_note = not _has_web_tool
+        else:
+            _strip_web = _needs_web_note = not _web_allowed_turn
+        if _strip_web:
+            # Switch off, "don't search the web", or GROUNDED mode (guard CX-01).
             tools = [t for t in tools if not (t.get("name", "").startswith("web_") or t.get("name", "") == "web_search")]
+        if _needs_web_note:
+            _who = "for this session" if _bench_ts.active() else "for this request by the user"
             disabled_web_note = (
-                "\n\nNOTE: Web search is DISABLED for this request by the user. You have no web tools. "
+                f"\n\nNOTE: Web search is DISABLED {_who}. You have no web tools. "
                 "Do not include an 'Updated Information from the Web' section or any web-sourced "
                 "claims/links, and do not imply web verification. Answer from internal tools, "
                 "documentation context, and prior knowledge only, and if freshness matters, say web "
@@ -1270,10 +1812,10 @@ def _stream_response_api_impl(
                 "NEVER write 'Page unknown', 'Date: unknown', or make up your own Relevance scores.\n"
                 "2. After presenting the documentation-based answer, add a disclaimer line: "
                 "'*📚 The above is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies.*'\n"
-                "3. WEB SECTION: ONLY if web search results are actually present in your context, summarize them under "
-                "'🌐 Updated Information from the Web:', citing ONLY URLs that appear verbatim in those results — never "
-                "invent or reconstruct a link. If no web results are present or none are relevant, omit the section "
-                "entirely (a documentation-only answer is fine)."
+                "3. WEB EVIDENCE: ONLY if a WEB EVIDENCE block with [W#] tags is present in your context, cite each "
+                "web fact inline with its tag right after the claim (e.g. [W2]); do not add a separate web section and "
+                "never invent a tag or a link. If no web evidence is present, do not add web content "
+                "(a documentation-only answer is fine)."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}{disabled_web_note}\n\nUser: {query}"
 
@@ -1284,6 +1826,16 @@ def _stream_response_api_impl(
         # E.g. "How many papers has Paola Caselli published?" matches both
         # _is_paper_query (contains 'papers') and _is_researcher_query,
         # but should route to lookup_researcher, not search_papers.
+        from core import bench_toolset as _bench_ts
+
+        if _bench_ts.active():
+            # Benchmark allowlist arm: none of the native-tool directives or
+            # forced first-round tool calls below may fire.
+            _is_openalex_query = _is_paper_query = False
+            _is_archive_fetch = _is_data_product_triage_query = False
+            _is_alma_science_archive_query = _is_cross_archive_source_match_query = False
+            _is_archive_overlay_query = _is_imagery_request = _is_radio_sed_query = False
+            _oneshot_intent = None
         _oneshot_tool = (_oneshot_intent or {}).get("tool")
         if _is_openalex_query:
             pass  # handled below
@@ -1315,10 +1867,17 @@ def _stream_response_api_impl(
                 if _email_thread is not None:
                     _email_thread.join(timeout=8)
                     _email_data = _email_result_holder.get("data")
+                    if _web_registry is not None and isinstance(_email_data, dict) and _email_data.get("success"):
+                        # The contact search is web evidence too: its pages get
+                        # W# ids in the same registry (PLAN 1.3, D2 family).
+                        _web_registry.add_from_payload(_email_data, origin="researcher_email")
                     if _email_data and _email_data.get("success"):
                         _email_snippets = []
                         for _r in _email_data.get("results", [])[:3]:
-                            _snippet = _r.get("content", "").strip()
+                            # Normalized results carry "snippet"; "content" is the
+                            # raw Tavily field (D2: reading only "content" left
+                            # the contact context always empty).
+                            _snippet = str(_r.get("snippet") or _r.get("content") or "").strip()
                             if _snippet:
                                 _email_snippets.append(_snippet)
                         if _email_snippets:
@@ -1391,7 +1950,50 @@ def _stream_response_api_impl(
         # 4c. Prevent duplicate web searches — when the parallel cutoff search
         #     is already running, tell the LLM not to call web_search itagent.
         #     This eliminates redundant Tavily calls and speeds up response time.
-        if _web_search_query is not None:
+        # 4d. Grounded web evidence (PLAN 1.3): JOIN the pre-pass search (bounded
+        #     by QUASAR_WEB_EVIDENCE_WAIT from when it started) and hand the
+        #     numbered evidence to the model BEFORE it writes. Not ready in time
+        #     -> the legacy behaviour below, exactly, so latency never regresses.
+        _web_block = ""
+        if _web_prepass is not None and _web_registry is not None:
+            full_input, _web_block = _inject_web_evidence(
+                full_input, query, _web_registry, _web_prepass,
+                evidence_query=_web_search_query or _user_query,
+            )
+        if _web_block:
+            _web_grounded = True
+            # The search is done (a deep read may still refine excerpts):
+            # close its step now and show the sources while the answer is
+            # being written (PLAN 1.7).
+            _close_web_step(on_status, _web_status_open_label, True, 0)
+            _web_step_closed = True
+            _prepass_data = _web_result_holder.get("data")
+            # The numbered listing goes out once it is known the standard path
+            # answers (below, before its first model call): a Conductor turn
+            # never sees this evidence and must not show it numbered (guard CX-02).
+            _web_listing_images = (
+                _web_event_payload(_prepass_data, keep_images=bool(_want_web_images)).get("images")
+                if isinstance(_prepass_data, dict) else None
+            )
+            _web_listing_pending = True
+            # The pre-pass payload joins the tool trace so the verifier and the
+            # Show-query panel see what the model was given (PLAN 1.5).
+            try:
+                _trace_args = {"query": _web_search_query or _user_query, "source": "pre-pass"}
+                _plan_for_trace = _web_result_holder.get("plan")
+                if _plan_for_trace is not None:
+                    _trace_args["plan"] = _plan_for_trace.as_dict()
+                if isinstance(_prepass_data, dict) and _prepass_data.get("queries"):
+                    _trace_args["queries"] = list(_prepass_data.get("queries") or [])
+                agent._record_tool_trace(
+                    "web_search",
+                    _trace_args,
+                    json.dumps(_prepass_data, default=str)[:8000],
+                    result_obj=_prepass_data,
+                )
+            except Exception:
+                pass
+        elif _web_search_query is not None:
             full_input += (
                 "\n\n[SYSTEM NOTE: A web search is already running in parallel for this query. "
                 "Do NOT call the `web_search` tool yourself — the results will be appended "
@@ -1405,8 +2007,10 @@ def _stream_response_api_impl(
         #     separately via `context=rag_context` so the planner can use it for planning
         #     without it polluting the DAG decomposition or synthesis prompts.
         try:
+            from core import bench_toolset as _bench_ts
+
             complexity = agent.complexity_detector.assess(_user_query).score
-            if complexity > Conductor.COMPLEXITY_THRESHOLD:
+            if complexity > Conductor.COMPLEXITY_THRESHOLD and not _bench_ts.active():
                 import asyncio, json as _json
                 trace_id = agent.query_tracer.new_trace(_user_query, user_id=user_id)
                 if on_status:
@@ -1475,7 +2079,10 @@ def _stream_response_api_impl(
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         try:
-                            with reinstall_llm_request_context(_parent_llm_ctx):
+                            # the Conductor thread carries this turn's web switch and
+                            # event sink to its sub-agent threads (guard CX-01)
+                            with reinstall_llm_request_context(_parent_llm_ctx), \
+                                    _web_policy.web_scope(_web_allowed_turn, on_status):
                                 conductor_answer, conductor_run = loop.run_until_complete(
                                     agent.conductor.orchestrate(
                                     _user_query,
@@ -1488,6 +2095,7 @@ def _stream_response_api_impl(
                                     plan_feedback_queue=plan_feedback_queue,
                                     user_id=user_id,
                                     session_id=conversation_id,
+                                    web_search=_web_allowed_turn,
                                 )
                             )
                         finally:
@@ -1539,16 +2147,33 @@ def _stream_response_api_impl(
                     agent.query_tracer.end_trace(trace_id, "completed")
                     # Append parallel web search results to conductor answer
                     if _web_thread is not None:
-                        _web_thread.join(timeout=15)
-                        if on_status:
-                            # Close the EXACT label the pre-pass opened — the UI
-                            # matches steps by text, so a rebuilt label leaves
-                            # the original step spinning forever.
-                            on_status(
-                                _web_status_open_label or "Searching the web in parallel",
-                                "completed",
-                            )
-                        web_data = _web_result_holder.get("data")
+                        # Close the EXACT label the pre-pass opened — the UI
+                        # matches steps by text, so a rebuilt label leaves the
+                        # original step spinning forever; a timed-out join closes
+                        # as timed out, not "completed" (D9).
+                        _web_finished = (
+                            _web_prepass.search_done.wait(15) if _web_prepass is not None
+                            else _join_web_thread(_web_thread, 15)
+                        )
+                        if not _web_step_closed:
+                            _close_web_step(on_status, _web_status_open_label, _web_finished, 15)
+                        # The Conductor plans and synthesizes from the bare query, so
+                        # it never saw the evidence block: its answer keeps the legacy
+                        # appended web summary (Phase 1 deviation, see JOURNAL.md).
+                        web_data = (_web_result_holder.get("data") if _web_finished else None) or (
+                            _web_result_holder.get("data") if _web_grounded else None
+                        )
+                        if web_data and web_data.get("success") and not _web_grounded:
+                            # the Conductor path's web payload joins the trace (guard CX-07)
+                            try:
+                                agent._record_tool_trace(
+                                    "web_search",
+                                    {"query": _web_search_query or _user_query, "source": "pre-pass"},
+                                    json.dumps(web_data, default=str)[:8000],
+                                    result_obj=web_data,
+                                )
+                            except Exception:
+                                pass
                         if web_data and web_data.get("success"):
                             # Synthesize a query-relevant summary instead of using
                             # the raw Tavily answer which is often generic.
@@ -1581,7 +2206,24 @@ def _stream_response_api_impl(
                                     )
                                 web_event = agent._build_web_sources_event(web_event_payload)
                                 if web_event:
+                                    if _web_grounded:
+                                        # A numbered listing went out before routing; the
+                                        # Conductor never saw that evidence, so its answer
+                                        # gets the plain (id-less) listing (guard CX-02).
+                                        web_event["replace"] = True
                                     on_event(web_event)
+                        elif _web_grounded and _web_registry is not None and len(_web_registry):
+                            # no payload to rebuild from: strip the ids of the early listing
+                            on_event({
+                                "type": "web_sources",
+                                "sources": [
+                                    {k: v for k, v in s.items() if k not in ("id", "cited")}
+                                    for s in _web_registry.to_sse_sources()
+                                ],
+                                "images": [], "query": _web_search_query or _user_query,
+                                "provider": "", "image_provider": "", "search_type": "",
+                                "replace": True,
+                            })
                     # Re-emit accumulated images via last_run_result so the SSE
                     # loop in main.py can emit them as inline image events.
                     # `self` was the pre-extraction receiver — a latent NameError
@@ -1611,12 +2253,22 @@ def _stream_response_api_impl(
                         ],
                         all_tool_results=[],
                         had_tool_calls=bool(_conductor_trace),
+                        # The Conductor was shown no numbered evidence, so no [W#]
+                        # in its answer is valid: an empty registry strips them
+                        # (guard CX-03).
+                        web_registry=_web_evidence.EvidenceRegistry(),
                     )
 
                     return safe_assistant_text(conductor_answer)
                 # Conductor returned None → not complex enough, fall through to standard path
         except Exception as e:
             print(f"[WARNING] Complexity detection failed: {e}. Using standard path.")
+
+        # The standard path answers: show the numbered sources now, while the
+        # answer is being written (PLAN 1.7; deferred past the Conductor, CX-02).
+        if _web_listing_pending:
+            _web_listing_pending = False
+            _emit_registry_sources(images=_web_listing_images)
 
         # Visible to the turn-level error handler below: a provider failure
         # after tool rounds must still be able to return the evidence collected.
@@ -1689,7 +2341,13 @@ def _stream_response_api_impl(
             # answer). Real web results are appended post-hoc from the actual
             # payload (step 7a), which needs no scaffold.
             _dual_source_active = bool(rag_context)
-            _instructions = agent.system_prompt + ("\n\n" + DUAL_SOURCE_SCAFFOLD if _dual_source_active else "")
+            from core import bench_toolset as _bench_ts
+
+            if _bench_ts.active():
+                # Neutral prompt: the product prompt names native tools.
+                _instructions = _bench_ts.BENCH_SYSTEM_PROMPT
+            else:
+                _instructions = agent.system_prompt + ("\n\n" + DUAL_SOURCE_SCAFFOLD if _dual_source_active else "")
 
             # 5. Call Responses API with manual streaming loop
             _max_rounds = getattr(_token_budget, 'HARD_MAX_ITERATIONS', 25)
@@ -2250,14 +2908,16 @@ def _stream_response_api_impl(
                     _trace_result_obj = None
                     _tool_sidecar = None
                     _tool_timed_out = False
-                    tool = agent.tool_registry.get_tool(tool_name)
+                    from core import bench_toolset as _bench_ts
+
+                    tool = agent.tool_registry.get_tool(tool_name) if _bench_ts.allowed(tool_name) else None
                     if not tool:
                         # gpt-oss habitually typos tool names ("datlab_density_vetting")
                         # and then gives up after the Unknown-tool error (live test P12).
                         # Resolve unambiguous near-misses automatically; keep the original
                         # name in the trace note so the correction is auditable.
                         import difflib as _difflib
-                        _registered = [t.name for t in agent.tool_registry.list_tools()]
+                        _registered = _bench_ts.filter_names(t.name for t in agent.tool_registry.list_tools())
                         _fuzzy = _difflib.get_close_matches(tool_name, _registered, n=2, cutoff=0.75)
                         _unambiguous = len(_fuzzy) == 1 or (
                             len(_fuzzy) >= 2
@@ -2342,7 +3002,21 @@ def _stream_response_api_impl(
                                 )
                             if _prior_call and not _polling and isinstance(result, dict):
                                 result = dict(result, repeat_note="You already ran this; use its result or change approach.")
+                            # Web tool results join the turn's evidence registry and
+                            # every result item carries its tag ("cite_as": "[W7]"),
+                            # so ids continue across calls (PLAN 1.4).
+                            if (
+                                _web_registry is not None
+                                and tool_name in _web_policy.WEB_TOOL_NAMES
+                                and isinstance(result, dict)
+                                and result.get("success")
+                            ):
+                                result = _web_registry.annotate_tool_result(result, origin=f"tool:{tool_name}")
                             result_str = serialize_tool_result(result)
+                            if _web_registry is not None and tool_name in _web_policy.WEB_TOOL_NAMES:
+                                # citable = the tags that survived serialization / the
+                                # result budget, i.e. what the model will read (guard CX-08)
+                                _web_registry.confirm_tool_shown(result_str)
                             _acc_len_after = len(agent._accumulated_run_results)
 
                             # If the tool itself already accumulated results
@@ -2405,16 +3079,36 @@ def _stream_response_api_impl(
                                 "web_research_status",
                             } and isinstance(result, dict) and result.get("success"):
                                 _web_tool_results.append(result)
-                                web_event = agent._build_web_sources_event(
-                                    _web_event_payload(result, keep_images=bool(_is_imagery_request))
-                                )
-                                if web_event:
-                                    on_event(web_event)
+                                if not _web_search_query and not _web_decision_tool_fixed:
+                                    # the badge said "skipped" but the model searched itself
+                                    _web_decision_tool_fixed = True
+                                    _q_or_urls = (args or {}).get("query") or (args or {}).get("urls") or "" if isinstance(args, dict) else ""
+                                    if isinstance(_q_or_urls, (list, tuple)):
+                                        _q_or_urls = ", ".join(str(u) for u in _q_or_urls[:3])
+                                    _emit_web_decision(
+                                        True, f"the model searched the web itself ({tool_name})",
+                                        [str(_q_or_urls)] if str(_q_or_urls).strip() else (),
+                                        None, "tool", force=True,
+                                    )
+                                if _web_registry is not None and len(_web_registry):
+                                    # numbered sources (ids continue across calls)
+                                    _emit_registry_sources(
+                                        phase="tool",
+                                        images=_web_event_payload(result, keep_images=bool(_is_imagery_request)).get("images"),
+                                    )
+                                else:
+                                    web_event = agent._build_web_sources_event(
+                                        _web_event_payload(result, keep_images=bool(_is_imagery_request))
+                                    )
+                                    if web_event:
+                                        on_event(web_event)
                         except Exception as te:
                             result_str = json.dumps({"error": str(te)})
                     else:
                         import difflib as _difflib
-                        _tool_names = [t.name for t in agent.tool_registry.list_tools()]
+                        from core import bench_toolset as _bench_ts
+
+                        _tool_names = _bench_ts.filter_names(t.name for t in agent.tool_registry.list_tools())
                         # TACC/gpt-oss sometimes emits an ELIDED tool name (live
                         # P14: literal "dat..." x8). difflib can't resolve a
                         # 3-letter stub — prefix-match the registry first.
@@ -2555,18 +3249,37 @@ def _stream_response_api_impl(
             
             print(f"[DEBUG] Response text length: {len(output_text)}")
 
-            # 7a. Append parallel web search results if available
-            if _web_thread is not None:
-                _web_thread.join(timeout=30)  # wait up to 30s for web results
-                # Close off the web status indicator with the EXACT label the
-                # pre-pass opened — the UI matches steps by text, so a rebuilt
-                # label leaves the original step spinning forever.
-                if on_status:
-                    on_status(
-                        _web_status_open_label or "Searching the web in parallel",
-                        "completed",
-                    )
-                web_data = _web_result_holder.get("data")
+            # 7a. Append parallel web search results if available -- only on
+            # the legacy path. When the evidence went into the model input the
+            # answer already carries it with [W#] citations (PLAN 1.3).
+            if _web_thread is not None and _web_grounded:
+                if not _web_step_closed:
+                    _close_web_step(on_status, _web_status_open_label, True, 0)
+                print("[WEB EVIDENCE] grounded answer: no post-hoc web appendix")
+            elif _web_thread is not None:
+                # Wait up to 30 s for web results, then close the web status
+                # step with the EXACT label the pre-pass opened (the UI matches
+                # steps by text) -- as timed out when the join timed out (D9).
+                # With the evidence pipeline on, the pre-pass thread also deep-
+                # reads; the legacy appendix only needs the SEARCH result, so
+                # wait for that, not the extraction (guard CX-05).
+                _web_finished = (
+                    _web_prepass.search_done.wait(30) if _web_prepass is not None
+                    else _join_web_thread(_web_thread, 30)
+                )
+                _close_web_step(on_status, _web_status_open_label, _web_finished, 30)
+                web_data = _web_result_holder.get("data") if _web_finished else None
+                if isinstance(web_data, dict) and web_data.get("success"):
+                    # the legacy path's web payload is in the trace too (guard CX-07)
+                    try:
+                        agent._record_tool_trace(
+                            "web_search",
+                            {"query": _web_search_query or _user_query, "source": "pre-pass"},
+                            json.dumps(web_data, default=str)[:8000],
+                            result_obj=web_data,
+                        )
+                    except Exception:
+                        pass
                 if web_data and web_data.get("success"):
                     # Synthesize a query-relevant summary instead of using
                     # the raw Tavily answer which is often generic.
@@ -2617,10 +3330,52 @@ def _stream_response_api_impl(
                     json.dumps(_web_result_holder.get("data"), default=str)
                     if _web_result_holder.get("data") else "",
                     json.dumps(_all_tool_results, default=str) if _all_tool_results else "",
+                    json.dumps(_web_registry.to_sse_sources(), default=str)
+                    if _web_registry is not None and len(_web_registry) else "",
                 ],
                 all_tool_results=_all_tool_results,
                 had_tool_calls=_had_tool_calls,
+                web_registry=_web_registry,
             )
+            # 7f. Final numbered source listing: cited sources first, in the order
+            # the answer cites them, with the cited flags the UI renders (PLAN 1.5).
+            if _web_registry is not None and len(_web_registry):
+                from services.web_evidence import find_citations as _find_citations
+
+                _citable = set(_web_registry.citable_ids())
+                _cited_ids = [c for c in _find_citations(output_text) if c in _citable]
+                _tool_evidence = any(ev.origin.startswith("tool:") for ev in _web_registry.items())
+                if _web_grounded and not _cited_ids:
+                    print(f"[WEB CITE] web_uncited_answer items={len(_web_registry)} (evidence injected, nothing cited)")
+                print(f"[WEB CITE] cited={_cited_ids} of {len(_web_registry)} source(s) grounded={_web_grounded}")
+                # The legacy fallback (evidence not ready in time) keeps its
+                # legacy source card; a numbered listing only when the model saw
+                # numbered evidence.
+                if _web_grounded or _cited_ids or _tool_evidence:
+                    _emit_registry_sources(_cited_ids, replace=True, phase="final")
+
+            # 7g. Carry this turn's web evidence and entities to the next turn
+            # of the conversation (Phase 2 follow-ups). Cited pages first.
+            if _web_planner.planner_enabled():
+                try:
+                    from services.web_evidence import find_citations as _fc_carry
+
+                    _carry: List[Dict[str, Any]] = []
+                    if _web_registry is not None and len(_web_registry):
+                        _citable_now = set(_web_registry.citable_ids())
+                        _cited_now = [c for c in _fc_carry(output_text) if c in _citable_now]
+                        _by_id = {ev.id: ev for ev in _web_registry.items()}
+                        _ordered = [_by_id[c] for c in _cited_now if c in _by_id] + [
+                            ev for ev in _web_registry.items() if ev.id not in set(_cited_now) and ev.id in _citable_now
+                        ]
+                        _carry = [ev.as_carry() for ev in _ordered][:8]
+                    _web_planner.conversation_web_memory(agent).remember(
+                        f"{user_id or 'anonymous'}|{conversation_id}",
+                        evidence=_carry,
+                        entities=_web_planner.conversation_entities(getattr(agent, "_accumulated_tool_trace", None) or []),
+                    )
+                except Exception as _carry_err:
+                    print(f"[WEB EVIDENCE] carry-over failed (non-fatal): {_carry_err}")
 
             # 8. Update long-term memory — only for authenticated users
             output_text = safe_assistant_text(output_text)
