@@ -1191,10 +1191,65 @@ class ArchiveCatalogService:
             "method": "both sides selected server-side in the cone (with cuts), then positional match by nearest "
                       "neighbour within the match radius (astropy); counts are distinct sources",
         }
+        bn = self._gaia_best_neighbour_count(left, right, left_s, right_s, ra_f, dec_f, radius, match_r)
+        if bn is not None:
+            if bn.get("result") is not None:
+                results.append(bn.pop("result"))
+            if bn.get("warning"):
+                warnings.append(bn.pop("warning"))
+            summary["gaia_best_neighbour"] = bn
         rows = stats["sample_pairs"]
         return {"success": True, "summary": summary, "rows": rows,
                 "columns": ["left_ra", "left_dec", "right_ra", "right_dec", "sep_arcsec"],
                 "warnings": warnings, "provenance": _merge_prov(results)}
+
+    def _gaia_best_neighbour_count(self, left, right, left_s, right_s, ra_f, dec_f, radius, match_r
+                                   ) -> Optional[Dict[str, Any]]:
+        """Gaia DR3 x AllWISE: also count Gaia's precomputed best-neighbour
+        cross-match (gaiadr3.allwise_best_neighbour) in the same cone.
+
+        A plain nearest-neighbour match within 1" around NGC 2264 finds 721
+        Gaia sources (a Data Lab q3c join gives the same); Gaia's own
+        cross-match, which weighs positional errors and epochs and keeps about
+        one Gaia source per AllWISE source, gives 600 (ArchiveBench AB-D-56,
+        live 2026-09-26). The best-neighbour table is the archive's recommended
+        answer to "how many Gaia sources have an AllWISE counterpart"."""
+        kinds = [_survey_kind(spec) for spec in (left, right)]
+        if set(kinds) != {"allwise", "gaia_dr3"}:
+            return None
+        if left_s.get("cuts") or right_s.get("cuts"):
+            return None  # the precomputed table cannot carry the caller's cuts
+        sql = ("SELECT COUNT(*) AS n, COUNT(DISTINCT x.allwise_oid) AS n_allwise "
+               "FROM gaiadr3.gaia_source AS g JOIN gaiadr3.allwise_best_neighbour AS x "
+               "ON x.source_id = g.source_id WHERE "
+               + _cone("g.ra", "g.dec", ra_f, dec_f, radius / 3600.0)
+               + f" AND x.angular_distance < {float(match_r)!r}")
+        try:
+            res = self.client.query("gaia", sql, maxrec=5)
+        except Exception as exc:  # an extra count must never fail the crossmatch itself
+            msg = exc.message if isinstance(exc, TapQueryError) else f"{type(exc).__name__}: {exc}"
+            return {"table": "gaiadr3.allwise_best_neighbour", "n_gaia_with_counterpart": None,
+                    "warning": f"Gaia best-neighbour count failed ({msg}); only the positional match is available"}
+        row = (res.rows[0] or {}) if res.rows else {}
+        n = int(_float(row.get("n")) or 0)
+        capped = not (left_s.get("n_in_cone") == left_s.get("n_pulled") and right_s.get("n_in_cone") == right_s.get("n_pulled"))
+        compare = ("give the plain positional count (n_left_with_match or n_right_with_match) as the looser "
+                   "alternative, saying why they differ." if not capped else
+                   "note that the positional count covers only the rows pulled under the row cap (summary.complete "
+                   "is false), so it is not comparable with this server-side count.")
+        return {
+            "table": "gaiadr3.allwise_best_neighbour",
+            "n_gaia_with_counterpart": n,
+            "n_allwise_matched": int(_float(row.get("n_allwise")) or 0),
+            "match_radius_arcsec": match_r,
+            "preferred": True,
+            "note": ("Gaia's own precomputed AllWISE cross-match (positional errors, epoch propagation, one best "
+                     "neighbour per Gaia source, about one Gaia source per AllWISE source) restricted to "
+                     f"angular_distance < {match_r:g} arcsec. Report this as the number of Gaia sources with an "
+                     "AllWISE counterpart, and " + compare),
+            "query": sql,
+            "result": res,
+        }
 
     # ── TNS ────────────────────────────────────────────────────────
     def tns_object(self, name: str) -> Dict[str, Any]:
@@ -1343,6 +1398,18 @@ def _propagate(ra: float, dec: float, pmra: float, pmdec: float, from_year: floa
     cosd = math.cos(math.radians(dec)) or 1e-9
     ra_new = (ra + (pmra * dt) / 3.6e6 / cosd) % 360.0
     return ra_new, max(-90.0, min(90.0, dec_new))
+
+
+def _survey_kind(spec: Dict[str, Any]) -> Optional[str]:
+    """'gaia_dr3' / 'allwise' for the catalogue a crossmatch side names, else None."""
+    service = str((spec or {}).get("service") or "").lower()
+    table = str((spec or {}).get("table") or "").strip().strip('"').lower()
+    if table in ("gaiadr3.gaia_source", "i/355/gaiadr3", "gaia_dr3.gaia_source") or (
+            service == "gaia" and table.endswith("gaiadr3.gaia_source")):
+        return "gaia_dr3"
+    if table in ("allwise_p3as_psd", "ii/328/allwise", "allwise.source", "catwise.allwise_p3as_psd"):
+        return "allwise"
+    return None
 
 
 def _match(left: Sequence[Tuple[float, float]], right: Sequence[Tuple[float, float]], radius_arcsec: float

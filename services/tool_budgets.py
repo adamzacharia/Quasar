@@ -110,6 +110,12 @@ GUARD_OVERRIDES: Dict[str, float] = {
     "archive_overlay": 180.0,
     "datalab_healpix_density_map": 300.0,
     "datalab_satellite_search": 300.0,
+    # MMDC (live 2026-09-26): a cold SED preparation takes ~30 s and a full
+    # Mkn 421 CSV (7.6 MB) 14-50 s; an SSC fit runs ~184 s on MMDC's server,
+    # split across mmdc_model (submit + short wait) and mmdc_model_job polls.
+    "mmdc_sed": 240.0,
+    "mmdc_model": 210.0,
+    "mmdc_model_job": 210.0,
 }
 
 # Inner totals must stay this far below the guard: enough for the tool to
@@ -715,6 +721,7 @@ HEASARC_HOSTS = ("heasarc.gsfc.nasa.gov",)
 EXOPLANET_HOSTS = ("exoplanetarchive.ipac.caltech.edu",)
 TAPVIZIER_HOSTS = ("tapvizier.cds.unistra.fr",)
 TNS_HOSTS = ("www.wis-tns.org",)
+MMDC_HOSTS = ("mmdc.am",)
 
 # Tools whose transport is NOT requests-based and has no timeout of its own:
 # not even the requests-layer clamp applies; the outer guard is the only
@@ -900,6 +907,67 @@ def _merge(*getters: Callable[[], Dict[str, float]]) -> Callable[[], Dict[str, f
     return get
 
 
+def _mmdc() -> Dict[str, float]:
+    """MMDC SED phases; reads the live service constants (env overrides included)."""
+    from services import mmdc_service as m
+
+    return {
+        "MMDC known-source list": m.KNOWN_SOURCES_TIMEOUT_S,
+        "MMDC SED prepare (submit)": m.INFO_TIMEOUT_S,
+        "MMDC SED job poll (clamped to leave room for the CSV)": m.PREPARE_POLL_S,
+        "MMDC source info": m.INFO_TIMEOUT_S,
+        "MMDC SED CSV download (window, then the undated-row probe)": m.CSV_TIMEOUT_S,
+    }
+
+
+def _mmdc_lc() -> Dict[str, float]:
+    from services import mmdc_service as m
+
+    return {"MMDC known-source list": m.KNOWN_SOURCES_TIMEOUT_S, "MMDC light-curve cone per catalog": m.LC_TIMEOUT_S}
+
+
+def _mmdc_model() -> Dict[str, float]:
+    from services import mmdc_modeling as mm
+
+    return {
+        "MMDC inference / CSV validation / fit submission": max(mm.MODEL_INFER_TIMEOUT_S, mm.MODEL_VALIDATE_TIMEOUT_S,
+                                                                mm.MODEL_SUBMIT_TIMEOUT_S),
+        "NED redshift (only when neither the caller nor MMDC gives z)": mm.NED_TIMEOUT_S,
+        "fit status poll (a finished fit carries the posterior)": mm.FIT_STATUS_TIMEOUT_S,
+        "fit wait after submission (clamped to the budget)": mm.FIT_SUBMIT_WAIT_S,
+        "fit artifact copy (PDF / CSV, each)": mm.ARTIFACT_TIMEOUT_S,
+    }
+
+
+def _mmdc_model_job() -> Dict[str, float]:
+    from services import mmdc_modeling as mm
+
+    return {
+        "fit status poll (a finished fit carries the posterior)": mm.FIT_STATUS_TIMEOUT_S,
+        "fit wait (clamped to leave room for the artifact copies)": mm.FIT_JOB_WAIT_S,
+        "fit artifact copy (PDF / CSV, each)": mm.ARTIFACT_TIMEOUT_S,
+    }
+
+
+def _fermi_lcr() -> Dict[str, float]:
+    from services import fermi_lcr as f
+
+    return {"Fermi LCR 4FGL source list (cached on disk for 7 days)": f.SOURCE_LIST_TIMEOUT_S,
+            "SIMBAD resolve (only when the name is not a 4FGL association)": 20.0,
+            "Fermi LCR light curve": f.LC_TIMEOUT_S}
+
+
+def _variability() -> Dict[str, float]:
+    from services import mmdc_service as m
+
+    return {
+        "MMDC known-source list": m.KNOWN_SOURCES_TIMEOUT_S,
+        "MMDC light-curve cone": m.LC_TIMEOUT_S,
+        "MMDC redshift lookup (prepare poll + source info)": 15.0 + m.INFO_TIMEOUT_S,
+        "ALeRCE light curve (source='ztf')": 30.0,
+    }
+
+
 def _declare_defaults() -> None:
     LOOP = "loops over an input-sized list; call count bounded by the tool deadline"
     PHASES = "several sequential archive phases; each call clamped to the remaining tool budget"
@@ -997,6 +1065,16 @@ def _declare_defaults() -> None:
     declare(["galactic_extinction"], _merge(_simbad, _fixed("IRSA dust", 30.0)), IRSA_HOSTS)
     declare(["gaia_distance"], _merge(_simbad, _fixed("Gaia TAP", 60.0)), GAIA_HOSTS)
     declare(["ned_distance", "ned_sed_plot"], _fixed("NED", 60.0), NED_HOSTS)
+    declare_loop(["mmdc_sed"], _mmdc, MMDC_HOSTS,
+                 reason="source list, prepare + poll, info, then one or two CSV downloads; each clamped to the budget")
+    declare_loop(["mmdc_lightcurve"], _mmdc_lc, MMDC_HOSTS, reason="one cone query per requested catalog")
+    declare_loop(["mmdc_model"], _mmdc_model, MMDC_HOSTS + NED_HOSTS,
+                 reason="validate + submit (or one inference), a bounded wait, then up to three artifact copies")
+    declare_loop(["mmdc_model_job"], _mmdc_model_job, MMDC_HOSTS,
+                 reason="repeated fit-status polls within the wait, then up to three artifact copies")
+    declare(["fermi_lcr_lightcurve"], _fermi_lcr, ("fermi.gsfc.nasa.gov",) + SIMBAD_HOSTS)
+    declare_loop(["variability_analysis"], _variability, MMDC_HOSTS + ALERCE_HOSTS + MAST_HOSTS,
+                 reason="one light-curve fetch for the chosen source (lightkurve downloads are deadline-bounded) then local statistics")
     declare(["velocity_frame_distance"], _simbad, SIMBAD_HOSTS)
     declare(["resolve_target"], _merge(_fixed("Sesame x2 (astropy remote_timeout)", 20.0), _simbad), SIMBAD_HOSTS)
     declare_deadline_only(["search_space_lightcurves", "plot_space_lightcurve", "period_search"], MAST_HOSTS + ALERCE_HOSTS,

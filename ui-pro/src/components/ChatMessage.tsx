@@ -8,16 +8,17 @@ import rehypeKatex from "rehype-katex";
 import { answerLinkAttributes, prepareAnswerMarkdown } from "../lib/answer-markdown.js";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Copy, Check, Loader2, User as UserIcon, ThumbsUp, ThumbsDown, Send, X } from "lucide-react";
+import { Copy, Check, Loader2, ThumbsUp, ThumbsDown, Send, X } from "lucide-react";
 import { IconOpenBook, IconWebGlobe } from "./icons/QuasarIcons";
 import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { Message, WebSource } from "../lib/types";
-import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
+import { authBearerHeaders } from "../lib/auth-store";
 import { DataTableCard } from "./DataTableCard";
 import { PaperCard } from "./PaperCard";
 import { ThoughtProcessWidget, ThoughtStep } from "./ThoughtProcessWidget";
+import { ResearchTimeline } from "./ResearchTimeline";
 import { TaskExecutionWidget, type TaskExecutionState } from "./TaskExecutionWidget";
-import { WebEvidenceGrid, WebSourcesCard, WebSourcesStrip } from "./WebSourcesCard";
+import { WebSourcesCard, WebSourcesFooter, WebSourcesPanel, WebSourcesStrip } from "./WebSourcesCard";
 import { WebCitationChip } from "./WebCitationChip";
 import { citationIdFromHref, tokenizeWebCitations, webDecisionLabel, webDecisionTitle } from "../lib/web-citations.js";
 import { HipsImageCard } from "./HipsImageCard";
@@ -178,15 +179,15 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
             <div className="flex items-center gap-1">
                 <div className={`flex items-center gap-1 ${showReport ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100"} transition-opacity`}>
                     <button onClick={copyText} title="Copy response"
-                        className="p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-700/50 rounded-lg transition-all">
-                        {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                        className="p-1.5 rounded-full text-[var(--q-text-faint)] hover:text-[var(--q-text)] hover:bg-[var(--q-glass-control-hover)] transition-colors">
+                        {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" strokeWidth={1.75} />}
                     </button>
                     <button onClick={() => sendFeedback("like")} title="Good response"
-                        className={`p-1.5 rounded-lg transition-all ${feedback === "like" ? "text-emerald-400 bg-emerald-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                        className={`p-1.5 rounded-full transition-colors ${feedback === "like" ? "text-emerald-600 bg-emerald-500/10" : "text-[var(--q-text-faint)] hover:text-[var(--q-text)] hover:bg-[var(--q-glass-control-hover)]"}`}>
                         <ThumbsUp className="w-4 h-4" fill={feedback === "like" ? "currentColor" : "none"} />
                     </button>
                     <button onClick={() => { setReportState("idle"); setShowReport(shouldOpenIssueReport("dislike")); }} title="Report a problem"
-                        className={`p-1.5 rounded-lg transition-all ${feedback === "dislike" ? "text-red-400 bg-red-500/10" : "text-slate-500 hover:text-slate-200 hover:bg-slate-700/50"}`}>
+                        className={`p-1.5 rounded-full transition-colors ${feedback === "dislike" ? "q-err bg-red-500/10" : "text-[var(--q-text-faint)] hover:text-[var(--q-text)] hover:bg-[var(--q-glass-control-hover)]"}`}>
                         <ThumbsDown className="w-4 h-4" fill={feedback === "dislike" ? "currentColor" : "none"} />
                     </button>
                 </div>
@@ -197,7 +198,7 @@ function MessageActions({ message, reportPrompt = "" }: { message: Message; repo
                 )}
             </div>
             {showReport && (
-                <div className="mt-2 max-w-xl rounded-xl border border-red-500/20 bg-slate-950/90 p-3 shadow-xl">
+                <div className="mt-2 max-w-xl rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] p-3" style={{ boxShadow: "var(--q-popover-shadow)" }}>
                     <div className="flex items-center justify-between">
                         <div className="text-xs font-semibold text-slate-200">Report a problem</div>
                         <button type="button" onClick={() => setShowReport(false)} className="text-slate-500 hover:text-slate-200">
@@ -476,31 +477,6 @@ function AnswerBuffer({ phase }: { phase?: string }) {
     );
 }
 
-function InitialWaitingIndicator({ startTime }: { startTime: Date }) {
-    const [elapsed, setElapsed] = useState(() => Math.max(0, Math.round((Date.now() - startTime.getTime()) / 1000)));
-
-    useEffect(() => {
-        const interval = setInterval(() => {
-            setElapsed(Math.max(0, Math.round((Date.now() - startTime.getTime()) / 1000)));
-        }, 1000);
-        return () => clearInterval(interval);
-    }, [startTime]);
-
-    return (
-        <div className="flex items-center gap-3 py-1">
-            <div className="flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" style={{ animationDelay: '300ms' }} />
-            </div>
-            <span className="text-xs text-slate-500">
-                Waiting for response
-                <span className="font-mono ml-1.5 text-slate-600">{elapsed}s</span>
-            </span>
-        </div>
-    );
-}
-
 interface ChatMessageProps {
     message: Message;
     isStreaming?: boolean;
@@ -512,9 +488,14 @@ interface ChatMessageProps {
     /** Grounded web evidence of this turn (sources with W# ids): renders the
      *  sources strip, the inline [W#] chips and the cited-first grid. */
     turnWebSources?: WebSource[];
+    /** Every web source of this turn (grounded or not), for the research
+     *  timeline's "Reading" chips. */
+    researchSources?: WebSource[];
+    /** ADS papers returned this turn, for the same "Reading" row. */
+    researchPaperCount?: number;
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt, turnWebSources }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt, turnWebSources, researchSources, researchPaperCount }: ChatMessageProps) {
     const isUser = message.role === "user";
     const displayContent = isUser ? message.content : safeAssistantWebText(message.content);
     const hasContent = !!displayContent;
@@ -539,26 +520,19 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     // Show immediate waiting indicator when streaming but nothing has arrived yet
     const showInitialWaiting = Boolean(isStreaming && !hasContent && !hasThinking && !taskExecutionState);
 
-    const { user } = useAuthStore();
-    const userInitials = user?.display_name
-        ? user.display_name.split(' ').filter(Boolean).map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
-        : user?.username
-            ? user.username.substring(0, 2).toUpperCase()
-            : null;
 
     if (isUser) {
         return (
-            <div className="flex justify-end">
-                <div className="flex items-end gap-3 max-w-[80%]">
-                    <div className="space-y-1">
-                        <div className="flex justify-end"><span className="text-[10px] text-slate-400 uppercase font-medium tracking-wider mr-1">You</span></div>
-                        <div className="glass-surface border-primary/20 rounded-2xl rounded-tr-sm px-5 py-3 text-slate-100 space-y-3">
+            <div className="flex justify-end q-rise">
+                <div className="max-w-[80%]">
+                    <div>
+                        <div className="rounded-[20px] bg-[var(--q-bubble-user)] px-4 py-2.5 text-[14px] text-[var(--q-text)] space-y-3" aria-label="Your message">
                             {message.content && (
                                 <div className="prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-p:my-1">
                                     <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
                                         // Keep user messages lightweight — no code blocks, just inline code
                                         code({ children, ...props }) {
-                                            return <code className="bg-slate-800 px-1.5 py-0.5 rounded text-primary text-sm font-mono" {...props}>{children}</code>;
+                                            return <code className="bg-[var(--q-card)] px-1.5 py-0.5 rounded text-[var(--q-text)] text-sm font-mono" {...props}>{children}</code>;
                                         },
                                         a({ href, children }) {
                                             return <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">{children}</a>;
@@ -583,7 +557,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             {message.attachmentNames && message.attachmentNames.length > 0 && (
                                 <div className="flex flex-wrap gap-2">
                                     {message.attachmentNames.map((name, i) => (
-                                        <span key={i} className="glass-control flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs text-slate-300">
+                                        <span key={i} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs bg-[var(--q-card)] border border-[var(--q-border)] text-[var(--q-text-secondary)]">
                                             <svg className="w-3.5 h-3.5 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
                                             {name}
                                         </span>
@@ -592,13 +566,6 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             )}
                         </div>
                     </div>
-                    {user?.picture_url ? (
-                        <img src={user.picture_url} alt={user.display_name || "You"} className="size-8 rounded-full object-cover shrink-0 mb-1 shadow-md" referrerPolicy="no-referrer" />
-                    ) : (
-                        <div className="size-8 rounded-full bg-gradient-to-tr from-[#818cf8] to-[#c77dff] shrink-0 mb-1 flex items-center justify-center text-on-accent text-xs font-bold">
-                            {userInitials || <UserIcon className="w-4 h-4" />}
-                        </div>
-                    )}
                 </div>
             </div>
         );
@@ -621,10 +588,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
         return (
             <div className="flex justify-start">
-                <div className="flex items-start gap-3 w-full lg:max-w-[95%]">
-                    <div className="size-8 rounded-xl flex items-center justify-center shrink-0 mt-1 overflow-hidden" style={{ background: 'var(--q-bg)' }}>
-                        <img src="/quasar_logo.png" alt="Quasar" className="size-7 object-contain" />
-                    </div>
+                <div className="flex items-start w-full lg:max-w-[95%]">
                     <ThoughtProcessWidget
                         title={message.toolCall.displayName || message.toolCall.name}
                         status={message.toolCall.status}
@@ -645,7 +609,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         if (!rows || rows.length === 0) return null;
         return (
             <>
-                <div className="pl-11">
+                <div className="min-w-0">
                     <DataTableCard data={message.dataTable} />
                     <BlockRating blockId={message.blockId} blockKind={message.blockKind}
                         runId={message.runMeta?.run_id} model={message.runMeta?.model} />
@@ -665,7 +629,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         }
         const shouldScroll = message.papers.length > 6;
         return (
-            <div className="pl-11">
+            <div className="min-w-0">
                 <div className={`grid grid-cols-1 sm:grid-cols-2 gap-3 ${shouldScroll ? "max-h-[680px] overflow-y-auto pr-1 custom-scrollbar" : ""}`}>
                     {message.papers.map((paper) => (
                         <PaperCard key={paper.id} paper={paper} />
@@ -691,7 +655,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         const cellCount = cells.length;
         const title = message.notebookData.title || "Analysis Notebook";
         return (
-            <div className="pl-11">
+            <div className="min-w-0">
                 <button
                     onClick={() => {
                         const blob = new Blob([JSON.stringify(nbData, null, 2)], { type: "application/json" });
@@ -732,7 +696,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     meta={message.plotlyMeta}
                     request={message.request}
                 />
-                <div className="pl-11">
+                <div className="min-w-0">
                     <BlockRating blockId={message.blockId} blockKind={message.blockKind}
                     runId={message.runMeta?.run_id} model={message.runMeta?.model} />
                 </div>
@@ -751,7 +715,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                     imageMeta={message.imageMeta}
                     request={message.request}
                 />
-                <div className="pl-11">
+                <div className="min-w-0">
                     <BlockRating blockId={message.blockId} blockKind={message.blockKind}
                     runId={message.runMeta?.run_id} model={message.runMeta?.model} />
                 </div>
@@ -762,7 +726,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     // -- Web Sources (source cards + image grid from web search) --
     if (message.type === "web_sources" && (message.webSources?.length || message.webImages?.length)) {
         return (
-            <div className="pl-11">
+            <div className="min-w-0">
                 <WebSourcesCard
                     sources={message.webSources}
                     images={message.webImages}
@@ -780,28 +744,23 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
     // Assistant message — with integrated thinking process
     return (
         <div className="flex justify-start group/msg">
-            <div className="flex items-start gap-3 w-full lg:max-w-[95%]">
-                <div className="size-8 rounded-xl flex items-center justify-center shrink-0 mt-1 overflow-hidden" style={{ background: 'var(--q-bg)' }}>
-                    <img src="/quasar_logo.png" alt="Quasar" className="size-7 object-contain" />
-                </div>
-                <div className="space-y-3 w-full min-w-0">
-                    <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-slate-400 uppercase font-medium tracking-wider">Quasar AI</span>
-                        <span className="text-[10px] text-slate-500">{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-                    </div>
+            <div className="flex items-start w-full lg:max-w-[95%]">
+                <div className="space-y-3 w-full min-w-0" title={message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}>
 
-                    {/* Immediate waiting indicator — shown before any SSE events arrive */}
-                    {showInitialWaiting && <InitialWaitingIndicator startTime={message.timestamp} />}
-
-                    {/* Thinking Process Widget — rendered ABOVE content */}
-                    {hasThinking && (
-                        <ThoughtProcessWidget
-                            title="Thinking"
-                            status={thinkingIsRunning ? "running" : "completed"}
+                    {/* Research timeline, rendered ABOVE content. It also covers the
+                        first moments before any SSE event arrives, so the turn
+                        does not jump from a dots spinner to a panel. */}
+                    {(hasThinking || showInitialWaiting) && (
+                        <ResearchTimeline
+                            status={thinkingIsRunning || showInitialWaiting ? "running" : "completed"}
+                            streaming={Boolean(isStreaming)}
                             steps={thinkingSteps || []}
                             forceCollapsed={hasContent}
                             startTime={message.timestamp}
                             duration={message.thinkingDuration}
+                            webDecision={message.webDecision}
+                            webSources={researchSources}
+                            paperCount={researchPaperCount}
                         >
                             {message.thinking && (() => {
                                 if (thinkingStatus === "running") {
@@ -815,7 +774,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     </div>
                                 );
                             })()}
-                        </ThoughtProcessWidget>
+                        </ResearchTimeline>
                     )}
 
                     {/* Multi-Agent Workforce — always visible (full when active, collapsed when done) */}
@@ -823,10 +782,13 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                         <TaskExecutionWidget state={taskExecutionState} />
                     )}
 
-                    {/* Grounded web evidence: "N sources" strip ABOVE the answer, shown
-                        as soon as the evidence exists (before the answer is done). */}
+                    {/* Grounded web evidence: "N sources" pill ABOVE the answer, shown
+                        as soon as the evidence exists; it opens the sources panel. */}
                     {webEvidence.length > 0 && (
-                        <WebSourcesStrip sources={webEvidence} messageId={message.id} />
+                        <>
+                            <WebSourcesStrip sources={webEvidence} messageId={message.id} />
+                            <WebSourcesPanel sources={webEvidence} messageId={message.id} />
+                        </>
                     )}
 
                     {/* Content — rendered BELOW thinking */}
@@ -843,7 +805,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     const match = /language-(\w+)/.exec(className || "");
                                     const code = String(children).replace(/\n$/, "");
                                     if (match) return <CodeBlock language={match[1]}>{code}</CodeBlock>;
-                                    return <code className="bg-slate-800 px-1.5 py-0.5 rounded text-primary text-sm font-mono" {...props}>{children}</code>;
+                                    return <code className="rounded-md border border-[var(--q-border)] bg-[var(--q-card)] px-1.5 py-0.5 font-mono text-[0.85em] text-[var(--q-text)]" {...props}>{children}</code>;
                                 },
                                 // Replace source citation blobs and book/globe emojis in text-bearing nodes.
                                 p({ children }) {
@@ -896,7 +858,7 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                                     );
                                 },
                                 thead({ children }) {
-                                    return <thead className="bg-gradient-to-r from-primary/10 to-accent-purple/8 border-b border-primary/20">{children}</thead>;
+                                    return <thead className="border-b border-[var(--q-border)] bg-[var(--q-card)]">{children}</thead>;
                                 },
                                 tbody({ children }) {
                                     return <tbody>{children}</tbody>;
@@ -921,10 +883,10 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
 
                     {showAnswerBuffer && <AnswerBuffer phase={answerBufferPhase} />}
 
-                    {/* Sources grid under a grounded answer: cited first (numbered),
-                        the rest under a collapsed "Also consulted". */}
-                    {webEvidence.length > 0 && (
-                        <WebEvidenceGrid sources={webEvidence} messageId={message.id} />
+                    {/* Under the FINISHED answer only: a short row of cited sources and
+                        an "All sources" button (nothing large while it streams). */}
+                    {webEvidence.length > 0 && !isStreaming && (
+                        <WebSourcesFooter sources={webEvidence} messageId={message.id} />
                     )}
 
                     {/* Raw request provenance for this turn's tool calls (Feature 1).

@@ -25,11 +25,15 @@ interface PersonalDoc {
 
 interface MCPServer {
     name: string;
-    transport?: "stdio" | "http";
+    transport?: "stdio" | "http" | "streamable_http";
     command?: string;
     args?: string[];
     url?: string;
+    /** Masked by the API: names only, values are "********". */
     env?: Record<string, string>;
+    headers?: Record<string, string>;
+    /** Last known connection state, when the server has been connected. */
+    status?: { connected: boolean; tools: string[]; error?: string | null; transport?: string | null };
 }
 
 interface ProviderKeyMeta {
@@ -281,21 +285,71 @@ function PersonalizationPanel() {
 
 // ── MCP Servers Panel ───────────────────────────────────────────────────────
 
+type MCPTransport = "streamable_http" | "http" | "stdio";
+
+interface MCPConnection {
+    connected: boolean;
+    tools: string[];
+    error?: string | null;
+    transport?: string | null;
+}
+
+const MCP_TRANSPORTS: { value: MCPTransport; label: string; hint: string }[] = [
+    { value: "streamable_http", label: "HTTP (recommended)", hint: "A hosted MCP server URL, usually ending in /mcp." },
+    { value: "http", label: "SSE (legacy)", hint: "Older servers that only speak Server-Sent Events, usually ending in /sse." },
+    { value: "stdio", label: "Local command", hint: "Runs a command on the Quasar server. Only allowed on trusted local installs." },
+];
+
+const MCP_INPUT = "w-full rounded-xl border border-[var(--q-border)] bg-[var(--q-card)] px-3 py-2 text-sm text-[var(--q-text)] placeholder:text-[var(--q-text-faint)] focus:border-[var(--q-border-strong)] focus:outline-none";
+const MCP_LABEL = "mb-1.5 block text-xs font-medium text-[var(--q-text-muted)]";
+
+/** "KEY=value" (env) or "Name: value" (headers), one per line. */
+function parsePairs(text: string, sep: "=" | ":"): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const line of text.split("\n")) {
+        const i = line.indexOf(sep);
+        if (i <= 0) continue;
+        const k = line.slice(0, i).trim();
+        const v = line.slice(i + 1).trim();
+        if (k) out[k] = v;
+    }
+    return out;
+}
+
+function ConnectionPill({ status }: { status?: MCPConnection }) {
+    if (!status) {
+        return <span className="rounded-md bg-[var(--q-canvas)] px-2 py-0.5 text-[11px] text-[var(--q-text-muted)]">Not tested yet</span>;
+    }
+    if (status.connected) {
+        return (
+            <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-600">
+                Connected · {status.tools.length} tool{status.tools.length === 1 ? "" : "s"}
+            </span>
+        );
+    }
+    return <span className="rounded-md bg-red-500/10 px-2 py-0.5 text-[11px] font-medium q-err">Not connected</span>;
+}
+
 function MCPServersPanel() {
     const { isAuthenticated } = useAuthStore();
     const [activeTab, setActiveTab] = useState<"installed" | "add">("installed");
     const [servers, setServers] = useState<MCPServer[]>([]);
     const [loading, setLoading] = useState(false);
-    
+    const [testing, setTesting] = useState<string | null>(null);
+    // Results of Save & Connect / Test in this session, by server name.
+    const [results, setResults] = useState<Record<string, MCPConnection>>({});
+
     // Form state
     const [sName, setSName] = useState("");
-    const [sTransport, setSTransport] = useState<"stdio" | "http">("stdio");
+    const [sTransport, setSTransport] = useState<MCPTransport>("streamable_http");
     const [sCmd, setSCmd] = useState("npx");
-    const [sArgs, setSargs] = useState("-y @modelcontextprotocol/server-everything");
-    const [sUrl, setSUrl] = useState("https://huggingface.co/mcp");
+    const [sArgs, setSargs] = useState("");
+    const [sUrl, setSUrl] = useState("");
     const [sEnvStr, setSEnvStr] = useState("");
-    const [formMsg, setFormMsg] = useState<{type: "success" | "error", text: string} | null>(null);
+    const [sHeaderStr, setSHeaderStr] = useState("");
+    const [formMsg, setFormMsg] = useState<{ type: "success" | "error" | "warn"; text: string } | null>(null);
     const [saving, setSaving] = useState(false);
+    const isUrlTransport = sTransport !== "stdio";
 
     const fetchServers = useCallback(async () => {
         if (!isAuthenticated) return;
@@ -318,67 +372,76 @@ function MCPServersPanel() {
             return;
         }
         if (sTransport === "stdio" && !sCmd.trim()) {
-            setFormMsg({ type: "error", text: "Command is required for stdio transport." });
+            setFormMsg({ type: "error", text: "A command is required for a local server." });
             return;
         }
-        if (sTransport === "http" && !sUrl.trim()) {
-            setFormMsg({ type: "error", text: "URL is required for http transport." });
+        if (isUrlTransport && !/^https?:\/\//i.test(sUrl.trim())) {
+            setFormMsg({ type: "error", text: "Enter the server URL, starting with https://" });
             return;
         }
-        
-        // Parse args
-        const cmdArgs = sArgs.split(/\s+/).filter(a => a.trim().length > 0);
-        
-        // Parse Env
-        const envDict: Record<string, string> = {};
-        if (sEnvStr.trim()) {
-            const lines = sEnvStr.split("\n");
-            for (const line of lines) {
-                const parts = line.split("=");
-                if (parts.length >= 2) {
-                    const k = parts[0].trim();
-                    const v = parts.slice(1).join("=").trim();
-                    if (k) envDict[k] = v;
-                }
-            }
-        }
-        
+
         setSaving(true);
         try {
             const bodyPayload = {
                 name: sName.trim(),
                 transport: sTransport,
                 command: sTransport === "stdio" ? sCmd.trim() : null,
-                args: sTransport === "stdio" ? cmdArgs : [],
-                url: sTransport === "http" ? sUrl.trim() : null,
-                env: envDict
+                args: sTransport === "stdio" ? sArgs.split(/\s+/).filter(Boolean) : [],
+                url: isUrlTransport ? sUrl.trim() : null,
+                env: sTransport === "stdio" ? parsePairs(sEnvStr, "=") : {},
+                headers: isUrlTransport ? parsePairs(sHeaderStr, ":") : {},
             };
-            
-            const res = await fetch(`${API_BASE}/api/mcp-servers`, { credentials: "include",
+            const res = await fetch(`${API_BASE}/api/mcp-servers`, {
+                credentials: "include",
                 method: "POST",
                 headers: authBearerHeaders({ "Content-Type": "application/json" }),
-                body: JSON.stringify(bodyPayload)
+                body: JSON.stringify(bodyPayload),
             });
             const data = await res.json();
             if (res.ok) {
-                setFormMsg({ type: "success", text: `Server ${sName} added successfully!` });
-                setSName(""); setSCmd("npx"); setSargs(""); setSEnvStr(""); setSUrl("");
-                fetchServers();
-                setTimeout(() => { setActiveTab("installed"); setFormMsg(null); }, 1500);
+                const conn: MCPConnection | undefined = data.connection;
+                const name = bodyPayload.name;
+                if (conn) setResults((r) => ({ ...r, [name]: conn }));
+                if (conn?.connected) {
+                    setFormMsg({ type: "success", text: `Connected to ${name}: ${conn.tools.length} tool${conn.tools.length === 1 ? "" : "s"} available in chat (${conn.tools.slice(0, 4).join(", ")}${conn.tools.length > 4 ? ", ..." : ""}).` });
+                    setSName(""); setSargs(""); setSEnvStr(""); setSHeaderStr(""); setSUrl("");
+                    fetchServers();
+                    setTimeout(() => { setActiveTab("installed"); setFormMsg(null); }, 2200);
+                } else {
+                    setFormMsg({ type: "warn", text: `Saved ${name}, but it did not connect: ${conn?.error || "no response"}. Check the URL, transport and any required headers.` });
+                    fetchServers();
+                }
             } else {
                 setFormMsg({ type: "error", text: data.detail || "Failed to save server." });
             }
-        } catch (e) {
+        } catch {
             setFormMsg({ type: "error", text: "Network error saving server." });
         }
         setSaving(false);
+    };
+
+    const handleTest = async (name: string) => {
+        setTesting(name);
+        try {
+            const res = await fetch(`${API_BASE}/api/mcp-servers/${encodeURIComponent(name)}/test`, {
+                credentials: "include",
+                method: "POST",
+                headers: authBearerHeaders(),
+            });
+            if (res.ok) {
+                const conn: MCPConnection = await res.json();
+                setResults((r) => ({ ...r, [name]: conn }));
+            }
+        } catch { /* noop */ }
+        setTesting(null);
     };
 
     const handleDelete = async (name: string) => {
         if (!isAuthenticated) return;
         if (!confirm(`Delete MCP server "${name}"?`)) return;
         try {
-            const res = await fetch(`${API_BASE}/api/mcp-servers/${encodeURIComponent(name)}`, { credentials: "include",
+            const res = await fetch(`${API_BASE}/api/mcp-servers/${encodeURIComponent(name)}`, {
+                credentials: "include",
                 method: "DELETE",
                 headers: authBearerHeaders(),
             });
@@ -388,167 +451,157 @@ function MCPServersPanel() {
 
     if (!isAuthenticated) {
         return (
-            <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8 py-16">
-                <div className="w-14 h-14 rounded-2xl glass-control flex items-center justify-center">
-                    <Lock className="w-7 h-7 text-slate-500" />
+            <div className="flex h-full flex-col items-center justify-center gap-4 px-8 py-16 text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[var(--q-canvas)]">
+                    <Lock className="h-7 w-7 text-[var(--q-text-faint)]" />
                 </div>
                 <div>
-                    <p className="text-sm font-semibold text-slate-300">Sign in to use MCP Servers</p>
-                    <p className="text-xs text-slate-500 mt-1.5 max-w-xs">Connecting external tools via the Model Context Protocol requires an account.</p>
+                    <p className="text-sm font-medium text-[var(--q-text)]">Sign in to use MCP servers</p>
+                    <p className="mt-1.5 max-w-xs text-xs text-[var(--q-text-muted)]">Connecting external tools through the Model Context Protocol requires an account.</p>
                 </div>
             </div>
         );
     }
 
+    const tabClass = (active: boolean) =>
+        `px-4 py-2 text-sm font-medium border-b-2 transition-colors ${active ? "border-[var(--q-ink)] text-[var(--q-text)]" : "border-transparent text-[var(--q-text-muted)] hover:text-[var(--q-text)]"}`;
+
     return (
-        <div className="flex flex-col h-full bg-[#0a0a0f]">
-            <div className="flex border-b border-slate-700/50 px-4 pt-2 shrink-0">
-                <button 
-                    onClick={() => setActiveTab("installed")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 ${activeTab === "installed" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
-                >
-                    Connected ({servers.length})
+        <div className="flex h-full flex-col bg-[var(--q-bg)]">
+            <div className="flex shrink-0 border-b border-[var(--q-border)] px-4 pt-2">
+                <button onClick={() => setActiveTab("installed")} className={tabClass(activeTab === "installed")}>
+                    Your servers ({servers.length})
                 </button>
-                <button 
-                    onClick={() => setActiveTab("add")}
-                    className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors duration-200 flex flex-row items-center gap-1.5 ${activeTab === "add" ? "border-primary text-white" : "border-transparent text-slate-400 hover:text-slate-200"}`}
-                >
-                    <Plus className="w-4 h-4" /> Add Server
+                <button onClick={() => setActiveTab("add")} className={`${tabClass(activeTab === "add")} flex items-center gap-1.5`}>
+                    <Plus className="h-4 w-4" /> Add server
                 </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
+            <div className="flex-1 space-y-6 overflow-y-auto p-6">
                 {activeTab === "installed" && (
                     <div>
-                        {loading && <div className="text-slate-400 text-sm flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin"/> Loading...</div>}
+                        {loading && <div className="flex items-center gap-2 text-sm text-[var(--q-text-muted)]"><Loader2 className="h-4 w-4 animate-spin" /> Loading...</div>}
                         {!loading && servers.length === 0 && (
-                            <div className="text-center py-12">
-                                <Wrench className="w-12 h-12 text-slate-700 mx-auto mb-3" />
-                                <p className="text-sm text-slate-400 mb-2">No external MCP servers configured.</p>
-                                <p className="text-[10px] text-slate-500 max-w-xs mx-auto">Connect official integrations like GitHub, Postgres, or Google Drive via stdio.</p>
-                                <button onClick={() => setActiveTab("add")} className="mt-4 text-xs font-semibold text-primary hover:text-primary-400">
-                                    + Connect a server
+                            <div className="py-12 text-center">
+                                <Wrench className="mx-auto mb-3 h-10 w-10 text-[var(--q-text-faint)]" strokeWidth={1.5} />
+                                <p className="mb-1.5 text-sm text-[var(--q-text)]">No MCP servers yet</p>
+                                <p className="mx-auto max-w-xs text-xs text-[var(--q-text-muted)]">Add a hosted MCP server by URL and its tools become available to Quasar in your chats.</p>
+                                <button onClick={() => setActiveTab("add")} className="q-pill mt-4 h-8 px-3.5 text-xs">
+                                    <Plus className="h-3.5 w-3.5" /> Add a server
                                 </button>
                             </div>
                         )}
                         {!loading && servers.length > 0 && (
                             <div className="space-y-3">
-                                {servers.map(srv => (
-                                    <div key={srv.name} className="glass-control rounded-xl p-4 group flex items-start justify-between">
-                                        <div className="min-w-0 flex-1 pr-4">
-                                            <div className="flex items-center gap-2 mb-1">
-                                                <h4 className="text-sm font-semibold text-slate-200 truncate">{srv.name}</h4>
-                                                <span className={`text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded ${srv.transport === 'http' ? 'text-purple-400 bg-purple-400/10' : 'text-blue-400 bg-blue-400/10'}`}>MCP {srv.transport || 'stdio'}</span>
-                                            </div>
-                                            {srv.transport === "http" ? (
-                                                <p className="text-xs text-slate-400 font-mono mt-2 truncate bg-black/30 p-1.5 rounded border border-slate-700/50">
-                                                    {srv.url}
-                                                </p>
-                                            ) : (
-                                                <p className="text-xs text-slate-400 font-mono mt-2 truncate bg-black/30 p-1.5 rounded border border-slate-700/50">
-                                                    $ {srv.command} {(srv.args || []).join(" ")}
-                                                </p>
-                                            )}
-                                            {srv.env && Object.keys(srv.env).length > 0 && (
-                                                <div className="mt-2 text-[10px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded inline-block">
-                                                    Environment: {Object.keys(srv.env).join(", ")}
+                                {servers.map((srv) => {
+                                    const status = results[srv.name] ?? srv.status;
+                                    const transportLabel = MCP_TRANSPORTS.find((t) => t.value === (srv.transport || "stdio"))?.label.replace(" (recommended)", "") ?? srv.transport;
+                                    return (
+                                        <div key={srv.name} className="glass-card rounded-2xl p-4">
+                                            <div className="flex items-start justify-between gap-3">
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <h4 className="truncate text-sm font-medium text-[var(--q-text)]">{srv.name}</h4>
+                                                        <span className="q-tag">{transportLabel}</span>
+                                                        <ConnectionPill status={status} />
+                                                    </div>
+                                                    <p className="mt-2 truncate rounded-lg bg-[var(--q-canvas)] px-2 py-1.5 font-mono text-xs text-[var(--q-text-muted)]">
+                                                        {srv.transport === "stdio" || !srv.transport ? `$ ${srv.command} ${(srv.args || []).join(" ")}` : srv.url}
+                                                    </p>
+                                                    {status?.connected && status.tools.length > 0 && (
+                                                        <p className="mt-2 text-[11px] text-[var(--q-text-muted)]">Tools: {status.tools.join(", ")}</p>
+                                                    )}
+                                                    {status && !status.connected && status.error && (
+                                                        <p className="mt-2 text-[11px] q-err">{status.error}</p>
+                                                    )}
+                                                    {[...Object.keys(srv.headers || {}), ...Object.keys(srv.env || {})].length > 0 && (
+                                                        <p className="mt-2 text-[10px] text-[var(--q-text-faint)]">
+                                                            Secrets saved: {[...Object.keys(srv.headers || {}), ...Object.keys(srv.env || {})].join(", ")}
+                                                        </p>
+                                                    )}
                                                 </div>
-                                            )}
+                                                <div className="flex shrink-0 items-center gap-1.5">
+                                                    <button onClick={() => handleTest(srv.name)} disabled={testing === srv.name} className="q-pill h-8 px-3 text-xs" title="Connect now and list its tools">
+                                                        {testing === srv.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                                                        Test
+                                                    </button>
+                                                    <button onClick={() => handleDelete(srv.name)} className="rounded-full p-2 text-[var(--q-text-faint)] transition-colors hover:bg-red-500/10 hover:text-red-500" title="Delete server">
+                                                        <Trash2 className="h-4 w-4" />
+                                                    </button>
+                                                </div>
+                                            </div>
                                         </div>
-                                        <button
-                                            onClick={() => handleDelete(srv.name)}
-                                            className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-all opacity-0 group-hover:opacity-100 shrink-0"
-                                            title="Delete server"
-                                        >
-                                            <Trash2 className="w-4 h-4" />
-                                        </button>
-                                    </div>
-                                ))}
+                                    );
+                                })}
                             </div>
                         )}
                     </div>
                 )}
 
                 {activeTab === "add" && (
-                    <div className="space-y-4 max-w-2xl">
+                    <div className="max-w-2xl space-y-4">
                         {formMsg && (
-                            <div className={`flex items-center gap-2.5 px-4 py-3 rounded-xl text-sm ${formMsg.type === "success" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"}`}>
-                                {formMsg.type === "success" ? <CheckCircle className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
-                                {formMsg.text}
+                            <div className={`flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm ${formMsg.type === "success" ? "bg-emerald-500/10 text-emerald-600" : formMsg.type === "warn" ? "bg-amber-500/10 q-warn" : "bg-red-500/10 q-err"}`}>
+                                {formMsg.type === "success" ? <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+                                <span>{formMsg.text}</span>
                             </div>
                         )}
 
                         <div>
-                            <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Server Name</label>
-                            <input 
-                                type="text" value={sName} onChange={e => setSName(e.target.value)}
-                                placeholder="e.g. github_integration"
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-primary"
-                            />
+                            <label className={MCP_LABEL}>Server name</label>
+                            <input type="text" value={sName} onChange={(e) => setSName(e.target.value)} placeholder="e.g. deepwiki" className={MCP_INPUT} />
                         </div>
 
                         <div>
-                            <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Transport</label>
-                            <div className="flex gap-4">
-                                <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
-                                    <input type="radio" name="mcp_transport" value="stdio" checked={sTransport === "stdio"} onChange={() => setSTransport("stdio")} className="accent-primary" />
-                                    Command Line (stdio)
-                                </label>
-                                <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
-                                    <input type="radio" name="mcp_transport" value="http" checked={sTransport === "http"} onChange={() => setSTransport("http")} className="accent-primary" />
-                                    HTTP/SSE (url)
-                                </label>
+                            <label className={MCP_LABEL}>Transport</label>
+                            <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Transport">
+                                {MCP_TRANSPORTS.map((t) => (
+                                    <button key={t.value} type="button" role="radio" aria-checked={sTransport === t.value}
+                                        onClick={() => setSTransport(t.value)}
+                                        className={sTransport === t.value ? "q-pill-ink h-8 px-3 text-xs" : "q-pill h-8 px-3 text-xs"}>
+                                        {t.label}
+                                    </button>
+                                ))}
                             </div>
+                            <p className="mt-1.5 text-[11px] text-[var(--q-text-faint)]">{MCP_TRANSPORTS.find((t) => t.value === sTransport)?.hint}</p>
                         </div>
 
                         {sTransport === "stdio" ? (
                             <div className="flex gap-3">
                                 <div className="w-1/3">
-                                    <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Command</label>
-                                    <input 
-                                        type="text" value={sCmd} onChange={e => setSCmd(e.target.value)}
-                                        placeholder="npx, uvx, docker, etc."
-                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-primary"
-                                    />
+                                    <label className={MCP_LABEL}>Command</label>
+                                    <input type="text" value={sCmd} onChange={(e) => setSCmd(e.target.value)} placeholder="npx, uvx, docker..." className={`${MCP_INPUT} font-mono`} />
                                 </div>
                                 <div className="flex-1">
-                                    <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Arguments (Space separated)</label>
-                                    <input 
-                                        type="text" value={sArgs} onChange={e => setSargs(e.target.value)}
-                                        placeholder="-y @modelcontextprotocol/server-github"
-                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-primary"
-                                    />
+                                    <label className={MCP_LABEL}>Arguments (space separated)</label>
+                                    <input type="text" value={sArgs} onChange={(e) => setSargs(e.target.value)} placeholder="-y @modelcontextprotocol/server-everything" className={`${MCP_INPUT} font-mono`} />
                                 </div>
                             </div>
                         ) : (
                             <div>
-                                <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">SSE URL</label>
-                                <input 
-                                    type="text" value={sUrl} onChange={e => setSUrl(e.target.value)}
-                                    placeholder="https://huggingface.co/mcp"
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-primary"
-                                />
+                                <label className={MCP_LABEL}>Server URL</label>
+                                <input type="text" value={sUrl} onChange={(e) => setSUrl(e.target.value)} placeholder="https://mcp.deepwiki.com/mcp" className={`${MCP_INPUT} font-mono`} />
                             </div>
                         )}
 
-                        <div>
-                            <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">Environment Variables</label>
-                            <p className="text-[10px] text-slate-500 mb-2">One per line, format: <code>KEY=value</code>. These will be securely passed to the process.</p>
-                            <textarea 
-                                value={sEnvStr} onChange={e => setSEnvStr(e.target.value)}
-                                placeholder="GITHUB_PERSONAL_ACCESS_TOKEN=ghp_..."
-                                rows={3}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-white placeholder-slate-600 focus:outline-none focus:border-primary leading-relaxed"
-                            />
-                        </div>
+                        {sTransport === "stdio" ? (
+                            <div>
+                                <label className={MCP_LABEL}>Environment variables</label>
+                                <p className="mb-2 text-[11px] text-[var(--q-text-faint)]">One per line, <code>KEY=value</code>. Passed to the process.</p>
+                                <textarea value={sEnvStr} onChange={(e) => setSEnvStr(e.target.value)} placeholder="GITHUB_PERSONAL_ACCESS_TOKEN=ghp_..." rows={3} className={`${MCP_INPUT} font-mono leading-relaxed`} />
+                            </div>
+                        ) : (
+                            <div>
+                                <label className={MCP_LABEL}>Request headers (optional)</label>
+                                <p className="mb-2 text-[11px] text-[var(--q-text-faint)]">One per line, <code>Name: value</code>. For servers that need an API key. Values are never shown again after saving.</p>
+                                <textarea value={sHeaderStr} onChange={(e) => setSHeaderStr(e.target.value)} placeholder="Authorization: Bearer <token>" rows={2} className={`${MCP_INPUT} font-mono leading-relaxed`} />
+                            </div>
+                        )}
 
-                        <div className="pt-2 flex justify-end">
-                            <button 
-                                onClick={handleSave} disabled={saving}
-                                className="btn-accent disabled:opacity-50 text-sm font-semibold py-2 px-6 rounded-lg flex items-center gap-2"
-                            >
-                                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
-                                Save & Connect
+                        <div className="flex justify-end pt-2">
+                            <button onClick={handleSave} disabled={saving} className="q-pill-ink h-10 px-5 text-sm">
+                                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
+                                {saving ? "Connecting..." : "Save & Connect"}
                             </button>
                         </div>
                     </div>
@@ -1499,16 +1552,16 @@ function ThemeSwitch() {
     return (
         <button
             onClick={toggle}
-            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+            className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
             title={`Switch to ${isDark ? "light" : "dark"} mode`}
         >
             <div className="flex items-center gap-2.5">
                 {isDark ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
-                <span>{isDark ? "Dark Mode" : "Light Mode"}</span>
+                <span className="whitespace-nowrap">{isDark ? "Dark mode" : "Light mode"}</span>
             </div>
             {/* Toggle pill */}
-            <div className={`relative w-9 h-5 rounded-full transition-colors ${isDark ? "bg-slate-600" : "bg-primary/40"}`}>
-                <div className={`absolute top-0.5 w-4 h-4 rounded-full shadow-sm transition-all duration-200 ${isDark ? "left-0.5 bg-slate-300" : "left-[18px] bg-primary"}`} />
+            <div className={`relative w-9 h-5 shrink-0 rounded-full transition-colors ${isDark ? "bg-[var(--q-border-strong)]" : "bg-[var(--q-ink)]"}`}>
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full shadow-sm transition-all duration-200 ${isDark ? "left-0.5 bg-white" : "left-[18px] bg-[var(--q-on-ink)]"}`} />
             </div>
         </button>
     );
@@ -1529,15 +1582,15 @@ function EvalModeSwitch() {
     return (
         <button
             onClick={() => setEvalMode(!evalMode)}
-            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+            className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
             title="Rate every block of a turn before sending the next prompt"
         >
             <div className="flex items-center gap-2.5">
                 <Star className="w-4 h-4" />
-                <span>Eval Mode</span>
+                <span className="whitespace-nowrap">Eval mode</span>
             </div>
-            <div className={`relative w-9 h-5 rounded-full transition-colors ${evalMode ? "bg-primary/40" : "bg-slate-600"}`}>
-                <div className={`absolute top-0.5 w-4 h-4 rounded-full shadow-sm transition-all duration-200 ${evalMode ? "left-[18px] bg-primary" : "left-0.5 bg-slate-300"}`} />
+            <div className={`relative w-9 h-5 shrink-0 rounded-full transition-colors ${evalMode ? "bg-[var(--q-ink)]" : "bg-[var(--q-border-strong)]"}`}>
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full shadow-sm transition-all duration-200 ${evalMode ? "left-[18px] bg-[var(--q-on-ink)]" : "left-0.5 bg-white"}`} />
             </div>
         </button>
     );
@@ -1656,7 +1709,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
                             href="/terms"
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+                            className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
                         >
                             <div className="flex items-center gap-2.5">
                                 <ScrollText className="w-4 h-4" />
@@ -1669,7 +1722,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
                             href="https://github.com/adamzacharia/Quasar"
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
+                            className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent transition-colors"
                         >
                             <div className="flex items-center gap-2.5 min-w-0">
                                 <Github className="w-4 h-4 shrink-0" />

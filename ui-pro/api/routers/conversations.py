@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import conversation_service, get_current_user
-from api.models import ConversationCreate, ConversationTitleUpdate
+from api.models import ConversationCreate, ConversationStarUpdate, ConversationTitleUpdate
 
 router = APIRouter()
 
@@ -50,6 +50,24 @@ async def update_conversation_title_endpoint(
     if not updated:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"status": "ok"}
+
+
+@router.put("/api/conversations/{conversation_id}/star")
+async def update_conversation_star_endpoint(
+    conversation_id: str,
+    req: ConversationStarUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Star or unstar a conversation (persists across reloads and devices)."""
+    user_id = current_user["sub"]
+    updated = conversation_service.set_conversation_starred_for_user(
+        conversation_id,
+        user_id,
+        req.starred,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "ok", "starred": req.starred}
 
 
 @router.delete("/api/conversations/{conversation_id}")

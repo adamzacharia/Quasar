@@ -1,15 +1,28 @@
 """
-Script to ingest all ALMA documentation from docs/pdfs/ into Qdrant
-with rich metadata (year, category, cycle, title, etc.).
+Ingest documentation files (docs/pdfs/ by default) into Qdrant with rich metadata.
+
+Files listed in the manifest (scripts/download_alma_docs.py) get authoritative
+metadata (category, cycle, doc number, version, publication date, status,
+source URL, fetch date, and a one-line document header on every chunk).
+Unknown files fall back to the filename / PDF-metadata guesses.
 
 Usage:
-    conda run -n quasar python scripts/ingest_docs_folder.py
-    conda run -n quasar python scripts/ingest_docs_folder.py --no-wipe  # Keep existing data
+    python scripts/ingest_docs_folder.py --sync        # non-destructive refresh (recommended)
+    python scripts/ingest_docs_folder.py --estimate    # token + cost estimate only, no writes
+    python scripts/ingest_docs_folder.py --only alma-user-policies-cycle13.pdf --sync
+    python scripts/ingest_docs_folder.py               # LEGACY: wipe alma_general, re-ingest folder
+    python scripts/ingest_docs_folder.py --no-wipe     # LEGACY: append without replacing
+
+--only requires --sync outside --estimate, and every --only name must exist
+in the folder: the legacy default mode wipes the whole collection first.
+
+--sync never wipes the collection (notebooks, KB articles and HTML pages share
+it). It deletes the chunks of every RETIRED_FILES entry, then re-ingests each
+file with replace_existing=True, so re-running it is idempotent.
 """
 import os
 import sys
 import argparse
-from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,150 +41,168 @@ if "cgi" not in _sys.modules:
     _sys.modules["cgi"] = cgi
 # ---------------------------------------------
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 from dotenv import load_dotenv
 load_dotenv()
 
-from services.rag_service import RAGService
+SUPPORTED_EXT = {".pdf", ".txt", ".md"}
+# text-embedding-ada-002 list price, USD per 1M input tokens.
+EMBED_USD_PER_MTOK = 0.10
+
+
+def discover(docs_dir: str, only=None):
+    files = sorted(
+        f for f in os.listdir(docs_dir)
+        if os.path.splitext(f)[1].lower() in SUPPORTED_EXT
+    )
+    if only:
+        files = [f for f in files if f in set(only)]
+    return files
+
+
+def select_files(docs_dir: str, only, retired):
+    """(files to ingest, retired files skipped). Retired files still on disk
+    must never be re-ingested after --sync deleted their chunks (CX-01)."""
+    found = discover(docs_dir, only)
+    return [f for f in found if f not in retired], [f for f in found if f in retired]
+
+
+def selection_error(only, doc_files, skipped_retired, *, sync, no_wipe, estimate):
+    """Reason to refuse the run before anything is written, or None.
+
+    The legacy default mode wipes the whole shared collection before ingesting,
+    so a subset (--only) or an empty selection there would delete everything
+    and re-ingest little or nothing."""
+    if only:
+        found = set(doc_files) | set(skipped_retired)
+        missing = [f for f in only if f not in found]
+        if missing:
+            return f"--only names not found in the docs folder: {', '.join(missing)}"
+        if not doc_files:
+            return "--only selected only retired files; nothing to ingest"
+    if estimate:
+        return None
+    if only and not sync:
+        return "--only requires --sync (the default mode wipes the whole collection)"
+    if not doc_files and not sync and not no_wipe:
+        return "no documents found; refusing to wipe the collection"
+    return None
+
+
+def extract_text_for_estimate(path: str) -> str:
+    """Plain text used only for the token estimate (fast, no markdown pass)."""
+    if path.lower().endswith(".pdf"):
+        import fitz
+        with fitz.open(path) as d:
+            return "".join(page.get_text() for page in d)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def estimate_tokens(paths) -> dict:
+    """Embedding tokens for the given files, counting the 200-char chunk
+    overlap (chunk 1000 / overlap 200 re-embeds about 25 % of the text)."""
+    import tiktoken
+    enc = tiktoken.get_encoding("cl100k_base")
+    per_file = {}
+    for p in paths:
+        text = extract_text_for_estimate(p)
+        per_file[os.path.basename(p)] = int(len(enc.encode_ordinary(text)) * 1.25)
+    total = sum(per_file.values())
+    return {"per_file": per_file, "total_tokens": total,
+            "usd": round(total / 1e6 * EMBED_USD_PER_MTOK, 4)}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest docs/pdfs/ into Qdrant with rich metadata")
+    parser = argparse.ArgumentParser(description="Ingest docs into Qdrant with rich metadata")
     parser.add_argument("--no-wipe", action="store_true",
-                        help="Skip wiping the existing collection (default: wipe first)")
-    parser.add_argument("--dir", type=str, default=None,
-                        help="Override docs directory path")
+                        help="LEGACY: skip wiping the collection (append; may duplicate)")
+    parser.add_argument("--sync", action="store_true",
+                        help="Non-destructive refresh: drop retired sources, replace each file's chunks")
+    parser.add_argument("--estimate", action="store_true", help="Print token/cost estimate and exit")
+    parser.add_argument("--only", action="append", default=[], help="Limit to these filenames")
+    parser.add_argument("--dir", type=str, default=None, help="Override docs directory path")
     args = parser.parse_args()
 
-    print("=" * 70)
-    print("  ALMA Documentation RAG Ingestion (with Metadata)")
-    print("=" * 70)
+    from download_alma_docs import RETIRED_FILES, manifest_metadata  # scripts/ is on sys.path
 
-    rag = RAGService()
-
-    # Determine docs directory
-    if args.dir:
-        docs_dir = args.dir
-    else:
-        docs_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "docs", "pdfs"
-        )
-
+    docs_dir = args.dir or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "pdfs"
+    )
     if not os.path.exists(docs_dir):
-        print(f"✗ Directory not found: {docs_dir}")
+        print(f"Directory not found: {docs_dir}")
         return
 
-    # Discover files
-    supported_ext = {".pdf", ".txt", ".md"}
-    doc_files = sorted([
-        f for f in os.listdir(docs_dir)
-        if os.path.splitext(f)[1].lower() in supported_ext
-    ])
-    print(f"\nFound {len(doc_files)} documents in {docs_dir}")
-    for f in doc_files:
-        size_kb = os.path.getsize(os.path.join(docs_dir, f)) // 1024
-        print(f"  • {f}  ({size_kb:,} KB)")
+    doc_files, skipped_retired = select_files(docs_dir, args.only, RETIRED_FILES)
+    print(f"Found {len(doc_files)} documents in {docs_dir}")
+    for f in skipped_retired:
+        print(f"  skipping retired file still on disk: {f} ({RETIRED_FILES[f]})")
 
-    # Pre-ingestion stats
-    stats_before = rag.get_collection_stats()
-    print(f"\nPre-ingestion stats: {stats_before}")
+    err = selection_error(args.only, doc_files, skipped_retired,
+                          sync=args.sync, no_wipe=args.no_wipe, estimate=args.estimate)
+    if err:
+        print(f"Refusing to run: {err}")
+        sys.exit(2)
 
-    # Wipe collection if requested (default: wipe)
-    if not args.no_wipe:
-        print("\n⚠  Wiping existing alma_general collection for clean re-ingestion...")
+    if args.estimate:
+        est = estimate_tokens([os.path.join(docs_dir, f) for f in doc_files])
+        for fn, tok in est["per_file"].items():
+            print(f"  {fn:<55} {tok:>10,} tokens")
+        print(f"  TOTAL {est['total_tokens']:,} tokens ~ USD {est['usd']}")
+        return
+
+    from services.rag_service import RAGService
+    from services.vector_db import backend_label
+    print(f"Vector store backend: {backend_label()}")
+    rag = RAGService()
+    print(f"Pre-ingestion stats: {rag.get_collection_stats()}")
+
+    if args.sync:
+        for fn, why in RETIRED_FILES.items():
+            rag.delete_source(fn)
+        print(f"Removed chunks of {len(RETIRED_FILES)} retired source files (if present)")
+    elif not args.no_wipe:
+        print("Wiping alma_general for clean re-ingestion (legacy mode; use --sync to keep other sources)")
         rag.wipe_general_collection()
-        print("   ✓ Collection wiped and recreated")
-    else:
-        print("\n📌 Keeping existing data (--no-wipe mode)")
 
-    # Ingest each document
-    print("\n" + "─" * 70)
     results = {}
     total_chunks = 0
     for i, doc_file in enumerate(doc_files, 1):
         file_path = os.path.join(docs_dir, doc_file)
-        print(f"\n[{i}/{len(doc_files)}] Ingesting {doc_file}...")
-
+        meta = manifest_metadata(doc_file, path=file_path)
+        tag = "manifest" if meta else "UNLISTED (guessed metadata)"
+        print(f"\n[{i}/{len(doc_files)}] {doc_file}  [{tag}]")
         try:
             result = rag.ingest_document(
                 file_path,
                 personal=False,
-                progress_callback=lambda msg, pct: print(f"    {msg} ({pct}%)"),
+                override_metadata=meta,
+                replace_existing=args.sync,
             )
-            results[doc_file] = result
-
-            if result.get("success"):
-                meta = result.get("metadata", {})
-                chunks = result.get("chunks", 0)
-                total_chunks += chunks
-                month_str = f"/{meta['doc_month']:02d}" if meta.get('doc_month') else ""
-                print(f"    ✓ {chunks} chunks | Date: {meta.get('doc_year', '?')}{month_str} | "
-                      f"Category: {meta.get('doc_category', '?')} | "
-                      f"Cycle: {meta.get('alma_cycle', 'N/A')} | "
-                      f"Title: {meta.get('doc_title', '?')}")
-            else:
-                print(f"    ✗ FAILED: {result.get('error', 'Unknown error')}")
-
-        except Exception as e:
-            print(f"    ✗ Exception: {e}")
-            results[doc_file] = {"success": False, "error": str(e)}
-
-    # Create payload indexes for fast filtered search
-    print("\n" + "─" * 70)
-    print("Creating payload indexes for filtered search...")
-    rag.create_metadata_indexes()
-
-    # Summary
-    print("\n" + "=" * 70)
-    print("  INGESTION SUMMARY")
-    print("=" * 70)
-    success_count = sum(1 for v in results.values() if v.get("success"))
-    fail_count = len(results) - success_count
-    print(f"\n  ✓ Successful: {success_count}/{len(results)}")
-    if fail_count:
-        print(f"  ✗ Failed:     {fail_count}/{len(results)}")
-    print(f"  📦 Total chunks: {total_chunks}")
-
-    print("\n  Per-document details:")
-    print(f"  {'Document':<50} {'Status':<8} {'Chunks':<8} {'Year':<6} {'Category':<20}")
-    print("  " + "─" * 92)
-    for doc_file, result in results.items():
+        except Exception as e:  # keep going; report at the end
+            result = {"success": False, "error": str(e)}
+        results[doc_file] = result
         if result.get("success"):
-            meta = result.get("metadata", {})
-            print(f"  {doc_file:<50} {'✓':<8} {result.get('chunks', 0):<8} "
-                  f"{meta.get('doc_year', '?'):<6} {meta.get('doc_category', '?'):<20}")
+            m = result.get("metadata", {})
+            total_chunks += result.get("chunks", 0)
+            print(f"    {result.get('chunks', 0)} chunks | {m.get('doc_year')}/{m.get('doc_month')} | "
+                  f"{m.get('doc_category')} | {m.get('alma_cycle') or '-'} | {m.get('doc_title')}")
         else:
-            print(f"  {doc_file:<50} {'✗':<8} {'–':<8} {'–':<6} {'FAILED':<20}")
+            print(f"    FAILED: {result.get('error', 'unknown error')}")
 
-    # Post-ingestion stats
-    stats_after = rag.get_collection_stats()
-    print(f"\n  Post-ingestion stats: {stats_after}")
-
-    # Quick verification: test a filtered search
-    print("\n" + "=" * 70)
-    print("  VERIFICATION: Test Search")
-    print("=" * 70)
-    test_queries = [
-        ("ALMA Band 6 receiver", None, "Unfiltered"),
-        ("ALMA pipeline calibration", 2025, "Year ≥ 2025"),
-    ]
-    for query, min_year, label in test_queries:
-        print(f"\n  Query: '{query}' [{label}]")
-        test_results = rag.search(query, k=2, min_year=min_year, include_personal=False)
-        if test_results:
-            for j, doc in enumerate(test_results, 1):
-                src = doc.metadata.get("source_file", "?")
-                year = doc.metadata.get("doc_year", "?")
-                score = doc.metadata.get("_score", "?")
-                page = doc.metadata.get("page", "?")
-                cat = doc.metadata.get("doc_category", "?")
-                print(f"    [{j}] {src} | Page {page} | Year: {year} | "
-                      f"Score: {score} | Category: {cat}")
-                print(f"        {doc.page_content[:120]}...")
-        else:
-            print("    (no results)")
-
-    print("\n✅ Ingestion complete!")
+    rag.create_metadata_indexes()
+    ok = sum(1 for v in results.values() if v.get("success"))
+    print(f"\nIngested {ok}/{len(results)} files, {total_chunks} chunks")
+    for fn, r in results.items():
+        if not r.get("success"):
+            print(f"  FAILED {fn}: {r.get('error')}")
+    print(f"Post-ingestion stats: {rag.get_collection_stats()}")
+    if ok < len(results):
+        sys.exit(1)  # partial refresh must be visible to automation
 
 
 if __name__ == "__main__":

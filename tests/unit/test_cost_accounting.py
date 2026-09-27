@@ -113,9 +113,9 @@ def test_small_calls_do_not_round_to_zero():
         # deepseek-v4-pro is the repo's DEFAULT_LLM_MODEL — the model most real
         # turns actually run on, so an unpriced entry here unprices the common
         # path, not an edge case.
-        ("deepseek", "deepseek-v4-pro", 0.55),
-        ("deepseek", "deepseek-v4-flash", 0.27),
-        ("openai", "gpt-5.4-mini", 0.40),
+        ("deepseek", "deepseek-v4-pro", 1.32),
+        ("deepseek", "deepseek-v4-flash", 0.30),
+        ("openai", "gpt-5.4-mini", 0.75),
     ],
 )
 def test_configured_deployment_aliases_are_priced(provider, model, expected):

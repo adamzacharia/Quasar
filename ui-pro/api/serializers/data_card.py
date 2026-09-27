@@ -556,6 +556,11 @@ def _build_data_card_event(
             if v is None or (isinstance(v, float) and math.isnan(v)):
                 return ""
             if isinstance(v, float):
+                # Tiny magnitudes (SED fluxes ~1e-12) keep 4 significant figures: .3f displayed
+                # every nuFnu as "0" (MMDC UI 2026-09-26). Large values stay on the .3f path, since
+                # float-stored IDs (source_id with NaN, candid) must keep every digit.
+                if v != 0 and math.isfinite(v) and abs(v) < 1e-3:
+                    return f"{v:.4g}"
                 return f"{v:.3f}".rstrip("0").rstrip(".")
             return str(v)[:60]
 

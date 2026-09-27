@@ -184,7 +184,95 @@ def detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
             ),
         }
     if not alma:
-        return _datalab_intent(q)
+        return _mmdc_intent(q) or _datalab_intent(q)
+    return None
+
+
+# ── MMDC blazar intents (multi-epoch SEDs, emission-model fits, variability) ──
+
+_SED_WORD_RE = re.compile(r"\bSEDs?\b|\bspectral\s+energy\s+distributions?\b", re.I)
+_BLAZAR_WORD_RE = re.compile(r"\bblazars?\b|\bBL\s*Lac(?:ertae)?\b|\bFSRQs?\b|\bMMDC\b", re.I)
+_BLAZAR_NAME_RE = re.compile(
+    r"\b(?:Mkn|Mrk|Markarian)\s*\d{2,4}\b|\b1ES\s*\d{4}[+\-]\d{3}\b|\bPKS\s*\d{4}[+\-]\d{3}\b|\b3C\s*(?:279|454\.3|273|345|66A)\b"
+    r"|\bTXS\s*\d{4}[+\-]\d{3}\b|\bS[45]\s*\d{4}[+\-]\d{3}\b|\bOJ\s*287\b|\bPG\s*1553\+113\b|\bW\s*Com(?:ae)?\b"
+    r"|\bAO\s*0235\+164\b|\bCTA\s*102\b|\bBL\s*Lac(?:ertae)?\b|\b4C\s*[+\-]?\d{2}\.\d{2}\b", re.I)
+# Not bare "epoch" / "MJD": "the SED of M82 at epoch J2000" is not a time-resolved SED (guard CX-04).
+_MULTI_EPOCH_RE = re.compile(r"\bmulti[\s-]*epoch\b|\btime[\s-]*resolved\b", re.I)
+_MODEL_FIT_RE = re.compile(
+    r"\b(SSC|EIC|hadronic|lepto[\s-]*hadronic|synchrotron[\s-]+self[\s-]*compton|external[\s-]+(?:inverse[\s-]+)?compton)\b"
+    r".{0,80}\b(?:model\w*|fit\w*)\b|\b(?:fit\w*|model\w*)\b.{0,60}\b(SSC|EIC|hadronic|lepto[\s-]*hadronic)\b", re.I | re.S)
+_VARIABILITY_RE = re.compile(
+    r"\bfractional\s+variability\b|\bF[\s_-]?var\b|\bbayesian\s+blocks?\b|\bflares?\b|\blags?\b|\bcross[\s-]*band\b"
+    r"|\b(?:harder|softer)[\s-]+when[\s-]+brighter\b|\bspectral\s+index\b.{0,40}\bflux\b", re.I | re.S)
+_YEAR_RANGE_RE = re.compile(r"\b(?:between|from)?\s*((?:19|20)\d{2})\s*(?:and|to|through|until|-|–)\s*((?:19|20)\d{2})\b", re.I)
+_MONTH_YEAR_RE = re.compile(r"\b(" + "|".join(_MONTHS) + r")\s+((?:19|20)\d{2})\b", re.I)
+_ONE_YEAR_RE = re.compile(r"\b(?:in|for|during|from|of)\s+((?:19|20)\d{2})\b", re.I)
+
+
+def _mmdc_window(q: str) -> Dict[str, str]:
+    m = _YEAR_RANGE_RE.search(q)
+    if m:
+        return {"start_date": m.group(1), "end_date": m.group(2)}
+    m = _MONTH_YEAR_RE.search(q)
+    if m:
+        ym = f"{m.group(2)}-{_MONTHS[m.group(1).lower()]:02d}"
+        return {"start_date": ym, "end_date": ym}
+    m = _ONE_YEAR_RE.search(q)
+    if m:
+        return {"start_date": m.group(1), "end_date": m.group(1)}
+    return {}
+
+
+def _mmdc_intent(q: str) -> Optional[Dict[str, Any]]:
+    """Route blazar questions to the MMDC tools. Plain "SED of <galaxy>" with no
+    time window and no blazar signal is left alone (ned_sed_plot territory)."""
+    name_m = _BLAZAR_NAME_RE.search(q)
+    blazar = bool(name_m or _BLAZAR_WORD_RE.search(q))
+    window = _mmdc_window(q)
+    args: Dict[str, Any] = {}
+    if name_m:
+        args["target_name"] = re.sub(r"\s+", " ", name_m.group(0)).strip()
+    args.update(window)
+    tail = (" Restate the window rule the tool applied (contained or overlap) with the bounds in MJD and dates, and the "
+            "straddling and undated counts it reports; never describe out-of-window data as in-window; upper limits are "
+            "never detections. End with the MMDC acknowledgment and citation from the result.")
+    fit = _MODEL_FIT_RE.search(q)
+    # A fit routes to MMDC only with a blazar signal: "fit an SSC model to the SED of M82"
+    # must not be forced onto the blazar archive (guard CX-04).
+    if fit and blazar:
+        models: List[str] = []
+        for m in re.finditer(r"\b(SSC|EIC|hadronic|lepto[\s-]*hadronic|synchrotron[\s-]+self[\s-]*compton|"
+                             r"external[\s-]+(?:inverse[\s-]+)?compton)\b", q, re.I):
+            kind = m.group(1).upper()
+            model = "HADRONIC" if "HADRON" in kind else ("EIC" if kind.startswith(("EIC", "EXTERNAL")) else "SSC")
+            if model not in models:
+                models.append(model)
+        models = models or ["SSC"]
+        if len(models) == 1:
+            step2 = (f"Step 2: mmdc_model with mode='fit', model_type='{models[0]}' and that result_id (the fit then "
+                     "uses exactly the rows shown).")
+        else:
+            step2 = ("Step 2: submit one mmdc_model mode='fit' call PER MODEL (" + ", ".join(models) + ") IN THE SAME "
+                     "ROUND as parallel calls, each with that result_id, so the fits run concurrently within the turn's "
+                     "time budget; then compare them using each fit's logZ and parameters.")
+        return _dl("mmdc_sed", args,
+                   f"This is an emission-model fit ({' and '.join(models)}). Step 1: mmdc_sed with the window (it returns "
+                   f"result_id). {step2} Step 3: mmdc_model_job with each returned job_id until it is done (a fit takes "
+                   "3 to 8 minutes; if the turn ends first, say the job is still running and give its job_id). "
+                   "Redshift comes from the tool with its source; never guess one. For a hadronic fit with neutrinos pass "
+                   "likelihood_type and the neutrino inputs explicitly (Poisson: n_icecube and dt in months) and state them. "
+                   "Report best-fit parameters with errors, what the fit dropped or binned, at_bound flags and the "
+                   "surrogate-validity caveat." + tail)
+    if _VARIABILITY_RE.search(q) and blazar and not _SED_WORD_RE.search(q):
+        return _dl("variability_analysis", args,
+                   "It fetches the MMDC multiwavelength light curves for the target and window, then computes Fvar with "
+                   "analytic and bootstrap errors per band, Bayesian-block flares, cross-band lags (flare matching and DCF "
+                   "with errors, rest-frame when z is known) and index-flux trends. Quote only the numbers it returns, with "
+                   "their errors and the bands it skipped and why. End with the MMDC acknowledgment and citation.")
+    if _SED_WORD_RE.search(q) and (blazar or _MULTI_EPOCH_RE.search(q) or window):
+        return _dl("mmdc_sed", args,
+                   "It returns the multi-epoch MMDC SED for the window. If the result says not_mmdc_source, call its "
+                   "fallback_tool (ned_sed_plot) instead and do not claim MMDC data." + tail)
     return None
 
 
@@ -276,6 +364,40 @@ def _satellite_field_preset(q: str) -> Optional[str]:
 
 
 def _datalab_intent(q: str) -> Optional[Dict[str, Any]]:
+    # Python for a DESI redshift cone from Data Lab AND "how many": run the
+    # count first, then hand back the tool's verified client script
+    # (ArchiveBench AB-D-57, 2026-09-26: gpt-oss imported a nonexistent
+    # astroquery.datalab, DeepSeek never ran a tool).
+    if (_CODE_RE.search(q) and re.search(r"\bdesi\b", q, re.I) and re.search(r"\bredshifts?\b", q, re.I)
+            and re.search(r"\bhow\s+many\b|\bcounts?\b|\bnumber\s+of\b", q, re.I)):
+        args: Dict[str, Any] = {"catalog": "desi_dr1", "table": "zpix"}
+        # zwarn = 0 is what "good" redshifts means; a question that asks for
+        # all of them, or names its own zwarn cut, keeps its own selection.
+        good = bool(re.search(r"\b(?:good|reliable|secure|clean|confident|successful|valid)\b", q, re.I))
+        own_cut = bool(re.search(r"\bzwarn\b|\ball\s+(?:the\s+)?(?:desi\s+)?(?:dr1\s+)?redshifts\b|\bincluding\s+(?:bad|failed|flagged)\b", q, re.I))
+        if good and not own_cut:
+            args["value_cuts"] = [{"column": "zwarn", "op": "=", "value": 0}]
+        c = _coords(q)
+        for k in ("ra", "dec", "radius_deg"):
+            if k in c:
+                args[k] = c[k]
+        wm = re.search(r"\bwithin\s+(?:a\s+)?(\d+(?:\.\d+)?)\s*(°|deg(?:rees?)?\b|arc\s?min(?:utes?)?\b|')", q, re.I)
+        if wm and "radius_deg" not in args:
+            val = float(wm.group(1))
+            args["radius_deg"] = val / 60.0 if wm.group(2).lower().startswith(("arc", "'")) else val
+        where = "" if {"ra", "dec"} <= set(args) else " Resolve the named target's position first (resolve_target), then"
+        return {
+            "tool": "datalab_cone_count", "args": args,
+            "directive": (
+                "\n\nMANDATORY INSTRUCTION: The user wants Python for a Data Lab query AND the count." + where +
+                f" call `datalab_cone_count` (suggested arguments: {json.dumps(args)}"
+                + ("; zwarn = 0 is the 'good redshift' cut" if "value_cuts" in args else
+                   "; apply only the selection the user asked for")
+                + "). Answer with the count from `reported_count`, then give the returned `python_code` VERBATIM in a "
+                "```python block: it uses the Data Lab client (`from dl import queryClient as qc`) and the exact SQL that "
+                "ran. Never use astroquery.datalab, which does not exist, and do not write your own client code."
+            ),
+        }
     # L01: which catalogs cover a region AND which have some photometry: one
     # UNFILTERED listing (UI 2026-09-24 run 2: a band filter on the first call
     # dropped every covering catalog without that band)
@@ -441,21 +563,27 @@ def _datalab_intent(q: str) -> Optional[Dict[str, Any]]:
     # L03: a g vs (g-r) CMD of a cone from a named survey -> the CMD tool
     # (UI 2026-09-24: the model picked the expression diagram, which dropped
     # point_sources and has no depth / features blocks)
+    # g against g-i (ArchiveBench AB-D-55, SMASH) takes the same route with
+    # red_band from the colour the question names.
+    _cmd_colour = re.search(
+        r"\bg\s*(?:vs\.?|versus|against)\s*\(?\s*g\s*[−\-]\s*([riz])\b|\bg\s+and\s+([riz])\b|\bg\s*[−\-]\s*([riz])\b",
+        q, re.I)
     if (re.search(r"\bCMD\b|\bcolou?r[\s-]*magnitude\s+diagram\b", q, re.I)
-            and re.search(r"\bg\s*vs\.?\s*\(?\s*g\s*[−\-]\s*r|\bg\s+and\s+r\b|\bg\s*[−\-]\s*r\b", q, re.I)
+            and _cmd_colour
             and not re.search(r"\bproper[\s-]*motions?\b|\btidal\b|\bstream\b|\bsatellites?\b|\bwhite[\s-]*dwarfs?\b|\bgaia\b|\bcandidates?\b", q, re.I)):
         c = _coords(q)
         if {"ra", "dec"} <= set(c):
             cat = ("des_dr1" if re.search(r"\bdes\b", q, re.I) else "delve_dr3" if re.search(r"\bdelve\b", q, re.I)
                    else "smash_dr2" if re.search(r"\bsmash\b", q, re.I) else "nsc_dr2")
-            args: Dict[str, Any] = {"catalog": cat, "ra": c["ra"], "dec": c["dec"], "blue_band": "g", "red_band": "r",
+            red = next(g for g in _cmd_colour.groups() if g).lower()
+            args: Dict[str, Any] = {"catalog": cat, "ra": c["ra"], "dec": c["dec"], "blue_band": "g", "red_band": red,
                                     "point_sources": bool(re.search(r"\bpoint[\s-]*sources?\b|\bstars?\b", q, re.I))}
             wm = re.search(r"\bwithin\s+(?:a\s+)?(\d+(?:\.\d+)?)\s*(?:°|deg(?:rees?)?\b)", q, re.I)
             if "radius_deg" in c or wm:
                 args["radius_deg"] = c.get("radius_deg") or float(wm.group(1))
             return _dl("datalab_color_magnitude_diagram", args,
                        "It selects the cone with the survey's registered point-source cut and a documented faint depth bound "
-                       "in the SQL, draws g vs g-r with the magnitude axis inverted, and returns `depth` (bound applied, "
+                       f"in the SQL, draws g vs g-{red} with the magnitude axis inverted, and returns `depth` (bound applied, "
                        "turnover) and `features` (old-population turnoff / RGB / BHB excess over the surrounding field). "
                        "Report the cuts from `cuts_applied`, state the depth limit, and say which population features are "
                        "present according to `features`.")

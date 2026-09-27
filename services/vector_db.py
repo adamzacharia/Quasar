@@ -6,8 +6,11 @@ CALLED BY: services/rag_service.py, services/memory_service.py
 CALLS:     qdrant_client (Qdrant Cloud) OR qdrant_client (in-memory local)
 
 Provides a singleton QdrantClient and helpers for upserting/searching
-vectors. When QDRANT_URL is set, queries go to Qdrant Cloud (persistent).
-Otherwise, uses an in-memory Qdrant instance (for development).
+vectors. Backend selection, in priority order:
+  1. QDRANT_PATH set          -> embedded local Qdrant persisted on disk at that
+                                 path (one process at a time holds the lock).
+  2. QDRANT_URL + QDRANT_API_KEY -> Qdrant Cloud (persistent).
+  3. neither                  -> in-memory Qdrant (dev only, lost at exit).
 
 Supports:
   - Exact-match filtering (keyword fields)
@@ -37,8 +40,19 @@ from qdrant_client.models import (
 # ---------------------------------------------------------------------------
 QDRANT_URL = os.environ.get("QDRANT_URL")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+# Persistent embedded store. Wins over Cloud so a dead/suspended cluster can be
+# bypassed without touching the Cloud credentials (2026-09-25 outage).
+QDRANT_PATH = (os.environ.get("QDRANT_PATH") or "").strip() or None
+if QDRANT_PATH and not os.path.isabs(QDRANT_PATH):
+    # A relative path is anchored at the repo root, never the process CWD:
+    # the backend chdirs into ui-pro/ while scripts run from the root, and
+    # CWD-relative resolution would silently split the store (CX-20).
+    QDRANT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), QDRANT_PATH)
+if QDRANT_PATH:
+    QDRANT_PATH = os.path.normpath(QDRANT_PATH)
 
-_USE_CLOUD = bool(QDRANT_URL and QDRANT_API_KEY)
+_USE_LOCAL_PATH = bool(QDRANT_PATH)
+_USE_CLOUD = bool(QDRANT_URL and QDRANT_API_KEY) and not _USE_LOCAL_PATH
 
 # Embedding dimension for OpenAI text-embedding-ada-002 / text-embedding-3-small
 EMBEDDING_DIM = 1536
@@ -50,10 +64,23 @@ _client: Optional[QdrantClient] = None
 
 
 def get_qdrant_client() -> QdrantClient:
-    """Return the singleton QdrantClient (cloud or in-memory)."""
+    """Return the singleton QdrantClient (local path, cloud or in-memory)."""
     global _client
     if _client is None:
-        if _USE_CLOUD:
+        if _USE_LOCAL_PATH:
+            os.makedirs(QDRANT_PATH, exist_ok=True)
+            try:
+                _client = QdrantClient(path=QDRANT_PATH)
+            except RuntimeError as exc:
+                # Embedded Qdrant takes an exclusive directory lock: only one
+                # process (backend OR an ingest script) can open the store.
+                raise RuntimeError(
+                    f"Local Qdrant store {QDRANT_PATH} is locked by another process "
+                    "(the backend or another ingest). Stop it first, or run a Qdrant "
+                    f"server for concurrent access. ({exc})"
+                ) from exc
+            print(f"[VectorDB] Using local persistent Qdrant at {QDRANT_PATH}")
+        elif _USE_CLOUD:
             _client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
             print(f"[VectorDB] Connected to Qdrant Cloud: {QDRANT_URL}")
         else:
@@ -240,8 +267,14 @@ def scroll_all(
     return out[:limit]
 
 
-def delete_by_filter(collection: str, filter_conditions: Dict[str, str]) -> bool:
-    """Delete points matching a metadata filter."""
+def delete_by_filter(
+    collection: str,
+    filter_conditions: Dict[str, str],
+    exclude_conditions: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Delete points matching a metadata filter. ``exclude_conditions`` keeps
+    points whose field equals the given value (Qdrant ``must_not``); points
+    lacking the field are still deleted."""
     client = get_qdrant_client()
 
     existing = [c.name for c in client.get_collections().collections]
@@ -252,10 +285,46 @@ def delete_by_filter(collection: str, filter_conditions: Dict[str, str]) -> bool
         FieldCondition(key=k, match=MatchValue(value=v))
         for k, v in filter_conditions.items()
     ]
+    must_not = [
+        FieldCondition(key=k, match=MatchValue(value=v))
+        for k, v in (exclude_conditions or {}).items()
+    ]
     client.delete(
         collection_name=collection,
-        points_selector=Filter(must=must),
+        points_selector=Filter(must=must, must_not=must_not or None),
     )
+    return True
+
+
+def delete_older_runs(collection: str, source_file: str, run_id: str, run_ts: Union[int, float]) -> bool:
+    """Delete a source's chunks from runs OLDER than (run_id, run_ts), plus
+    legacy chunks that carry no ``ingest_ts``. Newer runs are never touched,
+    so two concurrent replacements of the same source converge on the newest
+    one instead of deleting each other (guard CX-25)."""
+    from qdrant_client.models import IsEmptyCondition, PayloadField
+
+    client = get_qdrant_client()
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing:
+        return False
+    source = FieldCondition(key="source_file", match=MatchValue(value=source_file))
+    client.delete(
+        collection_name=collection,
+        points_selector=Filter(
+            must=[source],
+            must_not=[FieldCondition(key="ingest_run", match=MatchValue(value=run_id))],
+            should=[
+                FieldCondition(key="ingest_ts", range=Range(lt=run_ts)),
+                IsEmptyCondition(is_empty=PayloadField(key="ingest_ts")),
+            ],
+        ),
+    )
+    # Deliberately NO self-deletion when a newer run is visible: that run may
+    # still be a partial upload that later rolls back, and deleting ourselves
+    # would leave the source empty (guard round 4, CX-02/CX-23). If an older
+    # run finishes after a newer one, both stay until the next replacement:
+    # a duplicate, never a loss. Concurrent ingests of one source are not a
+    # supported workflow (the embedded store is single-process anyway).
     return True
 
 
@@ -272,3 +341,22 @@ def collection_count(collection: str) -> int:
 def is_using_cloud() -> bool:
     """Return True when connected to Qdrant Cloud."""
     return _USE_CLOUD
+
+
+def backend_label() -> str:
+    """Human-readable backend description for logs and inventory reports."""
+    if _USE_LOCAL_PATH:
+        return f"local:{QDRANT_PATH}"
+    if _USE_CLOUD:
+        return f"cloud:{QDRANT_URL}"
+    return "memory"
+
+
+def get_collection_info(collection: str) -> Dict[str, Any]:
+    """Point count for a collection ({} when it does not exist)."""
+    client = get_qdrant_client()
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing:
+        return {}
+    info = client.get_collection(collection)
+    return {"points_count": info.points_count or 0, "vectors_count": info.points_count or 0}

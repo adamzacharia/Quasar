@@ -391,9 +391,28 @@ class QuasarAgent:
         print("DEBUG: Register Tools")
         self._register_tools()
 
-        # System prompt
+        # System prompt. The instruction bundle (legacy | v2) is selected ONCE
+        # here and consulted by the prompt builder, the tool-schema serializer
+        # and the runner (core/prompts/system_core.py). The API keeps this
+        # agent for the process lifetime, so flipping QUASAR_PROMPT_V2 needs a
+        # backend restart, and an existing TACC conversation keeps the system
+        # message it started with (the chat shim replays cached history).
         print("DEBUG: Build Prompt")
+        from core.prompts.system_core import v2_enabled as _v2_enabled
+        self.prompt_bundle = "v2" if _v2_enabled() else "legacy"
+        try:  # history hygiene for the per-turn context (core/llm_client.prune_turn_context_history)
+            self.client.responses._prune_turn_context = self.prompt_bundle == "v2"
+        except Exception:
+            pass
         self.system_prompt = self._build_system_prompt()
+        try:  # provenance line for bench metadata / arm verification
+            from core.prompts.system_core import PROMPT_VERSION as _pv, bundle_hash as _bh, count_tokens as _ct
+            print(
+                f"[PROMPT] bundle={self.prompt_bundle} version={_pv if self.prompt_bundle == 'v2' else 'legacy'} "
+                f"hash={_bh() if self.prompt_bundle == 'v2' else 'n/a'} system_prompt_tokens={_ct(self.system_prompt)}"
+            )
+        except Exception:
+            pass
 
         if self.config.verbose:
             print("[green]QuasarAgent initialized successfully[/green]")
@@ -1050,6 +1069,17 @@ class QuasarAgent:
                 )
             except Exception as e:
                 print(f"[SCHEMA GROUNDING] profile index unavailable: {e}")
+        # v2 bundle (core/prompts/system_core.py): compact core + the same
+        # generated schema index + the ALMA kernel; no date in the static body
+        # (the runner sends the date per turn). The legacy builder below stays
+        # byte-identical as the rollback and A/B control.
+        _bundle = getattr(self, "prompt_bundle", None)
+        if _bundle is None:
+            from core.prompts.system_core import v2_enabled as _v2_enabled
+            _bundle = "v2" if _v2_enabled() else "legacy"
+        if _bundle == "v2":
+            from core.prompts.system_core import build_core_prompt
+            return build_core_prompt(schema_grounding_block)
         return f"""You are Quasar, an expert AI research assistant for astronomy — all wavelengths, all archives.
 
 You give science users natural-language access to major astronomical data services:
@@ -1138,7 +1168,7 @@ GUIDELINES:
   If the query is asking HOW something works, WHAT something is, or about ALMA procedures/policies/deadlines — it is a KNOWLEDGE query. NEVER call search_papers for these.
 - **NO HALLUCINATIONS**: Only cite data you have retrieved using tools.
 - **MULTI-STEP RULE**: When asked to do multiple steps (e.g. "Do the following: 1. Search... 2. Filter... 3. Check..."), you MUST call the appropriate tool for EACH numbered step — do NOT describe what you would do. If there are 8 steps, make 8+ tool calls before writing your final summary. NEVER write "Access ALMA Archive: ..." — instead CALL search_by_target(). NEVER write "Use Splatalogue to..." — instead CALL search_lines_by_molecule().
-- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT write any text listing the papers — output NOTHING. The UI renders the papers as interactive cards automatically.
+- **PAPER SEARCH (MANDATORY TOOL)**: When the user asks for papers, publications, articles, literature, or studies — you MUST call the `search_papers` tool. Pass the user's request as NATURAL LANGUAGE (e.g. "recent papers on protoplanetary disks", "best ALMA papers on disk gaps", "foundational papers on planet formation"). If the user gives a proposal ID, project code, MOUS UID, ASDM UID, or archive dataset identifier and asks for papers connected to it, call `search_papers_by_observation_id` instead so QUASAR searches ADS for the exact identifier. Do NOT try to construct ADS field syntax yourself. NEVER use `web_search` for paper requests. After the tool runs, do NOT repeat the whole paper list: the UI renders the papers as interactive cards automatically. EXCEPTION: when the user asks which paper(s), or for bibcodes, DOIs or identifiers, name each one in the text (first author, year, short title, bibcode) as the tool returned it.
 - **AUTO-LINKING LITERATURE**: The backend automatically exact-links top ALMA project/proposal codes from `search_by_target` or `search_by_position` to NASA ADS papers for the Observation-Paper Graph. Do NOT call `search_papers_by_observation_id` merely to auto-link normal archive search results. Only call it when the user explicitly asks for papers connected to a specific identifier.
 - **RESEARCHER LOOKUP**: When the user asks about a person, scientist, astronomer — "Who is X?", "Tell me about X", "Where does X work?" — call `lookup_researcher`. ALWAYS present the profile using this EXACT format:
   1. **Header**: "## Profile: [Full Name]" with email and personal webpage (from web search if available)
@@ -1178,6 +1208,7 @@ GUIDELINES:
 - **ALMA SCIENCE ARCHIVE COUNTS/DIAGNOSTICS**: For Cycle/project counts, solar/Sun projects, array-combination questions (12m, 7m, total power), high-resolution Band N target summaries, required molecular line sets in the same project, or bandwidth-switching likelihood, call `query_alma_science_archive`. Do NOT answer these from memory and do NOT hand-write ADQL unless that tool cannot express the query.
 - **MMU/HATS CATALOG RULE**: Use `search_mmu_hats_catalog` when the user asks for source/catalog properties from large surveys -- Gaia astrometry/proper motions/parallaxes, DESI/SDSS redshifts and classifications, TESS source metadata, Chandra spectra metadata, what sources are near this position, source tables for ML, or cross-survey enrichment. Use the archive tools (search_by_target, search_by_position, search_mast, search_cadc_archive, search_eso_archive, triage_alma_data_products) when the user asks for observation availability, project/proposal IDs, FITS/data products, or telescope archive records. For combined requests (find ALMA data for M87 and Gaia sources in the field), call the archive tool FIRST to get observations/positions, THEN search_mmu_hats_catalog to enrich the field. For catalog-to-catalog matching use crossmatch_mmu_hats_catalogs within a bounded cone; if it fails, run two bounded cone searches and say so. Examples: Find ALMA data for M87 -> search_by_target. What Gaia sources are near M87? -> search_mmu_hats_catalog(catalog_key='gaia', target_name='M87'). Download ALMA FITS files -> ALMA/DataLink tools, never MMU/HATS.
 - **LIVE IMAGERY RULE**: Use `hips_cutout` or `hips_multiband_panel` for "show me", appearance, and multiwavelength postage-stamp questions; they are deeper and broader than `get_sky_image`. Use `datalab_color_image` / `datalab_image_cutout` when the user names a specific survey (DECam / Legacy Surveys / DES) — a "color image of survey X" must come from survey X. Use `vlass_cutout` for 3 GHz radio continuum imagery (Dec > -40 only). Use `search_ztf_alerts`, `ztf_light_curve`, and `ztf_stamps` for transients and variability. Use `ned_sed_plot` for literature SEDs. Use `sparcl_find_spectra` and `sparcl_plot_spectrum` for real DESI/SDSS optical spectra. MMU/Data Lab remain authoritative for catalog tables.
+- **BLAZAR / MMDC RULE**: For multi-epoch or time-resolved SEDs, and for any SED, light curve or emission model of a blazar (BL Lac, FSRQ, or a source MMDC knows), use `mmdc_sed` (SED with a time window), `mmdc_lightcurve` (multiwavelength light curves), `fermi_lcr_lightcurve` (Fermi-LAT light curves from the NASA repository, independent of MMDC), `mmdc_model` / `mmdc_model_job` (SSC / EIC / hadronic fits, the fit reusing the SED's result_id) and `variability_analysis` (Fvar, Bayesian-block flares, cross-band lags, spectral index vs flux; it also accepts ZTF, TESS/Kepler and Data Lab light-curve result_ids). Any other target's SED goes to `ned_sed_plot`; when `mmdc_sed` returns not_mmdc_source, call its fallback_tool and do not claim MMDC data. Always restate the window rule the tool applied (contained or overlap) with its bounds and the straddling / undated counts, never describe out-of-window data as in-window, never present an upper limit as a detection, never guess a redshift (use the tool's value and say where it came from), and end with the MMDC acknowledgment and citation the tool returns.
 - **RADIO SED RULE**: Use `radio_sed` for compact-source radio continuum SED or radio spectral-index questions; always repeat its flags and state that v1 uses TGSS/GLEAM/SUMSS/NVSS/FIRST catalog fluxes without resolution matching, flux-scale corrections, or image-plane photometry.
 - **SKY MONITOR RULE**: When the user wants ongoing watching ("keep an eye on", "alert me", "monitor"), use `monitor_add_target` then `monitor_check_now`; report only NEW alerts, and use `monitor_list_targets` / `monitor_remove_target` to manage the watchlist.
 - **VO DISCOVERY RULE**: When no built-in tool covers an archive/dataset, use the VO chain: `vo_find_services` -> `vo_list_tables` -> `vo_describe_table` -> `vo_adql_query` (SELECT-only). Always inspect the schema before writing ADQL, quote table names containing '/' or '+' in double quotes, and pass a keyword to `vo_list_tables` on big services like VizieR. For slow or heavy queries pass `mode='auto'` (or `'async'`) and follow the returned job with `vo_tap_job`; for images/cubes at a position on a generic SIA service (ALMA, CADC, or one found by `vo_find_services`) use `vo_image_search`. ESA Gaia, ESO and CADC have curated notes: `browse_schema('gaia'|'eso'|'cadc')`.
@@ -2598,6 +2629,12 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "ztf_light_curve": f"Plotting ZTF light curve {args.get('oid', '')}",
             "ztf_stamps": f"Fetching ZTF stamps {args.get('oid', '')}",
             "ned_sed_plot": f"Plotting NED SED {args.get('target_name', '')}",
+            "mmdc_sed": f"Fetching MMDC multi-epoch SED {args.get('target_name', '')}".rstrip(),
+            "mmdc_lightcurve": f"Fetching MMDC light curves {args.get('target_name', '')}".rstrip(),
+            "mmdc_model": f"Running MMDC {args.get('model_type', 'SSC')} model ({args.get('mode', 'spectrum')})",
+            "mmdc_model_job": "Checking MMDC model fit",
+            "fermi_lcr_lightcurve": f"Fetching Fermi-LAT light curve {args.get('target_name', '')}".rstrip(),
+            "variability_analysis": "Analysing variability (Fvar, flares, lags)",
             "radio_sed": "Compiling radio SED + spectral index",
             "monitor_add_target": "Adding sky-monitor target",
             "monitor_list_targets": "Listing sky-monitor watchlist",
@@ -4241,25 +4278,42 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         user_id=None,
         conversation_id=None,
         run_token=None,
+        turn_context: str = "",
+        extra_instruction: str = "",
     ) -> str:
         """One extra no-tools round that turns raw tool results into a real answer.
 
         Weaker models sometimes exhaust the tool loop without emitting any final
         text; without this round the user would only see the mechanical step
-        summary from _summarize_tool_outcomes."""
+        summary from _summarize_tool_outcomes.
+
+        ``turn_context`` (v2 bundle only): the current date and the response
+        guidance selected for this turn, passed separately from the evidence
+        because this request is standalone (no previous_response_id) and the
+        static system prompt carries no date."""
         from core.turn_recovery import compact_tool_outputs
         compact = compact_tool_outputs(tool_results or [])
         compact = [c for c in compact if c]
         if not compact:
             return ""
+        _v2 = getattr(self, "prompt_bundle", "legacy") == "v2"
+        _cards = (
+            "Tool-produced visuals and tables appear in separate cards. Refer to them as the card "
+            "or the figure card. "
+            if _v2 else
+            "Plots and data cards produced by the tools are already displayed above your reply, "
+            "so refer to them naturally. "
+        )
         prompt = (
             "The user asked:\n" + str(user_query or "") + "\n\n"
             "Tools were already executed for this request. Their JSON results (possibly truncated):\n"
             + "\n".join(compact)
             + "\n\nWrite the final answer to the user's question based ONLY on these results. "
-            "Plots and data cards produced by the tools are already displayed above your reply, "
-            "so refer to them naturally. If some steps failed, briefly say what failed and answer "
+            + _cards
+            + "If some steps failed, briefly say what failed and answer "
             "with what succeeded. Do not call tools; preserve the user's requested output format."
+            + (("\n" + turn_context) if (_v2 and turn_context) else "")
+            + (("\n" + extra_instruction) if extra_instruction else "")
         )
         request_kwargs = {
             "model": selected_model,
@@ -5426,6 +5480,293 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    # ── MMDC (mmdc.am): multi-epoch blazar SEDs, light curves, emission models,
+    # and the generic variability analysis. Bodies live in services/
+    # mmdc_service.py, mmdc_modeling.py and variability.py; these wrappers turn
+    # their private "_table"/"_figure" payloads into UI cards, store tables for
+    # the complete CSV export, and map failures to structured tool errors.
+    def _get_mmdc_service(self):
+        if not hasattr(self, "_mmdc_service_instance"):
+            from services.mmdc_service import default_mmdc_service
+
+            self._mmdc_service_instance = default_mmdc_service()
+        return self._mmdc_service_instance
+
+    def _mmdc_user_id(self) -> Optional[str]:
+        uid = getattr(getattr(self, "_tls", None), "current_user_id", None) or getattr(
+            getattr(self, "config", None), "user_id", None)
+        return str(uid) if uid else None
+
+    def _mmdc_cards(self, result: Dict[str, Any], *, tool_name: str, source: str = "MMDC",
+                    store_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        table = result.pop("_table", None)
+        figures = [f for f in [result.pop("_figure", None)] + list(result.pop("_figures", None) or []) if f]
+        cards: List[Dict[str, Any]] = []
+        if table is not None:
+            df, label = table
+            owner = self._mmdc_user_id()
+            meta = {"source": source, "tool_name": tool_name, "rowcount": int(len(df)), **(store_meta or {})}
+            if owner:
+                meta["owner_id"] = owner
+            rid = None
+            try:
+                from services.datalab_result_store import default_result_store
+
+                rid = default_result_store().put(df, meta)
+            except Exception as exc:  # noqa: BLE001 - the card still renders without an export id
+                result.setdefault("warnings", []).append(f"Table could not be stored for export: {exc}")
+            card: Dict[str, Any] = {"type": "data", "data": df, "source": source, "filter_label": label,
+                                    "tool_name": tool_name}
+            if rid:
+                card["result_id"] = rid
+                result["result_id"] = rid
+            result["table_rows"] = int(len(df))
+            result["table_note"] = ("The full table is the data card in the UI (its CSV export is complete); "
+                                    "do not repeat rows in text.")
+            cards.append(card)
+        for figure in figures:
+            url = figure.get("path") or (
+                f"data:image/png;base64,{figure['image_base64']}" if figure.get("image_base64") else None)
+            if url:
+                image: Dict[str, Any] = {"type": "image", "image_url": url, "caption": figure.get("caption") or source}
+                if figure.get("plotly_spec"):
+                    image["plotly_spec"] = figure["plotly_spec"]
+                cards.append(image)
+                result["figure_attached"] = True
+        if len(figures) > 1:
+            result["figures_attached"] = [f.get("caption") for f in figures]
+        for card in cards:
+            self._accumulated_run_results.append(card)
+        if cards:
+            self.last_run_result = cards[-1]
+        return result
+
+    def _mmdc_turn_seconds_left(self) -> Optional[float]:
+        """What remains of the runner's per-turn tool budget (None outside a turn)."""
+        soft = getattr(getattr(self, "_tls", None), "turn_soft_deadline", None)
+        return None if soft is None else max(0.0, soft - time.monotonic())
+
+    def _mmdc_call(self, tool_name: str, fn, *, host: Optional[str] = None,
+                   service_label: str = "MMDC") -> Dict[str, Any]:
+        """Run an MMDC-family tool body; map breaker, SDK, budget and input errors.
+        ``host`` / ``service_label`` name the service the tool actually talks to
+        (review CX-B04: ALeRCE, MAST and Fermi failures were reported as MMDC)."""
+        self.last_run_result = None
+        from services.host_breaker import HostCircuitOpen, structured_error
+        from services.mmdc_service import MMDC_HOST, MmdcUnavailable
+        from services.tool_budgets import BudgetExhausted, TurnCancelled, tools_for_host
+
+        host = MMDC_HOST if host is None else host
+        try:
+            return fn()
+        except HostCircuitOpen as exc:
+            return structured_error(exc, tool_name=tool_name, affected_tools=tools_for_host(exc.hostname or exc.host))
+        except MmdcUnavailable as exc:
+            return {"success": False, "error": str(exc), "dependency_missing": "astro-mmdc"}
+        except TurnCancelled as exc:
+            return {"success": False, "cancelled": True, "error": f"'{tool_name}' stopped: {exc}"}
+        except BudgetExhausted as exc:
+            return {"success": False, "budget_exhausted": True,
+                    "error": f"{tool_name} ran out of its time budget: {exc}. Answer with what you have."}
+        except TimeoutError as exc:
+            out: Dict[str, Any] = {"success": False, "infrastructure_failure": True,
+                                   "error": f"{service_label} did not answer in time: {exc}. Do not retry this tool this turn."}
+            if host:
+                out["host"] = host
+            return out
+        except (ValueError, KeyError) as exc:
+            return {"success": False, "error": f"{tool_name}: {exc}"}
+        except Exception as exc:  # noqa: BLE001 - SDK APIError / ValidationError / transport errors
+            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            return {"success": False, "error": f"{service_label} request failed ({type(exc).__name__}"
+                                               f"{f', HTTP {status}' if status else ''}): {exc}"}
+
+    def _mmdc_sed(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        start_date: Any = None,
+        end_date: Any = None,
+        window_mode: str = "contained",
+        include_undated: bool = False,
+        exclude_catalogs: Optional[List[str]] = None,
+        include_ranges: Optional[List[str]] = None,
+        color_by: str = "epoch",
+        max_points: int = 5000,
+        job_uuid: Optional[str] = None,
+        require_known_source: bool = True,
+    ) -> Dict[str, Any]:
+        def _run():
+            result = self._get_mmdc_service().sed(
+                target_name=target_name, ra=ra, dec=dec, start_date=start_date, end_date=end_date,
+                window_mode=window_mode, include_undated=include_undated, exclude_catalogs=exclude_catalogs,
+                include_ranges=include_ranges, color_by=color_by, max_points=max_points, job_uuid=job_uuid,
+                require_known_source=True, resolver=self._resolve_target, user_id=self._mmdc_user_id())
+            meta = {"mmdc": {"kind": "sed", "target": result.get("target"), "job_uuid": result.get("mmdc_job_uuid"),
+                             "redshift": result.get("redshift"), "resolved_position": result.get("resolved_position"),
+                             "window": result.get("window"), "filters": result.get("filters")}}
+            return self._mmdc_cards(result, tool_name="mmdc_sed", store_meta=meta)
+
+        return self._mmdc_call("mmdc_sed", _run)
+
+    def _mmdc_lightcurve(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        start_date: Any = None,
+        end_date: Any = None,
+        catalogs: Optional[List[str]] = None,
+        bands: Optional[List[str]] = None,
+        radius_arcsec: float = 5.0,
+        require_known_source: bool = True,
+    ) -> Dict[str, Any]:
+        def _run():
+            result = self._get_mmdc_service().lightcurve(
+                target_name=target_name, ra=ra, dec=dec, start_date=start_date, end_date=end_date, catalogs=catalogs,
+                bands=bands, radius_arcsec=radius_arcsec, require_known_source=True,
+                resolver=self._resolve_target, user_id=self._mmdc_user_id())
+            meta = {"mmdc": {"kind": "lightcurve", "target": result.get("target"),
+                             "resolved_position": result.get("resolved_position"), "window": result.get("window")},
+                    "lightcurve_contract": "mmdc"}
+            return self._mmdc_cards(result, tool_name="mmdc_lightcurve", store_meta=meta)
+
+        return self._mmdc_call("mmdc_lightcurve", _run)
+
+    def _fermi_lcr_lightcurve(
+        self,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        source_name: Optional[str] = None,
+        cadence: str = "weekly",
+        flux_type: str = "photon",
+        index_type: str = "fixed",
+        ts_min: float = 4.0,
+        start_date: Any = None,
+        end_date: Any = None,
+    ) -> Dict[str, Any]:
+        def _run():
+            if not hasattr(self, "_fermi_lcr_service_instance"):
+                from services.fermi_lcr import FermiLcrService
+
+                self._fermi_lcr_service_instance = FermiLcrService()
+            result = self._fermi_lcr_service_instance.lightcurve(
+                target_name=target_name, ra=ra, dec=dec, source_name=source_name, cadence=cadence,
+                flux_type=flux_type, index_type=index_type, ts_min=ts_min, start_date=start_date,
+                end_date=end_date, resolver=self._resolve_target)
+            return self._mmdc_cards(result, tool_name="fermi_lcr_lightcurve", source="Fermi LAT LCR",
+                                    store_meta={"lightcurve_contract": "fermi_lcr", "fermi_lcr": result.get("lcr_source")})
+
+        return self._mmdc_call("fermi_lcr_lightcurve", _run, host="fermi.gsfc.nasa.gov",
+                               service_label="The Fermi LAT Light Curve Repository")
+
+    def _get_mmdc_modeling_service(self):
+        if not hasattr(self, "_mmdc_modeling_service_instance"):
+            from services.mmdc_modeling import MmdcModelingService
+
+            self._mmdc_modeling_service_instance = MmdcModelingService(self._get_mmdc_service())
+        return self._mmdc_modeling_service_instance
+
+    def _mmdc_model(
+        self,
+        mode: str = "spectrum",
+        model_type: str = "SSC",
+        z: Optional[float] = None,
+        ebl: bool = True,
+        parameters: Optional[Dict[str, Any]] = None,
+        result_id: Optional[str] = None,
+        csv_text: Optional[str] = None,
+        target_name: Optional[str] = None,
+        fixed_parameters: Optional[Dict[str, Any]] = None,
+        likelihood_type: Optional[str] = None,
+        n_icecube: Optional[int] = None,
+        dt: Optional[float] = None,
+        x1: Optional[float] = None,
+        x2: Optional[float] = None,
+        y: Optional[float] = None,
+        bin_dex: float = 0.1,
+    ) -> Dict[str, Any]:
+        def _run():
+            svc = self._get_mmdc_modeling_service()
+            uid = self._mmdc_user_id()
+            m = str(mode or "spectrum").strip().lower()
+            if m == "spectrum":
+                result = svc.spectrum(model_type=model_type, z=z, parameters=parameters or {}, ebl=ebl,
+                                      result_id=result_id, target_name=target_name, owner_id=uid, user_id=uid)
+            elif m == "fit":
+                result = svc.submit_fit(model_type=model_type, z=z, ebl=ebl, result_id=result_id, csv_text=csv_text,
+                                        target_name=target_name, fixed_parameters=fixed_parameters,
+                                        likelihood_type=likelihood_type, n_icecube=n_icecube, dt=dt, x1=x1, x2=x2, y=y,
+                                        bin_dex=bin_dex, owner_id=uid, user_id=uid,
+                                        turn_seconds_left=self._mmdc_turn_seconds_left())
+            else:
+                raise ValueError("mode must be 'spectrum' or 'fit'")
+            return self._mmdc_cards(result, tool_name="mmdc_model")
+
+        return self._mmdc_call("mmdc_model", _run)
+
+    def _mmdc_model_job(self, job_id: str, wait_seconds: Optional[float] = None) -> Dict[str, Any]:
+        def _run():
+            uid = self._mmdc_user_id()
+            try:
+                result = self._get_mmdc_modeling_service().poll(str(job_id), owner_id=uid, user_id=uid,
+                                                                turn_seconds_left=self._mmdc_turn_seconds_left(),
+                                                                wait_seconds=wait_seconds)
+            except KeyError:
+                return {"success": False, "error": f"Unknown MMDC fit job {job_id!r} (jobs are kept in memory on this "
+                                                   "server; resubmit with mmdc_model mode='fit')."}
+            return self._mmdc_cards(result, tool_name="mmdc_model_job")
+
+        return self._mmdc_call("mmdc_model_job", _run)
+
+    def _variability_analysis(
+        self,
+        result_id: Optional[str] = None,
+        source: Optional[str] = None,
+        target_name: Optional[str] = None,
+        ra: Optional[float] = None,
+        dec: Optional[float] = None,
+        identifier: Optional[str] = None,
+        index: int = 0,
+        start_date: Any = None,
+        end_date: Any = None,
+        bands: Optional[List[str]] = None,
+        lag_bands: Optional[List[str]] = None,
+        min_points: int = 5,
+        p0: float = 0.05,
+        flare_k: float = 3.0,
+        lag_window_days: float = 30.0,
+        max_lag_days: Optional[float] = None,
+        dcf_bin_days: Optional[float] = None,
+        z: Optional[float] = None,
+        merge_duplicate_epochs: bool = True,
+    ) -> Dict[str, Any]:
+        def _run():
+            from services.variability import VariabilityService
+
+            uid = self._mmdc_user_id()
+            svc = VariabilityService(self._get_mmdc_service())
+            try:
+                result = svc.run(result_id=result_id, source=source, target_name=target_name, ra=ra, dec=dec,
+                                 identifier=identifier, index=index, start_date=start_date, end_date=end_date,
+                                 bands=bands, lag_bands=lag_bands, min_points=min_points, p0=p0, flare_k=flare_k,
+                                 lag_window_days=lag_window_days, max_lag_days=max_lag_days, dcf_bin_days=dcf_bin_days,
+                                 z=z, merge_duplicate_epochs=merge_duplicate_epochs, owner_id=uid, user_id=uid,
+                                 resolver=self._resolve_target)
+            except LookupError as exc:
+                return {"success": False, "error": str(exc)}
+            source_label = "MMDC" if result.get("attribution") else "Quasar variability"
+            return self._mmdc_cards(result, tool_name="variability_analysis", source=source_label,
+                                    store_meta={"variability": {"target": result.get("target"), "input": result.get("input")}})
+
+        src = str(source or "").strip().lower()
+        vhost, vlabel = {"ztf": ("api.alerce.online", "ALeRCE"), "tess": ("mast.stsci.edu", "MAST (lightkurve)"),
+                         "kepler": ("mast.stsci.edu", "MAST (lightkurve)"), "k2": ("mast.stsci.edu", "MAST (lightkurve)")
+                         }.get(src, ("", "The light-curve service") if result_id else ("mmdc.am", "MMDC"))
+        return self._mmdc_call("variability_analysis", _run, host=vhost, service_label=vlabel)
+
     def _sparcl_find_spectra(
         self,
         target_name: Optional[str] = None,
@@ -6461,13 +6802,21 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         # Convert from Chat Completions format to Responses API format
         from core import bench_toolset as _bench
 
+        # v2 bundle: per-tool rule amendments are appended at serialization
+        # time only (core/prompts/tool_description_overrides.py); the registry
+        # keeps the original text for the legacy arm, rollback and the neutral
+        # benchmark arm.
+        _amend = None
+        if getattr(self, "prompt_bundle", "legacy") == "v2" and not _bench.active():
+            from core.prompts.tool_description_overrides import effective_description as _amend
+
         for tool in self.tool_registry.list_tools():
             if not _bench.allowed(tool.name):
                 continue  # benchmark arm allowlist (no-op unless configured)
             tools.append({
                 "type": "function",
                 "name": tool.name,
-                "description": tool.description,
+                "description": _amend(tool.name, tool.description) if _amend else tool.description,
                 "parameters": tool.parameters,
             })
         

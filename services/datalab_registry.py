@@ -357,8 +357,12 @@ DATALAB_CATALOGS: Dict[str, Dict[str, Any]] = {
         "tables": {
             "tractor": {
                 # Forced unWISE W1/W2 only — W3/W4 are NOT in dered_mag_* (guardrail).
+                # Observed mag_* first: a plain "brighter than r = 20" means the
+                # observed magnitude; with only dered_* exposed both models cut on
+                # dered_mag_r (ArchiveBench AB-D-53, 483 vs 431, 2026-09-26).
                 "columns": [
                     "release", "brickid", "objid", "ra", "dec", "type",
+                    "mag_g", "mag_r", "mag_z", "mag_w1", "mag_w2",
                     "dered_mag_g", "dered_mag_r", "dered_mag_z", "dered_mag_w1", "dered_mag_w2",
                     "snr_g", "snr_r", "snr_z", "snr_w1", "snr_w2",
                 ],
@@ -712,6 +716,22 @@ def default_table(catalog: str) -> str:
     if not tables:
         raise ValueError(f"No tables registered for Data Lab catalog: {catalog}")
     return tables[0]
+
+
+# Older release -> the newer release of the same survey that Data Lab also
+# serves. An empty result from the older one is not a coverage verdict until
+# the newer one was asked too (ArchiveBench AB-D-55, SMASH DR1 over the SMC bar).
+RELEASE_SUCCESSORS: Dict[str, str] = {"smash_dr1": "smash_dr2"}
+
+
+def newer_release(catalog: str) -> Optional[str]:
+    """The registered newer release of ``catalog``, or None."""
+    succ = RELEASE_SUCCESSORS.get(_normalize_identifier(catalog))
+    return succ if succ in DATALAB_CATALOGS else None
+
+
+def has_table(catalog: str, table: str) -> bool:
+    return _normalize_identifier(table) in (DATALAB_CATALOGS.get(_normalize_identifier(catalog), {}).get("tables") or {})
 
 
 # Survey sentinel-magnitude bounds: catalogs pad MISSING photometry with
@@ -2003,8 +2023,13 @@ TABLE_PROFILE_INFO: Dict[str, Dict[str, Any]] = {
             "dec": ("float", "deg", "dec", "ICRS declination."),
             "type": ("string", None, "category", "Tractor morphological type; PSF = point source, others extended."),
             "dered_mag_g": ("float", "mag", "measurement", "Dereddened model g magnitude (AB). LS DR9 has g/r/z — NO i band."),
-            "dered_mag_r": ("float", "mag", "measurement", "Dereddened model r magnitude (AB)."),
-            "dered_mag_z": ("float", "mag", "measurement", "Dereddened model z magnitude (AB)."),
+            "dered_mag_r": ("float", "mag", "measurement", "Dereddened (extinction-corrected) model r magnitude (AB). Use only when dereddened magnitudes are asked for, or for colours and SEDs."),
+            "dered_mag_z": ("float", "mag", "measurement", "Dereddened (extinction-corrected) model z magnitude (AB). Use only when dereddened magnitudes are asked for."),
+            "mag_g": ("float", "mag", "measurement", "Observed model g magnitude (AB), not extinction-corrected. Use for a plain 'g < 20'."),
+            "mag_r": ("float", "mag", "measurement", "Observed model r magnitude (AB), not extinction-corrected. Use for a plain 'brighter than r = 20'."),
+            "mag_z": ("float", "mag", "measurement", "Observed model z magnitude (AB), not extinction-corrected."),
+            "mag_w1": ("float", "mag", "measurement", "Observed forced unWISE W1 magnitude (AB); W3/W4 are NOT available."),
+            "mag_w2": ("float", "mag", "measurement", "Observed forced unWISE W2 magnitude (AB)."),
             "dered_mag_w1": ("float", "mag", "measurement", "Forced unWISE W1 magnitude (AB); W3/W4 are NOT available."),
             "dered_mag_w2": ("float", "mag", "measurement", "Forced unWISE W2 magnitude (AB)."),
             "snr_g": ("float", "1", "quality", "Flux S/N in g."),
@@ -2299,7 +2324,9 @@ _PROFILE_PITFALLS = [
         "detail": (
             "There is no bare mag_auto, class_star or spread_model on des_dr1.main — use mag_auto_r, class_star_r, "
             "spread_model_r etc. NSC/SMASH use gmag/rmag/...; Gaia uses phot_g_mean_mag/phot_bp_mean_mag/"
-            "phot_rp_mean_mag (bands g|bp|rp, so 'rmag' does not exist); LS DR9 uses dered_mag_g/r/z (+W1/W2, no i band)."
+            "phot_rp_mean_mag (bands g|bp|rp, so 'rmag' does not exist); LS DR9 has observed mag_g/r/z and dereddened "
+            "dered_mag_g/r/z (+W1/W2, no i band): a plain 'r < 20' cut is mag_r, dered_mag_r only when dereddened "
+            "magnitudes are asked for."
         ),
         "applies_to": [{"kind": "archive", "ref": "datalab"}],
         "prompt_rank": 2,

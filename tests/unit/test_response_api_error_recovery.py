@@ -189,6 +189,9 @@ def test_mid_stream_timeout_retries_only_that_round(monkeypatch):
 
 def test_mid_stream_timeout_after_visible_text_does_not_retry(monkeypatch):
     _no_backoff(monkeypatch)
+    # Visible text: with the pre-tool narration hold on, short text stays
+    # unshown until the round ends (see the held-text test below).
+    monkeypatch.setattr("core.runner._NARRATION_HOLD_CHARS", 0)
     fake = _MidStreamFailResponses(failures=1, pre_text="partial answer text ")
     agent = _make_agent(fake)
     tokens = []
@@ -202,6 +205,22 @@ def test_mid_stream_timeout_after_visible_text_does_not_retry(monkeypatch):
     assert "could not be completed" in result
     assert "(the model timed out)" in result
     assert agent._tls.last_provider_failure["error_class"] == "_FakeReadTimeout"
+
+
+def test_mid_stream_timeout_after_held_text_retries_the_round(monkeypatch):
+    # Short text held back as possible narration never reached the user, so
+    # the round may be retried without duplicating anything (2026-09-26 F3).
+    _no_backoff(monkeypatch)
+    fake = _MidStreamFailResponses(failures=1, pre_text="partial answer text ")
+    agent = _make_agent(fake)
+    tokens = []
+
+    result = agent.stream_response_api(
+        "hello there", conversation_id="conv-5b", on_token=tokens.append
+    )
+
+    assert len(fake.create_calls) == 2
+    assert "resumed answer" in result and "partial answer text" not in "".join(tokens)
 
 
 def test_mid_stream_timeout_retries_exhausted_returns_friendly_message(monkeypatch):

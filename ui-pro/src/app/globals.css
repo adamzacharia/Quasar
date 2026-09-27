@@ -61,106 +61,156 @@ html {
 }
 
 /* ── Theme Tokens ──────────────────────────────────────────── */
-/* Tailwind @theme block for design-system constants            */
+/* Orbita design language (2026-09-27, replaces Aurora): a quiet
+   white/charcoal shell, a light-grey chat canvas, near-black ("ink") pill
+   buttons for primary actions, thin-outlined white pills for the rest, and
+   one blue accent for links, focus and live states. Palette from the Orbita
+   shot: #F7F7F7 #020203 #BABBC9 #383945 #5A5B65 #7D84A8 #445CBD. */
 @theme {
-  /* Aurora: violet is the brand accent (was pink #f471b5).
-     --color-primary is re-declared per-theme below so text-primary/bg-primary/
-     ring-primary stay legible on both dark cards and light surfaces. */
-  --color-primary: #a78bfa;
-  /* Text that sits ON a solid bg-primary fill. bg-primary inverts lightness
-     between themes (light violet on dark, deep violet on light), so this is
-     re-declared per-theme below to keep contrast. */
-  --color-primary-dark: #1c0f2e;
-  --color-accent-purple: #a855f7;
+  /* --color-primary is the ACCENT (links, focus rings, live dots, spinners),
+     re-declared per theme below. Solid primary buttons use --q-ink. */
+  --color-primary: #445cbd;
+  /* Text that sits ON a solid bg-primary fill (per theme below). */
+  --color-primary-dark: #ffffff;
+  --color-accent-purple: #445cbd;
   --color-emerald-accent: #10b981;
+  /* Orbita greys replace Tailwind's blue-tinted slate scale, so the many
+     hardcoded slate-* classes read as the same cool neutrals as the tokens
+     (Orbita swatches: #BABBC9 #7D84A8 #5A5B65 #383945). */
+  --color-slate-50: #f7f7f8;
+  --color-slate-100: #ededf0;
+  --color-slate-200: #dcdce3;
+  --color-slate-300: #babbc9;
+  --color-slate-400: #9a9ba8;
+  --color-slate-500: #7d7f8f;
+  --color-slate-600: #5a5b65;
+  --color-slate-700: #383945;
+  --color-slate-800: #1f1f26;
+  --color-slate-900: #16161b;
+  --color-slate-950: #0e0e12;
   --font-display: "Inter", sans-serif;
   --font-mono: "JetBrains Mono", monospace;
 }
 
-/* ── Dark theme (default) ──────────────────────────────────── */
+/* ── Dark theme ────────────────────────────────────────────── */
 :root,
 [data-theme="dark"] {
-  /* Aurora — deep-space violet/black with pink·violet·blue nebula glow */
-  --color-primary: #a78bfa;
-  --q-bg: #0f0b1d;
-  --q-sidebar: #0a0714;
-  --q-card: #14101f;
-  --q-surface: #0d0a1a;
-  --q-text: #f3effb;
-  --q-text-secondary: #c9bee8;
-  --q-text-muted: #b8abce;
-  --q-border: rgba(255, 255, 255, 0.1);
-  --q-glass-bg: rgba(255, 255, 255, 0.05);
-  --q-glass-hover: rgba(255, 255, 255, 0.1);
-  --q-glass-border: rgba(255, 255, 255, 0.1);
-  --q-glass-hover-border: rgba(167, 139, 250, 0.5);
-  --q-glass-surface: rgba(18, 12, 32, 0.62);
-  --q-glass-strong: rgba(18, 12, 32, 0.82);
-  --q-glass-sidebar: rgba(10, 7, 20, 0.55);
-  --q-glass-drawer: rgba(12, 8, 22, 0.88);
-  --q-drawer-border: rgba(255, 255, 255, 0.12);
-  --q-drawer-shadow: 24px 0 60px rgba(0, 0, 0, 0.55);
-  --q-drawer-scrim: rgba(4, 2, 10, 0.55);
-  --q-glass-popover: rgba(10, 7, 20, 0.95);
-  --q-glass-control: rgba(255, 255, 255, 0.06);
-  --q-glass-control-hover: rgba(255, 255, 255, 0.1);
-  --q-glass-highlight: rgba(255, 255, 255, 0.14);
-  --q-glass-shadow: 0 18px 48px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  --q-scrollbar-track: #0a0714;
-  --q-scrollbar-thumb: rgba(140, 120, 180, 0.4);
-  --q-input-bg: #0d0a1a;
-  --q-code-bg: #0a0712;
-  --q-shadow-glow: rgba(167, 139, 250, 0.25);
-  --q-text-faint: #9286b3;
-  --q-mono-accent: #c4b5fd;
-  --q-content-scrim: rgba(7, 5, 16, 0.42);
-  --q-observation-graph-node-bg: rgba(18, 12, 32, 0.92);
-  --q-observation-graph-node-text: #f3effb;
-  --q-observation-graph-node-detail: #b9a9e0;
-  --q-observation-graph-edge: rgba(167, 139, 250, 0.34);
+  /* Orbita dark: neutral charcoal, same hierarchy as light. */
+  --color-primary: #8b9df0;
+  --color-primary-dark: #0c0c0f;
+  --q-bg: #0c0c0f;
+  --q-sidebar: #0c0c0f;
+  --q-rail: #101014;
+  --q-canvas: #141418;
+  --q-card: #1a1a20;
+  --q-surface: #16161b;
+  --q-bubble-user: #25252c;
+  --q-ink: #f2f2f5;
+  --q-on-ink: #0c0c0f;
+  --q-ink-hover: #ffffff;
+  --q-text: #f2f2f5;
+  --q-text-secondary: #c4c5d0;
+  --q-text-muted: #9a9ba8;
+  /* Orbita's #7d84a8 reads as blue on charcoal; a neutral grey instead. */
+  --q-text-faint: #7f808c;
+  --q-border: rgba(255, 255, 255, 0.08);
+  --q-border-strong: rgba(255, 255, 255, 0.16);
+  --q-accent-soft: rgba(139, 157, 240, 0.14);
+  --q-glass-bg: rgba(255, 255, 255, 0.04);
+  --q-glass-hover: rgba(255, 255, 255, 0.06);
+  --q-glass-border: rgba(255, 255, 255, 0.09);
+  --q-glass-hover-border: rgba(255, 255, 255, 0.18);
+  --q-glass-surface: #1a1a20;
+  --q-glass-strong: #1a1a20;
+  --q-glass-sidebar: #0c0c0f;
+  --q-glass-drawer: #0f0f13;
+  --q-drawer-border: rgba(255, 255, 255, 0.08);
+  --q-drawer-shadow: 24px 0 60px rgba(0, 0, 0, 0.5);
+  --q-drawer-scrim: rgba(0, 0, 0, 0.5);
+  --q-glass-popover: #1a1a20;
+  --q-glass-control: #1a1a20;
+  --q-glass-control-hover: #22222a;
+  --q-glass-highlight: rgba(255, 255, 255, 0.04);
+  --q-glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --q-popover-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  --q-scrollbar-track: transparent;
+  --q-scrollbar-thumb: rgba(255, 255, 255, 0.14);
+  --q-input-bg: #1a1a20;
+  --q-code-bg: #101014;
+  --q-shadow-glow: rgba(0, 0, 0, 0.35);
+  --q-mono-accent: #8b9df0;
+  --q-content-scrim: transparent;
+  --q-observation-graph-node-bg: rgba(26, 26, 32, 0.95);
+  --q-observation-graph-node-text: #f2f2f5;
+  --q-observation-graph-node-detail: #9a9ba8;
+  --q-observation-graph-edge: rgba(139, 157, 240, 0.34);
 }
 
-/* ── Light theme ───────────────────────────────────────────── */
+/* ── Light theme (default) ─────────────────────────────────── */
 [data-theme="light"] {
-  /* Aurora light — aurora on near-white, deeper violet accent for contrast */
-  --color-primary: #9333ea;
+  --color-primary: #445cbd;
   --color-primary-dark: #ffffff;
-  --q-bg: #fbfaff;
+  /* Most components were built dark-first with hardcoded slate classes
+     (bg-slate-800 card, bg-slate-700/70 selected row, text-slate-300 body).
+     Inverting the scale in light mode turns every such pairing into its light
+     equivalent at once (dark fill -> light fill, light text -> dark text), so
+     no grey box ends up with dark text on a dark fill. */
+  --color-slate-50: #1b1c24;
+  --color-slate-100: #2a2b35;
+  --color-slate-200: #383945;
+  --color-slate-300: #45464f;
+  --color-slate-400: #5a5b65;
+  --color-slate-500: #6e707e;
+  --color-slate-600: #b4b5c2;
+  --color-slate-700: #dcdce3;
+  --color-slate-800: #ededf0;
+  --color-slate-900: #f4f4f6;
+  --color-slate-950: #fafafb;
+  --q-bg: #ffffff;
   --q-sidebar: #ffffff;
+  --q-rail: #f7f7f7;
+  --q-canvas: #f7f7f7;
   --q-card: #ffffff;
-  --q-surface: #f5f3ff;
-  --q-text: #1c1530;
-  --q-text-secondary: #514866;
-  --q-text-muted: #625873;
-  --q-border: rgba(120, 90, 160, 0.18);
-  --q-glass-bg: rgba(255, 255, 255, 0.5);
-  --q-glass-hover: rgba(120, 90, 160, 0.08);
-  --q-glass-border: rgba(120, 90, 160, 0.18);
-  --q-glass-hover-border: rgba(168, 85, 247, 0.4);
-  --q-glass-surface: rgba(255, 255, 255, 0.72);
-  --q-glass-strong: rgba(255, 255, 255, 0.88);
-  --q-glass-sidebar: rgba(255, 255, 255, 0.74);
-  --q-glass-drawer: rgba(255, 255, 255, 0.9);
-  --q-drawer-border: rgba(120, 90, 160, 0.18);
-  --q-drawer-shadow: 24px 0 60px rgba(80, 50, 130, 0.22);
-  --q-drawer-scrim: rgba(28, 21, 48, 0.26);
-  --q-glass-popover: rgba(255, 255, 255, 0.97);
-  --q-glass-control: rgba(255, 255, 255, 0.6);
-  --q-glass-control-hover: rgba(255, 255, 255, 0.85);
+  --q-surface: #f7f7f7;
+  --q-bubble-user: #ededf0;
+  --q-ink: #020203;
+  --q-on-ink: #ffffff;
+  --q-ink-hover: #1b1c24;
+  --q-text: #020203;
+  --q-text-secondary: #383945;
+  --q-text-muted: #5a5b65;
+  --q-text-faint: #7d84a8;
+  --q-border: #e7e7ec;
+  --q-border-strong: #babbc9;
+  --q-accent-soft: rgba(68, 92, 189, 0.1);
+  --q-glass-bg: #f7f7f7;
+  --q-glass-hover: #f3f3f6;
+  --q-glass-border: #e4e4ea;
+  --q-glass-hover-border: #babbc9;
+  --q-glass-surface: #ffffff;
+  --q-glass-strong: #ffffff;
+  --q-glass-sidebar: #ffffff;
+  --q-glass-drawer: #ffffff;
+  --q-drawer-border: #e7e7ec;
+  --q-drawer-shadow: 24px 0 60px rgba(2, 2, 3, 0.12);
+  --q-drawer-scrim: rgba(2, 2, 3, 0.24);
+  --q-glass-popover: #ffffff;
+  --q-glass-control: #ffffff;
+  --q-glass-control-hover: #f3f3f6;
   --q-glass-highlight: rgba(255, 255, 255, 0.9);
-  --q-glass-shadow: 0 18px 48px rgba(80, 50, 130, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.78);
-  --q-scrollbar-track: #ece8f7;
-  --q-scrollbar-thumb: #c3b6e0;
+  --q-glass-shadow: 0 1px 2px rgba(2, 2, 3, 0.04);
+  --q-popover-shadow: 0 16px 40px rgba(2, 2, 3, 0.1);
+  --q-scrollbar-track: transparent;
+  --q-scrollbar-thumb: #d6d7df;
   --q-input-bg: #ffffff;
-  --q-code-bg: #f3f0fb;
-  --q-shadow-glow: rgba(168, 85, 247, 0.18);
-  --q-text-faint: #837995;
-  --q-mono-accent: #a855f7;
-  --q-content-scrim: rgba(255, 255, 255, 0.62);
-  --q-observation-graph-node-bg: rgba(28, 21, 48, 0.92);
-  --q-observation-graph-node-text: #f3effb;
-  --q-observation-graph-node-detail: #cabfe6;
-  --q-observation-graph-edge: rgba(120, 90, 160, 0.32);
+  --q-code-bg: #f4f4f6;
+  --q-shadow-glow: rgba(2, 2, 3, 0.08);
+  --q-mono-accent: #445cbd;
+  --q-content-scrim: transparent;
+  --q-observation-graph-node-bg: rgba(2, 2, 3, 0.9);
+  --q-observation-graph-node-text: #f2f2f5;
+  --q-observation-graph-node-detail: #babbc9;
+  --q-observation-graph-edge: rgba(68, 92, 189, 0.3);
 }
 
 /* ── Backwards-compatible Tailwind aliases ─────────────────── */
@@ -172,23 +222,9 @@ html {
   --color-surface-dark: var(--q-surface);
 }
 
-/* Aurora nebula — pink · violet · blue radial glow on deep space */
+/* The app shell. Aurora painted a nebula here; Orbita is a plain surface. */
 .quasar-backdrop {
   background-color: var(--q-bg);
-  background-image:
-    radial-gradient(54% 46% at 26% 66%, rgba(244, 114, 182, 0.40), transparent 62%),
-    radial-gradient(54% 54% at 76% 38%, rgba(167, 139, 250, 0.46), transparent 62%),
-    radial-gradient(46% 42% at 58% 86%, rgba(96, 165, 250, 0.32), transparent 62%);
-  background-repeat: no-repeat;
-  background-attachment: fixed;
-  background-size: cover;
-}
-
-[data-theme="light"] .quasar-backdrop {
-  background-image:
-    radial-gradient(54% 48% at 26% 66%, rgba(249, 168, 212, 0.55), transparent 60%),
-    radial-gradient(54% 54% at 76% 38%, rgba(196, 181, 253, 0.60), transparent 60%),
-    radial-gradient(48% 44% at 58% 86%, rgba(165, 180, 252, 0.50), transparent 62%);
 }
 
 ::-webkit-scrollbar {
@@ -206,152 +242,211 @@ html {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #a78bfa;
+  background: var(--q-text-faint);
 }
 
 .text-gradient {
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-image: linear-gradient(to right, #c77dff, #818cf8);
+  color: var(--q-text);
 }
 
+/* ── Orbita primitives ─────────────────────────────────────── */
+/* In the components layer so Tailwind utilities on the same element (hidden,
+   sm:inline-flex, h-9, px-4...) still win over the primitive's defaults. */
+@layer components {
+/* Solid primary action: the near-black pill ("New Chat", "Send"). Inverts in
+   dark mode (light pill, dark text). */
+.q-pill-ink {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border-radius: 9999px;
+  background: var(--q-ink);
+  color: var(--q-on-ink) !important;
+  font-weight: 500;
+  transition: background-color 0.18s ease, opacity 0.18s ease, transform 0.18s ease;
+}
+.q-pill-ink:hover:not(:disabled) { background: var(--q-ink-hover); }
+.q-pill-ink:active:not(:disabled) { transform: scale(0.98); }
+.q-pill-ink:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* Secondary action: white pill with a hairline border ("Attach", "Share"). */
+.q-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border-radius: 9999px;
+  background: var(--q-card);
+  border: 1px solid var(--q-border);
+  color: var(--q-text) !important;
+  font-weight: 500;
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+}
+.q-pill:hover:not(:disabled) {
+  background: var(--q-glass-control-hover);
+  border-color: var(--q-border-strong);
+}
+.q-pill:disabled { opacity: 0.45; cursor: not-allowed; }
+.q-pill[aria-pressed="true"],
+.q-pill[aria-expanded="true"] {
+  border-color: var(--q-border-strong);
+  background: var(--q-glass-control-hover);
+}
+
+/* Small outlined tag next to a title ("Beta", model names). */
+.q-tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 0.375rem;
+  border: 1px solid var(--q-border);
+  padding: 0.05rem 0.4rem;
+  font-size: 0.68rem;
+  line-height: 1.4;
+  color: var(--q-text-muted);
+  background: var(--q-card);
+}
+
+/* The inset light-grey canvas the conversation sits on. */
+.q-canvas {
+  background: var(--q-canvas);
+}
+
+/* Round icon button (the left rail). Active = ink disc. */
+.q-rail-btn {
+  position: relative;
+  display: inline-flex;
+  width: 42px;
+  height: 42px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  color: var(--q-text-muted);
+  background: transparent;
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+.q-rail-btn:hover { background: var(--q-card); color: var(--q-text); box-shadow: 0 0 0 1px var(--q-border); }
+.q-rail-btn[data-active="true"] { background: var(--q-ink); color: var(--q-on-ink); box-shadow: none; }
+
+/* Letter avatar used for starred chats and the user ("C", "S"). */
+.q-letter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 9999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+}
+
+/* Staggered entrance for list rows (sidebar history, suggestions). */
+@keyframes q-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.q-rise { animation: q-rise 0.42s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+@media (prefers-reduced-motion: reduce) {
+  .q-rise { animation: none; }
+}
+
+/* Legacy class names, re-skinned so every existing use becomes Orbita. */
 .glass-card {
-  background: var(--q-glass-surface);
-  backdrop-filter: blur(18px) saturate(140%);
-  -webkit-backdrop-filter: blur(18px) saturate(140%);
-  border: 1px solid var(--q-glass-border);
+  background: var(--q-card);
+  border: 1px solid var(--q-border);
   box-shadow: var(--q-glass-shadow);
-  background-clip: padding-box;
-  transition: all 0.3s ease;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
 }
 
-/* Guarded: on touch, :hover latches after a tap, so an unguarded lift leaves the
-   tapped card floating until the user taps elsewhere. */
+/* Guarded: on touch, :hover latches after a tap. */
 @media (hover: hover) {
   .glass-card:hover {
-    background: var(--q-glass-strong);
-    border-color: var(--q-glass-hover-border);
-    transform: translateY(-2px);
-    box-shadow: 0 10px 30px -10px var(--q-shadow-glow);
+    border-color: var(--q-border-strong);
+    box-shadow: 0 6px 20px -8px var(--q-shadow-glow);
   }
 }
 
 .logo-glow {
-  box-shadow: 0 0 60px -15px rgba(167, 139, 250, 0.5);
+  box-shadow: none;
 }
 
-/* Text that sits on the violet CTA gradient — must stay white in BOTH themes
-   (the light-mode .text-white override below would otherwise darken it). */
+/* Text on a solid ink fill: flips with the theme. */
 .text-on-accent {
-  color: #fff !important;
+  color: var(--q-on-ink) !important;
 }
 
-/* Aurora primary CTA — the c77dff->9333ea violet gradient with white text.
-   Use on every solid primary action button for consistent, AA-safe contrast
-   (white on the gradient's deep end) in both themes. */
+/* Every solid primary action button. */
 .btn-accent {
-  background-image: linear-gradient(135deg, #c77dff, #9333ea);
-  color: #fff !important;
-  transition: filter 0.2s ease, box-shadow 0.2s ease;
+  background: var(--q-ink);
+  color: var(--q-on-ink) !important;
+  transition: background-color 0.18s ease, opacity 0.18s ease;
 }
-.btn-accent:hover {
-  filter: brightness(1.08);
-}
-.btn-accent:disabled {
-  filter: none;
+.btn-accent:hover:not(:disabled) {
+  background: var(--q-ink-hover);
 }
 
 .btn-new-chat {
-  background: linear-gradient(135deg, rgba(167, 139, 250, 0.22), rgba(147, 51, 234, 0.26));
-  color: var(--q-text) !important;
-  border: 1px solid rgba(167, 139, 250, 0.28);
-  box-shadow: 0 10px 26px rgba(75, 55, 130, 0.12), inset 0 1px 0 var(--q-glass-highlight);
-  transition: background-color 0.2s ease, border-color 0.2s ease, filter 0.2s ease;
+  background: var(--q-ink);
+  color: var(--q-on-ink) !important;
+  border: 1px solid transparent;
+  transition: background-color 0.18s ease;
 }
 .btn-new-chat:hover {
-  background: linear-gradient(135deg, rgba(167, 139, 250, 0.30), rgba(147, 51, 234, 0.34));
-  border-color: rgba(167, 139, 250, 0.42);
+  background: var(--q-ink-hover);
 }
 
-/* Subtle scrim behind the chat scroll area so messages/tables stay legible
-   over the full-strength nebula. */
 .chat-scrim {
-  background: var(--q-content-scrim);
-}
-
-.chat-session-active {
-  background: var(--q-content-scrim);
-}
-
-.chat-session-active .chat-scrim {
   background: transparent;
 }
 
-[data-theme="dark"] .chat-session-active {
-  background: linear-gradient(180deg, rgba(3, 2, 8, 0.95), rgba(2, 2, 7, 0.98));
-}
-
-[data-theme="dark"] .chat-session-active .glass-panel {
-  background: rgba(5, 4, 10, 0.88);
+.chat-session-active {
+  background: transparent;
 }
 
 .sidebar-rail-button {
   display: inline-flex;
-  width: 44px;
-  height: 44px;
+  width: 42px;
+  height: 42px;
   align-items: center;
   justify-content: center;
-  border-radius: 14px;
-  color: var(--q-text-secondary);
-  transition: background-color 0.18s ease, color 0.18s ease, transform 0.18s ease;
+  border-radius: 9999px;
+  color: var(--q-text-muted);
+  transition: background-color 0.18s ease, color 0.18s ease;
 }
 .sidebar-rail-button:hover {
-  background: var(--q-glass-control-hover);
+  background: var(--q-card);
   color: var(--q-text);
+  box-shadow: 0 0 0 1px var(--q-border);
 }
 
 .glass-panel {
-  background: var(--q-glass-strong);
-  backdrop-filter: blur(20px) saturate(145%);
-  -webkit-backdrop-filter: blur(20px) saturate(145%);
+  background: var(--q-bg);
   border: 1px solid var(--q-border);
-  box-shadow: var(--q-glass-shadow);
-  background-clip: padding-box;
 }
 
 .glass-surface {
-  background: var(--q-glass-surface);
-  backdrop-filter: blur(18px) saturate(145%);
-  -webkit-backdrop-filter: blur(18px) saturate(145%);
-  border: 1px solid var(--q-glass-border);
+  background: var(--q-card);
+  border: 1px solid var(--q-border);
   box-shadow: var(--q-glass-shadow);
-  background-clip: padding-box;
 }
 
 .glass-sidebar {
-  background: var(--q-glass-sidebar);
-  backdrop-filter: blur(22px) saturate(150%);
-  -webkit-backdrop-filter: blur(22px) saturate(150%);
-  box-shadow: var(--q-glass-shadow);
-  background-clip: padding-box;
+  background: var(--q-sidebar);
 }
 
-/* Mobile navigation drawer — denser than .glass-sidebar (0.88/0.90 vs 0.55/0.74)
-   because it floats over live content rather than sitting beside it. */
+/* Mobile navigation drawer: floats over live content. */
 .glass-drawer {
   background: var(--q-glass-drawer);
-  backdrop-filter: blur(24px) saturate(150%);
-  -webkit-backdrop-filter: blur(24px) saturate(150%);
   border-right: 1px solid var(--q-drawer-border);
   box-shadow: var(--q-drawer-shadow);
-  background-clip: padding-box;
 }
 
 .drawer-scrim {
   background: var(--q-drawer-scrim);
-  backdrop-filter: blur(3px);
-  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
 }
 
 /* This project has no tailwindcss-animate, so `animate-in slide-in-from-left`
@@ -380,7 +475,7 @@ html {
   backdrop-filter: blur(24px) saturate(155%);
   -webkit-backdrop-filter: blur(24px) saturate(155%);
   border: 1px solid var(--q-glass-border);
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.36), inset 0 1px 0 var(--q-glass-highlight);
+  box-shadow: var(--q-popover-shadow);
   background-clip: padding-box;
 }
 
@@ -398,16 +493,9 @@ html {
 }
 
 .glass-active {
-  background: rgba(167, 139, 250, 0.16);
-  border: 1px solid rgba(167, 139, 250, 0.28);
-  border-left: 3px solid #a78bfa;
-  box-shadow: inset 0 1px 0 var(--q-glass-highlight);
-}
-
-[data-theme="light"] .glass-active {
-  background: rgba(192, 132, 252, 0.16);
-  border: 1px solid rgba(168, 85, 247, 0.28);
-  border-left: 3px solid #a855f7;
+  background: var(--q-card);
+  border: 1px solid var(--q-border);
+  box-shadow: var(--q-glass-shadow);
 }
 
 /* Hide scrollbar for carousels */
@@ -446,6 +534,86 @@ html {
   .animate-qfade { animation: none; }
 }
 
+/* Research timeline (ResearchTimeline.tsx): the live "what is Quasar doing"
+   view. Height animates with the grid-rows trick so the collapse is smooth
+   without measuring the content. */
+.q-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 0.34s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.22s ease;
+}
+.q-collapse[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.q-collapse > div {
+  min-height: 0;
+  overflow: hidden;
+}
+@keyframes q-item-in {
+  from { opacity: 0; transform: translateY(4px); filter: blur(3px); }
+  to   { opacity: 1; transform: none; filter: blur(0); }
+}
+.q-item-in {
+  animation: q-item-in 0.4s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+@keyframes q-line-grow {
+  from { transform: scaleY(0); }
+  to   { transform: scaleY(1); }
+}
+.q-line-grow {
+  transform-origin: top;
+  animation: q-line-grow 0.45s ease-out both;
+}
+/* Text sweep on the phase that is running right now. */
+@keyframes q-shimmer {
+  from { background-position: 100% 0; }
+  to   { background-position: -100% 0; }
+}
+.q-shimmer {
+  background-image: linear-gradient(90deg,
+    var(--q-text-faint) 0%, var(--q-text-faint) 32%,
+    var(--q-text) 50%,
+    var(--q-text-faint) 68%, var(--q-text-faint) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: q-shimmer 2.4s linear infinite;
+}
+/* Error / notice accents that stay readable on the light theme too. */
+.q-err { color: #f87171; }
+.q-warn { color: #fbbf24; }
+[data-theme="light"] .q-err { color: #b91c1c; }
+[data-theme="light"] .q-warn { color: #b45309; }
+/* Timeline dot; the live one sends out a soft ping. */
+.q-dot { background: currentColor; }
+.q-dot-live::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: q-dot-ping 1.7s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+@keyframes q-dot-ping {
+  0%        { transform: scale(1); opacity: 0.6; }
+  80%, 100% { transform: scale(2.8); opacity: 0; }
+}
+@keyframes q-orbit-spin {
+  to { transform: rotate(360deg); }
+}
+.q-orbit-spin {
+  animation: q-orbit-spin 3.2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .q-collapse { transition: none; }
+  .q-item-in, .q-line-grow, .q-orbit-spin { animation: none; }
+  .q-dot-live::after { display: none; }
+  .q-shimmer { animation: none; background-image: none; color: var(--q-text); }
+}
+
 /* ══════════════════════════════════════════════════════════════
    LIGHT THEME — comprehensive surface overrides
    Remap hardcoded Tailwind slate classes so every component
@@ -476,19 +644,19 @@ html {
 [data-theme="light"] .bg-slate-900\/60,
 [data-theme="light"] .bg-slate-900\/70,
 [data-theme="light"] .bg-slate-900\/95 {
-  background-color: #f1f5f9 !important;
+  background-color: #f7f7f7 !important;
 }
 
 [data-theme="light"] .bg-slate-950,
 [data-theme="light"] .bg-slate-950\/70,
 [data-theme="light"] .bg-slate-950\/90,
 [data-theme="light"] .bg-slate-950\/95 {
-  background-color: #e9e6f5 !important;
+  background-color: #efeff2 !important;
 }
 
 [data-theme="light"] .border-slate-800,
 [data-theme="light"] .border-slate-800\/80 {
-  border-color: rgba(0, 0, 0, 0.08) !important;
+  border-color: #e7e7ec !important;
 }
 
 /* Secondary pages (help, spectral-lines, workbench, settings modal) hardcode
@@ -506,46 +674,46 @@ html {
 
 [data-theme="light"] .bg-slate-700,
 [data-theme="light"] .bg-slate-700\/50 {
-  background-color: #e2e8f0 !important;
+  background-color: #ededf0 !important;
 }
 
 /* ── Hover states ─────────────────────────────────────────── */
 [data-theme="light"] .hover\:bg-slate-800\/50:hover,
 [data-theme="light"] .hover\:bg-slate-800:hover {
-  background-color: #e2e8f0 !important;
+  background-color: #f3f3f6 !important;
 }
 [data-theme="light"] .hover\:bg-slate-700:hover,
 [data-theme="light"] .hover\:bg-slate-700\/50:hover {
-  background-color: #cbd5e1 !important;
+  background-color: #ededf0 !important;
 }
 
 /* ── Text ─────────────────────────────────────────────────── */
 [data-theme="light"] .text-white {
-  color: #0f172a !important;
+  color: #020203 !important;
 }
 [data-theme="light"] .text-slate-100 {
-  color: #1e293b !important;
+  color: #1b1c24 !important;
 }
 [data-theme="light"] .text-slate-200 {
-  color: #334155 !important;
+  color: #2a2b35 !important;
 }
 [data-theme="light"] .text-slate-300 {
-  color: #475569 !important;
+  color: #383945 !important;
 }
 [data-theme="light"] .text-slate-400 {
-  color: #64748b !important;
+  color: #5a5b65 !important;
 }
 [data-theme="light"] .text-slate-500 {
-  color: #94a3b8 !important;
+  color: #7d84a8 !important;
 }
 [data-theme="light"] .text-slate-600 {
-  color: #94a3b8 !important;
+  color: #7d84a8 !important;
 }
 [data-theme="light"] .hover\:text-white:hover {
-  color: #0f172a !important;
+  color: #020203 !important;
 }
 [data-theme="light"] .hover\:text-slate-200:hover {
-  color: #1e293b !important;
+  color: #1b1c24 !important;
 }
 
 /* ── Pale accent text (readable only on dark) ─────────────── */
@@ -588,7 +756,7 @@ html {
    generic slate-500 light remap above (#94a3b8) is too faint for uppercase
    10px header text — keep headers at true slate-500. */
 [data-theme="light"] thead.text-slate-500 {
-  color: #64748b !important;
+  color: #5a5b65 !important;
 }
 
 /* ── Borders ──────────────────────────────────────────────── */
@@ -596,7 +764,7 @@ html {
 [data-theme="light"] .border-slate-700,
 [data-theme="light"] .border-slate-600\/50,
 [data-theme="light"] .border-slate-800\/80 {
-  border-color: rgba(0, 0, 0, 0.08) !important;
+  border-color: #e7e7ec !important;
 }
 
 /* ── Inputs and interactive surfaces ─────────────────────── */
@@ -649,7 +817,7 @@ html {
   background: rgba(0, 0, 0, 0.02) !important;
 }
 [data-theme="light"] .prose hr {
-  border-color: rgba(0, 0, 0, 0.08) !important;
+  border-color: #e7e7ec !important;
 }
 
 /* ── Markdown prose table borders ────────────────────────── */
@@ -662,7 +830,7 @@ html {
 
 /* ── Chat area header glass panel ────────────────────────── */
 [data-theme="light"] .glass-panel {
-  background: rgba(255, 255, 255, 0.7) !important;
+  background: var(--q-bg) !important;
   border-color: var(--q-border) !important;
 }
 
@@ -685,7 +853,7 @@ html {
    correct in dark AND light. Wiring the bare --tw-prose-* set instead would be
    a no-op here and would reintroduce pale-on-white text in light mode. */
 .prose {
-  --tw-prose-invert-body: var(--q-text);
+  --tw-prose-invert-body: var(--q-text-secondary);
   --tw-prose-invert-headings: var(--q-text);
   --tw-prose-invert-lead: var(--q-text-secondary);
   --tw-prose-invert-links: var(--color-primary);
@@ -731,6 +899,11 @@ html {
   margin-top: 0.8em;
   margin-bottom: 0.8em;
   line-height: 1.7;
+}
+
+/* Orbita: inline code reads as a quiet chip, not a bold accent. */
+.prose-answer :where(code) {
+  font-weight: 500;
 }
 
 .prose-answer :where(ul, ol, li) {
@@ -786,39 +959,38 @@ html {
   border-spacing: 0;
   border-radius: 0.75rem;
   overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.15);
+  border: 1px solid var(--q-border);
+  background: var(--q-card);
   margin: 1rem 0;
   font-size: 0.8rem;
 }
 
 .prose thead {
-  background: linear-gradient(135deg, rgba(167, 139, 250, 0.16), rgba(96, 165, 250, 0.10));
-  border-bottom: 1px solid rgba(167, 139, 250, 0.28);
+  background: var(--q-card);
+  border-bottom: 1px solid var(--q-border);
 }
 
 .prose thead th {
-  padding: 0.65rem 0.9rem;
+  padding: 0.7rem 0.95rem;
   text-align: left;
-  font-weight: 600;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  font-weight: 500;
+  font-size: 0.8rem;
   color: var(--q-text);
   white-space: nowrap;
-  border-bottom: 1px solid rgba(167, 139, 250, 0.22);
+  border-bottom: 1px solid var(--q-border);
 }
 
 .prose tbody tr {
-  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+  border-bottom: 1px solid var(--q-border);
   transition: background-color 0.15s ease;
 }
 
 .prose tbody tr:nth-child(even) {
-  background: rgba(255, 255, 255, 0.02);
+  background: transparent;
 }
 
 .prose tbody tr:hover {
-  background: rgba(167, 139, 250, 0.08);
+  background: var(--q-glass-hover);
 }
 
 .prose tbody td {

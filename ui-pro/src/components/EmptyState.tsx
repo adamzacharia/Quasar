@@ -10,31 +10,32 @@ interface Category {
     example: string;
 }
 
-// Aurora empty state — example prompts per the QUASAR design handoff.
-const ICON_CLASS = "size-[15px] md:size-[19px]";
+// Orbita empty state: example prompts per the QUASAR design handoff.
+const ICON_CLASS = "size-4";
+const ICON_STROKE = 1.75;
 
 const CATEGORIES: Category[] = [
     {
         key: "archive",
-        icon: <Radio className={ICON_CLASS} />,
+        icon: <Radio className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Search the archive",
         example: "Find ALMA observations of Sz65 in Band 6.",
     },
     {
         key: "lit",
-        icon: <FileText className={ICON_CLASS} />,
+        icon: <FileText className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Search the literature",
         example: "Recent papers on protoplanetary disk substructure.",
     },
     {
         key: "policy",
-        icon: <HelpCircle className={ICON_CLASS} />,
+        icon: <HelpCircle className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Policy & guidance",
         example: "What is the current ALMA proprietary period?",
     },
     {
         key: "spectral",
-        icon: <BarChart3 className={ICON_CLASS} />,
+        icon: <BarChart3 className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Spectral coverage",
         example: "Check CO(2-1) line coverage for M87.",
     },
@@ -72,7 +73,7 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
     }, []);
 
     return (
-        <div className="hide-scrollbar flex-1 w-full overflow-y-auto px-3 py-4 md:p-8 md:pb-6">
+        <div className="hide-scrollbar flex-1 w-full overflow-y-auto px-4 py-4 md:p-8 md:pb-6">
             {/* min-h-full (not h-full) keeps justify-center safe: once the content
                 outgrows the viewport the box grows instead of centering overflow
                 out of scroll reach. */}
@@ -80,22 +81,21 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
                 {/* Centered content — grows to fill the viewport so the disclaimer can sit at the bottom */}
                 <div className="flex w-full flex-1 flex-col items-center justify-center">
                     {/* Hero */}
-                    <div className="flex flex-col items-center justify-center text-center mb-6 md:mb-7">
-                        <div className="relative mb-3 md:mb-4">
-                            <div className="absolute inset-[-18px] md:inset-[-22px] rounded-full bg-primary/30 blur-2xl" aria-hidden="true" />
-                            <img src="/quasar_logo.png" alt="Quasar" className="relative size-[62px] md:size-20 object-contain" />
+                    <div className="mb-6 flex flex-col items-center justify-center text-center md:mb-7">
+                        <div className="mb-4 flex size-11 items-center justify-center rounded-full border border-[var(--q-border)] bg-[var(--q-card)] shadow-[var(--q-glass-shadow)]">
+                            <img src="/quasar_logo.png" alt="Quasar" className="size-8 object-contain" />
                         </div>
-                        <h1 className="text-[23px] md:text-[31px] font-semibold tracking-tight" style={{ color: "var(--q-text)" }}>
+                        <h1 className="text-[22px] font-medium tracking-tight text-[var(--q-text)] md:text-[26px]">
                             What are you researching today?
                         </h1>
-                        <p className="text-[12.5px] md:text-[15px] mt-1.5 md:mt-2 max-w-[26rem] md:max-w-lg" style={{ color: "var(--q-text-secondary)" }}>
-                            Observations, archives, literature — ask in plain language.
+                        <p className="mt-1.5 max-w-[26rem] text-[13px] text-[var(--q-text-muted)] md:max-w-lg md:text-[14px]">
+                            Observations, archives, literature. Ask in plain language.
                         </p>
                     </div>
 
                     {/* Hero composer (centered) */}
                     {composer && (
-                        <div className="w-full mb-7 md:mb-8">
+                        <div className="mb-6 w-full md:mb-7">
                             {composer}
                         </div>
                     )}
@@ -104,24 +104,25 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
                     <div className="w-full max-w-[var(--q-suggestion-grid-width)]">
                         {showStartingPoints && (
                             <>
-                                <div className="mb-2.5 md:mb-3 text-[10px] md:text-[11px] font-semibold uppercase tracking-[0.12em]" style={{ color: "var(--q-text-muted)" }}>
+                                <div className="mb-2.5 px-1 text-[13px] text-[var(--q-text-faint)]">
                                     Try a starting point
                                 </div>
-                                <div className="grid grid-cols-2 gap-[10px] md:gap-3.5">
-                                    {CATEGORIES.map((c) => (
+                                <div className="grid grid-cols-2 gap-2 md:gap-2.5">
+                                    {CATEGORIES.map((c, i) => (
                                         <button
                                             key={c.key}
                                             onClick={() => onSuggestionClick(c.example)}
-                                            className="glass-card rounded-[16px] md:rounded-3xl p-[13px] md:p-[18px] text-left group flex flex-col gap-2 md:flex-row md:items-start md:gap-4"
+                                            style={{ animationDelay: `${i * 40}ms` }}
+                                            className="q-rise group flex flex-col gap-2 rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] p-3 text-left shadow-[var(--q-glass-shadow)] transition-colors hover:border-[var(--q-border-strong)] md:flex-row md:items-start md:gap-3 md:p-3.5"
                                         >
-                                            <div className="shrink-0 size-[30px] md:size-10 rounded-full flex items-center justify-center bg-primary/15 text-primary transition-colors group-hover:bg-primary/25">
+                                            <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--q-canvas)] text-[var(--q-text-muted)] transition-colors group-hover:text-[var(--q-text)]">
                                                 {c.icon}
                                             </div>
                                             <div className="min-w-0">
-                                                <h3 className="font-semibold text-[12.5px] md:text-[15px] mb-0.5 md:mb-1 group-hover:text-primary transition-colors" style={{ color: "var(--q-text)" }}>
+                                                <h3 className="mb-0.5 text-[13px] font-medium text-[var(--q-text)]">
                                                     {c.title}
                                                 </h3>
-                                                <p className="text-[10.5px] md:text-[13px] leading-[1.45] md:leading-relaxed" style={{ color: "var(--q-text-secondary)" }}>
+                                                <p className="text-[12px] leading-[1.45] text-[var(--q-text-muted)]">
                                                     {c.example}
                                                 </p>
                                             </div>
@@ -135,10 +136,10 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
 
                 {/* Disclaimer — pinned to the bottom of the page below the centered content */}
                 {showDisclaimer && (
-                    <p className="pt-6 text-center text-[10px]" style={{ color: "var(--q-text-faint)" }}>
-                        QUASAR may produce inaccurate information. · Accepts images, PDFs, FITS, CSV
+                    <p className="pt-6 text-center text-[12px] text-[var(--q-text-faint)]">
+                        Quasar may produce inaccurate information. · Accepts images, PDFs, FITS, CSV
                         {hitCount !== null && (
-                            <> · <span className="font-mono tabular-nums" style={{ color: "var(--q-mono-accent)" }}>{hitCount.toLocaleString()}</span> visits</>
+                            <> · <span className="tabular-nums">{hitCount.toLocaleString()}</span> visits</>
                         )}
                     </p>
                 )}

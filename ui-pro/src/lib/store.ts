@@ -8,12 +8,14 @@ import {
     fetchConversationMessages as apiFetchMessages,
     fetchBlockRatings as apiFetchBlockRatings,
     deleteConversationApi,
+    setConversationStarred as apiSetConversationStarred,
     type ServerConversation,
     type ServerMessage,
 } from "./api";
 import {
     attachThinkingStepsToLastAssistant,
     findLastAssistantTextIndex,
+    normalizeServerMessageType,
     sanitizeAssistantContent,
     updateLastAssistantContent,
     updateLastAssistantThinking as updateAssistantThinking,
@@ -399,7 +401,7 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
         id: blockIdOr(runMeta0?.text_block_id, `srv-${index}`),
         role: msg.role as Message["role"],
         content: msg.role === "assistant" ? sanitizeAssistantContent(msg.content || "") : msg.content || "",
-        type: (msg.type || "text") as Message["type"],
+        type: normalizeServerMessageType(msg.type) as Message["type"],
         timestamp: new Date(),
         blockId: typeof runMeta0?.text_block_id === "string" ? runMeta0.text_block_id : undefined,
         blockKind: msg.role === "assistant" ? "text" : undefined,
@@ -573,6 +575,7 @@ function serverConvToLocal(conv: ServerConversation): Conversation {
         updatedAt: new Date(conv.updated_at),
         messages: [],
         model: conv.model || "",
+        isStarred: Boolean(conv.is_starred),
     };
 }
 
@@ -886,11 +889,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
     clearMessages: () => set({ messages: [], activeConversationId: null }),
 
-    toggleStar: (id) => set((state) => ({
-        conversations: state.conversations.map(c =>
-            c.id === id ? { ...c, isStarred: !c.isStarred } : c
-        )
-    })),
+    // Optimistic toggle, persisted server-side (stars used to be browser-only
+    // and vanished on reload). A chat that only exists locally ("conv-" id,
+    // not yet created on the server) keeps the local toggle until it is saved.
+    toggleStar: (id) => {
+        const current = get().conversations.find(c => c.id === id);
+        const next = !current?.isStarred;
+        const apply = (value: boolean) => set((state) => ({
+            conversations: state.conversations.map(c => c.id === id ? { ...c, isStarred: value } : c),
+        }));
+        apply(next);
+        if (id.startsWith("conv-")) return;
+        void apiSetConversationStarred(id, next).then((ok) => {
+            if (!ok) apply(!next);
+        });
+    },
 
     addThinkingStep: (step, state) => set((s) => {
         const steps = [...s.thinkingSteps];

@@ -67,6 +67,10 @@ class ProviderCatalogService:
         cached = self.keys.get_catalog(user_id, provider)
         try:
             models = _MODELS.validate_json(cached.models_json) if cached else self.static_models(provider)
+            # Prices are re-applied on read: the cache holds a day-old model
+            # list, but the rate table can change (a newly verified price must
+            # show without waiting for the catalog to expire).
+            models = [price_model(m) for m in models]
             fetched = datetime.fromisoformat(cached.fetched_at) if cached else None
             if fetched is not None and fetched.tzinfo is None:
                 fetched = fetched.replace(tzinfo=timezone.utc)

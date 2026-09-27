@@ -198,7 +198,7 @@ export function ModelDropdown({
                 }}
                 aria-haspopup="listbox"
                 aria-expanded={open}
-                className="flex flex-col items-start w-full px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors border border-slate-700/50"
+                className="flex flex-col items-start w-full px-3.5 py-2.5 text-[13px] font-medium text-[var(--q-text)] bg-[var(--q-card)] rounded-2xl hover:bg-[var(--q-glass-control-hover)] transition-colors border border-[var(--q-border)] hover:border-[var(--q-border-strong)]"
             >
                 <div className="flex items-center justify-between w-full">
                     <div className="flex items-center gap-2">

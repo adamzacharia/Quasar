@@ -1,0 +1,512 @@
+{
+ "uuid": "78838d86-ee92-49f4-9092-94ec2b9d56ec",
+ "source_name": "1ES 1959+650",
+ "database_name": "SSDC",
+ "ra": 299.99938,
+ "dec": 65.14851,
+ "data": {
+  "range_data": {
+   "radio_waves": {
+    "TGSS150": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       150000000.0
+      ],
+      "flux": [
+       3.006e-16
+      ],
+      "err_flux": [
+       3.03e-17
+      ],
+      "color": "#fb6176"
+     }
+    },
+    "SPECFINDV3": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       150000000.0,
+       325000000.0
+      ],
+      "flux": [
+       4.11e-16,
+       8.19e-16
+      ],
+      "err_flux": [
+       8.25e-17,
+       1.625e-16
+      ],
+      "color": "#fb645e"
+     }
+    },
+    "Texas": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       365000000.0
+      ],
+      "flux": [
+       1.372e-15
+      ],
+      "err_flux": [
+       2.445e-16
+      ],
+      "color": "#fb6637"
+     }
+    }
+   },
+   "microwaves": {
+    "VLASSQL": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       3000000000.0
+      ],
+      "flux": [
+       8.416e-15
+      ],
+      "err_flux": [
+       4.6e-17
+      ],
+      "color": "#d4831e"
+     }
+    },
+    "GB87": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       4800000000.0
+      ],
+      "flux": [
+       1.214e-14
+      ],
+      "err_flux": [
+       1.105e-15
+      ],
+      "color": "#ca881e"
+     }
+    },
+    "GB6": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       4800000000.0
+      ],
+      "flux": [
+       1.142e-14
+      ],
+      "err_flux": [
+       1.005e-15
+      ],
+      "color": "#c18d1e"
+     }
+    }
+   },
+   "infrared": {
+    "CatWISE": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       65170000000000.0,
+       88170000000000.0
+      ],
+      "flux": [
+       1.232e-11,
+       1.556e-11
+      ],
+      "err_flux": [
+       8.5e-14,
+       1.6e-13
+      ],
+      "color": "#b9901e"
+     }
+    },
+    "UNWISE": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       65170000000000.0,
+       88170000000000.0
+      ],
+      "flux": [
+       1.113e-11,
+       1.54e-11
+      ],
+      "err_flux": [
+       1e-14,
+       1e-14
+      ],
+      "color": "#b1931e"
+     }
+    },
+    "2MASS": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       138900000000000.0,
+       180400000000000.0
+      ],
+      "flux": [
+       1.785e-11,
+       2.065e-11
+      ],
+      "err_flux": [
+       4.75e-13,
+       7.25e-13
+      ],
+      "color": "#a9961e"
+     }
+    }
+   },
+   "visible": {
+    "ASAS-SN": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       545100000000000.0,
+       545100000000000.0
+      ],
+      "flux": [
+       6.1e-11,
+       7.387e-11
+      ],
+      "err_flux": [
+       5.983e-13,
+       1.292e-12
+      ],
+      "color": "#84a11e"
+     }
+    },
+    "HSTGSC": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       545100000000000.0,
+       681300000000000.0
+      ],
+      "flux": [
+       6.744e-11,
+       8.712e-11
+      ],
+      "err_flux": [
+       1.042e-11,
+       1.038e-11
+      ],
+      "color": "#77a31e"
+     }
+    },
+    "MMDCOUV": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       548300000000000.0,
+       548300000000000.0
+      ],
+      "flux": [
+       2.551e-11,
+       3.297e-11
+      ],
+      "err_flux": [
+       1.194e-12,
+       1.338e-12
+      ],
+      "color": "#67a61e"
+     }
+    }
+   },
+   "ultraviolet": {
+    "GALEX": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       1295000000000000.0,
+       1948000000000000.0
+      ],
+      "flux": [
+       1.927e-11,
+       1.863e-11
+      ],
+      "err_flux": [
+       5.15e-13,
+       7.6e-13
+      ],
+      "color": "#1ead27"
+     }
+    },
+    "XMMOM": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       1414000000000000.0
+      ],
+      "flux": [
+       1.584e-11
+      ],
+      "err_flux": [
+       1.19e-12
+      ],
+      "color": "#1eac53"
+     }
+    }
+   },
+   "x_rays": {
+    "4XMM-DR14": {
+     "UL": {
+      "freq": [
+       1.813e+17,
+       3.627e+17
+      ],
+      "flux": [
+       1.359e-10,
+       1.444e-10
+      ],
+      "err_flux": [
+       0.0,
+       0.0
+      ],
+      "color": "#1fab68"
+     },
+     "Other": {
+      "freq": [
+       7.253e+16,
+       2.418e+17
+      ],
+      "flux": [
+       1.637e-10,
+       1.103e-10
+      ],
+      "err_flux": [
+       1e-13,
+       5e-14
+      ],
+      "color": "#1fab68"
+     }
+    },
+    "OUSXB": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       1.209e+17,
+       1.209e+17
+      ],
+      "flux": [
+       4.822e-11,
+       4.806e-11
+      ],
+      "err_flux": [
+       1.02e-12,
+       2.7e-12
+      ],
+      "color": "#1faa76"
+     }
+    },
+    "2SXPS": {
+     "UL": {
+      "freq": [],
+      "flux": [],
+      "err_flux": [],
+      "color": null
+     },
+     "Other": {
+      "freq": [
+       1.209e+17,
+       3.627e+17
+      ],
+      "flux": [
+       1.085e-10,
+       1.287e-10
+      ],
+      "err_flux": [
+       6e-13,
+       6e-13
+      ],
+      "color": "#20a980"
+     }
+    }
+   },
+   "gamma_rays": {
+    "4FGL-DR3": {
+     "UL": {
+      "freq": [
+       1.813e+22
+      ],
+      "flux": [
+       8.834e-12
+      ],
+      "err_flux": [
+       0.0
+      ],
+      "color": "#23a4bd"
+     },
+     "Other": {
+      "freq": [
+       4.835e+22,
+       1.451e+23
+      ],
+      "flux": [
+       7.187e-12,
+       1.023e-11
+      ],
+      "err_flux": [
+       8.85e-13,
+       2.97e-13
+      ],
+      "color": "#23a4bd"
+     }
+    },
+    "4FGL-DR4": {
+     "UL": {
+      "freq": [
+       1.813e+22
+      ],
+      "flux": [
+       1.439e-11
+      ],
+      "err_flux": [
+       0.0
+      ],
+      "color": "#23a3c5"
+     },
+     "Other": {
+      "freq": [
+       4.835e+22,
+       1.451e+23
+      ],
+      "flux": [
+       6.083e-12,
+       9.849e-12
+      ],
+      "err_flux": [
+       9.38e-13,
+       2.79e-13
+      ],
+      "color": "#23a3c5"
+     }
+    },
+    "MMDCGR": {
+     "UL": {
+      "freq": [
+       8.325e+24,
+       8.508e+24
+      ],
+      "flux": [
+       2.691e-11,
+       3.775e-11
+      ],
+      "err_flux": [
+       0.0,
+       0.0
+      ],
+      "color": "#24a1ce"
+     },
+     "Other": {
+      "freq": [
+       4.21e+22,
+       4.227e+22
+      ],
+      "flux": [
+       2.208e-11,
+       4.318e-11
+      ],
+      "err_flux": [
+       5.201e-12,
+       8.114e-12
+      ],
+      "color": "#24a1ce"
+     }
+    }
+   }
+  },
+  "min_max": {
+   "freq": [
+    15000000.0,
+    4.8359999999999996e+26
+   ],
+   "flux": [
+    3.006e-17,
+    3.442e-09
+   ],
+   "err_flux": [
+    0,
+    0
+   ],
+   "color": "#FFFFFF"
+  }
+ }
+}

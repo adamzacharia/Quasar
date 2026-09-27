@@ -1,15 +1,16 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useChatStore } from "../lib/store";
 import { useAuthStore } from "../lib/auth-store";
+import { useThemeStore } from "../lib/theme-store";
 import {
-    Plus, MessageSquare, History, Bookmark, Settings, HelpCircle,
+    Plus, MessageSquare, Bookmark, Settings, HelpCircle,
     X, ExternalLink, Github, BookOpen, Search,
-    Telescope, FileText, Zap, Check, LogOut, User as UserIcon, Trash2,
-    Database, RefreshCw
+    Check, LogOut, User as UserIcon, Trash2,
+    Database, RefreshCw, Sparkles, Star, ChevronDown, MoreHorizontal, Sun, Moon
 } from "lucide-react";
 import { SettingsModal } from "./SettingsModal";
 import { ModelDropdown } from "./ModelDropdown";
@@ -43,13 +44,13 @@ function OverlayPanel({ open, onClose, title, icon: Icon, children }: {
     return (
         <div className="absolute inset-0 z-50 flex flex-col glass-sidebar animate-in fade-in slide-in-from-left-2 duration-200">
             {/* Header */}
-            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700/50">
-                <div className="flex items-center gap-2.5">
-                    <Icon className="w-5 h-5 text-primary" />
-                    <h2 className="text-sm font-semibold text-white">{title}</h2>
+            <div className="flex h-[66px] shrink-0 items-center justify-between px-4 border-b border-[var(--q-border)]">
+                <div className="flex items-center gap-2">
+                    <Icon className="size-4 text-[var(--q-text-muted)]" />
+                    <h2 className="text-[15px] font-medium text-[var(--q-text)]">{title}</h2>
                 </div>
-                <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-700/50 hover:text-white transition-colors">
-                    <X className="w-4 h-4" />
+                <button onClick={onClose} aria-label="Close panel" className="flex size-8 items-center justify-center rounded-full text-[var(--q-text-muted)] hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)] transition-colors">
+                    <X className="size-4" strokeWidth={1.75} />
                 </button>
             </div>
             {/* Body */}
@@ -204,6 +205,9 @@ function jobStatusChip(status: string): string {
     }
 }
 
+/** Job states that still hold server resources (can be cancelled). */
+const ACTIVE_JOB_STATUSES = ["queued", "running", "submitted"];
+
 function DatalabJobsContent() {
     const [jobs, setJobs] = useState<DatalabJobRecord[]>([]);
     const [loading, setLoading] = useState(true);
@@ -253,7 +257,7 @@ function DatalabJobsContent() {
                 </button>
             </div>
             {jobs.map((job) => {
-                const active = ["queued", "running", "submitted"].includes(job.status);
+                const active = ACTIVE_JOB_STATUSES.includes(job.status);
                 return (
                     <div key={job.job_id} className="glass-control rounded-xl p-3 space-y-1.5">
                         <div className="flex items-center justify-between gap-2">
@@ -366,6 +370,35 @@ function DataLabPanelContent() {
 }
 
 /* ────────────────────────────────────────────
+   HISTORY HELPERS — date buckets + letter tints
+   ──────────────────────────────────────────── */
+const HISTORY_GROUPS = ["Today", "Yesterday", "Previous 7 days", "Older"] as const;
+type HistoryGroup = typeof HISTORY_GROUPS[number];
+
+function historyGroup(date: Date, now: Date): HistoryGroup {
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const t = date.getTime();
+    const day = 24 * 60 * 60 * 1000;
+    if (t >= startOfToday) return "Today";
+    if (t >= startOfToday - day) return "Yesterday";
+    if (t >= startOfToday - 7 * day) return "Previous 7 days";
+    return "Older";
+}
+
+/** Soft 10% tints for starred-chat letter avatars, stable per conversation id. */
+function letterTint(id: string, isDark: boolean): string {
+    const tints = isDark
+        ? ["bg-[var(--q-accent-soft)] text-primary", "bg-amber-500/10 text-amber-300", "bg-emerald-500/10 text-emerald-300"]
+        : ["bg-[var(--q-accent-soft)] text-primary", "bg-amber-500/10 text-amber-600", "bg-emerald-500/10 text-emerald-600"];
+    let sum = 0;
+    for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
+    return tints[sum % tints.length];
+}
+
+/** Row entrance stagger (30ms), capped so a long history does not trickle in. */
+const riseDelay = (i: number) => ({ animationDelay: `${Math.min(i, 14) * 30}ms` });
+
+/* ────────────────────────────────────────────
    MAIN SIDEBAR
    ──────────────────────────────────────────── */
 interface SidebarProps {
@@ -386,6 +419,8 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
     } = useChatStore();
 
     const { user, logout, isAuthenticated, openAuthModal } = useAuthStore();
+    const { theme, toggle: toggleTheme } = useThemeStore();
+    const isDark = theme === "dark";
     const pathname = usePathname();
     const router = useRouter();
 
@@ -408,9 +443,88 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
     const [query, setQuery] = useState("");
 
     const isDrawer = variant === "drawer";
+    // The filter field hides behind the header's search icon; the drawer opens
+    // with it showing, since there the recents list is the way back in.
+    const [searchOpen, setSearchOpen] = useState(isDrawer);
+    const [closedGroups, setClosedGroups] = useState<Partial<Record<HistoryGroup, boolean>>>({});
+
+    // Account popover (rail avatar). Fixed-positioned so it escapes the
+    // overflow-hidden sidebar wrapper, even when only the rail is showing.
+    const accountBtnRef = useRef<HTMLButtonElement>(null);
+    const accountPopRef = useRef<HTMLDivElement>(null);
+    const [accountPos, setAccountPos] = useState<{ left: number; bottom: number } | null>(null);
+    useEffect(() => {
+        if (!accountPos) return;
+        const onDown = (e: MouseEvent) => {
+            const target = e.target as Node;
+            if (accountPopRef.current?.contains(target) || accountBtnRef.current?.contains(target)) return;
+            setAccountPos(null);
+        };
+        const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setAccountPos(null); };
+        document.addEventListener("mousedown", onDown);
+        document.addEventListener("keydown", onKey);
+        return () => {
+            document.removeEventListener("mousedown", onDown);
+            document.removeEventListener("keydown", onKey);
+        };
+    }, [accountPos]);
+    const toggleAccount = () => {
+        if (accountPos) { setAccountPos(null); return; }
+        const btn = accountBtnRef.current;
+        const r = btn?.getBoundingClientRect();
+        // Anchor to the rail's right edge so the card clears the rail.
+        const railRight = btn?.closest("nav")?.getBoundingClientRect().right ?? r?.right ?? 0;
+        if (r) setAccountPos({ left: railRight + 8, bottom: window.innerHeight - r.bottom });
+    };
+
+    // The Data Lab entry only appears once the user has something there (a
+    // background job or a saved table); most users never do. Re-checked when a
+    // chat turn ends (that is when a job gets submitted), and every few
+    // seconds while a job is still running so the badge clears on its own.
+    const isStreaming = useChatStore((s) => s.isStreaming);
+    const [dataLab, setDataLab] = useState({ jobs: 0, running: 0, tables: 0 });
+    useEffect(() => {
+        if (!isAuthenticated) return;
+        let stopped = false;
+        const check = async () => {
+            try {
+                const [jobs, tables] = await Promise.all([listDatalabJobs(), listMyTables()]);
+                if (stopped) return;
+                setDataLab({
+                    jobs: jobs.length,
+                    running: jobs.filter((j) => ACTIVE_JOB_STATUSES.includes(j.status)).length,
+                    tables: tables.length,
+                });
+            } catch { /* backend offline: keep the last state */ }
+        };
+        check();
+        const timer = setInterval(check, dataLab.running > 0 ? 5000 : 60000);
+        return () => { stopped = true; clearInterval(timer); };
+    }, [isAuthenticated, isStreaming, dataLab.running]);
+    const showDataLab = isAuthenticated && (dataLab.jobs > 0 || dataLab.tables > 0 || activePanel === "datalab");
 
     const togglePanel = (panel: "papers" | "datalab") => {
         setActivePanel((prev) => (prev === panel ? null : panel));
+    };
+
+    // Rail version: from the collapsed rail there is no panel to slide the
+    // overlay over, so open the sidebar with that overlay already showing.
+    const openRailPanel = (panel: "papers" | "datalab") => {
+        if (collapsed) {
+            setActivePanel(panel);
+            onToggle?.();
+        } else {
+            togglePanel(panel);
+        }
+    };
+
+    const handleChatRail = () => {
+        setActivePanel(null);
+        if (collapsed) onToggle?.();
+        if (pathname !== "/") {
+            router.push("/");
+            onClose?.();
+        }
     };
 
     const handleSelectConversation = (convId: string) => {
@@ -443,6 +557,22 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
         ? conversations.filter((c) => c.title.toLowerCase().includes(query.trim().toLowerCase()))
         : conversations;
 
+    // Starred chats get their own section; the rest bucket by last activity.
+    const starred = visibleConversations.filter((c) => c.isStarred);
+    const now = new Date();
+    const buckets = HISTORY_GROUPS
+        .map((group) => ({
+            group,
+            items: visibleConversations.filter((c) =>
+                !c.isStarred && historyGroup(new Date(c.updatedAt ?? c.createdAt), now) === group),
+        }))
+        .filter((g) => g.items.length > 0);
+    // First stagger index of each bucket, so rows rise in one continuous wave.
+    const grouped = buckets.map((g, gi) => ({
+        ...g,
+        start: starred.length + buckets.slice(0, gi).reduce((n, prev) => n + prev.items.length, 0),
+    }));
+
     // Get user initials from display name, or fallback to username initials
     const initials = user?.display_name
         ? user.display_name.split(' ').filter(Boolean).map((n: string) => n[0]).join('').substring(0, 2).toUpperCase()
@@ -450,258 +580,327 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             ? user.username.substring(0, 2).toUpperCase()
             : "U";
 
-    if (collapsed) {
-        return (
-            <aside className="relative w-[var(--q-sidebar-rail-width)] glass-sidebar border-r border-slate-700/50 flex flex-col items-center h-full shrink-0 overflow-hidden py-3">
+    const avatar = (size: string) => user?.picture_url ? (
+        <img src={user.picture_url} alt="" className={`${size} rounded-full object-cover`} referrerPolicy="no-referrer" />
+    ) : (
+        <span className={`${size} flex items-center justify-center rounded-full border border-[var(--q-border)] bg-[var(--q-card)] text-[12px] font-semibold text-[var(--q-text)]`}>
+            {initials}
+        </span>
+    );
+
+    const railIcon = "size-[18px]";
+
+    /* ── RAIL — always visible on desktop, also inside the phone drawer ── */
+    const rail = (
+        <nav
+            aria-label="Primary"
+            className={`flex h-full w-[var(--q-sidebar-rail-width)] shrink-0 flex-col items-center bg-[var(--q-rail)] py-3 ${collapsed ? "border-r border-[var(--q-border)]" : ""}`}
+        >
+            {collapsed ? (
                 <button
                     type="button"
                     onClick={onToggle}
-                    className="mb-5 flex size-11 items-center justify-center rounded-xl transition-colors hover:bg-white/10"
+                    className="mb-4 flex size-[42px] items-center justify-center rounded-full border border-[var(--q-border)] bg-[var(--q-card)] transition-colors hover:border-[var(--q-border-strong)]"
                     title="Expand sidebar"
                     aria-label="Expand sidebar"
                 >
-                    <img src="/quasar_logo.png" alt="" className="size-8 object-contain" />
+                    <img src="/quasar_logo.png" alt="" className="size-[30px] object-contain" />
                 </button>
+            ) : (
+                <Link href="/" onClick={onClose} className="mb-4 flex size-[42px] items-center justify-center rounded-full border border-[var(--q-border)] bg-[var(--q-card)]" title="Quasar" aria-label="Quasar home">
+                    <img src="/quasar_logo.png" alt="Quasar" className="size-[30px] object-contain" />
+                </Link>
+            )}
 
-                <div className="flex flex-col items-center gap-2">
-                    <button onClick={handleNewChat} className="sidebar-rail-button text-primary" title="New chat" aria-label="New chat">
-                        <Plus className="w-5 h-5" />
-                    </button>
-                    <button type="button" onClick={onToggle} className="sidebar-rail-button" title="Search and history" aria-label="Search and history">
-                        <Search className="w-5 h-5" />
-                    </button>
-                    <button type="button" onClick={onToggle} className="sidebar-rail-button" title="Recent chats" aria-label="Recent chats">
-                        <MessageSquare className="w-5 h-5" />
-                    </button>
-                    <Link
-                        href="/gallery"
-                        className={`sidebar-rail-button ${pathname === "/gallery" ? "text-primary bg-primary/10" : ""}`}
-                        title="Recipe Gallery"
-                        aria-label="Recipe Gallery"
-                    >
-                        <BookOpen className="w-5 h-5" />
-                    </Link>
-                </div>
-
-                <div className="mt-auto flex flex-col items-center gap-2">
-                    <Link
-                        href="/help"
-                        className={`sidebar-rail-button ${pathname === "/help" ? "text-primary bg-primary/10" : ""}`}
-                        title="Help and docs"
-                        aria-label="Help and docs"
-                    >
-                        <HelpCircle className="w-5 h-5" />
-                    </Link>
-                    <button type="button" onClick={() => setSettingsOpen(true)} className="sidebar-rail-button" title="Settings" aria-label="Settings">
-                        <Settings className="w-5 h-5" />
-                    </button>
-                    {isAuthenticated ? (
-                        <button type="button" onClick={onToggle} className="mt-2 rounded-full" title={user?.display_name || user?.username || "Account"} aria-label="Account">
-                            {user?.picture_url ? (
-                                <img src={user.picture_url} alt="" className="size-9 rounded-full object-cover shadow-md" referrerPolicy="no-referrer" />
-                            ) : (
-                                <span className="flex size-9 items-center justify-center rounded-full bg-gradient-to-tr from-[#818cf8] to-[#c77dff] text-on-accent text-xs font-bold shadow-md">
-                                    {initials}
+            <div className="flex flex-col items-center gap-2">
+                <button type="button" onClick={handleChatRail} className="q-rail-btn"
+                    data-active={pathname === "/" && !activePanel ? "true" : undefined}
+                    title="Chat" aria-label="Chat">
+                    <MessageSquare className={railIcon} strokeWidth={1.75} />
+                </button>
+                <Link href="/gallery" onClick={onClose} className="q-rail-btn"
+                    data-active={pathname === "/gallery" ? "true" : undefined}
+                    title="Recipe Gallery" aria-label="Recipe Gallery">
+                    <BookOpen className={railIcon} strokeWidth={1.75} />
+                </Link>
+                <button type="button" onClick={() => openRailPanel("papers")} className="q-rail-btn"
+                    data-active={activePanel === "papers" ? "true" : undefined}
+                    title="Saved Papers" aria-label="Saved Papers">
+                    <Bookmark className={railIcon} strokeWidth={1.75} />
+                </button>
+                {/* Data Lab shows only once the user has a job or a saved table. */}
+                {showDataLab && (
+                    <button type="button" onClick={() => openRailPanel("datalab")} className="q-rail-btn"
+                        data-active={activePanel === "datalab" ? "true" : undefined}
+                        title={dataLab.running > 0
+                            ? `Data Lab: ${dataLab.running} job${dataLab.running === 1 ? "" : "s"} running`
+                            : "Data Lab jobs & saved tables"}
+                        aria-label="Data Lab">
+                        <span className="relative">
+                            <Database className={railIcon} strokeWidth={1.75} />
+                            {dataLab.running > 0 && (
+                                <span className="absolute -right-1 -top-1 flex h-2 w-2" aria-hidden="true">
+                                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60 motion-reduce:hidden" />
+                                    <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
                                 </span>
                             )}
-                        </button>
-                    ) : (
-                        <button type="button" onClick={openAuthModal} className="sidebar-rail-button mt-2" title="Sign in" aria-label="Sign in">
-                            <UserIcon className="w-5 h-5" />
-                        </button>
-                    )}
-                </div>
-
-                <SettingsModal open={settingsOpen} initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(undefined); }} />
-            </aside>
-        );
-    }
-    return (
-        <aside className={`relative flex flex-col h-full overflow-hidden ${isDrawer
-            ? "w-full glass-drawer"
-            : "w-[var(--q-sidebar-width)] glass-sidebar border-r border-slate-700/50 shrink-0"}`}>
-            {/* Collapse is handled by the single toggle in the chat header (ChatArea)
-                — no duplicate button here. The drawer gets its own close button,
-                since on a phone there is no chat header behind it to reach. */}
-            {/* Logo */}
-            {isDrawer ? (
-                <div className="flex items-center gap-[11px] px-4 py-3">
-                    <img src="/quasar_logo.png" alt="" className="size-[38px] shrink-0 object-contain" />
-                    <Link href="/" onClick={onClose} className="flex flex-1 flex-col min-w-0">
-                        <h1 className="text-[15.5px] font-bold tracking-[-0.01em]" style={{ color: "var(--q-text)" }}>QUASAR</h1>
-                        <span className="text-[10.5px]" style={{ color: "var(--q-text-secondary)" }}>Research Assistant</span>
-                    </Link>
-                    <button
-                        type="button"
-                        onClick={onClose}
-                        aria-label="Close navigation"
-                        className="glass-control flex size-[32px] shrink-0 items-center justify-center rounded-full"
-                        style={{ color: "var(--q-text-secondary)" }}
-                    >
-                        <X className="size-[13px]" strokeWidth={1.9} />
+                        </span>
                     </button>
-                </div>
-            ) : (
-                <Link href="/" className="p-6 flex items-center gap-3">
-                    <img src="/quasar_logo.png" alt="Quasar" className="size-[60px] object-contain" />
-                    <div className="flex flex-col">
-                        <h1 className="text-lg font-bold tracking-tight text-white">QUASAR</h1>
-                        <span className="text-xs text-slate-400 font-medium">Research Assistant</span>
-                    </div>
+                )}
+                <Link href="/help" onClick={onClose} className="q-rail-btn"
+                    data-active={pathname === "/help" ? "true" : undefined}
+                    title="Help and docs" aria-label="Help and docs">
+                    <HelpCircle className={railIcon} strokeWidth={1.75} />
                 </Link>
-            )}
+            </div>
 
-            {/* New Chat */}
-            <div className={isDrawer ? "px-3.5 mb-2.5" : "px-4 mb-6"}>
-                <button onClick={handleNewChat}
-                    className={`w-full flex items-center justify-center gap-2 font-semibold px-4 group ${isDrawer
-                        ? "btn-accent py-2.5 rounded-[13px] text-[13.5px] shadow-[0_10px_24px_rgba(147,51,234,0.45)]"
-                        : "btn-new-chat py-3 rounded-xl"}`}>
-                    <Plus className={`${isDrawer ? "size-[17px]" : "w-5 h-5"} transition-transform group-hover:rotate-90`} />
-                    <span>New Chat</span>
+            <div className="mt-auto flex flex-col items-center gap-2">
+                <button type="button" onClick={toggleTheme} className="q-rail-btn"
+                    title={isDark ? "Switch to light theme" : "Switch to dark theme"}
+                    aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}>
+                    {isDark ? <Moon className={railIcon} strokeWidth={1.75} /> : <Sun className={railIcon} strokeWidth={1.75} />}
                 </button>
-            </div>
-
-            {/* Conversation filter — drawer only, where the recents list is the
-                primary way back into a session. */}
-            {isDrawer && (
-                <div className="px-3.5 mb-2.5">
-                    <label className="glass-control flex items-center gap-2.5 rounded-[11px] px-3 py-2">
-                        <Search className="size-[14px] shrink-0" style={{ color: "var(--q-text-muted)" }} />
-                        <input
-                            type="text"
-                            value={query}
-                            onChange={(e) => setQuery(e.target.value)}
-                            placeholder="Search research…"
-                            aria-label="Search research"
-                            className="w-full min-w-0 bg-transparent border-none outline-none text-xs placeholder:text-[var(--q-text-muted)]"
-                        />
-                    </label>
-                </div>
-            )}
-
-            <div className={`${isDrawer ? "px-3.5 mb-3" : "px-4 mb-4"} space-y-1`}>
-                <Link href="/gallery" onClick={onClose}
-                    className={`w-full flex items-center gap-3 rounded-xl transition-colors ${isDrawer ? "px-3 py-2.5 text-[12.5px] font-medium" : "px-3 py-2.5 text-sm"} ${pathname === "/gallery" ? "bg-indigo-400/15 text-indigo-300 border border-indigo-400/30" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                    <BookOpen className={isDrawer ? "size-[15px]" : "w-4 h-4"} />
-                    Recipe Gallery
-                </Link>
-            </div>
-
-            {/* Conversation History */}
-            <div className="flex-1 overflow-y-auto px-3 space-y-1">
-                {visibleConversations.length > 0 ? (
-                    <>
-                        <div className="px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">Recent Research</div>
-                        {visibleConversations.map((conv) => {
-                            const isActive = conv.id === activeConversationId;
-                            return (
-                                <div key={conv.id} className="relative group/item">
-                                    <button onClick={() => handleSelectConversation(conv.id)}
-                                        className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-all text-left ${isActive ? "glass-active text-white" : "text-slate-300 hover:bg-white/10 group"}`}>
-                                        {isActive ? <MessageSquare className="w-5 h-5 text-primary shrink-0" /> : <History className="w-5 h-5 text-slate-400 group-hover:text-primary transition-colors shrink-0" />}
-                                        <div className="flex flex-col overflow-hidden flex-1">
-                                            <span className="text-sm font-medium truncate">{conv.title}</span>
-                                            <span className="text-[10px] text-slate-500">{timeAgo(conv.updatedAt)}</span>
-                                        </div>
-                                    </button>
-                                    {/* Delete button — visible on hover, always visible when active */}
-                                    <button
-                                        onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
-                                        onClick={(e) => handleDeleteConversation(e, conv.id)}
-                                        title="Delete conversation"
-                                        className={`absolute right-1 top-1/2 -translate-y-1/2 p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-all ${isActive ? "opacity-70" : "opacity-0"} group-hover/item:opacity-100`}
-                                    >
-                                        <Trash2 className="w-4 h-4" />
-                                    </button>
-                                </div>
-                            );
-                        })}
-                    </>
-                ) : query.trim() ? (
-                    <div className="px-3 py-8 text-center">
-                        <p className="text-sm text-slate-500">No matches for “{query.trim()}”.</p>
-                    </div>
+                <button type="button" onClick={() => setSettingsOpen(true)} className="q-rail-btn" title="Settings" aria-label="Settings">
+                    <Settings className={railIcon} strokeWidth={1.75} />
+                </button>
+                {isAuthenticated ? (
+                    <button
+                        ref={accountBtnRef}
+                        type="button"
+                        onClick={toggleAccount}
+                        className="relative mt-1 rounded-full"
+                        title={user?.display_name || user?.username || "Account"}
+                        aria-label="Account"
+                        aria-haspopup="menu"
+                        aria-expanded={!!accountPos}
+                    >
+                        {avatar("size-9")}
+                        <span className="absolute right-0 top-0 size-2.5 rounded-full border-2 border-[var(--q-rail)] bg-emerald-500" aria-hidden="true" />
+                    </button>
                 ) : (
-                    <div className="px-3 py-8 text-center">
-                        <p className="text-sm text-slate-500">No conversations yet.</p>
-                        <p className="text-xs text-slate-600 mt-1">Start a new chat to begin!</p>
-                    </div>
+                    <button type="button" onClick={openAuthModal} className="q-rail-btn mt-1" title="Sign in" aria-label="Sign in">
+                        <UserIcon className={railIcon} strokeWidth={1.75} />
+                    </button>
                 )}
             </div>
+        </nav>
+    );
 
-            {/* Bottom Controls — compact, so Recent Research keeps its room */}
-            <div className="p-3 border-t border-slate-700/50 space-y-2.5">
-                {/* Model Dropdown */}
-                <ModelDropdown
-                    selectedModel={selectedModel}
-                    onSelect={setSelectedModel}
-                    onAddProviderKey={() => { setSettingsTab("providerKeys"); setSettingsOpen(true); }}
-                />
-
-                {/* Compact action row: Saved · Data Lab · Settings · Help */}
-                <div className="flex gap-1.5">
-                    <button onClick={() => togglePanel("papers")}
-                        title="Saved Papers"
-                        className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${activePanel === "papers" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                        <Bookmark className="w-4 h-4 shrink-0" />Saved
-                    </button>
-                    <button onClick={() => togglePanel("datalab")}
-                        title="Data Lab jobs & saved tables"
-                        className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${activePanel === "datalab" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                        <Database className="w-4 h-4 shrink-0" />Data Lab
-                    </button>
-                    <button onClick={() => setSettingsOpen(true)}
-                        title="Settings"
-                        className="flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs text-slate-400 hover:bg-white/10 hover:text-white">
-                        <Settings className="w-4 h-4 shrink-0" />Settings
-                    </button>
-                    <Link href="/help" onClick={onClose}
-                        title="Help & Docs"
-                        className={`flex-1 flex items-center justify-center gap-1.5 px-1 py-2 rounded-lg transition-colors text-xs ${pathname === "/help" ? "bg-primary/10 text-primary" : "text-slate-400 hover:bg-white/10 hover:text-white"}`}>
-                        <HelpCircle className="w-4 h-4 shrink-0" />Help
-                    </Link>
-                </div>
-
-                {/* User / Sign-in (Log Out folded into this row when signed in) */}
-                <div className="pt-2.5 border-t border-slate-700/50">
-                    {isAuthenticated ? (
-                        <div className="flex items-center gap-3 px-1">
-                            {user?.picture_url ? (
-                                <img src={user.picture_url} alt={user.display_name || "User"} className="size-8 rounded-full object-cover shadow-md" referrerPolicy="no-referrer" />
-                            ) : (
-                                <div className="size-8 rounded-full bg-gradient-to-tr from-[#818cf8] to-[#c77dff] flex items-center justify-center text-on-accent text-xs font-bold shadow-md">
-                                    {initials}
-                                </div>
-                            )}
-                            <div className="flex flex-col flex-1 overflow-hidden">
-                                <span className="text-sm font-semibold text-white truncate">{user?.display_name || user?.username || "User"}</span>
-                                <span className="text-[10px] text-slate-400 truncate">{user?.username || ""}</span>
-                            </div>
-                            <button onClick={logout} title="Log out"
-                                className="shrink-0 p-1.5 rounded-lg text-red-500/70 hover:bg-red-500/10 hover:text-red-500 transition-colors">
-                                <LogOut className="w-4 h-4" />
-                            </button>
-                        </div>
-                    ) : (
-                        <button
-                            onClick={openAuthModal}
-                            className="glass-control w-full text-[var(--q-text)] font-medium text-sm py-2.5 px-4 rounded-xl transition-all flex items-center justify-center gap-2"
-                        >
-                            <UserIcon className="w-4 h-4" />
-                            Sign In / Sign Up
-                        </button>
+    /* ── HISTORY ROW — shared by Starred and the date groups ── */
+    const historyRow = (conv: typeof conversations[number], index: number, starredRow: boolean) => {
+        const isActive = conv.id === activeConversationId;
+        return (
+            <div key={conv.id} className="q-rise relative group/item" style={riseDelay(index)}>
+                <button onClick={() => handleSelectConversation(conv.id)}
+                    title={conv.title}
+                    className={`flex w-full items-center gap-2.5 rounded-xl border text-left text-[13px] transition-colors ${starredRow ? "px-2 py-1.5" : "px-2.5 py-1.5"} ${isActive
+                        ? "border-[var(--q-border)] bg-[var(--q-card)] text-[var(--q-text)]"
+                        : "border-transparent text-[var(--q-text-secondary)] hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)]"}`}>
+                    {starredRow && (
+                        <span className={`q-letter ${letterTint(conv.id, isDark)}`} aria-hidden="true">
+                            {(conv.title.trim()[0] || "?").toUpperCase()}
+                        </span>
                     )}
-                </div>
+                    <span className="min-w-0 flex-1 truncate pr-6">{conv.title}</span>
+                </button>
+                {/* "…" at rest on starred rows; hovering any row swaps in delete. */}
+                {starredRow && (
+                    <MoreHorizontal aria-hidden="true"
+                        className="pointer-events-none absolute right-2.5 top-1/2 size-4 -translate-y-1/2 text-[var(--q-text-faint)] transition-opacity group-hover/item:opacity-0" />
+                )}
+                <button
+                    onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                    onClick={(e) => handleDeleteConversation(e, conv.id)}
+                    title="Delete conversation"
+                    aria-label="Delete conversation"
+                    className={`absolute right-1.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-[var(--q-text-faint)] transition-opacity hover:bg-red-500/10 hover:text-red-500 ${isActive && !starredRow ? "opacity-70" : "opacity-0"} group-hover/item:opacity-100 focus-visible:opacity-100`}
+                >
+                    <Trash2 className="size-3.5" strokeWidth={1.75} />
+                </button>
             </div>
+        );
+    };
 
-            {/* ── OVERLAY PANELS ── */}
-            <OverlayPanel open={activePanel === "papers"} onClose={() => setActivePanel(null)} title="Saved Papers" icon={Bookmark}>
-                <SavedPapersContent />
-            </OverlayPanel>
-            <OverlayPanel open={activePanel === "datalab"} onClose={() => setActivePanel(null)} title="Data Lab" icon={Database}>
-                <DataLabPanelContent />
-            </OverlayPanel>
+    return (
+        <aside className={`relative flex h-full overflow-hidden ${isDrawer
+            ? "w-full glass-drawer"
+            : collapsed
+                ? "w-[var(--q-sidebar-rail-width)] shrink-0"
+                : "w-[calc(var(--q-sidebar-rail-width)+var(--q-sidebar-width))] shrink-0"}`}>
+            {rail}
+
+            {/* ── PANEL — title, New Chat, Starred, history, model card.
+                Collapse is handled by the single toggle in the chat header
+                (ChatArea); the drawer gets its own close button, since on a
+                phone there is no chat header behind it to reach. ── */}
+            {!collapsed && (
+                <div className={`relative flex min-w-0 flex-col bg-[var(--q-bg)] ${isDrawer
+                    ? "flex-1"
+                    : "w-[var(--q-sidebar-width)] shrink-0 border-r border-[var(--q-border)]"}`}>
+                    {/* Header */}
+                    <div className="flex h-[66px] shrink-0 items-center gap-1 px-4">
+                        <h2 className="flex-1 text-[15px] font-medium text-[var(--q-text)]">Chat</h2>
+                        <button
+                            type="button"
+                            onClick={() => setSearchOpen((v) => !v)}
+                            className="flex size-8 items-center justify-center rounded-full text-[var(--q-text-muted)] transition-colors hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)]"
+                            title="Search research"
+                            aria-label="Search research"
+                            aria-expanded={searchOpen}
+                        >
+                            <Search className="size-4" strokeWidth={1.75} />
+                        </button>
+                        {isDrawer && (
+                            <button
+                                type="button"
+                                onClick={onClose}
+                                aria-label="Close navigation"
+                                className="flex size-8 items-center justify-center rounded-full text-[var(--q-text-muted)] transition-colors hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)]"
+                            >
+                                <X className="size-4" strokeWidth={1.75} />
+                            </button>
+                        )}
+                    </div>
+
+                    {/* New Chat */}
+                    <div className="shrink-0 px-3">
+                        <button onClick={handleNewChat} className="q-pill-ink h-10 w-full px-4 text-[13px]">
+                            <Plus className="size-4" strokeWidth={1.75} />
+                            <span>New Chat</span>
+                            <Sparkles className="size-3.5" strokeWidth={1.75} />
+                        </button>
+                    </div>
+
+                    {/* Conversation filter */}
+                    {(searchOpen || query) && (
+                        <div className="shrink-0 px-3 pt-2.5">
+                            <label className="flex items-center gap-2 rounded-full border border-[var(--q-border)] bg-[var(--q-card)] px-3 py-1.5 focus-within:border-[var(--q-border-strong)]">
+                                <Search className="size-3.5 shrink-0 text-[var(--q-text-faint)]" strokeWidth={1.75} />
+                                <input
+                                    type="text"
+                                    value={query}
+                                    onChange={(e) => setQuery(e.target.value)}
+                                    onKeyDown={(e) => { if (e.key === "Escape" && !isDrawer) { setQuery(""); setSearchOpen(false); } }}
+                                    placeholder="Search research…"
+                                    aria-label="Search research"
+                                    autoFocus={!isDrawer}
+                                    className="w-full min-w-0 bg-transparent border-none outline-none text-[13px] text-[var(--q-text)] placeholder:text-[var(--q-text-faint)]"
+                                />
+                                {query && (
+                                    <button type="button" onClick={() => setQuery("")} aria-label="Clear search"
+                                        className="shrink-0 text-[var(--q-text-faint)] hover:text-[var(--q-text)]">
+                                        <X className="size-3.5" strokeWidth={1.75} />
+                                    </button>
+                                )}
+                            </label>
+                        </div>
+                    )}
+
+                    {/* Conversation History */}
+                    <div className="mt-3 flex-1 overflow-y-auto px-3 pb-3">
+                        {visibleConversations.length > 0 ? (
+                            <>
+                                {starred.length > 0 && (
+                                    <section className="mb-2 border-b border-[var(--q-border)] pb-3">
+                                        <div className="flex items-center gap-1.5 px-1 py-1.5 text-[13px] text-[var(--q-text-faint)]">
+                                            <Star className="size-3.5" strokeWidth={1.75} />
+                                            Starred
+                                        </div>
+                                        <div className="space-y-0.5">
+                                            {starred.map((conv, i) => historyRow(conv, i, true))}
+                                        </div>
+                                    </section>
+                                )}
+                                {grouped.map(({ group, items, start }) => {
+                                    const closed = !!closedGroups[group];
+                                    return (
+                                        <section key={group} className="mt-1">
+                                            <button
+                                                type="button"
+                                                onClick={() => setClosedGroups((prev) => ({ ...prev, [group]: !prev[group] }))}
+                                                aria-expanded={!closed}
+                                                className="flex w-full items-center justify-between rounded-lg px-1 py-1.5 text-[13px] text-[var(--q-text-faint)] transition-colors hover:text-[var(--q-text-muted)]"
+                                            >
+                                                {group}
+                                                <ChevronDown className={`size-3.5 transition-transform ${closed ? "-rotate-90" : ""}`} strokeWidth={1.75} />
+                                            </button>
+                                            {!closed && (
+                                                <div className="mb-1 space-y-0.5">
+                                                    {items.map((conv, i) => historyRow(conv, start + i, false))}
+                                                </div>
+                                            )}
+                                        </section>
+                                    );
+                                })}
+                            </>
+                        ) : query.trim() ? (
+                            <div className="px-3 py-8 text-center">
+                                <p className="text-[13px] text-[var(--q-text-muted)]">No matches for “{query.trim()}”.</p>
+                            </div>
+                        ) : (
+                            <div className="px-3 py-8 text-center">
+                                <p className="text-[13px] text-[var(--q-text-muted)]">No conversations yet.</p>
+                                <p className="mt-1 text-[12px] text-[var(--q-text-faint)]">Start a new chat to begin!</p>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Bottom card — model picker (plus sign-in while signed out) */}
+                    <div className="shrink-0 space-y-2 px-3 pb-3">
+                        {!isAuthenticated && (
+                            <button
+                                onClick={openAuthModal}
+                                className="q-pill h-9 w-full px-4 text-[13px]"
+                            >
+                                <UserIcon className="size-4" strokeWidth={1.75} />
+                                Sign In / Sign Up
+                            </button>
+                        )}
+                        <ModelDropdown
+                            selectedModel={selectedModel}
+                            onSelect={setSelectedModel}
+                            onAddProviderKey={() => { setSettingsTab("providerKeys"); setSettingsOpen(true); }}
+                        />
+                    </div>
+
+                    {/* ── OVERLAY PANELS ── */}
+                    <OverlayPanel open={activePanel === "papers"} onClose={() => setActivePanel(null)} title="Saved Papers" icon={Bookmark}>
+                        <SavedPapersContent />
+                    </OverlayPanel>
+                    <OverlayPanel open={activePanel === "datalab"} onClose={() => setActivePanel(null)} title="Data Lab" icon={Database}>
+                        <DataLabPanelContent />
+                    </OverlayPanel>
+                </div>
+            )}
+
+            {/* Account popover — name, username, Log out */}
+            {isAuthenticated && accountPos && (
+                <div
+                    ref={accountPopRef}
+                    role="menu"
+                    aria-label="Account"
+                    className="fixed z-[70] w-56 rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] p-1.5"
+                    style={{ left: accountPos.left, bottom: accountPos.bottom, boxShadow: "var(--q-popover-shadow)" }}
+                >
+                    <div className="flex items-center gap-2.5 px-2.5 py-2">
+                        {avatar("size-8")}
+                        <div className="flex min-w-0 flex-col">
+                            <span className="truncate text-[13px] font-medium text-[var(--q-text)]">{user?.display_name || user?.username || "User"}</span>
+                            <span className="truncate text-[12px] text-[var(--q-text-muted)]">{user?.username || ""}</span>
+                        </div>
+                    </div>
+                    <div className="my-1 h-px bg-[var(--q-border)]" />
+                    <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => { setAccountPos(null); logout(); }}
+                        className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[13px] text-[var(--q-text-secondary)] transition-colors hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)]"
+                    >
+                        <LogOut className="size-4 text-[var(--q-text-muted)]" strokeWidth={1.75} />
+                        Log out
+                    </button>
+                </div>
+            )}
 
             {/* Settings float modal — rendered outside sidebar via portal-like pattern */}
             <SettingsModal open={settingsOpen} initialTab={settingsTab} onClose={() => { setSettingsOpen(false); setSettingsTab(undefined); }} />

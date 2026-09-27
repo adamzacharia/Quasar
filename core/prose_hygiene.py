@@ -283,10 +283,85 @@ def _mark_label(label: str) -> str:
     return _LABEL_MARK + label if label.startswith("the ") else label
 
 
+# Result-payload field names the tools' answer guidance points the model at
+# (``fov_rationale``, ``rgb_mapping`` ...). The model copied them into answer
+# tables verbatim ("Coverage gap | None, coverage_gap: false"; ArchiveBench
+# AB-D-54, graded as an interface leak). Curated on purpose: catalogue column
+# names (dered_mag_r, gmag) legitimately describe a selection and stay.
+RESULT_FIELD_LABELS: Dict[str, str] = {
+    "coverage_gap": "coverage gap",
+    "archive_coverage_gap": "archive coverage gap",
+    "coverage_reason": "coverage note",
+    "coverage_summary": "coverage summary",
+    "fov_rationale": "field-of-view choice",
+    "rgb_mapping": "colour mapping",
+    "bands_found": "bands found",
+    "cuts_applied": "cuts applied",
+    "reported_count": "reported count",
+    "answer_guidance": "tool guidance",
+    "population_test": "population test",
+    "release_fallback": "release fallback",
+    "gaia_best_neighbour": "Gaia best-neighbour cross-match",
+    "n_left_with_match": "number of matched sources",
+    "n_right_with_match": "number of matched counterparts",
+    "fraction_left_matched": "matched fraction",
+    "python_code": "Python code",
+}
+_FIELD_BOOL_RE = re.compile(
+    r"(?<![\w.])(?:`)?(" + "|".join(map(re.escape, RESULT_FIELD_LABELS)) + r")(?:`)?\s*[:=]\s*(true|false|none|null)\b", re.I)
+_FIELD_NAME_RE = re.compile(r"(?<![\w.`])(" + "|".join(map(re.escape, RESULT_FIELD_LABELS)) + r")(?![\w`])")
+_API_PAREN_RE = re.compile(r"\s*\((?:make_lupton_rgb|astropy\.visualization\.make_lupton_rgb)\)")
+
+
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def split_fences(text: str) -> List[Tuple[bool, str]]:
+    """(is_fenced_code, segment) pieces, CommonMark-style: a fence closes only on
+    a line of the same character at least as long as the opener; an unclosed
+    fence runs to the end (guard CX-08 / CX-28: a ```` fence may contain ```)."""
+    out: List[Tuple[bool, str]] = []
+    buf: List[str] = []
+    fence: Optional[str] = None
+    for line in str(text or "").splitlines(keepends=True):
+        m = _FENCE_LINE_RE.match(line)
+        if fence is None:
+            if m:
+                if buf:
+                    out.append((False, "".join(buf)))
+                buf, fence = [line], m.group(1)
+            else:
+                buf.append(line)
+        else:
+            buf.append(line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line.strip()[len(m.group(1)):].strip():
+                out.append((True, "".join(buf)))
+                buf, fence = [], None
+    if buf:
+        out.append((fence is not None, "".join(buf)))
+    return out
+
+
+def _field_bool_sub(m: "re.Match[str]") -> str:
+    label = RESULT_FIELD_LABELS[m.group(1).lower()]
+    return f"no {label}" if m.group(2).lower() in ("false", "none", "null") else f"a {label}"
+
+
+def _humanize_result_fields(s: str) -> str:
+    """Field names from tool payloads -> words, in prose segments only."""
+    s = _FIELD_BOOL_RE.sub(_field_bool_sub, s)
+    s = _FIELD_NAME_RE.sub(lambda m: RESULT_FIELD_LABELS[m.group(1)], s)
+    return _API_PAREN_RE.sub("", s)
+
+
 def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: bool = True) -> str:
     """Rewrite ``text`` for the user (see module docstring). Code untouched."""
     if not text:
         return text or ""
+    # `coverage_gap`: false (inline code + boolean) reads "no coverage gap" too
+    # (guard CX-12). Fenced blocks are left alone; inline spans are handled here
+    # because the split below would separate the span from its value.
+    text = "".join(seg if fenced else _FIELD_BOOL_RE.sub(_field_bool_sub, seg) for fenced, seg in split_fences(text))
     rx = _identifier_regex(tool_names)
     names = {str(n).strip() for n in tool_names if n}
     pieces: List[str] = []
@@ -299,6 +374,9 @@ def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: boo
             m = re.fullmatch(r"`\s*(?:functions\.)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^()\n]*\))?\s*`", seg)
             if m and m.group(1) in names:
                 pieces.append(_mark_label(humanize_tool_name(m.group(1))))
+                continue
+            if m and m.group(1) in RESULT_FIELD_LABELS and "(" not in seg:
+                pieces.append(RESULT_FIELD_LABELS[m.group(1)])  # `fov_rationale` as a code span
                 continue
             # Protected: a placeholder through the global clean-ups below, so
             # `<br>` or `Client()` inside code is never rewritten (guard CX-25).
@@ -322,6 +400,7 @@ def humanize_prose(text: str, tool_names: Iterable[str], *, drop_json_dumps: boo
                 return blob
 
             s = _JSON_DUMP_RE.sub(_json_sub, s)
+        s = _humanize_result_fields(s)
         s = strip_image_placeholders(s)
         pieces.append(s)
     out = "".join(pieces)

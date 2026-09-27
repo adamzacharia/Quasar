@@ -136,6 +136,63 @@ export function splitCitedSources(sources = []) {
     return { cited, uncited };
 }
 
+function safeDecode(text) {
+    try {
+        return decodeURIComponent(text);
+    } catch {
+        return text;
+    }
+}
+
+function urlPathParts(url) {
+    try {
+        const u = new URL(url);
+        const path = safeDecode(u.pathname).replace(/\/+$/, "");
+        return { segs: path.split("/").filter(Boolean), query: safeDecode(u.search) };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Path hints, aligned with `sources`, that tell apart pages sharing a title
+ * ("" for a unique title). Each group gets the shortest path suffix (two
+ * segments or more) that differs across the group, so /2024/docs/guide and
+ * /2025/docs/guide show their years; the query string is added only when the
+ * paths are identical.
+ */
+export function distinctPathHints(sources = []) {
+    const list = sources || [];
+    const hints = list.map(() => "");
+    const groups = new Map();
+    list.forEach((s, i) => {
+        const title = String(s?.title || "").trim().toLowerCase();
+        if (!title) return;
+        if (!groups.has(title)) groups.set(title, []);
+        groups.get(title).push(i);
+    });
+    for (const idx of groups.values()) {
+        if (idx.length < 2) continue;
+        const parts = idx.map((i) => urlPathParts(list[i]?.url));
+        const domains = idx.map((i) => list[i]?.domain || domainOf(list[i]?.url));
+        const maxSegs = Math.max(0, ...parts.map((p) => (p ? p.segs.length : 0)));
+        const render = (p, k, withQuery) => {
+            if (!p) return "";
+            const path = p.segs.length && k > 0 ? "/" + p.segs.slice(-k).join("/") : "";
+            return path + (withQuery ? p.query : "");
+        };
+        const distinct = (labels) => new Set(labels.map((l, j) => `${domains[j]}${l}`)).size === labels.length;
+        let labels = null;
+        for (let k = Math.min(2, maxSegs); k <= maxSegs && !labels; k++) {
+            const candidate = parts.map((p) => render(p, k, false));
+            if (k > 0 && distinct(candidate)) labels = candidate;
+        }
+        if (!labels) labels = parts.map((p) => render(p, maxSegs, true));
+        idx.forEach((i, j) => { hints[i] = labels[j]; });
+    }
+    return hints;
+}
+
 /** The display number of a citation id ("W3" -> "3"). */
 export function citationLabel(id) {
     const m = /^W(\d+)$/i.exec(String(id || ""));

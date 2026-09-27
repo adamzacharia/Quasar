@@ -125,7 +125,7 @@ export function AuthModal() {
             <div className="absolute inset-0" onClick={isAuthenticated ? closeAuthModal : undefined} />
 
             {/* Modal Content */}
-            <div className="relative w-full max-w-[400px] glass-surface rounded-3xl p-8 animate-in zoom-in-95 duration-300">
+            <div className="relative w-full max-w-[400px] glass-surface rounded-3xl p-8 animate-in zoom-in-95 duration-300" style={{ boxShadow: "var(--q-popover-shadow)" }}>
                 {isAuthenticated && (
                     <button
                         onClick={closeAuthModal}
@@ -136,10 +136,10 @@ export function AuthModal() {
                 )}
 
                 <div className="text-center mb-6">
-                    <h2 className="text-2xl text-white font-[400] tracking-tight mb-2 font-serif">
-                        Sign in to QUASAR
+                    <h2 className="text-[22px] text-[var(--q-text)] font-medium tracking-tight mb-1.5">
+                        Sign in to Quasar
                     </h2>
-                    <p className="text-sm text-slate-400">
+                    <p className="text-[13px] text-[var(--q-text-muted)]">
                         Unlock full access to the AI radio astronomy assistant
                     </p>
                 </div>
@@ -157,9 +157,9 @@ export function AuthModal() {
                                 }}
                                 className="sr-only peer"
                             />
-                            <div className="w-5 h-5 border border-slate-700 peer-checked:border-white peer-checked:bg-white peer-focus-visible:ring-2 peer-focus-visible:ring-primary/60 rounded-md flex items-center justify-center transition-all duration-200">
+                            <div className="w-5 h-5 border border-[var(--q-border-strong)] peer-checked:border-[var(--q-ink)] peer-checked:bg-[var(--q-ink)] peer-focus-visible:ring-2 peer-focus-visible:ring-primary/60 rounded-md flex items-center justify-center transition-all duration-200">
                                 <svg
-                                    className={`w-3.5 h-3.5 text-black transition-opacity duration-200 ${isAgreed ? "opacity-100" : "opacity-0"}`}
+                                    className={`w-3.5 h-3.5 text-[var(--q-on-ink)] transition-opacity duration-200 ${isAgreed ? "opacity-100" : "opacity-0"}`}
                                     fill="none"
                                     viewBox="0 0 24 24"
                                     stroke="currentColor"
@@ -223,7 +223,7 @@ export function AuthModal() {
                         <>
                             <button
                                 onClick={() => setShowEmailForm(true)}
-                                className="glass-control w-full flex items-center justify-center gap-2 text-white py-2.5 px-4 rounded-lg text-sm font-medium"
+                                className="q-pill w-full h-10 text-[13px]"
                             >
                                 <Mail className="w-4 h-4" />
                                 Continue with Email
@@ -288,7 +288,7 @@ export function AuthModal() {
                                 <button
                                     type="submit"
                                     disabled={isLoading || !isAgreed}
-                                    className="w-full bg-white hover:bg-slate-200 text-black font-semibold text-sm py-3 px-4 rounded-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center mt-2 group"
+                                    className="q-pill-ink w-full h-10 text-[13px] disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center mt-2 group"
                                 >
                                     {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : (isLogin ? "Sign In" : "Create Account")}
                                 </button>

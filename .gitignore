@@ -242,3 +242,4 @@ AGENTS.md
 # Pytest temp artifacts & debug error logs
 .pytest-catalog-suite-venv/
 *.err
+.pytest_bt/

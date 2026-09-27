@@ -12,6 +12,13 @@ Provenance of the tables below (re-verify before quoting cost in a paper):
   - anthropic: from the vendored claude-api reference, 2026-07-16.
   - openai / deepseek / google: best-effort from public pricing pages; these
     are the least trustworthy rows.
+  - 2026-09-27 re-verified against the live pages: claude-opus-5 / -5-5
+    (claude-api reference), gpt-5.4-mini (developers.openai.com/api/docs/pricing,
+    standard tier, short context), deepseek-v4-pro / deepseek-flash
+    (api-docs.deepseek.com/quick_start/pricing). DeepSeek bills a peak and an
+    off-peak (half) rate; the PEAK rate is stored so estimates are an upper
+    bound. DeepSeek retired deepseek-v4-flash: the name is still accepted and
+    served by deepseek-flash, so it carries deepseek-flash's rate.
 
 `tacc` and `local` are deliberately absent. TACC is grant-funded and `local/`
 is self-hosted, so neither has a per-token price we can honestly quote —
@@ -36,17 +43,19 @@ from typing import Dict, Optional
 _VERSION_SUFFIX = re.compile(r"^[-@:_.]\d")
 
 # Date the tables below were last checked against provider pricing pages.
-PRICING_LAST_VERIFIED = "2026-07-16"
+PRICING_LAST_VERIFIED = "2026-09-27"
 
-# Existing deployment-alias estimates are useful to billing but must not be
-# displayed as known catalog prices. Keep provenance beside the rate table.
-CATALOG_UNVERIFIED_PRICES = frozenset({"gpt-5.4-mini", "deepseek-v4-pro", "deepseek-v4-flash"})
+# Rates that are estimates only and must not be displayed as catalog prices.
+# Empty since the 2026-09-27 re-verification; keep the hook for future rows.
+CATALOG_UNVERIFIED_PRICES: frozenset = frozenset()
 
 # {provider: {model: {input_per_mtok, output_per_mtok}}} in USD per 1M tokens.
 MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
     "anthropic": {
         "claude-fable-5": {"input_per_mtok": 10.00, "output_per_mtok": 50.00},
         "claude-mythos-5": {"input_per_mtok": 10.00, "output_per_mtok": 50.00},
+        "claude-opus-5-5": {"input_per_mtok": 4.00, "output_per_mtok": 20.00},
+        "claude-opus-5": {"input_per_mtok": 5.00, "output_per_mtok": 25.00},
         "claude-opus-4-8": {"input_per_mtok": 5.00, "output_per_mtok": 25.00},
         "claude-opus-4-7": {"input_per_mtok": 5.00, "output_per_mtok": 25.00},
         "claude-opus-4-6": {"input_per_mtok": 5.00, "output_per_mtok": 25.00},
@@ -64,10 +73,10 @@ MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
         "gpt-4.1": {"input_per_mtok": 2.00, "output_per_mtok": 8.00},
         "gpt-4.1-mini": {"input_per_mtok": 0.40, "output_per_mtok": 1.60},
         "gpt-4.1-nano": {"input_per_mtok": 0.10, "output_per_mtok": 0.40},
-        # Quasar deployment alias. Rate INFERRED from OpenAI's mini tier;
-        # unverified against the deployment's actual contract — correct before
-        # quoting in a publication.
-        "gpt-5.4-mini": {"input_per_mtok": 0.40, "output_per_mtok": 1.60},
+        # Verified 2026-09-27 (standard tier, short context).
+        "gpt-5.4-mini": {"input_per_mtok": 0.75, "output_per_mtok": 4.50},
+        "gpt-5.4": {"input_per_mtok": 2.50, "output_per_mtok": 15.00},
+        "gpt-5.4-nano": {"input_per_mtok": 0.20, "output_per_mtok": 1.25},
         "o3": {"input_per_mtok": 2.00, "output_per_mtok": 8.00},
         "o3-mini": {"input_per_mtok": 1.10, "output_per_mtok": 4.40},
         "o4-mini": {"input_per_mtok": 1.10, "output_per_mtok": 4.40},
@@ -81,14 +90,24 @@ MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
     "deepseek": {
         "deepseek-chat": {"input_per_mtok": 0.27, "output_per_mtok": 1.10},
         "deepseek-reasoner": {"input_per_mtok": 0.55, "output_per_mtok": 2.19},
-        # Quasar deployment aliases (the IDs /api/models actually serves).
-        # Rates INFERRED from DeepSeek's public chat/reasoner tiers — the exact
-        # rate for this deployment's contract is unverified. Correct these to
-        # the real numbers before quoting cost in a publication.
-        "deepseek-v4-flash": {"input_per_mtok": 0.27, "output_per_mtok": 1.10},
-        "deepseek-v4-pro": {"input_per_mtok": 0.55, "output_per_mtok": 2.19},
+        # Verified 2026-09-27, PEAK rates (cache miss); off-peak is half.
+        "deepseek-flash": {"input_per_mtok": 0.30, "output_per_mtok": 1.20},
+        # Retired name, still accepted and served by deepseek-flash.
+        "deepseek-v4-flash": {"input_per_mtok": 0.30, "output_per_mtok": 1.20},
+        "deepseek-v4-pro": {"input_per_mtok": 1.32, "output_per_mtok": 3.96},
     },
     "google": {
+        # Verified 2026-09-27 (ai.google.dev/gemini-api/docs/pricing, paid
+        # Standard tier, text, <=200k prompts). The 3.6-3.8 Flash rates are
+        # promotional through 2026-12-31 and double on 2027-01-01.
+        "gemini-3.8-flash": {"input_per_mtok": 0.75, "output_per_mtok": 3.75},
+        "gemini-3.7-flash": {"input_per_mtok": 0.75, "output_per_mtok": 3.75},
+        "gemini-3.6-flash": {"input_per_mtok": 0.75, "output_per_mtok": 3.75},
+        "gemini-3.5-flash": {"input_per_mtok": 1.50, "output_per_mtok": 9.00},
+        "gemini-3.5-flash-lite": {"input_per_mtok": 0.30, "output_per_mtok": 2.50},
+        "gemini-3.1-flash-lite": {"input_per_mtok": 0.25, "output_per_mtok": 1.50},
+        "gemini-3.1-pro-preview": {"input_per_mtok": 2.00, "output_per_mtok": 12.00},
+        "gemini-2.5-flash-lite": {"input_per_mtok": 0.10, "output_per_mtok": 0.40},
         "gemini-2.5-pro": {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
         "gemini-2.5-flash": {"input_per_mtok": 0.30, "output_per_mtok": 2.50},
         "gemini-2.0-flash": {"input_per_mtok": 0.10, "output_per_mtok": 0.40},

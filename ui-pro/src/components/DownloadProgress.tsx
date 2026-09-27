@@ -114,7 +114,7 @@ export function DownloadProgress({ data }: DownloadProgressProps) {
                             className={`h-full rounded-full transition-all duration-300 ease-out ${
                                 isDone
                                     ? "bg-emerald-500"
-                                    : "bg-gradient-to-r from-primary to-accent-purple"
+                                    : "bg-primary"
                             }`}
                             style={{ width: `${percent}%` }}
                         />

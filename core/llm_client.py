@@ -189,10 +189,15 @@ TACC_MODEL_IDS = [
     "Meta-Llama-3.3-70B-Instruct",
     "Mistral-Large-3-675B-Instruct-2512",
     "E5-Mistral-7B-Instruct",
+    # Served by the TACC endpoint (live /models, 2026-09-25). Listed here so the
+    # name routes to TACC, not to the DeepSeek API provider ("deepseek" in name).
+    "DeepSeek-V3.2",
+    "Qwen3-235B-A22B-Instruct-2507",
 ]
 
 TACC_VISIBLE_MODEL_IDS = [
     "gpt-oss-120b",
+    "DeepSeek-V3.2",
     "Qwen3-32B",
     "gemma-4-31B-it",
     "MiniMax-M2.7",
@@ -488,6 +493,9 @@ class ResponsesShim:
         self._llm = llm_client
         self._history_cache = {}  # response_id -> list of chat messages
         self._history_lock = _threading.Lock()
+        # Prompt v2 only (set by QuasarAgent after bundle selection): prune
+        # earlier turns' "Turn context [qv2]" blocks when replaying history.
+        self._prune_turn_context = False
 
     def clear_history(self, response_id: Optional[str] = None) -> None:
         """Clear one compatibility-history chain or all cached chains."""
@@ -974,6 +982,8 @@ class ResponsesShim:
         with self._history_lock:
             cached = list(self._history_cache.get(prev_id, [])) if prev_id else []
         if cached:
+            if _is_new_user_turn(input_data) and getattr(self, "_prune_turn_context", False):
+                cached = prune_turn_context_history(cached)  # prompt v2 hygiene (DX-15)
             cached.extend(self._build_anthropic_messages(input_data, attachments=attachments))
             return cached
         is_tool_results = isinstance(input_data, list) and any(
@@ -2057,6 +2067,15 @@ class ResponsesShim:
         with self._history_lock:
             cached = list(self._history_cache.get(prev_id, [])) if prev_id else []
         if cached:
+            if _is_new_user_turn(input_data) and getattr(self, "_prune_turn_context", False):
+                # A NEW user turn: earlier turns' per-turn context (prompt v2
+                # date + workflow playbooks, core/prompts/playbooks.py) is
+                # historical and would otherwise be replayed on every later
+                # request of the conversation, eroding the v2 token saving
+                # (duel task-dd87861-15924 DX-15). Prune it from the replayed
+                # copy; the pruned list becomes the stored history after this
+                # round, so growth stays bounded.
+                cached = prune_turn_context_history(cached)
             self._append_chat_input(cached, input_data)
             return cached
         is_tool_results = isinstance(input_data, list) and any(
@@ -2348,6 +2367,33 @@ class ResponsesShim:
             req = cap
         return max(1, min(req, cap))
 
+    # Values the DeepSeek API accepts for reasoning_effort (live 2026-09-26: an
+    # unknown value is a 422). "none" is left out on purpose: thinking stays on.
+    DEEPSEEK_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+    # Default "high" (owner decision 2026-09-26); "max" stays available via the env var.
+    DEEPSEEK_REASONING_EFFORT_DEFAULT = "high"
+
+    @classmethod
+    def _deepseek_reasoning_effort(cls) -> str:
+        """DEEPSEEK_REASONING_EFFORT, checked against the allowed values.
+
+        "max" let flash think through the whole 16k output cap on hard steps
+        (65 reasoning-only finish_reason=length rounds in 29 of 120 benchmark
+        questions, 2026-09-26); a probe on a small Gaia question gave "high"
+        about a third of the reasoning tokens and a fifth of the latency. An
+        invalid value falls back to the default with a warning instead of
+        turning every call into a 422."""
+        raw = str(os.getenv("DEEPSEEK_REASONING_EFFORT", "") or "").strip().lower()
+        if not raw:
+            return cls.DEEPSEEK_REASONING_EFFORT_DEFAULT
+        if raw not in cls.DEEPSEEK_REASONING_EFFORTS:
+            logger.warning(
+                f"DEEPSEEK_REASONING_EFFORT={raw!r} is not one of {cls.DEEPSEEK_REASONING_EFFORTS}; "
+                f"using {cls.DEEPSEEK_REASONING_EFFORT_DEFAULT!r}"
+            )
+            return cls.DEEPSEEK_REASONING_EFFORT_DEFAULT
+        return raw
+
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
         """Translate responses.create() to DeepSeek Chat Completions API."""
@@ -2387,8 +2433,8 @@ class ResponsesShim:
         if json_mode:
             call_kwargs["response_format"] = {"type": "json_object"}
 
-        # highest thinking settings as requested
-        call_kwargs["reasoning_effort"] = "max"
+        reasoning_effort = self._deepseek_reasoning_effort()
+        call_kwargs["reasoning_effort"] = reasoning_effort
         call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
 
         completions_engine = getattr(getattr(client, "chat"), "completions")
@@ -2396,7 +2442,8 @@ class ResponsesShim:
         result = self._chat_completion_to_llm_response(resp)
         print(
             f"[PROVIDER] deepseek finish_reason={result.finish_reason!r} "
-            f"max_tokens={max_tokens} output_chars={len(result.output_text or '')}"
+            f"max_tokens={max_tokens} reasoning_effort={reasoning_effort} "
+            f"output_chars={len(result.output_text or '')}"
         )
 
         # Extract reasoning_content from the response message
@@ -2465,8 +2512,8 @@ class ResponsesShim:
                 # Omit/translate forced choices (like "required" or dict structures) to "auto" to avoid 400 error.
                 call_kwargs["tool_choice"] = "auto" if tool_choice == "required" or not isinstance(tool_choice, str) else tool_choice
 
-        # highest thinking settings as requested
-        call_kwargs["reasoning_effort"] = "max"
+        reasoning_effort = self._deepseek_reasoning_effort()
+        call_kwargs["reasoning_effort"] = reasoning_effort
         call_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         call_kwargs["stream_options"] = {"include_usage": True}
 
@@ -2553,7 +2600,7 @@ class ResponsesShim:
         completed_items = [fc for fc in function_calls.values()]
         print(
             f"[PROVIDER] deepseek stream finish_reason={finish_reason!r} "
-            f"max_tokens={max_tokens} output_chars={len(output_text)} "
+            f"max_tokens={max_tokens} reasoning_effort={reasoning_effort} output_chars={len(output_text)} "
             f"reasoning_chars={len(reasoning_content)} tool_calls={len(completed_items)}"
         )
         yield StreamEvent(
@@ -2846,3 +2893,65 @@ class LLMClient:
                 timeout=self._http_timeout("deepseek"),
             )
         return self._deepseek_client
+
+
+# ---------------------------------------------------------------------------
+# Prompt v2 history hygiene (core/prompts/playbooks.py renders these markers)
+# ---------------------------------------------------------------------------
+TURN_CONTEXT_MARKER = "\n\nTurn context [qv2]\n- Current date:"
+TURN_CONTEXT_UPDATE_PREFIX = "Turn context update [qv2] (applies to this turn only):"
+# The runner's same-turn string inputs (provider-cutoff continuation, tool
+# budget final note) all start with this; they are not a new user turn.
+SAME_TURN_CONTINUATION_PREFIX = "[SYSTEM CONTINUATION]"
+
+
+def _is_new_user_turn(input_data) -> bool:
+    """A string input opens a new user turn unless it is one of the runner's
+    same-turn continuations, whose current-turn context must survive."""
+    return isinstance(input_data, str) and not input_data.lstrip().startswith(SAME_TURN_CONTINUATION_PREFIX)
+
+
+def prune_turn_context_history(messages: list) -> list:
+    """Return a copy of a Chat Completions history with earlier turns' per-turn
+    context removed: the trailing "Turn context" block of each user message is
+    cut, and user-role "Turn context update" items are dropped. Message dicts
+    are copied, never mutated in place (they are shared with the cache)."""
+    def _prune_text(text: str):
+        if text.startswith(TURN_CONTEXT_UPDATE_PREFIX):
+            return None
+        idx = text.find(TURN_CONTEXT_MARKER)
+        return text[:idx] if idx >= 0 else text
+
+    out = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            out.append(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            pruned = _prune_text(content)
+            if pruned is None:
+                continue
+            if pruned != content:
+                m = {**m, "content": pruned}
+            out.append(m)
+            continue
+        if isinstance(content, list):  # Anthropic content blocks
+            blocks = []
+            changed = False
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+                    pruned = _prune_text(b["text"])
+                    if pruned is None:
+                        changed = True
+                        continue
+                    if pruned != b["text"]:
+                        changed = True
+                        b = {**b, "text": pruned}
+                blocks.append(b)
+            if changed and not blocks:
+                continue
+            out.append({**m, "content": blocks} if changed else m)
+            continue
+        out.append(m)
+    return out

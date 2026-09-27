@@ -168,6 +168,12 @@ def discover_ingestible_files(directory: str) -> Dict[str, List[str]]:
             if ext == ".ipynb":
                 found["notebooks"].append(fpath)
             elif ext == ".pdf":
+                # Generated query reports and badge images (ALminer
+                # reports/, images/) are plots, not documentation, and the
+                # same report exists in several folders (RAG refresh 2026-09).
+                parts = {p.lower() for p in os.path.normpath(root).split(os.sep)}
+                if parts & {"reports", "images", "figures", "img"}:
+                    continue
                 found["pdfs"].append(fpath)
             elif ext == ".md":
                 found["markdown"].append(fpath)
@@ -221,6 +227,10 @@ def ingest_directory(
                 temp_md,
                 personal=False,
                 progress_callback=lambda msg, pct: None,
+                # repo-relative identity: same-named files in different
+                # folders must not replace each other (guard CX-01)
+                original_filename=f"{repo_name}/{rel_path}".replace(os.sep, "/"),
+                replace_existing=True,  # re-runs replace, never duplicate
             )
 
             # Cleanup temp file
@@ -252,6 +262,10 @@ def ingest_directory(
                 pdf_path,
                 personal=False,
                 progress_callback=lambda msg, pct: None,
+                # repo-relative identity: same-named files in different
+                # folders must not replace each other (guard CX-01)
+                original_filename=f"{repo_name}/{rel_path}".replace(os.sep, "/"),
+                replace_existing=True,  # re-runs replace, never duplicate
             )
             if result.get("success"):
                 chunks = result.get("chunks", 0)
@@ -282,6 +296,10 @@ def ingest_directory(
                 doc_path,
                 personal=False,
                 progress_callback=lambda msg, pct: None,
+                # repo-relative identity: same-named files in different
+                # folders must not replace each other (guard CX-01)
+                original_filename=f"{repo_name}/{rel_path}".replace(os.sep, "/"),
+                replace_existing=True,  # re-runs replace, never duplicate
             )
             if result.get("success"):
                 chunks = result.get("chunks", 0)

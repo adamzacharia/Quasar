@@ -55,6 +55,12 @@ class ConversationService:
                 cursor.execute('ALTER TABLE conversations ADD COLUMN model TEXT')
             except Exception:
                 pass  # Column already exists
+            # Starred chats are per-user server state; they used to live only
+            # in the browser and vanished on every reload.
+            try:
+                cursor.execute('ALTER TABLE conversations ADD COLUMN is_starred INTEGER DEFAULT 0')
+            except Exception:
+                pass  # Column already exists
         
             # Messages table
             cursor.execute('''
@@ -398,11 +404,13 @@ class ConversationService:
         try:
             cursor = conn.cursor()
         
+            # Starred first, so a starred chat older than the most recent
+            # `limit` still comes back; recency order within each group.
             cursor.execute('''
-                SELECT id, title, created_at, updated_at, model
+                SELECT id, title, created_at, updated_at, model, COALESCE(is_starred, 0)
                 FROM conversations 
                 WHERE user_id = ?
-                ORDER BY updated_at DESC
+                ORDER BY COALESCE(is_starred, 0) DESC, updated_at DESC
                 LIMIT ?
             ''', (user_id, limit))
         
@@ -413,7 +421,8 @@ class ConversationService:
                     "title": row[1],
                     "created_at": row[2],
                     "updated_at": row[3],
-                    "model": row[4] if len(row) > 4 else None
+                    "model": row[4] if len(row) > 4 else None,
+                    "is_starred": bool(row[5]) if len(row) > 5 else False,
                 })
         
         finally:
@@ -474,6 +483,31 @@ class ConversationService:
             conn.close()
         return updated
     
+    def set_conversation_starred_for_user(
+        self,
+        conversation_id: str,
+        user_id: str,
+        starred: bool,
+    ) -> bool:
+        """Star or unstar a conversation owned by user_id. Does not bump
+        updated_at: starring is not activity and must not reorder history."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                UPDATE conversations
+                SET is_starred = ?
+                WHERE id = ? AND user_id = ?
+                ''',
+                (1 if starred else 0, conversation_id, user_id),
+            )
+            conn.commit()
+            updated = cursor.rowcount > 0
+        finally:
+            conn.close()
+        return updated
+
     def generate_title_from_message(self, first_message: str) -> str:
         """Generate a short title from the first message"""
         # Take first 40 chars, clean it up

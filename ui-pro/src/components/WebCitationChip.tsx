@@ -2,9 +2,10 @@
 
 /* eslint-disable @next/next/no-img-element */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { openWebSources } from "./WebSourcesCard";
 import { ExternalLink } from "lucide-react";
 import type { WebSource } from "../lib/types";
-import { citationLabel, domainOf, sourceCardDomId } from "../lib/web-citations.js";
+import { citationLabel, domainOf } from "../lib/web-citations.js";
 
 interface WebCitationChipProps {
     /** Evidence id, e.g. "W3". */
@@ -23,8 +24,8 @@ function favicon(url: string): string {
 /**
  * Inline citation chip for web evidence ("[W3]" in the answer renders as a
  * small "3"). Hover or keyboard focus shows a card with the source's favicon,
- * title, domain, date and a three-line excerpt; clicking scrolls to and
- * highlights the source in the grid below the answer. The card's "Open" link
+ * title, domain, date and a three-line excerpt; clicking opens the sources
+ * panel scrolled to the source, highlighted. The card's "Open" link
  * opens the page in a new tab.
  */
 export function WebCitationChip({ citationId, source, messageId }: WebCitationChipProps) {
@@ -43,16 +44,8 @@ export function WebCitationChip({ citationId, source, messageId }: WebCitationCh
     };
     useEffect(() => () => cancelClose(), []);
 
-    const jumpToSource = useCallback(() => {
-        const el = document.getElementById(sourceCardDomId(messageId, citationId));
-        if (!el) return;
-        // The grid collapses "Also consulted" sources; open it when the target is inside.
-        const details = el.closest("details");
-        if (details && !details.open) details.open = true;
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.setAttribute("data-highlight", "true");
-        setTimeout(() => el.removeAttribute("data-highlight"), 1800);
-    }, [messageId, citationId]);
+    // Opens the answer's sources panel scrolled to (and highlighting) this source.
+    const jumpToSource = useCallback(() => openWebSources(messageId, citationId), [messageId, citationId]);
 
     const quality = source?.evidenceQuality;
     const title = source?.title || source?.domain || citationId;

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Send, PlusCircle, X, FileText, Image as ImageIcon, Square, ShieldCheck, Globe } from "lucide-react";
+import { ArrowUp, ChevronDown, Paperclip, WandSparkles, X, FileText, Image as ImageIcon, Square, ShieldCheck, Globe } from "lucide-react";
 import type { WebSearchMode } from "../lib/types";
 
 interface AttachedFile {
@@ -15,7 +15,7 @@ interface ChatInputProps {
     onStop?: () => void;
     isStreaming: boolean;
     initialValue?: string;
-    /** "hero" = centered pill on the empty landing; "docked" = pinned at the bottom during a chat. */
+    /** "hero" = centered card on the empty landing; "docked" = pinned at the bottom during a chat. */
     variant?: "hero" | "docked";
     /* Composer options + analytics are owned by the parent so they survive the
        hero→docked switch (and the visit counter is fetched only once). */
@@ -33,6 +33,12 @@ const WEB_SEARCH_MODE_OPTIONS: { value: WebSearchMode; label: string; hint: stri
     { value: "always", label: "Always", hint: "Search the web on every message" },
 ];
 
+type OpenMenu = "sources" | "attach" | null;
+
+const ICON = "h-4 w-4 shrink-0";
+const MENU_ROW =
+    "flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[13px] text-[var(--q-text)] transition-colors hover:bg-[var(--q-glass-control-hover)] focus-visible:bg-[var(--q-glass-control-hover)] focus-visible:outline-none";
+
 export function ChatInput({
     onSend, onStop, isStreaming, initialValue = "", variant = "docked",
     grounded: groundedSummary, onGroundedChange, webSearchMode, onWebSearchModeChange, hitCount = null,
@@ -41,26 +47,28 @@ export function ChatInput({
     const webSearch = webSearchMode !== "off";
     const [value, setValue] = useState(initialValue);
     const [attachments, setAttachments] = useState<AttachedFile[]>([]);
-    const [menuOpen, setMenuOpen] = useState(false);
+    const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const documentInputRef = useRef<HTMLInputElement>(null);
-    const menuRef = useRef<HTMLDivElement>(null);
+    const sourcesRef = useRef<HTMLDivElement>(null);
+    const attachRef = useRef<HTMLDivElement>(null);
 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     useEffect(() => { if (initialValue) { setValue(initialValue); inputRef.current?.focus(); } }, [initialValue]);
 
     useEffect(() => {
-        if (!menuOpen) return;
+        if (!openMenu) return;
+        const menuRef = openMenu === "sources" ? sourcesRef : attachRef;
 
         const handlePointerDown = (event: MouseEvent | TouchEvent) => {
             const target = event.target as Node | null;
             if (target && menuRef.current?.contains(target)) return;
-            setMenuOpen(false);
+            setOpenMenu(null);
         };
 
         const handleKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape") setMenuOpen(false);
+            if (event.key === "Escape") setOpenMenu(null);
         };
 
         document.addEventListener("mousedown", handlePointerDown);
@@ -72,7 +80,9 @@ export function ChatInput({
             document.removeEventListener("touchstart", handlePointerDown);
             document.removeEventListener("keydown", handleKeyDown);
         };
-    }, [menuOpen]);
+    }, [openMenu]);
+
+    const toggleMenu = (menu: Exclude<OpenMenu, null>) => setOpenMenu(open => (open === menu ? null : menu));
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, selectedType?: "image" | "document") => {
         const files = Array.from(e.target.files || []);
@@ -113,15 +123,9 @@ export function ChatInput({
         }
     };
 
-    // The composer is a full pill only while empty. Once an attachment row
-    // stacks on top, the box grows tall — and rounded-full (radius = 50% of
-    // height) would warp it into a distorted stadium with the chips/input row
-    // pushed out of alignment. Switch to a fixed corner radius in that state.
-    // Docked stays a pill on phones (the mobile home dock) and squares off at md.
-    const noAttachments = attachments.length === 0;
-    const radius = isHero
-        ? (noAttachments ? "rounded-full" : "rounded-3xl")
-        : (noAttachments ? "rounded-full md:rounded-2xl" : "rounded-2xl");
+    const webLabel = WEB_SEARCH_MODE_OPTIONS.find(o => o.value === webSearchMode)?.label ?? "Off";
+    const sourcesOpen = openMenu === "sources";
+    const attachOpen = openMenu === "attach";
 
     return (
         <div className={isHero ? "w-full z-20" : "w-full px-4 md:px-8 pb-3 pt-2 z-20"}>
@@ -130,101 +134,99 @@ export function ChatInput({
                 of the px-4 gutter and squeezes the dock narrower than the content
                 above it, so it only applies from md up. */}
             <div className={`w-full mx-auto relative ${isHero ? "max-w-[var(--q-suggestion-grid-width)]" : "max-w-none md:max-w-[var(--q-chat-input-width)]"}`}>
-                <form onSubmit={handleSubmit} className="relative group">
-                    <div className={`absolute inset-0 bg-primary/20 ${radius} blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500`} />
-                    <div className={`relative w-full glass-surface ${radius} ring-1 ring-white/10 focus-within:border-primary/50 focus-within:ring-primary/50 transition-all`}>
+                <form onSubmit={handleSubmit} className="relative">
+                    <div className="relative w-full rounded-[22px] border border-[var(--q-border)] bg-[var(--q-card)] shadow-[0_1px_2px_var(--q-shadow-glow),0_8px_24px_-12px_var(--q-shadow-glow)] transition-colors focus-within:border-[var(--q-border-strong)]">
+
+                        {/* Hidden file inputs */}
+                        <input
+                            ref={imageInputRef}
+                            type="file"
+                            multiple
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(event) => handleFileChange(event, "image")}
+                        />
+                        <input
+                            ref={documentInputRef}
+                            type="file"
+                            multiple
+                            accept=".pdf,.txt,.csv,.md,.json,.fits,.fit,.fits.gz,.uvfits,.doc,.docx"
+                            className="hidden"
+                            onChange={(event) => handleFileChange(event, "document")}
+                        />
 
                         {/* Attachment previews */}
                         {attachments.length > 0 && (
-                            <div className={`flex flex-wrap gap-2 pt-3 ${isHero ? "px-5" : "px-3"}`}>
+                            <div className={`flex flex-wrap gap-2 pt-3 ${isHero ? "px-5" : "px-4"}`}>
                                 {attachments.map((att, i) => (
-                                    <div key={i} className="relative group/att glass-control flex items-center gap-2 rounded-xl px-3 py-2 max-w-[200px]">
+                                    <div key={i} className="group/att relative flex max-w-[200px] items-center gap-2 rounded-xl border border-[var(--q-border)] bg-[var(--q-card)] py-1.5 pl-1.5 pr-2">
                                         {att.type === "image" && att.preview ? (
-                                            <img src={att.preview} alt={att.file.name} className="w-8 h-8 rounded-lg object-cover shrink-0" />
+                                            <img src={att.preview} alt={att.file.name} className="h-7 w-7 shrink-0 rounded-lg object-cover" />
                                         ) : (
-                                            <FileText className="w-5 h-5 text-primary shrink-0" />
+                                            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[var(--q-canvas)]">
+                                                <FileText className="h-3.5 w-3.5 text-[var(--q-text-muted)]" strokeWidth={1.75} />
+                                            </span>
                                         )}
-                                        <span className="text-xs text-slate-300 truncate max-w-[120px]">{att.file.name}</span>
+                                        <span className="max-w-[120px] truncate text-[12px] text-[var(--q-text-secondary)]">{att.file.name}</span>
                                         <button
                                             type="button"
                                             onClick={() => removeAttachment(i)}
-                                            className="ml-1 p-0.5 rounded-full glass-control hover:bg-red-500/80 text-slate-400 hover:text-white transition-all opacity-0 group-hover/att:opacity-100"
+                                            aria-label={`Remove ${att.file.name}`}
+                                            className="rounded-full p-0.5 text-[var(--q-text-faint)] opacity-0 transition-all hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)] focus-visible:opacity-100 group-hover/att:opacity-100"
                                         >
-                                            <X className="w-3 h-3" />
+                                            <X className="h-3 w-3" />
                                         </button>
                                     </div>
                                 ))}
                             </div>
                         )}
 
-                        {/* Input row */}
-                        <div className={`flex items-center gap-2 ${isHero ? "p-2.5 pl-5" : "p-2"}`}>
-                            {/* Hidden file inputs */}
+                        {/* Row 1: prompt */}
+                        <div className={`flex items-center gap-2.5 ${isHero ? "px-5 pt-4 pb-1.5" : "px-4 pt-3.5 pb-1"}`}>
+                            <WandSparkles className="h-4 w-4 shrink-0 text-[var(--q-text-faint)]" strokeWidth={1.75} aria-hidden="true" />
                             <input
-                                ref={imageInputRef}
-                                type="file"
-                                multiple
-                                accept="image/*"
-                                className="hidden"
-                                onChange={(event) => handleFileChange(event, "image")}
+                                ref={inputRef}
+                                type="text"
+                                value={value}
+                                onChange={(e) => setValue(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                placeholder={isStreaming ? "Quasar is thinking…" : "Ask Quasar about observations, data, or literature…"}
+                                className="min-w-0 flex-1 border-none bg-transparent text-[14px] text-[var(--q-text)] outline-none placeholder:text-[var(--q-text-faint)] focus:ring-0"
+                                disabled={isStreaming}
                             />
-                            <input
-                                ref={documentInputRef}
-                                type="file"
-                                multiple
-                                accept=".pdf,.txt,.csv,.md,.json,.fits,.fit,.fits.gz,.uvfits,.doc,.docx"
-                                className="hidden"
-                                onChange={(event) => handleFileChange(event, "document")}
-                            />
-                            <div ref={menuRef} className="relative shrink-0">
+                            {/* Keyboard shortcut hint */}
+                            {!isStreaming && value.trim() && (
+                                <span className="hidden select-none font-mono text-[11px] text-[var(--q-text-faint)] sm:inline">⏎</span>
+                            )}
+                        </div>
+
+                        {/* Row 2: sources · attach · send */}
+                        <div className={`flex items-center gap-2 ${isHero ? "px-4 pb-3.5 pt-2" : "px-3 pb-3 pt-2"}`}>
+                            <div ref={sourcesRef} className="relative shrink-0">
                                 <button
                                     type="button"
-                                    onClick={() => setMenuOpen(open => !open)}
+                                    onClick={() => toggleMenu("sources")}
                                     disabled={isStreaming}
                                     aria-haspopup="menu"
-                                    aria-expanded={menuOpen}
-                                    className="relative p-2.5 text-slate-400 hover:text-primary hover:bg-white/10 rounded-full transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-                                    title="Add files or modes"
+                                    aria-expanded={sourcesOpen}
+                                    className="q-pill h-8 gap-1.5 px-3 text-[13px]"
+                                    title="Sources: grounded mode and web search"
                                 >
-                                    <PlusCircle className="w-5 h-5" />
                                     {groundedSummary && (
-                                        <span className={`absolute ${webSearch ? "right-3.5" : "right-1.5"} top-1.5 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-card-dark`} aria-hidden="true" />
+                                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />
                                     )}
                                     {webSearch && (
-                                        <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-cyan-400 ring-2 ring-card-dark" aria-hidden="true" />
+                                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-cyan-500" aria-hidden="true" />
                                     )}
+                                    <span className="whitespace-nowrap">Web: {webLabel}</span>
+                                    <ChevronDown className={`h-3.5 w-3.5 text-[var(--q-text-muted)] transition-transform ${sourcesOpen ? "rotate-180" : ""}`} strokeWidth={1.75} />
                                 </button>
 
-                                {menuOpen && (
+                                {sourcesOpen && (
                                     <div
                                         role="menu"
-                                        className="glass-popover absolute bottom-full left-0 z-30 mb-2 w-56 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl p-1.5"
+                                        className="glass-popover absolute bottom-full left-0 z-30 mb-2 w-64 max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl p-1.5"
                                     >
-                                        <button
-                                            type="button"
-                                            role="menuitem"
-                                            onClick={() => {
-                                                setMenuOpen(false);
-                                                imageInputRef.current?.click();
-                                            }}
-                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
-                                        >
-                                            <ImageIcon className="h-4 w-4 text-primary" />
-                                            <span>Upload images</span>
-                                        </button>
-                                        <button
-                                            type="button"
-                                            role="menuitem"
-                                            onClick={() => {
-                                                setMenuOpen(false);
-                                                documentInputRef.current?.click();
-                                            }}
-                                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10"
-                                        >
-                                            <FileText className="h-4 w-4 text-primary" />
-                                            <span>Upload documents</span>
-                                        </button>
-                                        <div className="my-1 h-px bg-white/10" />
                                         <div className="group/grounded relative">
                                             <button
                                                 type="button"
@@ -232,41 +234,42 @@ export function ChatInput({
                                                 aria-checked={groundedSummary}
                                                 aria-describedby="grounded-mode-tooltip"
                                                 onClick={() => onGroundedChange(!groundedSummary)}
-                                                className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm text-slate-200 transition-colors hover:bg-white/10 focus-visible:bg-white/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-400/50"
+                                                className={`${MENU_ROW} justify-between`}
                                             >
-                                                <span className="flex min-w-0 items-center gap-3">
-                                                    <ShieldCheck className={`h-4 w-4 ${groundedSummary ? "text-emerald-300" : "text-slate-500"}`} />
+                                                <span className="flex min-w-0 items-center gap-2.5">
+                                                    <ShieldCheck className={`${ICON} ${groundedSummary ? "text-emerald-300" : "text-[var(--q-text-muted)]"}`} strokeWidth={1.75} />
                                                     <span>Grounded</span>
                                                 </span>
-                                                <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                                                <span className={`relative inline-flex h-[18px] w-8 shrink-0 items-center rounded-full border transition-colors ${
                                                     groundedSummary
-                                                        ? "border-emerald-400/50 bg-emerald-500/25"
-                                                        : "border-slate-700 bg-slate-900"
+                                                        ? "border-emerald-500/40 bg-emerald-500/15"
+                                                        : "border-[var(--q-border)] bg-[var(--q-canvas)]"
                                                 }`}>
-                                                    <span className={`h-3.5 w-3.5 rounded-full transition-transform ${
+                                                    <span className={`h-3 w-3 rounded-full transition-transform ${
                                                         groundedSummary
-                                                            ? "translate-x-4 bg-emerald-300"
-                                                            : "translate-x-1 bg-slate-500"
+                                                            ? "translate-x-[15px] bg-emerald-500"
+                                                            : "translate-x-[2px] bg-[var(--q-border-strong)]"
                                                     }`} />
                                                 </span>
                                             </button>
                                             <div
                                                 id="grounded-mode-tooltip"
                                                 role="tooltip"
-                                                className="max-h-0 overflow-hidden px-3 text-[11px] leading-relaxed text-slate-400 opacity-0 transition-all duration-150 group-hover/grounded:mb-1 group-hover/grounded:max-h-28 group-hover/grounded:opacity-100 group-focus-within/grounded:mb-1 group-focus-within/grounded:max-h-28 group-focus-within/grounded:opacity-100"
+                                                className="max-h-0 overflow-hidden px-2.5 text-[12px] leading-relaxed text-[var(--q-text-muted)] opacity-0 transition-all duration-150 group-hover/grounded:mb-1 group-hover/grounded:max-h-28 group-hover/grounded:opacity-100 group-focus-within/grounded:mb-1 group-focus-within/grounded:max-h-28 group-focus-within/grounded:opacity-100"
                                             >
-                                                <span className="block font-semibold text-emerald-200">Grounded mode</span>
+                                                <span className="block font-medium text-[var(--q-text)]">Grounded mode</span>
                                                 Summarizes only rows, counts, identifiers, coordinates, links, and explicit errors returned by tools in this run. It avoids outside background knowledge, guesses, and unstated counts.
                                             </div>
                                         </div>
+                                        <div className="mx-2 my-1 h-px bg-[var(--q-border)]" />
                                         {/* Web search mode (Phase 2): a segmented control instead of the
                                             on/off switch. Persisted by ChatArea in localStorage. */}
-                                        <div className="rounded-lg px-3 py-2" role="group" aria-label="Web search mode" data-testid="web-search-mode">
-                                            <span className="flex min-w-0 items-center gap-3 text-sm text-slate-200">
-                                                <Globe className={`h-4 w-4 ${webSearch ? "text-cyan-300" : "text-slate-500"}`} />
-                                                <span>Web Search</span>
+                                        <div className="rounded-xl px-2.5 py-2" role="group" aria-label="Web search mode" data-testid="web-search-mode">
+                                            <span className="flex min-w-0 items-center gap-2.5 text-[13px] text-[var(--q-text)]">
+                                                <Globe className={`${ICON} ${webSearch ? "text-cyan-300" : "text-[var(--q-text-muted)]"}`} strokeWidth={1.75} />
+                                                <span>Web search</span>
                                             </span>
-                                            <div className="mt-1.5 grid grid-cols-3 gap-0.5 rounded-lg border border-slate-700 bg-slate-900/70 p-0.5">
+                                            <div className="mt-2 grid grid-cols-3 gap-0.5 rounded-full border border-[var(--q-border)] bg-[var(--q-canvas)] p-0.5">
                                                 {WEB_SEARCH_MODE_OPTIONS.map((opt) => {
                                                     const active = webSearchMode === opt.value;
                                                     return (
@@ -279,10 +282,10 @@ export function ChatInput({
                                                             data-mode={opt.value}
                                                             title={opt.hint}
                                                             onClick={() => onWebSearchModeChange(opt.value)}
-                                                            className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${
+                                                            className={`rounded-full px-2 py-1 text-[12px] font-medium transition-colors ${
                                                                 active
-                                                                    ? "bg-cyan-500/25 text-cyan-200 ring-1 ring-cyan-400/50"
-                                                                    : "text-slate-400 hover:bg-white/10 hover:text-slate-200"
+                                                                    ? "bg-[var(--q-card)] text-[var(--q-text)] shadow-[0_1px_2px_var(--q-shadow-glow)] ring-1 ring-[var(--q-border-strong)]"
+                                                                    : "text-[var(--q-text-muted)] hover:text-[var(--q-text)]"
                                                             }`}
                                                         >
                                                             {opt.label}
@@ -294,49 +297,85 @@ export function ChatInput({
                                     </div>
                                 )}
                             </div>
-                            <input
-                                ref={inputRef}
-                                type="text"
-                                value={value}
-                                onChange={(e) => setValue(e.target.value)}
-                                onKeyDown={handleKeyDown}
-                                placeholder={isStreaming ? "QUASAR is thinking..." : "Ask QUASAR about observations, data, or literature..."}
-                                className="flex-1 bg-transparent border-none outline-none text-white placeholder-slate-500 focus:ring-0 text-sm"
-                                disabled={isStreaming}
-                            />
-                            {/* Keyboard shortcut hint */}
-                            {!isStreaming && value.trim() && (
-                                <span className="text-[10px] text-slate-500 font-mono mr-1 select-none hidden sm:inline">⏎</span>
-                            )}
-                            {isStreaming ? (
-                                <button
-                                    type="button"
-                                    onClick={onStop}
-                                    className="p-2.5 bg-red-500/80 hover:bg-red-500 text-on-accent rounded-full transition-all shadow-lg shadow-red-500/20 flex items-center justify-center animate-pulse"
-                                    title="Stop generating"
-                                >
-                                    <Square className="w-4 h-4 fill-current" />
-                                </button>
-                            ) : (
-                                <button
-                                    type="submit"
-                                    disabled={!value.trim() && attachments.length === 0}
-                                    className="btn-accent p-2.5 rounded-full shadow-lg shadow-[#9333ea]/40 flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
-                                >
-                                    <Send className="w-5 h-5" />
-                                </button>
-                            )}
+
+                            <div className="ml-auto flex shrink-0 items-center gap-2">
+                                <div ref={attachRef} className="relative">
+                                    <button
+                                        type="button"
+                                        onClick={() => toggleMenu("attach")}
+                                        disabled={isStreaming}
+                                        aria-haspopup="menu"
+                                        aria-expanded={attachOpen}
+                                        className="q-pill h-8 gap-1.5 px-3 text-[13px]"
+                                        title="Attach images or documents"
+                                    >
+                                        <Paperclip className="h-3.5 w-3.5 text-[var(--q-text-muted)]" strokeWidth={1.75} />
+                                        <span>Attach</span>
+                                    </button>
+
+                                    {attachOpen && (
+                                        <div
+                                            role="menu"
+                                            className="glass-popover absolute bottom-full right-0 z-30 mb-2 w-52 max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl p-1.5"
+                                        >
+                                            <button
+                                                type="button"
+                                                role="menuitem"
+                                                onClick={() => {
+                                                    setOpenMenu(null);
+                                                    imageInputRef.current?.click();
+                                                }}
+                                                className={MENU_ROW}
+                                            >
+                                                <ImageIcon className={`${ICON} text-[var(--q-text-muted)]`} strokeWidth={1.75} />
+                                                <span>Upload images</span>
+                                            </button>
+                                            <button
+                                                type="button"
+                                                role="menuitem"
+                                                onClick={() => {
+                                                    setOpenMenu(null);
+                                                    documentInputRef.current?.click();
+                                                }}
+                                                className={MENU_ROW}
+                                            >
+                                                <FileText className={`${ICON} text-[var(--q-text-muted)]`} strokeWidth={1.75} />
+                                                <span>Upload documents</span>
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {isStreaming ? (
+                                    <button
+                                        type="button"
+                                        onClick={onStop}
+                                        className="q-err inline-flex h-8 items-center justify-center gap-1.5 rounded-full bg-red-500/10 px-3.5 text-[13px] font-medium transition-colors hover:bg-red-500/15"
+                                        title="Stop generating"
+                                    >
+                                        <Square className="h-3 w-3 fill-current" />
+                                        <span>Stop</span>
+                                    </button>
+                                ) : (
+                                    <button
+                                        type="submit"
+                                        disabled={!value.trim() && attachments.length === 0}
+                                        className="q-pill-ink h-8 gap-1.5 px-3.5 text-[13px]"
+                                    >
+                                        <ArrowUp className="h-3.5 w-3.5" strokeWidth={2} />
+                                        <span>Send</span>
+                                    </button>
+                                )}
+                            </div>
                         </div>
                     </div>
                 </form>
                 {!isHero && (
-                    <div className="text-center mt-2">
-                        <p className="text-[10px] text-slate-500">
-                            QUASAR may produce inaccurate information.
-                            <span className="text-slate-600 ml-2">· Accepts images, PDFs, FITS, CSV</span>
-                            <span className={`text-slate-600 ml-2 transition-opacity duration-500 ${hitCount !== null ? 'opacity-100' : 'opacity-0'}`}>· Visits: <span className="text-[var(--q-mono-accent)] font-mono tabular-nums">{hitCount !== null ? hitCount.toLocaleString() : '—'}</span></span>
-                        </p>
-                    </div>
+                    <p className="mt-2 flex flex-wrap justify-center gap-x-1.5 text-center text-[12px] text-[var(--q-text-faint)]">
+                        <span>Quasar may produce inaccurate information.</span>
+                        <span className="whitespace-nowrap">· Accepts images, PDFs, FITS, CSV</span>
+                        <span className={`whitespace-nowrap transition-opacity duration-500 ${hitCount !== null ? "opacity-100" : "opacity-0"}`}>· Visits: <span className="tabular-nums">{hitCount !== null ? hitCount.toLocaleString() : "—"}</span></span>
+                    </p>
                 )}
             </div>
         </div>

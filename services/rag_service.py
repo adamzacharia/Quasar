@@ -31,6 +31,19 @@ METADATA SCHEMA (per chunk in alma_general):
     ingested_at    (str)  — ISO timestamp of ingestion
     file_size_kb   (int)  — File size in kilobytes
     is_personal    (bool) — Whether this is a personal document
+  Manifest-driven ingest (scripts/download_alma_docs.py, ingest_html_pages.py,
+  ingest_alma_kb.py) also stores:
+    doc_number, doc_version, doc_status (current | current-old | reference |
+    version-note), source_url, fetched_at, doc_label (the one-line header
+    prepended to every chunk so the model sees title/cycle/version).
+  Every ingest (services/rag_enrich.py, 2026-09-26) also stores:
+    page / pdf_page (1-based physical PDF page; the loader's page is 0-based),
+    page_label (printed page number), section (heading path), content_kind
+    (text | table | code), chunk_chars, chunk_tokens, start_index, doc_date
+    (ISO), doc_date_source, facility, file_sha256, pdf_created / pdf_modified
+    (UTC), pdf_producer / pdf_author / pdf_title / pdf_format, and for KB /
+    web sources doc_author, kb_category, http_last_modified. Table-of-contents
+    chunks are dropped; local file paths never reach a payload.
 """
 
 import logging
@@ -46,6 +59,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 
 from services.vector_db import (
+    delete_older_runs,
     upsert_vectors,
     search_vectors,
     scroll_all,
@@ -56,6 +70,7 @@ from services.vector_db import (
     ensure_collection,
 )
 from qdrant_client.models import PayloadSchemaType
+from services import rag_enrich
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +90,33 @@ def _personal_collection(user_id: str) -> str:
 # Document category mapping (filename pattern → category)
 # ──────────────────────────────────────────────────────────────────
 CATEGORY_MAP = {
+    # Specific prefixes first: the first matching pattern wins, and generic
+    # tokens below ("pipeline", "archive", "known-issues") would otherwise
+    # capture e.g. a Knowledgebase article about the pipeline.
+    "kb-":                    "knowledgebase",
+    "knowledgebase":          "knowledgebase",
+    "news-":                  "news",
+    "science-archive-manual": "archive_manual",
+    "archive-manual":         "archive_manual",
+    "qa2":                    "qa2_products",
+    "science-primer":         "primer",
+    "arcguide":               "arc_guide",
+    "datalab":                "data_lab",
+    "data-lab":               "data_lab",
+    "jwst":                   "jwst",
+    "jdox":                   "jwst",
+    "eso-":                   "eso",
+    "vla-":                   "vla",
+    "vlass":                  "vla",
+    "ivoa-":                  "ivoa",
+    "desi-":                  "desi",
+    "legacysurvey":           "legacy_surveys",
+    "legacy-surveys":         "legacy_surveys",
+    "gaia-":                  "gaia",
+    "ztf-":                   "ztf",
+    "wsu":                    "wsu",
+    "casaguide":              "casa_guides",
+    "version-note":           "pipeline",
     "technical-handbook":     "technical_handbook",
     "technical_handbook":     "technical_handbook",
     "proposers-guide":        "proposers_guide",
@@ -183,6 +225,12 @@ CYCLE_YEAR_MAP = {
 }
 
 _SEMANTIC_TIE_TOLERANCE = 0.005
+
+# Manifest fields copied into every chunk payload when present.
+_MANIFEST_PAYLOAD_KEYS = (
+    "doc_number", "doc_version", "doc_status", "source_url", "fetched_at", "doc_label",
+    "kb_category", "doc_date_source", "doc_author", "http_last_modified",
+)
 
 
 def _coerce_doc_year(value: Any) -> Optional[int]:
@@ -527,7 +575,9 @@ def extract_document_metadata(file_path: str, pages_text: Optional[List[str]] = 
         Dict with: doc_year, doc_category, doc_title, alma_cycle,
                    file_size_kb, total_pages, ingested_at.
     """
-    filename = original_filename or os.path.basename(file_path)
+    # original_filename may be a repo-relative identity ("repo/dir/x.md"):
+    # classify by the file's own name, never by folder names (guard CX-10).
+    filename = os.path.basename((original_filename or file_path).replace("\\", "/"))
 
     # Date detection (priority: filename → PDF metadata → content scan)
     year = _extract_year_from_filename(filename)
@@ -738,6 +788,8 @@ class RAGService:
         progress_callback: Optional[Callable[[str, int], None]] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
         original_filename: Optional[str] = None,
+        override_metadata: Optional[Dict[str, Any]] = None,
+        replace_existing: bool = False,
     ) -> Dict[str, Any]:
         """
         Ingest a single document into the vector store with rich metadata.
@@ -747,7 +799,16 @@ class RAGService:
             personal: If True, add to personal collection
             progress_callback: Function(status_msg, percent) for progress updates
             extra_metadata: Optional additional metadata to merge into each chunk
+                (never overrides an extracted field)
             original_filename: Optional original filename if file_path is temporary
+            override_metadata: Authoritative metadata (from a curated manifest)
+                that DOES override the extracted doc_* fields; a ``doc_label``
+                key is also prepended to every chunk's text as a one-line header
+            replace_existing: Replace this source_file's chunks in the target
+                collection (idempotent re-ingest). New chunks are upserted
+                first under a fresh ``ingest_run`` id; only then are the older
+                chunks of the same source deleted, so a failed embed or upsert
+                never leaves the document missing.
 
         Returns:
             Dict with success status, chunk count, extracted metadata, etc.
@@ -768,6 +829,14 @@ class RAGService:
             doc_meta = extract_document_metadata(file_path, pages_text, original_filename=original_filename)
             total_pages = len(documents)
             doc_meta["total_pages"] = total_pages
+            if override_metadata:
+                # Manifest dates are the document's publication date; the PDF
+                # ModDate/filename guesses must not leak in beside them.
+                if "doc_year" in override_metadata:
+                    doc_meta["doc_month"] = None
+                    doc_meta["doc_day"] = None
+                doc_meta.update({k: v for k, v in override_metadata.items() if v is not None})
+            doc_label = str((override_metadata or {}).get("doc_label") or "").strip()
 
             # R4: best-effort OpenAlex citation-count enrichment (needs a DOI).
             # Non-fatal by design — ingest must never fail on a metadata lookup.
@@ -784,12 +853,90 @@ class RAGService:
             if progress_callback:
                 progress_callback(f"Splitting {total_pages} pages...", 30)
 
+            # Document-level facts (2026-09-26): section tracking over the page
+            # texts, printed page numbers, normalised PDF info, content hash.
+            is_pdf = os.path.splitext(file_path)[1].lower() == ".pdf"
+            for i, d in enumerate(documents):
+                d.metadata["_doc_index"] = i
+            sections = rag_enrich.SectionTracker(pages_text)
+            page_labels: Dict[int, str] = {}
+            if is_pdf:
+                try:
+                    import fitz
+                    with fitz.open(file_path) as _pdf:
+                        for i in range(_pdf.page_count):
+                            page_labels[i] = rag_enrich.printed_page_label(_pdf[i].get_text())
+                except Exception:
+                    page_labels = {}
+                # Scanned PDFs have no native text: fall back to the loader /
+                # OCR page text the chunks were cut from (guard CX-02).
+                for i, d in enumerate(documents):
+                    # key by the document's own physical page: OCR output
+                    # omits pages without text, so list position != page (CX-02)
+                    raw = d.metadata.get("page")
+                    idx0 = int(raw) if isinstance(raw, int) or str(raw).isdigit() else i
+                    if not page_labels.get(idx0):
+                        label = rag_enrich.printed_page_label(d.page_content)
+                        if label:
+                            page_labels[idx0] = label
+            doc_facts: Dict[str, Any] = {}
+            if is_pdf and documents:
+                doc_facts.update(rag_enrich.pdf_document_facts(documents[0].metadata))
+            sha = rag_enrich.file_sha256(file_path)
+            if sha:
+                doc_facts["file_sha256"] = sha
+            iso_date = rag_enrich.iso_doc_date(doc_meta.get("doc_year"), doc_meta.get("doc_month"), doc_meta.get("doc_day"))
+            if iso_date:
+                doc_facts["doc_date"] = iso_date
+            if not doc_meta.get("doc_date_source"):
+                doc_facts["doc_date_source"] = "manifest" if override_metadata and "doc_year" in override_metadata else "extracted"
+            facility = rag_enrich.FACILITY_BY_CATEGORY.get(str(doc_meta.get("doc_category") or ""))
+            if facility:
+                doc_facts["facility"] = facility
+            elif str(doc_meta.get("doc_category") or "") not in ("general", "internal", ""):
+                doc_facts["facility"] = "ALMA"
+
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200,
                 length_function=len,
+                add_start_index=True,
             )
             chunks = text_splitter.split_documents(documents)
+            # Table-of-contents chunks (dotted leaders to page numbers) carry no
+            # content and outrank real text on title-like queries (C09 check).
+            content_chunks = [c for c in chunks if not rag_enrich.is_toc_chunk(c.page_content)]
+            dropped_toc = len(chunks) - len(content_chunks)
+            if content_chunks:
+                chunks = content_chunks
+            else:
+                dropped_toc = 0
+            chunk_facts: List[Dict[str, Any]] = []
+            for chunk in chunks:
+                di = int(chunk.metadata.get("_doc_index", 0) or 0)
+                facts: Dict[str, Any] = {
+                    "section": sections.section_at(di, int(chunk.metadata.get("start_index", 0) or 0)),
+                    "content_kind": rag_enrich.content_kind(chunk.page_content),
+                    "chunk_chars": len(chunk.page_content),
+                    "chunk_tokens": rag_enrich.token_count(chunk.page_content),
+                }
+                if is_pdf:
+                    # PyMuPDF(4LLM) page metadata is 0-based; citations need the
+                    # 1-based physical page a reader finds in a PDF viewer.
+                    raw_page = chunk.metadata.get("page")
+                    idx0 = int(raw_page) if isinstance(raw_page, int) or str(raw_page).isdigit() else di
+                    facts["page"] = idx0 + 1
+                    facts["pdf_page"] = idx0 + 1
+                    if page_labels.get(idx0):
+                        facts["page_label"] = page_labels[idx0]
+                chunk_facts.append({k: v for k, v in facts.items() if v not in (None, "")})
+                if doc_label:
+                    header = rag_enrich.chunk_header(
+                        doc_label, facts.get("section", ""), facts.get("page"), page_labels.get(facts.get("page", 0) - 1, "") if is_pdf else ""
+                    )
+                    chunk.page_content = f"{header}\n{chunk.page_content}"
+                    chunk_facts[-1]["chunk_chars"] = len(chunk.page_content)
+                    chunk_facts[-1]["chunk_tokens"] = rag_enrich.token_count(chunk.page_content)
 
             # Guard: skip documents with no extractable text (e.g. scanned PDFs)
             if not chunks:
@@ -860,6 +1007,11 @@ class RAGService:
                     "file_size_kb": doc_meta["file_size_kb"],
                     "ingested_at": doc_meta["ingested_at"],
                 }
+                for k in _MANIFEST_PAYLOAD_KEYS:
+                    if doc_meta.get(k) not in (None, ""):
+                        pay[k] = doc_meta[k]
+                pay.update(doc_facts)
+                pay.update(chunk_facts[idx])
                 if self.user_id and personal:
                     pay["user_id"] = self.user_id
                 # Merge extra metadata if provided
@@ -867,17 +1019,64 @@ class RAGService:
                     for k, v in extra_metadata.items():
                         if k not in pay:
                             pay[k] = v
-                # Carry over page number and other loader metadata
+                # Carry over remaining loader metadata, minus absolute local
+                # paths and the raw duplicated PDF info keys (normalised above).
                 for k, v in chunk.metadata.items():
-                    if k not in pay:
-                        pay[k] = str(v) if not isinstance(v, (str, int, float, bool)) else v
+                    if k in pay or k in rag_enrich.LOADER_KEYS_TO_DROP or k.startswith("_"):
+                        continue
+                    if k == "page" and not is_pdf:
+                        continue  # only PDFs have physical pages (guard CX-04)
+                    pay[k] = str(v) if not isinstance(v, (str, int, float, bool)) else v
                 payloads.append(pay)
 
             # Step 5: Upsert to Qdrant
             if progress_callback:
                 progress_callback(f"Storing {len(chunks)} chunks in Qdrant...", 80)
 
-            upsert_vectors(target, ids, vectors, payloads)
+            if replace_existing:
+                # Upsert first, then drop the previous run's chunks, so a failed
+                # write never leaves the source empty (CX-02). upsert_vectors
+                # writes in batches; if a later batch fails, roll back the
+                # batches this run already wrote so the old document is the
+                # only version searchable (CX-23).
+                import time as _time
+                run_id = uuid.uuid4().hex
+                run_ts = _time.time_ns()  # integer ns: equal stamps across runs are practically impossible
+                for pay in payloads:
+                    pay["ingest_run"] = run_id
+                    pay["ingest_ts"] = run_ts
+                try:
+                    upsert_vectors(target, ids, vectors, payloads)
+                except Exception as upsert_err:
+                    rollback_err = None
+                    for attempt in range(3):
+                        try:
+                            delete_by_filter(target, {"source_file": filename, "ingest_run": run_id})
+                            rollback_err = None
+                            break
+                        except Exception as e:
+                            rollback_err = e
+                            if attempt < 2:
+                                _time.sleep(0.5 * (attempt + 1))
+                    if rollback_err is not None:
+                        # Never report this like an ordinary failed write: the
+                        # partial run stays searchable next to the old document
+                        # until a later replace (delete_older_runs) or
+                        # delete_source removes it.
+                        logger.error("rollback of partial ingest %s for %s failed: %s",
+                                     run_id, filename, rollback_err)
+                        raise RuntimeError(
+                            f"{upsert_err}; rollback of partial run {run_id} also failed ({rollback_err}): "
+                            f"partial chunks of {filename} remain searchable until the file is re-ingested "
+                            f"or deleted"
+                        ) from upsert_err
+                    raise
+                # Only runs older than this one (and legacy chunks without an
+                # ingest_ts) are removed, so concurrent runs cannot delete
+                # each other (CX-25).
+                delete_older_runs(target, filename, run_id, run_ts)
+            else:
+                upsert_vectors(target, ids, vectors, payloads)
 
             if progress_callback:
                 progress_callback(f"✓ Ingested {filename}", 100)
@@ -887,6 +1086,7 @@ class RAGService:
                 "filename": filename,
                 "pages": total_pages,
                 "chunks": len(chunks),
+                "dropped_toc_chunks": dropped_toc,
                 "personal": personal,
                 "metadata": doc_meta,
             }
@@ -925,35 +1125,29 @@ class RAGService:
         ensure_collection(self.general_collection)
         return deleted
 
+    def delete_source(self, source_file: str, collection: Optional[str] = None) -> bool:
+        """Delete every chunk of one source file (general collection by default)."""
+        return delete_by_filter(collection or self.general_collection, {"source_file": source_file})
+
     def create_metadata_indexes(self):
         """Create payload indexes on frequently filtered metadata fields."""
-        try:
-            create_payload_index(
-                self.general_collection, "doc_year", PayloadSchemaType.INTEGER
-            )
-        except Exception as e:
-            print(f"[RAG] Index on doc_year may already exist: {e}")
-
-        try:
-            create_payload_index(
-                self.general_collection, "doc_month", PayloadSchemaType.INTEGER
-            )
-        except Exception as e:
-            print(f"[RAG] Index on doc_month may already exist: {e}")
-
-        try:
-            create_payload_index(
-                self.general_collection, "doc_category", PayloadSchemaType.KEYWORD
-            )
-        except Exception as e:
-            print(f"[RAG] Index on doc_category may already exist: {e}")
-
-        try:
-            create_payload_index(
-                self.general_collection, "source_file", PayloadSchemaType.KEYWORD
-            )
-        except Exception as e:
-            print(f"[RAG] Index on source_file may already exist: {e}")
+        fields = [
+            ("doc_year", PayloadSchemaType.INTEGER),
+            ("doc_month", PayloadSchemaType.INTEGER),
+            ("page", PayloadSchemaType.INTEGER),
+            ("doc_category", PayloadSchemaType.KEYWORD),
+            ("source_file", PayloadSchemaType.KEYWORD),
+            ("alma_cycle", PayloadSchemaType.KEYWORD),
+            ("doc_status", PayloadSchemaType.KEYWORD),
+            ("facility", PayloadSchemaType.KEYWORD),
+            ("content_kind", PayloadSchemaType.KEYWORD),
+            ("ingest_run", PayloadSchemaType.KEYWORD),
+        ]
+        for name, schema in fields:
+            try:
+                create_payload_index(self.general_collection, name, schema)
+            except Exception as e:
+                print(f"[RAG] Index on {name} may already exist: {e}")
 
     # ------------------------------------------------------------------
     # Search (with metadata filtering)

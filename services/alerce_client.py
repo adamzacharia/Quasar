@@ -309,6 +309,11 @@ class AlerceClient:
             "candid": row.get("candid"),
             "has_stamp": bool(row.get("has_stamp")),
             "diffmaglim": _float_or_none(row.get("diffmaglim")),
+            # magpsf is a DIFFERENCE-image magnitude; the reference-corrected source
+            # magnitude is what variability statistics need (services/variability.py).
+            "magpsf_corr": _float_or_none(row.get("magpsf_corr")),
+            "sigmapsf_corr": _float_or_none(row.get("sigmapsf_corr")),
+            "isdiffpos": row.get("isdiffpos"),
         }
 
     @staticmethod

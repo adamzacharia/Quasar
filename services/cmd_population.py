@@ -158,7 +158,8 @@ def population_test(
     red_dominant = red["significance"] >= 3.0 and red["excess"] > max(old_excess, 0.0)
     n_total_in = int(cells["n_in"].sum()) if not cells.empty else 0
     if n_total_in == 0:
-        verdict, reason = "inconclusive", "no point sources in the aperture (coverage gap or empty query)"
+        verdict, reason = "inconclusive", ("no point sources from this catalog in the aperture (empty query; check "
+                                           "the survey's other releases before calling it a coverage gap)")
     elif red_dominant:
         verdict = "field-like"
         reason = (f"the excess is red (g-r >= 1.0: {red['excess']:+.0f} stars, {red['significance']:.1f} sigma), "

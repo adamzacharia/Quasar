@@ -413,7 +413,10 @@ class CatalogCrossmatch(BaseCapability):
         "different services) inside one cone: both sides are selected by the archives (cone + optional cuts), "
         "then matched within match_radius_arcsec. Returns how many LEFT sources have a match, out of how many, "
         "the matched fraction, how many right sources are matched, separation statistics and whether both sides "
-        "were complete. Use for 'how many X have a Y counterpart within N arcsec'."
+        "were complete. Use for 'how many X have a Y counterpart within N arcsec'. For Gaia DR3 x AllWISE "
+        "(gaia gaiadr3.gaia_source or vizier I/355/gaiadr3, against irsa allwise_p3as_psd or vizier II/328/allwise) "
+        "the summary also carries gaia_best_neighbour: Gaia's precomputed best-neighbour cross-match in the same "
+        "cone, the archive's recommended count; report it first and the positional count as the looser one."
     )
     category = "archive"
     InputModel = CatalogCrossmatchInput

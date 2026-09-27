@@ -8,7 +8,7 @@ import { OnboardingOverlay, useShowOnboarding } from "@/components/OnboardingOve
 import { useAuthStore } from "../lib/auth-store";
 import { useIsMobile } from "../lib/use-is-mobile";
 import { useEffect, useState } from "react";
-import { Lock, Compass, FileText, Activity, Sparkles, LogIn } from "lucide-react";
+import { Lock, Compass, FileText, Activity, LogIn } from "lucide-react";
 
 export default function Home() {
   const sidebarOpen = useChatStore((s) => s.sidebarOpen);
@@ -57,93 +57,59 @@ export default function Home() {
   // ── Authentication Lock Screen / Landing Gate ──
   if (!isAuthenticated) {
     return (
-      <div className="relative min-h-screen w-full flex flex-col items-center justify-center p-6 overflow-hidden bg-[#070510]">
-        {/* Cosmic Background Gradients */}
-        <div 
-          className="absolute top-[-20%] right-[-10%] w-[800px] h-[800px] pointer-events-none opacity-30 select-none animate-pulse duration-[10s]" 
-          style={{ background: 'radial-gradient(circle, rgba(168,85,247,0.15) 0%, rgba(168,85,247,0) 70%)' }} 
-        />
-        <div 
-          className="absolute bottom-[-20%] left-[-10%] w-[800px] h-[800px] pointer-events-none opacity-30 select-none animate-pulse duration-[8s]" 
-          style={{ background: 'radial-gradient(circle, rgba(244,113,181,0.1) 0%, rgba(244,113,181,0) 70%)' }} 
-        />
+      <div className="relative min-h-screen w-full flex flex-col items-center justify-center p-6 overflow-hidden bg-[var(--q-bg)]">
+        {/* Orbita landing gate: a calm centered card on the plain shell. */}
+        <div className="relative z-10 w-full max-w-[820px] flex flex-col items-center text-center space-y-8 q-rise">
 
-        {/* Floating star sparks mock */}
-        <div className="absolute inset-0 bg-[url('/stars_pattern.png')] bg-repeat opacity-20 pointer-events-none select-none" />
-
-        {/* Central Card */}
-        <div className="relative z-10 w-full max-w-[850px] flex flex-col items-center text-center space-y-8 animate-in fade-in zoom-in-95 duration-500">
-          
           {/* System Badge */}
-          <div className="glass-control flex items-center gap-2 px-4 py-1.5 rounded-full text-slate-300 text-xs font-semibold uppercase tracking-widest">
-            <Lock className="w-3.5 h-3.5 text-purple-400" />
-            Strict Access Control
+          <div className="q-pill h-8 px-3.5 text-xs text-[var(--q-text-muted)]">
+            <Lock className="w-3.5 h-3.5" strokeWidth={1.75} />
+            Strict access control
           </div>
 
           {/* Heading */}
-          <div className="space-y-4">
-            <h1 className="text-5xl md:text-6xl text-white font-[400] font-serif tracking-tight leading-none">
-              QUASAR
+          <div className="space-y-3">
+            <img src="/quasar_logo.png" alt="" className="mx-auto size-12 rounded-full object-contain" />
+            <h1 className="text-4xl md:text-5xl font-medium tracking-tight leading-none text-[var(--q-text)]">
+              Quasar
             </h1>
-            <p className="text-base md:text-lg text-slate-400 max-w-[600px] mx-auto font-sans font-light">
-              An AI-Powered Research Assistant for Advanced Astronomy Workflows & Multi-Archive Radio Observations.
+            <p className="text-[15px] md:text-base text-[var(--q-text-muted)] max-w-[560px] mx-auto">
+              An AI research assistant for astronomy workflows and multi-archive radio observations.
             </p>
           </div>
 
           {/* Central Call-to-action */}
-          <div className="flex flex-col items-center space-y-4">
-            <button
-              onClick={openAuthModal}
-              className="flex items-center gap-3 bg-white hover:bg-slate-200 text-black font-semibold text-base py-4 px-10 rounded-2xl shadow-xl shadow-purple-950/20 transition-all duration-300 transform hover:scale-[1.02] group"
-            >
-              <LogIn className="w-5 h-5 group-hover:translate-x-0.5 transition-transform" />
-              Sign In to Workspace
+          <div className="flex flex-col items-center space-y-3">
+            <button onClick={openAuthModal} className="q-pill-ink h-11 px-7 text-[14px] group">
+              <LogIn className="w-4 h-4 transition-transform group-hover:translate-x-0.5" strokeWidth={1.75} />
+              Sign in to workspace
             </button>
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-[var(--q-text-faint)]">
               Only authorized investigators can access conversation and tool pipelines.
             </p>
           </div>
 
           {/* Feature Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full pt-10 border-t border-slate-900/60">
-            {/* Card 1 */}
-            <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
-              <div className="p-3 rounded-xl bg-purple-500/10 text-purple-400 mb-4 border border-purple-500/10">
-                <Compass className="w-5 h-5" />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 w-full pt-8 border-t border-[var(--q-border)]">
+            {[
+              { icon: Compass, title: "Conductor DAG engine", body: "Decomposes complex research prompts into parallel steps that query the CADC and ALMA science archives automatically." },
+              { icon: FileText, title: "FITS processing", body: "Upload images or tables to analyze spectral line coverage and CO isotope maps, and resolve SIMBAD coordinates." },
+              { icon: Activity, title: "Observability and privacy", body: "End-to-end tracing with secure encryption. You control your query history and persistence." },
+            ].map(({ icon: Icon, title, body }, i) => (
+              <div key={title} className="glass-card q-rise flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl" style={{ animationDelay: `${80 + i * 60}ms` }}>
+                <div className="mb-4 flex size-9 items-center justify-center rounded-xl bg-[var(--q-canvas)] text-[var(--q-text-muted)]">
+                  <Icon className="w-[18px] h-[18px]" strokeWidth={1.75} />
+                </div>
+                <h3 className="text-[13px] font-medium text-[var(--q-text)] mb-1.5">{title}</h3>
+                <p className="text-xs text-[var(--q-text-muted)] leading-relaxed">{body}</p>
               </div>
-              <h3 className="text-sm font-semibold text-slate-200 mb-2">Conductor DAG Engine</h3>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Decomposes complex research prompts into parallel processing steps to query CADC & ALMA science archives automatically.
-              </p>
-            </div>
-
-            {/* Card 2 */}
-            <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
-              <div className="p-3 rounded-xl bg-fuchsia-500/10 text-fuchsia-300 mb-4 border border-fuchsia-500/10">
-                <FileText className="w-5 h-5" />
-              </div>
-              <h3 className="text-sm font-semibold text-slate-200 mb-2">FITS Processing</h3>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Upload images or raw tables to analyze spectral line coverage, CO isotope maps, and resolve Simbad coordinates instantly.
-              </p>
-            </div>
-
-            {/* Card 3 */}
-            <div className="glass-card flex flex-col items-center md:items-start text-center md:text-left p-5 rounded-2xl">
-              <div className="p-3 rounded-xl bg-indigo-500/10 text-indigo-400 mb-4 border border-indigo-500/10">
-                <Activity className="w-5 h-5" />
-              </div>
-              <h3 className="text-sm font-semibold text-slate-200 mb-2">Observability & Privacy</h3>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Full end-to-end tracing via Langfuse with secure encryption. You control your query histories and database persistence.
-              </p>
-            </div>
+            ))}
           </div>
 
           {/* Legal link footer */}
-          <div className="text-[11px] text-slate-600 pt-6">
+          <div className="text-[11px] text-[var(--q-text-faint)] pt-4">
             By signing in, you agree to our{" "}
-            <a href="/terms" className="underline hover:text-slate-400 transition-colors">Terms & Conditions & Privacy Policy</a>.
+            <a href="/terms" className="underline hover:text-[var(--q-text)] transition-colors">Terms &amp; Conditions &amp; Privacy Policy</a>.
           </div>
         </div>
 
@@ -179,7 +145,8 @@ export default function Home() {
 
       {/* ── DESKTOP: sidebar as a push panel ── */}
       {!isMobile && (
-        <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} transition-all duration-300 shrink-0 overflow-hidden`}>
+        // Orbita: the icon rail is always visible; opening adds the list panel beside it.
+        <div className={`${sidebarOpen ? "w-[calc(var(--q-sidebar-rail-width)+var(--q-sidebar-width))]" : "w-[var(--q-sidebar-rail-width)]"} transition-all duration-300 shrink-0 overflow-hidden`}>
           <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
         </div>
       )}
@@ -192,15 +159,6 @@ export default function Home() {
       {/* Onboarding Tutorial — first visit only */}
       {showOnboarding && <OnboardingOverlay onComplete={dismissOnboarding} />}
 
-      {/* Radial ambient glow gradients */}
-      <div 
-        className="fixed top-[-10%] right-[-5%] w-[500px] h-[500px] pointer-events-none" 
-        style={{ background: 'radial-gradient(circle, rgba(244,113,181,0.05) 0%, rgba(244,113,181,0) 70%)' }} 
-      />
-      <div 
-        className="fixed bottom-[-10%] left-[-5%] w-[600px] h-[600px] pointer-events-none" 
-        style={{ background: 'radial-gradient(circle, rgba(168,85,247,0.05) 0%, rgba(168,85,247,0) 70%)' }} 
-      />
     </>
   );
 }

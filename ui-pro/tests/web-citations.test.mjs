@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
     citationIdFromHref,
     citationLabel,
+    distinctPathHints,
     hasEvidenceIds,
     mergeTurnWebSources,
     normalizeWebSource,
@@ -152,4 +153,39 @@ test("CX-22: indented code, existing links and escaped tags are not tokenized", 
     assert.ok(out.includes("\\[W2\\]"), "escaped tag stays as typed");
     assert.match(out, /and \[2\]\(#web-cite-W2\)\./);
     assert.match(out, /continued \[1\]\(#web-cite-W1\)$/);
+});
+
+test("duplicate-title hints differ even when the last two path segments match (CX-24)", () => {
+    const hints = distinctPathHints([
+        { title: "Guide", url: "https://example.org/2024/docs/guide" },
+        { title: "guide ", url: "https://example.org/2025/docs/guide/" },
+        { title: "Other", url: "https://example.org/a/b/c" },
+    ]);
+    assert.deepEqual(hints, ["/2024/docs/guide", "/2025/docs/guide", ""]);
+});
+
+test("duplicate-title hints keep two segments when that is enough, add the query only when paths match", () => {
+    assert.deepEqual(
+        distinctPathHints([
+            { title: "T", url: "https://e.org/x/cycle12/guide" },
+            { title: "T", url: "https://e.org/x/cycle13/guide" },
+        ]),
+        ["/cycle12/guide", "/cycle13/guide"],
+    );
+    assert.deepEqual(
+        distinctPathHints([
+            { title: "Search", url: "https://e.org/find?q=m31" },
+            { title: "Search", url: "https://e.org/find?q=m33" },
+        ]),
+        ["/find?q=m31", "/find?q=m33"],
+    );
+    // different hosts already tell same-path pages apart; malformed URLs do not throw
+    assert.deepEqual(
+        distinctPathHints([
+            { title: "FAQ", url: "https://a.org/help/faq" },
+            { title: "FAQ", url: "https://b.org/help/faq" },
+            { title: "FAQ", url: "not a url" },
+        ]),
+        ["/help/faq", "/help/faq", ""],
+    );
 });

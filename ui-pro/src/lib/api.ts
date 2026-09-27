@@ -1160,6 +1160,23 @@ export interface ServerConversation {
     created_at: string;
     updated_at: string;
     model?: string;
+    is_starred?: boolean;
+}
+
+/** Persist a conversation's star. Returns false on any failure (the caller
+ *  reverts its optimistic toggle). */
+export async function setConversationStarred(conversationId: string, starred: boolean): Promise<boolean> {
+    try {
+        const res = await fetch(`${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/star`, {
+            credentials: "include",
+            method: "PUT",
+            headers: authHeaders(),
+            body: JSON.stringify({ starred }),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
 }
 
 export interface ServerMessage {

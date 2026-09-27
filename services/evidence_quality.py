@@ -6,6 +6,7 @@ search provider returned the result.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
@@ -109,6 +110,17 @@ AUTHORITY_RULES: tuple[AuthorityRule, ...] = (
     ),
 )
 
+# A publication signal as a WORD: journal abbreviations, an arXiv id, "et al."
+# next to a year. Bare "journal" / "accepted" are not signals (see
+# assess_web_source_quality).
+# The bare word "arXiv" is not a signal ("How to search arXiv"); an identifier is.
+_re_scholarly = re.compile(
+    r"\b(?:apj|apjs|apjl|mnras|a&a|aj|pasp|pasj|araa|nature astronomy)\b"
+    r"|\barxiv(?::\s?|\s|\.org/(?:abs|pdf)/)\d{4}\.\d{4,5}(?:v\d+)?\b"
+    r"|\b(?:arxiv:\s?)?astro-ph/\d{7}\b",
+    re.IGNORECASE,
+)
+
 GENERAL_QUALITY = {
     "score": 42,
     "tier": "general",
@@ -153,7 +165,16 @@ def assess_web_source_quality(url: str, title: str = "", snippet: str = "") -> D
             break
 
     if best is None:
-        if any(term in title_l or term in snippet_l for term in ("doi:", "bibcode", "journal", "accepted", "apj", "mnras")):
+        # Publication signals only: a DOI, an ADS bibcode, an arXiv id or a
+        # journal abbreviation as a WORD. The bare words "journal" / "accepted"
+        # labelled a Merriam-Webster definition page "Likely scholarly"
+        # (live 2026-09-25) and are gone.
+        _text = f"{title_l} {snippet_l}"
+        if (
+            "doi:" in _text
+            or "bibcode" in _text
+            or _re_scholarly.search(_text)
+        ):
             return {
                 "score": 74,
                 "tier": "institutional",

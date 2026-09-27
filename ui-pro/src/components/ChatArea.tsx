@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { PanelLeft, Star, ArrowDown } from "lucide-react";
+import { PanelLeft, Star, ArrowDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../lib/store";
 import { sendChatMessage, reviewProposal, submitPlanFeedback } from "../lib/api";
 import { EmptyState } from "./EmptyState";
@@ -26,6 +26,7 @@ import {
     normalizeWebDecision,
     normalizeWebSearchMode,
 } from "../lib/web-citations.js";
+import { turnPaperCount } from "../lib/research-timeline.js";
 
 const WEB_SEARCH_MODE_KEY = "quasar-web-search-mode";
 import { buildObservationPaperGraph } from "../lib/research-graph";
@@ -46,7 +47,7 @@ export function ChatArea() {
         toggleSidebar,
         activeConversationId, setActiveConversation,
         selectedModel, conversations,
-        toggleStar,
+        toggleStar, createNewConversation,
         thinkingSteps, thinkingStatus, addThinkingStep, heartbeatThinkingStep, clearThinking,
         attachThinkingToLastMessage,
         taskGroups, taskItems, taskChecklist, taskExecutionActive,
@@ -961,32 +962,48 @@ export function ChatArea() {
         : "New Research Session";
 
     return (
-        <main className={`flex-1 flex flex-col h-full overflow-hidden relative z-10 ${hasMessages ? "chat-session-active" : ""}`}>
+        <main className={`flex-1 flex flex-col h-full overflow-hidden relative z-10 bg-[var(--q-bg)] ${hasMessages ? "chat-session-active" : ""}`}>
             {isMobileHome ? (
                 <MobileHomeBar />
             ) : (
-                <header className="shrink-0 flex items-center justify-between px-3 md:px-6 py-1.5 md:py-2 border-b border-slate-800/80 glass-panel">
-                    <div className="flex items-center gap-3">
-                        <button onClick={toggleSidebar} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/10 transition-all"><PanelLeft className="w-5 h-5" /></button>
-                        <h2 className="text-base font-semibold text-white tracking-tight">
-                            {hasMessages ? messages[0].content.slice(0, 50) + (messages[0].content.length > 50 ? "…" : "") : conversationTitle}
+                <header className="shrink-0 flex items-center justify-between gap-3 px-3 md:px-5 py-2.5 md:py-3 bg-[var(--q-bg)]">
+                    <div className="flex min-w-0 items-center gap-2.5">
+                        <button onClick={toggleSidebar} title="Toggle sidebar"
+                            className="shrink-0 rounded-full p-2 text-[var(--q-text-muted)] transition-colors hover:bg-[var(--q-glass-control-hover)] hover:text-[var(--q-text)]">
+                            <PanelLeft className="h-[18px] w-[18px]" strokeWidth={1.75} />
+                        </button>
+                        <h2 className="truncate text-[15px] font-medium tracking-tight text-[var(--q-text)]">
+                            {hasMessages ? messages[0].content.slice(0, 60) + (messages[0].content.length > 60 ? "…" : "") : conversationTitle}
                         </h2>
+                        <span className="q-tag hidden shrink-0 sm:inline-flex" title="Model for the next message">{selectedModel}</span>
                     </div>
-                    <div className="flex items-center gap-1 transition-opacity">
+                    <div className="flex shrink-0 items-center gap-2">
+                        {hasMessages && activeConversationId && (
+                            <button
+                                onClick={() => toggleStar(activeConversationId)}
+                                title="Star this chat"
+                                aria-pressed={isStarred}
+                                className="q-pill h-9 px-3.5 text-[13px]"
+                            >
+                                <span className="hidden sm:inline">{isStarred ? "Starred" : "Star"}</span>
+                                <Star className={`h-4 w-4 ${isStarred ? "text-amber-500" : ""}`} strokeWidth={1.75} fill={isStarred ? "currentColor" : "none"} />
+                            </button>
+                        )}
                         <button
-                            onClick={() => activeConversationId && toggleStar(activeConversationId)}
-                            title="Star this chat"
-                            className={`p-2 rounded-lg transition-all ${isStarred
-                                ? "text-yellow-500 hover:bg-white/10 hover:text-yellow-400"
-                                : "text-slate-400 hover:text-yellow-500 hover:bg-white/10"
-                                }`}
+                            onClick={() => createNewConversation()}
+                            title="New chat"
+                            className="q-pill-ink h-9 px-4 text-[13px]"
                         >
-                            <Star className="w-[18px] h-[18px]" fill={isStarred ? "currentColor" : "none"} />
+                            <span className="hidden sm:inline">New Chat</span>
+                            <Sparkles className="h-4 w-4" strokeWidth={1.75} />
                         </button>
                     </div>
                 </header>
             )}
 
+            {/* Orbita canvas: the conversation and the composer sit on one
+                inset light-grey panel below the white header. */}
+            <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden q-canvas md:mx-3 md:mb-3 md:rounded-2xl">
             {hasMessages ? (
               <>
                 <div
@@ -1020,6 +1037,8 @@ export function ChatArea() {
                                 if (webView === "hide") return null;
                                 if (webView === "images-only") msg = { ...msg, webSources: [] };
                                 const isLastAssistant = isStreaming && i === lastTextAssistantIdx;
+                                const hasResearch = msg.role === "assistant"
+                                    && (isLastAssistant || !!msg.thinkingSteps?.length || !!msg.thinking);
                                 // Task execution state persists AFTER streaming ends
                                 // so the widget auto-collapses instead of vanishing.
                                 const isLastAssistantMsg = i === lastTextAssistantIdx;
@@ -1048,6 +1067,10 @@ export function ChatArea() {
                                         observationGraph={turnGraphs[msg.id]}
                                         reportPrompt={reportPrompt}
                                         turnWebSources={msg.type === "text" && groundedWeb ? webForTurn : undefined}
+                                        // Reloaded answers come back typed "general", not "text",
+                                        // so key the timeline data on having research steps.
+                                        researchSources={hasResearch ? (msg.type === "text" ? webForTurn : (webSourcesForTurn(messages, i) as WebSource[])) : undefined}
+                                        researchPaperCount={hasResearch ? turnPaperCount(messages, i) : undefined}
                                     />
                                 );
                             });
@@ -1068,10 +1091,10 @@ export function ChatArea() {
                     <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20">
                         <button
                             onClick={scrollToBottom}
-                            className="glass-control w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200 hover:scale-110 animate-in fade-in slide-in-from-bottom-2 duration-200"
+                            className="q-pill h-9 w-9 animate-scrim-in"
                             style={{
                                 color: 'var(--q-text-secondary)',
-                                boxShadow: '0 4px 16px -2px rgba(0,0,0,0.25)',
+                                boxShadow: 'var(--q-popover-shadow)',
                             }}
                             title="Scroll to bottom"
                         >
@@ -1129,6 +1152,7 @@ export function ChatArea() {
                 )}
               </>
             )}
+            </div>
         </main>
     );
 }

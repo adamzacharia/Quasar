@@ -110,7 +110,9 @@ def test_prices_are_exact_or_version_prefix_never_family_guesses():
     assert price("gpt-4.1").inputPricePerM == 2
     assert price("gpt-4.1-2025-04-14").inputPricePerM == 2
     assert price("gpt-4.1-unannounced").inputPricePerM is None
-    assert price("gpt-5.4-mini").inputPricePerM is None
+    # Verified 2026-09-27, so the catalog now shows it.
+    assert price("gpt-5.4-mini").inputPricePerM == 0.75
+    assert price("gpt-5.4-mini-ultra").inputPricePerM is None
 
 
 @pytest.fixture

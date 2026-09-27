@@ -1,0 +1,6 @@
+{"source": "https://mmdc.am/assets/index-B6Lud6G6.js (fetched 2026-09-26)",
+ "SSC": {"z": [0, 10], "lorentz_factor": [3, 50], "log_radius": [15, 18], "log_gamma_min": [1.5, 5], "log_gamma_cut": [2, 8], "spectral_index": [1.8, 5], "log_electron_luminosity": [42, 48], "log_B": [-3, 2]},
+ "EIC": {"z": [0, 10], "lorentz_factor": [3, 50], "log_radius": [15, 18], "log_gamma_min": [1.5, 5], "log_gamma_cut": [2, 6], "spectral_index": [1.8, 5], "log_electron_luminosity": [42, 48], "log_B": [-3, 2.5], "log_Ld": [43.5, 47], "log_MBH": [7, 10], "log_nu_BLR": [14.5, 16], "log_nu_DT": [12.5, 14]},
+ "HADRONIC": {"z": [0, 10], "lorentz_factor": [3.5, 80], "log_B": [-3, 3.5], "log_Le": [42.5, 48.5], "log_gamma_e_cut": [2, 8], "log_gamma_e_min": [1.5, 2], "log_gamma_p_cut": [3, 11], "log_Lp": [42, 52], "log_R": [14.5, 18], "pe": [1.75, 5], "pp": [1.65, 3.45]},
+ "neutrino": {"chi2_y_log_flux": [-16, -9], "chi2_x1_E1_TeV": [1, 1000], "chi2_x2_E2_TeV": [100, 10000], "poisson_dt_months": [1, 120], "poisson_n_icecube": [1, 100]},
+ "citations_web_ui": ["Begue, Sahakyan, Dereli Begue, et al., 2024, ApJ, 963, 71 (2024ApJ...963...71B)", "Sahakyan, Begue, Casotto, et al., 2024, ApJ, 971, 70 (2024ApJ...971...70S)", "Sahakyan, Vardanyan, Giommi, et al., 2024, AJ, 168, 289 (2024AJ....168..289S)"]}

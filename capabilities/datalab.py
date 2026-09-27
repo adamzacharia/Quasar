@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -900,7 +901,68 @@ class ConeCount(BaseCapability):
                 meta.setdefault("warnings", []).append(quality_note)
         except Exception as e:
             return datalab_error(e)
-        return execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+        res = execute_datalab_sql(sql, meta, tool_name=self.name, ctx=ctx)
+        try:
+            native = res.native if isinstance(res.native, dict) else None
+            executed = getattr(res.provenance, "query", None) if res.provenance is not None else None
+            if res.success and native is not None and executed and native.get("reported_count") is not None:
+                native["python_code"] = datalab_python_template(
+                    executed, int(native["reported_count"]), inp.catalog, inp.table)
+                native["python_code_note"] = (
+                    "Verified Data Lab client script for exactly this query. Only if the user asked for code, give it "
+                    "VERBATIM in a ```python block; never use astroquery.datalab (it does not exist).")
+        except Exception:
+            pass  # the template is a convenience; never fail the count over it
+        return res
+
+
+def datalab_python_template(count_sql: str, count: int, catalog: str, table: str) -> str:
+    """A runnable Data Lab client script for an executed cone COUNT query: the
+    count itself, the matching rows, and (when the table has a redshift column)
+    a histogram. ArchiveBench AB-D-57 (2026-09-26): asked for Python, gpt-oss
+    imported a nonexistent ``astroquery.datalab``; notebook_gen.py already uses
+    the real client (``from dl import queryClient as qc``)."""
+    cols = []
+    try:
+        info = (datalab_registry.DATALAB_CATALOGS.get(str(catalog).lower(), {}).get("tables") or {}).get(str(table).lower()) or {}
+        registered = [str(c) for c in (info.get("columns") or [])]
+        for c in ("targetid", "source_id", "objid", info.get("ra_column"), info.get("dec_column"),
+                  "z", "zwarn", "spectype"):
+            if c and c in registered and c not in cols:
+                cols.append(c)
+    except Exception:
+        registered = []
+    select = ", ".join(cols) if cols else "*"
+    rows_sql = re.sub(r"^\s*SELECT\s+COUNT\(\*\)\s+AS\s+row_count", f"SELECT {select}", count_sql.strip(), count=1, flags=re.I)
+    # A synchronous pull stays bounded (guard CX-11); a bigger cone says so.
+    row_bound = 100000
+    capped = int(count) > row_bound
+    if capped:
+        rows_sql += f"\nLIMIT {row_bound}"
+    lines = [
+        "# Data Lab client (pip install astro-datalab); anonymous access is enough for public catalogs.",
+        "from dl import queryClient as qc",
+        "",
+        f'count_sql = """{count_sql.strip()}"""',
+        "print(qc.query(sql=count_sql, fmt='pandas'))  # row_count = " + f"{count}",
+        "",
+        f'rows_sql = """{rows_sql}"""',
+        "df = qc.query(sql=rows_sql, fmt='pandas')",
+        (f"print(len(df), 'rows')  # expect {count}" if not capped else
+         f"print(len(df), 'rows')  # the cone has {count}; this pulls the first {row_bound} (storage order, not a "
+         "random sample), so use an async query job for the full set"),
+    ]
+    if "z" in cols:
+        lines += [
+            "",
+            "import matplotlib.pyplot as plt",
+            "plt.hist(df['z'], bins=60)",
+            "plt.xlabel('redshift z'); plt.ylabel('N')",
+            (f"plt.title('{catalog}.{table}: {count} redshifts')" if not capped else
+             f"plt.title('{catalog}.{table}: first {row_bound} of {count} redshifts (storage-order slice)')"),
+            "plt.show()",
+        ]
+    return "\n".join(lines)
 
 
 class SelectCatalogRows(BaseCapability):
@@ -1583,7 +1645,7 @@ class ColorImage(BaseCapability):
             mapping_state = "used" if result.get("color_hips_completion") else "would be used"
         rgb = {"red": red, "green": green, "blue": blue, "state": mapping_state,
                "rule": "reddest band -> red, middle -> green, bluest -> blue",
-               "stretch": {"method": "Lupton et al. (2004) asinh (make_lupton_rgb)", "Q": q, "stretch": stretch}}
+               "stretch": {"method": "Lupton et al. (2004) asinh stretch", "Q": q, "stretch": stretch}}
         key = next((k for k in cls._D25_ARCMIN if k in str(label).lower()), None)
         if key:
             name, d25 = cls._D25_ARCMIN[key]
@@ -2075,19 +2137,55 @@ class ColorMagnitudeDiagram(BaseCapability):
             blue_band = inp.blue_band or "g"
             red_band = inp.red_band or "r"
             ra_f, dec_f, label = _resolve_coords(inp.target_name, inp.ra, inp.dec, ctx)
-            out = datalab_orchestration.color_magnitude_diagram(
-                inp.catalog, table, ra_f, dec_f, radius_deg,
-                blue_band=blue_band, red_band=red_band, mag_band=inp.mag_band, limit=limit,
-                title=inp.title or f"{inp.catalog} CMD: {label}",
-                point_sources=bool(inp.point_sources), morphology=inp.morphology,
-                value_cuts=inp.value_cuts, x_expr=inp.x_expr, y_expr=inp.y_expr,
-                overlay_locus=inp.overlay_locus,
-                owner_id=(str(ctx.user_id) if ctx.user_id else None),  # dl-export-owner-gap
-            )
+
+            def _cmd(catalog, tbl):
+                return datalab_orchestration.color_magnitude_diagram(
+                    catalog, tbl, ra_f, dec_f, radius_deg,
+                    blue_band=blue_band, red_band=red_band, mag_band=inp.mag_band, limit=limit,
+                    title=inp.title or f"{catalog} CMD: {label}",
+                    point_sources=bool(inp.point_sources), morphology=inp.morphology,
+                    value_cuts=inp.value_cuts, x_expr=inp.x_expr, y_expr=inp.y_expr,
+                    overlay_locus=inp.overlay_locus,
+                    owner_id=(str(ctx.user_id) if ctx.user_id else None),  # dl-export-owner-gap
+                )
+
+            catalog = inp.catalog
+            out = _cmd(catalog, table)
+            # An older release that returns no rows is not a coverage verdict:
+            # SMASH DR1 is empty over the SMC bar while DR2 has ~860k rows there
+            # (ArchiveBench AB-D-55, 2026-09-26: "SMASH has no coverage").
+            successor = datalab_registry.newer_release(catalog)
+            if successor and isinstance(out, dict) and out.get("success") and int(out.get("rowcount") or 0) == 0:
+                succ_table = table if datalab_registry.has_table(successor, table) else datalab_registry.default_table(successor)
+                try:
+                    newer = _cmd(successor, succ_table)
+                    newer_err = None if (isinstance(newer, dict) and newer.get("success")) else (
+                        (newer or {}).get("error") if isinstance(newer, dict) else "no result")
+                except Exception as exc:  # the DR1 result stays valid; say DR2 was not checked
+                    newer, newer_err = None, f"{type(exc).__name__}: {exc}"
+                if newer_err is not None:
+                    note = (f"{catalog}.{table} returned no rows in this cone and the newer release {successor} could "
+                            f"not be checked ({str(newer_err)[:200]}); an empty older release is not evidence of no "
+                            "coverage. Say so in the answer.")
+                    out.setdefault("warnings", [])
+                    if isinstance(out["warnings"], list):
+                        out["warnings"].append(note)
+                    out["release_fallback"] = {"requested": catalog, "used": catalog, "checked": successor,
+                                               "error": str(newer_err)[:200], "note": note}
+                if isinstance(newer, dict) and newer.get("success"):
+                    note = (f"{catalog}.{table} returned no rows in this cone; the diagram uses the newer release "
+                            f"{successor}.{succ_table} instead. Say so in the answer.")
+                    if int(newer.get("rowcount") or 0) == 0:
+                        note = (f"Both {catalog}.{table} and {successor}.{succ_table} returned no rows in this cone.")
+                    newer.setdefault("warnings", [])
+                    if isinstance(newer["warnings"], list):
+                        newer["warnings"].append(note)
+                    newer["release_fallback"] = {"requested": catalog, "used": successor, "note": note}
+                    out, catalog, table = newer, successor, succ_table
             if isinstance(out, dict):
                 out["_caption"] = inp.title or f"Color-magnitude diagram: {label}"
                 if out.get("success") and not (inp.x_expr or inp.y_expr) and radius_deg <= 0.8:
-                    out["features"] = self._population_features(inp.catalog, table, ra_f, dec_f, radius_deg, ctx)
+                    out["features"] = self._population_features(catalog, table, ra_f, dec_f, radius_deg, ctx)
                     out["answer_guidance"] = ("State the depth (the bound applied and the turnover magnitude from `depth`) and "
                                               "which CMD features are present from `features` (verdict, and turnoff / RGB / BHB "
                                               "excess over the surrounding field). Do not claim features it did not find.")

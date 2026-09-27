@@ -7,6 +7,19 @@ export function findLastAssistantTextIndex(messages) {
     return -1;
 }
 
+// Block types a server row may legitimately carry. Anything else ("general",
+// the backend's default message_type, or a missing value) is a plain answer
+// and must become "text": the [W#] chips, the sources strip and the
+// last-answer lookups above all key on type "text", so a reloaded turn typed
+// "general" rendered raw [W#] tags and the full web_sources card.
+const SERVER_MESSAGE_TYPES = new Set([
+    "text", "data", "papers", "tool_call", "image", "plotly", "critique", "notebook", "web_sources",
+]);
+
+export function normalizeServerMessageType(type) {
+    return SERVER_MESSAGE_TYPES.has(type) ? type : "text";
+}
+
 export function sanitizeAssistantContent(content) {
     const text = String(content ?? "");
     return text.replace(/(?:\u{1F9D1}\u200D)?\u{1F52C}\s*/gu, "");

@@ -119,6 +119,27 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+# Text a round writes before its tool calls is held up to this many characters
+# and, when a tool call follows, shown as a thinking step instead of answer
+# prose. Longer text is treated as answer and streams live. 0 disables.
+_NARRATION_HOLD_CHARS = _env_int("QUASAR_NARRATION_HOLD_CHARS", 500, minimum=0)
+
+
+def _emit_narration_step(on_status, text: str) -> None:
+    """Show pre-tool narration in the Thought panel (one step per line)."""
+    if not on_status:
+        return
+    try:
+        # gpt-oss harmony markup must not reach the Thought panel either.
+        clean = strip_harmony_markup(str(text or "")) if "<|" in str(text or "") else str(text or "")
+        for line in clean.splitlines():
+            line = line.strip()
+            if line:
+                on_status(f"💭 {line[:300]}", "completed")
+    except Exception:
+        pass  # status streaming is cosmetic; never fail the round over it
+
+
 # The forced final round when the tool budget of a turn is spent. The model
 # must summarise -- never invent -- what the collected results support.
 TOOL_BUDGET_FINAL_NOTE = (
@@ -767,6 +788,9 @@ def _stream_response_api_impl(
         agent.last_search_results = None
         agent._tls.current_conversation_id = conversation_id
         agent._tls.current_user_id = user_id
+        # This request's user MCP tools (name -> Tool), filled when the tool
+        # list is built; defined up front so every dispatch path can read it.
+        _user_mcp_tools: dict = {}
         # Cleared per turn; set by the error paths below so the SSE layer can
         # record the run as failed even though the user sees a friendly message
         # returned as normal text (provider failures used to land in chat_runs
@@ -1330,6 +1354,19 @@ def _stream_response_api_impl(
             r'\b(?:observation|observations|data)\b.*\b(?:of|for|from|available)\b',
             _query_lower,
         ))
+        # Live archive facts (a project code, "who is the PI", "how many ...
+        # according to", "is there public ... data"): with documentation
+        # context gpt-oss answered from the excerpts and never queried
+        # (ArchiveBench dev 2026-09-26, AB-D-41/48/49/51).
+        if not _is_archive_fetch:
+            try:
+                from core.rag_routing import live_archive_fact_request
+
+                _is_archive_fetch = live_archive_fact_request(_user_query)
+                if _is_archive_fetch:
+                    print("[ROUTING] live archive fact request -> archive tools, no documentation RAG")
+            except Exception as _live_fact_err:
+                print(f"[ROUTING] live-fact check failed (non-fatal): {_live_fact_err}")
         if _is_archive_fetch:
             _should_rag = False
 
@@ -1770,6 +1807,24 @@ def _stream_response_api_impl(
         # 3. Build tools list
         # `or []`: an allowlist that matches nothing yields no tools, not a crash (guard CX-10).
         tools = agent._build_tools_for_responses_api() or []
+        # This user's own MCP servers (Settings > MCP Servers). Scoped to the
+        # request: the shared agent's registry never holds them, so one user's
+        # servers (and credentials) never reach another user's turn. Skipped in
+        # benchmark arms so a saved server cannot change a measured toolset.
+        if not _bench_ts.active():
+            try:
+                from services.user_mcp import get_user_mcp_pool
+
+                for _mt in get_user_mcp_pool().tools_for(user_id):
+                    _user_mcp_tools[_mt.name] = _mt
+                    tools.append({
+                        "type": "function",
+                        "name": _mt.name,
+                        "description": _mt.description,
+                        "parameters": _mt.parameters,
+                    })
+            except Exception as _umcp_err:
+                print(f"[UserMCP] could not load user MCP tools (non-fatal): {_umcp_err}")
         disabled_web_note = ""
         _has_web_tool = any(str(t.get("name", "")).startswith("web_") for t in tools)
         if _bench_ts.active():
@@ -1810,7 +1865,7 @@ def _stream_response_api_impl(
                 "'[Source: alma-proposers-guide-cycle13.pdf, Page 36, Date: February 2026, Relevance: 0.88]', "
                 "write EXACTLY that string after the sentence that uses info from that chunk. "
                 "NEVER write 'Page unknown', 'Date: unknown', or make up your own Relevance scores.\n"
-                "2. After presenting the documentation-based answer, add a disclaimer line: "
+                "2. If your answer uses the documentation context, add this disclaimer line after that part: "
                 "'*📚 The above is sourced from ALMA Documentation, tutorials, and community notebooks and may not reflect the very latest policies.*'\n"
                 "3. WEB EVIDENCE: ONLY if a WEB EVIDENCE block with [W#] tags is present in your context, cite each "
                 "web fact inline with its tag right after the claim (e.g. [W2]); do not add a separate web section and "
@@ -1818,6 +1873,9 @@ def _stream_response_api_impl(
                 "(a documentation-only answer is fine)."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}{disabled_web_note}\n\nUser: {query}"
+        # v2 bundle: everything appended after this point in round 0 is route
+        # directive text and counts toward the per-turn workflow budget.
+        _full_input_base_len = len(full_input)
 
         # 4b. Paper query safety net — even if RAG context leaked in above,
         #     force the LLM to call search_papers (ADS) for paper queries.
@@ -1928,7 +1986,7 @@ def _stream_response_api_impl(
             from core.oneshot_routing import census_directive
 
             full_input += census_directive(_alma_science_route)
-        elif _oneshot_tool and _oneshot_tool.startswith("datalab_"):
+        elif _oneshot_tool and (_oneshot_tool.startswith(("datalab_", "mmdc_")) or _oneshot_tool == "variability_analysis"):
             full_input += _oneshot_intent["directive"]
         elif _oneshot_tool in {"alma_archive_link", "alma_public_band_status", "code_recipe"}:
             full_input += _oneshot_intent["directive"]
@@ -1938,14 +1996,14 @@ def _stream_response_api_impl(
                     "explanation; the tool result is authoritative for URLs, archive state and code.]"
                 )
         elif rag_context:
-            # Knowledge query with RAG context — explicitly prevent search_papers
-            knowledge_directive = (
-                "\n\n[SYSTEM NOTE: This is a KNOWLEDGE query answered from ALMA documentation. "
-                "Do NOT call `search_papers` — the user is asking about ALMA procedures, policies, "
-                "or technical details, NOT requesting scientific papers or publications. "
-                "Answer using the DOCUMENTATION CONTEXT provided above.]"
-            )
-            full_input += knowledge_directive
+            # Documentation context and no route directive. How-to / policy
+            # questions answer from the docs; anything else treats them as
+            # background and gets live facts from the tools. The old single
+            # "answer using the DOCUMENTATION CONTEXT" note made gpt-oss skip
+            # the archive tools (ArchiveBench dev 2026-09-26, AB-D-41/48/49/51).
+            from core.rag_routing import rag_directive
+
+            full_input += rag_directive(_user_query)
 
         # 4c. Prevent duplicate web searches — when the parallel cutoff search
         #     is already running, tell the LLM not to call web_search itagent.
@@ -1999,6 +2057,53 @@ def _stream_response_api_impl(
                 "Do NOT call the `web_search` tool yourself — the results will be appended "
                 "automatically after your response. Focus on answering from your knowledge.]"
             )
+
+        # 4-v2. Prompt bundle v2 (core/prompts/system_core.py): the static
+        #       system prompt carries no date and no workflow recipes. Assemble
+        #       the current-turn context ONCE here: the date (captured now,
+        #       reused by recovery), and the workflow playbooks selected from
+        #       the bare query and the resolved intents, under one cumulative
+        #       budget that the route directives appended above already count
+        #       toward. Skipped in the neutral benchmark arm together with the
+        #       one-shot directives.
+        _turn_state = None
+        _turn_date = ""
+        _turn_playbooks_sent = []
+        _prompt_v2_active = (
+            getattr(agent, "prompt_bundle", "legacy") == "v2" and not _bench_ts.active()
+        )
+        if _prompt_v2_active:
+            try:
+                from datetime import datetime as _dt_now
+                from core.prompts.playbooks import (
+                    INITIAL_BUDGET, TOTAL_BUDGET, TurnState,
+                    render_turn_context, select_initial_playbooks,
+                )
+                from core.prompts.system_core import count_tokens as _count_tokens
+
+                _turn_date = _dt_now.now().astimezone().strftime("%Y-%m-%d (%Z)")
+                _turn_state = TurnState()
+                _directive_tokens = _count_tokens(full_input[_full_input_base_len:])
+                _turn_state.spent_tokens = min(_directive_tokens, TOTAL_BUDGET)
+                _turn_state.log.append(f"round0: route directives {_directive_tokens} tok")
+                _resolved_intent = {
+                    "oneshot_tool": _oneshot_tool,
+                    "oneshot_args": (_oneshot_intent or {}).get("args") or {},
+                    "researcher": bool(_is_openalex_query and _is_researcher_query),
+                    "product_triage": bool(_is_data_product_triage_query),
+                }
+                _turn_playbooks_sent = select_initial_playbooks(
+                    _user_query, _resolved_intent,
+                    budget=max(0, INITIAL_BUDGET - _directive_tokens),
+                    state=_turn_state,
+                )
+                full_input += render_turn_context(_turn_date, "", _turn_playbooks_sent)
+                print(
+                    f"[PROMPT V2] date={_turn_date} playbooks={[p.id for p in _turn_playbooks_sent]} "
+                    f"omitted={_turn_state.omitted} spent={_turn_state.spent_tokens}"
+                )
+            except Exception as _pv2_err:  # never block the turn on prompt plumbing
+                print(f"[PROMPT V2] turn-context assembly failed: {_pv2_err}")
 
         # 4a. Conductor check — delegate complex queries to DAG orchestration
         #     IMPORTANT: The Conductor receives `_user_query` (the bare user question),
@@ -2285,6 +2390,7 @@ def _stream_response_api_impl(
             _web_tool_results: List[Dict[str, Any]] = []
             _all_tool_results = []  # every round's tool outputs (for the no-text safety net)
             tool_results: List[Dict[str, Any]] = []
+            _next_input = None  # v2: budgeted outputs + optional guidance item for the next round
 
             # Provider-truncation recovery (live P6/P8/P9: DeepSeek hits its
             # output-token cap mid-round; the stream ends cleanly and the
@@ -2379,7 +2485,10 @@ def _stream_response_api_impl(
                 )
                 request_kwargs = {
                     "model": selected_model,
-                    "input": full_input if _eff_round == 0 else tool_results,
+                    # Rounds > 0 send the budgeted tool outputs plus, in the v2
+                    # bundle, at most one user-role guidance item (_next_input);
+                    # the evidence accumulators never see that item.
+                    "input": full_input if _eff_round == 0 else (_next_input if _next_input is not None else tool_results),
                     "instructions": _instructions,
                     "previous_response_id": last_id,
                     "tools": tools,
@@ -2485,6 +2594,13 @@ def _stream_response_api_impl(
                     _round_finish_reason = None  # provider finish_reason for THIS round
                     _round_text_len_before = len(output_text)
                     _round_text_buffer = ""
+                    # Short text that precedes a tool call in the same round is
+                    # narration ("Let me retry with broader phrasing."), not
+                    # answer prose: hold it until the round shows whether a tool
+                    # call follows (ArchiveBench AB-D-59, WebBench TRN-02).
+                    _hold_narration = (
+                        not _buffer_round_text and not _finalizing and _NARRATION_HOLD_CHARS > 0
+                    )
 
                     _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
                     _round_had_reasoning = False
@@ -2552,10 +2668,20 @@ def _stream_response_api_impl(
                                     _reasoning_emitted = False
                                 if _buffer_round_text:
                                     _round_text_buffer += event.delta
+                                elif _hold_narration:
+                                    _round_text_buffer += event.delta
+                                    if len(_round_text_buffer) > _NARRATION_HOLD_CHARS:
+                                        # Too long for narration: this is answer
+                                        # text, stream it live from here on.
+                                        _hold_narration = False
+                                        output_text += _round_text_buffer
+                                        if on_token:
+                                            on_token(_round_text_buffer)
+                                        _round_text_buffer = ""
                                 else:
                                     output_text += event.delta
-                                if on_token and not _buffer_round_text:
-                                    on_token(event.delta)
+                                    if on_token:
+                                        on_token(event.delta)
                             elif event.type == "response.output_item.added":
                                 # Check if it's a function_call item
                                 item = event.item
@@ -2683,7 +2809,7 @@ def _stream_response_api_impl(
                             on_status("Provider stream interrupted — retrying", "completed")
                 
                 if not function_calls:
-                    if _buffer_round_text and _round_text_buffer:
+                    if _round_text_buffer:  # round-0 route buffer or held narration
                         output_text += _round_text_buffer
                         if on_token:
                             on_token(_round_text_buffer)
@@ -2740,6 +2866,10 @@ def _stream_response_api_impl(
                             "If you announced a tool call (rendering a plot, running a query), MAKE "
                             "that tool call now. Then finish your answer for the user."
                         )
+                        # The previous tool round's v2 bundle (outputs + playbook
+                        # item) was already sent; it must not take precedence
+                        # over the cutoff instruction on the next request.
+                        _next_input = None
                         continue
                     break  # No tool calls — we have the final text
 
@@ -2749,11 +2879,12 @@ def _stream_response_api_impl(
 
                 _had_tool_calls = True
                 _reasoning_only_retries = 0  # productive round: recovery budget is per logical round
-                if _buffer_round_text and _round_text_buffer:
+                if _round_text_buffer:
                     print(
                         f"[STREAM] Suppressed pre-tool assistant text "
-                        f"({len(_round_text_buffer)} chars)"
+                        f"({len(_round_text_buffer)} chars) — shown as a thinking step"
                     )
+                    _emit_narration_step(on_status, _round_text_buffer)
 
                 # Track output growth for smart budget. Tool-productive rounds count
                 # as progress even when the interleaved narration is short.
@@ -2764,6 +2895,7 @@ def _stream_response_api_impl(
                 
                 # Execute each function call and collect results
                 tool_results = []
+                _next_input = None
                 _round_duplicates = 0
                 for fc in function_calls.values():
                     # Check run liveness between tools, not only at round tops —
@@ -2910,7 +3042,9 @@ def _stream_response_api_impl(
                     _tool_timed_out = False
                     from core import bench_toolset as _bench_ts
 
-                    tool = agent.tool_registry.get_tool(tool_name) if _bench_ts.allowed(tool_name) else None
+                    tool = _user_mcp_tools.get(tool_name) or (
+                        agent.tool_registry.get_tool(tool_name) if _bench_ts.allowed(tool_name) else None
+                    )
                     if not tool:
                         # gpt-oss habitually typos tool names ("datlab_density_vetting")
                         # and then gives up after the Unknown-tool error (live test P12).
@@ -3163,6 +3297,26 @@ def _stream_response_api_impl(
                 _duplicate_rounds = _duplicate_rounds + 1 if _round_duplicates == len(function_calls) else 0
                 tool_results = apply_tool_result_budget(tool_results)
                 _all_tool_results.extend(tool_results)
+                # v2 bundle: tool-observed playbook activation. Real results are
+                # budgeted and accumulated first (the budget protects the last
+                # two list entries by position, so guidance must not be in that
+                # list); the guidance travels only in the provider input.
+                if _prompt_v2_active and _turn_state is not None:
+                    try:
+                        from core.prompts.playbooks import (
+                            render_followup_item, result_flags_from_outputs, select_tool_followups,
+                        )
+                        _called = [fc.get("name") for fc in function_calls.values() if fc.get("name")]
+                        _new_pbs = select_tool_followups(
+                            _called, result_flags_from_outputs(tool_results), _turn_state,
+                        )
+                        _item = render_followup_item(_new_pbs)
+                        if _item is not None:
+                            _turn_playbooks_sent.extend(_new_pbs)
+                            _next_input = list(tool_results) + [_item]
+                            print(f"[PROMPT V2] follow-up playbooks={[p.id for p in _new_pbs]} after {_called}")
+                    except Exception as _pv2_err:
+                        print(f"[PROMPT V2] follow-up selection failed: {_pv2_err}")
 
             # A deadline/cancel break must not fall through into composition,
             # web-thread joins, and citation verification — that postprocessing
@@ -3224,6 +3378,17 @@ def _stream_response_api_impl(
             ):
                 if on_status:
                     on_status("Composing final answer from tool results", "running")
+                # Recovery is a standalone no-tools request: give it the date
+                # and the response-format guidance only. Playbook texts carry
+                # tool-calling directives that would contradict its "do not
+                # call tools" instruction (duel DX-14), so they stay out.
+                _recovery_context = ""
+                if _prompt_v2_active and _turn_date:
+                    _recovery_context = (
+                        f"\n\nTurn context\n- Current date: {_turn_date}\n"
+                        "- Response guidance: refer to tool-produced visuals and tables as the card; "
+                        "state only counts and cuts present in the tool results; relay every warning."
+                    )
                 output_text = agent._compose_final_answer_from_tools(
                     _user_query,
                     _all_tool_results,
@@ -3231,6 +3396,7 @@ def _stream_response_api_impl(
                     user_id=user_id,
                     conversation_id=conversation_id,
                     run_token=run_token,
+                    turn_context=_recovery_context,
                 )
                 if on_status:
                     on_status("Composing final answer from tool results", "completed")
@@ -3246,7 +3412,56 @@ def _stream_response_api_impl(
                 output_text = "I processed your query but didn't generate a text response. Please try rephrasing."
                 if on_token:
                     on_token(output_text)
-            
+
+            # The question asked for identifiers (bibcodes, DOIs, project codes,
+            # obs ids) or a count, the tools returned them, and the prose does
+            # not carry them (AB-D-59: "... is rendered in the paper cards").
+            # One no-tools synthesis round; kept only if it fixes the gap. The
+            # SSE layer replaces the streamed text with the returned text.
+            if (
+                output_text
+                and _had_tool_calls
+                and agent._response_run_active(conversation_id, selected_model, run_token)
+            ):
+                try:
+                    from core.answer_verifier import requested_items_missing
+
+                    _missing_items = requested_items_missing(_user_query, output_text, _all_tool_results)
+                    if _missing_items:
+                        _missing_str = ", ".join(_missing_items)
+                        print(f"[VERIFY] answer lacks the requested {_missing_str} — one synthesis re-ask")
+                        if on_status:
+                            on_status("Adding the requested details to the answer", "running")
+                        _reask_text = agent._compose_final_answer_from_tools(
+                            _user_query,
+                            _all_tool_results,
+                            selected_model,
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            run_token=run_token,
+                            extra_instruction=(
+                                f"The user explicitly asked for {_missing_str}. State them in the answer text "
+                                "itself, copied exactly from the tool results (for papers: first author, year, "
+                                "title and bibcode for each), even if cards also show them. Do not invent any "
+                                "that the results do not contain."
+                            ),
+                        )
+                        if on_status:
+                            on_status("Adding the requested details to the answer", "completed")
+                        if _reask_text and not requested_items_missing(_user_query, _reask_text, _all_tool_results):
+                            output_text = _reask_text
+                            print(f"[VERIFY] synthesis re-ask supplied the {_missing_str} ({len(output_text)} chars)")
+                        else:
+                            print("[VERIFY] synthesis re-ask did not supply them — keeping the original answer")
+                except Exception as _reask_err:
+                    # Aliased: a bare local import would make QuotaExceededError
+                    # local to this whole function and break the turn handler.
+                    from services.usage_quota_service import QuotaExceededError as _ReaskQuotaError
+
+                    if isinstance(_reask_err, _ReaskQuotaError):
+                        raise
+                    print(f"[VERIFY] requested-items check failed (non-fatal): {_reask_err}")
+
             print(f"[DEBUG] Response text length: {len(output_text)}")
 
             # 7a. Append parallel web search results if available -- only on

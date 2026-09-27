@@ -111,13 +111,16 @@ export function PaperCard({ paper, request }: PaperCardProps) {
                 </div>
                 <h4 className="text-sm font-bold text-white group-hover:text-primary transition-colors leading-snug">{paper.title}</h4>
                 <p className="text-xs text-slate-400 line-clamp-1">{paper.authors}</p>
+                {paper.bibcode && (
+                    <p className="text-[10px] font-mono text-slate-500 select-all" title="ADS bibcode">{paper.bibcode}</p>
+                )}
 
                 {/* Funder tags */}
                 {hasFunders && (
                     <div className="flex items-center gap-1.5 flex-wrap pt-1">
                         <span className="text-[9px] text-slate-500 font-semibold uppercase tracking-wider">Funded by</span>
                         {paper.funders!.slice(0, 3).map((f, i) => (
-                            <span key={i} className="px-1.5 py-0.5 rounded text-[9px] bg-violet-500/10 text-violet-400 font-medium">
+                            <span key={i} className="px-1.5 py-0.5 rounded text-[9px] bg-[var(--q-accent-soft)] text-primary font-medium">
                                 {f.name}
                             </span>
                         ))}

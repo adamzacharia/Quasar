@@ -230,9 +230,14 @@ def test_runner_scrubs_harmony_residue_from_the_final_answer(capsys):
         _events(2, text="Found the data."),
     ])
     agent, executed = _tool_agent(responses)
-    result = agent.stream_response_api("hello there", conversation_id="harmony-residue")
+    statuses = []
+    result = agent.stream_response_api("hello there", conversation_id="harmony-residue",
+                                       on_status=lambda label, state: statuses.append(label))
     assert len(executed) == 1
     assert "Found the data." in result
     assert "<|" not in result and "functions.query_archive" not in result
+    # Pre-tool text is held as narration (2026-09-26 F3): the markup reaches
+    # neither the answer nor the Thought panel.
+    assert not any("<|" in s or "functions.query_archive" in s for s in statuses)
     out = capsys.readouterr().out
-    assert "harmony control markup from the final text" in out
+    assert "Suppressed pre-tool assistant text" in out

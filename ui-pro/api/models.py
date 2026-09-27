@@ -148,6 +148,10 @@ class ConversationTitleUpdate(BaseModel):
     title: str
 
 
+class ConversationStarUpdate(BaseModel):
+    starred: bool
+
+
 class PlanFeedbackRequest(BaseModel):
     conversation_id: str
     approve: bool = False
@@ -173,6 +177,7 @@ class MCPServerRequest(BaseModel):
     args: List[str] = []
     url: Optional[str] = None
     env: Dict[str, str] = {}
+    headers: Dict[str, str] = {}
 
 
 class DatalabTiledSearchRequest(BaseModel):

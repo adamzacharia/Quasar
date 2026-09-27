@@ -46,6 +46,7 @@ __all__ = [
     "VerificationReport",
     "build_trace_summary",
     "format_verification_block",
+    "requested_items_missing",
     "verify_answer",
 ]
 
@@ -541,7 +542,7 @@ _NUMBER = r"[-+−]?\d+(?:\.\d+)?"
 # "16 < g < 20", "LIMIT 5000", "radius = 2°" -- in prose, bullets or tables.
 _CUT_RE = re.compile(
     rf"(?P<lhs>{_NUMBER})\s*(?P<c1><|<=|≤)\s*(?P<col>{_CUT_COLUMNS_RE})\s*(?P<c2><|<=|≤)\s*(?P<rhs>{_NUMBER})"   # 0.3 < bp_rp < 0.9
-    rf"|(?P<col2>{_CUT_COLUMNS_RE})\s*(?P<cmp>{_CMP})\s*(?P<val>{_NUMBER})(?:\s*(?:and|–|-|to)\s*(?P<val2>{_NUMBER}))?"  # col > 0.5 / z between a and b
+    rf"|(?<![\w])(?P<col2>{_CUT_COLUMNS_RE})\s*(?P<cmp>{_CMP})\s*(?P<val>{_NUMBER})(?:\s*(?:and|–|-|to)\s*(?P<val2>{_NUMBER}))?"  # col > 0.5 / z between a and b
     rf"|(?P<kw>limit|top)\s+(?P<lim>\d{{2,}})",
     re.I,
 )
@@ -692,6 +693,12 @@ _TOOL_FIGURE_KEYS: Dict[str, Tuple[str, ...]] = {
     "ztf_light_curve": ("light curve",),
     "datalab_sed_plot": ("sed",),
     "ned_sed_plot": ("sed",),
+    "mmdc_sed": ("sed",),
+    "mmdc_model": ("sed",),
+    "mmdc_model_job": ("sed",),
+    "mmdc_lightcurve": ("light curve",),
+    "fermi_lcr_lightcurve": ("light curve",),
+    "variability_analysis": ("light curve",),
     "radio_sed": ("sed",),
     "datalab_lss_wedge": ("wedge", "cone plot", "scatter"),
     "datalab_catalog_scatter": ("scatter", "histogram"),
@@ -994,9 +1001,11 @@ def _result_field_matches(col: str, num: str, summary: TraceSummary) -> bool:
     t = num.replace(" ", "").replace(",", "")
     decimals = len(t.split(".", 1)[1]) if "." in t else 0
     names = {v.replace(" ", "_") for v in _column_variants(col) if len(v) >= 3}
+    # Short names ("z") match only a key that IS that name (MMDC fit results carry "z").
+    exact = {v.replace(" ", "_") for v in _column_variants(col) if len(v) < 3}
     for key, v in summary.keyed_numbers:
         # The column must be a whole token of the key (best_frequency_per_day).
-        if not any(re.search(rf"(?:^|_){re.escape(n)}(?:_|$)", key) for n in names):
+        if key not in exact and not any(re.search(rf"(?:^|_){re.escape(n)}(?:_|$)", key) for n in names):
             continue
         if abs(round(v, decimals) - val) <= 0.5 * 10 ** (-decimals) + 1e-12:
             return True
@@ -1429,3 +1438,154 @@ def format_verification_block(report: VerificationReport, *, max_items: int = 8)
     else:
         lines.append("> Treat these as unverified; the Show-query panels above show exactly what was executed.")
     return "\n".join(lines)
+
+
+# ── requested identifiers / counts present in the final prose ────────────
+#
+# ArchiveBench AB-D-59 (2026-09-26): "Give me bibcodes." The paper cards and the
+# tool results held every right bibcode, but the final round said only that the
+# papers "are rendered in the paper cards", and scored 0. When the question asks
+# for identifiers or a count and the tools returned them, the prose must carry
+# them; the runner then spends one no-tools synthesis round (core/runner.py).
+
+_REQUEST_KINDS: Tuple[Tuple[str, "re.Pattern[str]", "re.Pattern[str]"], ...] = (
+    (
+        "bibcodes",
+        re.compile(r"\bbibcodes?\b", re.I),
+        # 19 characters: year, journal (with dots as padding), volume, page, initial
+        re.compile(r"(?<![\w.&])(?:1[89]|20)\d\d[A-Za-z&][A-Za-z0-9&.]{13}[A-Za-z.](?![\w&])"),
+    ),
+    (
+        "DOIs",
+        re.compile(r"\bdois?\b", re.I),
+        re.compile(r"\b10\.\d{4,9}/[^\s\"'<>)\]]+"),
+    ),
+    (
+        "ALMA project codes",
+        re.compile(r"\bproject\s+codes?\b", re.I),
+        re.compile(r"\b\d{4}\.\d\.\d{5}\.[A-Z]\b"),
+    ),
+    (
+        "observation ids",
+        re.compile(r"\bobs(?:ervation)?[\s_-]*ids?\b|\buids?\b|"
+                   r"\b(?:mous|member\s+ous|asdm|execution\s+block)\s+(?:ids?|uids?)\b", re.I),
+        # ALMA MOUS / ASDM uids (uid://A001/X1284/X265), MAST/HEASARC-style obs ids
+        re.compile(r"\buid://A\d{3}/X[0-9a-f]+/X[0-9a-f]+\b|\b(?:[a-z]{1,4}\d[\w-]{5,}|\d{6,})\b", re.I),
+    ),
+)
+_COUNT_REQUEST_RE = re.compile(r"\bhow\s+many\b|\bnumber\s+of\b|\bcount\s+(?:of|the)\b", re.I)
+# A number standing on its own ("431", "1,394", "0.6"), not the digit inside
+# "Gaia DR3", "2MASS" or "W1" (guard review: "Gaia DR3 results are in the cards").
+_STANDALONE_NUMBER_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w])")
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:no|none|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|dozens?|hundreds?)\b", re.I
+)
+
+
+def _prose_only(text: str) -> str:
+    """Answer prose without code blocks (a bibcode inside printed code is still
+    not an answer to the user). Fences are parsed like CommonMark (CX-08)."""
+    from core.prose_hygiene import split_fences  # stdlib-only leaf, no cycle
+
+    return " ".join(seg for fenced, seg in split_fences(str(text or "")) if not fenced)
+
+
+_YEAR_RE = re.compile(r"(?:19|20)\d\d")
+# A number that labels something rather than counting it: "Band 6", "RA 150",
+# "Cycle 10", "DR3", "Sector 90", "z = 0.5" (guard CX-06 verify).
+_LABEL_BEFORE_NUMBER_RE = re.compile(
+    r"(?:\bbands?|\bra|\bdec|\bcycles?|\bdr|\bsectors?|\btables?|\bfig(?:ure)?s?|\bpages?|\bversions?|\breleases?|"
+    r"\bsteps?|\bsections?|\bchapters?|\bepochs?|\bngc|\bic|\babell|\bmessier|\bm|\bz|\bredshift|\bradius|"
+    r"\bwithin|\bat|\bof\s+(?:ra|dec)|\bj|\bb|\bw|\bv|\bplan|\bprogram(?:me)?|\bproject|\bpid|\bid)\s*[=:~]?\s*[+\-]?$",
+    re.I,
+)
+
+
+def _prose_states_a_count(prose: str, counts: Sequence[float]) -> bool:
+    """A number word, one of the tools' own count values, or a standalone number
+    that is not a bare year ("The 2026 results are in the cards" is not a count,
+    guard CX-06; a tool count of 2016 still is)."""
+    if _NUMBER_WORD_RE.search(prose):
+        return True
+    wanted = {v for c in counts for v in _num_variants(str(int(c)) if float(c).is_integer() else str(c))}
+    for m in _STANDALONE_NUMBER_RE.finditer(prose):
+        tok = m.group(0).rstrip(",")
+        # A label is never the count, even when it equals one ("Band 6" with a
+        # count of 6; guard CX-06 round 3).
+        if _LABEL_BEFORE_NUMBER_RE.search(prose[max(0, m.start() - 16):m.start()]):
+            continue
+        # The tools' own count value, or a number that counts something
+        # ("about 430 sources"). A cut or a parameter ("r < 20", "1 arcsec")
+        # is not a count (guard CX-06 round 4).
+        if tok in wanted or tok.replace(",", "") in wanted:
+            return True
+        if _YEAR_RE.fullmatch(tok):
+            continue  # "the 2026 results" is a date, not a count
+        if _COUNT_NOUN_AFTER_RE.match(prose, m.end()):
+            return True
+    return False
+
+
+_COUNT_NOUN_AFTER_RE = re.compile(
+    r"\s+(?:[\w-]+\s+){0,3}?(?:sources?|stars?|galax(?:y|ies)|objects?|rows?|entries|redshifts?|planets?|"
+    r"exoplanets?|projects?|programs?|programmes?|observations?|matches|counterparts?|units?|mous|datasets?|"
+    r"detections?|spectra|spectrum|images?|papers?|targets?|members?|candidates?|systems?|hosts?|"
+    r"sectors?|exposures?|files?|records?|hits?|results?|fields?|tiles?|epochs?)\b",
+    re.I,
+)
+
+
+def _tool_evidence_text(tool_outputs: Sequence[Any]) -> str:
+    parts: List[str] = []
+    for item in tool_outputs or []:
+        raw = item.get("output") if isinstance(item, dict) and "output" in item else item
+        parts.append(raw if isinstance(raw, str) else json.dumps(raw, default=str))
+    return "\n".join(parts)
+
+
+def requested_items_missing(question: str, answer: str, tool_outputs: Sequence[Any]) -> List[str]:
+    """What the question asked for that the tools returned but the prose lacks.
+
+    Returns the missing kinds ("bibcodes", "DOIs", "ALMA project codes",
+    "observation ids", "a count"); empty when nothing is missing, or when the
+    tools returned nothing of that kind (a re-ask cannot add what no tool
+    produced; the honesty rules cover that answer)."""
+    q = str(question or "")
+    prose = _prose_only(answer)
+    evidence = _tool_evidence_text(tool_outputs)
+    if not evidence.strip():
+        return []
+    missing: List[str] = []
+    for kind, asked_re, id_re in _REQUEST_KINDS:
+        if not asked_re.search(q):
+            continue
+        if id_re.search(prose):
+            continue
+        if id_re.search(evidence):
+            missing.append(kind)
+    if _COUNT_REQUEST_RE.search(q):
+        counts = _tool_counts(tool_outputs)
+        if counts and not _prose_states_a_count(prose, counts):
+            missing.append("a count")
+    return missing
+
+
+def _tool_counts(tool_outputs: Sequence[Any]) -> List[float]:
+    """Count values the SUCCESSFUL tool results carry (rowcount, reported_count,
+    n_*, ...). A failed tool that returned no count gives nothing to re-ask for."""
+    counts: List[float] = []
+    for item in tool_outputs or []:
+        raw = item.get("output") if isinstance(item, dict) and "output" in item else item
+        obj = _parse_maybe_json(raw) if isinstance(raw, str) else raw
+        if not isinstance(obj, (dict, list)):
+            continue
+        if isinstance(obj, dict) and obj.get("success") is False:
+            continue
+        for key, val in _walk(obj):
+            if not _is_count_key(key) or isinstance(val, bool):
+                continue
+            if isinstance(val, (int, float)):
+                counts.append(float(val))
+            elif isinstance(val, str) and re.fullmatch(r"\s*\d[\d,]*(?:\.\d+)?\s*", val):
+                counts.append(float(val.replace(",", "")))  # "count": "42" (CX-27)
+    return counts

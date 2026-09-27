@@ -30,6 +30,9 @@ class MCPServerConfig(BaseModel):
     url: Optional[str] = None # e.g. "https://huggingface.co/mcp"
 
     env: Dict[str, str] = {}    # e.g., {"GITHUB_TOKEN": "ghp_..."}
+    # HTTP transports only: request headers, e.g. {"Authorization": "Bearer ..."}
+    # for hosted servers that need an API key (env only reaches stdio).
+    headers: Dict[str, str] = {}
 
 
 # The complete transport roster. Anything else is rejected up front: the mount

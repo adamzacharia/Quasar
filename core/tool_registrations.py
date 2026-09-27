@@ -1639,7 +1639,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         parameters={
             "type": "object",
             "properties": {
-                "catalog": {"type": "string"},
+                "catalog": {"type": "string", "description": "Data Lab catalog id. For SMASH use smash_dr2 (DR1 misses much of the Magellanic system; an empty DR1 cone falls through to DR2)."},
                 "table": {"type": "string", "description": "Optional; defaults to the catalog's primary table."},
                 "radius_deg": {"type": "number", "default": 0.4},
                 "ra": {"type": "number"},
@@ -2004,6 +2004,194 @@ def register_tools(agent: "QuasarAgent") -> None:
         description="Plot a literature SED from NED photometry for a named target.",
         function=agent._ned_sed_plot,
         parameters={"type": "object", "properties": {"target_name": {"type": "string"}}, "required": ["target_name"]},
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="mmdc_sed",
+        description=(
+            "Multi-epoch broadband SED of a blazar from MMDC (Markarian Multiwavelength Data Center: Fermi-LAT, "
+            "Swift-XRT/UVOT, NuSTAR reductions plus 80+ archival catalogs), with an optional time window. Use for "
+            "time-resolved or multi-epoch SEDs and for blazars / BL Lacs / FSRQs; for any other target use "
+            "ned_sed_plot. Returns an interactive nuFnu plot coloured by epoch (upper limits as down arrows), a "
+            "table card with a complete CSV, per-catalog counts and date ranges, and a result_id for mmdc_model. "
+            "Window rule: window_mode='contained' (default) keeps only rows whose [MJD_start, MJD_end] lies inside "
+            "the window; 'overlap' also keeps bins that extend outside it. The result counts both and names the "
+            "rule applied; restate it. Undated archival points are excluded from a window unless include_undated=true. "
+            "A non-MMDC target returns not_mmdc_source with fallback_tool."
+        ),
+        function=agent._mmdc_sed,
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_name": {"type": "string", "description": "Source name, e.g. '1ES 1959+650', 'Mkn 421'."},
+                "ra": {"type": "number", "description": "ICRS degrees (with dec, overrides target_name resolution)."},
+                "dec": {"type": "number"},
+                "start_date": {"type": "string", "description": "Window start: YYYY, YYYY-MM, YYYY-MM-DD or MJD."},
+                "end_date": {"type": "string", "description": "Window end: YYYY, YYYY-MM, YYYY-MM-DD or MJD; a year/month/day end includes that whole period."},
+                "window_mode": {"type": "string", "enum": ["contained", "overlap"], "default": "contained"},
+                "include_undated": {"type": "boolean", "default": False,
+                                    "description": "Show undated archival points as a separate group inside a window."},
+                "exclude_catalogs": {"type": "array", "items": {"type": "string"}},
+                "include_ranges": {"type": "array", "items": {"type": "string", "enum": ["radio", "infrared", "optical", "uv", "xray", "gamma"]}},
+                "color_by": {"type": "string", "enum": ["epoch", "catalog"], "default": "epoch"},
+                "max_points": {"type": "integer", "default": 5000, "description": "Plot point cap (the table stays complete)."},
+                "job_uuid": {"type": "string", "description": "MMDC job id from a pending result, to collect it."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="mmdc_lightcurve",
+        description=(
+            "Multiwavelength light curves of a blazar from MMDC: Fermi-LAT (MMDCGR, with photon index), Swift-XRT "
+            "(MMDCXRT, with photon index), NuSTAR, Swift-UVOT bands, ASAS-SN, ZTF, Pan-STARRS and SMARTS, optionally "
+            "limited to an MJD/date window, catalogs or bands. Returns stacked plotly panels (gamma / X-ray / UV / "
+            "optical) against MJD, a table card with a complete CSV, and a result_id for variability_analysis."
+        ),
+        function=agent._mmdc_lightcurve,
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_name": {"type": "string"},
+                "ra": {"type": "number"},
+                "dec": {"type": "number"},
+                "start_date": {"type": "string", "description": "YYYY, YYYY-MM, YYYY-MM-DD or MJD."},
+                "end_date": {"type": "string", "description": "YYYY, YYYY-MM, YYYY-MM-DD or MJD (inclusive of that period)."},
+                "catalogs": {"type": "array", "items": {"type": "string", "enum": ["MMDCGR", "MMDCXRT", "MMDCXRT_ORBIT", "MMDCNuX", "MMDCOUV", "ASAS-SN", "ZTF", "PanSTARRS-LC", "SMARTS"]}},
+                "bands": {"type": "array", "items": {"type": "string"}, "description": "Band labels such as 'MMDCOUV:W1', 'ZTF:G' or filter names like 'W1'."},
+                "radius_arcsec": {"type": "number", "default": 5},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="fermi_lcr_lightcurve",
+        description=(
+            "Fermi-LAT gamma-ray light curve (0.1-100 GeV) of a variable 4FGL source from the Fermi LAT Light Curve "
+            "Repository (NASA FSSC), independent of MMDC: cadence 'daily' (~3-day bins), 'weekly' or 'monthly'; "
+            "photon or energy flux; fixed or free photon index; bins below ts_min are upper limits. Resolves a common "
+            "name through the 4FGL association list, then by position. Returns a plotly light curve, a table card with "
+            "a complete CSV and a result_id for variability_analysis. Non-variable 4FGL sources are not in the repository."
+        ),
+        function=agent._fermi_lcr_lightcurve,
+        parameters={
+            "type": "object",
+            "properties": {
+                "target_name": {"type": "string"},
+                "ra": {"type": "number"},
+                "dec": {"type": "number"},
+                "source_name": {"type": "string", "description": "Exact 4FGL name, e.g. '4FGL J1104.4+3812'."},
+                "cadence": {"type": "string", "enum": ["daily", "weekly", "monthly"], "default": "weekly"},
+                "flux_type": {"type": "string", "enum": ["photon", "energy"], "default": "photon"},
+                "index_type": {"type": "string", "enum": ["fixed", "free"], "default": "fixed"},
+                "ts_min": {"type": "number", "default": 4, "description": "Bins below this TS are upper limits (1, 2, 3 or 4 are typical)."},
+                "start_date": {"type": "string", "description": "YYYY, YYYY-MM, YYYY-MM-DD or MJD."},
+                "end_date": {"type": "string", "description": "YYYY, YYYY-MM, YYYY-MM-DD or MJD (inclusive of that period)."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="mmdc_model",
+        description=(
+            "Blazar broadband emission modeling with MMDC's neural-network surrogates of SSC, EIC and hadronic "
+            "(lepto-hadronic, with neutrinos) models. mode='spectrum': the model SED for fixed parameters (all "
+            "parameters required), overlaid on an mmdc_sed result when result_id is given. mode='fit': a MultiNest fit "
+            "to an mmdc_sed result_id (the rows the user saw; upper limits dropped, detections averaged in "
+            "log-frequency bins) or to csv_text (frequency, flux, flux_err in Hz and erg cm^-2 s^-1); it runs about 3 "
+            "minutes on MMDC's server, so it usually returns a job_id: then call mmdc_model_job. z is taken from MMDC "
+            "or NED when not given (never guessed). Parameter names (SSC: log_B, log_electron_luminosity, "
+            "log_gamma_cut, log_gamma_min, log_radius, lorentz_factor = Doppler factor, spectral_index; EIC adds "
+            "log_Ld, log_MBH, log_nu_BLR, log_nu_DT; HADRONIC: log_B, log_Le, log_gamma_e_min, log_gamma_e_cut, "
+            "log_gamma_p_cut, log_Lp, log_R, lorentz_factor, pe, pp) are validated against the surrogate's training "
+            "ranges. Hadronic neutrino likelihood: likelihood_type='poisson' with n_icecube and dt (months), or "
+            "'chi2' with x1, x2 (TeV) and y (log10 flux)."
+        ),
+        function=agent._mmdc_model,
+        parameters={
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["spectrum", "fit"], "default": "spectrum"},
+                "model_type": {"type": "string", "enum": ["SSC", "EIC", "HADRONIC"], "default": "SSC"},
+                "z": {"type": "number", "description": "Redshift; omit to use MMDC's or NED's value (reported with its source)."},
+                "ebl": {"type": "boolean", "default": True, "description": "Apply EBL absorption."},
+                "parameters": {"type": "object", "description": "mode='spectrum': every model parameter by name."},
+                "result_id": {"type": "string", "description": "An mmdc_sed result_id (fit input, or the SED to overlay)."},
+                "csv_text": {"type": "string", "description": "Alternative fit input: CSV with frequency,flux,flux_err."},
+                "target_name": {"type": "string", "description": "Used for the NED redshift lookup and titles."},
+                "fixed_parameters": {"type": "object", "description": "mode='fit': parameters held fixed, by name."},
+                "likelihood_type": {"type": "string", "enum": ["poisson", "chi2"]},
+                "n_icecube": {"type": "integer", "description": "Poisson: number of IceCube events (1-100)."},
+                "dt": {"type": "number", "description": "Poisson: time window in months (1-120)."},
+                "x1": {"type": "number", "description": "chi2: lower neutrino energy E1 in TeV (1-1000)."},
+                "x2": {"type": "number", "description": "chi2: upper neutrino energy E2 in TeV (100-10000)."},
+                "y": {"type": "number", "description": "chi2: log10 neutrino flux in erg cm^-2 s^-1 (-16 to -9)."},
+                "bin_dex": {"type": "number", "default": 0.1, "description": "Fit-input log10 frequency bin width."},
+            },
+            "required": [],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="mmdc_model_job",
+        description=(
+            "Collect an MMDC emission-model fit started by mmdc_model mode='fit': waits up to about 90 s, then returns "
+            "either the finished fit (best-fit parameters with errors and at_bound flags, fit statistics, the model "
+            "overlaid on the SED, copies of MMDC's PDF corner plot and CSVs) or pending with the same job_id to call again."
+        ),
+        function=agent._mmdc_model_job,
+        parameters={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "wait_seconds": {"type": "number", "description": "Max wait for completion this call (default 90)."},
+            },
+            "required": ["job_id"],
+        },
+        category="analysis",
+    ))
+    agent.tool_registry.register(Tool(
+        name="variability_analysis",
+        description=(
+            "Variability statistics for any light curve: fractional variability Fvar per band (Vaughan et al. 2003 "
+            "error plus a bootstrap error), Bayesian-block flares (Scargle et al. 2013; quiescent = median block, flare "
+            "= blocks above median + flare_k x 1.4826 MAD), cross-band lags (flare peak matching and a discrete "
+            "correlation function with FR/RSS bootstrap errors; rest-frame with z) and photon index vs flux trends "
+            "(Pearson and Spearman). Input: result_id from mmdc_lightcurve or datalab_star_lightcurve (or any stored "
+            "table with time/flux or mag columns), or source='mmdc' with target_name (and dates) to fetch MMDC light "
+            "curves, source='ztf' with identifier (ALeRCE oid), or source='tess'/'kepler'/'k2' with identifier."
+        ),
+        function=agent._variability_analysis,
+        parameters={
+            "type": "object",
+            "properties": {
+                "result_id": {"type": "string"},
+                "source": {"type": "string", "enum": ["mmdc", "ztf", "tess", "kepler", "k2"]},
+                "target_name": {"type": "string"},
+                "ra": {"type": "number"},
+                "dec": {"type": "number"},
+                "identifier": {"type": "string", "description": "ZTF oid, or TESS/Kepler target for lightkurve."},
+                "index": {"type": "integer", "default": 0, "description": "TESS/Kepler light-curve index."},
+                "start_date": {"type": "string", "description": "YYYY, YYYY-MM, YYYY-MM-DD or MJD."},
+                "end_date": {"type": "string", "description": "YYYY, YYYY-MM, YYYY-MM-DD or MJD (inclusive of that period)."},
+                "bands": {"type": "array", "items": {"type": "string"},
+                          "description": "Bands to analyse: labels such as 'MMDCGR', 'ZTF:R' or aliases gamma, xray, uv, optical."},
+                "lag_bands": {"type": "array", "items": {"type": "string"},
+                              "description": "Two bands for the lag, e.g. ['xray', 'gamma']; default MMDCXRT vs MMDCGR when both exist."},
+                "min_points": {"type": "integer", "default": 5},
+                "p0": {"type": "number", "default": 0.05, "description": "Bayesian Blocks false-alarm probability."},
+                "flare_k": {"type": "number", "default": 3.0},
+                "lag_window_days": {"type": "number", "default": 30, "description": "Flare peak matching window."},
+                "max_lag_days": {"type": "number", "description": "DCF lag range (default: min(100, span/4))."},
+                "dcf_bin_days": {"type": "number"},
+                "z": {"type": "number", "description": "Redshift for rest-frame lags; omit to use MMDC's value."},
+                "merge_duplicate_epochs": {"type": "boolean", "default": True},
+            },
+            "required": [],
+        },
         category="analysis",
     ))
     agent.tool_registry.register(Tool(

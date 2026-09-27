@@ -1,0 +1,47 @@
+frequency,flux,flux_err,MJD_start,MJD_end,flag,catalog,reference
+7.400e+07,9.102e-16,1.849e-16,55000.0,55000.0,Det,SPECFINDV3,  Stein et al.  2021  A&A  655  A17! 
+3.650e+08,2.905e-15,0.000e+00,55000.0,55000.0,Det,NORTH20,  White and Becker  1992  ApJS  79  331 
+3.650e+08,2.832e-15,6.950e-17,55000.0,55000.0,Det,Texas,  Survey Douglas et al. 1996 AJ 111 1945 
+8.870e+08,4.779e-15,1.400e-17,55000.0,55000.0,Det,RACS,  Hale et al. 2021  PASA  38  e058 
+1.400e+09,8.041e-15,2.500e-18,55000.0,55000.0,Det,FIRST,  White et al. 1997  ApJ  475 479 
+1.400e+09,1.074e-14,4.050e-16,55000.0,55000.0,Det,NVSS,  Condon et al. 1998  AJ  115  1693 
+1.655e+09,1.279e-14,1.425e-15,55000.0,55000.0,Det,RACSHIGH,  Hale et al. 2021  PASA  38  e058 
+2.300e+09,1.564e-14,7.800e-16,55000.0,55000.0,Det,RATAN600,  Mufakharov T. et. al.  2015  MNRAS  450  2658! 
+3.000e+09,1.340e-14,4.500e-17,55000.0,55000.0,Det,VLASSQL,  Gordon et al. 2021  ApJS  255  30 
+4.800e+09,3.470e-14,3.075e-15,55000.0,55000.0,Det,GB6,  Gregory et al. 1996  ApJS  103  427 
+4.800e+09,3.466e-14,4.275e-15,55000.0,55000.0,Det,GB87,  Gregory et al. 1992  VizieR  VIII/14/j2000 
+8.400e+09,5.305e-14,0.000e+00,55000.0,55000.0,Det,CRATES,  Healey et al. 2007  ApJS  171  61 
+5.450e+11,1.785e-12,0.000e+00,55000.0,55000.0,UL,PCNT,  The Planck Collaboration 2018  A&A  619  A94 
+8.570e+11,4.879e-12,0.000e+00,55000.0,55000.0,UL,PCNT,  The Planck Collaboration 2018  A&A  619  A94 
+3.986e+14,3.570e-11,6.028e-14,55250.472407,55250.472407,Det,PanSTARRS-LC,"Chambers, K. C., Magnier, E. A., et al. 2016, arXiv:1612.05560"
+3.986e+14,5.996e-11,6.802e-14,55250.463402,55250.463402,Det,PanSTARRS-LC,"Chambers, K. C., Magnier, E. A., et al. 2016, arXiv:1612.05560"
+4.854e+14,8.199e-11,7.617e-14,55248.456081,55248.456081,Det,PanSTARRS-LC,"Chambers, K. C., Magnier, E. A., et al. 2016, arXiv:1612.05560"
+4.854e+14,8.293e-11,7.845e-14,55248.465366,55248.465366,Det,PanSTARRS-LC,"Chambers, K. C., Magnier, E. A., et al. 2016, arXiv:1612.05560"
+1.153e+15,1.194e-10,2.511e-12,55252.26,55252.26,Det,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.153e+15,1.136e-10,2.546e-12,55253.23,55253.23,Det,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.153e+15,1.173e-10,2.613e-12,55254.23,55254.23,Det,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.153e+15,1.289e-10,2.631e-12,55251.53,55251.53,Det,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.153e+15,1.304e-10,2.704e-12,55250.32,55250.32,Det,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.153e+15,1.321e-10,2.731e-12,55228.3,55228.3,Det,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.335e+15,2.435e-13,0.000e+00,58897.17,58897.17,UL,MMDCOUV,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.813e+17,4.399e-11,0.000e+00,55000.0,55000.0,UL,4XMM-DR14,  Webb et al. 2020  A&A  641  A136 
+1.233e+17,5.383e-10,3.260e-12,55246.98,55246.98,Det,MMDCXRT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,2.107e-10,3.313e-12,55230.1,55230.1,Det,MMDCXRT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,2.769e-10,3.842e-12,55235.21,55235.21,Det,MMDCXRT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,2.286e-10,5.989e-12,55236.06,55236.06,Det,MMDCXRT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.959e+17,1.906e-10,3.365e-12,55230.1,55230.1,Det,MMDCXRT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.959e+17,6.432e-10,3.863e-12,55246.98,55246.98,Det,MMDCXRT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,2.107e-10,3.313e-12,55230.1,55230.1,Det,MMDCXRT_ORBIT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,4.385e-10,4.893e-12,55247.5,55247.5,Det,MMDCXRT_ORBIT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,2.286e-10,5.989e-12,55236.06,55236.06,Det,MMDCXRT_ORBIT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,5.311e-10,6.046e-12,55246.98,55246.98,Det,MMDCXRT_ORBIT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,2.574e-10,7.232e-12,55235.45,55235.45,Det,MMDCXRT_ORBIT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.233e+17,6.935e-10,7.625e-12,55247.3,55247.3,Det,MMDCXRT_ORBIT,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+4.351e+22,1.799e-11,3.046e-12,55214.22,55307.39,Det,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+4.723e+22,2.547e-11,0.000e+00,60062.32,60066.11,UL,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+5.935e+22,1.866e-11,0.000e+00,57029.21,57033.84,UL,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+1.299e+23,2.730e-11,2.107e-12,55214.22,55307.39,Det,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+3.509e+23,4.519e-11,3.470e-12,55214.22,55307.39,Det,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+9.545e+23,5.094e-11,5.512e-12,55214.22,55307.39,Det,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+2.758e+24,6.626e-11,1.018e-11,55214.22,55307.39,Det,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"
+8.710e+24,1.069e-10,2.145e-11,55214.22,55307.39,Det,MMDCGR,"Sahakyan N., et al., 2024, Astron. J., 168, 289"

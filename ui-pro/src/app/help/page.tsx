@@ -57,7 +57,7 @@ export default function HelpPage() {
     return (
         <div className="flex h-screen w-full bg-[#0a0f1c] text-slate-300 overflow-hidden font-sans selection:bg-primary/30">
             {/* Sidebar */}
-            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} transition-all duration-300 shrink-0 overflow-hidden z-20 bg-sidebar-dark`}>
+            <div className={`${sidebarOpen ? "w-[calc(var(--q-sidebar-rail-width)+var(--q-sidebar-width))]" : "w-[var(--q-sidebar-rail-width)]"} transition-all duration-300 shrink-0 overflow-hidden z-20 bg-sidebar-dark`}>
                 <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
             </div>
 

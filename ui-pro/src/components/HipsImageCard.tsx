@@ -26,7 +26,7 @@ function FullSizeLink({ href }: { href: string }) {
             href={href}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1"
+            className="text-xs text-primary hover:underline underline-offset-2 transition-colors flex items-center gap-1"
         >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
             Full size
@@ -45,7 +45,7 @@ function FitsDownloadLink({ href }: { href: string }) {
             rel="noopener noreferrer"
             download
             title="Download the FITS image"
-            className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1"
+            className="text-xs text-primary hover:underline underline-offset-2 transition-colors flex items-center gap-1"
         >
             <Download className="w-3.5 h-3.5" />
             FITS
@@ -58,7 +58,7 @@ function PlainImageCard({ imageUrl, caption, fitsHref }: { imageUrl: string; cap
     const showFooter = Boolean(caption) || Boolean(fitsHref);
     return (
         <div className="pl-11">
-            <div className="mt-4 rounded-xl border border-cyan-500/30 bg-slate-900/60 overflow-hidden shadow-xl shadow-cyan-500/5">
+            <div className="mt-4 rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] overflow-hidden">
                 <img
                     src={imageUrl}
                     alt={caption || "Rendered FITS image"}
@@ -178,7 +178,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
 
     return (
         <div className="pl-11">
-            <div className="mt-4 rounded-xl border border-cyan-500/30 bg-slate-900/60 overflow-hidden shadow-xl shadow-cyan-500/5">
+            <div className="mt-4 rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] overflow-hidden">
                 <div className="relative bg-black">
                     <img
                         src={displayedUrl}
@@ -275,7 +275,7 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
                             <button
                                 type="button"
                                 onClick={() => setInteractiveOpen(true)}
-                                className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/15"
+                                className="q-pill h-7 px-2.5 text-[11px]"
                             >
                                 <Maximize2 className="h-3.5 w-3.5" />
                                 Interactive

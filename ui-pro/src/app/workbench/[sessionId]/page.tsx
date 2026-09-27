@@ -843,7 +843,7 @@ export default function WorkbenchPage() {
 
     return (
         <div className="flex h-screen w-full overflow-hidden bg-[#090d16] text-slate-200">
-            <div className={`${sidebarOpen ? "w-[var(--q-sidebar-width)]" : "w-[var(--q-sidebar-rail-width)]"} shrink-0 overflow-hidden transition-all duration-300`}>
+            <div className={`${sidebarOpen ? "w-[calc(var(--q-sidebar-rail-width)+var(--q-sidebar-width))]" : "w-[var(--q-sidebar-rail-width)]"} shrink-0 overflow-hidden transition-all duration-300`}>
                 <Sidebar collapsed={!sidebarOpen} onToggle={toggleSidebar} />
             </div>
 

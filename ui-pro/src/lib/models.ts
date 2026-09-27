@@ -1,5 +1,6 @@
 export const TACC_MODELS = [
     "gpt-oss-120b",
+    "DeepSeek-V3.2",
     "Qwen3-32B",
     "gemma-4-31B-it",
     "MiniMax-M2.7",
