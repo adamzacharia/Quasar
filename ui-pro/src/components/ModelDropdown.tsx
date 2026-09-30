@@ -24,6 +24,7 @@ import {
     connectedLabels,
     contextChip,
     flattenRows,
+    isSelectable,
     loadRecentModels,
     modelLabel,
     nextRecentModels,
@@ -170,20 +171,21 @@ export function ModelDropdown({
         activeEl?.scrollIntoView({ block: "nearest" });
     }, [active, open, flat]);
 
-    const selectedInfo = useMemo(() => {
-        for (const catalog of providers) {
-            for (const model of catalog.models) {
-                if (model.id === selectedModel) return model;
-            }
-        }
-        return null;
+    const selected = useMemo(() => {
+        const matches = providers.filter(isSelectable).flatMap((catalog) => catalog.models.filter((model) => model.id === selectedModel));
+        // Routing rejects cross-provider duplicate IDs. Keep branding/costs
+        // neutral too, rather than claiming the first catalog's provider.
+        if (new Set(matches.map((model) => model.provider)).size > 1) return { info: null, provider: null };
+        return { info: matches[0] ?? null, provider: matches[0]?.provider };
     }, [providers, selectedModel]);
 
+    const selectedInfo = selected.info;
     const currentIn = selectedInfo?.inputPricePerM;
     const currentOut = selectedInfo?.outputPricePerM;
+    const currentIsTacc = selected.provider !== undefined ? selected.provider === "tacc" : isTaccModel(selectedModel);
     const showCurrentCost =
-        typeof currentIn === "number" && typeof currentOut === "number" && !isTaccModel(selectedModel);
-    const currentTag = isTaccModel(selectedModel) ? "US hosted" : null;
+        typeof currentIn === "number" && typeof currentOut === "number" && !currentIsTacc;
+    const currentTag = currentIsTacc ? "US hosted" : null;
 
     const connected = connectedLabels(providers);
     const lockedHint = suggestedLockedProvider(query, providers);
@@ -204,10 +206,10 @@ export function ModelDropdown({
                 aria-expanded={open}
                 className="flex flex-col items-start w-full px-3.5 py-2.5 text-[13px] font-medium text-[var(--q-text)] bg-[var(--q-card)] rounded-2xl hover:bg-[var(--q-glass-control-hover)] transition-colors border border-[var(--q-border)] hover:border-[var(--q-border-strong)]"
             >
-                <div className="flex items-center justify-between w-full">
-                    <div className="flex items-center gap-2">
-                        <ModelIcon model={selectedModel} className="w-4 h-4 shrink-0" />
-                        <span className="truncate">
+                <div className="flex items-center justify-between gap-2 w-full">
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <ModelIcon model={selectedModel} provider={selected.provider} className="w-4 h-4 shrink-0" />
+                        <span className="min-w-0 truncate" title={selectedModel}>
                             Model: {selectedModel.startsWith("local/") ? selectedModel.replace("local/", "[Local] ") : selectedModel}
                         </span>
                     </div>

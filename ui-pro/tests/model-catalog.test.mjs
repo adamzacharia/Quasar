@@ -339,3 +339,16 @@ test("a recent model that is no longer available is skipped", () => {
     const { groups } = buildGroups("", providers, { recent: ["claude-opus-4-8", "gpt-4.1"] });
     assert.deepEqual(groups[0].rows.map(r => r.model.id), ["gpt-4.1"]);
 });
+
+test("cross-provider duplicate IDs cannot be selected from search, expanded or recent rows", () => {
+    const providers = [
+        catalog("openai", "connected", [model("openai", "gpt-oss-120b"), GPT41]),
+        catalog("tacc", "included_quota", [model("tacc", "gpt-oss-120b"), model("tacc", "Qwen3-32B")]),
+    ];
+    const initial = buildGroups("", providers, { recent: ["gpt-oss-120b"] });
+    const ids = flattenRows(initial.groups).map(row => row.model.id);
+    assert.deepEqual(ids, ["gpt-4.1", "Qwen3-32B"]);
+    assert.ok(!initial.groups.some(group => group.key === "recent"));
+    assert.equal(flattenRows(buildGroups("gpt-oss-120b", providers).groups).length, 0);
+    assert.ok(!flattenRows(buildGroups("", providers, { expanded: true }).groups).some(row => row.model.id === "gpt-oss-120b"));
+});

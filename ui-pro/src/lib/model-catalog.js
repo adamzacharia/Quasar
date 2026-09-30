@@ -269,12 +269,24 @@ export function buildGroups(query, providers, options) {
     const q = String(query || "").trim();
     const recentIds = (options && options.recent) || [];
     const groups = [];
+    // Chat selection stores a model ID only; cross-provider collisions cannot
+    // be routed safely and must not be offered by mouse or keyboard.
+    const owners = new Map();
+    for (const catalog of list) {
+        if (!isSelectable(catalog)) continue;
+        for (const model of catalog.models || []) {
+            if (!owners.has(model.id)) owners.set(model.id, new Set());
+            owners.get(model.id).add(catalog.provider);
+        }
+    }
+    const ambiguous = (id) => owners.get(id)?.size > 1;
 
     for (const catalog of orderProviders(list)) {
         if (!isSelectable(catalog)) continue;
         const label = PROVIDER_LABELS[catalog.provider] || catalog.provider;
         const rows = [];
         for (const model of catalog.models || []) {
+            if (ambiguous(model.id)) continue;
             if (!q) {
                 rows.push({ model, score: 0, idRanges: [], nameRanges: [] });
                 continue;
@@ -306,7 +318,9 @@ export function buildGroups(query, providers, options) {
         const selectable = new Map();
         for (const catalog of list) {
             if (!isSelectable(catalog)) continue;
-            for (const model of catalog.models || []) selectable.set(model.id, model);
+            for (const model of catalog.models || []) {
+                if (!ambiguous(model.id)) selectable.set(model.id, model);
+            }
         }
         const rows = [];
         for (const id of recentIds) {
