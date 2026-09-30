@@ -103,11 +103,21 @@ class _Page(BaseModel):
 
 
 EXCLUDED = ("embedding", "whisper", "tts", "dall-e", "moderation", "realtime",
-            "audio", "image", "transcribe", "babbage", "davinci", "sora")
+            "audio", "image", "transcribe", "babbage", "davinci", "sora", "gpt-live-")
 SNAPSHOT = re.compile(r"-(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{4})$")
+# Official model pages list no streaming support for these text models.
+# Quasar's chat/tool loop requires streamed Responses events.
+NON_STREAMING_OPENAI = ("gpt-5.5-pro", "o3-pro")
+
+
+def is_openai_chat_model(model_id: str) -> bool:
+    lowered = model_id.lower()
+    return not (any(word in lowered for word in EXCLUDED) or any(
+        lowered == name or lowered.startswith(name + "-") for name in NON_STREAMING_OPENAI
+    ))
 FAMILY_ORDER: dict[str, tuple[str, ...]] = {
     "anthropic": ("claude-opus", "claude-sonnet", "claude-haiku"),
-    "openai": ("gpt-5", "o4", "o3", "gpt-4.1", "gpt-4o", "o1", "gpt-4", "gpt-3.5"),
+    "openai": ("gpt-", "o4", "o3", "o1"),
     "deepseek": ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-reasoner", "deepseek-chat"),
     "google": ("gemini-3", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0", "gemini-1.5"),
 }
@@ -117,22 +127,43 @@ FAMILY_ORDER: dict[str, tuple[str, ...]] = {
 
 def price_model(model: ModelInfo) -> ModelInfo:
     if any(model.id == key or model.id.startswith(key + "-") for key in CATALOG_UNVERIFIED_PRICES):
-        return model
+        return model.model_copy(update={"inputPricePerM": None, "outputPricePerM": None})
     rates = get_model_pricing(model.provider, model.id)
     if rates:
         return model.model_copy(update={"inputPricePerM": rates["input_per_mtok"],
                                         "outputPricePerM": rates["output_per_mtok"]})
-    return model
+    # Cached estimates from older rate tables must not survive a now-unmatched ID.
+    return model.model_copy(update={"inputPricePerM": None, "outputPricePerM": None})
 
 
 def sort_models(models: list[ModelInfo]) -> list[ModelInfo]:
-    def rank(model: ModelInfo) -> tuple[int, float, str]:
+    def rank(model: ModelInfo) -> tuple:
         families = FAMILY_ORDER.get(model.provider, ())
         index = next((i for i, family in enumerate(families) if model.id.startswith(family)), len(families))
         created = model.createdAt
         timestamp = created.replace(tzinfo=created.tzinfo or timezone.utc).timestamp() if created else 0
+        if model.provider == "openai":
+            generation = re.match(r"^gpt-(\d+)(?:\.(\d+))?", model.id)
+            major, minor = (int(generation[1]), int(generation[2] or 0)) if generation else (0, 0)
+            suffix = model.id[generation.end():].lstrip("-") if generation else ""
+            tiers = ("", "astra", "sol", "terra", "luna", "mini", "nano", "pro", "codex")
+            tier = next((i for i, name in enumerate(tiers) if suffix == name or (name and suffix.startswith(name + "-"))), len(tiers))
+            return index, -major, -minor, bool(SNAPSHOT.search(model.id)), -timestamp, tier, model.id.casefold()
         return index, -timestamp, model.id.casefold()
     return sorted({model.id: model for model in models}.values(), key=rank)
+
+
+def chat_models(models: list[ModelInfo]) -> list[ModelInfo]:
+    """Apply current chat compatibility to old caches as well as discovery."""
+    def supported(model: ModelInfo) -> bool:
+        if model.provider == "openai":
+            return is_openai_chat_model(model.id)
+        if model.provider == "deepseek":
+            return not any(word in model.id.lower() for word in EXCLUDED)
+        if model.provider == "google":
+            return not any(word in model.id.lower() for word in ("embedding", "aqa", "imagen", "veo", "tts"))
+        return True
+    return sort_models([model for model in models if supported(model)])
 
 
 class _Adapter:
@@ -156,6 +187,8 @@ class _Adapter:
                     continue
             elif self.provider in {"openai", "deepseek"}:
                 if any(word in model_id.lower() for word in EXCLUDED):
+                    continue
+                if self.provider == "openai" and not is_openai_chat_model(model_id):
                     continue
                 alias = SNAPSHOT.sub("", model_id)
                 if alias != model_id and alias in ids:

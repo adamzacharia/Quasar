@@ -11,6 +11,7 @@ import { create } from "zustand";
 
 import { authBearerHeaders } from "./auth-store";
 import { DEFAULT_AVAILABLE_MODELS, isTaccModel } from "./models";
+import { modelPrice } from "./pricing";
 import type {
     AvailableModels,
     ModelInfo,
@@ -34,6 +35,7 @@ function fallbackCatalog(): AvailableModels {
               : "openai";
         const models = byProvider.get(provider) ?? [];
         models.push({
+            ...modelPrice(provider, id),
             provider,
             id,
             displayName: id,

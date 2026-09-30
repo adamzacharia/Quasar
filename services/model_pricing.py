@@ -40,10 +40,13 @@ from typing import Dict, Optional
 # what lets "claude-haiku-4-5-20251001" resolve to "claude-haiku-4-5" while
 # "gpt-4o-imaginary" (separator + letter) stays UNKNOWN instead of borrowing
 # gpt-4o's price. A word-suffix model is a different model, not a variant.
+# A dot continues the GPT generation (gpt-5 -> gpt-5.7), not a snapshot.
+# Never borrow a family's price for a newer, unverified model generation.
+_OPENAI_VERSION_SUFFIX = re.compile(r"^[-@:_]\d")
 _VERSION_SUFFIX = re.compile(r"^[-@:_.]\d")
 
-# Date the tables below were last checked against provider pricing pages.
-PRICING_LAST_VERIFIED = "2026-09-27"
+# Latest verification update; individual rows retain their source-check dates.
+PRICING_LAST_VERIFIED = "2026-09-30"
 
 # Rates that are estimates only and must not be displayed as catalog prices.
 # Empty since the 2026-09-27 re-verification; keep the hook for future rows.
@@ -73,6 +76,30 @@ MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
         "gpt-4.1": {"input_per_mtok": 2.00, "output_per_mtok": 8.00},
         "gpt-4.1-mini": {"input_per_mtok": 0.40, "output_per_mtok": 1.60},
         "gpt-4.1-nano": {"input_per_mtok": 0.10, "output_per_mtok": 0.40},
+        # Verified 2026-09-28 (developers.openai.com/api/docs/pricing, standard
+        # tier, short context). Cached input is 1/10 of these; cache writes 1.25x.
+        "gpt-6-luna": {"input_per_mtok": 0.10, "output_per_mtok": 0.50},
+        "gpt-6-sol": {"input_per_mtok": 2.00, "output_per_mtok": 10.00},
+        "gpt-6-astra": {"input_per_mtok": 10.00, "output_per_mtok": 50.00},
+        # Verified 2026-09-30, standard short-context rates:
+        # https://developers.openai.com/api/docs/models/gpt-6.1-sol
+        "gpt-6.1-sol": {"input_per_mtok": 2.00, "output_per_mtok": 10.00},
+        # Verified 2026-09-30 against each official model page at
+        # https://developers.openai.com/api/docs/models/<model-id>.
+        # GPT-5.6 Sol includes the current promotion through at least Nov 21.
+        "gpt-5.6-sol": {"input_per_mtok": 4.00, "output_per_mtok": 20.00},
+        "gpt-5.6-terra": {"input_per_mtok": 2.00, "output_per_mtok": 12.00},
+        "gpt-5.6-luna": {"input_per_mtok": 0.20, "output_per_mtok": 1.20},
+        "gpt-5.5": {"input_per_mtok": 5.00, "output_per_mtok": 30.00},
+        "gpt-5.4-pro": {"input_per_mtok": 30.00, "output_per_mtok": 180.00},
+        "gpt-5.3-codex": {"input_per_mtok": 1.75, "output_per_mtok": 14.00},
+        "gpt-5.2": {"input_per_mtok": 1.75, "output_per_mtok": 14.00},
+        "gpt-5.2-pro": {"input_per_mtok": 21.00, "output_per_mtok": 168.00},
+        "gpt-5.1": {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
+        "gpt-5": {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
+        "gpt-5-pro": {"input_per_mtok": 15.00, "output_per_mtok": 120.00},
+        "gpt-5-mini": {"input_per_mtok": 0.25, "output_per_mtok": 2.00},
+        "gpt-5-nano": {"input_per_mtok": 0.05, "output_per_mtok": 0.40},
         # Verified 2026-09-27 (standard tier, short context).
         "gpt-5.4-mini": {"input_per_mtok": 0.75, "output_per_mtok": 4.50},
         "gpt-5.4": {"input_per_mtok": 2.50, "output_per_mtok": 15.00},
@@ -148,7 +175,8 @@ def get_model_pricing(provider: str, model: str) -> Optional[Dict[str, float]]:
     carry a date or variant suffix (``claude-haiku-4-5-20251001``,
     ``gpt-4o-2024-08-06``) that shares a prefix with the base ID.
     """
-    table = MODEL_PRICING.get(normalize_provider(provider))
+    provider = normalize_provider(provider)
+    table = MODEL_PRICING.get(provider)
     if not table:
         return None
 
@@ -159,11 +187,12 @@ def get_model_pricing(provider: str, model: str) -> Optional[Dict[str, float]]:
         return dict(table[key])
 
     lowered = key.lower()
+    version_suffix = _OPENAI_VERSION_SUFFIX if provider == "openai" else _VERSION_SUFFIX
     matches = [
         name
         for name in table
         if lowered.startswith(name.lower())
-        and _VERSION_SUFFIX.match(lowered[len(name):])
+        and version_suffix.match(lowered[len(name):])
     ]
     if not matches:
         return None

@@ -835,12 +835,50 @@ class ResponsesShim:
         "o4-mini",
         "gpt-5-nano", "gpt-5-mini", "gpt-5.4-mini",
     })
+    # GPT-6 (gpt-6-luna / -sol / -astra) rejects temperature and top_p with a
+    # 400 "Unsupported parameter" (live 2026-09-28), so every Quasar call failed.
+    _NO_SAMPLING_PREFIXES = ("gpt-6",)
+    # Values accepted for reasoning.effort on the GPT-6 family.
+    OPENAI_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+    @classmethod
+    def _openai_reasoning_effort(cls) -> Optional[str]:
+        """QUASAR_OPENAI_REASONING_EFFORT, or None to keep the provider default.
+
+        An unknown value is logged and ignored rather than sent (a bad effort
+        word would 400 every call)."""
+        raw = str(os.getenv("QUASAR_OPENAI_REASONING_EFFORT", "") or "").strip().lower()
+        if not raw:
+            return None
+        if raw not in cls.OPENAI_REASONING_EFFORTS:
+            logger.warning(
+                f"QUASAR_OPENAI_REASONING_EFFORT={raw!r} is not one of {cls.OPENAI_REASONING_EFFORTS}; "
+                "using the provider default"
+            )
+            return None
+        return raw
 
     def _strip_unsupported_params(self, kwargs: dict) -> dict:
-        """Remove params unsupported by certain OpenAI models (e.g. temperature)."""
-        model = kwargs.get("model", "")
+        """Remove params unsupported by certain OpenAI models (e.g. temperature).
+
+        For the GPT-6 family also drops top_p and applies
+        QUASAR_OPENAI_REASONING_EFFORT, keeping any reasoning summary setting
+        the caller already asked for."""
+        model = str(kwargs.get("model", "") or "")
         if model in self._NO_TEMPERATURE_MODELS:
             kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+        # Newly listed GPT-5/Pro/Codex and o-series reasoning models can reject
+        # sampling controls with their default reasoning mode. Let the provider
+        # choose sampling rather than sending an incompatible shared setting.
+        if model.startswith(("gpt-5", "o1", "o3", "o4")):
+            kwargs = {k: v for k, v in kwargs.items() if k not in ("temperature", "top_p")}
+        if model.startswith(self._NO_SAMPLING_PREFIXES):
+            kwargs = {k: v for k, v in kwargs.items() if k not in ("temperature", "top_p")}
+            effort = self._openai_reasoning_effort()
+            if effort:
+                reasoning = dict(kwargs.get("reasoning") or {})
+                reasoning["effort"] = effort
+                kwargs["reasoning"] = reasoning
         return kwargs
 
     @with_retry(max_retries=3, backoff_base=1.0)

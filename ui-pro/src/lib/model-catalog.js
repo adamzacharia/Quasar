@@ -68,6 +68,32 @@ const SCORE_SUBSTRING = 400;
 const SCORE_SUBSEQUENCE = 200;
 /** A provider-name hit is weaker evidence than a model-id hit. */
 const PROVIDER_WEIGHT = 0.45;
+export const INITIAL_MODELS_PER_PROVIDER = 4;
+
+/** Numeric versions keep GPT-6 (and future generations) ahead of GPT-5. */
+function compareModels(a, b) {
+    if (a.provider !== "openai" || b.provider !== "openai") return 0;
+    const versionA = /^gpt-(\d+)(?:\.(\d+))?/.exec(a.id);
+    const versionB = /^gpt-(\d+)(?:\.(\d+))?/.exec(b.id);
+    if (!!versionA !== !!versionB) return versionA ? -1 : 1;
+    if (versionA && versionB) {
+        const generation = Number(versionB[1]) - Number(versionA[1]) || Number(versionB[2] || 0) - Number(versionA[2] || 0);
+        if (generation) return generation;
+    }
+    const snapshot = (model) => /-(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{4})$/.test(model.id);
+    const snapshotOrder = Number(snapshot(a)) - Number(snapshot(b));
+    if (snapshotOrder) return snapshotOrder;
+    const created = (model) => Date.parse(model.createdAt || "") || 0;
+    const dateOrder = created(b) - created(a);
+    if (dateOrder) return dateOrder;
+    const tiers = ["", "astra", "sol", "terra", "luna", "mini", "nano", "pro", "codex"];
+    const tier = (model, version) => {
+        const suffix = version ? model.id.slice(version[0].length).replace(/^-/, "") : "";
+        const index = tiers.findIndex((name) => suffix === name || (name && suffix.startsWith(name + "-")));
+        return index < 0 ? tiers.length : index;
+    };
+    return tier(a, versionA) - tier(b, versionB) || a.id.localeCompare(b.id);
+}
 
 const WORD_BOUNDARY = /[-_./ :]/;
 
@@ -256,15 +282,22 @@ export function buildGroups(query, providers, options) {
             const scored = scoreModel(q, model, label);
             if (scored.score > 0) rows.push({ model, ...scored });
         }
-        if (q) rows.sort((a, b) => b.score - a.score);
+        rows.sort((a, b) => b.score - a.score || compareModels(a.model, b.model));
         if (rows.length === 0) continue;
+        let visible = rows;
+        if (!q && !options?.expanded) {
+            visible = rows.slice(0, INITIAL_MODELS_PER_PROVIDER);
+            const selected = rows.find((row) => row.model.id === options?.selectedModel);
+            if (selected && !visible.includes(selected)) visible[visible.length - 1] = selected;
+        }
         groups.push({
             key: catalog.provider,
             provider: catalog.provider,
             label,
             byok: catalog.status === "connected",
             stale: !!catalog.stale,
-            rows,
+            rows: visible,
+            hiddenCount: rows.length - visible.length,
         });
     }
 

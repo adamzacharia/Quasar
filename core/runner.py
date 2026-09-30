@@ -80,6 +80,24 @@ if TYPE_CHECKING:
     from core.agent import QuasarAgent
 
 
+# Thinking models support the `reasoning` parameter, which returns a
+# model-provided reasoning summary that the runner streams to the UI.
+_THINKING_MODELS = frozenset({
+    "o1", "o1-mini", "o1-pro",
+    "o3", "o3-mini", "o3-pro",
+    "o4-mini",
+    "deepseek-v4-pro", "deepseek-v4-flash",
+})
+# GPT-5.x / GPT-6 adaptive thinking.
+_THINKING_MODEL_PREFIXES = ("gpt-5", "gpt-6")
+
+
+def _wants_reasoning_summary(model: str) -> bool:
+    """Whether a request for ``model`` should ask for a reasoning summary."""
+    model = str(model or "")
+    return model in _THINKING_MODELS or model.startswith(_THINKING_MODEL_PREFIXES)
+
+
 def _result_indicates_timeout(result) -> bool:
     """True when a tool result represents a wall-clock timeout.
 
@@ -2564,20 +2582,7 @@ def _stream_response_api_impl(
                     request_kwargs.pop("temperature", None)
 
                 # Enable reasoning summary streaming for thinking models
-                # These models support the `reasoning` parameter which returns
-                # a model-provided reasoning summary that we stream to the UI.
-                _thinking_models = {
-                    "o1", "o1-mini", "o1-pro",
-                    "o3", "o3-mini", "o3-pro",
-                    "o4-mini",
-                    "deepseek-v4-pro", "deepseek-v4-flash",
-                }
-                _current_model = request_kwargs.get("model", "")
-                _is_thinking_model = (
-                    _current_model in _thinking_models
-                    or _current_model.startswith("gpt-5")  # GPT-5.x adaptive thinking
-                )
-                if _is_thinking_model:
+                if _wants_reasoning_summary(request_kwargs.get("model", "")):
                     request_kwargs["reasoning"] = {"summary": "auto"}
 
                 # A provider stream can die mid-round (httpx.ReadTimeout while a

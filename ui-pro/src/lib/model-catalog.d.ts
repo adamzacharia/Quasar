@@ -79,6 +79,7 @@ export interface ModelGroup {
     byok: boolean;
     stale: boolean;
     rows: ModelRow[];
+    hiddenCount?: number;
 }
 
 export interface LockedProvider {
@@ -103,6 +104,7 @@ export declare const PROVIDER_SHORT_LABELS: Readonly<Record<string, string>>;
 export declare const MODEL_ALIASES: Readonly<Record<string, readonly string[]>>;
 export declare const RECENT_MODELS_KEY: string;
 export declare const RECENT_LIMIT: number;
+export declare const INITIAL_MODELS_PER_PROVIDER: number;
 
 export declare function fuzzyMatch(query: string, text: string): FuzzyMatch;
 export declare function scoreModel(
@@ -117,7 +119,7 @@ export declare function isSelectable(catalog: ProviderCatalog | null | undefined
 export declare function buildGroups(
     query: string,
     providers: ProviderCatalog[],
-    options?: { recent?: string[] },
+    options?: { recent?: string[]; expanded?: boolean; selectedModel?: string },
 ): BuiltGroups;
 export declare function flattenRows(groups: ModelGroup[]): FlatRow[];
 export declare function connectedLabels(providers: ProviderCatalog[]): string[];

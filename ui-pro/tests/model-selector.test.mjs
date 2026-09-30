@@ -47,7 +47,7 @@ test("a search box is pinned at the top of the panel and autofocused", () => {
 });
 
 test("search results are produced by the shared fuzzy scorer", () => {
-    assert.match(dropdown, /buildGroups\(query, providers, \{ recent \}\)/);
+    assert.match(dropdown, /buildGroups\(query, providers, \{ recent, expanded, selectedModel \}\)/);
 });
 
 test("matched characters are highlighted", () => {

@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from services.model_pricing import get_model_pricing
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +28,10 @@ logger = logging.getLogger(__name__)
 MODEL_PRICING = {
     # model_name: (input_per_1k, output_per_1k)
     "gpt-5.4":       (0.010, 0.030),
+    "gpt-6-luna":    (0.0001, 0.0005),
+    "gpt-6-sol":     (0.002, 0.010),
+    "gpt-6.1-sol":   (0.002, 0.010),
+    "gpt-6-astra":   (0.010, 0.050),
     "gpt-5.4-mini":  (0.00075, 0.0045),
     "gpt-4.1":       (0.002, 0.008),
     "gpt-4.1-mini":  (0.0004, 0.0016),
@@ -45,6 +51,10 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     Falls back to gpt-5.4-mini pricing if the model is unknown.
     """
     pricing = MODEL_PRICING.get(model)
+    if model.startswith(("gpt-", "o1", "o3", "o4")):
+        rates = get_model_pricing("openai", model)
+        if rates:
+            pricing = (rates["input_per_mtok"] / 1000, rates["output_per_mtok"] / 1000)
     if not pricing:
         # Try prefix match (e.g. "gpt-5.4-mini-2026-04-14" → "gpt-5.4-mini")
         for known_model, p in MODEL_PRICING.items():

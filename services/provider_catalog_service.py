@@ -11,7 +11,7 @@ from services.provider_key_service import (
 )
 from services.provider_models import (
     ADAPTERS, AvailableModels, CatalogError, ModelInfo, Provider, ProviderAdapter,
-    ProviderCatalog, price_model, sort_models,
+    ProviderCatalog, chat_models, price_model, sort_models,
 )
 
 _MODELS = TypeAdapter(list[ModelInfo])
@@ -26,12 +26,14 @@ class ProviderCatalogService:
         self.adapters = ADAPTERS if adapters is None else adapters
 
     def static_models(self, provider: Provider) -> list[ModelInfo]:
+        # Curated IDs can be explicit deployment overrides. Discovery filtering
+        # applies to provider payloads/caches; do not silently rewrite config.
         return sort_models([price_model(ModelInfo(provider=provider, id=model, displayName=model, source="static"))
                             for model in self.curated.get(provider, [])])
 
     @staticmethod
     def serialize(models: list[ModelInfo]) -> StoredCatalog:
-        return StoredCatalog(_MODELS.dump_json(models, exclude_none=True).decode(),
+        return StoredCatalog(_MODELS.dump_json(chat_models(models), exclude_none=True).decode(),
                              datetime.now(timezone.utc).isoformat())
 
     def save(self, user_id: str, provider: str, api_key: str, token_limit: int | None) -> ProviderCatalog:
@@ -45,9 +47,10 @@ class ProviderCatalogService:
         validation = self.adapters[provider].validate_key(key)
         if not validation.ok:
             raise CatalogError(validation.error or "Could not validate provider key.", validation.invalidKey)
-        stored = self.serialize(validation.models)
+        models = chat_models(validation.models)
+        stored = self.serialize(models)
         self.keys.save_key(user_id, provider, key, token_limit, catalog=stored)
-        return ProviderCatalog(provider=provider, status="connected", models=validation.models,
+        return ProviderCatalog(provider=provider, status="connected", models=models,
                                fetchedAt=datetime.fromisoformat(stored.fetched_at))
 
     def catalog(self, user_id: str, provider: Provider, *, refresh: bool = False,
@@ -70,7 +73,7 @@ class ProviderCatalogService:
             # Prices are re-applied on read: the cache holds a day-old model
             # list, but the rate table can change (a newly verified price must
             # show without waiting for the catalog to expire).
-            models = [price_model(m) for m in models]
+            models = chat_models([price_model(m) for m in models])
             fetched = datetime.fromisoformat(cached.fetched_at) if cached else None
             if fetched is not None and fetched.tzinfo is None:
                 fetched = fetched.replace(tzinfo=timezone.utc)
@@ -85,7 +88,7 @@ class ProviderCatalogService:
                 self.keys.admit_validation(user_id)
             elif not self.keys.claim_discovery(user_id, provider, revision):
                 return ProviderCatalog(provider=provider, status="connected", models=models, fetchedAt=fetched, stale=True)
-            live = self.adapters[provider].list_models(key)
+            live = chat_models(self.adapters[provider].list_models(key))
             stored = self.serialize(live)
             if not self.keys.cache_catalog(user_id, provider, revision, stored):
                 # Removed or rotated during discovery. Re-read current state,
@@ -123,7 +126,7 @@ class ProviderCatalogService:
             models = self.static_models(provider)
             if provider in connected and provider in catalogs:
                 try:
-                    models = _MODELS.validate_json(catalogs[provider].models_json)
+                    models = chat_models(_MODELS.validate_json(catalogs[provider].models_json))
                 except ValidationError:
                     pass
             for model in models:

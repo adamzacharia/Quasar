@@ -66,6 +66,7 @@ export function ModelDropdown({
 }) {
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
+    const [expanded, setExpanded] = useState(false);
     const [activeIndex, setActiveIndex] = useState(0);
     // Read once on first render. The panel is closed on mount, so the stored
     // list never reaches the server-rendered markup and cannot mismatch.
@@ -86,8 +87,8 @@ export function ModelDropdown({
     }, []);
 
     const { groups, locked } = useMemo(
-        () => buildGroups(query, providers, { recent }),
-        [query, providers, recent],
+        () => buildGroups(query, providers, { recent, expanded, selectedModel }),
+        [query, providers, recent, expanded, selectedModel],
     );
     const flat = useMemo(() => flattenRows(groups), [groups]);
     /** Index of each group's first row within `flat`, for keyboard addressing. */
@@ -123,6 +124,8 @@ export function ModelDropdown({
 
     const handleKeyDown = useCallback(
         (event: React.KeyboardEvent<HTMLDivElement>) => {
+            // Buttons retain native Enter/Space activation inside the panel.
+            if ((event.target as HTMLElement).closest("button") && (event.key === "Enter" || event.key === " ")) return;
             if (event.key === "ArrowDown") {
                 event.preventDefault();
                 if (flat.length > 0) setActiveIndex((active + 1) % flat.length);
@@ -165,7 +168,7 @@ export function ModelDropdown({
         if (!open || !listRef.current) return;
         const activeEl = listRef.current.querySelector<HTMLElement>('[data-active="true"]');
         activeEl?.scrollIntoView({ block: "nearest" });
-    }, [active, open]);
+    }, [active, open, flat]);
 
     const selectedInfo = useMemo(() => {
         for (const catalog of providers) {
@@ -192,6 +195,7 @@ export function ModelDropdown({
                     // Every open starts from a fresh, unfiltered list.
                     if (!open) {
                         setQuery("");
+                        setExpanded(false);
                         setActiveIndex(0);
                     }
                     setOpen(!open);
@@ -365,6 +369,22 @@ export function ModelDropdown({
                             </div>
                         )}
                     </div>
+
+                    {groups.some((group) => (group.hiddenCount ?? 0) > 0) && (
+                        <button
+                            type="button"
+                            aria-controls={listId}
+                            aria-expanded={expanded}
+                            onClick={() => {
+                                setExpanded(true);
+                                setActiveIndex(0);
+                                inputRef.current?.focus();
+                            }}
+                            className="shrink-0 w-full border-t border-slate-700/50 px-3 py-2 text-[11px] text-primary hover:bg-slate-800/60 transition-colors text-left"
+                        >
+                            Show all models ({groups.reduce((count, group) => count + (group.hiddenCount ?? 0), 0)} more)
+                        </button>
+                    )}
 
                     {locked.length > 0 && (
                         <div className="shrink-0 border-t border-slate-700/50 bg-slate-900">

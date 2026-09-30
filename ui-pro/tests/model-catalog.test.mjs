@@ -197,7 +197,7 @@ test("flattened rows follow render order for keyboard navigation", () => {
     ]);
     assert.deepEqual(
         flattenRows(groups).map(r => r.model.id),
-        ["gpt-4.1", "gpt-5.4-mini", "claude-opus-4-8"],
+        ["gpt-5.4-mini", "gpt-4.1", "claude-opus-4-8"],
     );
 });
 
@@ -248,6 +248,66 @@ test("a provider name that is not connected still offers its key link", () => {
 });
 
 /* ── recently used ──────────────────────────────────────────────────────── */
+
+test("large catalogs start with four latest models and searches reach every match", () => {
+    const ids = ["gpt-4.1", "gpt-5.4-mini", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6-astra", "gpt-6.1-sol"];
+    const providers = [catalog("openai", "included_quota", ids.map(id => model("openai", id)))];
+    const initial = buildGroups("", providers);
+    assert.deepEqual(flattenRows(initial.groups).map(row => row.model.id), ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
+    assert.equal(initial.groups[0].hiddenCount, 3);
+    assert.equal(flattenRows(buildGroups("   ", providers).groups).length, 4);
+    const searching = buildGroups("gpt", providers);
+    assert.equal(flattenRows(searching.groups).length, ids.length);
+    assert.equal(searching.groups[0].rows[0].model.id, "gpt-6.1-sol");
+    assert.equal(searching.groups[0].hiddenCount, 0);
+    assert.equal(flattenRows(buildGroups("", providers, { expanded: true }).groups).length, ids.length);
+    assert.equal(flattenRows(buildGroups("gpt-4.1", providers).groups)[0].model.id, "gpt-4.1", "exact relevance wins over generation");
+});
+
+test("selected older model stays within the initial four without hiding latest search matches", () => {
+    const ids = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-4.1"];
+    const providers = [catalog("openai", "connected", ids.map(id => model("openai", id)))];
+    const options = { selectedModel: "gpt-4.1" };
+    const initial = flattenRows(buildGroups("", providers, options).groups);
+    assert.equal(initial.length, 4);
+    assert.equal(initial[0].model.id, "gpt-6.1-sol");
+    assert.equal(initial[3].model.id, "gpt-4.1");
+    assert.equal(flattenRows(buildGroups("gpt", providers, options).groups).length, 5);
+    assert.equal(flattenRows(buildGroups("", providers, { selectedModel: "missing" }).groups).length, 4);
+});
+
+test("search sorts numeric generations and uses provider release times within a generation", () => {
+    const providers = [catalog("openai", "connected", [
+        model("openai", "gpt-5.9"),
+        model("openai", "gpt-5.10"),
+        model("openai", "gpt-7-sol", { createdAt: "2026-09-01T00:00:00Z" }),
+        model("openai", "gpt-7-luna", { createdAt: "2026-09-02T00:00:00Z" }),
+    ])];
+    assert.deepEqual(flattenRows(buildGroups("gpt", providers).groups).map(row => row.model.id), ["gpt-7-luna", "gpt-7-sol", "gpt-5.10", "gpt-5.9"]);
+});
+
+test("stable aliases stay above newer dated snapshots on broad searches", () => {
+    const providers = [catalog("openai", "connected", [
+        model("openai", "gpt-6-sol-2026-09-20", { createdAt: "2026-09-20T00:00:00Z" }),
+        model("openai", "gpt-6-sol", { createdAt: "2026-09-01T00:00:00Z" }),
+    ])];
+    assert.deepEqual(flattenRows(buildGroups("gpt", providers).groups).map(row => row.model.id), ["gpt-6-sol", "gpt-6-sol-2026-09-20"]);
+    assert.equal(flattenRows(buildGroups("gpt-6-sol-2026-09-20", providers).groups)[0].model.id, "gpt-6-sol-2026-09-20");
+});
+
+test("compact groups preserve provider locks, recent shortcuts and keyboard render order", () => {
+    const ids = Array.from({ length: 8 }, (_, index) => `gpt-6.${index}-sol`);
+    const providers = [
+        catalog("openai", "connected", ids.map(id => model("openai", id))),
+        catalog("google", "not_connected", [], { unlockCount: 8 }),
+    ];
+    const { groups, locked } = buildGroups("", providers, { recent: [ids[0]] });
+    assert.equal(groups[0].key, "recent");
+    assert.equal(groups[1].rows.length, 4);
+    assert.deepEqual(flattenRows(groups).map(row => row.model.id), groups.flatMap(group => group.rows.map(row => row.model.id)));
+    assert.equal(locked[0].provider, "google");
+    assert.equal(flattenRows(buildGroups("google", providers).groups).length, 0);
+});
 
 test("recent models are most-recent-first, de-duplicated and capped at 3", () => {
     let recent = [];

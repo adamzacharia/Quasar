@@ -19,7 +19,7 @@ from services.provider_catalog_service import ProviderCatalogService
 from services.provider_key_service import CatalogRateLimitError, ProviderKeyService, StoredCatalog
 from services.provider_models import (
     AnthropicAdapter, CatalogError, DeepSeekAdapter, GoogleAdapter, ModelInfo,
-    OpenAIAdapter, _Page, price_model,
+    OpenAIAdapter, _Page, price_model, sort_models,
 )
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "provider_models"
@@ -70,6 +70,57 @@ def test_google_filter():
     assert [m.id for m in GoogleAdapter().normalize(page.models)] == ["gemini-2.5-flash"]
 
 
+def test_openai_latest_generations_sort_before_old_models_and_keep_aliases():
+    ids = ["gpt-4.1", "gpt-6-sol-2026-09-01", "gpt-6-luna", "gpt-5.6-sol",
+           "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-image-2", "gpt-live-1", "gpt-5.5-pro", "o3-pro-2025-06-10"]
+    page = _Page.model_validate({"data": [{"id": model} for model in ids]})
+    models = OpenAIAdapter().normalize(page.data)
+    assert [m.id for m in models[:4]] == ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+    assert "gpt-6-sol-2026-09-01" not in [m.id for m in models]
+    assert "gpt-image-2" not in [m.id for m in models]
+    assert "gpt-live-1" not in [m.id for m in models]
+    assert "gpt-5.5-pro" not in [m.id for m in models]
+    assert "o3-pro-2025-06-10" not in [m.id for m in models]
+    assert models[0].inputPricePerM == 2
+    assert models[0].outputPricePerM == 10
+
+
+def test_openai_numeric_versions_and_release_time():
+    models = [ModelInfo(provider="openai", id=id, displayName=id, createdAt=date) for id, date in [
+        ("gpt-5.9", None), ("gpt-5.10", None),
+        ("gpt-7-sol", datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        ("gpt-7-luna", datetime(2026, 9, 2, tzinfo=timezone.utc)),
+    ]]
+    assert [m.id for m in sort_models(models)] == ["gpt-7-luna", "gpt-7-sol", "gpt-5.10", "gpt-5.9"]
+
+
+def test_openai_defaults_match_frontend_and_include_current_text_models():
+    # Parse defaults without importing the API kernel or contacting providers.
+    import ast
+    import re
+    root = Path(__file__).parents[2]
+    tree = ast.parse((root / "ui-pro/api/deps.py").read_text(encoding="utf-8"))
+    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "OPENAI_VISIBLE_MODEL_IDS" for target in node.targets))
+    backend = ast.literal_eval(assignment.value.args[1])
+    source = (root / "ui-pro/src/lib/models.ts").read_text(encoding="utf-8")
+    frontend = json.loads("[" + re.search(r"OPENAI_MODELS = \[([\s\S]*?)\];", source)[1].rstrip().rstrip(",") + "]")
+    assert backend == frontend
+    assert len(backend) == len(set(backend))
+    assert {"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+            "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex"} <= set(backend)
+    assert all(price_model(ModelInfo(provider="openai", id=id, displayName=id)).inputPricePerM is not None for id in backend)
+
+
+def test_openai_stable_alias_precedes_newer_snapshot_in_cache():
+    models = [ModelInfo(provider="openai", id=id, displayName=id, createdAt=date) for id, date in [
+        ("gpt-6-sol-2026-09-20", datetime(2026, 9, 20, tzinfo=timezone.utc)),
+        ("gpt-6-sol", datetime(2026, 9, 1, tzinfo=timezone.utc)),
+    ]]
+    assert [m.id for m in sort_models(models)] == ["gpt-6-sol", "gpt-6-sol-2026-09-20"]
+    assert [m["id"] for m in json.loads(ProviderCatalogService.serialize(models).models_json)] == ["gpt-6-sol", "gpt-6-sol-2026-09-20"]
+
+
 @pytest.mark.parametrize("cls", [AnthropicAdapter, GoogleAdapter])
 def test_pagination(cls):
     seen: list[httpx.Request] = []
@@ -113,6 +164,15 @@ def test_prices_are_exact_or_version_prefix_never_family_guesses():
     # Verified 2026-09-27, so the catalog now shows it.
     assert price("gpt-5.4-mini").inputPricePerM == 0.75
     assert price("gpt-5.4-mini-ultra").inputPricePerM is None
+    assert price("gpt-5.7").inputPricePerM is None
+    # Preserve other providers' existing numeric-version suffix behavior.
+    google = price_model(ModelInfo(provider="google", id="gemini-2.5-flash.1", displayName="Flash"))
+    assert google.inputPricePerM == 0.30
+    cached_unknown = ModelInfo(provider="openai", id="gpt-5.4-mini-ultra", displayName="Unknown",
+                               inputPricePerM=1.25, outputPricePerM=10)
+    refreshed = price_model(cached_unknown)
+    assert refreshed.inputPricePerM is None and refreshed.outputPricePerM is None
+    assert cached_unknown.inputPricePerM == 1.25
 
 
 @pytest.fixture
@@ -122,6 +182,47 @@ def catalog(monkeypatch, tmp_path):
     adapter = AnthropicAdapter(httpx.MockTransport(lambda req: httpx.Response(200, json={
         "data": [{"id": "claude-opus-test", "display_name": "Test Opus"}], "has_more": False})))
     return ProviderCatalogService(keys, CURATED, {"anthropic": adapter})
+
+
+def test_fresh_openai_cache_gets_current_sort_without_a_provider_request(catalog):
+    ids = ["gpt-4.1", "gpt-5.4-mini", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"]
+    models = [ModelInfo(provider="openai", id=id, displayName=id) for id in ids]
+    catalog.keys.save_key("alice", "openai", "unit-secret-key", catalog=catalog.serialize(models))
+    cached = catalog.catalog("alice", "openai")
+    assert not cached.stale
+    assert [m.id for m in cached.models] == ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.4-mini", "gpt-4.1"]
+    assert cached.models[0].inputPricePerM == 2
+
+
+def test_legacy_openai_cache_filters_unsupported_models_on_read_and_routing(catalog):
+    ids = ["gpt-5.5-pro", "o3-pro-2025-06-10", "gpt-live-1", "gpt-image-2", "gpt-6-sol"]
+    models = [ModelInfo(provider="openai", id=id, displayName=id) for id in ids]
+    raw = StoredCatalog(json.dumps([m.model_dump(mode="json") for m in models]), datetime.now(timezone.utc).isoformat())
+    catalog.keys.save_key("alice", "openai", "unit-secret-key", catalog=raw)
+    assert [m.id for m in catalog.catalog("alice", "openai", cached_only=True).models] == ["gpt-6-sol"]
+    assert [m.id for m in catalog.catalog("alice", "openai").models] == ["gpt-6-sol"]
+    routes = catalog.model_providers("alice", ["openai"])
+    assert routes["gpt-6-sol"] == "openai"
+    assert not set(ids[:-1]) & routes.keys()
+
+
+@pytest.mark.parametrize("provider,good,bad", [
+    ("deepseek", "deepseek-v4-pro", "deepseek-embedding-small"),
+    ("google", "gemini-2.5-flash", "gemini-tts"),
+])
+def test_other_provider_legacy_media_cache_is_filtered(catalog, provider, good, bad):
+    models = [ModelInfo(provider=provider, id=id, displayName=id) for id in (good, bad)]
+    raw = StoredCatalog(json.dumps([m.model_dump(mode="json") for m in models]), datetime.now(timezone.utc).isoformat())
+    catalog.keys.save_key("alice", provider, "unit-secret-key", catalog=raw)
+    assert [m.id for m in catalog.catalog("alice", provider, cached_only=True).models] == [good]
+    assert bad not in catalog.model_providers("alice", [provider])
+
+
+def test_explicit_curated_openai_overrides_remain_visible_and_routable(catalog):
+    configured = ["gpt-5.5-pro", "o3-pro"]
+    service = ProviderCatalogService(catalog.keys, {"openai": configured}, {})
+    assert [m.id for m in service.catalog("alice", "openai").models] == configured
+    assert service.model_providers("alice", []) == {id: "openai" for id in configured}
 
 
 def test_save_cache_restart_and_isolation(catalog):
