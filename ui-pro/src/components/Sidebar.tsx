@@ -519,11 +519,16 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
     };
 
     const handleChatRail = () => {
+        // Switching from another page/overlay reveals chat; clicking the
+        // already visible chat panel toggles it closed.
+        if (variant === "drawer") {
+            if (pathname !== "/" || !activePanel) onClose?.();
+        } else if (collapsed || (pathname === "/" && !activePanel)) {
+            onToggle?.();
+        }
         setActivePanel(null);
-        if (collapsed) onToggle?.();
         if (pathname !== "/") {
             router.push("/");
-            onClose?.();
         }
     };
 
@@ -596,13 +601,14 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             aria-label="Primary"
             className={`flex h-full w-[var(--q-sidebar-rail-width)] shrink-0 flex-col items-center bg-[var(--q-rail)] py-3 ${collapsed ? "border-r border-[var(--q-border)]" : ""}`}
         >
-            {collapsed ? (
+            {variant === "panel" ? (
                 <button
                     type="button"
                     onClick={onToggle}
                     className="mb-4 flex size-[42px] items-center justify-center rounded-full border border-[var(--q-border)] bg-[var(--q-card)] transition-colors hover:border-[var(--q-border-strong)]"
-                    title="Expand sidebar"
-                    aria-label="Expand sidebar"
+                    title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    aria-expanded={!collapsed}
                 >
                     <img src="/quasar_logo.png" alt="" className="size-[30px] object-contain" />
                 </button>
@@ -615,6 +621,7 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             <div className="flex flex-col items-center gap-2">
                 <button type="button" onClick={handleChatRail} className="q-rail-btn"
                     data-active={pathname === "/" && !activePanel ? "true" : undefined}
+                    aria-expanded={!collapsed && pathname === "/" && !activePanel}
                     title="Chat" aria-label="Chat">
                     <MessageSquare className={railIcon} strokeWidth={1.75} />
                 </button>
@@ -730,8 +737,8 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
             {rail}
 
             {/* ── PANEL — title, New Chat, Starred, history, model card.
-                Collapse is handled by the single toggle in the chat header
-                (ChatArea); the drawer gets its own close button, since on a
+                The rail and chat header toggle the panel. The drawer gets
+                its own close button, since on a
                 phone there is no chat header behind it to reach. ── */}
             {!collapsed && (
                 <div className={`relative flex min-w-0 flex-col bg-[var(--q-bg)] ${isDrawer
