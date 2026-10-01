@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 import type { Conversation, Message, Paper, TaskGroup, TaskItem, TaskChecklist, WebDecision, WebImage, WebSource } from "./types";
-import type { ThoughtStep } from "@/components/ThoughtProcessWidget";
+import type { McpStepMeta, ThoughtStep } from "@/components/ThoughtProcessWidget";
 import {
     fetchConversations as apiFetchConversations,
     fetchConversationMessages as apiFetchMessages,
@@ -93,6 +93,7 @@ interface ChatStore {
     toggleStar: (id: string) => void;
     addThinkingStep: (step: string, state: "running" | "completed") => void;
     heartbeatThinkingStep: (phase: string) => void;
+    setThinkingStepMcp: (step: string, mcp: McpStepMeta) => void;
     clearThinking: () => void;
     fetchModels: () => Promise<void>;
     attachThinkingToLastMessage: () => void;
@@ -410,8 +411,12 @@ function serverMessageToLocal(msg: ServerMessage, index: number): Message[] {
     // Restore thinking steps from metadata (shown in "Thinking" widget)
     const meta = msg.metadata || {};
     if (meta.thinkingSteps && Array.isArray(meta.thinkingSteps)) {
-        base.thinkingSteps = (meta.thinkingSteps as { step: string; state: string }[]).map(
-            (s) => ({ text: s.step, status: s.state as "running" | "completed" })
+        base.thinkingSteps = (meta.thinkingSteps as { step: string; state: string; mcp?: McpStepMeta }[]).map(
+            (s) => ({
+                text: s.step,
+                status: s.state as "running" | "completed",
+                ...(s.mcp && typeof s.mcp.server === "string" ? { mcp: s.mcp } : {}),
+            })
         );
     }
     if (meta.thinking) {
@@ -916,7 +921,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 // restart its timer so heartbeat elapsed times measure this
                 // run, not the earlier one (CX-15).
                 ...(state === "running"
-                    ? { startedAt: Date.now(), elapsedSeconds: undefined }
+                    // ...and drops the previous call's MCP outcome, so a rerun
+                    // never shows the old failure while it runs (guard CX-05).
+                    ? { startedAt: Date.now(), elapsedSeconds: undefined, mcp: undefined }
                     : {}),
             };
         } else {
@@ -951,6 +958,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             elapsedSeconds: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
         };
         return { thinkingSteps: steps };
+    }),
+
+    // MCP metadata arrives right after the step's own status event; attach it
+    // to every entry with that label (a re-run label keeps the latest outcome).
+    setThinkingStepMcp: (step, mcp) => set((s) => {
+        if (!s.thinkingSteps.some(t => t.text === step)) return {};
+        return {
+            thinkingSteps: s.thinkingSteps.map(t => (t.text === step ? { ...t, mcp } : t)),
+        };
     }),
 
     clearThinking: () => set({ thinkingSteps: [], thinkingStatus: "idle" }),

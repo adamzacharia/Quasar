@@ -2,7 +2,7 @@
 
 The GPT-6 family rejects temperature and top_p with a 400 "Unsupported
 parameter" (live 2026-09-28), which made every Quasar turn on gpt-6-luna fail.
-QUASAR_OPENAI_REASONING_EFFORT sets reasoning.effort for the family.
+QUASAR_OPENAI_REASONING_EFFORT sets reasoning.effort for the family (default high).
 """
 from __future__ import annotations
 
@@ -31,7 +31,12 @@ def test_gpt6_drops_temperature_and_top_p(model):
     out = _strip({"model": model, "input": "hi", "temperature": 0.2, "top_p": 0.9, "stream": True})
     assert "temperature" not in out and "top_p" not in out
     assert out["stream"] is True and out["input"] == "hi"
-    assert "reasoning" not in out  # no env -> provider default effort
+    assert out["reasoning"] == {"effort": "high"}  # no env -> Quasar default (high)
+
+
+def test_effort_env_overrides_default(monkeypatch):
+    monkeypatch.setenv("QUASAR_OPENAI_REASONING_EFFORT", "medium")
+    assert _strip({"model": "gpt-6-luna"})["reasoning"] == {"effort": "medium"}
 
 
 def test_other_models_keep_sampling_params():
@@ -53,10 +58,10 @@ def test_effort_env_not_applied_to_other_models(monkeypatch):
     assert "reasoning" not in _strip({"model": "gpt-4.1"})
 
 
-def test_unknown_effort_is_ignored_and_logged(monkeypatch, caplog):
+def test_unknown_effort_falls_back_to_default_and_logs(monkeypatch, caplog):
     monkeypatch.setenv("QUASAR_OPENAI_REASONING_EFFORT", "ultra")
     with caplog.at_level(logging.WARNING):
-        assert "reasoning" not in _strip({"model": "gpt-6-luna"})
+        assert _strip({"model": "gpt-6-luna"})["reasoning"] == {"effort": "high"}
     assert any("QUASAR_OPENAI_REASONING_EFFORT='ultra'" in r.getMessage() for r in caplog.records)
 
 

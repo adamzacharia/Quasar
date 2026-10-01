@@ -90,13 +90,15 @@ def _is_public(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
 
 
 def check_public_url(
-    url: str, param: str = "access_url", *, resolve: bool = True
+    url: str, param: str = "access_url", *, resolve: bool = True, use_allowlist: bool = True
 ) -> Tuple[bool, str]:
     """(ok, reason). ``reason`` is model-facing and names ``param``.
 
     ``resolve=False`` skips DNS (syntax, allowlist, IP literals and local
     names only): the cheap early check used before a service object is
-    built. The HTTP-layer check always resolves."""
+    built. The HTTP-layer check always resolves. ``use_allowlist=False``
+    skips ``VO_ALLOWED_HOSTS``, which scopes the VO tools only (the MCP
+    connector reuses the public-address checks, services/mcp_url_policy.py)."""
     try:
         parts = urlsplit(str(url or "").strip())
     except ValueError:
@@ -114,7 +116,7 @@ def check_public_url(
         return False, f"{param} has an invalid port."
 
     allowed = _allowed_hosts()
-    if _allowlist_configured() and not _host_matches(host, allowed):
+    if use_allowlist and _allowlist_configured() and not _host_matches(host, allowed):
         return False, f"{param} host {host!r} is not in this deployment's VO_ALLOWED_HOSTS."
 
     if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):

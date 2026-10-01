@@ -1,6 +1,7 @@
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
 import { splitProviderChunk } from "./feedback-report";
 import { getStoredToken } from "./auth-store";
+import type { McpStepMeta } from "@/components/ThoughtProcessWidget";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -92,6 +93,8 @@ export interface StreamCallbacks {
     // guarded tool is still executing). Without a dispatch case the step
     // spinner looked frozen for the whole tool call (2026-08-04 density hang).
     onRunProgress?: (phase: string, tool: string) => void;
+    /** A user MCP tool call's server, tool and outcome for the step `step`. */
+    onMcpStep?: (step: string, meta: McpStepMeta) => void;
     onTaskGroup?: (group: Record<string, unknown>) => void;
     onTaskUpdate?: (update: Record<string, unknown>) => void;
     onTaskList?: (list: Record<string, unknown>) => void;
@@ -338,6 +341,11 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onStatus(parsed.step, parsed.state);
                         } else if (parsed.type === "run_progress" && callbacks.onRunProgress) {
                             callbacks.onRunProgress(String(parsed.phase || ""), String(parsed.tool || ""));
+                        } else if (parsed.type === "mcp_step" && callbacks.onMcpStep) {
+                            if (typeof parsed.step === "string" && typeof parsed.server === "string") {
+                                const { type: _t, step, ...meta } = parsed;
+                                callbacks.onMcpStep(step, meta as McpStepMeta);
+                            }
                         } else if (parsed.type === "tool_call") {
                             // Show as a thinking step, not a separate message bubble
                             if (callbacks.onStatus) {

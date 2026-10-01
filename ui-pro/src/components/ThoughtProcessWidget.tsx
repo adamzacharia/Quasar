@@ -11,6 +11,18 @@ export interface ThoughtStep {
     startedAt?: number;
     /** Seconds the step has been running, refreshed by tool heartbeats. */
     elapsedSeconds?: number;
+    /** Set when the step is a call to one of the user's own MCP servers. */
+    mcp?: McpStepMeta;
+}
+
+export interface McpStepMeta {
+    server: string;
+    tool: string;
+    state?: "running" | "completed" | "error";
+    ok?: boolean;
+    error?: string | null;
+    /** Wall-clock duration of the finished call. */
+    ms?: number;
 }
 
 interface ThoughtProcessWidgetProps {

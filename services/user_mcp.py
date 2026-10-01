@@ -57,22 +57,116 @@ def _describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}"[:300]
 
 
+def _find_exception(exc: BaseException, types, depth: int = 0):
+    """The first exception of ``types`` anywhere in an exception (group) tree."""
+    if depth > 10 or exc is None:
+        return None
+    if isinstance(exc, types):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            found = _find_exception(sub, types, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_http_status_error(exc: BaseException, depth: int = 0):
+    """The httpx.HTTPStatusError anywhere in an exception (group) tree."""
+    import httpx
+
+    return _find_exception(exc, httpx.HTTPStatusError, depth)
+
+
+def _is_oauth(cfg: dict) -> bool:
+    return (cfg.get("auth") or "none") == "oauth"
+
+
+def _classify_failure(exc: BaseException, cfg: dict) -> str:
+    """Connection state for a failed connect: needs_auth | needs_api_key | error."""
+    from services.mcp_oauth import OAuthSignInRequired
+
+    if _find_exception(exc, OAuthSignInRequired) is not None:
+        return "needs_auth"
+    err = _find_http_status_error(exc)
+    if err is not None and err.response.status_code == 401:
+        return "needs_auth" if _is_oauth(cfg) else "needs_api_key"
+    return "error"
+
+
+def _http_error_message(exc: BaseException, cfg: dict, what: str) -> Optional[str]:
+    """A user-facing message when the server answered with an HTTP error
+    status (``what`` is "call" or "connection"), else None."""
+    from services.mcp_oauth import SIGN_IN_AGAIN, OAuthSignInRequired
+
+    server = cfg.get("name") or "MCP server"
+    if _find_exception(exc, OAuthSignInRequired) is not None:
+        return f"{server}: {SIGN_IN_AGAIN}"
+    err = _find_http_status_error(exc)
+    if err is None:
+        return None
+    code = err.response.status_code
+    status = f"{code} {err.response.reason_phrase or ''}".strip()
+    if code == 401 and _is_oauth(cfg):
+        return f"{server} rejected the {what} ({status}): {SIGN_IN_AGAIN}"
+    has_key = any(str(k).lower() in ("authorization", "x-api-key", "api-key")
+                  for k in (cfg.get("headers") or {}))
+    if code == 401 and has_key:
+        hint = "the API key under Request headers was rejected; check that it is current and complete"
+    elif code == 401:
+        hint = "this server needs an API key, add it under Request headers as Authorization: Bearer <key>"
+    elif code == 402:
+        hint = "the account behind this API key is out of credits or needs a paid plan"
+    elif code == 403:
+        hint = "the API key under Request headers is missing or not allowed to use this tool"
+    elif code == 429:
+        hint = "the server is rate limiting requests; wait a little and try again"
+    elif code >= 500:
+        return f"{server} failed with a server error ({status}); try again later"
+    else:
+        return f"{server} rejected the {what} ({status})"
+    return f"{server} rejected the {what} ({status}): {hint}"
+
+
+class _ConnectionDropped(Exception):
+    """The transport under an in-flight call died (e.g. HTTP 401 on its POST)."""
+
+
 class _Conn:
-    def __init__(self, cfg: dict, fingerprint: str):
+    def __init__(self, cfg: dict, fingerprint: str, key: Optional[Tuple[str, str]] = None):
         self.cfg = cfg
         self.fingerprint = fingerprint
+        self.key = key
         self.session = None
         self.tools: list = []
         self.transport_used: Optional[str] = None
         self.error: Optional[str] = None
         self.ready = threading.Event()
         self.close_evt: Optional[asyncio.Event] = None
+        # Set on the pool loop whenever the holder task ends, for any reason.
+        # In-flight calls race against it: when an HTTP error (say 401 on a
+        # tools/call POST) kills the streamable HTTP transport's task group,
+        # the SDK never resolves the pending call_tool, so without this the
+        # caller sat out the full MCP call timeout (seen live 2026-10-01).
+        self.dropped = asyncio.Event()
+        self.drop_error: Optional[str] = None
         self.failed_at: Optional[float] = None
+        # Why it is not connected: "needs_auth" (OAuth sign-in missing or
+        # expired), "needs_api_key" (plain 401) or "error".
+        self.failure_state: str = "error"
         self.last_used = time.monotonic()
 
     @property
     def alive(self) -> bool:
         return self.session is not None and self.error is None
+
+    @property
+    def state(self) -> str:
+        if self.alive:
+            return "connected"
+        if self.error:
+            return self.failure_state
+        return "connecting"
 
 
 class UserMCPPool:
@@ -102,16 +196,35 @@ class UserMCPPool:
             return loop
 
     # ── one connection ──────────────────────────────────────────────────
-    async def _open(self, stack, cfg: dict):
+    async def _open(self, stack, cfg: dict, user_id: str = ""):
         from mcp.client.session import ClientSession
 
         transport = (cfg.get("transport") or "stdio").strip().lower()
         url = (cfg.get("url") or "").strip()
         headers = {str(k): str(v) for k, v in (cfg.get("headers") or {}).items() if k} or None
+        http_kw: Dict[str, Any] = {}
+        if transport in ("streamable_http", "http"):
+            from services.mcp_url_policy import ensure_mcp_url, guarded_client_factory
+
+            # SSRF guard: checked here and again on every request (redirects
+            # included) by the guarded client factory.
+            oauth = _is_oauth(cfg)
+            await asyncio.to_thread(ensure_mcp_url, url, require_https=oauth)
+            http_kw["httpx_client_factory"] = guarded_client_factory(require_https=oauth)
+            if oauth:
+                from services.mcp_oauth import OAuthBearer
+
+                # The stored token is attached (and refreshed) per request;
+                # it never sits in cfg or the connection fingerprint.
+                http_kw["auth"] = OAuthBearer(user_id, cfg["name"])
+                if headers:
+                    headers.pop("Authorization", None)
+                    headers.pop("authorization", None)
         if transport == "streamable_http":
             from mcp.client.streamable_http import streamablehttp_client
 
-            read, write, _ = await stack.enter_async_context(streamablehttp_client(url, headers=headers))
+            read, write, _ = await stack.enter_async_context(
+                streamablehttp_client(url, headers=headers, **http_kw))
             used = "streamable_http"
         elif transport == "http":
             # Legacy SSE transport. Stored "http" configs predate the
@@ -120,7 +233,7 @@ class UserMCPPool:
             # as streamable HTTP when SSE fails.
             from mcp.client.sse import sse_client
 
-            read, write = await stack.enter_async_context(sse_client(url, headers=headers))
+            read, write = await stack.enter_async_context(sse_client(url, headers=headers, **http_kw))
             used = "sse"
         else:
             from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -147,29 +260,70 @@ class UserMCPPool:
             # timeout. Genuine SSE servers still connect on the second try.
             cfgs = [{**conn.cfg, "transport": "streamable_http"}, conn.cfg]
         errors: List[str] = []
-        for cfg in cfgs:
-            try:
-                async with AsyncExitStack() as stack:
-                    # asyncio.timeout (not wait_for): the transport's anyio
-                    # scopes must be entered and exited in THIS task.
-                    async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
-                        session, tools, used = await self._open(stack, cfg)
-                    conn.session, conn.tools, conn.transport_used = session, tools, used
-                    conn.error = None
-                    conn.ready.set()
-                    await conn.close_evt.wait()
+        try:
+            for cfg in cfgs:
+                established = False
+                try:
+                    async with AsyncExitStack() as stack:
+                        # asyncio.timeout (not wait_for): the transport's anyio
+                        # scopes must be entered and exited in THIS task.
+                        async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
+                            session, tools, used = await self._open(
+                                stack, cfg, conn.key[0] if conn.key else "")
+                        conn.session, conn.tools, conn.transport_used = session, tools, used
+                        conn.error = None
+                        established = True
+                        conn.ready.set()
+                        await conn.close_evt.wait()
+                        return
+                except asyncio.CancelledError:
                     return
-            except asyncio.TimeoutError:
-                errors.append(f"timed out after {CONNECT_TIMEOUT_SECONDS:.0f}s")
-            except asyncio.CancelledError:
-                return
-            except BaseException as exc:  # noqa: BLE001 - reported, not raised
-                errors.append(_describe_error(exc))
-            finally:
-                conn.session = None
-        conn.error = " | ".join(errors) or "connection failed"
-        conn.failed_at = time.monotonic()
-        conn.ready.set()
+                except BaseException as exc:  # noqa: BLE001 - reported, not raised
+                    if established:
+                        # A live session died, not a failed connect: no SSE
+                        # fallback and no retry backoff.
+                        self._on_drop(conn, exc)
+                        return
+                    from services.mcp_url_policy import UnsafeMcpUrl
+
+                    state = _classify_failure(exc, cfg)
+                    if state != "error":
+                        conn.failure_state = state
+                    unsafe = _find_exception(exc, UnsafeMcpUrl)
+                    if isinstance(exc, TimeoutError):
+                        errors.append(f"timed out after {CONNECT_TIMEOUT_SECONDS:.0f}s")
+                    elif unsafe is not None:
+                        errors.append(str(unsafe))
+                    else:
+                        errors.append(_http_error_message(exc, cfg, "connection") or _describe_error(exc))
+                    if state != "error" or unsafe is not None:
+                        break  # the SSE fallback would fail the same way
+                finally:
+                    conn.session = None
+            conn.error = " | ".join(errors) or "connection failed"
+            conn.failed_at = time.monotonic()
+        finally:
+            conn.ready.set()
+            conn.dropped.set()
+
+    def _on_drop(self, conn: _Conn, exc: BaseException) -> None:
+        """Record why a live session died and reconnect in the background, so
+        one rejected call (a credit-gated tool without a key, say) does not
+        take the server's other tools down with it."""
+        name = conn.cfg.get("name")
+        conn.drop_error = (_http_error_message(exc, conn.cfg, "call")
+                           or f"{name} connection dropped: {_describe_error(exc)}")
+        conn.error = conn.drop_error
+        conn.failed_at = None
+        print(f"[UserMCP] {name} session dropped: {conn.drop_error}")
+        if conn.key is None or self._loop is None:
+            return
+        with self._lock:
+            current = self._conns.get(conn.key) is conn
+        if current:
+            # call_soon: runs after this holder task has fired conn.dropped,
+            # so waiting calls report drop_error, not a fresh connect.
+            self._loop.call_soon(self._connect, conn.key[0], conn.cfg)
 
     def _close(self, conn: _Conn) -> None:
         loop = self._loop
@@ -207,11 +361,35 @@ class UserMCPPool:
                 return conn
             if conn is not None:
                 self._close(conn)
-            conn = _Conn(cfg, fingerprint)
+            conn = _Conn(cfg, fingerprint, key)
             self._conns[key] = conn
+        if _is_oauth(cfg):
+            reason = self._oauth_blocker(user_id, cfg["name"])
+            if reason:
+                # No usable sign-in: do not dial the server at all (a turn
+                # must never wait on, or hammer, a server that will say 401).
+                conn.error, conn.failure_state = reason, "needs_auth"
+                conn.failed_at = time.monotonic()
+                conn.ready.set()
+                conn.dropped.set()
+                return conn
         loop = self._ensure_loop()
         asyncio.run_coroutine_threadsafe(self._hold(conn), loop)
         return conn
+
+    @staticmethod
+    def _oauth_blocker(user_id: str, name: str) -> Optional[str]:
+        """Why an OAuth server cannot be connected right now, or None."""
+        try:
+            from services.mcp_oauth_store import MCPOAuthStore
+
+            rec = MCPOAuthStore().get(user_id, name)
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not read the saved sign-in ({type(exc).__name__})."
+        if rec is None or not rec.access_token:
+            return (rec.status_reason if rec and rec.status_reason
+                    else "Sign in to finish connecting this server.")
+        return None
 
     def _reap_idle(self) -> None:
         now = time.monotonic()
@@ -253,6 +431,8 @@ class UserMCPPool:
                     function=self._tool_fn(user_id, conn.cfg, t.name),
                     parameters=t.inputSchema or {"type": "object", "properties": {}},
                     category="mcp",
+                    mcp_server=name,
+                    mcp_tool=t.name,
                 ))
         if tools:
             print(f"[UserMCP] {len(tools)} tool(s) for {user_id}: {', '.join(x.name for x in tools[:8])}")
@@ -264,6 +444,9 @@ class UserMCPPool:
         between building the tool list and the model's call must not leave
         the tool pointing at a closed session."""
         from concurrent.futures import TimeoutError as FutureTimeoutError
+
+        from mcp.shared.exceptions import McpError
+        from mcp.types import CONNECTION_CLOSED
 
         from adapters.mcp.normalize import normalize_mcp_failure, normalize_mcp_result
         from core.agent import _mcp_call_timeout_seconds
@@ -285,7 +468,33 @@ class UserMCPPool:
             session = conn.session
 
             async def run():
-                res = await session.call_tool(tool_name, arguments=kwargs)
+                # Race the call against the session dying (see _Conn.dropped).
+                task = asyncio.ensure_future(session.call_tool(tool_name, arguments=kwargs))
+                dropped = asyncio.ensure_future(conn.dropped.wait())
+                try:
+                    await asyncio.wait({task, dropped}, return_when=asyncio.FIRST_COMPLETED)
+                except asyncio.CancelledError:
+                    task.cancel()
+                    raise
+                finally:
+                    dropped.cancel()
+                if not task.done():
+                    task.cancel()
+                    raise _ConnectionDropped(conn.drop_error or f"{server} connection closed")
+                try:
+                    res = task.result()
+                except McpError as exc:
+                    # Teardown may fail the call ("Connection closed") just
+                    # before the holder records why; prefer the reason.
+                    if getattr(exc.error, "code", None) != CONNECTION_CLOSED:
+                        raise
+                    try:
+                        await asyncio.wait_for(conn.dropped.wait(), 2)
+                    except TimeoutError:
+                        pass
+                    if conn.drop_error:
+                        raise _ConnectionDropped(conn.drop_error) from None
+                    raise
                 return normalize_mcp_result(server, tool_name, res, kwargs)
 
             timeout = _mcp_call_timeout_seconds()
@@ -295,6 +504,8 @@ class UserMCPPool:
             except FutureTimeoutError:
                 fut.cancel()
                 return fail(f"MCP tool call timed out after {timeout:.0f} seconds")
+            except _ConnectionDropped as exc:
+                return fail(str(exc))
             except BaseException as exc:  # noqa: BLE001 - reported to the model
                 return fail(_describe_error(exc))
 
@@ -308,15 +519,17 @@ class UserMCPPool:
         conn = self._connect(user_id, cfg, force=True)
         conn.ready.wait(CONNECT_TIMEOUT_SECONDS * 2 + 2)
         if conn.alive:
-            return {"connected": True, "transport": conn.transport_used,
+            return {"connected": True, "state": "connected", "transport": conn.transport_used,
                     "tools": [t.name for t in conn.tools], "error": None}
-        return {"connected": False, "tools": [], "error": conn.error or "timed out connecting"}
+        return {"connected": False, "state": conn.state if conn.error else "error",
+                "tools": [], "error": conn.error or "timed out connecting"}
 
     def status(self, user_id: str) -> Dict[str, Dict[str, Any]]:
         """Last known state of this user's connections (no new connects)."""
         with self._lock:
             return {
-                name: {"connected": c.alive, "tools": [t.name for t in c.tools] if c.alive else [],
+                name: {"connected": c.alive, "state": c.state,
+                       "tools": [t.name for t in c.tools] if c.alive else [],
                        "error": c.error, "transport": c.transport_used}
                 for (uid, name), c in self._conns.items() if uid == user_id and c.ready.is_set()
             }

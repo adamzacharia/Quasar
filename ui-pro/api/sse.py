@@ -118,6 +118,29 @@ def _sse_status(step: str, state: str = "running") -> str:
     return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
 
 
+# core/runner.py MCP_STEP_SENTINEL (kept literal: this module must not import
+# the runner at load time).
+_MCP_STEP_SENTINEL = "__mcp_step__"
+
+
+def _apply_mcp_step(step: str, state: str, rich_thinking: list) -> Optional[str]:
+    """User MCP call metadata (core/runner.py _emit_mcp_step) -> `mcp_step`
+    SSE line, also attached to the persisted thinking step(s) with that label
+    so a reloaded conversation keeps the badge and the outcome. None for a
+    malformed sentinel."""
+    try:
+        meta = json.loads(step[len(_MCP_STEP_SENTINEL):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(meta, dict) or not isinstance(meta.get("step"), str):
+        return None
+    meta["state"] = state
+    for entry in rich_thinking:
+        if isinstance(entry, dict) and entry.get("step") == meta["step"]:
+            entry["mcp"] = {k: v for k, v in meta.items() if k != "step"}
+    return f"data: {json.dumps({'type': 'mcp_step', **meta})}\n\n"
+
+
 def _provider_failure_error_message(failure: Any) -> Optional[str]:
     """Map the runner's thread-local provider-failure record to the
     chat_runs error_message, or None when no failure was recorded.
@@ -1567,6 +1590,11 @@ async def _stream_chat_response(
                             heartbeat_tool, _, heartbeat_label = heartbeat_detail.partition("::")
                             run_last_status = heartbeat_label or heartbeat_tool or run_last_status
                             yield f"data: {json.dumps({'type': 'run_progress', 'phase': run_last_status, 'tool': heartbeat_tool})}\n\n"
+                            continue
+                        if isinstance(step, str) and step.startswith(_MCP_STEP_SENTINEL):
+                            mcp_event = _apply_mcp_step(step, state, _rich_thinking)
+                            if mcp_event:
+                                yield mcp_event
                             continue
                         if isinstance(step, str) and step.startswith("__eager_data__"):
                             # Agent sent inline result data — stash it for

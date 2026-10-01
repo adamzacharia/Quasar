@@ -165,14 +165,10 @@ app.add_middleware(LoggingMiddleware)
 # regex (localhost/127.0.0.1:300x is not attacker-registerable). Operators can
 # add specific deploy origins (e.g. a Vercel preview or a raw onrender URL) via
 # the comma-separated ``QUASAR_CORS_ORIGINS`` env var — never a wildcard.
-_DEFAULT_CORS_ORIGINS = [
-    "https://quasarassistant.com",
-    "https://www.quasarassistant.com",
-]
-_cors_env = os.getenv("QUASAR_CORS_ORIGINS", "").strip()
-_extra_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
-CORS_ALLOWED_ORIGINS = list(dict.fromkeys(_DEFAULT_CORS_ORIGINS + _extra_cors_origins))
-CORS_ALLOWED_ORIGIN_REGEX = r"http://localhost:300[0-9]|http://127\.0\.0\.1:300[0-9]"
+# The list lives in api/cors_origins.py so the MCP OAuth result page can
+# address the same origins.
+from api.cors_origins import CORS_ALLOWED_ORIGINS, CORS_ALLOWED_ORIGIN_REGEX  # noqa: E402,F401
+from api.cors_origins import is_allowed_origin as _is_allowed_origin  # noqa: E402
 
 
 # ── CSRF: Origin check for cookie-authenticated writes (S6) ───────────────────
@@ -194,12 +190,6 @@ CORS_ALLOWED_ORIGIN_REGEX = r"http://localhost:300[0-9]|http://127\.0\.0\.1:300[
 # means a non-browser client (curl, server-to-server), which cannot be a CSRF
 # victim. Bearer-only clients are untouched.
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
-
-
-def _is_allowed_origin(origin: str) -> bool:
-    if origin in CORS_ALLOWED_ORIGINS:
-        return True
-    return re.fullmatch(CORS_ALLOWED_ORIGIN_REGEX, origin) is not None
 
 
 class CookieCsrfMiddleware(BaseHTTPMiddleware):

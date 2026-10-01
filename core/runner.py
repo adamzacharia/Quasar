@@ -41,7 +41,7 @@ from core.router import policy_web_override as _policy_web_override
 from core import web_planner as _web_planner
 from services.citation_verifier import append_citation_warning
 from services.content_safety import FILTER_NOTICE, is_explicit_query, safe_assistant_text
-from services.secret_redaction import redact_secrets
+from services.secret_redaction import redact_error_text, redact_secrets
 
 
 def _stamp_request_on_results(agent, request: Dict[str, Any], tool_name: str,
@@ -113,6 +113,91 @@ def _result_indicates_timeout(result) -> bool:
     # non-progress: the archive is down, nothing was fetched, and the SSE
     # deadline must not be extended for it.
     return result.get("timeout") is True or result.get("infrastructure_failure") is True
+
+
+# Status-channel sentinel for user MCP tool calls; ui-pro/api/sse.py turns it
+# into an `mcp_step` SSE event and attaches it to the persisted thinking step.
+MCP_STEP_SENTINEL = "__mcp_step__"
+# Closing state of a repeated MCP call that was served from cache instead of
+# re-executed. Not "completed": sse.py extends the turn deadline only for
+# completed steps, and a cache hit is not progress (guard CX-09/CX-10). The UI
+# renders any non-running, non-error state as done.
+MCP_SKIPPED_STATE = "skipped"
+
+
+def _user_mcp_step_meta(tool, tool_name: str, step_label: str,
+                        used_labels: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
+    """Timeline metadata for a call to one of the user's own MCP tools, or None.
+
+    The generic label reads "Running Astropy  fetch astropy documentation"
+    (the ``__`` separator becomes a double space); MCP calls get
+    "Astropy: fetch astropy documentation" instead, keeping any argument hint.
+    With ``used_labels`` (per turn), a repeat gets " · call N": the timeline
+    keys steps by label, so two calls sharing one would show one outcome and
+    a later success could hide an earlier failure (guard CX-02).
+    """
+    server = getattr(tool, "mcp_server", None) if tool is not None else None
+    if not server:
+        return None
+    mcp_tool = getattr(tool, "mcp_tool", None) or tool_name
+    generic_prefix = f"Running {tool_name.replace('_', ' ')}"
+    hint = step_label[len(generic_prefix):] if step_label.startswith(generic_prefix) else ""
+    label = f"{server}: {mcp_tool.replace('_', ' ')}{hint}"
+    if used_labels is not None:
+        n = used_labels.get(label, 0) + 1
+        used_labels[label] = n
+        if n > 1:
+            label = f"{label} · call {n}"
+    return {"step": label, "server": server, "tool": mcp_tool}
+
+
+def _mcp_close_meta(meta: Dict[str, Any], result, timed_out: bool, elapsed_s: float):
+    """Closing state and timeline payload for a finished user MCP call.
+
+    Every MCP failure (isError, exception, MCP timeout, lost connection)
+    comes back as a {"success": False} dict, which used to close as a plain
+    completion. The error is shown in the browser and saved with the
+    conversation, so credentials (headers, ?token= URLs) are scrubbed.
+    """
+    fail = tool_result_failure_reason(result)
+    state = "error" if (timed_out or fail) else "completed"
+    return state, {
+        **meta,
+        "ok": state == "completed",
+        "error": redact_error_text(fail or "timed out")[:300] if state == "error" else None,
+        "ms": max(0, int(elapsed_s * 1000)),
+    }
+
+
+def _emit_mcp_step(on_status, meta: Dict[str, Any], state: str) -> None:
+    try:
+        on_status(MCP_STEP_SENTINEL + json.dumps(meta, default=str), state)
+    except Exception as exc:  # display-only; never break a tool call over it
+        print(f"[UserMCP] could not emit timeline step: {exc}")
+
+
+def _report_skipped_repeat(on_status, step_label: str, mcp_meta: Optional[Dict[str, Any]],
+                           note: str, failed: bool, reason: Optional[str] = None) -> None:
+    """Timeline entry for a repeated call the runner did NOT re-execute.
+
+    A user MCP call becomes one badged chip ("Astropy: search (repeat
+    skipped)") instead of a plain label left open plus a separate skip line.
+    """
+    if not on_status:
+        return
+    if not mcp_meta:
+        on_status(step_label, "running")
+        on_status(f"{step_label} skipped — {note}", "error" if failed else "completed")
+        return
+    state = "error" if failed else MCP_SKIPPED_STATE
+    label = f"{mcp_meta['step']} (repeat skipped)"
+    on_status(label, state)
+    _emit_mcp_step(on_status, {
+        **mcp_meta,
+        "step": label,
+        "ok": not failed,
+        "error": redact_error_text(f"{note}: {reason}" if reason else note)[:300] if failed else None,
+    }, state)
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -809,6 +894,9 @@ def _stream_response_api_impl(
         # This request's user MCP tools (name -> Tool), filled when the tool
         # list is built; defined up front so every dispatch path can read it.
         _user_mcp_tools: dict = {}
+        # MCP timeline labels used this turn -> count, so two calls to one
+        # tool never share a label (and an outcome) in the Research panel.
+        _mcp_step_labels: dict = {}
         # Cleared per turn; set by the error paths below so the SSE layer can
         # record the run as failed even though the user sees a friendly message
         # returned as normal text (provider failures used to land in chat_runs
@@ -2929,6 +3017,16 @@ def _stream_response_api_impl(
                         _round_duplicates += 1
                         cached = json.loads(_prior_call)
                         if isinstance(cached, dict) and cached.get("success") and re.search(r"search|query", tool_name):
+                            # Built-in tools stay silent here (unchanged); a user
+                            # MCP repeat gets its badged "repeat skipped" chip
+                            # like the other skip paths (guard CX-08).
+                            _cache_mcp_meta = _user_mcp_step_meta(
+                                _user_mcp_tools.get(tool_name), tool_name,
+                                agent._tool_status_label(tool_name, args), _mcp_step_labels,
+                            )
+                            if _cache_mcp_meta:
+                                _report_skipped_repeat(on_status, "", _cache_mcp_meta,
+                                                       "identical call already ran this turn", failed=False)
                             result_str = serialize_tool_result({
                                 "repeated_call": True,
                                 "note": "You already ran this; use its result or change approach. This call was not re-executed.",
@@ -2946,9 +3044,11 @@ def _stream_response_api_impl(
                             # failure in milliseconds instead.
                             print(f"[TOOL CALL] {tool_name} repeated with identical args after a timeout/outage/budget cut — not re-executed")
                             step_label = agent._tool_status_label(tool_name, args)
-                            if on_status:
-                                on_status(step_label, "running")
-                                on_status(f"{step_label} skipped — identical call timed out this turn", "error")
+                            _report_skipped_repeat(
+                                on_status, step_label,
+                                _user_mcp_step_meta(_user_mcp_tools.get(tool_name), tool_name, step_label, _mcp_step_labels),
+                                "identical call timed out this turn", failed=True,
+                            )
                             result_str = serialize_tool_result({
                                 **cached,
                                 "repeated_call": True,
@@ -2992,12 +3092,16 @@ def _stream_response_api_impl(
                         if not _allow_retry:
                             _round_duplicates += 1
                             step_label = agent._tool_status_label(tool_name, args)
+                            _skip_mcp_meta = _user_mcp_step_meta(
+                                _user_mcp_tools.get(tool_name), tool_name, step_label, _mcp_step_labels,
+                            )
                             if _canon_prior.get("failed"):
                                 _why = str(_canon_prior.get("reason") or "it failed")[:300]
                                 print(f"[TOOL CALL] {tool_name} repeated (canonically identical) after a failure — not re-executed: {_why[:120]}")
-                                if on_status:
-                                    on_status(step_label, "running")
-                                    on_status(f"{step_label} skipped — identical call already failed this turn", "error")
+                                _report_skipped_repeat(
+                                    on_status, step_label, _skip_mcp_meta,
+                                    "identical call already failed this turn", failed=True, reason=_why,
+                                )
                                 result_str = serialize_tool_result({
                                     "success": False,
                                     "repeated_call": True,
@@ -3010,9 +3114,10 @@ def _stream_response_api_impl(
                                 })
                             else:
                                 print(f"[TOOL CALL] {tool_name} repeated (canonically identical) after a success — served from this turn's cache")
-                                if on_status:
-                                    on_status(step_label, "running")
-                                    on_status(f"{step_label} skipped — identical call already ran this turn", "completed")
+                                _report_skipped_repeat(
+                                    on_status, step_label, _skip_mcp_meta,
+                                    "identical call already ran this turn", failed=False,
+                                )
                                 try:
                                     _prev_obj = json.loads(_canon_prior["result_str"])
                                 except (ValueError, TypeError):
@@ -3039,8 +3144,20 @@ def _stream_response_api_impl(
 
                     # Emit archive-aware tool status to the live phase tracker.
                     step_label = agent._tool_status_label(tool_name, args)
+                    # A user MCP tool gets a server-tagged label plus a
+                    # side-channel record (server, tool, outcome, duration) so
+                    # the Research timeline can badge it and show whether the
+                    # call actually succeeded.
+                    _mcp_meta = _user_mcp_step_meta(
+                        _user_mcp_tools.get(tool_name), tool_name, step_label, _mcp_step_labels,
+                    )
+                    if _mcp_meta:
+                        step_label = _mcp_meta["step"]
                     if on_status:
                         on_status(step_label, "running")
+                        if _mcp_meta:
+                            _emit_mcp_step(on_status, _mcp_meta, "running")
+                    _mcp_started = time.monotonic()
 
                     _trace_result_obj = None
                     _tool_sidecar = None
@@ -3274,7 +3391,22 @@ def _stream_response_api_impl(
                         # a bare label would defeat its timeout exclusion (CX-04).
                         # "error" closes the step with a failure mark in the UI
                         # and never extends the deadline.
-                        on_status(step_label, "error" if _tool_timed_out else "completed")
+                        # A failed MCP call (isError, exception, MCP timeout,
+                        # lost connection) also closes as "error": those all
+                        # come back as {"success": False} dicts, which used to
+                        # render as a normal completion.
+                        if _mcp_meta:
+                            _closed_state, _mcp_done = _mcp_close_meta(
+                                _mcp_meta,
+                                _trace_result_obj if _trace_result_obj is not None else result_str,
+                                _tool_timed_out,
+                                time.monotonic() - _mcp_started,
+                            )
+                        else:
+                            _closed_state = "error" if _tool_timed_out else "completed"
+                        on_status(step_label, _closed_state)
+                        if _mcp_meta:
+                            _emit_mcp_step(on_status, _mcp_done, _closed_state)
 
                     agent._record_tool_trace(tool_name, args, result_str,
                                             result_obj=_trace_result_obj,

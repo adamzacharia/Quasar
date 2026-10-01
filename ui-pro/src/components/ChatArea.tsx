@@ -48,7 +48,7 @@ export function ChatArea() {
         activeConversationId, setActiveConversation,
         selectedModel, conversations,
         toggleStar, createNewConversation,
-        thinkingSteps, thinkingStatus, addThinkingStep, heartbeatThinkingStep, clearThinking,
+        thinkingSteps, thinkingStatus, addThinkingStep, heartbeatThinkingStep, setThinkingStepMcp, clearThinking,
         attachThinkingToLastMessage,
         taskGroups, taskItems, taskChecklist, taskExecutionActive,
         handleTaskGroup, handleTaskUpdate, handleTaskList, clearTaskExecution,
@@ -579,6 +579,9 @@ export function ChatArea() {
                         onRunProgress: (phase: string) => {
                             if (ownerIsActive()) heartbeatThinkingStep(phase);
                         },
+                        onMcpStep: (step, meta) => {
+                            if (ownerIsActive()) setThinkingStepMcp(step, meta);
+                        },
                         onData: (data: Record<string, unknown>) => {
                             const tableData = data as unknown as DataTableResult;
                             // The server-minted block id doubles as the message id
@@ -900,6 +903,7 @@ export function ChatArea() {
         messages,
         addThinkingStep,
         heartbeatThinkingStep,
+        setThinkingStepMcp,
         clearThinking,
         attachThinkingToLastMessage,
         clearTaskExecution,

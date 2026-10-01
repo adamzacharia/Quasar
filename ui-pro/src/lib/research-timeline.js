@@ -89,8 +89,10 @@ function dedupeSteps(steps) {
         if (!s || typeof s.text !== "string") continue;
         const text = s.text.trim();
         if (!text) continue;
-        if (!byText.has(text)) order.push(text);
-        byText.set(text, { ...s, text });
+        const prev = byText.get(text);
+        if (!prev) order.push(text);
+        // MCP metadata may sit on an earlier entry only; never lose it.
+        byText.set(text, { ...s, text, ...(!s.mcp && prev?.mcp ? { mcp: prev.mcp } : {}) });
     }
     return order.map((t) => byText.get(t));
 }
@@ -121,7 +123,8 @@ function pushUnique(items, item) {
  * @param {number} [input.paperCount]    ADS papers returned this turn
  * @returns {{
  *   sections: Array<{kind: string, title: string, status: string,
- *     items: Array<{text: string, status: string, icon: string, url?: string, domain?: string, elapsedSeconds?: number}>,
+ *     items: Array<{text: string, status: string, icon: string, url?: string, domain?: string, elapsedSeconds?: number,
+ *       mcp?: {server: string, error?: string, ms?: number}}>,
  *     overflow?: number, hiddenCount?: number}>,
  *   sourceCount: number,
  *   stepCount: number,
@@ -132,7 +135,14 @@ function pushUnique(items, item) {
 export function buildResearchTimeline(input = {}) {
     const running = Boolean(input.running);
     const raw = Array.isArray(input.steps) ? input.steps : [];
-    const steps = dedupeSteps(raw).filter((s) => !HIDDEN_STEP_RES.some((re) => re.test(s.text)));
+    const deduped = dedupeSteps(raw);
+    // The tool guard's "<label> timed out after Ns — continuing" notice for an
+    // MCP call repeats what its red MCP chip already says (guard CX-04).
+    const mcpLabels = deduped.filter((s) => s.mcp).map((s) => `${s.text} timed out after `);
+    // A step that carries MCP metadata is itself a call, never a notice, even
+    // if its label happens to extend another one (guard verify CX-04).
+    const steps = deduped.filter((s) => !HIDDEN_STEP_RES.some((re) => re.test(s.text))
+        && (s.mcp || !mcpLabels.some((p) => s.text.startsWith(p))));
 
     /** @type {Map<string, {kind: string, title: string, items: any[], order: number, generic?: any[]}>} */
     const sections = new Map();
@@ -156,7 +166,29 @@ export function buildResearchTimeline(input = {}) {
         const base = { status, ...(typeof s.elapsedSeconds === "number" ? { elapsedSeconds: s.elapsedSeconds } : {}) };
         if (status === "running") current = text.replace(REASON_RE, "").replace(/^🌐\s*/u, "");
 
-        if (REASON_RE.test(text)) {
+        if (s.mcp && typeof s.mcp.server === "string" && s.mcp.server) {
+            // A call to one of the user's own MCP servers (core/runner.py
+            // _user_mcp_step_meta). The chip carries the server badge, so the
+            // "Server: " label prefix is dropped from its text.
+            const prefix = `${s.mcp.server}: `;
+            // A call whose closing record never arrived (the turn timed out or
+            // was stopped mid-call) did not succeed: never show it green
+            // after the turn ends (guard CX-03).
+            const unfinished = !running && s.mcp.state === "running";
+            const mcpStatus = s.mcp.state === "error" || s.mcp.ok === false || unfinished ? "error" : status;
+            const mcpError = unfinished ? "did not finish" : s.mcp.error;
+            section("mcp", "Using your MCP servers").items.push({
+                ...base,
+                status: mcpStatus,
+                text: text.startsWith(prefix) ? text.slice(prefix.length) : text,
+                icon: "mcp",
+                mcp: {
+                    server: s.mcp.server,
+                    ...(mcpStatus === "error" && mcpError ? { error: String(mcpError) } : {}),
+                    ...(typeof s.mcp.ms === "number" && mcpStatus !== "running" ? { ms: s.mcp.ms } : {}),
+                },
+            });
+        } else if (REASON_RE.test(text)) {
             const line = text.replace(REASON_RE, "").trim();
             if (line) section("reasoning", "Thinking").items.push({ ...base, text: line, icon: "spark" });
         } else if (READING_RE.test(text)) {

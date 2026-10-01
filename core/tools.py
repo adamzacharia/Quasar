@@ -28,6 +28,10 @@ class Tool:
     function: Callable
     parameters: Dict[str, Any]  # full JSON schema
     category: str = "general"
+    # Set only for a user's own MCP server tools (services/user_mcp.py) so the
+    # Research timeline can badge the call with its real server and tool name.
+    mcp_server: Optional[str] = None
+    mcp_tool: Optional[str] = None
 
     def execute(self, **kwargs) -> Any:
         """Execute the tool function"""

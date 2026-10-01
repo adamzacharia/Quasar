@@ -63,6 +63,23 @@ def _resolve_fernet() -> Fernet:
     return Fernet(_dev_fernet_key())
 
 
+def encrypt_secret(plaintext: str) -> str:
+    """Encrypt a user secret with the same Fernet key as provider API keys.
+
+    Shared by other stores (MCP server headers, OAuth tokens) so there is one
+    key, one production requirement and one rotation story."""
+    return _resolve_fernet().encrypt((plaintext or "").encode("utf-8")).decode("utf-8")
+
+
+def decrypt_secret(token: str) -> str:
+    """Inverse of :func:`encrypt_secret`; raises ProviderKeyError when the
+    value was encrypted under a different key or is corrupt."""
+    try:
+        return _resolve_fernet().decrypt(str(token or "").encode("utf-8")).decode("utf-8")
+    except InvalidToken as exc:
+        raise ProviderKeyError("A stored secret could not be decrypted (wrong or rotated key).") from exc
+
+
 def _normalize_provider(provider: str) -> str:
     value = (provider or "").strip().lower()
     if value == "gemini":

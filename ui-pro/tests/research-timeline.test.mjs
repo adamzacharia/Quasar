@@ -259,3 +259,118 @@ test("turnPaperCount counts only the turn's papers", () => {
     assert.equal(turnPaperCount(messages, 6), 3);
     assert.equal(turnPaperCount(messages, 99), 0);
 });
+
+test("user MCP calls get their own section with server, outcome and duration", () => {
+    const astropy = { server: "Astropy", tool: "search_astropy_documentation" };
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [
+            { text: "Querying ALMA by target", status: "completed" },
+            { text: 'Astropy: search astropy documentation ("SkyCoord")', status: "completed",
+                mcp: { ...astropy, state: "completed", ok: true, ms: 1240 } },
+            { text: "DeepWiki: ask question", status: "error",
+                mcp: { server: "DeepWiki", tool: "ask_question", state: "error", ok: false, error: "Repository not found", ms: 310 } },
+        ],
+    });
+    assert.deepEqual(kinds(t), ["querying", "mcp"]);
+    const [ok, failed] = t.sections[1].items;
+    assert.equal(ok.text, 'search astropy documentation ("SkyCoord")');
+    assert.equal(ok.status, "completed");
+    assert.deepEqual(ok.mcp, { server: "Astropy", ms: 1240 });
+    assert.equal(failed.status, "error");
+    assert.deepEqual(failed.mcp, { server: "DeepWiki", error: "Repository not found", ms: 310 });
+    assert.equal(t.stepCount, 3);
+});
+
+test("MCP failure wins even if the plain step closed as completed", () => {
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [{ text: "Hub: search", status: "completed",
+            mcp: { server: "Hub", tool: "search", state: "error", ok: false, error: "401" } }],
+    });
+    assert.equal(t.sections[0].items[0].status, "error");
+    assert.equal(t.sections[0].status, "error");
+});
+
+test("persisted MCP metadata on an earlier entry survives dedupe", () => {
+    // Reloaded history records running + completed entries for one label.
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [
+            { text: "Astropy: fetch astropy documentation", status: "running",
+                mcp: { server: "Astropy", tool: "fetch_astropy_documentation", state: "completed", ok: true, ms: 800 } },
+            { text: "Astropy: fetch astropy documentation", status: "completed" },
+        ],
+    });
+    assert.deepEqual(kinds(t), ["mcp"]);
+    assert.equal(t.sections[0].items[0].text, "fetch astropy documentation");
+    assert.equal(t.sections[0].items[0].status, "completed");
+});
+
+test("a running MCP call is live and shows no duration yet", () => {
+    const t = buildResearchTimeline({
+        running: true,
+        steps: [{ text: "Context7: resolve-library-id", status: "running",
+            mcp: { server: "Context7", tool: "resolve-library-id", state: "running" } }],
+    });
+    assert.equal(t.sections[0].status, "running");
+    assert.equal(t.sections[0].items[0].mcp.ms, undefined);
+    assert.equal(t.current, "Context7: resolve-library-id");
+});
+
+test("an MCP call that never closed is not shown as a success after the turn", () => {  // guard CX-03
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [{ text: "Hub: search", status: "running",
+            mcp: { server: "Hub", tool: "search", state: "running" } }],
+    });
+    const item = t.sections[0].items[0];
+    assert.equal(item.status, "error");
+    assert.equal(item.mcp.error, "did not finish");
+});
+
+test("the guard's timeout notice for an MCP call is folded into its chip", () => {  // guard CX-04
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [
+            { text: "Hub: search", status: "error",
+                mcp: { server: "Hub", tool: "search", state: "error", ok: false, error: "timed out" } },
+            { text: "Hub: search timed out after 150s — continuing with available data", status: "completed" },
+        ],
+    });
+    assert.deepEqual(kinds(t), ["mcp"]);
+    assert.equal(t.sections[0].items.length, 1);
+});
+
+test("two calls to one MCP tool keep separate outcomes", () => {  // guard CX-02
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [
+            { text: "Hub: search", status: "error", mcp: { server: "Hub", tool: "search", state: "error", ok: false, error: "401" } },
+            { text: "Hub: search · call 2", status: "completed", mcp: { server: "Hub", tool: "search", state: "completed", ok: true, ms: 90 } },
+        ],
+    });
+    assert.deepEqual(t.sections[0].items.map((i) => i.status), ["error", "completed"]);
+});
+
+test("an MCP tool whose label extends another's is never hidden as a notice", () => {  // guard verify CX-04
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [
+            { text: "Hub: search", status: "completed", mcp: { server: "Hub", tool: "search", state: "completed", ok: true } },
+            { text: "Hub: search timed out after 150s", status: "completed",
+                mcp: { server: "Hub", tool: "search_timed_out_after_150s", state: "completed", ok: true } },
+        ],
+    });
+    assert.equal(t.sections[0].items.length, 2);
+});
+
+test("a cache-served MCP repeat (state skipped) reads as done, not failed", () => {  // guard verify CX-10
+    const t = buildResearchTimeline({
+        running: false,
+        steps: [{ text: "Hub: search (repeat skipped)", status: "skipped",
+            mcp: { server: "Hub", tool: "search", state: "skipped", ok: true } }],
+    });
+    assert.equal(t.sections[0].items[0].status, "completed");
+    assert.equal(t.sections[0].items[0].text, "search (repeat skipped)");
+});

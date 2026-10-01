@@ -2,8 +2,8 @@
 
 /* eslint-disable @next/next/no-img-element */
 import {
-    AlertCircle, BookOpen, ChartLine, ChevronDown, Database, Download, FileText, GitMerge,
-    Globe, Image as ImageIcon, Loader2, Orbit, Search, Sparkles,
+    AlertCircle, BookOpen, ChartLine, CheckCircle2, ChevronDown, Database, Download, FileText, GitMerge,
+    Globe, Image as ImageIcon, Loader2, Orbit, Plug, Search, Sparkles,
 } from "lucide-react";
 import { useEffect, useId, useState, type ReactNode } from "react";
 import type { ThoughtStep } from "./ThoughtProcessWidget";
@@ -68,7 +68,61 @@ function ItemIcon({ item }: { item: Item }) {
     }
 }
 
+function formatMs(ms: number): string {
+    return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+}
+
+/**
+ * A call to one of the user's MCP servers: violet chip with the server name
+ * as a badge, then the outcome (green check + duration, or red "Failed" with
+ * the server's error on hover). Without this a failed MCP call looked exactly
+ * like a successful one.
+ */
+function McpChip({ item, index }: { item: Item; index: number }) {
+    const mcp = item.mcp;
+    const running = item.status === "running";
+    const error = item.status === "error";
+    const outcome = running ? "running" : error ? `failed${mcp?.error ? `: ${mcp.error}` : ""}` : "succeeded";
+    const title = `${mcp?.server ?? ""} MCP server · ${item.text} · ${outcome}`;
+    return (
+        <span
+            className={`q-item-in inline-flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] leading-5 ${error ? "q-err" : "q-mcp-chip"}`}
+            style={{
+                animationDelay: `${Math.min(index, 8) * 55}ms`,
+                ...(error ? { background: "rgba(248, 113, 113, 0.08)", border: "1px solid rgba(248, 113, 113, 0.3)" } : {}),
+            }}
+            title={title}
+        >
+            {running
+                ? <Loader2 className="q-mcp-icon h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden="true" />
+                : <Plug className={`h-3.5 w-3.5 shrink-0 ${error ? "" : "q-mcp-icon"}`} aria-hidden="true" />}
+            <span className={`shrink-0 rounded px-1.5 text-[10px] font-semibold leading-4 ${error ? "" : "q-mcp-badge"}`}
+                style={error ? { background: "rgba(248, 113, 113, 0.15)" } : undefined}>
+                {mcp?.server}
+            </span>
+            <span className={`truncate ${running ? "q-shimmer" : ""}`}>{item.text}</span>
+            {running && typeof item.elapsedSeconds === "number" && item.elapsedSeconds >= 15 && (
+                <span className="shrink-0 font-mono" style={{ color: "var(--q-text-faint)" }}>{item.elapsedSeconds}s</span>
+            )}
+            {!running && !error && (
+                <span className="q-ok inline-flex shrink-0 items-center gap-0.5">
+                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    {typeof mcp?.ms === "number" && <span className="font-mono text-[10px]">{formatMs(mcp.ms)}</span>}
+                </span>
+            )}
+            {error && (
+                <span className="inline-flex min-w-0 shrink items-center gap-0.5 font-medium">
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span className="truncate">{mcp?.error ? `Failed: ${mcp.error}` : "Failed"}</span>
+                </span>
+            )}
+            {!error && <span className="sr-only">{outcome}</span>}
+        </span>
+    );
+}
+
 function Chip({ item, index, mono }: { item: Item; index: number; mono: boolean }) {
+    if (item.mcp) return <McpChip item={item} index={index} />;
     const running = item.status === "running";
     const error = item.status === "error";
     const body = (

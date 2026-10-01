@@ -587,6 +587,29 @@ html {
 .q-warn { color: #fbbf24; }
 [data-theme="light"] .q-err { color: #b91c1c; }
 [data-theme="light"] .q-warn { color: #b45309; }
+.q-ok { color: #34d399; }
+[data-theme="light"] .q-ok { color: #047857; }
+/* Research timeline: a call to one of the user's own MCP servers. Violet so
+   it reads apart from Quasar's built-in archive tools at a glance. */
+.q-mcp-chip {
+  background: rgba(167, 139, 250, 0.1);
+  border: 1px solid rgba(167, 139, 250, 0.3);
+  color: var(--q-text-secondary);
+}
+.q-mcp-badge {
+  background: rgba(167, 139, 250, 0.2);
+  color: #c4b5fd;
+}
+.q-mcp-icon { color: #a78bfa; }
+[data-theme="light"] .q-mcp-chip {
+  background: rgba(124, 58, 237, 0.06);
+  border-color: rgba(124, 58, 237, 0.25);
+}
+[data-theme="light"] .q-mcp-badge {
+  background: rgba(124, 58, 237, 0.12);
+  color: #6d28d9;
+}
+[data-theme="light"] .q-mcp-icon { color: #7c3aed; }
 /* Timeline dot; the live one sends out a soft ping. */
 .q-dot { background: currentColor; }
 .q-dot-live::after {

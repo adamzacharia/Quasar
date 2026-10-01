@@ -71,3 +71,22 @@ def redact_url(value: Any) -> str:
         return redact_secrets(rebuilt)
     except Exception:
         return redact_secrets(raw)
+
+
+_SECRET_PARAM_IN_TEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(" + "|".join(sorted(map(re.escape, _SECRET_QUERY_PARAMS), key=len, reverse=True))
+    + r")=([^&\s'\"<>]+)"
+)
+
+
+def redact_error_text(value: Any) -> str:
+    """Redact free text that may embed URLs, such as an upstream error message.
+
+    ``redact_url`` needs the value to BE a URL; an error like
+    "401 for url 'https://h/mcp?token=abc'" carries one inside prose, and its
+    short ``token=`` value survives ``redact_secrets``. Credential-named
+    ``name=value`` pairs are scrubbed wherever they appear, then the generic
+    key patterns run.
+    """
+    text = _SECRET_PARAM_IN_TEXT.sub(lambda m: f"{m.group(1)}=[REDACTED]", str(value or ""))
+    return redact_secrets(text)

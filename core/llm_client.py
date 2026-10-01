@@ -840,22 +840,26 @@ class ResponsesShim:
     _NO_SAMPLING_PREFIXES = ("gpt-6",)
     # Values accepted for reasoning.effort on the GPT-6 family.
     OPENAI_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+    # Same default as DeepSeek (DEEPSEEK_REASONING_EFFORT_DEFAULT); the
+    # provider's own default for gpt-6-luna is medium. Owner choice 2026-09-30.
+    OPENAI_REASONING_EFFORT_DEFAULT = "high"
 
     @classmethod
-    def _openai_reasoning_effort(cls) -> Optional[str]:
-        """QUASAR_OPENAI_REASONING_EFFORT, or None to keep the provider default.
+    def _openai_reasoning_effort(cls) -> str:
+        """QUASAR_OPENAI_REASONING_EFFORT, checked against the allowed values.
 
-        An unknown value is logged and ignored rather than sent (a bad effort
-        word would 400 every call)."""
+        Unset -> OPENAI_REASONING_EFFORT_DEFAULT. An unknown value is logged
+        and replaced by the default rather than sent (a bad effort word would
+        400 every call)."""
         raw = str(os.getenv("QUASAR_OPENAI_REASONING_EFFORT", "") or "").strip().lower()
         if not raw:
-            return None
+            return cls.OPENAI_REASONING_EFFORT_DEFAULT
         if raw not in cls.OPENAI_REASONING_EFFORTS:
             logger.warning(
                 f"QUASAR_OPENAI_REASONING_EFFORT={raw!r} is not one of {cls.OPENAI_REASONING_EFFORTS}; "
-                "using the provider default"
+                f"using {cls.OPENAI_REASONING_EFFORT_DEFAULT!r}"
             )
-            return None
+            return cls.OPENAI_REASONING_EFFORT_DEFAULT
         return raw
 
     def _strip_unsupported_params(self, kwargs: dict) -> dict:
@@ -2481,7 +2485,9 @@ class ResponsesShim:
         print(
             f"[PROVIDER] deepseek finish_reason={result.finish_reason!r} "
             f"max_tokens={max_tokens} reasoning_effort={reasoning_effort} "
-            f"output_chars={len(result.output_text or '')}"
+            f"output_chars={len(result.output_text or '')} "
+            f"cache_hit={getattr(result.usage, 'cache_hit_tokens', None)} "
+            f"cache_miss={getattr(result.usage, 'cache_miss_tokens', None)}"
         )
 
         # Extract reasoning_content from the response message
@@ -2639,7 +2645,9 @@ class ResponsesShim:
         print(
             f"[PROVIDER] deepseek stream finish_reason={finish_reason!r} "
             f"max_tokens={max_tokens} reasoning_effort={reasoning_effort} output_chars={len(output_text)} "
-            f"reasoning_chars={len(reasoning_content)} tool_calls={len(completed_items)}"
+            f"reasoning_chars={len(reasoning_content)} tool_calls={len(completed_items)} "
+            f"cache_hit={getattr(usage_obj, 'cache_hit_tokens', None)} "
+            f"cache_miss={getattr(usage_obj, 'cache_miss_tokens', None)}"
         )
         yield StreamEvent(
             type="response.completed",
