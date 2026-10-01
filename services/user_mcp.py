@@ -154,6 +154,10 @@ class _Conn:
         # Why it is not connected: "needs_auth" (OAuth sign-in missing or
         # expired), "needs_api_key" (plain 401) or "error".
         self.failure_state: str = "error"
+        # Wall-clock time this connection attempt settled (connected or
+        # failed): lets the Settings sign-in wait tell a status produced
+        # after a sign-in from an older one.
+        self.checked_at: Optional[float] = None
         self.last_used = time.monotonic()
 
     @property
@@ -273,6 +277,7 @@ class UserMCPPool:
                         conn.session, conn.tools, conn.transport_used = session, tools, used
                         conn.error = None
                         established = True
+                        conn.checked_at = time.time()
                         conn.ready.set()
                         await conn.close_evt.wait()
                         return
@@ -300,9 +305,15 @@ class UserMCPPool:
                         break  # the SSE fallback would fail the same way
                 finally:
                     conn.session = None
-            conn.error = " | ".join(errors) or "connection failed"
+            from services.secret_redaction import redact_error_text
+
+            # Shown in Settings and the API: an httpx error can quote the
+            # URL, and some servers take their key as ?api_key=...
+            conn.error = redact_error_text(" | ".join(errors)) or "connection failed"
             conn.failed_at = time.monotonic()
         finally:
+            if conn.checked_at is None:
+                conn.checked_at = time.time()
             conn.ready.set()
             conn.dropped.set()
 
@@ -370,6 +381,7 @@ class UserMCPPool:
                 # must never wait on, or hammer, a server that will say 401).
                 conn.error, conn.failure_state = reason, "needs_auth"
                 conn.failed_at = time.monotonic()
+                conn.checked_at = time.time()
                 conn.ready.set()
                 conn.dropped.set()
                 return conn
@@ -524,13 +536,38 @@ class UserMCPPool:
         return {"connected": False, "state": conn.state if conn.error else "error",
                 "tools": [], "error": conn.error or "timed out connecting"}
 
+    def test_config(self, user_id: str, cfg: dict) -> Dict[str, Any]:
+        """Connect an UNSAVED config once (initialize + tools/list) and close
+        it again. The connection is never registered in the pool, so chats
+        never see it and nothing reconnects it; used to prove a replacement
+        config works before a saved one is touched."""
+        from services.mcp_server_service import mcp_stdio_enabled
+
+        cfg = dict(cfg)
+        transport = (cfg.get("transport") or "stdio").strip().lower()
+        if transport not in ("http", "streamable_http") and not mcp_stdio_enabled():
+            return {"connected": False, "state": "error", "tools": [],
+                    "error": "Local (stdio) servers are disabled here."}
+        # key=None: unregistered, and _on_drop never schedules a reconnect.
+        conn = _Conn(cfg, json.dumps(cfg, sort_keys=True, default=str), None)
+        asyncio.run_coroutine_threadsafe(self._hold(conn), self._ensure_loop())
+        try:
+            conn.ready.wait(CONNECT_TIMEOUT_SECONDS * 2 + 2)
+            if conn.alive:
+                return {"connected": True, "state": "connected", "transport": conn.transport_used,
+                        "tools": [t.name for t in conn.tools], "error": None}
+            return {"connected": False, "state": conn.state if conn.error else "error",
+                    "tools": [], "error": conn.error or "timed out connecting"}
+        finally:
+            self._close(conn)
+
     def status(self, user_id: str) -> Dict[str, Dict[str, Any]]:
         """Last known state of this user's connections (no new connects)."""
         with self._lock:
             return {
                 name: {"connected": c.alive, "state": c.state,
                        "tools": [t.name for t in c.tools] if c.alive else [],
-                       "error": c.error, "transport": c.transport_used}
+                       "error": c.error, "transport": c.transport_used, "checked_at": c.checked_at}
                 for (uid, name), c in self._conns.items() if uid == user_id and c.ready.is_set()
             }
 

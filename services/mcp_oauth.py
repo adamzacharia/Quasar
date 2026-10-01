@@ -32,6 +32,7 @@ import json
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -128,10 +129,139 @@ class ProbeResult:
     status_code: Optional[int] = None
     www_scope: Optional[str] = None
     prm: Any = None  # mcp.shared.auth.ProtectedResourceMetadata
+    # Authorization server URLs exactly as the PRM JSON spells them (pydantic
+    # normalizes them, which an exact issuer comparison must not see).
+    prm_servers_raw: Optional[list] = None
+    # The reply carried a real JSON-RPC initialize result (protocolVersion).
+    initialized: bool = False
+
+    @property
+    def answered_ok(self) -> bool:
+        """The server completed an anonymous MCP initialize: a JSON-RPC result
+        with a protocolVersion came back, not merely a 2xx status. Only this
+        justifies turning a saved OAuth server into a plain one; a 200 error
+        page, a 404, 405 or other odd status is not evidence that the sign-in
+        is no longer needed (guard CX-04, CX-08)."""
+        return self.kind == "open" and self.initialized
 
 
-def _same_url(a: str, b: str) -> bool:
-    return str(a or "").rstrip("/").lower() == str(b or "").rstrip("/").lower()
+_INIT_READ_LIMIT = 64 * 1024
+_INIT_READ_SECONDS = 10.0
+
+
+def _is_initialize_result(msg: Any) -> bool:
+    """A JSON-RPC response to our initialize whose result the MCP SDK itself
+    accepts as an InitializeResult (protocolVersion, capabilities and
+    serverInfo all present and well-formed)."""
+    from pydantic import ValidationError
+
+    from mcp.types import InitializeResult
+
+    if not (isinstance(msg, dict) and msg.get("jsonrpc") == "2.0" and msg.get("id") == _INIT_BODY["id"]
+            and isinstance(msg.get("result"), dict)):
+        return False
+    try:
+        InitializeResult.model_validate(msg["result"])
+    except ValidationError:
+        return False
+    return True
+
+
+async def _read_initialize_result(resp: httpx.Response) -> bool:
+    """Whether a 2xx reply to our initialize is a real MCP initialize result.
+    Reads at most 64 KB / 10 s of raw body: a JSON body, or SSE events
+    (multi-line `data:` fields joined, as the SDK's decoder does) until the
+    first JSON-RPC message; the stream may stay open after it."""
+    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    try:
+        async with asyncio.timeout(_INIT_READ_SECONDS):
+            if ctype == "application/json":
+                buf = b""
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > _INIT_READ_LIMIT:
+                        return False
+                return _is_initialize_result(json.loads(buf))
+            if ctype == "text/event-stream":
+                async for data in _sse_events(resp):
+                    try:
+                        msg = json.loads(data)
+                    except ValueError:
+                        continue
+                    if _is_initialize_result(msg):
+                        return True
+                    if isinstance(msg, dict) and msg.get("id") == _INIT_BODY["id"]:
+                        return False  # our reply, but not a valid initialize result
+    except (TimeoutError, httpx.HTTPError, ValueError):
+        return False
+    return False
+
+
+async def _sse_events(resp: httpx.Response):
+    """Yield the data of each "message" SSE event, joining multi-line data
+    fields as the SSE spec (and the SDK's decoder) do. The byte cap applies
+    to the RAW stream, before any event is complete, so an endless
+    unterminated event cannot grow memory past _INIT_READ_LIMIT (guard CX-10)."""
+    import codecs
+
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")  # characters split across chunks
+    total = 0
+    pending = ""
+    event_type, data_lines = "", []
+    async for chunk in resp.aiter_bytes():
+        total += len(chunk)
+        if total > _INIT_READ_LIMIT:
+            return
+        pending += decoder.decode(chunk)
+        # A trailing "\r" may be the first half of "\r\n" in the next chunk.
+        hold_cr = pending.endswith("\r")
+        if hold_cr:
+            pending = pending[:-1]
+        pending = pending.replace("\r\n", "\n").replace("\r", "\n")
+        *lines, pending = pending.split("\n")
+        if hold_cr:
+            pending += "\r"
+        for line in lines:
+            if line == "":
+                if data_lines and event_type in ("", "message"):
+                    yield "\n".join(data_lines)
+                event_type, data_lines = "", []
+            elif line.startswith(":"):
+                continue
+            else:
+                field, _, value = line.partition(":")
+                value = value[1:] if value.startswith(" ") else value
+                if field == "data":
+                    data_lines.append(value)
+                elif field == "event":
+                    event_type = value
+
+
+def _issuer_equal(a: Any, b: Any) -> bool:
+    """RFC 9207 / client-reuse issuer comparison: exact string equality."""
+    return a is not None and b is not None and str(a) == str(b)
+
+
+def _issuer_matches_listed_server(issuer: Any, listed: Any) -> bool:
+    """RFC 8414 3.3: the metadata's issuer must be identical to the
+    authorization server URL the protected resource listed (guard CX-06).
+
+    One deviation, for interoperability: a listed URL whose path is exactly
+    "/" also matches the same string without it (Semgrep lists
+    "https://login.semgrep.dev/" and serves issuer "https://login.semgrep.dev",
+    live 2026-10-01). Both spellings name the same origin and the same
+    well-known metadata URL, so this cannot redirect discovery anywhere else.
+    Host case and every other path difference still fail."""
+    if issuer is None or listed is None:
+        return False
+    issuer, listed = str(issuer), str(listed)
+    if issuer == listed:
+        return True
+    try:
+        parts = urlsplit(listed)
+    except ValueError:
+        return False
+    return parts.path == "/" and not parts.query and not parts.fragment and issuer == listed[:-1]
 
 
 async def _fetch_prm(client: httpx.AsyncClient, url: str, server_url: str):
@@ -152,14 +282,15 @@ async def _fetch_prm(client: httpx.AsyncClient, url: str, server_url: str):
         return None
     try:
         prm = ProtectedResourceMetadata.model_validate_json(resp.content)
-    except ValidationError:
+        raw_servers = [str(s) for s in (json.loads(resp.content).get("authorization_servers") or [])]
+    except (ValidationError, ValueError, AttributeError):
         return None
     # RFC 8707 / 9728: the metadata must describe this server (or a parent
     # of it), or a hostile server could send us to someone else's resource.
     if not check_resource_allowed(requested_resource=resource_url_from_server_url(server_url),
                                   configured_resource=str(prm.resource)):
         return None
-    return prm
+    return prm, raw_servers
 
 
 async def probe(url: str) -> ProbeResult:
@@ -182,16 +313,25 @@ async def probe(url: str) -> ProbeResult:
                 status = resp.status_code
                 www_meta = extract_field_from_www_auth(resp, "resource_metadata") if status == 401 else None
                 www_scope = extract_scope_from_www_auth(resp) if status == 401 else None
+                initialized = 200 <= status < 300 and await _read_initialize_result(resp)
             if status == 401:
                 for prm_url in build_protected_resource_metadata_discovery_urls(www_meta, url):
-                    prm = await _fetch_prm(client, prm_url, url)
-                    if prm is not None:
-                        return ProbeResult("oauth", status_code=401, www_scope=www_scope, prm=prm)
+                    found = await _fetch_prm(client, prm_url, url)
+                    if found is not None:
+                        prm, raw_servers = found
+                        return ProbeResult("oauth", status_code=401, www_scope=www_scope, prm=prm,
+                                           prm_servers_raw=raw_servers)
                 return ProbeResult("api_key", "This server needs an API key.", status_code=401)
             if status == 403:
                 return ProbeResult("api_key", "This server refused the request without an API key.",
                                    status_code=403)
-            return ProbeResult("open", status_code=status)
+            if status >= 500 or status in (408, 425, 429):
+                # A failing, timing-out or overloaded server says nothing
+                # about what it needs; callers must not save or convert
+                # anything on it (guard CX-04, CX-08).
+                return ProbeResult("unreachable", f"The server answered with an error ({status}). Try again later.",
+                                   status_code=status)
+            return ProbeResult("open", status_code=status, initialized=initialized)
     except UnsafeMcpUrl as exc:
         return ProbeResult("blocked", str(exc))
     except httpx.TimeoutException:
@@ -210,9 +350,11 @@ def _endpoint_ok(url: Optional[str], what: str) -> None:
         raise OAuthSetupError(reason)
 
 
-async def discover_authorization_server(prm, server_url: str) -> Tuple[Any, Dict[str, Any]]:
+async def discover_authorization_server(prm, server_url: str,
+                                        listed: Optional[list] = None) -> Tuple[Any, Dict[str, Any]]:
     """(OAuthMetadata, raw metadata dict) for the first usable authorization
-    server the protected resource lists."""
+    server the protected resource lists. ``listed`` is the PRM's raw
+    authorization_servers strings (exact, not pydantic-normalized)."""
     from pydantic import ValidationError
 
     from mcp.client.auth.utils import (
@@ -223,7 +365,7 @@ async def discover_authorization_server(prm, server_url: str) -> Tuple[Any, Dict
 
     errors = []
     async with guarded_async_client(require_https=True) as client:
-        for as_url in [str(u) for u in prm.authorization_servers][:3]:
+        for as_url in (listed or [str(u) for u in prm.authorization_servers])[:3]:
             ok, reason = check_mcp_url(as_url, label="The sign-in server", require_https=True)
             if not ok:
                 errors.append(reason)
@@ -245,7 +387,7 @@ async def discover_authorization_server(prm, server_url: str) -> Tuple[Any, Dict
                     errors.append("unreadable metadata")
                     continue
                 # RFC 8414 section 3.3: the issuer must be the server we asked.
-                if not _same_url(str(asm.issuer), as_url):
+                if not _issuer_matches_listed_server(raw.get("issuer"), as_url):
                     errors.append("issuer mismatch")
                     continue
                 return asm, raw
@@ -386,15 +528,18 @@ async def start_sign_in(*, user_id: str, server: str, server_url: str, probe_res
     if not ok:
         raise OAuthSetupError(reason)
     store = store or MCPOAuthStore()
-    asm, raw = await discover_authorization_server(probe_result.prm, server_url)
+    asm, raw = await discover_authorization_server(probe_result.prm, server_url,
+                                                   listed=probe_result.prm_servers_raw)
     _validate_metadata(asm)
-    issuer = str(asm.issuer)
+    # The issuer exactly as the server spells it: RFC 9207 compares the
+    # callback's `iss` against this string.
+    issuer = str(raw.get("issuer") or asm.issuer)
     scope = _scope_for(probe_result, asm)
     resource = _resource_for(server_url, probe_result.prm)
 
     existing = await asyncio.to_thread(store.get, user_id, server)
     client = None
-    if existing and _same_url(existing.issuer, issuer) and _client_usable(existing.client, redirect_uri):
+    if existing and _issuer_equal(existing.issuer, issuer) and _client_usable(existing.client, redirect_uri):
         client = existing.client
     if client is None:
         client = await register_client(asm, redirect_uri, scope)
@@ -499,7 +644,7 @@ async def finish_sign_in(*, state: Optional[str], code: Optional[str], error: Op
         base.message = "This server was removed or changed while signing in. Start again from Settings."
         return base
     # RFC 9207: reject a code minted by a different authorization server.
-    if iss is not None and not _same_url(iss, rec.issuer):
+    if iss is not None and not _issuer_equal(iss, rec.issuer):
         base.message = "The sign-in reply came from an unexpected server and was rejected."
         return base
     if iss is None and rec.metadata.get("authorization_response_iss_parameter_supported"):
@@ -520,9 +665,13 @@ async def finish_sign_in(*, state: Optional[str], code: Optional[str], error: Op
     except (OAuthSetupError, TransientOAuthError) as exc:
         base.message = scrub(exc)
         return base
-    await asyncio.to_thread(
+    stored = await asyncio.to_thread(
         store.set_tokens, st.user_id, st.server, access_token=token.access_token,
-        refresh_token=token.refresh_token, expires_in=token.expires_in, scope=token.scope or rec.scope)
+        refresh_token=token.refresh_token, expires_in=token.expires_in, scope=token.scope or rec.scope,
+        require_state=state, signed_in_at=time.time())
+    if not stored:
+        base.message = "This server was disconnected or removed while signing in. Start again from Settings."
+        return base
     base.ok, base.message = True, "Signed in."
     return base
 
@@ -583,7 +732,9 @@ async def current_access_token(user_id: str, server: str, *, failed_token: Optio
             store.set_tokens, user_id, server, access_token=token.access_token,
             # Servers that do not rotate refresh tokens omit it; keep ours.
             refresh_token=token.refresh_token or rec.refresh_token,
-            expires_in=token.expires_in, scope=token.scope or rec.scope)
+            expires_in=token.expires_in, scope=token.scope or rec.scope,
+            # a refresh is not a new sign-in
+            signed_in_at=rec.signed_in_at, signed_in_attempt=rec.signed_in_attempt)
         return token.access_token
 
 
@@ -608,15 +759,19 @@ class OAuthBearer(httpx.Auth):
         if response.status_code != 401:
             return
         fresh = await current_access_token(self.user_id, self.server, failed_token=token, store=self._store)
-        if fresh is None or fresh == token:
-            if fresh == token:
-                # The server rejects a token the sign-in server still calls
-                # valid: stop here instead of looping on it.
-                await asyncio.to_thread((self._store or MCPOAuthStore()).mark_needs_auth,
-                                        self.user_id, self.server, SIGN_IN_AGAIN)
-            return
-        request.headers["Authorization"] = f"Bearer {fresh}"
-        yield request
+        if fresh is None:
+            return  # refresh rejected: already marked needs_auth
+        if fresh != token:
+            request.headers["Authorization"] = f"Bearer {fresh}"
+            response = yield request
+            if response.status_code != 401:
+                return
+        # The MCP server rejects a token the sign-in server just issued (or
+        # still calls valid). Record needs_auth so the pool stops dialing it
+        # until the user signs in again, instead of reconnect-looping on a
+        # token that will keep failing (guard CX-03).
+        await asyncio.to_thread((self._store or MCPOAuthStore()).mark_needs_auth,
+                                self.user_id, self.server, SIGN_IN_AGAIN)
 
 
 class OAuthSignInRequired(Exception):
@@ -625,34 +780,44 @@ class OAuthSignInRequired(Exception):
 
 # ── disconnect ─────────────────────────────────────────────────────────────
 
+async def revoke_tokens(rec: Optional[OAuthRecord]) -> bool:
+    """Best-effort RFC 7009 revocation of the tokens in ``rec`` (a snapshot;
+    nothing in the store is touched). True if the server confirmed one."""
+    if rec is None or not rec.metadata.get("revocation_endpoint") or not (rec.refresh_token or rec.access_token):
+        return False
+    url = str(rec.metadata["revocation_endpoint"])
+    ok, _ = check_mcp_url(url, require_https=True, resolve=False)
+    if not ok:
+        return False
+    revoked = False
+    async with guarded_async_client(require_https=True, timeout=10.0) as client:
+        for token, hint in ((rec.refresh_token, "refresh_token"), (rec.access_token, "access_token")):
+            if not token:
+                continue
+            data = {"token": token, "token_type_hint": hint, "client_id": str(rec.client.get("client_id") or "")}
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            _client_auth(rec.client, data, headers)
+            try:
+                resp = await client.post(url, data=data, headers=headers)
+                revoked = revoked or resp.status_code == 200
+            except (httpx.HTTPError, UnsafeMcpUrl):
+                pass
+    return revoked
+
 async def revoke_and_forget(user_id: str, server: str, *, keep_registration: bool = False,
                             store: Optional[MCPOAuthStore] = None) -> bool:
     """Best-effort RFC 7009 revocation, then drop the tokens (and, unless
     ``keep_registration``, the whole OAuth row). Returns True if the server
     confirmed a revocation."""
     store = store or MCPOAuthStore()
+    # First cancel sign-ins started earlier, so a popup still open cannot
+    # store fresh tokens after this call (guard CX-05).
+    await asyncio.to_thread(store.delete_states, user_id, server)
     rec = await asyncio.to_thread(store.get, user_id, server)
-    revoked = False
-    if rec is not None and rec.metadata.get("revocation_endpoint") and (rec.refresh_token or rec.access_token):
-        url = str(rec.metadata["revocation_endpoint"])
-        ok, _ = check_mcp_url(url, require_https=True, resolve=False)
-        if ok:
-            async with guarded_async_client(require_https=True, timeout=10.0) as client:
-                for token, hint in ((rec.refresh_token, "refresh_token"), (rec.access_token, "access_token")):
-                    if not token:
-                        continue
-                    data = {"token": token, "token_type_hint": hint,
-                            "client_id": str(rec.client.get("client_id") or "")}
-                    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-                    _client_auth(rec.client, data, headers)
-                    try:
-                        resp = await client.post(url, data=data, headers=headers)
-                        revoked = revoked or resp.status_code == 200
-                    except (httpx.HTTPError, UnsafeMcpUrl):
-                        pass
+    revoked = await revoke_tokens(rec)
     if keep_registration:
         if rec is not None:
-            await asyncio.to_thread(store.mark_needs_auth, user_id, server, "Disconnected. Press Reconnect to sign in again.")
+            await asyncio.to_thread(store.mark_needs_auth, user_id, server, "Disconnected. Press Sign in to connect again.")
     else:
         await asyncio.to_thread(store.delete, user_id, server)
     return revoked

@@ -298,7 +298,7 @@ class MCPServerService:
         return {"env": dict(data.get("env") or {}), "headers": dict(data.get("headers") or {})}
 
     def _row_to_dict(self, row) -> Optional[dict]:
-        name, transport, url, command, args_json, secrets_enc, auth = row
+        name, transport, url, command, args_json, secrets_enc, auth, updated_at = row
         try:
             secrets = self._decrypt_secrets(secrets_enc)
         except Exception as e:  # noqa: BLE001 - one bad row must not hide the rest
@@ -314,6 +314,9 @@ class MCPServerService:
             env=secrets["env"], headers=secrets["headers"],
         ).model_dump()
         cfg["auth"] = auth if auth in KNOWN_AUTH_KINDS else "none"
+        # Opaque version of this row (microsecond write time), for
+        # compare-and-set updates (restore_if_revision).
+        cfg["revision"] = updated_at
         return cfg
 
     # ── legacy JSON import ───────────────────────────────────────────────
@@ -364,7 +367,7 @@ class MCPServerService:
         conn = self._conn()
         try:
             rows = conn.execute(
-                """SELECT name, transport, url, command, args_json, secrets_enc, auth
+                """SELECT name, transport, url, command, args_json, secrets_enc, auth, updated_at
                    FROM user_mcp_servers WHERE user_id = ? ORDER BY created_at, name""",
                 (str(user_id),),
             ).fetchall()
@@ -448,6 +451,37 @@ class MCPServerService:
         saved = self.get_server(user_id, server_config.name)
         return saved if saved is not None else {**server_config.model_dump(), "auth": auth or "none"}
 
+    def revision_of(self, user_id: str, name: str) -> Optional[str]:
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT updated_at FROM user_mcp_servers WHERE user_id = ? AND name = ?",
+                               (str(user_id), name)).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+
+    def restore_if_revision(self, user_id: str, revision: str, cfg: MCPServerConfig, *, auth: str) -> bool:
+        """Overwrite the row with ``cfg`` only if it is still at ``revision``
+        (one conditional UPDATE): a save that landed in between wins over a
+        rollback computed from an older snapshot. Returns whether it wrote."""
+        validate_server_config(cfg)
+        if auth not in KNOWN_AUTH_KINDS:
+            raise ValueError(f"Unknown MCP auth kind {auth!r}.")
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                """UPDATE user_mcp_servers SET transport = ?, url = ?, command = ?, args_json = ?,
+                   secrets_enc = ?, auth = ?, updated_at = ?
+                   WHERE user_id = ? AND name = ? AND updated_at = ?""",
+                (cfg.transport, cfg.url, cfg.command, json.dumps(list(cfg.args or [])),
+                 self._encrypt_secrets(cfg.env, cfg.headers), auth, now, str(user_id), cfg.name, revision),
+            )
+            conn.commit()
+            return getattr(cur, "rowcount", 0) == 1
+        finally:
+            conn.close()
+
     def delete_server(self, user_id: str, name: str) -> bool:
         """Delete an MCP server config by name (its OAuth rows are removed by
         the caller through services.mcp_oauth_store)."""
@@ -471,9 +505,15 @@ class MCPServerService:
 
 
 def mask_server(cfg: dict) -> dict:
-    """A copy safe to send to a browser: env/header VALUES replaced, names kept."""
+    """A copy safe to send to a browser: env/header VALUES replaced, names
+    kept, and credential-looking URL query values (``?api_key=...``, which
+    some hosted servers use instead of a header) redacted."""
+    from services.secret_redaction import redact_url
+
     out = {k: v for k, v in (cfg or {}).items()}
     for field in ("env", "headers"):
         if isinstance(out.get(field), dict):
             out[field] = {k: "********" for k in out[field]}
+    if isinstance(out.get("url"), str) and out["url"]:
+        out["url"] = redact_url(out["url"])
     return out

@@ -46,6 +46,15 @@ class FakeAuthState:
     mcp_auth_headers: List[str] = field(default_factory=list)
     send_iss: bool = True
     tool_calls: int = 0
+    # The MCP endpoint rejects every token, even freshly issued ones.
+    reject_tokens: bool = False
+    # The MCP endpoint stops requiring a token at all.
+    open_mode: bool = False
+    # The MCP endpoint answers every request with this HTTP status (outage),
+    # with fail_body / fail_type as the body (default: a plain-text error).
+    fail_status: Optional[int] = None
+    fail_body: bytes = b"temporarily unavailable"
+    fail_type: bytes = b"text/plain"
 
     @property
     def resource(self) -> str:
@@ -243,7 +252,14 @@ button{{font:inherit;padding:8px 18px;border-radius:999px;border:1px solid #222;
             auth = dict(scope.get("headers") or []).get(b"authorization", b"").decode()
             state.mcp_auth_headers.append(auth)
             tok = auth[7:] if auth.lower().startswith("bearer ") else ""
-            if not tok or state.access.get(tok, 0) < time.time():
+            if state.fail_status:
+                await send({"type": "http.response.start", "status": state.fail_status,
+                            "headers": [(b"content-type", state.fail_type)]})
+                await send({"type": "http.response.body", "body": state.fail_body})
+                return
+            if state.open_mode:
+                return await mcp_app(scope, receive, send)
+            if not tok or state.reject_tokens or state.access.get(tok, 0) < time.time():
                 await send({"type": "http.response.start", "status": 401,
                             "headers": [(b"www-authenticate", unauthorized),
                                         (b"content-type", b"application/json")]})

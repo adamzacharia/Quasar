@@ -439,7 +439,15 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
     const [activePanel, setActivePanel] = useState<"papers" | "datalab" | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
     // Set when Settings is opened from a deep link (e.g. "add an API key").
-    const [settingsTab, setSettingsTab] = useState<"providerKeys" | undefined>(undefined);
+    const [settingsTab, setSettingsTab] = useState<"providerKeys" | "mcp" | undefined>(undefined);
+    // Back from an MCP server sign-in that ran in this tab (popup blocked):
+    // reopen Settings > MCP servers, which reads and clears the result flag.
+    useEffect(() => {
+        if (!new URLSearchParams(window.location.search).has("mcp_oauth")) return;
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setSettingsTab("mcp");
+        setSettingsOpen(true);
+    }, []);
     const [query, setQuery] = useState("");
 
     const isDrawer = variant === "drawer";

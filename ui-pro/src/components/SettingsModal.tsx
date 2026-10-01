@@ -10,6 +10,7 @@ import { useThemeStore } from "../lib/theme-store";
 import { useChatStore } from "../lib/store";
 import { EVAL_MODE_ENABLED } from "../lib/use-eval-mode";
 import { useAvailableModels } from "../lib/useAvailableModels";
+import { MCPServersPanel as ConnectMCPServersPanel } from "./MCPServersPanel";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -283,7 +284,9 @@ function PersonalizationPanel() {
     );
 }
 
-// ── MCP Servers Panel ───────────────────────────────────────────────────────
+// ── MCP Servers Panel (superseded) ──────────────────────────────────────────
+// Replaced by components/MCPServersPanel.tsx (one-click connect, 2026-10-01).
+// Kept only until its removal is confirmed; nothing renders it.
 
 type MCPTransport = "streamable_http" | "http" | "stdio";
 
@@ -1753,7 +1756,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
                     <div className="flex-1 overflow-hidden">
                         {currentTab === 'personalization' && <PersonalizationPanel />}
                         {currentTab === 'providerKeys' && <ProviderKeysPanel />}
-                        {currentTab === 'mcp' && <MCPServersPanel />}
+                        {currentTab === 'mcp' && <ConnectMCPServersPanel />}
                         {currentTab === 'analytics' && <AnalyticsPanel />}
                     </div>
                 </div>

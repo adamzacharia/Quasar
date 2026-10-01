@@ -178,6 +178,10 @@ class MCPServerRequest(BaseModel):
     url: Optional[str] = None
     env: Dict[str, str] = {}
     headers: Dict[str, str] = {}
+    # False: refuse (409) instead of updating when a server with this name
+    # already exists for a DIFFERENT URL. The Settings form sends False for a
+    # name it derived itself, True when the user typed the name (an edit).
+    replace: bool = True
 
 
 class DatalabTiledSearchRequest(BaseModel):

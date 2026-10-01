@@ -436,3 +436,469 @@ def test_scrub_removes_oauth_values():
     text = scrub("failed: code=abc123&state=zzz client_secret=s3cr3t Bearer eyJabcdefghijklmnop")
     for leaked in ("abc123", "zzz", "s3cr3t", "eyJabcdefghijklmnop"):
         assert leaked not in text
+
+
+# ── guard round 1 regressions (task-84382ab-7923, CX-01..07) ────────────────
+
+def test_cx01_access_log_drops_the_callback_query(api):
+    import logging
+
+    from api.routers.tools import _CallbackQueryFilter
+
+    access = logging.getLogger("uvicorn.access")
+    assert any(isinstance(f, _CallbackQueryFilter) for f in access.filters)
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("1.2.3.4:5", "GET", "/api/mcp/oauth/callback?code=SECRETCODE&state=SECRETSTATE", "1.1", 200),
+                               None)
+    for f in access.filters:
+        f.filter(record)
+    line = record.getMessage()
+    assert "SECRETCODE" not in line and "SECRETSTATE" not in line and "/api/mcp/oauth/callback?[redacted]" in line
+    other = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                              ("1.2.3.4:5", "GET", "/api/mcp-servers?x=1", "1.1", 200), None)
+    for f in access.filters:
+        f.filter(other)
+    assert "/api/mcp-servers?x=1" in other.getMessage()
+
+
+def test_cx02_every_request_is_resolved_again(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from services import vo_url_guard
+    from services.mcp_url_policy import UnsafeMcpUrl, request_guard
+
+    answers = iter([["93.184.215.14"], ["10.0.0.7"]])  # public, then rebound to private
+    monkeypatch.setattr(vo_url_guard, "_resolve", lambda host: next(answers))
+    hook = request_guard()
+    req = httpx.Request("POST", "https://rebind.example/mcp")
+    asyncio.run(hook(req))
+    with pytest.raises(UnsafeMcpUrl):
+        asyncio.run(hook(req))
+
+
+def test_cx03_token_rejected_after_refresh_marks_needs_auth_without_redialing(api, fake, env):
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    _pool().forget("alice")
+    fake.reject_tokens = True
+    assert _pool().tools_for("alice") == []
+    rec = MCPOAuthStore().get("alice", "fake")
+    assert rec.status == "needs_auth" and rec.access_token is None
+    assert fake.token_calls.count("refresh_token") == 1
+    seen = len(fake.mcp_auth_headers)
+    time.sleep(0.5)  # a background reconnect, if any, would dial now
+    for _ in range(3):
+        assert _pool().tools_for("alice") == []
+    assert len(fake.mcp_auth_headers) == seen
+
+
+def test_cx04_unreachable_probe_changes_nothing(api, fake, env, monkeypatch):
+    from services import mcp_oauth
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    token = MCPOAuthStore().get("alice", "fake").access_token
+
+    async def down(url):
+        return mcp_oauth.ProbeResult("unreachable", "The server did not answer within 15 seconds.")
+
+    monkeypatch.setattr(mcp_oauth, "probe", down)
+    body = _connect(api, fake.resource)
+    assert body["status"] == "error" and "Nothing was changed" in body["message"]
+    listed = api.get("/api/mcp-servers").json()
+    assert listed[0]["auth"] == "oauth"
+    assert MCPOAuthStore().get("alice", "fake").access_token == token
+    assert fake.revoked == []
+    new = _connect(api, "http://127.0.0.1:9/mcp", name="new-one")
+    assert new["status"] == "error"
+    assert [s["name"] for s in api.get("/api/mcp-servers").json()] == ["fake"], "a new server is not saved either"
+
+
+def test_cx05_disconnect_cancels_a_sign_in_in_flight(api, fake, env):
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    body = _connect(api, fake.resource)
+    pending = auto_approve(fake, body["authorize_url"])
+    assert api.post("/api/mcp-servers/fake/disconnect").status_code == 200
+    page = _callback(api, pending)
+    assert '"ok": false' in page.text and "not valid" in page.text
+    assert MCPOAuthStore().get("alice", "fake").access_token is None
+    assert fake.token_calls == []
+
+
+def test_cx05_tokens_are_not_stored_once_the_state_is_gone(tmp_path):
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    store = MCPOAuthStore(db_path=str(tmp_path / "o.db"))
+    store.save_registration("alice", "srv", server_url="https://s.example/mcp", resource="https://s.example/mcp",
+                            issuer="https://as.example", metadata={}, client={"client_id": "c"},
+                            redirect_uri="https://api.example/cb")
+    raw = store.create_state("alice", "srv", code_verifier="v" * 64, resource="r", redirect_uri="u", return_origin="o")
+    store.consume_state(raw)
+    store.delete_states("alice", "srv")  # Disconnect while the code was being exchanged
+    assert store.set_tokens("alice", "srv", access_token="late", refresh_token=None, expires_in=None,
+                            scope=None, require_state=raw) is False
+    assert store.get("alice", "srv").access_token is None
+
+
+def test_cx06_issuer_comparison_is_exact():
+    from services.mcp_oauth import _issuer_equal, _issuer_matches_listed_server
+
+    # RFC 9207 iss and client reuse: exact strings only.
+    assert _issuer_equal("https://as.example", "https://as.example")
+    assert not _issuer_equal("https://as.example", "https://as.example/")
+    assert not _issuer_equal("https://AS.example", "https://as.example")
+    assert not _issuer_equal(None, "https://as.example")
+    # RFC 8414 discovery: exact, plus only the "listed with a bare '/' path"
+    # spelling (Semgrep). Host case and other path differences fail.
+    match = _issuer_matches_listed_server
+    assert match("https://login.semgrep.dev", "https://login.semgrep.dev/")
+    assert match("https://as.example/t", "https://as.example/t")
+    assert not match("https://as.example/", "https://as.example")
+    assert not match("https://AS.example", "https://as.example/")
+    assert not match("https://as.example/Tenant", "https://as.example/tenant")
+    assert not match("https://as.example/t", "https://as.example/t/")
+    assert not match("https://as.example", "http://as.example/")
+
+
+@pytest.mark.parametrize("status,body,ctype", [
+    (503, None, None), (500, None, None), (429, None, None), (408, None, None),
+    (404, None, None), (405, None, None), (400, None, None),
+    (200, None, None),                                             # 200 text error page
+    (200, b'{"error": "maintenance"}', b"application/json"),      # 200 JSON, not JSON-RPC
+    (200, b'{"jsonrpc": "2.0", "id": 0, "result": {}}', b"application/json"),  # no protocolVersion
+    (200, b'{"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18"}}',
+     b"application/json"),                                         # no capabilities / serverInfo
+    (200, b"event: message\ndata: not json\n\n", b"text/event-stream"),
+])
+def test_cx04_cx08_no_handshake_never_converts_or_revokes(api, fake, env, status, body, ctype):
+    """Only a completed anonymous MCP initialize turns a signed-in server into
+    a plain one. Outages (5xx, 408, 429), odd statuses (404, 405, 400) and 2xx
+    replies that are not an initialize result change nothing, on a re-save
+    or a Reconnect."""
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    token = MCPOAuthStore().get("alice", "fake").access_token
+    fake.fail_status = status
+    if body is not None:
+        fake.fail_body, fake.fail_type = body, ctype
+    body = _connect(api, fake.resource)  # re-save while the server misbehaves
+    assert body["status"] == "error" and str(status) in body["message"] and "Nothing was changed" in body["message"]
+    again = api.post("/api/mcp-servers/fake/reconnect").json()  # Reconnect while it misbehaves
+    assert again["status"] == "error" and str(status) in again["message"]
+    listed = api.get("/api/mcp-servers").json()[0]
+    assert listed["auth"] == "oauth"
+    rec = MCPOAuthStore().get("alice", "fake")
+    assert rec is not None and rec.access_token == token
+    assert fake.revoked == []
+    fake.fail_status = None
+
+
+def test_cx07_reconnect_adopts_a_server_that_stopped_asking_for_sign_in(api, fake, env):
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    api.post("/api/mcp-servers/fake/disconnect")
+    fake.open_mode = True
+    body = api.post("/api/mcp-servers/fake/reconnect").json()
+    assert body["status"] == "connected", body
+    listed = api.get("/api/mcp-servers").json()[0]
+    assert listed["auth"] == "none" and listed["status"]["state"] == "connected"
+    assert MCPOAuthStore().get("alice", "fake") is None
+
+
+def test_cx04_initialize_detection_matches_the_sdk():
+    """Codex's verify-4 cases: a result missing capabilities/serverInfo is
+    rejected (the SDK's InitializeResult rejects it too), and a valid result
+    split across two SSE data: lines is accepted (lines of one event join)."""
+    import asyncio
+
+    import httpx
+
+    from services.mcp_oauth import _read_initialize_result
+
+    full = {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                  "serverInfo": {"name": "s", "version": "1"}}}
+    partial = {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18"}}
+
+    def run(body: bytes, ctype: str) -> bool:
+        resp = httpx.Response(200, headers={"content-type": ctype}, content=body)
+        return asyncio.run(_read_initialize_result(resp))
+
+    assert run(json.dumps(full).encode(), "application/json") is True
+    assert run(json.dumps(partial).encode(), "application/json; charset=utf-8") is False
+    text = json.dumps(full, indent=1)
+    split = "event: message\n" + "".join(f"data: {line}\n" for line in text.splitlines()) + "\n"
+    assert run(split.encode(), "text/event-stream") is True
+    assert run(f"event: message\ndata: {json.dumps(partial)}\n\n".encode(), "text/event-stream") is False
+    assert run(json.dumps(full).encode(), "text/plain") is False
+
+
+def test_cx07_cx08_sign_in_is_kept_unless_the_plain_connection_works(api, fake, env, monkeypatch):
+    """Even a server that completes an anonymous initialize only replaces a
+    signed-in config if a real connection without the sign-in then works;
+    otherwise the OAuth config is restored and nothing is revoked."""
+    from services.mcp_oauth_store import MCPOAuthStore
+    from services.user_mcp import UserMCPPool
+
+    import services.mcp_server_service as mss
+
+    _sign_in(api, fake)
+    token = MCPOAuthStore().get("alice", "fake").access_token
+    revision = mss.MCPServerService().get_server("alice", "fake")["revision"]
+    fake.open_mode = True  # the probe now sees a valid anonymous initialize
+    monkeypatch.setattr(UserMCPPool, "test_config", lambda self, uid, cfg: {
+        "connected": False, "state": "error", "tools": [], "error": "tools/list failed"})
+    body = _connect(api, fake.resource)
+    assert body["status"] == "error" and "existing sign-in was kept" in body["message"]
+    again = api.post("/api/mcp-servers/fake/reconnect").json()
+    assert again["status"] == "error" and "Nothing was changed" in again["message"]
+    stored = mss.MCPServerService().get_server("alice", "fake")
+    assert stored["auth"] == "oauth" and stored["revision"] == revision, "nothing was written at all"
+    assert MCPOAuthStore().get("alice", "fake").access_token == token
+    assert fake.revoked == []
+
+
+def test_cx09_a_save_that_lands_in_between_beats_the_rollback(api, fake, env, monkeypatch):
+    """Another worker re-saves the server while this request's plain
+    connection test runs: the rollback must not overwrite that newer save,
+    and the revoke must not fire on a server this request no longer owns."""
+    import services.mcp_server_service as mss
+    from services.user_mcp import UserMCPPool
+
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    fake.open_mode = True
+
+    def interleaved(self, uid, cfg):
+        # Another worker re-saves the server while this request verifies.
+        mss.MCPServerService().save_server(uid, mss.MCPServerConfig(
+            name=cfg["name"], transport="streamable_http", url="http://127.0.0.1:9/other"), auth="oauth")
+        return {"connected": True, "state": "connected", "tools": ["echo"], "error": None}
+
+    monkeypatch.setattr(UserMCPPool, "test_config", interleaved)
+    body = _connect(api, fake.resource)
+    assert body["status"] == "error" and body["saved"] is False
+    stored = mss.MCPServerService().get_server("alice", "fake")
+    assert stored["url"] == "http://127.0.0.1:9/other", "the newer save was not overwritten"
+    assert MCPOAuthStore().get("alice", "fake") is not None and fake.revoked == [], "and nothing was revoked"
+
+
+def test_cx09_a_sign_in_started_meanwhile_survives_the_switch(api, fake, env, monkeypatch):
+    """The switch revokes and deletes only the OAuth row version it read: a
+    sign-in another worker starts during the revocation keeps its row and
+    its state."""
+    from services import mcp_oauth
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    fake.open_mode = True
+    real_revoke = mcp_oauth.revoke_tokens
+    started = {}
+
+    import services.mcp_server_service as mss
+
+    async def revoke_then_new_sign_in(rec):
+        out = await real_revoke(rec)
+        # Exactly what the OAuth branch of another worker's connect does:
+        # save the server as "oauth", register, create a state.
+        time.sleep(0.002)
+        mss.MCPServerService().save_server("alice", mss.MCPServerConfig(
+            name="fake", transport="streamable_http", url="https://other.example/mcp"), auth="oauth")
+        store = MCPOAuthStore()
+        started["early"] = store.create_state("alice", "fake", code_verifier="w" * 64, resource="r",
+                                              redirect_uri="u", return_origin="o")
+        store.save_registration("alice", "fake", server_url="https://other.example/mcp",
+                                resource="https://other.example/mcp", issuer="https://as.example",
+                                metadata={}, client={"client_id": "c2"}, redirect_uri=f"{PUBLIC_API}/cb")
+        started["state"] = store.create_state("alice", "fake", code_verifier="v" * 64, resource="r",
+                                              redirect_uri="u", return_origin="o")
+        return out
+
+    monkeypatch.setattr(mcp_oauth, "revoke_tokens", revoke_then_new_sign_in)
+    body = _connect(api, fake.resource)
+    # Our switch was written; the final connection test then sees the other
+    # worker's server (OAuth, sign-in not finished yet).
+    assert body["saved"] is True and body["status"] == "needs_auth", body
+    rec = MCPOAuthStore().get("alice", "fake")
+    assert rec is not None and rec.server_url == "https://other.example/mcp", "the newer registration survived"
+    for key in ("early", "state"):
+        st, why = MCPOAuthStore().consume_state(started[key])
+        assert st is not None and why == "", f"its {key} sign-in state is still usable"
+    # The server row and the OAuth row agree: the later sign-in owns both.
+    stored = mss.MCPServerService().get_server("alice", "fake")
+    assert stored["auth"] == "oauth" and stored["url"] == "https://other.example/mcp"
+
+
+def test_cx09_restore_if_revision_is_compare_and_set(tmp_path):
+    import services.mcp_server_service as mss
+
+    svc = mss.MCPServerService(base_dir=str(tmp_path))
+    a = svc.save_server("alice", mss.MCPServerConfig(name="s", transport="streamable_http", url="https://a.example/mcp"))
+    time.sleep(0.002)
+    svc.save_server("alice", mss.MCPServerConfig(name="s", transport="streamable_http", url="https://b.example/mcp"))
+    old = mss.MCPServerConfig(name="s", transport="streamable_http", url="https://old.example/mcp")
+    assert svc.restore_if_revision("alice", a["revision"], old, auth="oauth") is False
+    assert svc.get_server("alice", "s")["url"] == "https://b.example/mcp"
+    cur = svc.get_server("alice", "s")["revision"]
+    assert svc.restore_if_revision("alice", cur, old, auth="oauth") is True
+    assert svc.get_server("alice", "s")["auth"] == "oauth"
+
+
+def test_cx10_sse_reader_caps_raw_bytes_and_handles_chunk_boundaries():
+    import asyncio
+
+    import httpx
+
+    from services import mcp_oauth
+
+    class Chunks(httpx.AsyncByteStream):
+        def __init__(self, chunks):
+            self.chunks, self.served = chunks, 0
+
+        async def __aiter__(self):
+            for c in self.chunks:
+                self.served += len(c)
+                yield c
+
+    def run(chunks):
+        stream = Chunks(chunks)
+        resp = httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+        return asyncio.run(mcp_oauth._read_initialize_result(resp)), stream.served
+
+    full = json.dumps({"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                             "serverInfo": {"name": "sé", "version": "1"}}},
+                      ensure_ascii=False)
+    # One endless event with no terminating blank line (~400 KB offered): the
+    # reader gives up on the RAW byte count, before the event completes.
+    ok, served = run([b"data: " + b"x" * 8192 + b"\n"] * 50)
+    assert ok is False and served <= mcp_oauth._INIT_READ_LIMIT + 8200
+    # \r\n split across chunks and a multi-byte character split across chunks.
+    raw = ("event: message\r\ndata: " + full + "\r\n\r\n").encode("utf-8")
+    cut = raw.index("é".encode("utf-8")) + 1  # inside the two-byte "é"
+    crlf = raw.index(b"\r\n") + 1              # between \r and \n
+    assert run([raw[:crlf], raw[crlf:cut], raw[cut:]])[0] is True
+
+
+def test_cx09_a_popup_finishing_during_the_switch_cannot_store_tokens(api, fake, env, monkeypatch):
+    """A Reconnect popup is open; the user switches the server to plain; the
+    popup's callback completes while the switch is revoking. The callback
+    must not store tokens, and the end state is consistent: plain server, no
+    OAuth row, no states."""
+    import sqlite3 as _sqlite
+
+    import services.mcp_server_service as mss
+    from services import mcp_oauth
+    from services.mcp_oauth_store import MCPOAuthStore
+
+    _sign_in(api, fake)
+    pending = api.post("/api/mcp-servers/fake/reconnect").json()
+    assert pending["status"] == "needs_auth"
+    redirect = auto_approve(fake, pending["authorize_url"])
+    q = {k: v[0] for k, v in parse_qs(urlsplit(redirect).query).items()}
+    fake.open_mode = True
+    real_revoke = mcp_oauth.revoke_tokens
+    outcome = {}
+
+    async def revoke_while_callback_lands(rec):
+        out = await real_revoke(rec)
+        outcome["cb"] = await mcp_oauth.finish_sign_in(state=q["state"], code=q["code"], iss=q.get("iss"))
+        return out
+
+    monkeypatch.setattr(mcp_oauth, "revoke_tokens", revoke_while_callback_lands)
+    body = _connect(api, fake.resource)
+    assert body["status"] == "connected" and body["saved"] is True, body
+    assert outcome["cb"].ok is False and "disconnected or removed" in outcome["cb"].message
+    assert mss.MCPServerService().get_server("alice", "fake")["auth"] == "none"
+    assert MCPOAuthStore().get("alice", "fake") is None
+    con = _sqlite.connect(str(env / "mcp.db"))
+    assert con.execute("SELECT COUNT(*) FROM mcp_oauth_states").fetchone()[0] == 0
+    con.close()
+
+
+def test_cx09_reconnect_never_signs_in_onto_a_server_switched_meanwhile(api, fake, env, monkeypatch):
+    """Reconnect reads an OAuth server and probes it; another worker switches
+    the row to plain before the sign-in starts. The claim fails: no new
+    registration or state is written, and the plain row stays as it is."""
+    import sqlite3 as _sqlite
+
+    import services.mcp_server_service as mss
+    from services import mcp_oauth
+
+    _sign_in(api, fake)
+    real_probe = mcp_oauth.probe
+
+    async def probe_then_switch(url):
+        result = await real_probe(url)
+        mss.MCPServerService().save_server("alice", mss.MCPServerConfig(
+            name="fake", transport="streamable_http", url=fake.resource), auth="none")
+        return result
+
+    con = _sqlite.connect(str(env / "mcp.db"))
+    states_before = con.execute("SELECT COUNT(*) FROM mcp_oauth_states").fetchone()[0]
+    oauth_before = con.execute("SELECT updated_at FROM user_mcp_oauth").fetchone()[0]
+    con.close()
+    monkeypatch.setattr(mcp_oauth, "probe", probe_then_switch)
+    body = api.post("/api/mcp-servers/fake/reconnect").json()
+    assert body["status"] == "error" and "changed by another request" in body["message"]
+    assert mss.MCPServerService().get_server("alice", "fake")["auth"] == "none"
+    con = _sqlite.connect(str(env / "mcp.db"))
+    assert con.execute("SELECT COUNT(*) FROM mcp_oauth_states").fetchone()[0] == states_before
+    assert con.execute("SELECT updated_at FROM user_mcp_oauth").fetchone()[0] == oauth_before
+    con.close()
+
+
+def test_fe_cx03_derived_name_never_replaces_a_different_server(api, keyed_server, env):
+    import services.mcp_server_service as mss
+
+    mss.MCPServerService().save_server("alice", mss.MCPServerConfig(
+        name="docs", transport="streamable_http", url="https://a.example/mcp"))
+    resp = api.post("/api/mcp-servers", json={"name": "docs", "transport": "streamable_http",
+                                              "url": "https://b.example/mcp", "replace": False})
+    assert resp.status_code == 409
+    assert mss.MCPServerService().get_server("alice", "docs")["url"] == "https://a.example/mcp"
+
+
+def test_fe_cx20_attempt_id_round_trip(api, fake, env):
+    import hashlib
+
+    body = _connect(api, fake.resource)
+    state = parse_qs(urlsplit(body["authorize_url"]).query)["state"][0]
+    assert body["attempt"] == hashlib.sha256(state.encode()).hexdigest()[:16]
+    assert state not in json.dumps(body["attempt"])
+    listed = api.get("/api/mcp-servers").json()[0]
+    assert listed["oauth"]["signed_in"] is False and listed["oauth"]["signed_in_attempt"] is None
+    _callback(api, auto_approve(fake, body["authorize_url"]))
+    listed = api.get("/api/mcp-servers").json()[0]
+    assert listed["oauth"]["signed_in_attempt"] == body["attempt"]
+    assert isinstance(listed["oauth"]["signed_in_at"], float)
+    assert "revision" not in listed
+    # The callback's connection test settled AFTER the sign-in (frontend CX-26).
+    assert listed["status"]["state"] == "connected"
+    assert listed["status"]["checked_at"] >= listed["oauth"]["signed_in_at"]
+
+
+def test_q2_signed_in_but_not_connected_is_reported_as_such(api, fake, env, monkeypatch):
+    from services.user_mcp import UserMCPPool
+
+    body = _connect(api, fake.resource)
+    redirect = auto_approve(fake, body["authorize_url"])
+    monkeypatch.setattr(UserMCPPool, "test", lambda self, uid, name: {
+        "connected": False, "state": "error", "tools": [], "error": "fake went away"})
+    page = _callback(api, redirect)
+    assert '"ok": true' in page.text and "fake went away" in page.text
+    assert "mcp_oauth=signed_in" in page.text and "Signed in, not connected yet" in page.text
+
+
+def test_q3_keys_in_url_queries_never_reach_the_browser(api, keyed_server, env):
+    from services.mcp_server_service import mask_server
+
+    masked = mask_server({"name": "x", "url": "https://h.example/mcp?api_key=SECRET123&x=1"})
+    assert "SECRET123" not in masked["url"] and "x=1" in masked["url"]
+    body = _connect(api, keyed_server + "?api_key=SECRET123", name="keyed")
+    assert body["status"] == "needs_api_key" and "SECRET123" not in json.dumps(body)

@@ -25,8 +25,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
-import time
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -93,33 +92,15 @@ def ensure_mcp_url(url: str, **kw) -> str:
     return str(url).strip()
 
 
-# Host decisions are cached briefly: the guard runs on every MCP POST.
-_HOST_CACHE: Dict[Tuple[str, str, bool], Tuple[float, bool, str]] = {}
-_HOST_CACHE_TTL = 60.0
-
-
-def _cached_check(url: str, require_https: bool) -> Tuple[bool, str]:
-    parts = urlsplit(url)
-    if parts.username or parts.password:
-        return check_mcp_url(url, require_https=require_https)  # never cached
-    key = (parts.scheme.lower(), (parts.hostname or "").lower(), require_https)
-    now = time.monotonic()
-    hit = _HOST_CACHE.get(key)
-    if hit and now - hit[0] < _HOST_CACHE_TTL:
-        return hit[1], hit[2]
-    ok, reason = check_mcp_url(url, require_https=require_https)
-    if len(_HOST_CACHE) > 512:
-        _HOST_CACHE.clear()
-    _HOST_CACHE[key] = (now, ok, reason)
-    return ok, reason
-
-
 def request_guard(require_https: bool = False):
     """An httpx async ``request`` event hook that refuses unsafe targets. It
-    runs for every request the client sends, redirect hops included."""
+    runs for every request the client sends, redirect hops included, and
+    resolves the host every time: a cached "public" verdict would let a
+    rebinding host point later requests at a private address (guard CX-02).
+    The OS resolver cache keeps this cheap."""
 
     async def hook(request: httpx.Request) -> None:
-        ok, reason = await asyncio.to_thread(_cached_check, str(request.url), require_https)
+        ok, reason = await asyncio.to_thread(check_mcp_url, str(request.url), require_https=require_https)
         if not ok:
             raise UnsafeMcpUrl(reason)
 

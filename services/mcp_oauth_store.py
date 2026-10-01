@@ -45,6 +45,14 @@ def _hash_state(raw: str) -> str:
     return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
 
 
+def attempt_id(raw_state: str) -> str:
+    """A public id for one sign-in attempt (a prefix of the state's hash, so
+    it reveals nothing usable). The connect reply hands it to the browser
+    and the stored tokens remember which attempt produced them, so a popup
+    wait ends on ITS sign-in, not on another tab's (frontend guard CX-20)."""
+    return _hash_state(raw_state)[:16]
+
+
 class ConnectRateLimited(Exception):
     """Too many connect / sign-in attempts for one account."""
 
@@ -65,6 +73,12 @@ class OAuthRecord:
     scope: Optional[str] = None
     status: str = "needs_auth"
     status_reason: Optional[str] = None
+    # When the user last completed a sign-in (not a refresh): the frontend
+    # uses a change in it to see that a popup sign-in finished.
+    signed_in_at: Optional[float] = None
+    signed_in_attempt: Optional[str] = None
+    # Row version (its last write time) for compare-and-delete.
+    updated_at: Optional[str] = None
 
     @property
     def has_tokens(self) -> bool:
@@ -88,7 +102,12 @@ class StateRecord:
 
 class MCPOAuthStore:
     def __init__(self, db_path: Optional[str] = None):
+        from services.mcp_server_service import MCPServerService
+
         self._db_path = mcp_db_path(db_path)
+        # The token write and the switch cleanup check user_mcp_servers in the
+        # same statement, so that table must exist in this database too.
+        MCPServerService(db_path=self._db_path)
         self._init_db()
 
     def _conn(self):
@@ -153,7 +172,7 @@ class MCPOAuthStore:
         try:
             row = conn.execute(
                 """SELECT server_url, resource, issuer, metadata_json, client_enc, redirect_uri,
-                          tokens_enc, expires_at, scope, status, status_reason
+                          tokens_enc, expires_at, scope, status, status_reason, updated_at
                    FROM user_mcp_oauth WHERE user_id = ? AND server = ?""",
                 (str(user_id), server),
             ).fetchone()
@@ -162,12 +181,12 @@ class MCPOAuthStore:
         if not row:
             return None
         (server_url, resource, issuer, metadata_json, client_enc, redirect_uri,
-         tokens_enc, expires_at, scope, status, status_reason) = row
+         tokens_enc, expires_at, scope, status, status_reason, updated_at) = row
         rec = OAuthRecord(
             user_id=str(user_id), server=server, server_url=server_url, resource=resource,
             issuer=issuer, metadata=json.loads(metadata_json or "{}"), client={},
             redirect_uri=redirect_uri, expires_at=expires_at, scope=scope,
-            status=status, status_reason=status_reason,
+            status=status, status_reason=status_reason, updated_at=updated_at,
         )
         try:
             if client_enc:
@@ -176,6 +195,8 @@ class MCPOAuthStore:
                 tokens = json.loads(decrypt_secret(tokens_enc))
                 rec.access_token = tokens.get("access_token") or None
                 rec.refresh_token = tokens.get("refresh_token") or None
+                rec.signed_in_at = tokens.get("signed_in_at")
+                rec.signed_in_attempt = tokens.get("signed_in_attempt")
         except Exception as e:  # noqa: BLE001 - a key rotation makes the row unusable, not fatal
             print(f"[MCPOAuth] stored OAuth data for {server!r} could not be decrypted: {type(e).__name__}")
             rec.client, rec.access_token, rec.refresh_token = {}, None, None
@@ -230,21 +251,40 @@ class MCPOAuthStore:
 
     def set_tokens(self, user_id: str, server: str, *, access_token: str,
                    refresh_token: Optional[str], expires_in: Optional[int],
-                   scope: Optional[str]) -> None:
+                   scope: Optional[str], require_state: Optional[str] = None,
+                   signed_in_at: Optional[float] = None, signed_in_attempt: Optional[str] = None) -> bool:
+        """Store tokens. With ``require_state`` (the raw state of the sign-in
+        that produced them) the write only happens while that state row still
+        exists, in the same statement: a Disconnect or Delete that ran while
+        the code was being exchanged wins. ``signed_in_at`` is the time of the
+        sign-in these tokens descend from (a refresh passes the old value on).
+        Returns whether a row was written."""
         from services.provider_key_service import encrypt_secret
 
+        if require_state is not None and signed_in_attempt is None:
+            signed_in_attempt = attempt_id(require_state)
         tokens_enc = encrypt_secret(json.dumps({"access_token": access_token,
-                                                "refresh_token": refresh_token or None}))
+                                                "refresh_token": refresh_token or None,
+                                                "signed_in_at": signed_in_at,
+                                                "signed_in_attempt": signed_in_attempt}))
         expires_at = time.time() + int(expires_in) if expires_in is not None else None
+        sql = """UPDATE user_mcp_oauth SET tokens_enc = ?, expires_at = ?, scope = ?,
+                 status = 'authorized', status_reason = NULL, updated_at = ?
+                 WHERE user_id = ? AND server = ?"""
+        params: tuple = (tokens_enc, expires_at, scope, _now_iso(), str(user_id), server)
+        if require_state is not None:
+            # A callback stores tokens only while (1) its state row still
+            # exists and (2) the saved server still uses sign-in: a switch to
+            # a plain server that landed while the code was being exchanged
+            # wins (backend guard CX-09). One statement, atomic on Turso too.
+            sql += (" AND EXISTS (SELECT 1 FROM mcp_oauth_states WHERE state_hash = ? AND user_id = ? AND server = ?)"
+                    " AND EXISTS (SELECT 1 FROM user_mcp_servers WHERE user_id = ? AND name = ? AND auth = 'oauth')")
+            params += (_hash_state(require_state), str(user_id), server, str(user_id), server)
         conn = self._conn()
         try:
-            conn.execute(
-                """UPDATE user_mcp_oauth SET tokens_enc = ?, expires_at = ?, scope = ?,
-                   status = 'authorized', status_reason = NULL, updated_at = ?
-                   WHERE user_id = ? AND server = ?""",
-                (tokens_enc, expires_at, scope, _now_iso(), str(user_id), server),
-            )
+            cur = conn.execute(sql, params)
             conn.commit()
+            return getattr(cur, "rowcount", 0) == 1
         finally:
             conn.close()
 
@@ -259,6 +299,42 @@ class MCPOAuthStore:
                 (reason[:300], _now_iso(), str(user_id), server),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def delete_states(self, user_id: str, server: str) -> None:
+        """Cancel every pending sign-in for this server (Disconnect: a popup
+        opened earlier must not be able to store new tokens afterwards)."""
+        conn = self._conn()
+        try:
+            conn.execute("DELETE FROM mcp_oauth_states WHERE user_id = ? AND server = ?", (str(user_id), server))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def delete_if_server_plain(self, user_id: str, server: str) -> bool:
+        """After a switch to a plain server: delete this server's OAuth row
+        and states, but only while the saved server row is still plain
+        (auth='none'), each in one statement.
+
+        Every path that starts a sign-in first writes the server row as
+        'oauth' (Connect saves it so, Reconnect claims it by compare-and-set),
+        so a sign-in begun after the switch has already flipped the row back
+        and keeps its registration and states; and a callback can only store
+        tokens while the row is 'oauth' (set_tokens). The two tables can
+        therefore never disagree (backend guard CX-09). Returns whether an
+        OAuth row was removed."""
+        guard = "EXISTS (SELECT 1 FROM user_mcp_servers WHERE user_id = ? AND name = ? AND auth = 'none')"
+        conn = self._conn()
+        try:
+            conn.execute(f"DELETE FROM user_mcp_oauth WHERE user_id = ? AND server = ? AND {guard}",
+                         (str(user_id), server, str(user_id), server))
+            conn.execute(f"DELETE FROM mcp_oauth_states WHERE user_id = ? AND server = ? AND {guard}",
+                         (str(user_id), server, str(user_id), server))
+            conn.commit()
+            left = conn.execute("SELECT 1 FROM user_mcp_oauth WHERE user_id = ? AND server = ?",
+                                (str(user_id), server)).fetchone()
+            return left is None
         finally:
             conn.close()
 

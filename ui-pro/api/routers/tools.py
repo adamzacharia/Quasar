@@ -12,6 +12,7 @@ API key answers ``needs_api_key``; anything else is saved and connected.
 import asyncio
 import html
 import json
+import logging
 import secrets
 from typing import Optional
 from urllib.parse import quote, urlsplit
@@ -22,10 +23,34 @@ from fastapi.responses import HTMLResponse
 from api.cors_origins import default_frontend_origin, is_allowed_origin
 from api.deps import get_current_user
 from api.models import MCPServerRequest
+from services.secret_redaction import redact_url
 
 router = APIRouter()
 
 _KEY_HEADERS = ("authorization", "x-api-key", "api-key")
+CALLBACK_ROUTE = "/api/mcp/oauth/callback"
+
+
+class _CallbackQueryFilter(logging.Filter):
+    """Uvicorn's access log prints the path WITH its query string, which for
+    the OAuth callback carries the authorization code and state (guard
+    CX-01). Drop the query for that one route; every other line is untouched."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str) \
+                and args[2].startswith(CALLBACK_ROUTE + "?"):
+            record.args = args[:2] + (CALLBACK_ROUTE + "?[redacted]",) + args[3:]
+        return True
+
+
+def _install_access_log_filter() -> None:
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _CallbackQueryFilter) for f in access.filters):
+        access.addFilter(_CallbackQueryFilter())
+
+
+_install_access_log_filter()
 
 
 def _pool():
@@ -66,21 +91,63 @@ def _oauth_summary(user_id: str, name: str) -> dict:
     from services.mcp_oauth_store import MCPOAuthStore
 
     rec = MCPOAuthStore().get(user_id, name)
-    return {"signed_in": bool(rec and rec.access_token),
+    signed_in = bool(rec and rec.access_token)
+    return {"signed_in": signed_in,
+            # Change only when a sign-in completes (not on refresh): the
+            # Settings popup waiter watches them (frontend guard CX-06/20).
+            "signed_in_at": rec.signed_in_at if signed_in else None,
+            "signed_in_attempt": rec.signed_in_attempt if signed_in else None,
             "reason": rec.status_reason if rec else "Sign in to finish connecting this server."}
+
+
+def _attempt_of(authorize_url: str) -> Optional[str]:
+    """The public attempt id for the state inside an authorize URL."""
+    from urllib.parse import parse_qs
+
+    from services.mcp_oauth_store import attempt_id
+
+    state = (parse_qs(urlsplit(authorize_url).query).get("state") or [""])[0]
+    return attempt_id(state) if state else None
 
 
 def _public_view(srv: dict, live: Optional[dict], oauth: Optional[dict]) -> dict:
     from services.mcp_server_service import mask_server
 
     out = mask_server(srv)
+    out.pop("revision", None)
     out["auth"] = srv.get("auth") or "none"
+    if oauth is not None:
+        out["oauth"] = {"signed_in": oauth["signed_in"], "signed_in_at": oauth["signed_in_at"],
+                        "signed_in_attempt": oauth["signed_in_attempt"]}
     if live is not None:
         out["status"] = live
     elif oauth is not None and not oauth["signed_in"]:
         out["status"] = {"connected": False, "state": "needs_auth", "tools": [],
                          "error": oauth["reason"], "transport": None}
     return out
+
+
+# Mutations of one (user, server) run one at a time in this process, so two
+# overlapping saves / reconnects cannot interleave their save-test-revoke
+# steps (backend guard CX-09). Across processes the row revision check in
+# _save_plain still keeps an older snapshot from overwriting a newer save.
+_SERVER_LOCKS: dict = {}
+
+
+def _server_lock(user_id: str, name: str) -> asyncio.Lock:
+    key = (user_id, name)
+    lock = _SERVER_LOCKS.get(key)
+    if lock is None:
+        if len(_SERVER_LOCKS) > 2048:
+            for k in [k for k, v in _SERVER_LOCKS.items() if not v.locked()][:1024]:
+                _SERVER_LOCKS.pop(k, None)
+        lock = _SERVER_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+def _not_saved(name: str, url: Optional[str], transport: str, message: str, status: str = "error") -> dict:
+    return {"status": status, "saved": False, "message": message,
+            "server": {"name": name, "url": redact_url(url) if url else url, "transport": transport}}
 
 
 async def _start_oauth(request: Request, user_id: str, name: str, url: str, probe_result) -> str:
@@ -125,14 +192,12 @@ async def test_mcp_server(name: str, current_user: dict = Depends(get_current_us
 async def save_mcp_server(req: MCPServerRequest, request: Request,
                           current_user: dict = Depends(get_current_user)):
     """Detect what the server needs, then save and connect (or start sign-in)."""
-    from services.mcp_oauth import OAuthSetupError, probe, revoke_and_forget
-    from services.mcp_server_service import (MCPServerConfig, MCPServerService, mask_server,
-                                             validate_server_config)
-    from services.mcp_url_policy import check_mcp_url
+    from services.mcp_server_service import MCPServerConfig, MCPServerService, validate_server_config
 
     user_id = current_user["sub"]
     svc = MCPServerService()
     payload = req.model_dump()
+    replace = bool(payload.pop("replace", True))
     if not (payload.get("name") or "").strip() and payload.get("url"):
         payload["name"] = _derive_name(payload["url"])
     try:
@@ -140,8 +205,20 @@ async def save_mcp_server(req: MCPServerRequest, request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     _admit(user_id)
+    async with _server_lock(user_id, config.name):
+        return await _save_locked(request, user_id, svc, config, replace)
+
+
+async def _save_locked(request: Request, user_id: str, svc, config, replace: bool = True):
+    from services.mcp_oauth import OAuthSetupError, probe
+    from services.mcp_server_service import mask_server
+    from services.mcp_url_policy import check_mcp_url
 
     previous = await asyncio.to_thread(svc.get_server, user_id, config.name)
+    if previous and not replace and (previous.get("url") or "") != (config.url or ""):
+        # A name the form derived must never overwrite a different server
+        # (frontend guard CX-03); the form picks another name and retries.
+        raise HTTPException(status_code=409, detail=f"A different server is already saved as {config.name}.")
     is_http = config.transport in ("http", "streamable_http")
     if is_http:
         ok, reason = await asyncio.to_thread(check_mcp_url, config.url)
@@ -153,10 +230,21 @@ async def save_mcp_server(req: MCPServerRequest, request: Request,
         result = await probe(config.url)
         if result.kind == "blocked":
             raise HTTPException(status_code=400, detail=result.message)
+        if result.kind == "unreachable":
+            # Never save (or overwrite and revoke a working sign-in) on the
+            # strength of a failed probe: an outage says nothing about what
+            # the server needs (guard CX-04).
+            return _not_saved(config.name, config.url, config.transport,
+                              f"Could not reach the server: {result.message} Nothing was changed.")
         if result.kind == "api_key":
             # Nothing is saved: the form asks for the key and submits again.
-            return {"status": "needs_api_key", "message": result.message,
-                    "server": {"name": config.name, "url": config.url, "transport": config.transport}}
+            return _not_saved(config.name, config.url, config.transport, result.message, status="needs_api_key")
+        if result.kind == "open" and previous and previous.get("auth") == "oauth" and not result.answered_ok:
+            # Replacing a signed-in server with a plain one revokes its
+            # sign-in: only on a completed anonymous MCP handshake.
+            return _not_saved(config.name, config.url, config.transport,
+                              f"The server answered HTTP {result.status_code} without a working MCP handshake, "
+                              "so it is unclear whether it still needs sign-in. Nothing was changed.")
         if result.kind == "oauth":
             try:
                 srv = await asyncio.to_thread(
@@ -165,36 +253,93 @@ async def save_mcp_server(req: MCPServerRequest, request: Request,
                 raise HTTPException(status_code=400, detail=str(exc))
             _pool().forget(user_id, config.name)
             view = {**mask_server(srv), "auth": "oauth"}
+            view.pop("revision", None)
             try:
                 authorize_url = await _start_oauth(request, user_id, config.name, config.url, result)
             except OAuthSetupError as exc:
-                return {"status": "error", "message": _scrub(exc), "server": view}
-            return {"status": "needs_auth", "authorize_url": authorize_url, "server": view,
+                return {"status": "error", "saved": True, "message": _scrub(exc), "server": view}
+            return {"status": "needs_auth", "saved": True, "authorize_url": authorize_url,
+                    "attempt": _attempt_of(authorize_url), "server": view,
                     "message": "Sign in to finish connecting."}
 
     try:
-        srv = await asyncio.to_thread(lambda: svc.save_server(user_id, config, auth="none"))
+        srv, result, kept = await _save_plain(user_id, config, previous)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if previous and previous.get("auth") == "oauth":
-        # Switched from OAuth to a key / no auth: the old sign-in is dead weight.
-        await revoke_and_forget(user_id, config.name)
+    if kept:
+        view = {**mask_server(previous), "auth": "oauth"}
+        view.pop("revision", None)
+        return {"status": "error", "saved": False, "server": view, "connection": result,
+                "message": f"{config.name} did not connect that way ({_scrub(result.get('error'))}), "
+                           "so the existing sign-in was kept. Nothing was changed."}
     # "Save & Connect" really connects: the result tells the user at once
     # whether the server answered and which tools it offers.
-    result = await asyncio.to_thread(_pool().test, user_id, srv["name"])
     state = result.get("state") or ("connected" if result.get("connected") else "error")
-    return {"status": state, "server": {**mask_server(srv), "auth": "none"}, "connection": result}
+    view = {**mask_server(srv), "auth": "none"}
+    view.pop("revision", None)
+    return {"status": state, "saved": True, "server": view, "connection": result}
+
+
+async def _save_plain(user_id: str, config, previous: Optional[dict]):
+    """Save ``config`` as a plain (key or no-auth) server and connect it.
+
+    When it replaces a signed-in OAuth server, the new config must first
+    connect on a throwaway connection; only then is it written (compare-and-
+    set) and the old sign-in revoked. If it does not connect, nothing is
+    written at all (guard CX-04/07/08/09: no probe heuristic or overlapping
+    request can destroy a working sign-in). Returns
+    (saved server, connection result, kept_previous)."""
+    from services.mcp_oauth import revoke_tokens
+    from services.mcp_oauth_store import MCPOAuthStore
+    from services.mcp_server_service import MCPServerService
+
+    svc = MCPServerService()
+    if not (previous and previous.get("auth") == "oauth"):
+        srv = await asyncio.to_thread(lambda: svc.save_server(user_id, config, auth="none"))
+        _pool().forget(user_id, config.name)
+        result = await asyncio.to_thread(_pool().test, user_id, srv["name"])
+        return srv, result, False
+    # Replacing a signed-in server (guard CX-09). Nothing is written until the
+    # plain config has connected on a throwaway, unregistered connection, so
+    # chats never see an unverified config and a failure changes nothing.
+    result = await asyncio.to_thread(_pool().test_config, user_id, config.model_dump())
+    if not result.get("connected"):
+        return previous, result, True
+    store = MCPOAuthStore()
+    snapshot = await asyncio.to_thread(store.get, user_id, config.name)
+    # One compare-and-set write: only if the row is still the version this
+    # request started from. A save from another worker in between wins.
+    if not await asyncio.to_thread(lambda: svc.restore_if_revision(user_id, previous.get("revision"), config,
+                                                                   auth="none")):
+        return previous, {"connected": False, "state": "error", "tools": [],
+                          "error": "the server was changed by another request meanwhile"}, True
+    _pool().forget(user_id, config.name)
+    srv = await asyncio.to_thread(svc.get_server, user_id, config.name) or {**config.model_dump(), "auth": "none"}
+    # Revoke the OLD tokens (a snapshot), then drop this server's OAuth data
+    # only while the server row is still plain: a sign-in begun meanwhile has
+    # already flipped it back to "oauth" and keeps its row and states, and an
+    # older popup's callback can no longer store tokens (set_tokens checks
+    # the row too).
+    await revoke_tokens(snapshot)
+    await asyncio.to_thread(store.delete_if_server_plain, user_id, config.name)
+    result = await asyncio.to_thread(_pool().test, user_id, config.name)
+    return srv, result, False
 
 
 @router.post("/api/mcp-servers/{name}/reconnect")
 async def reconnect_mcp_server(name: str, request: Request,
                                current_user: dict = Depends(get_current_user)):
     """OAuth servers: start a fresh sign-in. Others: reconnect now."""
+    user_id = current_user["sub"]
+    _admit(user_id)
+    async with _server_lock(user_id, name):
+        return await _reconnect_locked(request, user_id, name)
+
+
+async def _reconnect_locked(request: Request, user_id: str, name: str):
     from services.mcp_oauth import OAuthSetupError, probe
     from services.mcp_server_service import MCPServerService
 
-    user_id = current_user["sub"]
-    _admit(user_id)
     srv = await asyncio.to_thread(MCPServerService().get_server, user_id, name)
     if srv is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -202,17 +347,47 @@ async def reconnect_mcp_server(name: str, request: Request,
         result = await asyncio.to_thread(_pool().test, user_id, name)
         return {"status": result.get("state") or "error", "connection": result}
     result = await probe(srv["url"])
-    if result.kind != "oauth":
-        if result.kind in ("blocked", "unreachable"):
-            return {"status": "error", "message": result.message}
-        # The server stopped asking for sign-in; just connect.
-        conn = await asyncio.to_thread(_pool().test, user_id, name)
+    if result.kind in ("blocked", "unreachable"):
+        return {"status": "error", "message": result.message}
+    if result.kind == "api_key":
+        return {"status": "needs_api_key", "message": f"{result.message} It no longer offers sign-in; "
+                "remove it and add it again with a key."}
+    if result.kind == "open" and not result.answered_ok:
+        return {"status": "error", "message": f"The server answered HTTP {result.status_code} without a working "
+                "MCP handshake instead of asking for sign-in. Nothing was changed; try again later."}
+    if result.kind == "open":
+        # The server stopped asking for sign-in (it completed an anonymous
+        # initialize): try it as a plain server; the old sign-in is dropped
+        # only if that connection works (guard CX-07/08).
+        from services.mcp_server_service import MCPServerConfig
+
+        cfg = MCPServerConfig(**{k: srv[k] for k in ("name", "transport", "url", "command", "args", "env", "headers")
+                                 if k in srv})
+        _, conn, kept = await _save_plain(user_id, cfg, srv)
+        if kept:
+            return {"status": "error", "connection": conn,
+                    "message": "The server no longer asks for sign-in but did not connect without it either. "
+                               "Nothing was changed."}
         return {"status": conn.get("state") or "error", "connection": conn}
+    # Claim the server row (compare-and-set at the version read above, still
+    # auth="oauth") BEFORE any registration or state is written: if another
+    # worker switched it to plain meanwhile, the claim fails and no sign-in
+    # starts; if ours lands first, that worker's own CAS fails instead. The
+    # server row and the OAuth row can never disagree (backend guard CX-09).
+    from services.mcp_server_service import MCPServerConfig
+
+    cfg = MCPServerConfig(**{k: srv[k] for k in ("name", "transport", "url", "command", "args", "env", "headers")
+                             if k in srv})
+    claimed = await asyncio.to_thread(
+        lambda: MCPServerService().restore_if_revision(user_id, srv.get("revision"), cfg, auth="oauth"))
+    if not claimed:
+        return {"status": "error", "message": "This server was changed by another request meanwhile. "
+                "Nothing was started; reload the list and try again."}
     try:
         authorize_url = await _start_oauth(request, user_id, name, srv["url"], result)
     except OAuthSetupError as exc:
         return {"status": "error", "message": _scrub(exc)}
-    return {"status": "needs_auth", "authorize_url": authorize_url}
+    return {"status": "needs_auth", "authorize_url": authorize_url, "attempt": _attempt_of(authorize_url)}
 
 
 @router.post("/api/mcp-servers/{name}/disconnect")
@@ -223,13 +398,14 @@ async def disconnect_mcp_server(name: str, current_user: dict = Depends(get_curr
     from services.mcp_server_service import MCPServerService
 
     user_id = current_user["sub"]
-    srv = await asyncio.to_thread(MCPServerService().get_server, user_id, name)
-    if srv is None:
-        raise HTTPException(status_code=404, detail="Server not found")
-    if srv.get("auth") != "oauth":
-        raise HTTPException(status_code=400, detail="This server does not use sign-in.")
-    revoked = await revoke_and_forget(user_id, name, keep_registration=True)
-    _pool().forget(user_id, name)
+    async with _server_lock(user_id, name):
+        srv = await asyncio.to_thread(MCPServerService().get_server, user_id, name)
+        if srv is None:
+            raise HTTPException(status_code=404, detail="Server not found")
+        if srv.get("auth") != "oauth":
+            raise HTTPException(status_code=400, detail="This server does not use sign-in.")
+        revoked = await revoke_and_forget(user_id, name, keep_registration=True)
+        _pool().forget(user_id, name)
     return {"status": "needs_auth", "revoked": revoked}
 
 
@@ -239,13 +415,14 @@ async def delete_mcp_server(name: str, current_user: dict = Depends(get_current_
     from services.mcp_server_service import MCPServerService
 
     user_id = current_user["sub"]
-    srv = await asyncio.to_thread(MCPServerService().get_server, user_id, name)
-    if srv is None:
-        raise HTTPException(status_code=404, detail="Server not found")
-    if srv.get("auth") == "oauth":
-        await revoke_and_forget(user_id, name)
-    await asyncio.to_thread(MCPServerService().delete_server, user_id, name)
-    _pool().forget(user_id, name)
+    async with _server_lock(user_id, name):
+        srv = await asyncio.to_thread(MCPServerService().get_server, user_id, name)
+        if srv is None:
+            raise HTTPException(status_code=404, detail="Server not found")
+        if srv.get("auth") == "oauth":
+            await revoke_and_forget(user_id, name)
+        await asyncio.to_thread(MCPServerService().delete_server, user_id, name)
+        _pool().forget(user_id, name)
     return {"status": "success"}
 
 
@@ -293,23 +470,29 @@ async def mcp_oauth_callback(request: Request, code: Optional[str] = None, state
     result = await finish_sign_in(state=state, code=code, error=error,
                                   error_description=error_description, iss=iss)
     message = result.message
+    # ok = the sign-in finished and the tokens are stored. Whether the MCP
+    # server then connected is reported separately: `error` is set (and the
+    # redirect flag says signed_in, not connected) when it did not.
+    connected = False
     if result.ok:
         conn = await asyncio.to_thread(_pool().test, result.user_id, result.server)
-        if conn.get("connected"):
+        connected = bool(conn.get("connected"))
+        if connected:
             n = len(conn.get("tools") or [])
             message = f"Connected to {result.server}: {n} tool{'s' if n != 1 else ''} ready for your chats."
         else:
             message = f"Signed in, but {result.server} did not connect yet: {_scrub(conn.get('error'))}"
     origin = result.return_origin if result.return_origin and is_allowed_origin(result.return_origin) \
         else default_frontend_origin()
-    flag = "connected" if result.ok else "failed"
+    flag = "connected" if connected else ("signed_in" if result.ok else "failed")
     back = f"{origin}/?mcp_oauth={flag}" + (f"&mcp_server={quote(result.server)}" if result.server else "")
     payload = {"type": "quasar-mcp-oauth", "server": result.server, "ok": result.ok,
-               "error": None if result.ok else _scrub(message)}
+               "error": None if connected else _scrub(message)}
     nonce = secrets.token_urlsafe(16)
     page = _PAGE.format(
-        tone="ok" if result.ok else "err",
-        title=html.escape("You're connected" if result.ok else "Sign-in did not finish"),
+        tone="ok" if connected else "err",
+        title=html.escape("You're connected" if connected else
+                          ("Signed in, not connected yet" if result.ok else "Sign-in did not finish")),
         body=html.escape(_scrub(message)), back=html.escape(back, quote=True), nonce=nonce,
         payload=_js(payload), origin=_js(origin), back_js=_js(back),
     )
