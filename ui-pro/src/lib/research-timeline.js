@@ -77,6 +77,25 @@ export function stepIcon(text) {
 }
 
 /**
+ * Which timeline section a step lands in. Mirrors the branch order in
+ * buildResearchTimeline; used to tell the header what is happening now.
+ * @param {{text: string, mcp?: {server?: string}}} s
+ */
+function stepKind(s) {
+    const t = s.text;
+    if (s.mcp && typeof s.mcp.server === "string" && s.mcp.server) return "mcp";
+    if (REASON_RE.test(t)) return "reasoning";
+    if (READING_RE.test(t)) return "reading";
+    if (WEB_QUERY_RE.test(t) || WEB_TIMEOUT_RE.test(t) || WEB_PREPASS_RE.test(t) || WEB_TOOL_RE.test(t)) return "searching";
+    if (WRAP_RE.test(t)) return "wrapping";
+    if (NOTICE_RE.test(t)) return "notice";
+    return "querying";
+}
+
+/** A running step this old reads as waiting on a slow tool. */
+export const WAITING_AFTER_SECONDS = 15;
+
+/**
  * Dedupe steps by label, keeping the LAST status. The persisted history
  * (rich_meta.thinkingSteps) records every transition, so a reloaded turn has
  * both "running" and "completed" entries for the same label.
@@ -129,6 +148,7 @@ function pushUnique(items, item) {
  *   sourceCount: number,
  *   stepCount: number,
  *   current: string | undefined,
+ *   activity: "starting" | "thinking" | "searching" | "querying" | "mcp" | "reading" | "wrapping" | "waiting" | "notice" | undefined,
  *   favicons: string[],
  * }}
  */
@@ -159,12 +179,18 @@ export function buildResearchTimeline(input = {}) {
     let readingStatus = null;
     let readingLabel = "";
     let current;
+    let currentKind;
+    let currentElapsed = 0;
 
     for (const s of steps) {
         const status = normalizeStatus(s.status, running);
         const text = s.text;
         const base = { status, ...(typeof s.elapsedSeconds === "number" ? { elapsedSeconds: s.elapsedSeconds } : {}) };
-        if (status === "running") current = text.replace(REASON_RE, "").replace(/^🌐\s*/u, "");
+        if (status === "running") {
+            current = text.replace(REASON_RE, "").replace(/^🌐\s*/u, "");
+            currentKind = stepKind(s);
+            currentElapsed = typeof s.elapsedSeconds === "number" ? s.elapsedSeconds : 0;
+        }
 
         if (s.mcp && typeof s.mcp.server === "string" && s.mcp.server) {
             // A call to one of the user's own MCP servers (core/runner.py
@@ -301,11 +327,24 @@ export function buildResearchTimeline(input = {}) {
         }));
 
     const stepCount = out.reduce((n, s) => n + (s.kind === "reading" ? 0 : s.items.length), 0);
+
+    // What the turn is doing right now, for the header's animated mark. With
+    // no running step the model is between calls (or has not started yet).
+    let activity;
+    if (running) {
+        if (currentKind === "notice") activity = "notice";
+        else if (currentKind && currentElapsed >= WAITING_AFTER_SECONDS) activity = "waiting";
+        else if (currentKind) activity = currentKind === "reasoning" ? "thinking" : currentKind;
+        else if (searching?.live) activity = "searching";
+        else activity = out.length ? "thinking" : "starting";
+    }
+
     return {
         sections: out,
         sourceCount: urls.size + paperCount,
         stepCount,
         current,
+        activity,
         favicons: sourceItems.slice(0, 4).map((i) => i.domain),
     };
 }

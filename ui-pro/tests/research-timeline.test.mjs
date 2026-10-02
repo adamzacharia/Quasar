@@ -374,3 +374,28 @@ test("a cache-served MCP repeat (state skipped) reads as done, not failed", () =
     assert.equal(t.sections[0].items[0].status, "completed");
     assert.equal(t.sections[0].items[0].text, "search (repeat skipped)");
 });
+
+test("activity names what the running turn is doing right now", () => {
+    const at = (steps, extra = {}) => buildResearchTimeline({ running: true, steps, ...extra }).activity;
+    assert.equal(at([{ text: "🧠 Reasoning", status: "running" }]), "starting");
+    assert.equal(at([{ text: "💭 Weighing the archives", status: "running" }]), "thinking");
+    assert.equal(at([{ text: 'Searching the web: "ALMA cycle 13"', status: "running" }]), "searching");
+    assert.equal(at([{ text: "Querying ALMA by target", status: "running" }]), "querying");
+    assert.equal(at([{ text: "DeepWiki: ask_question", status: "running", mcp: { server: "DeepWiki", state: "running" } }]), "mcp");
+    assert.equal(at([{ text: "Reading 3 pages", status: "running" }]), "reading");
+    assert.equal(at([{ text: "Composing final answer", status: "running" }]), "wrapping");
+    assert.equal(at([{ text: "gpt-oss is degraded, using DeepSeek", status: "running" }]), "notice");
+    assert.equal(at([{ text: "Querying ALMA by target", status: "running", elapsedSeconds: 20 }]), "waiting");
+    // Between calls: something already ran, nothing is running now.
+    assert.equal(at([{ text: "Querying ALMA by target", status: "completed" }]), "thinking");
+    // The last running step wins.
+    assert.equal(at([
+        { text: "Querying ALMA by target", status: "running" },
+        { text: "Reading 3 pages", status: "running" },
+    ]), "reading");
+});
+
+test("a finished turn has no activity", () => {
+    const t = buildResearchTimeline({ running: false, steps: [{ text: "Querying ALMA by target", status: "running" }] });
+    assert.equal(t.activity, undefined);
+});

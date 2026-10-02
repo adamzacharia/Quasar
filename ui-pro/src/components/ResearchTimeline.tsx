@@ -3,12 +3,13 @@
 /* eslint-disable @next/next/no-img-element */
 import {
     AlertCircle, BookOpen, ChartLine, CheckCircle2, ChevronDown, Database, Download, FileText, GitMerge,
-    Globe, Image as ImageIcon, Loader2, Orbit, Plug, Search, Sparkles,
+    Globe, Image as ImageIcon, Loader2, Plug, Search, Sparkles,
 } from "lucide-react";
 import { useEffect, useId, useState, type ReactNode } from "react";
 import type { ThoughtStep } from "./ThoughtProcessWidget";
 import type { WebDecision, WebSource } from "../lib/types";
 import { buildResearchTimeline, REASONING_VISIBLE } from "../lib/research-timeline.js";
+import { WorkingDots } from "./WorkingDots";
 
 interface ResearchTimelineProps {
     status: "running" | "completed";
@@ -213,11 +214,7 @@ export function ResearchTimeline({
                 className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-[var(--q-glass-hover)]"
             >
                 <span className="flex min-w-0 items-center gap-2.5">
-                    <Orbit
-                        className={`h-[18px] w-[18px] shrink-0 ${running ? "q-orbit-spin text-primary" : ""}`}
-                        style={running ? undefined : { color: "var(--q-text-muted)" }}
-                        aria-hidden="true"
-                    />
+                    <WorkingDots live={running} activity={timeline.activity} />
                     <span className="text-sm font-medium" style={{ color: "var(--q-text)" }}>
                         {running ? "Researching" : "Research"}
                     </span>

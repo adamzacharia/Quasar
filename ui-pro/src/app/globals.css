@@ -624,15 +624,9 @@ html {
   0%        { transform: scale(1); opacity: 0.6; }
   80%, 100% { transform: scale(2.8); opacity: 0; }
 }
-@keyframes q-orbit-spin {
-  to { transform: rotate(360deg); }
-}
-.q-orbit-spin {
-  animation: q-orbit-spin 3.2s linear infinite;
-}
 @media (prefers-reduced-motion: reduce) {
   .q-collapse { transition: none; }
-  .q-item-in, .q-line-grow, .q-orbit-spin { animation: none; }
+  .q-item-in, .q-line-grow { animation: none; }
   .q-dot-live::after { display: none; }
   .q-shimmer { animation: none; background-image: none; color: var(--q-text); }
 }
