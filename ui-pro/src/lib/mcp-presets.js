@@ -51,6 +51,40 @@ export const MCP_PRESETS = [
     },
 ];
 
+// Astronomy and space servers from the official MCP Registry. Each one was
+// connected and answered a real tool call on ASTRONOMY_PRESETS_VERIFIED_ON
+// (moon phase, Kp index, arXiv search, Earthdata collections, a dark-sky
+// spot). All are keyless. They add things Quasar does not have built in;
+// third-party wrappers of archives Quasar already covers (SIMBAD, ADS, MAST,
+// ...) are left out on purpose. `builtinOverlap` names a partial overlap.
+export const ASTRONOMY_PRESETS_VERIFIED_ON = "2026-10-02";
+
+export const ASTRONOMY_PRESETS = [
+    {
+        id: "astronomy-calc", name: "Astronomy calculator", url: "https://astronomy.caseyjhand.com/mcp", domain: "caseyjhand.com",
+        auth: "none", verified: "tool-call", blurb: "Sky positions, rise and set times, moon phases, eclipses, what is visible tonight",
+    },
+    {
+        id: "noaa-spaceweather", name: "NOAA space weather", url: "https://noaa-spaceweather.caseyjhand.com/mcp", domain: "caseyjhand.com",
+        auth: "none", verified: "tool-call", blurb: "Kp index, solar wind, flares, alerts and aurora forecasts from NOAA SWPC data (third-party server)",
+    },
+    {
+        id: "arxiv-fulltext", name: "arXiv full text", url: "https://arxiv.caseyjhand.com/mcp", domain: "caseyjhand.com",
+        auth: "none", verified: "tool-call", builtinOverlap: "arXiv search",
+        blurb: "Read the full text of arXiv papers (Quasar already searches arXiv; this adds reading the paper itself)",
+    },
+    {
+        id: "nasa-earthdata", name: "NASA Earthdata", url: "https://cmr.earthdata.nasa.gov/mcp/v1", domain: "earthdata.nasa.gov",
+        auth: "none", verified: "tool-call", official: true, blurb: "NASA's own server for Earth science datasets and granules (CMR)",
+    },
+    {
+        id: "star-ninja", name: "Star Ninja", url: "https://stars.2pm.ninja/mcp", domain: "2pm.ninja",
+        auth: "none", verified: "tool-call", blurb: "Sky darkness, cloud cover and moonless hours for an observing spot",
+    },
+];
+
+const ALL_PRESETS = [...MCP_PRESETS, ...ASTRONOMY_PRESETS];
+
 // Where a provider hands out API keys, for servers that answer "needs an API
 // key" (checked 2026-10-01 from the provider's own docs).
 const KEY_PAGES = {
@@ -74,7 +108,7 @@ export function gitmcpUrl(input) {
 /** The preset a saved server came from (same URL), for its key link and icon. */
 export function presetForUrl(url) {
     const u = String(url || "").replace(/\/+$/, "").toLowerCase();
-    return MCP_PRESETS.find((p) => p.url.replace(/\/+$/, "").toLowerCase() === u)
+    return ALL_PRESETS.find((p) => p.url.replace(/\/+$/, "").toLowerCase() === u)
         || (u.startsWith("https://gitmcp.io/") ? MCP_PRESETS.find((p) => p.id === "gitmcp") : undefined);
 }
 

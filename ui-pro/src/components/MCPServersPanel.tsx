@@ -8,12 +8,18 @@
 // lib/mcp-connect.js (unit-tested); this file renders and wires them.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, CheckCircle, ChevronDown, ExternalLink, KeyRound, Loader2, Lock, LogIn, LogOut, Plus, RefreshCw, Trash2, Wrench } from "lucide-react";
+import { AlertCircle, CheckCircle, ChevronDown, ExternalLink, KeyRound, Loader2, Lock, LogIn, LogOut, Plus, RefreshCw, Search, Telescope, Trash2, Wrench } from "lucide-react";
 import { useAuthStore, authBearerHeaders } from "../lib/auth-store";
 import { parseMcpInput, deriveServerName } from "../lib/mcp-paste.js";
 import type { McpTransport, ParsedMcpInput } from "../lib/mcp-paste.js";
-import { MCP_PRESETS, PRESETS_VERIFIED_ON, apiKeyPageFor, gitmcpUrl, iconDomain } from "../lib/mcp-presets.js";
+import {
+    ASTRONOMY_PRESETS, ASTRONOMY_PRESETS_VERIFIED_ON, MCP_PRESETS, PRESETS_VERIFIED_ON, apiKeyPageFor, gitmcpUrl, iconDomain,
+} from "../lib/mcp-presets.js";
 import type { McpPreset } from "../lib/mcp-presets.js";
+import {
+    REGISTRY_HOME, mergeResults, overlapNote, registryAction, registryBadges, registrySearchParams,
+} from "../lib/mcp-registry.js";
+import type { RegistryItem, RegistryMode, RegistrySearchResult } from "../lib/mcp-registry.js";
 import {
     buildConnectBody, createOnce, credentialsStillApply, isOAuthResultMessage, nextStep, oauthWaitDecision,
     readOAuthReturn, returnBanner, statusView, stripOAuthReturn,
@@ -151,6 +157,26 @@ export function MCPServersPanel() {
     const [formMsg, setFormMsg] = useState<FormMsg>(null);
     const [connecting, setConnecting] = useState(false);
     const keyInputRef = useRef<HTMLInputElement>(null);
+    const urlInputRef = useRef<HTMLTextAreaElement>(null);
+
+    // MCP Registry search
+    const [regQuery, setRegQuery] = useState("");
+    const [regMode, setRegMode] = useState<RegistryMode | null>(null);
+    const [regItems, setRegItems] = useState<RegistryItem[]>([]);
+    const [regMeta, setRegMeta] = useState<Omit<RegistrySearchResult, "items"> | null>(null);
+    const [regLoading, setRegLoading] = useState(false);
+    const [regError, setRegError] = useState<string | null>(null);
+    const [regShowAll, setRegShowAll] = useState(false);
+    const [regPending, setRegPending] = useState<string | null>(null);
+    const regSeq = useRef(0);
+    // The spinner belongs to the card whose click started this connect only.
+    useEffect(() => { if (!connecting && regPending) setRegPending(null); }, [connecting, regPending]);
+    // The form message sits at the top of the tab; a click on a registry
+    // result further down must still show it (unless a field takes focus).
+    const formMsgRef = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+        if (formMsg && formMsg.type !== "success") formMsgRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }, [formMsg]);
 
     // OAuth popup wait
     const [wait, setWait] = useState<OAuthWait | null>(null);
@@ -159,6 +185,7 @@ export function MCPServersPanel() {
     const parsed: ParsedMcpInput = useMemo(() => parseMcpInput(input), [input]);
     const parsedName = parsed.kind === "url" ? (parsed.name || deriveServerName(parsed.url)) : "";
     const keyHeader = parsed.kind === "url" ? parsed.keyHeader : undefined;
+    const keyPrefix = parsed.kind === "url" ? parsed.keyPrefix : undefined;
     const showKey = !!keyPrompt || !!keyHeader;
     const localSelected = showAdvanced && transport === "stdio";
 
@@ -316,7 +343,7 @@ export function MCPServersPanel() {
         setFormMsg(null);
         const built = buildConnectBody({
             preset, parsed, servers,
-            form: { advancedOpen: showAdvanced, transport, headerText, envText, cmd, cmdArgs, apiKey, keyHeader,
+            form: { advancedOpen: showAdvanced, transport, headerText, envText, cmd, cmdArgs, apiKey, keyHeader, keyPrefix,
                 name, nameTyped: nameTouched },
         });
         if (built.error !== undefined) {
@@ -336,7 +363,7 @@ export function MCPServersPanel() {
                 const fresh = await fetchServers();
                 const rebuilt = fresh && buildConnectBody({
                     preset, parsed, servers: fresh,
-                    form: { advancedOpen: showAdvanced, transport, headerText, envText, cmd, cmdArgs, apiKey, keyHeader,
+                    form: { advancedOpen: showAdvanced, transport, headerText, envText, cmd, cmdArgs, apiKey, keyHeader, keyPrefix,
                         name, nameTyped: nameTouched },
                 });
                 if (rebuilt && rebuilt.body && rebuilt.body.name !== body.name) {
@@ -404,6 +431,55 @@ export function MCPServersPanel() {
         setName(preset.name);
         setNameTouched(false);
         connect(preset, pre);
+    };
+
+    /** Search the registry. A newer search (or Load more) wins over an older
+     *  one still in flight. */
+    const searchRegistry = async (mode: RegistryMode, more = false) => {
+        if (mode.kind === "q" && !mode.q.trim()) return;
+        const seq = ++regSeq.current;
+        const cursor = more ? regMeta?.next_cursor : null;
+        setRegLoading(true);
+        setRegError(null);
+        if (!more) { setRegMode(mode); setRegItems([]); setRegMeta(null); setRegShowAll(false); }
+        try {
+            const res = await api(`/api/mcp-registry/search?${registrySearchParams(mode, cursor)}`);
+            const data = await readJson(res);
+            if (seq !== regSeq.current) return;
+            if (!res.ok) {
+                setRegError(String(data.detail || "The search did not work. Try again."));
+                return;
+            }
+            const result = data as unknown as RegistrySearchResult;
+            const { items, ...meta } = result;
+            setRegItems((cur) => (more ? mergeResults(cur, items || []) : (items || [])));
+            setRegMeta(meta);
+        } catch {
+            if (seq === regSeq.current) setRegError("Network error. Check your connection and try again.");
+        } finally {
+            if (seq === regSeq.current) setRegLoading(false);
+        }
+    };
+
+    const pickRegistryItem = (item: RegistryItem) => {
+        setRepoFor(null);
+        const act = registryAction(item);
+        if (act.kind === "connect") {
+            setRegPending(item.id);
+            connectPreset({ url: act.url, name: act.name, transport: "http" });
+            return;
+        }
+        // Needs the user first (a key, or part of the address): fill the box.
+        // A remote URL never goes out as a Local command (guard CX-06).
+        if (transport === "stdio") setTransport("http");
+        setApiKey("");
+        setHeaderText("");
+        setKeyPrompt(null);
+        setName("");
+        setNameTouched(false);
+        setInput(act.input);
+        setFormMsg({ type: "warn", text: act.note });
+        setTimeout(() => (act.focusKey ? keyInputRef.current : urlInputRef.current)?.focus(), 50);
     };
 
     const connectRepo = () => {
@@ -608,7 +684,7 @@ export function MCPServersPanel() {
                 {activeTab === "add" && (
                     <div className="max-w-2xl space-y-5">
                         {waitBox}
-                        {formMsg && <Banner msg={formMsg} />}
+                        {formMsg && <div ref={formMsgRef}><Banner msg={formMsg} /></div>}
                         {listError && !listLoaded && (
                             <Banner msg={{ type: "error", text: "Could not load your MCP servers, so Connect is off. Open Your servers and press Try again." }} />
                         )}
@@ -638,10 +714,123 @@ export function MCPServersPanel() {
                             </p>
                         </div>
 
+                        <div>
+                            <p className={LABEL}>Astronomy and space</p>
+                            <div className="flex flex-wrap gap-1.5">
+                                {ASTRONOMY_PRESETS.map((p) => (
+                                    <button key={p.id} type="button" onClick={() => pickPreset(p)} disabled={connecting || !!wait || !listLoaded}
+                                        className="q-pill h-8 gap-1.5 px-3 text-xs"
+                                        title={`${p.blurb}. ${p.official ? "Run by NASA itself. " : "Third-party server. "}${ASTRONOMY_PRESETS_VERIFIED_ON}, ${VERIFIED_LABEL[p.verified]}.`}>
+                                        <Favicon domain={p.domain} />
+                                        {p.name}
+                                    </button>
+                                ))}
+                            </div>
+                            <p className="mt-1.5 text-[11px] text-[var(--q-text-faint)]">
+                                From the MCP Registry, checked on {ASTRONOMY_PRESETS_VERIFIED_ON}: each one connected and answered a real tool call, no key needed. All are third-party except NASA Earthdata. Wrappers of archives Quasar already has built in (SIMBAD, ADS, MAST, Gaia and others) are left out.
+                            </p>
+                        </div>
+
+                        <div>
+                            <label className={LABEL} htmlFor="mcp-registry-q">Search the MCP Registry</label>
+                            <form className="flex gap-2" role="search" onSubmit={(e) => { e.preventDefault(); searchRegistry({ kind: "q", q: regQuery }); }}>
+                                <div className="relative flex-1">
+                                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--q-text-faint)]" />
+                                    <input id="mcp-registry-q" type="search" value={regQuery} onChange={(e) => setRegQuery(e.target.value)} maxLength={80}
+                                        placeholder="Server name, e.g. arxiv, nasa, github" className={`${INPUT} pl-9`} />
+                                </div>
+                                <button type="submit" disabled={regLoading || !regQuery.trim()} className="q-pill-ink h-9 shrink-0 px-4 text-sm">Search</button>
+                                <button type="button" disabled={regLoading} onClick={() => searchRegistry({ kind: "topic", topic: "astronomy" })}
+                                    className={`${regMode?.kind === "topic" ? "q-pill-ink" : "q-pill"} h-9 shrink-0 gap-1.5 px-3 text-sm`}
+                                    title="Several astronomy searches merged, with astrology and unrelated matches removed">
+                                    <Telescope className="h-4 w-4" /> Astronomy
+                                </button>
+                            </form>
+                            <p className="mt-1.5 text-[11px] text-[var(--q-text-faint)]">
+                                The registry matches server names only, and a plain &quot;astro&quot; search is mostly astrology, so use Astronomy for astronomy servers.
+                                Listings are published by their authors and not checked by Quasar. Connect only servers you trust: their tools see what you ask in chat.
+                                Only hosted servers (ones with a URL) are shown.
+                            </p>
+
+                            {regLoading && (
+                                <div className="mt-3 flex items-center gap-2 text-sm text-[var(--q-text-muted)]" role="status">
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                    {regMode?.kind === "topic" && !regItems.length ? "Searching the registry for astronomy servers (the first search can take up to 30 seconds)..." : "Searching the registry..."}
+                                </div>
+                            )}
+                            {regError && <div className="mt-3"><Banner msg={{ type: "error", text: regError }} /></div>}
+                            {!regLoading && !regError && regMeta && regItems.length === 0 && (
+                                <p className="mt-3 text-sm text-[var(--q-text-muted)]">
+                                    No hosted servers matched{regMeta.next_cursor ? " on this page" : ""}. Try a shorter name{regMode?.kind === "q" ? ", or Astronomy" : ""}.
+                                </p>
+                            )}
+                            {regItems.length > 0 && (
+                                <div className="mt-3 space-y-2">
+                                    <p className="text-[11px] text-[var(--q-text-muted)]">
+                                        {regItems.length} hosted server{regItems.length === 1 ? "" : "s"}
+                                        {regMode?.kind === "topic" ? " about astronomy and space; ones that add something Quasar lacks come first" : ""}.
+                                        {regMeta?.stale ? " The registry did not answer, so these are from an earlier search." : ""}
+                                        {regMeta?.partial ? " Some registry searches failed; the list may be incomplete." : ""}
+                                    </p>
+                                    {(regShowAll ? regItems : regItems.slice(0, 12)).map((item) => {
+                                        const badges = registryBadges(item, servers);
+                                        const act = registryAction(item);
+                                        const overlap = overlapNote(item);
+                                        return (
+                                            <div key={item.id} className="rounded-xl border border-[var(--q-border)] bg-[var(--q-card)] p-3">
+                                                <div className="flex items-start justify-between gap-3">
+                                                    <div className="min-w-0 flex-1">
+                                                        <div className="flex flex-wrap items-center gap-1.5">
+                                                            <Favicon domain={iconDomain(item.url)} />
+                                                            <span className="text-sm font-medium text-[var(--q-text)]">{item.title}</span>
+                                                            {badges.map((b) => (
+                                                                <span key={b.text} className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
+                                                                    b.tone === "ok" ? "bg-emerald-500/10 text-emerald-600"
+                                                                        : b.tone === "warn" ? "bg-amber-500/10 q-warn"
+                                                                            : "bg-[var(--q-canvas)] text-[var(--q-text-muted)]"}`}>{b.text}</span>
+                                                            ))}
+                                                        </div>
+                                                        {item.description && <p className="mt-1 line-clamp-2 text-xs text-[var(--q-text-muted)]">{item.description}</p>}
+                                                        {overlap && <p className="mt-1 text-[11px] q-warn">{overlap}</p>}
+                                                        <p className="mt-1 truncate font-mono text-[10px] text-[var(--q-text-faint)]" title={`${item.id}${item.version ? ` v${item.version}` : ""}`}>
+                                                            {item.url}
+                                                        </p>
+                                                        {(item.website || item.repository) && (
+                                                            <p className="mt-1 flex gap-3 text-[11px]">
+                                                                {item.repository && <a href={item.repository} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-[var(--q-text-muted)] underline">Source <ExternalLink className="h-3 w-3" /></a>}
+                                                                {item.website && <a href={item.website} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-[var(--q-text-muted)] underline">Website <ExternalLink className="h-3 w-3" /></a>}
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                    <button type="button" onClick={() => pickRegistryItem(item)} disabled={connecting || !!wait || !listLoaded}
+                                                        className="q-pill h-8 shrink-0 px-3 text-xs" aria-label={`${act.kind === "connect" ? "Connect" : "Set up"} ${item.title}`}>
+                                                        {connecting && regPending === item.id ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Connecting...</>
+                                                            : act.kind === "connect" ? <><Plus className="h-3.5 w-3.5" /> Connect</> : <><KeyRound className="h-3.5 w-3.5" /> Set up</>}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        {!regShowAll && regItems.length > 12 && (
+                                            <button type="button" className="q-pill h-8 px-3 text-xs" onClick={() => setRegShowAll(true)}>Show all {regItems.length}</button>
+                                        )}
+                                        {regMeta?.next_cursor && regMode?.kind === "q" && (
+                                            <button type="button" className="q-pill h-8 px-3 text-xs" disabled={regLoading}
+                                                onClick={() => { setRegShowAll(true); searchRegistry(regMode, true); }}>Load more from the registry</button>
+                                        )}
+                                        <a href={REGISTRY_HOME} target="_blank" rel="noopener noreferrer" className="ml-auto inline-flex items-center gap-0.5 text-[11px] text-[var(--q-text-faint)] underline">
+                                            {regMeta?.source || "registry.modelcontextprotocol.io"} <ExternalLink className="h-3 w-3" />
+                                        </a>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
                         {!localSelected && (
                             <div>
                                 <label className={LABEL} htmlFor="mcp-url">Paste a server URL</label>
-                                <textarea id="mcp-url" value={input} rows={input.includes("\n") ? 5 : input.length > 90 ? 4 : 1}
+                                <textarea id="mcp-url" ref={urlInputRef} value={input} rows={input.includes("\n") ? 5 : input.length > 90 ? 4 : 1}
                                     onChange={(e) => onInputChange(e.target.value)}
                                     onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !input.includes("\n")) { e.preventDefault(); connect(null); } }}
                                     placeholder="https://mcp.example.com/mcp" className={`${INPUT} resize-none font-mono`} spellCheck={false} />
@@ -676,7 +865,9 @@ export function MCPServersPanel() {
                                 <input id="mcp-key" ref={keyInputRef} type="password" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
                                     onKeyDown={(e) => { if (e.key === "Enter") connect(null); }} placeholder="Paste your key" className={`${INPUT} font-mono`} />
                                 <p className="mt-1.5 text-[11px] text-[var(--q-text-faint)]">
-                                    {keyHeaderName.toLowerCase() === "authorization"
+                                    {keyPrefix
+                                        ? <>Sent as <code>{keyHeaderName}: {keyPrefix.trim()} &lt;key&gt;</code>, as the server&apos;s config asks.</>
+                                        : keyHeaderName.toLowerCase() === "authorization"
                                         ? <>Sent as <code>Authorization: Bearer &lt;key&gt;</code> (a key that already starts with a scheme such as <code>Basic</code> is sent as typed).</>
                                         : <>Sent in the <code>{keyHeaderName}</code> header, as the server&apos;s config asks.</>}
                                     {" "}Stored encrypted, never shown again. For a different header, use Advanced.

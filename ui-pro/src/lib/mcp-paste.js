@@ -149,7 +149,18 @@ function alternativeFor(pkg) {
 }
 
 export function hasPlaceholder(value) {
-    return /\$\{[^}]*\}|\$[A-Z_][A-Z0-9_]*|<[^>]+>|\{[A-Z_]+\}|YOUR_|\.\.\./i.test(String(value || ""));
+    // Kept identical to _PLACEHOLDER_RE in services/mcp_registry.py (both
+    // test suites run the same cases).
+    return /\$\{[^}]*\}|\$[A-Z_][A-Z0-9_]*|<[^>]+>|\{[^{}]*\}|YOUR_|\.\.\./i.test(String(value || ""));
+}
+
+/** "Basic " from "Basic ${TOKEN}" / "Token <key>": the scheme a key header's
+ *  placeholder sits behind, so the typed key is sent with that scheme (not
+ *  Bearer). Only a single word followed by whitespace counts. */
+function schemePrefix(value) {
+    const m = String(value || "").match(/^([A-Za-z][A-Za-z0-9_-]*)\s+(?=\S)/);
+    if (!m) return undefined;
+    return hasPlaceholder(m[1]) ? undefined : `${m[1]} `;
 }
 
 /**
@@ -167,7 +178,8 @@ function splitHeaders(headers) {
     }
     // The key field fills Authorization if the config has one, else the first.
     const keyHeader = placeholders.find((k) => k.toLowerCase() === "authorization") || placeholders[0];
-    return { headers: out, keyHeader, placeholders };
+    const keyPrefix = keyHeader ? schemePrefix(headers[keyHeader]) : undefined;
+    return { headers: out, keyHeader, keyPrefix, placeholders };
 }
 
 /** The url result, or an invalid one when the URL itself is a template. */
@@ -175,10 +187,11 @@ function urlResult(url, name, rawHeaders, extra = {}) {
     if (hasPlaceholder(url.replace(/^https?:\/\//i, ""))) {
         return { kind: "invalid", message: `The server URL still has a placeholder in it (${url}). Replace it with the real address first.` };
     }
-    const { headers, keyHeader, placeholders } = splitHeaders(rawHeaders);
+    const { headers, keyHeader, keyPrefix, placeholders } = splitHeaders(rawHeaders);
     const out = { kind: "url", url, name: name || deriveServerName(url), headers, ...extra };
     if (keyHeader) {
         out.keyHeader = keyHeader;
+        if (keyPrefix) out.keyPrefix = keyPrefix;
         out.placeholderHeaders = placeholders;
         const others = placeholders.filter((k) => k !== keyHeader);
         out.note = [

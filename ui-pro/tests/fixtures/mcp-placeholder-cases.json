@@ -1,0 +1,20 @@
+{
+  "_comment": "Shared by ui-pro/tests/mcp-registry.test.mjs (hasPlaceholder) and tests/unit/test_mcp_registry.py (_PLACEHOLDER_RE), so the two never disagree on what is a placeholder in a URL (guard CX-17). Each value is the URL without its scheme.",
+  "placeholder": [
+    "v.example/{tenant}/mcp",
+    "v.example/{tenant:slug}/mcp",
+    "v.example/{api-key}/mcp",
+    "v.example/{}/mcp",
+    "v.example/<tenant>/mcp",
+    "v.example/${TENANT}/mcp",
+    "v.example/$TENANT/mcp",
+    "v.example/YOUR_TENANT/mcp",
+    "v.example/.../mcp"
+  ],
+  "plain": [
+    "v.example/mcp",
+    "v.example/TenantA/mcp?x=1",
+    "v.example:8443/mcp/v1",
+    "v.example/mcp/<>"
+  ]
+}

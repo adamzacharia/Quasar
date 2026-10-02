@@ -193,6 +193,15 @@ export function bearerHeader(key) {
     return /^(bearer|basic|token)\s+/i.test(k) ? k : `Bearer ${k}`;
 }
 
+/** The config's own scheme ("Basic ") before the key, unless the key was
+ *  typed with that scheme already. */
+export function withScheme(prefix, key) {
+    const k = String(key || "").trim();
+    const scheme = String(prefix || "").trim();
+    if (!k || !scheme) return k;
+    return k.toLowerCase().startsWith(`${scheme.toLowerCase()} `) ? k : `${scheme} ${k}`;
+}
+
 /** "KEY=value" (env) or "Name: value" (headers), one per line. */
 export function parsePairs(text, sep) {
     const out = {};
@@ -263,7 +272,8 @@ export function buildConnectBody({ preset = null, parsed, form, servers = [] }) 
         const key = String(form.apiKey || "").trim();
         const keyHeader = form.keyHeader || "Authorization";
         if (key && !Object.keys(headers).some((k) => k.toLowerCase() === keyHeader.toLowerCase())) {
-            headers[keyHeader] = keyHeader.toLowerCase() === "authorization" ? bearerHeader(key) : key;
+            headers[keyHeader] = form.keyPrefix ? withScheme(form.keyPrefix, key)
+                : keyHeader.toLowerCase() === "authorization" ? bearerHeader(key) : key;
         }
     }
     const transport = preset ? (preset.transport || "http")

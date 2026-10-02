@@ -9,6 +9,8 @@ export interface ParsedMcpUrl {
     note?: string;
     /** A header whose pasted value was only a placeholder: ask for the key for it. */
     keyHeader?: string;
+    /** The scheme the key header's placeholder sat behind ("Basic "), sent before the key. */
+    keyPrefix?: string;
     /** Every header whose pasted value was a placeholder (none of them is sent). */
     placeholderHeaders?: string[];
 }

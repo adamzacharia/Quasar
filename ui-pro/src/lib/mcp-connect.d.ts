@@ -42,6 +42,7 @@ export interface ConnectForm {
     cmdArgs: string;
     apiKey: string;
     keyHeader?: string;
+    keyPrefix?: string;
     name: string;
     nameTyped: boolean;
 }
@@ -82,6 +83,7 @@ export function createOnce<A extends unknown[]>(onFinish: (...args: A) => void):
 export function nextStep(body: any): ConnectStep;
 export function statusView(status: McpServerStatus | null | undefined, auth?: string): { tone: "ok" | "warn" | "err" | "idle"; label: string };
 export function bearerHeader(key: string): string | null;
+export function withScheme(prefix: string, key: string): string;
 export function parsePairs(text: string, sep: "=" | ":"): Record<string, string>;
 export function credentialsStillApply(prevInput: string, nextInput: string): boolean;
 export function buildConnectBody(args: {

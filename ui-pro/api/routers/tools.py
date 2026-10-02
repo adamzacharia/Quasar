@@ -180,6 +180,42 @@ async def list_mcp_servers(current_user: dict = Depends(get_current_user)):
     return out
 
 
+@router.get("/api/mcp-registry/search")
+async def search_mcp_registry(q: Optional[str] = None, topic: Optional[str] = None, cursor: Optional[str] = None,
+                              current_user: dict = Depends(get_current_user)):
+    """Hosted servers from the official MCP Registry (unvetted listings).
+
+    ``q`` is a free-text name search (with ``cursor`` for the next page);
+    ``topic=astronomy`` merges several astronomy searches. Results are data
+    only: connecting one goes through POST /api/mcp-servers like a pasted URL.
+    """
+    from services import mcp_registry as reg
+
+    query = (q or "").strip()
+    if topic is not None:
+        if topic not in reg.TOPICS:
+            raise HTTPException(status_code=400, detail=f"Unknown topic. Use one of: {', '.join(reg.TOPICS)}.")
+        if query or cursor:
+            raise HTTPException(status_code=400, detail="Send either q or topic, not both.")
+    elif not query:
+        raise HTTPException(status_code=400, detail="Type something to search for.")
+    if len(query) > reg.MAX_QUERY_LEN:
+        raise HTTPException(status_code=400, detail=f"Keep the search under {reg.MAX_QUERY_LEN} characters.")
+    if cursor is not None and (not cursor or len(cursor) > reg.MAX_CURSOR_LEN):
+        raise HTTPException(status_code=400, detail="That page link is not valid. Search again.")
+    try:
+        reg.admit_search(current_user["sub"])
+    except reg.SearchRateLimited as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    try:
+        if topic is not None:
+            return await reg.search_topic(topic)
+        return await reg.search_registry(query, cursor)
+    except reg.RegistryUnavailable as exc:
+        logging.getLogger(__name__).warning("MCP registry search failed: %s", exc)
+        raise HTTPException(status_code=502, detail="The MCP Registry did not answer. Try again in a minute.")
+
+
 @router.post("/api/mcp-servers/{name}/test")
 async def test_mcp_server(name: str, current_user: dict = Depends(get_current_user)):
     """Connect to a saved server now and report tools or the real error."""
