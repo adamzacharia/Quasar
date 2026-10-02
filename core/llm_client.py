@@ -492,10 +492,45 @@ class ResponsesShim:
     def __init__(self, llm_client: "LLMClient"):
         self._llm = llm_client
         self._history_cache = {}  # response_id -> list of chat messages
+        self._resp_history_tokens = {}  # response_id -> history tokens a chained call carries (estimate)
         self._history_lock = _threading.Lock()
+        # Call ids of personal-document tool calls (services/personal_docs.py).
+        # Their outputs are untrusted user-file excerpts: expired from cached
+        # history on the next user turn and never promoted into user-role text
+        # by broken-chain recovery. Identified by our own tool-call metadata
+        # (the model's tool name / the runner's prefetch), never by output text.
+        self._untrusted_call_ids = {}  # call_id -> None (insertion-ordered, bounded)
+        self._untrusted_lock = _threading.Lock()
         # Prompt v2 only (set by QuasarAgent after bundle selection): prune
         # earlier turns' "Turn context [qv2]" blocks when replaying history.
         self._prune_turn_context = False
+
+    def note_untrusted_call(self, call_id: str) -> None:
+        """Mark a tool call whose output is a personal-document excerpt."""
+        if not call_id:
+            return
+        with self._untrusted_lock:
+            self._untrusted_call_ids[str(call_id)] = None
+            while len(self._untrusted_call_ids) > 4096:
+                self._untrusted_call_ids.pop(next(iter(self._untrusted_call_ids)))
+
+    def is_untrusted_call(self, call_id: str) -> bool:
+        with self._untrusted_lock:
+            return str(call_id or "") in self._untrusted_call_ids
+
+    def _note_untrusted_from(self, messages: list) -> None:
+        """Register personal-document calls found in a stored chat history."""
+        try:
+            from services.personal_docs import TOOL_NAME
+        except Exception:
+            return
+        for m in messages or []:
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                fn = (tc or {}).get("function") or {}
+                if fn.get("name") == TOOL_NAME:
+                    self.note_untrusted_call(tc.get("id", ""))
 
     def clear_history(self, response_id: Optional[str] = None) -> None:
         """Clear one compatibility-history chain or all cached chains."""
@@ -594,8 +629,38 @@ class ResponsesShim:
         except Exception:  # pragma: no cover - accounting must never bite
             logger.debug("[health] recording failed", exc_info=True)
 
+    def _log_billed(self, provider: str, model: str, call_bd, result: Any, call_meta=None) -> None:
+        try:
+            from core import call_tokens as _ct
+
+            usage = getattr(result, "usage", None)
+            if _ct.enabled():
+                _ct.log_billed(provider, model, call_bd, usage, call_meta)
+            # History size after this response (billed input minus the fixed
+            # system + tools part, plus the reply): lets the runner bound a
+            # server-side chain (OpenAI previous_response_id).
+            resp_id = getattr(result, "id", None)
+            billed_in = getattr(usage, "input_tokens", None) if usage is not None else None
+            if resp_id and billed_in and call_bd:
+                hist = int(billed_in) - int(call_bd.get("sys") or 0) - int(call_bd.get("tools") or 0)                     + int(getattr(usage, "output_tokens", 0) or 0)
+                with self._history_lock:
+                    self._resp_history_tokens[str(resp_id)] = max(0, hist)
+                    while len(self._resp_history_tokens) > 2000:
+                        self._resp_history_tokens.pop(next(iter(self._resp_history_tokens)))
+        except Exception:  # pragma: no cover - accounting must never bite
+            pass
+
+    def history_tokens_after(self, response_id: Optional[str]) -> Optional[int]:
+        """Estimated history tokens a call chained on response_id would carry
+        (None when unknown)."""
+        if not response_id:
+            return None
+        with self._history_lock:
+            return self._resp_history_tokens.get(str(response_id))
+
     def _wrap_usage_stream(
-        self, stream: Any, provider: str, model: str, reservation_id: Optional[str] = None
+        self, stream: Any, provider: str, model: str, reservation_id: Optional[str] = None,
+        call_bd=None, call_meta=None,
     ):
         """Wrap a stream and record usage from the completed response event.
 
@@ -628,6 +693,7 @@ class ResponsesShim:
             # stream abandoned mid-flight still settles rather than leaking.
             if last_response is not None:
                 self._record_usage(provider, model, last_response, reservation_id)
+                self._log_billed(provider, model, call_bd, last_response, call_meta)
             else:
                 self._release_quota(reservation_id)
 
@@ -691,6 +757,45 @@ class ResponsesShim:
 
         t0 = _time.perf_counter()
 
+        # Per-call input breakdown (core/call_tokens.py). Runner-only hint,
+        # never forwarded to a provider SDK.
+        call_meta = kwargs.pop("_call_meta", None) or {}
+        call_bd = None
+        try:
+            from core import call_tokens as _ct
+
+            # OpenAI chains always get the breakdown: the runner's server-side
+            # history cap reads it back (guard CX-02); logging stays optional.
+            if _ct.enabled() or provider == "openai":
+                _prev = kwargs.get("previous_response_id")
+                if provider == "openai" and _prev:
+                    _hist = None  # kept server-side
+                else:
+                    with self._history_lock:
+                        _hist = list(self._history_cache.get(_prev, [])) if _prev else []
+                    # What is actually sent: the shim compacts on a new user
+                    # turn (guard CX-08).
+                    if _hist and provider in ("tacc", "deepseek") and _is_new_user_turn(kwargs.get("input")):
+                        try:
+                            from core import history_compact as _hc
+
+                            # same order as _chat_messages_for_input (guard CX-08)
+                            _hist = expire_personal_document_history(_hist)
+                            if getattr(self, "_prune_turn_context", False):
+                                _hist = prune_turn_context_history(_hist)
+                            if _hc.enabled():
+                                _hist = _hc.compact_history(_hist, _is_new_user_turn)
+                        except Exception:
+                            pass
+                call_bd = _ct.breakdown(kwargs, _hist, rag_tokens=int(call_meta.get("rag_tokens") or 0))
+                if attachments:
+                    call_bd["attachments"] = len(attachments)  # not counted in est (guard CX-09)
+                if _ct.enabled():
+                    _ct.log_estimate(provider, model, call_bd)
+        except Exception as _ct_err:  # accounting must never break a call
+            logger.debug(f"[CALL TOKENS] breakdown failed: {_ct_err}")
+            call_bd = None
+
         try:
             # Runner-only flag: escalate tool_choice="required" from an emulated
             # nudge to server-enforced decoding (TACC) — set on re-samples after a
@@ -702,6 +807,19 @@ class ResponsesShim:
             # provider SDK (popped here, re-attached for the TACC shims only).
             gpt_oss_reasoning = kwargs.pop("_gpt_oss_reasoning", None)
             if provider == "openai":
+                # Prompt-cache routing hint (token plan rank 5). OpenAI routes by
+                # the prompt's first tokens plus this key; keying on the offered
+                # toolset sends every call with the same tools + system prefix
+                # (across chats and users) to the same cache. A per-chat key
+                # spread chats over machines (first calls showed cached=0).
+                # QUASAR_OPENAI_PROMPT_CACHE_KEY=0 disables.
+                if "prompt_cache_key" not in kwargs and os.getenv(
+                        "QUASAR_OPENAI_PROMPT_CACHE_KEY", "1").strip().lower() not in ("0", "false", "no", "off"):
+                    import hashlib as _hashlib
+
+                    _sig = "|".join([str(model)] + [str(t.get("name", t.get("type", ""))) for t in (kwargs.get("tools") or [])
+                                                    if isinstance(t, dict)])
+                    kwargs["prompt_cache_key"] = "quasar-" + _hashlib.sha256(_sig.encode("utf-8")).hexdigest()[:24]
                 result = self._call_openai(kwargs, attachments=attachments)
             elif provider == "tacc":
                 if gpt_oss_reasoning:
@@ -802,10 +920,12 @@ class ResponsesShim:
                 # settles or releases it in its finally once consumed — health
                 # for streams is recorded inside _wrap_usage_stream, where the
                 # outcome is actually known.
-                result = self._wrap_usage_stream(result, provider, model, reservation_id)
+                result = self._wrap_usage_stream(result, provider, model, reservation_id,
+                                                 call_bd=call_bd, call_meta=call_meta)
             else:
                 self._record_usage(provider, model, result, reservation_id)
                 self._record_provider_health(provider, model)
+                self._log_billed(provider, model, call_bd, result, call_meta)
 
             return result
 
@@ -893,7 +1013,15 @@ class ResponsesShim:
         if attachments:
             kwargs = dict(kwargs)
             kwargs["input"] = self._build_openai_input(kwargs.get("input", ""), attachments)
-        return client.responses.create(**kwargs)
+        try:
+            return client.responses.create(**kwargs)
+        except Exception as exc:
+            # prompt_cache_key is an optimisation only: never let a model or
+            # account that rejects it fail the call.
+            if "prompt_cache_key" in kwargs and "prompt_cache_key" in str(exc):
+                print(f"[PROVIDER] openai rejected prompt_cache_key ({str(exc)[:120]}); retrying without it")
+                return client.responses.create(**{k: v for k, v in kwargs.items() if k != "prompt_cache_key"})
+            raise
 
     def _build_openai_input(
         self,
@@ -1024,6 +1152,11 @@ class ResponsesShim:
         with self._history_lock:
             cached = list(self._history_cache.get(prev_id, [])) if prev_id else []
         if cached:
+            if _is_new_user_turn(input_data):
+                # Any bundle: expire earlier personal-document tool_result
+                # blocks (call ids registered by the runner) and old memory
+                # turn notes, as the chat shim does.
+                cached = expire_anthropic_personal_history(cached, self.is_untrusted_call)
             if _is_new_user_turn(input_data) and getattr(self, "_prune_turn_context", False):
                 cached = prune_turn_context_history(cached)  # prompt v2 hygiene (DX-15)
             cached.extend(self._build_anthropic_messages(input_data, attachments=attachments))
@@ -1031,12 +1164,23 @@ class ResponsesShim:
         is_tool_results = isinstance(input_data, list) and any(
             isinstance(i, dict) and i.get("type") == "function_call_output" for i in input_data
         )
-        if prev_id and is_tool_results:
-            parts = [
-                str(i.get("output", ""))[:4000]
-                for i in input_data
-                if isinstance(i, dict) and i.get("type") == "function_call_output"
-            ]
+        if prev_id and is_tool_results and not _is_new_user_turn(input_data):
+            # (A round-0 list that opens with the user's question plus a
+            # personal-document prefetch exchange is a NEW turn: built fresh
+            # below, never treated as orphaned tool output.)
+            # Personal-document outputs are dropped, never folded into the
+            # user-role recovery text (duel task-d03fcd0-9562 DX-13): the model
+            # is told to search again, which re-runs retrieval server-side for
+            # the authenticated user.
+            parts = []
+            for i in input_data:
+                if not (isinstance(i, dict) and i.get("type") == "function_call_output"):
+                    continue
+                if self.is_untrusted_call(i.get("call_id", "")):
+                    parts.append("[A search_my_documents result was dropped when the history reset. "
+                                 "Call search_my_documents again if it is still needed.]")
+                else:
+                    parts.append(str(i.get("output", ""))[:4000])
             print(
                 f"[PROVIDER] anthropic history chain broken for {prev_id} — converting "
                 f"{len(parts)} orphaned tool output(s) into a user message"
@@ -1114,6 +1258,7 @@ class ResponsesShim:
                 call_kwargs["tool_choice"] = {"type": "none"}
         if self._anthropic_has_document(attachments):
             call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
+        call_kwargs = self._apply_anthropic_cache_control(call_kwargs)
 
         try:
             resp = client.messages.create(**call_kwargs)
@@ -1162,6 +1307,7 @@ class ResponsesShim:
                 call_kwargs["tool_choice"] = {"type": "none"}
         if self._anthropic_has_document(attachments):
             call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
+        call_kwargs = self._apply_anthropic_cache_control(call_kwargs)
 
         # Return a generator that yields StreamEvent objects
         return self._anthropic_stream_generator(client, call_kwargs)
@@ -1266,10 +1412,7 @@ class ResponsesShim:
         try:
             final_msg = stream.get_final_message()
             if final_msg and hasattr(final_msg, 'usage') and final_msg.usage:
-                usage_obj = LLMUsage(
-                    input_tokens=getattr(final_msg.usage, 'input_tokens', 0),
-                    output_tokens=getattr(final_msg.usage, 'output_tokens', 0),
-                )
+                usage_obj = _anthropic_usage(final_msg.usage)
         except Exception:
             pass
 
@@ -1352,6 +1495,42 @@ class ResponsesShim:
                 })
         return anthropic_tools
 
+    @staticmethod
+    def _apply_anthropic_cache_control(call_kwargs: dict) -> dict:
+        """Prompt-cache breakpoints (token plan rank 5): the last tool (caches
+        the whole tool block), the system prompt, and the newest message (the
+        conversation so far). Anthropic allows 4 breakpoints, so markers left
+        on older messages are removed first. Copies; never mutates the
+        caller's tools/messages. QUASAR_ANTHROPIC_PROMPT_CACHE=0 disables."""
+        if os.getenv("QUASAR_ANTHROPIC_PROMPT_CACHE", "1").strip().lower() in ("0", "false", "no", "off"):
+            return call_kwargs
+        eph = {"type": "ephemeral"}
+        tools = call_kwargs.get("tools")
+        if tools:
+            call_kwargs["tools"] = [*tools[:-1], {**tools[-1], "cache_control": eph}]
+        system = call_kwargs.get("system")
+        if isinstance(system, str) and system:
+            call_kwargs["system"] = [{"type": "text", "text": system, "cache_control": eph}]
+
+        def _strip(m):
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, list) and any(isinstance(b, dict) and "cache_control" in b for b in c):
+                return {**m, "content": [{k: v for k, v in b.items() if k != "cache_control"}
+                                         if isinstance(b, dict) else b for b in c]}
+            return m
+
+        msgs = [_strip(m) for m in (call_kwargs.get("messages") or [])]
+        if msgs and isinstance(msgs[-1], dict):
+            last = msgs[-1]
+            c = last.get("content")
+            if isinstance(c, str) and c:
+                msgs[-1] = {**last, "content": [{"type": "text", "text": c, "cache_control": eph}]}
+            elif isinstance(c, list) and c and isinstance(c[-1], dict):
+                msgs[-1] = {**last, "content": [*c[:-1], {**c[-1], "cache_control": eph}]}
+        if msgs:
+            call_kwargs["messages"] = msgs
+        return call_kwargs
+
     def _anthropic_to_llm_response(self, resp) -> LLMResponse:
         """Convert Anthropic response to LLMResponse."""
         output_text = ""
@@ -1370,10 +1549,7 @@ class ResponsesShim:
 
         usage = None
         if hasattr(resp, 'usage') and resp.usage:
-            usage = LLMUsage(
-                input_tokens=getattr(resp.usage, 'input_tokens', 0),
-                output_tokens=getattr(resp.usage, 'output_tokens', 0),
-            )
+            usage = _anthropic_usage(resp.usage)
 
         return LLMResponse(
             output_text=output_text,
@@ -1801,6 +1977,7 @@ class ResponsesShim:
             new_messages.append({"role": "assistant", "content": result.output_text})
         with self._history_lock:
             self._history_cache[result.id] = new_messages
+            self._note_untrusted_from(new_messages)
         return result
 
     def _stream_tacc(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
@@ -1934,6 +2111,7 @@ class ResponsesShim:
             new_messages.append({"role": "assistant", "content": output_text})
         with self._history_lock:
             self._history_cache[resp_id] = new_messages
+            self._note_untrusted_from(new_messages)
 
     @staticmethod
     def _new_tacc_stream_state():
@@ -1958,9 +2136,13 @@ class ResponsesShim:
         events, accumulating into ``st`` so a caller can restart the attempt."""
         for chunk in stream:
             if hasattr(chunk, "usage") and chunk.usage:
+                _ptd = getattr(chunk.usage, "prompt_tokens_details", None)
                 st.usage_obj = LLMUsage(
                     input_tokens=getattr(chunk.usage, "prompt_tokens", 0),
                     output_tokens=getattr(chunk.usage, "completion_tokens", 0),
+                    # vLLM reports prefix-cache hits here when it runs with
+                    # --enable-prompt-tokens-details (None otherwise).
+                    cache_hit_tokens=(getattr(_ptd, "cached_tokens", None) if _ptd is not None else None),
                 )
 
             choice = chunk.choices[0] if chunk.choices else None
@@ -2109,6 +2291,20 @@ class ResponsesShim:
         with self._history_lock:
             cached = list(self._history_cache.get(prev_id, [])) if prev_id else []
         if cached:
+            # The per-request instructions carry this user's memory profile and
+            # memory policy; a cached chat must not keep the system message it
+            # started with (a Settings > Memory edit or pause applies next
+            # turn). Copy, never mutate: the list is shared with the cache.
+            if instructions and isinstance(cached[0], dict) and cached[0].get("role") == "system":
+                sys_content = instructions + (
+                    "\n\nYou MUST respond with valid JSON only. No extra text." if json_mode else "")
+                if cached[0].get("content") != sys_content:
+                    cached[0] = {**cached[0], "content": sys_content}
+            if _is_new_user_turn(input_data):
+                # Under EVERY prompt bundle: earlier turns' personal-document
+                # excerpts are expired (call ids kept) and legacy pasted-doc
+                # wrappers are cut from replayed user turns.
+                cached = expire_personal_document_history(cached)
             if _is_new_user_turn(input_data) and getattr(self, "_prune_turn_context", False):
                 # A NEW user turn: earlier turns' per-turn context (prompt v2
                 # date + workflow playbooks, core/prompts/playbooks.py) is
@@ -2118,17 +2314,42 @@ class ResponsesShim:
                 # copy; the pruned list becomes the stored history after this
                 # round, so growth stays bounded.
                 cached = prune_turn_context_history(cached)
+            if _is_new_user_turn(input_data):
+                # Bounded history (core/history_compact.py): older turns' tool
+                # outputs become stubs, the oldest turns drop past a cap. The
+                # compacted copy becomes the stored history after this round.
+                try:
+                    from core import history_compact as _hc
+
+                    if _hc.enabled():
+                        _before = len(cached)
+                        cached = _hc.compact_history(cached, _is_new_user_turn)
+                        if len(cached) != _before:
+                            print(f"[HISTORY] compacted cached chat {prev_id}: {_before} -> {len(cached)} messages")
+                except Exception as _hc_err:
+                    print(f"[HISTORY] compaction failed (non-fatal): {_hc_err}")
             self._append_chat_input(cached, input_data)
             return cached
         is_tool_results = isinstance(input_data, list) and any(
             isinstance(i, dict) and i.get("type") == "function_call_output" for i in input_data
         )
-        if prev_id and is_tool_results:
-            parts = [
-                str(i.get("output", ""))[:4000]
-                for i in input_data
-                if isinstance(i, dict) and i.get("type") == "function_call_output"
-            ]
+        if prev_id and is_tool_results and not _is_new_user_turn(input_data):
+            # (A round-0 list that opens with the user's question plus a
+            # personal-document prefetch exchange is a NEW turn: built fresh
+            # below, never treated as orphaned tool output.)
+            # Personal-document outputs are dropped, never folded into the
+            # user-role recovery text (duel task-d03fcd0-9562 DX-13): the model
+            # is told to search again, which re-runs retrieval server-side for
+            # the authenticated user.
+            parts = []
+            for i in input_data:
+                if not (isinstance(i, dict) and i.get("type") == "function_call_output"):
+                    continue
+                if self.is_untrusted_call(i.get("call_id", "")):
+                    parts.append("[A search_my_documents result was dropped when the history reset. "
+                                 "Call search_my_documents again if it is still needed.]")
+                else:
+                    parts.append(str(i.get("output", ""))[:4000])
             print(
                 f"[PROVIDER] history chain broken for {prev_id} — converting "
                 f"{len(parts)} orphaned tool output(s) into a user message"
@@ -2157,15 +2378,7 @@ class ResponsesShim:
         elif isinstance(input_data, list):
             # Tool results: [{"type": "function_call_output", "call_id": ..., "output": ...}]
             # In Chat Completions, these are "tool" role messages
-            for item in input_data:
-                if isinstance(item, dict) and item.get("type") == "function_call_output":
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": item.get("call_id", ""),
-                        "content": item.get("output", ""),
-                    })
-                elif isinstance(item, dict) and item.get("role") == "user":
-                    messages.append({"role": "user", "content": item.get("content", "")})
+            _append_chat_items(messages, input_data)
         else:
             messages.append({"role": "user", "content": str(input_data)})
 
@@ -2289,15 +2502,7 @@ class ResponsesShim:
         if isinstance(input_data, str):
             messages.append({"role": "user", "content": input_data})
         elif isinstance(input_data, list):
-            for item in input_data:
-                if isinstance(item, dict) and item.get("type") == "function_call_output":
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": item.get("call_id", ""),
-                        "content": item.get("output", ""),
-                    })
-                elif isinstance(item, dict) and item.get("role") == "user":
-                    messages.append({"role": "user", "content": item.get("content", "")})
+            _append_chat_items(messages, input_data)
         else:
             messages.append({"role": "user", "content": str(input_data)})
 
@@ -2453,7 +2658,7 @@ class ResponsesShim:
             if fmt.get("type") == "json_object":
                 json_mode = True
 
-        messages = self._chat_messages_for_input(prev_id, instructions, input_data, json_mode)
+        messages = _deepseek_reasoning_fields(self._chat_messages_for_input(prev_id, instructions, input_data, json_mode))
 
         if attachments and any(att.get("type") == "image_url" or "image_url" in att for att in attachments):
             logger.warning("Dropping raw image attachments for DeepSeek; use the image prepass upstream.")
@@ -2523,6 +2728,7 @@ class ResponsesShim:
         
         with self._history_lock:
             self._history_cache[result.id] = new_messages
+            self._note_untrusted_from(new_messages)
         return result
 
     def _stream_deepseek(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
@@ -2535,7 +2741,7 @@ class ResponsesShim:
         tools_raw = kwargs.get("tools", None)
         prev_id = kwargs.get("previous_response_id", None)
 
-        messages = self._chat_messages_for_input(prev_id, instructions, input_data)
+        messages = _deepseek_reasoning_fields(self._chat_messages_for_input(prev_id, instructions, input_data))
 
         if attachments and any(att.get("type") == "image_url" or "image_url" in att for att in attachments):
             logger.warning("Dropping raw image attachments for DeepSeek streaming; use the image prepass upstream.")
@@ -2688,6 +2894,7 @@ class ResponsesShim:
         
         with self._history_lock:
             self._history_cache[resp_id] = new_messages
+            self._note_untrusted_from(new_messages)
 
 
 
@@ -2951,10 +3158,191 @@ TURN_CONTEXT_UPDATE_PREFIX = "Turn context update [qv2] (applies to this turn on
 SAME_TURN_CONTINUATION_PREFIX = "[SYSTEM CONTINUATION]"
 
 
+def _anthropic_usage(u) -> "LLMUsage":
+    """Anthropic reports uncached input separately from cache reads and cache
+    writes; total input is their sum (guard CX-01). cache_hit_tokens = reads."""
+    base = int(getattr(u, "input_tokens", 0) or 0)
+    read = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+    write = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
+    # Quota and the token totals need ACTUAL tokens (guard CX-15), and the one
+    # recorder feeds both quota and cost, so the USD estimate prices cache
+    # tokens at the uncached rate: cache READS are over-priced (real rate 0.1x)
+    # and cache WRITES under-priced (real rate 1.25x). DeepSeek cache hits get
+    # the same treatment; services/model_pricing.py has no cache-aware rates.
+    return LLMUsage(
+        input_tokens=base + read + write,
+        output_tokens=int(getattr(u, "output_tokens", 0) or 0),
+        cache_hit_tokens=read if (read or write) else None,
+    )
+
+
+def _deepseek_reasoning_fields(messages: list) -> list:
+    """DeepSeek thinking mode 400s ("reasoning_content ... must be passed back")
+    on an assistant tool-call message whose reasoning_content is missing or
+    null; an empty string is accepted (live 2026-10-02). Client-built calls
+    (direct dispatch, personal-document prefetch, rebuilt history) and model
+    turns that streamed no reasoning get "". Copies; the cache keeps its dicts."""
+    out = []
+    for m in messages or []:
+        if (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+                and not isinstance(m.get("reasoning_content"), str)):
+            m = {**m, "reasoning_content": ""}
+        out.append(m)
+    return out
+
+
 def _is_new_user_turn(input_data) -> bool:
     """A string input opens a new user turn unless it is one of the runner's
-    same-turn continuations, whose current-turn context must survive."""
+    same-turn continuations, whose current-turn context must survive. A list
+    that OPENS with a user item (round 0 with a personal-document prefetch
+    exchange, core/runner.py) is a new user turn too."""
+    if isinstance(input_data, list):
+        first = input_data[0] if input_data else None
+        return (isinstance(first, dict) and first.get("role") == "user"
+                and _is_new_user_turn(str(first.get("content", ""))))
     return isinstance(input_data, str) and not input_data.lstrip().startswith(SAME_TURN_CONTINUATION_PREFIX)
+
+
+def _append_chat_items(messages: list, items: list) -> None:
+    """Responses-style input items -> Chat Completions messages.
+
+    function_call_output -> role=tool; role=user -> user; function_call ->
+    an assistant message with tool_calls (consecutive calls merged), which is
+    how the runner's personal-document prefetch exchange is expressed.
+    """
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call_output":
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": item.get("output", ""),
+            })
+        elif item.get("type") == "function_call":
+            call = {
+                "id": item.get("call_id", ""),
+                "type": "function",
+                "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")},
+            }
+            prev = messages[-1] if messages else None
+            if isinstance(prev, dict) and prev.get("role") == "assistant" and prev.get("tool_calls") \
+                    and not prev.get("content"):
+                prev["tool_calls"] = [*prev["tool_calls"], call]
+            else:
+                messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+        elif item.get("role") == "user":
+            messages.append({"role": "user", "content": item.get("content", "")})
+        elif item.get("role") == "assistant" and isinstance(item.get("content"), str):
+            # earlier turns restored from the saved chat (core/history_rebuild.py)
+            messages.append({"role": "assistant", "content": item.get("content", "")})
+
+
+# Legacy wrapper the SSE layer used to paste personal documents into the user
+# turn (removed 2026-10); cut from cached history so old chats stop replaying it.
+LEGACY_PERSONAL_DOC_PREFIX = "The user has the following relevant documents in their personal knowledge base:"
+LEGACY_PERSONAL_DOC_SPLIT = "\n\n---\nUser's question: "
+# services/user_memory_service.MEMORY_TURN_NOTE_PREFIX, with its leading blank line.
+MEMORY_TURN_NOTE_MARKER = "\n\n[Saved preferences from this user's Memory"
+
+
+def expire_personal_document_history(messages: list) -> list:
+    """Copy of a cached chat history with personal-document material expired.
+
+    * role=tool outputs answering a search_my_documents call (identified from
+      the assistant's own tool_calls) become an inert stub, call id kept so the
+      tool_call/tool pairing stays valid;
+    * a user message carrying the legacy pasted-documents wrapper keeps only
+      the user's question.
+    Never mutates the cached dicts.
+    """
+    try:
+        from services.personal_docs import TOOL_NAME, EXPIRED_STUB
+    except Exception:  # pragma: no cover
+        return messages
+    ids = set()
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if ((tc or {}).get("function") or {}).get("name") == TOOL_NAME:
+                    ids.add(tc.get("id", ""))
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") in ids \
+                and m.get("content") != EXPIRED_STUB:
+            m = {**m, "content": EXPIRED_STUB}
+        elif isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
+            c = m["content"]
+            i = c.find(LEGACY_PERSONAL_DOC_PREFIX)
+            if i >= 0:
+                j = c.find(LEGACY_PERSONAL_DOC_SPLIT, i)
+                if j >= 0:
+                    c = c[:i] + c[j + len(LEGACY_PERSONAL_DOC_SPLIT):]
+            # Earlier turns' saved-preference notes: the current turn carries a
+            # fresh one, so replaying old copies only adds tokens (and could
+            # resurrect a value the user has since changed or deleted).
+            k = c.find(MEMORY_TURN_NOTE_MARKER)
+            while k >= 0:
+                end = c.find("]", k)
+                if end < 0:
+                    break
+                c = c[:k] + c[end + 1:]
+                k = c.find(MEMORY_TURN_NOTE_MARKER)
+            if c != m["content"]:
+                m = {**m, "content": c}
+        out.append(m)
+    return out
+
+
+def _strip_memory_turn_notes(text: str) -> str:
+    k = text.find(MEMORY_TURN_NOTE_MARKER)
+    while k >= 0:
+        end = text.find("]", k)
+        if end < 0:
+            break
+        text = text[:k] + text[end + 1:]
+        k = text.find(MEMORY_TURN_NOTE_MARKER)
+    return text
+
+
+def expire_anthropic_personal_history(messages: list, is_untrusted) -> list:
+    """Anthropic-format counterpart of expire_personal_document_history.
+
+    tool_result blocks answering a registered personal-document call become the
+    inert stub (tool_use_id kept so the pairing stays valid); old memory turn
+    notes are cut from user text. Never mutates the cached dicts.
+    """
+    try:
+        from services.personal_docs import EXPIRED_STUB
+    except Exception:  # pragma: no cover
+        return messages
+    out = []
+    for m in messages:
+        if not (isinstance(m, dict) and m.get("role") == "user"):
+            out.append(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            c = _strip_memory_turn_notes(content)
+            out.append(m if c == content else {**m, "content": c})
+            continue
+        if isinstance(content, list):
+            blocks, changed = [], False
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result" and is_untrusted(b.get("tool_use_id", "")) \
+                        and b.get("content") != EXPIRED_STUB:
+                    b = {**b, "content": EXPIRED_STUB}
+                    changed = True
+                elif isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+                    t = _strip_memory_turn_notes(b["text"])
+                    if t != b["text"]:
+                        b = {**b, "text": t}
+                        changed = True
+                blocks.append(b)
+            out.append({**m, "content": blocks} if changed else m)
+            continue
+        out.append(m)
+    return out
 
 
 def prune_turn_context_history(messages: list) -> list:

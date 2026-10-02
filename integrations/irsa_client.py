@@ -147,12 +147,15 @@ class IRSAClient:
             
             df = result.to_pandas()
             
+            total_rows = len(df)  # exact: the cone came back whole before the cap
             if len(df) > max_results:
                 df = df.head(max_results)
-            
+
             print(f"[IRSA] Found {len(df)} sources")
             out = self._standardize_columns(df, catalog)
             out.attrs["center"] = (float(ra), float(dec))
+            out.attrs["row_cap"] = int(max_results)
+            out.attrs["total_count"] = int(total_rows)
             return out
             
         except Exception as e:

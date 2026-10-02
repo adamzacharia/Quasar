@@ -15,7 +15,10 @@ Used by: agent.py → stream_response_api() to gate Conductor activation.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import List
 
@@ -59,6 +62,21 @@ class ComplexityResult:
 # ---------------------------------------------------------------------------
 # Complexity Detector
 # ---------------------------------------------------------------------------
+
+# Stuck-probe bookkeeping shared by every detector in the process.
+_PROBE_MAX_STUCK = 4
+# Hard ceiling on probes in flight at once (all of them, healthy or not). Turns
+# (the only callers) run on ui-pro/api/deps.py _chat_executor, sized by
+# CHAT_WORKER_THREADS (default 4), so concurrent probes cannot exceed that pool;
+# the ceiling sits at 4x the pool (at least 64) and never binds healthy load,
+# while bounding a burst that starts before any probe has timed out (guard CX-02/CX-07).
+_PROBE_MAX_INFLIGHT = max(64, 4 * int(os.getenv("CHAT_WORKER_THREADS", "4") or 4))
+_probe_lock = threading.Lock()
+_probe_stuck = 0          # stuck probes still counted (see _stuck_since)
+_stuck_since: dict = {}   # probe id -> monotonic time it timed out
+_probe_inflight = 0
+_probe_timed_out_at = 0.0
+
 
 class ComplexityDetector:
     """
@@ -149,6 +167,92 @@ class ComplexityDetector:
         # Normalize: 3+ hits → 1.0
         return min(_multi_hop_hits / 3.0, 1.0)
 
+    def _create_bounded(self, prompt: str):
+        """The probe call with a wall-clock cap (QUASAR_COMPLEXITY_TIMEOUT_S,
+        default 8 s). A provider that only streams keep-alives (DeepSeek
+        outage 2026-10-02) never trips the HTTP read timeout, so the probe hung
+        every turn that reached it, on every model. Raises TimeoutError on the
+        cap; the caller then falls back to the heuristic score.
+
+        A probe that answers in time behaves exactly as before. The call runs
+        on a DAEMON thread (an executor's workers are joined at interpreter
+        exit). Only probes that already TIMED OUT count as stuck: once
+        _PROBE_MAX_STUCK are stuck, new probes are skipped until one of them
+        returns, so a sustained outage cannot pile up threads; healthy
+        concurrent probes are never limited. QUASAR_COMPLEXITY_COOLDOWN_S
+        (default 0 = off) optionally skips probes for that long after a
+        timeout."""
+        global _probe_stuck, _probe_timed_out_at, _probe_inflight
+        try:
+            cap = float(os.getenv("QUASAR_COMPLEXITY_TIMEOUT_S", "8") or 8)
+        except ValueError:
+            cap = 8.0
+        try:
+            cooldown = float(os.getenv("QUASAR_COMPLEXITY_COOLDOWN_S", "0") or 0)
+        except ValueError:
+            cooldown = 0.0
+        with _probe_lock:
+            if cooldown > 0 and _probe_timed_out_at and time.monotonic() - _probe_timed_out_at < cooldown:
+                raise TimeoutError("complexity probe skipped: provider timed out recently")
+            # Stuck probes block new ones for at most QUASAR_COMPLEXITY_STUCK_TTL_S
+            # (default 120 s): a provider that recovered is tried again even if
+            # the old calls never return (guard CX-10). Threads stay bounded by
+            # _PROBE_MAX_INFLIGHT.
+            try:
+                ttl = float(os.getenv("QUASAR_COMPLEXITY_STUCK_TTL_S", "120") or 120)
+            except ValueError:
+                ttl = 120.0
+            now = time.monotonic()
+            for pid in [k for k, t0 in _stuck_since.items() if now - t0 >= ttl]:
+                _stuck_since.pop(pid, None)
+                _probe_stuck -= 1
+            if _probe_stuck >= _PROBE_MAX_STUCK:
+                raise TimeoutError("complexity probe skipped: earlier probes are still stuck")
+            if _probe_inflight >= _PROBE_MAX_INFLIGHT:
+                raise TimeoutError("complexity probe skipped: too many probes in flight")
+            _probe_inflight += 1
+        box: dict = {"stuck": False, "id": object()}
+        done = threading.Event()
+
+        def _run():
+            global _probe_stuck, _probe_inflight
+            try:
+                box["resp"] = self.client.responses.create(
+                    model=self.model,
+                    input=prompt,
+                    temperature=0,
+                    max_output_tokens=300,
+                    text={"format": {"type": "json_object"}},
+                )
+            except BaseException as exc:  # surfaced to the caller below
+                box["err"] = exc
+            finally:
+                with _probe_lock:
+                    done.set()
+                    _probe_inflight -= 1
+                    if box["stuck"] and _stuck_since.pop(box["id"], None) is not None:
+                        _probe_stuck -= 1
+
+        try:
+            threading.Thread(target=_run, name="complexity-probe", daemon=True).start()
+        except BaseException:
+            with _probe_lock:
+                _probe_inflight -= 1  # no worker will release it
+            raise
+        if not done.wait(cap):
+            # Past the cap the turn always falls back, even if the worker finishes
+            # during this bookkeeping (guard CX-08).
+            with _probe_lock:
+                if not done.is_set():  # still running: count it as stuck until it returns (or the TTL)
+                    box["stuck"] = True
+                    _probe_stuck += 1
+                    _stuck_since[box["id"]] = time.monotonic()
+                _probe_timed_out_at = time.monotonic()
+            raise TimeoutError(f"complexity probe exceeded {cap:.0f}s")
+        if "err" in box:
+            raise box["err"]
+        return box["resp"]
+
     def _llm_assess(self, query: str, heuristic_score: float) -> ComplexityResult:
         prompt = (
             "You are a complexity analyst for an astronomy research assistant.\n"
@@ -160,13 +264,7 @@ class ComplexityDetector:
             f"User query: \"{query}\"\n"
         )
         try:
-            resp = self.client.responses.create(
-                model=self.model,
-                input=prompt,
-                temperature=0,
-                max_output_tokens=300,
-                text={"format": {"type": "json_object"}},
-            )
+            resp = self._create_bounded(prompt)
             data = json.loads(resp.output_text)
             score = float(data.get("score", heuristic_score))
             return ComplexityResult(

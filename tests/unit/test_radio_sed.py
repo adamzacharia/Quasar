@@ -226,6 +226,7 @@ def test_agent_registration_prompt_status_and_radio_sed_wrapper():
     assert "VLASS" not in tool.description
     assert "LoTSS" not in tool.description
     assert agent._tool_status_label("radio_sed", {}) == "Compiling radio SED + spectral index"
+    agent.prompt_bundle = "legacy"  # these rules live in the legacy prompt; v2 is the default since 2026-10-02
     prompt = agent._build_system_prompt()
     assert "radio_sed" in prompt
     assert "flags" in prompt

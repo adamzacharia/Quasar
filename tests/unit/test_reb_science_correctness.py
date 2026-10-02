@@ -464,6 +464,7 @@ def test_system_prompt_no_longer_instructs_cross_survey_substitution():
     from tests.integration.test_agent_archive_tools import _load_agent_module
     module = _load_agent_module()
     agent = module.QuasarAgent.__new__(module.QuasarAgent)
+    agent.prompt_bundle = "legacy"  # these rules live in the legacy prompt; v2 is the default since 2026-10-02
     prompt = agent._build_system_prompt()
     # The old rule literally instructed the forbidden substitution.
     assert "hips_multiband_panel` for an optical color view" not in prompt

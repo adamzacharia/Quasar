@@ -32,7 +32,7 @@ from typing import Any, Dict, Literal, Optional, Tuple
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
 ArchiveSlug = Literal[
-    "datalab", "alma", "ads_openalex", "sia_hips", "vo", "splatalogue", "gaia", "eso", "cadc"
+    "datalab", "alma", "ads_openalex", "sia_hips", "vo", "splatalogue", "gaia", "eso", "cadc", "nrao"
 ]
 
 ScalarType = Literal[

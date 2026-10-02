@@ -204,7 +204,8 @@ class VoAdqlQuery(BaseCapability):
     name = "vo_adql_query"
     description = (
         "Run a guarded SELECT-only ADQL query against any TAP service URL. On ADQL errors "
-        "the server's message is returned - read it and fix the query."
+        "the server's message is returned - read it and fix the query. NRAO (VLA/VLBA/GBT): "
+        "https://data-query.nrao.edu/tap, table tap_schema.obscore."
     )
     category = "archive"
     InputModel = VoAdqlQueryInput
@@ -214,10 +215,26 @@ class VoAdqlQuery(BaseCapability):
         get_service = ctx.service("get_vo_registry_service")
         table_result = ctx.service("external_catalog_table_result")
         access_url, adql, max_rows = inp.access_url, inp.adql, inp.max_rows
+        # Archive-aware pre-flight (MANNA evals 2026-10-01): one-correct-answer
+        # rewrites (NRAO ivoa.obscore, Data Lab q3c/CONTAINS dialect) are applied
+        # and disclosed; queries that can only fail (NRAO LOWER(), VLA filters on
+        # the ALMA mirror) come back at once with the fix instead of a timeout.
+        preflight_warnings: List[str] = []
+        try:
+            from services.adql_preflight import PreflightRejection, preflight
+
+            adql, preflight_warnings = preflight(access_url, adql, inp.mode)
+        except PreflightRejection as rej:
+            return _native({"success": False, "error": str(rej), "hint": rej.hint,
+                            "query_sent": False, "access_url": access_url})
+        except Exception:  # a pre-flight bug must never block a query
+            preflight_warnings = []
         try:
             result = get_service().run_adql(access_url, adql, max_rows=max_rows,
                                             mode=inp.mode or "sync",
                                             owner=getattr(ctx, "user_id", None))
+            if preflight_warnings and isinstance(result, dict):
+                result = dict(result, warnings=preflight_warnings + list(result.get("warnings") or []))
             # A failure, or an async job handle (no rows yet), passes through;
             # an auto-mode job that finished carries rows and gets a card.
             if not result.get("success") or (result.get("job_url") and "rows" not in result):
@@ -228,7 +245,7 @@ class VoAdqlQuery(BaseCapability):
             if len(columns) > 12:
                 columns = columns[:12]
                 warnings.append("Displaying the first 12 of the result's columns.")
-            return _native(table_result(
+            out = table_result(
                 rows,
                 columns=columns or ["result"],
                 source=f"TAP: {access_url}",
@@ -236,7 +253,16 @@ class VoAdqlQuery(BaseCapability):
                 tool_name="vo_adql_query",
                 warnings=warnings,
                 provenance=result.get("provenance", {}),
-            ))
+            )
+            # Row cap: the query's own TOP/LIMIT or the service MAXREC. The card
+            # helper drops `truncated`, so the model-facing keys go on here.
+            from services.row_cap import adql_row_limit, with_row_cap
+
+            caps = [c for c in (adql_row_limit(adql), (result.get("provenance") or {}).get("maxrec"),
+                                result.get("maxrec")) if isinstance(c, int) and c > 0]
+            if caps and isinstance(out, dict):
+                out = with_row_cap(out, len(rows), min(caps))
+            return _native(out)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 
@@ -361,7 +387,9 @@ class VoImageSearch(BaseCapability):
             if not result.get("success"):
                 return _native(result)
             rows = result.get("rows") or []
-            preferred = ["obs_collection", "instrument_name", "target_name", "dataproduct_type",
+            # fits_url (a resolved DataLink #this file) leads, so the model reads
+            # the real file URL before the DataLink access_url (MANNA evals T12).
+            preferred = ["fits_url", "obs_collection", "instrument_name", "target_name", "dataproduct_type",
                          "calib_level", "s_ra", "s_dec", "s_fov", "s_resolution", "em_min",
                          "em_max", "t_exptime", "access_format", "access_url"]
             columns = [c for c in preferred if any(c in r for r in rows)]
@@ -419,7 +447,7 @@ class VoConeSearch(BaseCapability):
                 columns = columns[:12]
                 warnings.append("Displaying the first 12 of the result's columns.")
             radius_label = float(result.get("provenance", {}).get("radius_deg", radius_deg))
-            return _native(table_result(
+            out = table_result(
                 rows,
                 columns=columns or ["result"],
                 source=f"SCS: {access_url}",
@@ -427,7 +455,14 @@ class VoConeSearch(BaseCapability):
                 tool_name="vo_cone_search",
                 warnings=warnings,
                 provenance=result.get("provenance", {}),
-            ))
+            )
+            # The service flags a full result (truncated); give the model the
+            # shared row-cap shape (Codex CX-07).
+            if result.get("truncated") and isinstance(out, dict):
+                from services.row_cap import with_row_cap
+
+                out = with_row_cap(out, len(rows), len(rows), unit="sources")
+            return _native(out)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 

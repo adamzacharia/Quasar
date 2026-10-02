@@ -43,6 +43,7 @@ export function ChatArea() {
         messages, addMessage, mergeWebSourcesMessage, updateLastAssistantMessage, updateLastAssistantThinking,
         updateLastAssistantRunMeta, updateLastAssistantUsage, updateLastAssistantToolTrace,
         setLastAssistantWebDecision,
+        setLastAssistantMemoryUpdates,
         isStreaming, setStreaming,
         toggleSidebar,
         activeConversationId, setActiveConversation,
@@ -545,6 +546,9 @@ export function ChatArea() {
                         onWebDecision: (decision) => {
                             const clean = normalizeWebDecision(decision);
                             if (clean) setLastAssistantWebDecision(clean, ownerFor());  // UI-01
+                        },
+                        onMemoryUpdate: (events) => {
+                            if (events.length) setLastAssistantMemoryUpdates(events, ownerFor());
                         },
                         onThought: (thought: string) => {
                             accumulatedThought += thought;

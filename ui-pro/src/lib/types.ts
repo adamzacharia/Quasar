@@ -117,6 +117,8 @@ export interface Message {
     webQuery?: string;              // original web query or URL
     /** Why the web was (not) searched this turn (web search redesign, Phase 2). */
     webDecision?: WebDecision;
+    /** Long-term memory saved during this turn (Settings > Memory). */
+    memoryUpdates?: MemoryUpdateEvent[];
     usageTokens?: number;           // provider-reported tokens used for this response
 }
 
@@ -124,6 +126,16 @@ export interface Message {
  *  decides, always = search every turn. The boolean `web_search` request
  *  field stays for older clients (true = auto, false = off). */
 export type WebSearchMode = "off" | "auto" | "always";
+
+/** One long-term memory change saved during a turn (services/user_memory_service.py). */
+export interface MemoryUpdateEvent {
+    id: string;
+    slot: string;
+    op: "set" | "update" | "clear" | string;
+    label: string;
+    display: string | null;
+    previous?: string | null;
+}
 
 /** The `web_decision` SSE event: one per turn, rendered as a small badge. */
 export interface WebDecision {

@@ -295,6 +295,7 @@ from api.routers import (  # noqa: E402
     general,
     health,
     issue_reports,
+    memory,
     personalization,
     proposals,
     provider_keys,
@@ -318,6 +319,7 @@ app.include_router(workbench.router)
 app.include_router(conversations.router)
 app.include_router(chat.router)
 app.include_router(personalization.router)
+app.include_router(memory.router)
 app.include_router(proposals.router)
 app.include_router(analytics.router)
 app.include_router(issue_reports.router)

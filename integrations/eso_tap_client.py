@@ -170,8 +170,15 @@ class ESOTAPClient:
                 return pd.DataFrame()
             
             print(f"[ESO] Found {len(df)} observations")
-            return self._standardize_columns(df)
-            
+            df = self._standardize_columns(df)
+            # Row cap reached: the archive holds at least this many rows, so ask
+            # it for the exact total on the same predicate (MANNA evals MQ17:
+            # the 500-row cap was reported as "500 observations"; truth 4,386).
+            df.attrs["row_cap"] = int(max_results)
+            if len(df) >= int(max_results):
+                df.attrs["total_count"] = self._count_where(where)
+            return df
+
         except ImportError:
             print("[ESO] pyvo not available")
             return pd.DataFrame()
@@ -179,7 +186,31 @@ class ESOTAPClient:
             print(f"[ESO] Search error: {e}")
             import traceback
             traceback.print_exc()
-            return pd.DataFrame()
+            # A failed search is not "no observations": tag the frame so the
+            # tool reports an archive error (same convention as services/search.py).
+            failed = pd.DataFrame()
+            failed.attrs["quasar_error"] = f"ESO TAP search failed: {e}"
+            return failed
+
+    def _count_where(self, where: str, timeout_s: float = 45.0) -> Optional[int]:
+        """Exact ``COUNT(*)`` over ivoa.ObsCore for ``where``, or None on any
+        failure or timeout (the caller then reports the total as unknown)."""
+        try:
+            import pyvo
+            from integrations.tap import _TimeoutHTTPSession
+
+            session = _TimeoutHTTPSession(timeout=timeout_s)
+            try:
+                service = pyvo.dal.TAPService(self.TAP_URL, session=session)
+            except TypeError:
+                service = pyvo.dal.TAPService(self.TAP_URL)
+            table = service.search(f"SELECT COUNT(*) AS n FROM ivoa.ObsCore WHERE {where}").to_table()
+            value = int(table[table.colnames[0]][0])
+            print(f"[ESO] COUNT(*) companion: {value} rows match")
+            return value
+        except Exception as e:  # noqa: BLE001 - the count is a bonus, never a failure
+            print(f"[ESO] COUNT(*) companion failed: {e}")
+            return None
 
     def execute_adql(self, query: str) -> pd.DataFrame:
         """

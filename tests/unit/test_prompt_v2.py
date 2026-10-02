@@ -316,8 +316,10 @@ def test_recovery_prompt_uses_card_wording_and_turn_context_in_v2(monkeypatch):
     assert "displayed above your reply" in captured["input"] and "IGNORED" not in captured["input"]
 
 
-def test_v2_flag_default_off(monkeypatch):
+def test_v2_flag_default_on(monkeypatch):
     monkeypatch.delenv(sc.ENV_FLAG, raising=False)
+    assert sc.v2_enabled() is True
+    monkeypatch.setenv(sc.ENV_FLAG, "0")
     assert sc.v2_enabled() is False
     monkeypatch.setenv(sc.ENV_FLAG, "1")
     assert sc.v2_enabled() is True

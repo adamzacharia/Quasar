@@ -1003,7 +1003,10 @@ def _declare_defaults() -> None:
     declare(["search_mast"], _merge(_simbad, _mast_query), MAST_HOSTS)
     declare(["search_mast_by_criteria", "get_mast_products"], _mast_query, MAST_HOSTS)
     declare(["download_mast_data"], _mast_download, MAST_HOSTS)
-    declare(["search_eso_archive"], _merge(_simbad, _fixed("ESO TAP", 30.0)), ESO_HOSTS)
+    # + the COUNT(*) companion that runs only when the 500-row cap is hit
+    # (integrations/eso_tap_client._count_where, its own 45 s session).
+    declare(["search_eso_archive"], _merge(_simbad, _fixed("ESO TAP", 30.0), _fixed("ESO COUNT(*) companion", 45.0)),
+            ESO_HOSTS)
     declare_deadline_only(["search_irsa"], IRSA_HOSTS,
                           reason="astroquery IRSA builds its TAPService on a bare requests.Session; conf.timeout never applied")
     declare_loop(["cross_match_source"], _merge(_simbad, _fixed("NED", 60.0), _mast_query, _fixed("VizieR", 30.0)),

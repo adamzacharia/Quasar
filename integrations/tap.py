@@ -74,6 +74,57 @@ class _TimeoutHTTPSession(requests.Session):
         return response
 
 
+NRAO_TAP_HOST = "data-query.nrao.edu"
+
+
+def _nrao_error_frame(message: str, exc: Optional[BaseException] = None) -> pd.DataFrame:
+    """An empty DataFrame tagged as a FAILED search, not a zero-row result.
+
+    Follows the archive-error convention of services/search.py and
+    alminer_client (``df.attrs["quasar_error"]``), which the search
+    capabilities turn into ``{"success": False, ...}``. ``quasar_error_meta``
+    carries the structured signals the runner keys on (infrastructure_failure,
+    host, retry_after_s; see services/host_breaker.structured_error) so an
+    unreachable NRAO archive is never reported as "no VLA observations".
+    """
+    from services.host_breaker import HostBreaker, HostCircuitOpen, classify_infrastructure_error
+
+    meta: Dict[str, Any] = {"host": NRAO_TAP_HOST}
+    reason = None
+    if exc is not None:
+        reason = "circuit breaker open" if isinstance(exc, HostCircuitOpen) else classify_infrastructure_error(exc)
+    if reason is not None:
+        meta.update(infrastructure_failure=True, reason=reason)
+        outage = (
+            f"The NRAO archive ({NRAO_TAP_HOST}) is unreachable right now ({reason}), so the search did NOT run "
+            "and it is UNKNOWN whether VLA/VLBA/GBT observations exist. This is a service outage, not a "
+            "'no observations' result: do not tell the user there are no observations."
+        )
+        user_advice = ("tell the user the NRAO archive is temporarily unavailable and suggest retrying in a "
+                       "few minutes or searching https://data.nrao.edu directly")
+        retry = int(round(exc.retry_after)) if isinstance(exc, HostCircuitOpen) else 0
+        if isinstance(exc, HostCircuitOpen):
+            meta.update(circuit_breaker=True, retry_after_s=retry, retry_after_seconds=retry)
+        # Same retry policy as host_breaker.structured_error: only a short
+        # breaker cooldown is worth one in-turn retry.
+        if 0 < retry <= HostBreaker.auto_wait_seconds():
+            hint = f"{outage} You MAY retry this exact call ONCE after ~{retry} s; if it fails again, {user_advice}."
+        else:
+            hint = f"{outage} Do NOT retry it this turn (it will fail the same way); {user_advice}."
+    else:
+        hint = (
+            "The NRAO archive query failed, so it is UNKNOWN whether VLA/VLBA/GBT observations exist. "
+            "This is not a 'no observations' result: do not tell the user there are no observations. "
+            "Check the arguments and retry once; if it fails again, report the archive error."
+        )
+    meta["retry_hint"] = hint
+    detail = f"{message}: {exc}" if exc is not None else message
+    df = pd.DataFrame()
+    df.attrs["quasar_error"] = f"{detail}. {hint}"
+    df.attrs["quasar_error_meta"] = meta
+    return df
+
+
 def _sanitize_adql(value: str) -> str:
     """Escape user input for safe ADQL interpolation."""
     # Remove/escape characters that could break ADQL string literals
@@ -113,6 +164,7 @@ class NRAOTapClient:
         self.obscore_table: Optional[str] = None
         self.nrao_tap = None
         self._connected = False
+        self._last_connect_error: Optional[BaseException] = None
         self._alma = None
         if not lazy:
             self._ensure_connected()
@@ -166,13 +218,22 @@ class NRAOTapClient:
                 self.obscore_table = "obscore"
 
             self._connected = True
+            self._last_connect_error = None
         except Exception as e:
             print(f"[NRAO TAP] Connection failed: {e}")
+            self._last_connect_error = e
             self.nrao_tap = None
             self.obscore_table = self.obscore_table or "obscore"
             self._connected = False
 
         return self._connected
+
+    def _unavailable_frame(self) -> pd.DataFrame:
+        """Error frame for a search that could not reach the NRAO archive."""
+        exc = self._last_connect_error
+        if exc is None:
+            exc = ConnectionError(f"{NRAO_TAP_HOST} is not reachable")
+        return _nrao_error_frame("NRAO TAP archive is unavailable; the VLA/VLBA/GBT search did not run", exc)
 
     def search_by_source_name(self, source_name: str, max_results: int = 100) -> pd.DataFrame:
         """
@@ -253,7 +314,7 @@ class NRAOTapClient:
         """
         if not self._ensure_connected() or not self.nrao_tap:
             print("[NRAO TAP] Service not available")
-            return pd.DataFrame()
+            return self._unavailable_frame()
 
         instruments = instruments or list(self.DEFAULT_INSTRUMENTS)
         inst_list = ", ".join(f"'{_sanitize_adql(i)}'" for i in instruments)
@@ -309,7 +370,7 @@ class NRAOTapClient:
             return pd.DataFrame()
         except Exception as e:
             print(f"[NRAO TAP] Position search error: {e}")
-            return pd.DataFrame()
+            return _nrao_error_frame("NRAO TAP position search failed", e)
 
     def search_by_frequency_range(self, min_freq_ghz: float, max_freq_ghz: float,
                                   instruments: Optional[List[str]] = None,
@@ -324,11 +385,11 @@ class NRAOTapClient:
         """
         if not self._ensure_connected() or not self.nrao_tap:
             print("[NRAO TAP] Service not available")
-            return pd.DataFrame()
+            return self._unavailable_frame()
 
         if min_freq_ghz <= 0 or max_freq_ghz <= 0 or max_freq_ghz < min_freq_ghz:
             print(f"[NRAO TAP] Invalid frequency range: {min_freq_ghz}-{max_freq_ghz} GHz")
-            return pd.DataFrame()
+            return _nrao_error_frame(f"Invalid frequency range {min_freq_ghz}-{max_freq_ghz} GHz")
 
         c = 299792458.0
         lam_max = c / (min_freq_ghz * 1e9)  # longest wavelength of the requested range
@@ -366,7 +427,7 @@ class NRAOTapClient:
             return pd.DataFrame()
         except Exception as e:
             print(f"[NRAO TAP] Frequency search error: {e}")
-            return pd.DataFrame()
+            return _nrao_error_frame("NRAO TAP frequency search failed", e)
 
     def search_vla_vlba(self, source_name: str, max_results: int = 100,
                         instruments: Optional[List[str]] = None) -> pd.DataFrame:
@@ -381,7 +442,7 @@ class NRAOTapClient:
         """
         if not self._ensure_connected() or not self.nrao_tap:
             print("[NRAO TAP] Service not available")
-            return pd.DataFrame()
+            return self._unavailable_frame()
 
         instruments = instruments or list(self.DEFAULT_INSTRUMENTS)
         inst_filter = ", ".join(f"'{_sanitize_adql(i)}'" for i in instruments)
@@ -502,8 +563,7 @@ class NRAOTapClient:
 
         except Exception as e:
             print(f"[NRAO TAP] Search error: {e}")
-            # Return empty dataframe on error
-            return pd.DataFrame()
+            return _nrao_error_frame("NRAO TAP target search failed", e)
 
     def search_alma(self, source_name: str, radius=5*u.arcmin) -> pd.DataFrame:
         """

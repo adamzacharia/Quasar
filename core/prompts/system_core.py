@@ -26,8 +26,10 @@ ENV_FLAG = "QUASAR_PROMPT_V2"
 def v2_enabled() -> bool:
     """The rollout flag. Read at agent construction (the API keeps a
     process-lifetime agent), so flipping it needs a backend restart, and an
-    existing TACC conversation keeps the system message it started with."""
-    return os.getenv(ENV_FLAG, "0").strip().lower() in ("1", "true", "yes", "on")
+    existing TACC conversation keeps the system message it started with.
+    Default ON since 2026-10-02 (token plan rank 2, -6.8k tokens per call);
+    QUASAR_PROMPT_V2=0 restores the legacy prompt."""
+    return os.getenv(ENV_FLAG, "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 # Section 1: identity and scope (~100 tokens)

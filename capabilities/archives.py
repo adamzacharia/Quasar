@@ -76,6 +76,22 @@ def _frame_error(df: Any) -> Optional[str]:
     return str(err) if err else None
 
 
+def _apply_row_cap(out: Dict[str, Any], df: Any, unit: str) -> Dict[str, Any]:
+    """Row-cap disclosure from the client's frame attrs (row_cap, total_count).
+    A capped result gets truncated/returned/total keys and total_results is
+    the exact pre-cap total when the client knows it (MANNA evals MQ22)."""
+    attrs = getattr(df, "attrs", None) or {}
+    cap, total = attrs.get("row_cap"), attrs.get("total_count")
+    if not cap or len(df) < int(cap):
+        return out
+    from services.row_cap import with_row_cap
+
+    merged = with_row_cap(out, len(df), cap, total, unit=unit)
+    if isinstance(total, int) and total >= len(df):
+        merged["total_results"] = total
+    return merged
+
+
 def _nearest_rows(df: Any, n: int = 5, max_cols: int = 40) -> List[Dict[str, Any]]:
     """The n rows nearest the search centre (df.attrs['center']) with their values,
     JSON-safe, so the model can quote magnitudes instead of pointing at a card."""
@@ -292,7 +308,7 @@ class SearchMast(BaseCapability):
             mission_summary = df["telescope"].value_counts().to_dict() if "telescope" in df.columns else {}
             instr_summary = df["instrument_name"].value_counts().to_dict() if "instrument_name" in df.columns else {}
 
-            return _native({
+            return _native(_apply_row_cap({
                 "success": True,
                 "total_results": len(df),
                 "missions": mission_summary,
@@ -306,7 +322,7 @@ class SearchMast(BaseCapability):
                     "Per-program ids, instruments, filters and dates are in `programs`; state the ones the user "
                     "asked for. The full table is shown in the UI."
                 )
-            }, provenance=prov)
+            }, df, "MAST observations"), provenance=prov)
         except Exception as e:
             return _native({"success": False, "error": f"MAST search failed: {str(e)}"},
                            provenance=prov)
@@ -406,7 +422,7 @@ class SearchMastByCriteria(BaseCapability):
             instr_summary = df["instrument_name"].value_counts().to_dict() if "instrument_name" in df.columns else {}
             filter_summary = df["filters"].value_counts().head(10).to_dict() if "filters" in df.columns else {}
 
-            return _native({
+            return _native(_apply_row_cap({
                 "success": True,
                 "total_results": len(df),
                 "missions": mission_summary,
@@ -419,7 +435,7 @@ class SearchMastByCriteria(BaseCapability):
                     f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
                     "Per-program ids, instruments, filters and dates are in `programs`. Full data shown in UI table."
                 )
-            }, provenance=prov)
+            }, df, "MAST observations"), provenance=prov)
         except Exception as e:
             return _native({"success": False, "error": f"MAST criteria search failed: {str(e)}"},
                            provenance=prov)
@@ -597,6 +613,14 @@ class SearchEso(BaseCapability):
             else:
                 return _native({"success": False, "error": "Provide target_name or (ra, dec) coordinates."})
 
+            _eso_err = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
+            if df.empty and _eso_err:
+                return _native({
+                    "success": False,
+                    "error": _eso_err,
+                    "note": ("The ESO archive query did not complete, so it is unknown whether ESO data "
+                             "exist here: this is an archive error, not a 'no observations' result."),
+                }, provenance=prov)
             if df.empty:
                 note = f"No ESO observations found"
                 if target_name:
@@ -623,7 +647,7 @@ class SearchEso(BaseCapability):
             instr_summary = df["instrument_name"].value_counts().to_dict() if "instrument_name" in df.columns else {}
             dptype_summary = df["dataproduct_type"].value_counts().to_dict() if "dataproduct_type" in df.columns else {}
 
-            return _native({
+            out = {
                 "success": True,
                 "total_results": len(df),
                 "instruments": instr_summary,
@@ -633,7 +657,23 @@ class SearchEso(BaseCapability):
                     f"Instruments: {', '.join(f'{i} ({c})' for i, c in instr_summary.items())}. "
                     f"Full data shown in UI table. Do NOT render a table — the UI already displays one."
                 )
-            }, provenance=prov)
+            }
+            # Row cap (500, newest first): never let the cap read as the total
+            # (MANNA evals MQ17/MQ22). The client ran an exact COUNT(*) companion.
+            cap = df.attrs.get("row_cap") if hasattr(df, "attrs") else None
+            total = df.attrs.get("total_count") if hasattr(df, "attrs") else None
+            if cap and len(df) >= int(cap):
+                from services.row_cap import with_row_cap
+
+                out = with_row_cap(out, len(df), cap, total, unit="ESO ObsCore rows (data products)")
+                if isinstance(total, int):
+                    out["total_results"] = total
+                out["note"] = out["note"].replace(
+                    f"Found {len(df)} ESO observations.",
+                    f"Listing the {len(df)} most recent ESO ObsCore rows (rows are data products, not observations; "
+                    "the instrument and data-type breakdowns cover the listed rows only).",
+                )
+            return _native(out, provenance=prov)
         except Exception as e:
             return _native({"success": False, "error": f"ESO archive search failed: {str(e)}"},
                            provenance=prov)
@@ -714,7 +754,7 @@ class SearchIrsa(BaseCapability):
                 "tool_name": "search_irsa"
             })
 
-            return _native({
+            return _native(_apply_row_cap({
                 "success": True,
                 "total_results": len(df),
                 "catalog": catalog,
@@ -725,7 +765,7 @@ class SearchIrsa(BaseCapability):
                     "The nearest sources' values are in `nearest_sources` (with sep_arcsec); state the values "
                     "the user asked for. The full table is shown in the UI."
                 )
-            }, provenance=prov)
+            }, df, f"IRSA {catalog} sources"), provenance=prov)
         except Exception as e:
             return _native({"success": False, "error": f"IRSA search failed: {str(e)}"},
                            provenance=prov)

@@ -91,6 +91,9 @@ class TraceSummary:
     query_arg_texts: List[str] = field(default_factory=list)  # arguments of DATA tools only (not documentation tools, CX-19)
     # grain head ("project", "mou", ...) -> row counts of calls whose OWN SQL is at that grain (guard CX-10, 2026-09-24)
     grain_counts: Dict[str, set] = field(default_factory=dict)
+    # Verbatim outputs of SUCCESSFUL calls: the corpus catalogue identifiers
+    # (source_id, obs ids, uids, bibcodes, file URLs) must appear in (MANNA evals MQ18).
+    raw_texts: List[str] = field(default_factory=list)
 
     # Normalised search corpora (computed lazily)
     _sql_norm: Optional[str] = None
@@ -328,22 +331,43 @@ def build_trace_summary(
         if isinstance(rec, dict) and rec.get("ok") is False and isinstance(rec.get("output"), str)
     }
 
+    def _is_failed_text(out: str) -> bool:
+        # The trace keeps only the first ~2,000 chars of an output, so a longer
+        # failed output never equals its trace record: match it by prefix too
+        # (Codex CX-02, 2026-10-02).
+        if out in failed_outputs:
+            return True
+        return any(len(f) >= 1000 and out.startswith(f) for f in failed_outputs)
+
     def _failed_item(item: Any) -> bool:
         if isinstance(item, dict):
             if item.get("ok") is False:
                 return True
             out = item.get("output")
-            return isinstance(out, str) and out in failed_outputs
-        return isinstance(item, str) and item in failed_outputs
+            return isinstance(out, str) and _is_failed_text(out)
+        return isinstance(item, str) and _is_failed_text(item)
+
+    def _evidence_text(text: str) -> bool:
+        """Only a SUCCESSFUL output may substantiate an identifier (CX-02)."""
+        parsed = _parse_maybe_json(text)
+        return not (isinstance(parsed, dict) and parsed.get("success") is False)
 
     tool_results = [item for item in (tool_results or ()) if not _failed_item(item)]
     for item in tool_results:
         if isinstance(item, dict) and "output" in item and isinstance(item.get("output"), str):
             ingest_result(item["output"])
             record_grain(item["output"])
+            if _evidence_text(item["output"]):
+                ts.raw_texts.append(item["output"])
         else:
             ingest_result(item)
             record_grain(item)
+            try:
+                text = item if isinstance(item, str) else json.dumps(item, default=str)
+                if _evidence_text(text) and not (isinstance(item, dict) and item.get("success") is False):
+                    ts.raw_texts.append(text)
+            except Exception:  # noqa: BLE001
+                pass
 
     for rec in tool_trace or ():
         if not isinstance(rec, dict):
@@ -374,6 +398,8 @@ def build_trace_summary(
             add_sql(req["text"])
         if isinstance(out, str):
             ingest_result(out)
+            if _evidence_text(out):
+                ts.raw_texts.append(out)
             rec_sqls = [rec.get("sql")] if isinstance(rec.get("sql"), str) else []
             if isinstance(args, dict):
                 rec_sqls += [args[k] for k in _SQL_KEYS if isinstance(args.get(k), str)]
@@ -1209,8 +1235,13 @@ def verify_answer(
     check_artifacts: bool = True,
     check_counts: bool = True,
     check_null_results: bool = True,
+    check_identifiers: bool = True,
+    user_text: str = "",
 ) -> VerificationReport:
-    """Run the deterministic checks and return the unsupported claims."""
+    """Run the deterministic checks and return the unsupported claims.
+
+    ``user_text`` (the question, plus earlier conversation text) is evidence
+    for the identifier check only: an id the user typed is never flagged."""
     report = VerificationReport()
     text = str(answer or "")
     if not text.strip():
@@ -1378,7 +1409,105 @@ def verify_answer(
                     "count", f"{total} projects",
                     f"{total} is the number of projects in the searched window; the tool's count of projects MATCHING the criteria is {matching} (unique_projects)",
                 ))
+
+    # (g) catalogue identifiers and file URLs no tool returned (MANNA evals
+    # 2026-10-01: MQ18 gave a Gaia source_id after a COUNT-only query; MQ09
+    # reported a local file:// path as the archive's FITS URL).
+    if check_identifiers:
+        _check_identifiers(prose, summary, user_text, report)
     return report
+
+
+# Identifier shapes worth checking: specific enough that a match in prose is
+# an identifier, and never derivable from the question. Coordinates, counts
+# and service base URLs are deliberately NOT here (answered from memory
+# correctly all the time; the count check covers numbers).
+_IDENTIFIER_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("Gaia/large integer source id", re.compile(r"(?<![\w.,])\d{15,19}(?![\w.,]\d)")),
+    ("ALMA uid", re.compile(r"\buid://A\d{3}/X[0-9A-Za-z]+/X[0-9A-Za-z]+\b")),
+    ("ALMA project code", re.compile(r"\b20\d{2}\.\d\.\d{5}\.[SLTAVEP]\b")),
+    ("bibcode", re.compile(r"\b(?:18|19|20)\d{2}[A-Za-z][A-Za-z&.]{4}[0-9.]{4}[A-Za-z0-9.][0-9.]{4}[A-Z]\b")),
+    ("JWST obs id", re.compile(r"\bjw\d{11}_\d{5}_\d{5}_[a-z0-9]+\b")),
+    ("ESO product id", re.compile(r"\b(?:ADP|[A-Z]{2,8})\.\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\b")),
+)
+_FILE_URL_RE = re.compile(r"file:/{2,3}[^\s)\]>\"'`]+", re.I)
+_HTTP_URL_RE = re.compile(r"https?://[^\s)\]>\"'`]+", re.I)
+# A URL is a data/file access URL (worth checking) when it points at a file or
+# a per-dataset service call; base service and documentation URLs are not.
+# Data/file access URLs only: a FITS file, a DataLink / CADC data service, an
+# IVOA or ALMA dataset id parameter, a cutout. Generic ?id= and /files/ paths
+# are common on documentation sites and are not policed (Codex CX-10 reopen).
+_DATA_URL_MARKERS = re.compile(
+    r"\.fits?(?:\.gz|\.fz)?(?:$|[?#])|\.fz(?:$|[?#])|/datalink|/caom2ops/|/raven/|/minoc/|"
+    r"[?&](?:id|uid)=(?:ivo|uid)(?::|%3a)|[?&]siaref=|/cutout|/getfile",
+    re.I,
+)
+# Characters that may continue a URL / identifier: a match must not be followed
+# (or, for ids, preceded) by one, so a truncated or overlapping value never
+# counts as returned (Codex CX-03).
+# A comma or semicolon can be part of a URL ("a.fits,version2"), so they end
+# one only when followed by whitespace, the end, or the next URL in a compact
+# list ("a.fits,https://.../b.fits") (Codex CX-03 reopen, CX-13).
+_URL_TAIL_STOP = r"(?=$|[\s\"'<>)\]}\\|`]|[,;](?:\s|$|https?://|file:/))"
+_ID_EDGE = r"[0-9A-Za-z]"
+
+
+def _present_id(value: str, corpus: str) -> bool:
+    return re.search(rf"(?<!{_ID_EDGE}){re.escape(value)}(?!{_ID_EDGE})", corpus, re.I) is not None
+
+
+def _present_url(value: str, corpus: str) -> bool:
+    return re.search(re.escape(value) + _URL_TAIL_STOP, corpus, re.I) is not None
+
+
+def _ident_corpus(summary: TraceSummary, user_text: str) -> str:
+    from urllib.parse import unquote
+
+    parts = list(summary.raw_texts) + list(summary.arg_texts) + list(summary.result_texts) + [str(user_text or "")]
+    blob = "\n".join(str(p) for p in parts if p)
+    # JSON escapes '/' as '\/' in some encoders and & as &amp; in HTML-ish text.
+    blob = blob.replace("\\/", "/").replace("&amp;", "&")
+    return blob + "\n" + unquote(blob)
+
+
+def _check_identifiers(prose: str, summary: TraceSummary, user_text: str, report: VerificationReport) -> None:
+    corpus = _ident_corpus(summary, user_text)
+    seen: set = set()
+    # A local file:// path is never an archive URL, even one the user typed
+    # (Codex CX-06): always flagged.
+    for m in _FILE_URL_RE.finditer(prose):
+        value = m.group(0).rstrip(".,;:")
+        if value in seen:
+            continue
+        seen.add(value)
+        report.checked["identifier"] = report.checked.get("identifier", 0) + 1
+        report.unsupported.append(Claim(
+            "local_url", value,
+            "a local file path on the Quasar server, not an archive URL anyone else can open",
+        ))
+    for label, pat in _IDENTIFIER_PATTERNS:
+        for m in pat.finditer(prose):
+            value = m.group(0)
+            if value in seen:
+                continue
+            seen.add(value)
+            report.checked["identifier"] = report.checked.get("identifier", 0) + 1
+            if not _present_id(value, corpus):
+                report.unsupported.append(Claim(
+                    "identifier", value, f"{label} not returned by any tool this turn and not in the question",
+                ))
+    from urllib.parse import unquote
+
+    for m in _HTTP_URL_RE.finditer(prose):
+        value = m.group(0).rstrip(".,;:*_")
+        if value in seen or not _DATA_URL_MARKERS.search(value):
+            continue
+        seen.add(value)
+        report.checked["identifier"] = report.checked.get("identifier", 0) + 1
+        if not _present_url(value, corpus) and not _present_url(unquote(value), corpus):
+            report.unsupported.append(Claim(
+                "identifier", value, "data/file URL not returned by any tool this turn",
+            ))
 
 
 def verify_web_citations(answer: str, registry: Any) -> VerificationReport:
@@ -1421,6 +1550,8 @@ def format_verification_block(report: VerificationReport, *, max_items: int = 8)
         "count": "number not found in any tool result",
         "null_result": "null result stated while a phase timed out or was skipped",
         "web_citation": "not in the cited web source",
+        "identifier": "identifier or URL that no tool returned",
+        "local_url": "local file path presented as a URL",
     }
     for claim in report.unsupported[:max_items]:
         text = claim.text.replace("\n", " ").strip()

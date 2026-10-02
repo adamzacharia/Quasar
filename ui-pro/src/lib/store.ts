@@ -83,6 +83,8 @@ interface ChatStore {
     updateLastAssistantUsage: (totalTokens: number, durationMs?: number, ownerConversationId?: string | null) => void;
     /** Phase 2: stamp the turn's web_decision on its text message (badge). */
     setLastAssistantWebDecision: (decision: WebDecision, ownerConversationId?: string | null) => void;
+    /** Stamp this turn's long-term memory writes on its text message (chip with undo). */
+    setLastAssistantMemoryUpdates: (events: import("./types").MemoryUpdateEvent[], ownerConversationId?: string | null) => void;
     setStreaming: (streaming: boolean) => void;
     setStreamingContent: (content: string) => void;
     appendStreamingContent: (chunk: string) => void;
@@ -806,6 +808,25 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         // pin one run's provenance onto another conversation's last answer.
         // When the owner is no longer active, patch the owner's stored copy
         // (the persisted rich_meta.toolTrace re-asserts it on reload too).
+        if (isOwnerRouted(state, ownerConversationId)) {
+            return patchOwnerConversation(state, ownerConversationId, stamp);
+        }
+        const messages = stamp(state.messages);
+        if (!messages) return {};
+        return {
+            messages,
+            conversations: syncActiveConversationMessages(state, messages),
+        };
+    }),
+
+    setLastAssistantMemoryUpdates: (events, ownerConversationId) => set((state) => {
+        const stamp = (messages: Message[]): Message[] | null => {
+            const index = findLastAssistantTextIndex(messages);
+            if (index < 0) return null;
+            const next = [...messages];
+            next[index] = { ...next[index], memoryUpdates: events };
+            return next;
+        };
         if (isOwnerRouted(state, ownerConversationId)) {
             return patchOwnerConversation(state, ownerConversationId, stamp);
         }

@@ -190,8 +190,8 @@ OVERRIDES: Dict[str, str] = {
     ),
     "vo_adql_query": (
         "Inspect the schema (vo_describe_table) before writing ADQL. Quote table names containing '/' or '+' "
-        "in double quotes. ESA Gaia, ESO, and CADC have curated notes: browse_schema('gaia'|'eso'|'cadc'). For "
-        "images or cubes at a position use vo_image_search instead."
+        "in double quotes. ESA Gaia, ESO, CADC and NRAO have curated notes: browse_schema('gaia'|'eso'|'cadc'|'nrao'). "
+        "For images or cubes at a position use vo_image_search instead."
     ),
     "moving_object_check": (
         "Use when a transient could be a known asteroid or comet."

@@ -68,6 +68,7 @@ def test_live_imagery_tool_registration_prompt_and_status_labels():
         assert tool.category == category
         assert name in agent.tool_registry.categories[category]
 
+    agent.prompt_bundle = "legacy"  # these rules live in the legacy prompt; v2 is the default since 2026-10-02
     prompt = agent._build_system_prompt()
     assert "LIVE IMAGERY RULE" in prompt
     assert "hips_cutout" in prompt and "sparcl_plot_spectrum" in prompt

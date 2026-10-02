@@ -50,7 +50,7 @@ const RAD = Math.PI / 180;
 const HIDDEN: Pose = [0, 0.3, 0];
 
 const H = 4.5; // half the 2x2 spacing
-const DOT = 3.75;
+const DOT = 4.5;
 // Dot order: 0 = TL, 1 = BR, 2 = TR, 3 = BL.
 const CORNERS: [number, number][] = [[-H, -H], [H, H], [H, -H], [-H, H]];
 
@@ -77,7 +77,7 @@ const WAVE_DELAYS = [0, 0.15, 0.33];
 const HEARTBEAT: Row[] = [[0, 1, 1], [0.12, 1.32, 1.15], [0.24, 0.92, 1], [0.36, 1.18, 1.08], [0.5, 1, 1], [1.3, 1, 1]];
 
 const SNAKE_PATH: [number, number][] = [[-5.5, -5.5], [0, -5.5], [5.5, -5.5], [5.5, 0], [5.5, 5.5], [0, 5.5], [-5.5, 5.5], [-5.5, 0]];
-const CRADLE_X = [-DOT, 0, DOT]; // touching balls, strings from y = -4
+const CRADLE_X = [-DOT, 0, DOT]; // touching balls, strings from y = -3
 
 function squarePose(t: number): Pose[] {
     const c = t % 1.3;
@@ -125,10 +125,10 @@ const MOVES: Record<string, Move> = {
     cradle: {
         period: 1.2,
         pose: (t) => {
-            const swing = 30 * Math.sin((2 * Math.PI * t) / 1.2);
+            const swing = 26 * Math.sin((2 * Math.PI * t) / 1.2);
             const balls = CRADLE_X.map((x0, i): Pose => {
                 const a = (i === 0 ? Math.min(0, swing) : i === 2 ? Math.max(0, swing) : 0) * RAD;
-                return [x0 + 7 * Math.sin(a), -4 + 7 * Math.cos(a), 1];
+                return [x0 + 6 * Math.sin(a), -3 + 6 * Math.cos(a), 1];
             });
             return [...balls, HIDDEN];
         },

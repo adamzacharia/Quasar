@@ -2,7 +2,7 @@
 """
 Centralized Vector Database Service — Qdrant Cloud + in-memory fallback.
 
-CALLED BY: services/rag_service.py, services/memory_service.py
+CALLED BY: services/rag_service.py, services/personal_docs.py
 CALLS:     qdrant_client (Qdrant Cloud) OR qdrant_client (in-memory local)
 
 Provides a singleton QdrantClient and helpers for upserting/searching
@@ -326,6 +326,59 @@ def delete_older_runs(collection: str, source_file: str, run_id: str, run_ts: Un
     # a duplicate, never a loss. Concurrent ingests of one source are not a
     # supported workflow (the embedded store is single-process anyway).
     return True
+
+
+def delete_personal_doc_points(collection: str, doc_id: Optional[str], source_file: str,
+                               legacy_by_filename: bool) -> int:
+    """Delete one personal document's points and return how many REMAIN.
+
+    New uploads carry ``doc_id`` on every chunk, so deleting one copy of a
+    twice-uploaded file no longer wipes the other copy (audit S20). Legacy
+    chunks (ingested before doc_id existed) are removed by filename only when
+    ``legacy_by_filename`` (the caller checked no other listed row shares the
+    filename), and only those WITHOUT a doc_id. The count afterwards is the
+    caller's proof the delete happened; a non-zero result must keep the row.
+    """
+    from qdrant_client.models import IsEmptyCondition, PayloadField
+
+    client = get_qdrant_client()
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing:
+        return 0
+    filters = []
+    if doc_id:
+        filters.append(Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]))
+    if legacy_by_filename and source_file:
+        filters.append(Filter(must=[
+            FieldCondition(key="source_file", match=MatchValue(value=source_file)),
+            IsEmptyCondition(is_empty=PayloadField(key="doc_id")),
+        ]))
+    remaining = 0
+    for f in filters:
+        client.delete(collection_name=collection, points_selector=f)
+    for f in filters:
+        remaining += client.count(collection_name=collection, count_filter=f, exact=True).count
+    return remaining
+
+
+def count_doc_points(collection: str, doc_id: str) -> int:
+    """Number of points stamped with ``doc_id`` (0 => a legacy, pre-doc_id upload)."""
+    client = get_qdrant_client()
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing or not doc_id:
+        return 0
+    f = Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])
+    return client.count(collection_name=collection, count_filter=f, exact=True).count
+
+
+def ensure_personal_indexes(collection: str) -> None:
+    """KEYWORD payload indexes for the personal-collection delete/count filters
+    (Qdrant Cloud strict mode rejects filtering on unindexed fields). Never raises."""
+    for field in ("doc_id", "source_file"):
+        try:
+            create_payload_index(collection, field, PayloadSchemaType.KEYWORD)
+        except Exception as e:
+            print(f"[VectorDB] payload index {collection}.{field} not created (non-fatal): {e}")
 
 
 def collection_count(collection: str) -> int:

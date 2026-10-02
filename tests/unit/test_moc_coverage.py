@@ -417,6 +417,7 @@ def test_agent_registration_prompt_status_and_wrappers():
     assert "survey_coverage" in agent.tool_registry.categories["archive"]
     assert "regime" in coverage_tool.parameters["properties"]
 
+    agent.prompt_bundle = "legacy"  # these rules live in the legacy prompt; v2 is the default since 2026-10-02
     prompt = agent._build_system_prompt()
     assert "MOC COVERAGE RULE" in prompt
     assert "survey_covers_position" in prompt

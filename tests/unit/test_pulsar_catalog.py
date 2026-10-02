@@ -296,6 +296,7 @@ def test_agent_registration_prompt_status_and_schema():
     assert search_tool.parameters["required"] == []
     assert lookup_tool.parameters["required"] == ["name"]
 
+    agent.prompt_bundle = "legacy"  # these rules live in the legacy prompt; v2 is the default since 2026-10-02
     prompt = agent._build_system_prompt()
     assert "PULSAR CATALOG RULE" in prompt
     assert "search_pulsars" in prompt

@@ -986,9 +986,67 @@ async def _stream_chat_response(
         for note in attachment_context.get("messages", []):
             yield _sse_status(note, "completed")
 
-        # Personal RAG retrieval for authenticated users only.
-        # Searches ONLY the user's personal Qdrant collection (not the shared ALMA docs).
         enriched_message = request.message
+        # Request-scoped personalization for the runner (never stored on the
+        # shared agent): personal tools, a prefetch exchange, and the
+        # instructions suffix (memory policy + profile + document hint).
+        turn_personalization = {"tools": [], "prefetch": [], "instructions_suffix": ""}
+
+        # Long-term memory (services/user_memory_service.py). The profile is
+        # rendered ONCE per turn into the instructions suffix (memory policy +
+        # this user's saved preferences); the extractor runs in parallel with
+        # the answer on the user's raw message only and reports what it saved
+        # as a "memory_update" event before [DONE] (UI chip with undo).
+        _memory_future = None
+        # Benchmark arms get no personalization at all: no memory reads or
+        # writes, no extractor call, no document tool (core/bench_toolset.py),
+        # so a measured run's tokens, latency and answers are not affected.
+        try:
+            from core import bench_toolset as _bench_ts_sse
+            _personalize = not _bench_ts_sse.active()
+        except Exception:
+            _personalize = True
+        if _personalize and current_user and current_user.get("sub"):
+            _mem_uid = current_user.get("sub")
+            try:
+                from services.user_memory_service import MEMORY_POLICY_OFF, get_user_memory_service
+                from services import memory_extractor as _mem_x
+                from services.personal_docs import strip_attachment_blocks as _strip_attach
+
+                _mem_svc = get_user_memory_service()
+                turn_personalization["instructions_suffix"] = await asyncio.to_thread(_mem_svc.render_block, _mem_uid)
+                turn_personalization["turn_note"] = await asyncio.to_thread(_mem_svc.render_turn_note, _mem_uid)
+                _mem_text = _strip_attach(request.message or "")
+                if _mem_x.should_extract(_mem_text):
+                    _mem_model = os.getenv("QUASAR_MEMORY_EXTRACTOR_MODEL", "gpt-oss-120b")
+                    _mem_conv = conv_id
+
+                    def _mem_llm(instructions_text, input_text):
+                        resp = agent.client.responses.create(
+                            model=_mem_model,
+                            instructions=instructions_text,
+                            input=input_text,
+                            temperature=0,
+                            max_output_tokens=800,
+                            _gpt_oss_reasoning="low",
+                        )
+                        return getattr(resp, "output_text", "") or ""
+
+                    def _mem_job():
+                        return _run_with_llm_context(
+                            llm_context, current_user_id, current_user_email, usage_recorder, quota_checker,
+                            lambda: _mem_x.extract_and_save(_mem_svc, _mem_uid, _mem_text, _mem_llm,
+                                                            conversation_id=_mem_conv),
+                            quota_releaser=quota_releaser,
+                        )
+
+                    _memory_future = asyncio.get_event_loop().run_in_executor(_mem_x.EXECUTOR, _mem_job)
+            except Exception as _mem_err:
+                print(f"[MEMORY] setup failed (non-fatal): {_mem_err}")
+                try:
+                    turn_personalization["instructions_suffix"] = MEMORY_POLICY_OFF
+                except Exception:
+                    pass
         image_prepass = attachment_context.get("image_prepass") or {}
         image_prepass_images = image_prepass.get("images") or []
         if image_prepass_images:
@@ -1034,142 +1092,102 @@ async def _stream_chat_response(
             yield _sse_status(f"Passing image context to {requested_model}", "completed")
         if request.grounded_summary:
             yield _sse_status("Grounded summary mode enabled", "completed")
-        if current_user and not request.grounded_summary:
+        # Personal knowledge base (Settings > Personalization) as a scoped tool.
+        # Excerpts are never pasted into the user turn any more (audit
+        # tmp/personalization-audit-2026-10-01: ada-002 + a 0.25 cutoff injected
+        # every upload into every turn and a poisoned upload hijacked answers).
+        # The model reaches them through search_my_documents, bound HERE to the
+        # authenticated user; an explicit self-reference ("my notes", a file
+        # name) runs the same search deterministically and the runner sends it
+        # as a tool exchange (services/personal_docs.py, core/runner.py).
+        if _personalize and current_user and not request.grounded_summary:
             user_id = current_user.get("sub")
             if user_id:
                 try:
-                    loop2 = asyncio.get_event_loop()
+                    from services import personal_docs as _pdocs
 
-                    def _personal_rag_search():
-                        from langchain_openai import OpenAIEmbeddings
-                        from langchain_core.documents import Document as LCDocument
-                        from services.vector_db import search_vectors, ensure_collection
-
-                        # Fast check 1: Skip short greetings / simple conversational chatter
-                        msg_clean = request.message.strip().lower().rstrip("?.! ")
-                        if msg_clean in {
-                            "hi", "hello", "hey", "hola", "thanks", "thank you", "ok", "okay", 
-                            "yes", "no", "cool", "great", "awesome", "perfect", "clear", 
-                            "how are you", "what's up", "good morning", "good afternoon", "good evening"
-                        } or len(msg_clean) < 4:
-                            return []
-
-                        # Fast check 2: Check if user has uploaded any personalization documents
+                    def _personal_filenames():
+                        conn = _get_pers_db()
                         try:
-                            conn = _get_pers_db()
-                            row = conn.execute(
-                                "SELECT 1 FROM documents WHERE user_id=? LIMIT 1",
-                                (user_id,)
-                            ).fetchone()
+                            rows = conn.execute(
+                                "SELECT filename FROM documents WHERE user_id=? ORDER BY uploaded_at DESC LIMIT 50",
+                                (user_id,),
+                            ).fetchall()
+                        finally:
                             conn.close()
-                            if not row:
-                                return []
-                        except Exception as db_err:
-                            print(f"[PERSONAL_RAG] DB check failed: {db_err}")
+                        return [r[0] for r in rows]
 
-                        collection_name = f"user_{user_id}_personal"
-                        try:
-                            ensure_collection(collection_name)
-                        except Exception:
-                            return []
+                    _pdoc_names = await asyncio.to_thread(_personal_filenames)
+                    if _pdoc_names:
+                        def _embed_personal_query(text):
+                            from langchain_openai import OpenAIEmbeddings
 
-                        openai_byok_key = llm_context["provider_api_keys"].get("openai")
-                        openai_key_source = "byok" if openai_byok_key else "platform"
-                        # reserve=True: the embed call is a real spend point
-                        # with a settle below, so it takes an ATOMIC reservation
-                        # like every LLM call — a bare read-then-check let
-                        # concurrent embedding requests overshoot the daily cap
-                        # (A2 guard CX-02 reopen).
-                        _embed_reservation = usage_quota_service.ensure_allowed(
-                            user_id=user_id,
-                            user_email=current_user_email,
-                            provider="openai",
-                            key_source=openai_key_source,
-                            byok_token_limit=llm_context["byok_token_limits"].get("openai"),
-                            reserve=True,
-                        )
-                        try:
-                            embeddings = (
-                                OpenAIEmbeddings(openai_api_key=openai_byok_key)
-                                if openai_byok_key
-                                else OpenAIEmbeddings()
-                            )
-                            query_vector = embeddings.embed_query(request.message)
-                        except Exception:
-                            # The call never spent — free the held tokens.
-                            usage_quota_service.release_reservation(_embed_reservation)
-                            raise
-                        # This call is quota-CHECKED above but was never
-                        # RECORDED: it goes through langchain_openai, not
-                        # LLMClient, so it never reaches LLMClient._record_usage
-                        # and its tokens were missing from both the per-turn
-                        # total and the quota ledger. Count them here.
-                        #
-                        # cl100k_base is OpenAI's real tokenizer for the
-                        # text-embedding-* family, so this is the exact billed
-                        # prompt-token count, not an approximation. Embeddings
-                        # have no output tokens.
-                        try:
-                            import tiktoken
-
-                            _embed_tokens = len(
-                                tiktoken.get_encoding("cl100k_base").encode(
-                                    request.message or ""
-                                )
-                            )
-                            usage_recorder(
+                            openai_byok_key = llm_context["provider_api_keys"].get("openai")
+                            openai_key_source = "byok" if openai_byok_key else "platform"
+                            # reserve=True: the embed call is a real spend point
+                            # with a settle below, so it takes an ATOMIC
+                            # reservation like every LLM call (A2 guard CX-02).
+                            _embed_reservation = usage_quota_service.ensure_allowed(
+                                user_id=user_id,
+                                user_email=current_user_email,
                                 provider="openai",
-                                model=getattr(
-                                    embeddings, "model", "text-embedding-ada-002"
-                                ),
                                 key_source=openai_key_source,
-                                input_tokens=_embed_tokens,
-                                output_tokens=0,
-                                reservation_id=_embed_reservation,
+                                byok_token_limit=llm_context["byok_token_limits"].get("openai"),
+                                reserve=True,
                             )
-                        except Exception as _embed_usage_err:
-                            # Accounting must never break retrieval, but a
-                            # silent drop hides undercounted spend — log it so a
-                            # persistent recording failure is visible. The held
-                            # reservation must still come off.
-                            usage_quota_service.release_reservation(_embed_reservation)
-                            logger.warning(
-                                f"[PERSONAL_RAG] embedding usage not recorded: {_embed_usage_err}"
-                            )
-                        hits = search_vectors(collection_name, query_vector, limit=6)
-                        print(f"[PERSONAL_RAG] User={user_id}, Query='{request.message[:60]}', Hits={len(hits)}")
-                        if hits:
-                            for h in hits[:3]:
-                                print(f"  → score={h['score']:.4f}, file={h['payload'].get('source_file','?')}")
+                            try:
+                                embeddings = (
+                                    OpenAIEmbeddings(openai_api_key=openai_byok_key)
+                                    if openai_byok_key
+                                    else OpenAIEmbeddings()
+                                )
+                                vector = embeddings.embed_query(text)
+                            except Exception:
+                                # The call never spent: free the held tokens.
+                                usage_quota_service.release_reservation(_embed_reservation)
+                                raise
+                            # Goes through langchain_openai, not LLMClient, so it
+                            # is recorded here (cl100k_base = the exact billed
+                            # prompt tokens for text-embedding-*).
+                            try:
+                                import tiktoken
 
-                        # Filter by semantic score ≥ 0.25 (lower threshold for personal docs)
-                        results = []
-                        for hit in hits:
-                            if hit["score"] < 0.25:
-                                continue
-                            meta = {k: v for k, v in hit["payload"].items() if k != "text"}
-                            meta["_semantic_score"] = round(hit["score"], 4)
-                            results.append(LCDocument(
-                                page_content=hit["payload"].get("text", ""),
-                                metadata=meta,
-                            ))
-                        return results[:4]
+                                usage_recorder(
+                                    provider="openai",
+                                    model=getattr(embeddings, "model", "text-embedding-ada-002"),
+                                    key_source=openai_key_source,
+                                    input_tokens=len(tiktoken.get_encoding("cl100k_base").encode(text or "")),
+                                    output_tokens=0,
+                                    reservation_id=_embed_reservation,
+                                )
+                            except Exception as _embed_usage_err:
+                                usage_quota_service.release_reservation(_embed_reservation)
+                                logger.warning(f"[PERSONAL_DOCS] embedding usage not recorded: {_embed_usage_err}")
+                            return vector
 
-                    personal_docs = await loop2.run_in_executor(_executor, _personal_rag_search)
-                    if personal_docs:
-                        yield _sse_status("Searching personal knowledge base", "running")
-                        ctx_lines = []
-                        for d in personal_docs:
-                            src = d.metadata.get("source_file", "personal doc")
-                            ctx_lines.append(f"[From: {src}]\n{d.page_content.strip()}")
-                        context_block = "\n\n---\n".join(ctx_lines)
-                        enriched_message = (
-                            "The user has the following relevant documents in their personal "
-                            f"knowledge base:\n\n{context_block}\n\n---\nUser's question: {enriched_message}"
-                        )
-                        yield _sse_status("Searching personal knowledge base", "completed")
+                        turn_personalization["tools"].append(_pdocs.build_tool(user_id, _embed_personal_query))
+                        turn_personalization["instructions_suffix"] += _pdocs.title_hint(_pdoc_names)
+                        if _pdocs.is_explicit_reference(request.message, _pdoc_names):
+                            yield _sse_status("Searching your documents", "running")
+                            _pdoc_state = "error"
+                            try:
+                                _pdoc_query = (_pdocs.strip_attachment_blocks(request.message) or request.message)[:2000]
+                                _pdoc_out = await asyncio.get_event_loop().run_in_executor(
+                                    _executor,
+                                    lambda: _pdocs.search_personal_documents(user_id, _pdoc_query, _embed_personal_query),
+                                )
+                                turn_personalization["prefetch"].append({
+                                    "call_id": f"call_pdoc_{uuid.uuid4().hex[:16]}",
+                                    "name": _pdocs.TOOL_NAME,
+                                    "arguments": json.dumps({"query": _pdoc_query[:300]}),
+                                    "output": _pdoc_out,
+                                })
+                                _pdoc_state = "completed"
+                            except Exception as _pdoc_err:
+                                print(f"[PERSONAL_DOCS] prefetch failed (non-fatal): {_pdoc_err}")
+                            yield _sse_status("Searching your documents", _pdoc_state)
                 except Exception as e:
-                    print(f"[WARN] Personal RAG search failed: {e}")
+                    print(f"[WARN] Personal document setup failed (non-fatal): {e}")
 
         if request.grounded_summary:
             enriched_message = (
@@ -1281,6 +1299,7 @@ async def _stream_chat_response(
                                 model=requested_model,
                                 run_token=run_id,
                                 web_search_mode=getattr(request, "web_search_mode", None),
+                                turn_personalization=turn_personalization,
                             )
                         finally:
                             # Clean up the plan feedback queue. UIAPI-08:
@@ -2128,6 +2147,22 @@ async def _stream_chat_response(
                     yield f"data: {json.dumps({'type': 'citation_metrics', 'metrics': _citation_metrics, 'run_id': run_id})}\n\n"
                 except Exception as _cm_err:
                     logger.warning(f"[CHAT] Failed to emit citation_metrics event: {_cm_err}")
+
+            # Memory writes from this turn (extractor ran in parallel). Waited
+            # for briefly so the chip lands on this answer; a late result is
+            # still saved, just not announced here (Settings > Memory shows it).
+            if _memory_future is not None:
+                try:
+                    _mem_events = await asyncio.wait_for(
+                        asyncio.shield(_memory_future),
+                        timeout=float(os.getenv("QUASAR_MEMORY_EXTRACT_WAIT_SECONDS", "6") or 6),
+                    )
+                    if _mem_events:
+                        yield f"data: {json.dumps({'type': 'memory_update', 'events': _mem_events}, ensure_ascii=False, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    print("[MEMORY] extractor still running at stream end; result will not be announced")
+                except Exception as _mem_wait_err:
+                    print(f"[MEMORY] extractor result unavailable (non-fatal): {_mem_wait_err}")
 
             _usage_line = usage_sse_line()
             if _usage_line:

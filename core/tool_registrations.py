@@ -187,7 +187,7 @@ def register_tools(agent: "QuasarAgent") -> None:
         description=(
             "Execute a custom ADQL/TAP query directly on the ALMA Science Archive (ivoa.obscore table).\n"
             "ALMA ONLY — NOT for NOIRLab Data Lab catalogs (gaia_dr3/des_dr1/desi_dr1/nsc_dr2/smash/...): "
-            "use datalab_sql_query for those.\n"
+            "use datalab_sql_query for those. Not NRAO VLA/VLBA/GBT data: browse_schema('nrao').\n"
             "IMPORTANT: obscore has NO 'redshift' column. Frequency coverage of nu_ghz: prefilter on the "
             "wavelength columns (METERS) — WHERE em_min <= 0.299792458/{nu_hi} AND em_max >= 0.299792458/{nu_lo} — "
             "then confirm exact SPW coverage from frequency_support; frequency +/- bandwidth/2 is WRONG "
@@ -2316,7 +2316,8 @@ def register_tools(agent: "QuasarAgent") -> None:
             "Use this when users ask for 'an image of', 'show me', 'DSS image', "
             "or 'what does X look like'. For a COLOR image from a specific named "
             "imaging survey (Legacy Surveys, DES, DECam), use datalab_color_image "
-            "instead — do not substitute one of these surveys."
+            "instead — do not substitute one of these surveys. "
+            "Not for a direct/FITS access URL (it saves a local preview): use vo_image_search."
         ),
         function=agent._viz_tool_fn("get_sky_image"),
         parameters={
@@ -3867,7 +3868,7 @@ def register_tools(agent: "QuasarAgent") -> None:
     ))
     agent.tool_registry.register(Tool(
         name="vo_adql_query",
-        description="Run a guarded SELECT-only ADQL query against any TAP service URL. On ADQL errors the server's message is returned - read it and fix the query. For slow or heavy queries use mode='auto' (falls back to an async job on timeout) or mode='async', then vo_tap_job.",
+        description="Run a guarded SELECT-only ADQL query against any TAP service URL. On ADQL errors the server's message is returned - read it and fix the query. For slow or heavy queries use mode='auto' (falls back to an async job on timeout) or mode='async', then vo_tap_job. NRAO (VLA/VLBA/GBT): https://data-query.nrao.edu/tap, tap_schema.obscore (browse_schema('nrao')).",
         function=agent._vo_tool_fn("vo_adql_query"),
         parameters={
             "type": "object",

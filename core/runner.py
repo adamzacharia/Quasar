@@ -818,7 +818,9 @@ def _finalize_answer_text(
                 _rr_for_verify,
                 extra_sql=_extra_sql,
             )
-            _verify_report = verify_answer(output_text, _trace_summary)
+            _verify_report = verify_answer(output_text, _trace_summary,
+                                           user_text=_identifier_context(agent, user_query, url_sources,
+                                                                         all_tool_results))
             print(
                 f"[VERIFY] unsupported_claims={len(_verify_report.unsupported)} "
                 f"checked={_verify_report.checked} cards={len(_trace_summary.cards)} "
@@ -845,8 +847,83 @@ def _finalize_answer_text(
             output_text += _web_block
             if on_token:
                 on_token(_web_block)
+    elif output_text:
+        # No tool ran: only the identifier check applies (a source_id, obs id,
+        # bibcode or file URL written from memory; MANNA evals 2026-10-01).
+        try:
+            from core.answer_verifier import TraceSummary, format_verification_block, verify_answer
+
+            _id_report = verify_answer(
+                output_text, TraceSummary(), check_cuts=False, check_artifacts=False,
+                check_counts=False, check_null_results=False,
+                user_text=_identifier_context(agent, user_query, url_sources, all_tool_results),
+            )
+            if not _id_report.ok:
+                print(f"[VERIFY] no-tool turn: unsupported_identifiers={len(_id_report.unsupported)}")
+                _id_block = format_verification_block(_id_report)
+                output_text += _id_block
+                if on_token:
+                    on_token(_id_block)
+        except Exception as _id_err:
+            print(f"[VERIFY] identifier check failed (non-fatal): {_id_err}")
 
     return output_text
+
+
+def _without_failed_records(text: str) -> str:
+    """A JSON source minus every failed record (ok: false / success: false, or an
+    "output" string that parses to success: false), re-serialized; non-JSON text
+    is returned unchanged. The Conductor passes its serialized tool TRACE as a
+    url_source, so failed calls must be removed here too (Codex CX-02 round 2)."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+
+    def failed(obj: Any) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if obj.get("ok") is False or obj.get("success") is False:
+            return True
+        out = obj.get("output")
+        if isinstance(out, str):
+            try:
+                parsed = json.loads(out)
+            except (TypeError, ValueError):
+                return False
+            return isinstance(parsed, dict) and parsed.get("success") is False
+        return False
+
+    def prune(obj: Any) -> Any:
+        if isinstance(obj, list):
+            return [prune(x) for x in obj if not failed(x)]
+        if isinstance(obj, dict):
+            return {k: prune(v) for k, v in obj.items() if not failed(v)}
+        return obj
+
+    if failed(data):
+        return ""
+    return json.dumps(prune(data), default=str)
+
+
+def _identifier_context(agent, user_query: str, url_sources: Optional[List[str]] = None,
+                        all_tool_results: Optional[List[Any]] = None) -> str:
+    """The question, earlier conversation text and this turn's documentation /
+    web sources: identifiers the user, an earlier turn or a cited source
+    supplied are evidence, never flagged. The serialized tool results that
+    url_sources also carries are left OUT: the trace summary already admits
+    only successful outputs, and this copy would readmit failed ones (Codex CX-02)."""
+    tool_blob = json.dumps(all_tool_results, default=str) if all_tool_results else None
+    parts = [str(user_query or "")] + [
+        _without_failed_records(str(s)) for s in (url_sources or []) if s and (tool_blob is None or s != tool_blob)
+    ]
+    try:
+        for msg in (agent.get_conversation_history() or [])[-20:]:
+            if isinstance(msg, dict):
+                parts.append(str(msg.get("content") or ""))
+    except Exception:  # noqa: BLE001 - history is optional evidence
+        pass
+    return "\n".join(parts)
 
 
 def _stream_response_api_impl(
@@ -866,7 +943,13 @@ def _stream_response_api_impl(
     run_token=None,
     _history_recovery_attempted=False,
     web_search_mode=None,
+    turn_personalization=None,
 ):
+        # turn_personalization (built per request by ui-pro/api/sse.py, never
+        # stored on the shared agent): {"tools": [Tool], "prefetch": [exchange],
+        # "instructions_suffix": str}. See services/personal_docs.py and
+        # services/user_memory_service.py. Ignored in benchmark arms.
+        _personal = turn_personalization or {}
         # Assign a unique conversation_id if none provided (isolates anonymous
         # concurrent requests so they never share OpenAI response state).
         if not conversation_id:
@@ -894,6 +977,9 @@ def _stream_response_api_impl(
         # This request's user MCP tools (name -> Tool), filled when the tool
         # list is built; defined up front so every dispatch path can read it.
         _user_mcp_tools: dict = {}
+        # This request's personal tools (search_my_documents), bound to the
+        # authenticated user by the SSE layer (services/personal_docs.py).
+        _request_tools: dict = {}
         # MCP timeline labels used this turn -> count, so two calls to one
         # tool never share a label (and an outcome) in the Research panel.
         _mcp_step_labels: dict = {}
@@ -1034,6 +1120,23 @@ def _stream_response_api_impl(
             register carried follow-up evidence, then deep-read the top pages
             within QUASAR_WEB_DEEP_READ_BUDGET. Planner off: the Phase 1 single
             search. Never raises."""
+            # Chat-attachment payloads never become third-party search queries
+            # (audit 2026-10-01: attached file text reached Tavily/Exa verbatim).
+            try:
+                from services.personal_docs import strip_attachment_blocks as _strip_attach
+
+                search_query = _strip_attach(search_query or "")
+            except Exception:
+                pass
+            if not search_query:
+                # Nothing left to search (attachment-only message): release the
+                # evidence waiters now instead of letting them time out.
+                try:
+                    if _web_prepass is not None:
+                        _web_prepass.finish()
+                except Exception:
+                    pass
+                return
             try:
                 plan = _web_plan
                 if plan is None and plan_job is not None:
@@ -1250,7 +1353,10 @@ def _stream_response_api_impl(
                     cutoff=_llm_cutoff(),
                     web_mode=_web_mode,
                 )
-                _planner_job = _web_planner.PlannerJob(_user_query, _planner_ctx).start()
+                # The planner's queries go to third-party search: give it the
+                # question without chat-attachment payloads.
+                from services.personal_docs import strip_attachment_blocks as _strip_attach_q
+                _planner_job = _web_planner.PlannerJob(_strip_attach_q(_user_query) or _user_query[:500], _planner_ctx).start()
             except Exception as _plan_err:
                 print(f"[WEB PLANNER] could not start (non-fatal): {_plan_err}")
                 _planner_job = None
@@ -1898,18 +2004,13 @@ def _stream_response_api_impl(
                     on_status("Searching ALMA Manuals & Documentation", "completed")
                 print(f"[WARNING] RAG search failed: {e}")
         
-        # 2. Retrieve long-term memories (from mem0) — only for authenticated users
+        # 2. Long-term user memory is NOT pasted into the user turn any more.
+        # The per-user profile (services/user_memory_service.py) arrives as an
+        # instructions suffix in turn_personalization; the old mem0 hook (which
+        # stored the doc-enriched query plus the answer) was removed in the
+        # 2026-10 memory rebuild.
         memory_context = ""
-        _is_anonymous = (not user_id or user_id == "anonymous")
-        if agent.long_term_memory and not _is_anonymous:
-            try:
-                memories = agent.long_term_memory.search(query=query, user_id=user_id, limit=5)
-                if memories and memories.get("results"):
-                    memory_pieces = [f"- {m['memory']}" for m in memories["results"]]
-                    memory_context = "\n\nUser Memories:\n" + "\n".join(memory_pieces)
-            except Exception as e:
-                print(f"[WARNING] mem0 search failed: {e}")
-        
+
         # 3. Build tools list
         # `or []`: an allowlist that matches nothing yields no tools, not a crash (guard CX-10).
         tools = agent._build_tools_for_responses_api() or []
@@ -1931,6 +2032,28 @@ def _stream_response_api_impl(
                     })
             except Exception as _umcp_err:
                 print(f"[UserMCP] could not load user MCP tools (non-fatal): {_umcp_err}")
+            # Personal tools for this request only (search_my_documents),
+            # bound to the authenticated user by the SSE layer. Offered only on
+            # providers whose history Quasar can expire (chat shim: TACC,
+            # DeepSeek; Anthropic): OpenAI-native chains keep tool outputs
+            # server-side via previous_response_id, so excerpts would persist.
+            _pt_provider_ok = detect_provider(selected_model) in ("tacc", "deepseek", "anthropic")
+            if (_personal.get("tools") and not _pt_provider_ok):
+                print(f"[PERSONAL_DOCS] tool not offered on provider {detect_provider(selected_model)!r} "
+                      "(history cannot be expired there)")
+            for _pt in ((_personal.get("tools") or []) if _pt_provider_ok else []):
+                try:
+                    if _pt.name in _request_tools or any(t.get("name") == _pt.name for t in tools):
+                        continue
+                    _request_tools[_pt.name] = _pt
+                    tools.append({
+                        "type": "function",
+                        "name": _pt.name,
+                        "description": _pt.description,
+                        "parameters": _pt.parameters,
+                    })
+                except Exception as _pt_err:
+                    print(f"[PERSONAL_DOCS] could not add request tool (non-fatal): {_pt_err}")
         disabled_web_note = ""
         _has_web_tool = any(str(t.get("name", "")).startswith("web_") for t in tools)
         if _bench_ts.active():
@@ -1979,9 +2102,61 @@ def _stream_response_api_impl(
                 "(a documentation-only answer is fine)."
             )
         full_input = f"{memory_context}{rag_context}{citation_note}{disabled_web_note}\n\nUser: {query}"
+        # This user's saved preferences, as a short labelled note right after
+        # the question (services/user_memory_service.render_turn_note_from_items).
+        if _personal.get("turn_note") and not _bench_ts.active():
+            full_input += _personal["turn_note"]
         # v2 bundle: everything appended after this point in round 0 is route
         # directive text and counts toward the per-turn workflow budget.
         _full_input_base_len = len(full_input)
+
+        # Personal-document prefetch (explicit "my notes / my proposal / <file>"
+        # reference): the SSE layer already ran search_my_documents for this
+        # authenticated user. It travels as a tool EXCHANGE after the user turn
+        # (assistant tool_call + tool output), never as user-role text, so the
+        # excerpt keeps the lower-trust tool role and the chat shim can expire
+        # it next turn. Only the chat-completions shims (TACC, DeepSeek) build
+        # that exchange; other providers get the tool + hint instead.
+        _prefetch = [] if _bench_ts.active() else list(_personal.get("prefetch") or [])
+        if _prefetch and detect_provider(selected_model) not in ("tacc", "deepseek"):
+            _prefetch = []
+
+        def _round0_input(text):
+            # No provider chain for this conversation+model (backend restart,
+            # model switched mid-chat, cache eviction): rebuild the earlier
+            # turns from the saved chat so the model does not silently forget
+            # it (core/history_rebuild.py). Chat-shim providers get real
+            # user/assistant messages; others a labelled recap in the turn.
+            seed = []
+            if last_id is None and not _bench_ts.active():
+                try:
+                    from core.history_rebuild import build_seed
+
+                    seed, _seed_tok = build_seed(agent.memory.get_history(), _user_query)
+                    if seed:
+                        print(f"[HISTORY] no provider chain for conv {str(conversation_id)[:12]} ({selected_model}): "
+                              f"restored {len(seed)} earlier message(s), ~{_seed_tok} tokens, from the saved chat")
+                except Exception as _seed_err:
+                    print(f"[HISTORY] rebuild failed (non-fatal): {_seed_err}")
+                    seed = []
+            if seed and detect_provider(selected_model) not in ("tacc", "deepseek"):
+                from core.history_rebuild import as_recap_text
+
+                text = as_recap_text(seed) + text
+                seed = []
+            if not _prefetch and not seed:
+                return text
+            items = [*seed, {"role": "user", "content": text}]
+            for ex in _prefetch:
+                items.append({"type": "function_call", "call_id": ex["call_id"],
+                              "name": ex["name"], "arguments": ex.get("arguments", "{}")})
+                items.append({"type": "function_call_output", "call_id": ex["call_id"],
+                              "output": ex["output"]})
+                try:
+                    agent.client.responses.note_untrusted_call(ex["call_id"])
+                except Exception:
+                    pass
+            return items
 
         # 4b. Paper query safety net — even if RAG context leaked in above,
         #     force the LLM to call search_papers (ADS) for paper queries.
@@ -2481,6 +2656,105 @@ def _stream_response_api_impl(
             _web_listing_pending = False
             _emit_registry_sources(images=_web_listing_images)
 
+        # Tool packs (core/tool_packs.py): offer only the tools this turn
+        # needs instead of all ~200 schemas on every call. `_tp_all` keeps the
+        # full per-request list (web stripping, user MCP and personal tools
+        # already applied) for find_tools, unoffered calls and the retry.
+        from core import tool_packs as _tool_packs
+
+        try:
+            from core.call_tokens import count as _ct_count
+
+            _rag_tokens_est = _ct_count(rag_context) if rag_context else 0
+        except Exception:
+            _rag_tokens_est = 0
+        _tp_active = _tool_packs.enabled() and not _bench_ts.active() and bool(tools)
+        _tp_all = list(tools)
+        _tp_all_by_name = {t.get("name"): t for t in _tp_all if t.get("name")}
+        _tp_expanded = False
+        _tp_called: set = set()
+        if _tp_active:
+            try:
+                _tp_signal_packs = []
+                if _is_alma_science_archive_query or _is_data_product_triage_query:
+                    _tp_signal_packs.append("alma")
+                if _is_cross_archive_source_match_query or _is_archive_fetch:
+                    _tp_signal_packs += ["alma", "multi_archive"]
+                if _is_archive_overlay_query:
+                    _tp_signal_packs += ["multi_archive", "imaging"]
+                if _is_paper_query or _is_openalex_query:
+                    _tp_signal_packs.append("literature")
+                if _is_imagery_request:
+                    _tp_signal_packs.append("imaging")
+                if _is_radio_sed_query:
+                    _tp_signal_packs.append("blazar_sed")
+                _tp_forced = []
+                if _oneshot_intent:
+                    _tp_forced.append(_oneshot_intent.get("tool"))
+                    _tp_forced += [c.get("tool") for c in (_oneshot_intent.get("calls") or []) if isinstance(c, dict)]
+                try:  # a missing/odd memory must never disable packs
+                    _tp_prior = _tool_packs.prior_user_message(agent.memory.get_history(), _user_query)
+                except Exception:
+                    _tp_prior = ""
+                _tp_sel = _tool_packs.select(
+                    _user_query,
+                    registered=[t.get("name") for t in _tp_all if t.get("name")],
+                    directive_text=full_input[_full_input_base_len:],
+                    forced_tools=[n for n in _tp_forced if n],
+                    conversation_id=conversation_id,
+                    prior_user_text=_tp_prior,
+                    web_mode=_web_mode,
+                    has_attachments=bool(attachments),
+                    extra_packs=_tp_signal_packs,
+                )
+                _ordered = [_tp_all_by_name[n] for n in _tp_sel["names"] if n in _tp_all_by_name]
+                _ordered += [t for t in _tp_all if t.get("name") in (set(_user_mcp_tools) | set(_request_tools))
+                             and t.get("name") not in set(_tp_sel["names"])]
+                _ordered += [t for t in _tp_all if t.get("type") != "function"]
+                tools = [_tool_packs.find_tools_schema()] + [t for t in _ordered if t.get("name") != _tool_packs.FIND_TOOLS]
+                print(
+                    f"[TOOL PACKS] offered {len(tools)}/{len(_tp_all) + 1} tools; packs={_tp_sel['packs']} "
+                    f"extra={_tp_sel['extra_tools'][:8]} reasons={_tp_sel['reasons']}"
+                )
+            except Exception as _tp_err:
+                print(f"[TOOL PACKS] selection failed, offering every tool (non-fatal): {_tp_err}")
+                _tp_active = False
+                tools = _tp_all
+
+        # Direct dispatch (token plan rank 6): a one-shot intent whose
+        # arguments are complete runs BEFORE the first model call, so the turn
+        # takes one model call instead of two. Chat-shim and OpenAI providers
+        # only (their input accepts a function_call + output exchange).
+        _dispatch_calls: List[Any] = []
+        _dispatch_prefix = None
+        _dispatch_done = False
+        if (
+            _oneshot_intent and _oneshot_intent.get("dispatch") and not attachments
+            and os.getenv("QUASAR_ONESHOT_DISPATCH", "1").strip().lower() not in ("0", "false", "no", "off")
+            and detect_provider(selected_model) in ("tacc", "deepseek", "openai")
+            and not _bench_ts.active()
+        ):
+            _dtool = _oneshot_intent.get("tool")
+            _dargs_list = _oneshot_intent.get("calls") or [_oneshot_intent.get("args") or {}]
+            if _dtool and _dtool in _tp_all_by_name:
+                _dispatch_calls = [(_dtool, dict(a)) for a in _dargs_list if isinstance(a, dict)]
+                _d_directive = _oneshot_intent.get("directive") or ""
+                if _d_directive and _d_directive in full_input:
+                    from core.oneshot_routing import dispatched_directive
+
+                    full_input = full_input.replace(_d_directive, dispatched_directive(_d_directive), 1)
+                print(f"[ROUTING] direct dispatch: {len(_dispatch_calls)} x {_dtool} before the first model call")
+
+        def _tp_offer(names, why):
+            """Add tools (registered and allowed this request) to the offered list."""
+            nonlocal tools
+            _have = {t.get("name") for t in tools}
+            _new = [n for n in names if n in _tp_all_by_name and n not in _have]
+            if _new:
+                tools = tools + [_tp_all_by_name[n] for n in _new]
+                print(f"[TOOL PACKS] +{len(_new)} tools ({why}): {_new[:10]}")
+            return _new
+
         # Visible to the turn-level error handler below: a provider failure
         # after tool rounds must still be able to return the evidence collected.
         output_text = ""
@@ -2491,6 +2765,20 @@ def _stream_response_api_impl(
             # Smart token budget replaces hard MAX_TOOL_ROUNDS = 12
             _token_budget = TokenBudget(max_budget=100_000)
             last_id = agent._get_response_id(conversation_id, selected_model)
+            if last_id and detect_provider(selected_model) == "openai" and not _bench_ts.active():
+                # OpenAI keeps the chain server-side, so the shim cannot compact
+                # it (core/history_compact.py does that for TACC/DeepSeek). Past
+                # the cap, start a fresh chain: round 0 then restores the saved
+                # chat as a bounded recap (core/history_rebuild.py).
+                try:
+                    _srv_hist = agent.client.responses.history_tokens_after(last_id)
+                    _srv_cap = _env_int("QUASAR_SERVER_HISTORY_CAP_TOKENS", 24000)
+                    if _srv_hist is not None and _srv_cap > 0 and _srv_hist > _srv_cap:
+                        print(f"[HISTORY] server-side chain for conv {str(conversation_id)[:12]} carries "
+                              f"~{_srv_hist} history tokens (> {_srv_cap}); starting a fresh chain from the saved chat")
+                        last_id = None
+                except Exception as _srv_err:
+                    print(f"[HISTORY] server-side history check failed (non-fatal): {_srv_err}")
             output_text = ""
             _had_tool_calls = False
             _web_tool_results: List[Dict[str, Any]] = []
@@ -2560,6 +2848,15 @@ def _stream_response_api_impl(
                 _instructions = _bench_ts.BENCH_SYSTEM_PROMPT
             else:
                 _instructions = agent.system_prompt + ("\n\n" + DUAL_SOURCE_SCAFFOLD if _dual_source_active else "")
+                # Per-request suffix (memory policy + this user's profile block +
+                # personal-document hint), rendered ONCE by the SSE layer for the
+                # whole turn. Appended last so the shared prefix stays stable for
+                # provider prefix caching; the chat shim refreshes the cached
+                # system message when this changes (core/llm_client.py).
+                if _personal.get("instructions_suffix"):
+                    _instructions = _instructions + _personal["instructions_suffix"]
+                    print(f"[MEMORY] per-turn instructions suffix applied ({len(_personal['instructions_suffix'])} chars, "
+                          f"profile={'USER MEMORY' in _personal['instructions_suffix']})")
 
             # 5. Call Responses API with manual streaming loop
             _max_rounds = getattr(_token_budget, 'HARD_MAX_ITERATIONS', 25)
@@ -2589,12 +2886,19 @@ def _stream_response_api_impl(
                     or _is_cross_archive_source_match_query or _is_archive_overlay_query
                     or bool(_oneshot_intent)
                 )
+                if _tp_active and _eff_round > 0 and isinstance(_next_input, list):
+                    # v2 follow-up playbooks name the tools they want next.
+                    _guidance = " ".join(str(i.get("content", "")) for i in _next_input
+                                         if isinstance(i, dict) and i.get("role") == "user")
+                    if _guidance:
+                        _tp_offer(_tool_packs.tool_names_in_text(_guidance, _tp_all_by_name), "follow-up guidance")
                 request_kwargs = {
                     "model": selected_model,
                     # Rounds > 0 send the budgeted tool outputs plus, in the v2
                     # bundle, at most one user-role guidance item (_next_input);
                     # the evidence accumulators never see that item.
-                    "input": full_input if _eff_round == 0 else (_next_input if _next_input is not None else tool_results),
+                    "input": (_round0_input(full_input) if _eff_round == 0
+                              else (_next_input if _next_input is not None else tool_results)),
                     "instructions": _instructions,
                     "previous_response_id": last_id,
                     "tools": tools,
@@ -2603,6 +2907,13 @@ def _stream_response_api_impl(
                     "stream": True,
                     "user_id": user_id,
                     "session_id": conversation_id,
+                    # per-call token accounting only (core/call_tokens.py)
+                    "_call_meta": {
+                        "round": _eff_round,
+                        "conv": str(conversation_id or "")[:12],
+                        "rag_tokens": _rag_tokens_est if _eff_round == 0 else 0,
+                        "tool_packs": _tp_active and not _tp_expanded,
+                    },
                 }
                 if _turn_exit_reason is None and _eff_round > 0:
                     if _eff_round >= _max_tool_rounds:
@@ -2699,6 +3010,22 @@ def _stream_response_api_impl(
                     _round_had_reasoning = False
                     _reasoning_emitted = False     # Track if we emitted the reasoning header
                     _emit_reasoning_details = True  # Stream the model-provided reasoning summary.
+
+                    if _dispatch_calls and _eff_round == 0 and not _finalizing and not _dispatch_done:
+                        _dispatch_done = True
+                        # Direct dispatch: this round's calls are known; no model
+                        # call. Round 1 receives the question + these calls +
+                        # their outputs as one input (built after execution).
+                        _r0 = request_kwargs["input"]
+                        _r0_items = list(_r0) if isinstance(_r0, list) else [{"role": "user", "content": str(_r0)}]
+                        for _dn, _da in _dispatch_calls:
+                            _dcid = f"call_qd{uuid.uuid4().hex[:14]}"
+                            function_calls[_dcid] = {"name": _dn, "arguments": json.dumps(_da), "call_id": _dcid}
+                        _dispatch_prefix = _r0_items + [
+                            {"type": "function_call", "call_id": c, "name": f["name"], "arguments": f["arguments"]}
+                            for c, f in function_calls.items()
+                        ]
+                        break
 
                     try:
                         try:
@@ -2902,6 +3229,26 @@ def _stream_response_api_impl(
                             on_status("Provider stream interrupted — retrying", "completed")
                 
                 if not function_calls:
+                    if (
+                        _tp_active and not _tp_expanded and not _finalizing
+                        and len(output_text) == _round_text_len_before
+                        and _tool_packs.says_lacks_tool(_round_text_buffer)
+                    ):
+                        # Nothing of this round has reached the user yet and the
+                        # model says it has no tool for the job: re-sample the
+                        # round once with every tool offered (core/tool_packs.py).
+                        _tp_expanded = True
+                        _tp_offer([t.get("name") for t in _tp_all], "answer said a tool was missing")
+                        print(f"[TOOL PACKS] round {_eff_round} said a tool is missing "
+                              f"({_round_text_buffer[:160]!r}) — re-sampling with the full toolset")
+                        _round_offset += 1
+                        last_id = _round_prev_last_id
+                        # The discarded response must not stay the stored chain
+                        # head if the re-sample then fails (guard CX-11).
+                        agent._set_response_id(conversation_id, _round_prev_last_id, selected_model, run_token)
+                        continue
+                    if _tp_active and _tool_packs.says_lacks_tool(output_text[_round_text_len_before:] + _round_text_buffer):
+                        print("[TOOL PACKS] answer says a tool is missing but text already streamed — no retry")
                     if _round_text_buffer:  # round-0 route buffer or held narration
                         output_text += _round_text_buffer
                         if on_token:
@@ -2991,6 +3338,14 @@ def _stream_response_api_impl(
                 _next_input = None
                 _round_duplicates = 0
                 for fc in function_calls.values():
+                    # Personal-document results are untrusted user-file text:
+                    # registered by call id for EVERY provider, so the shim can
+                    # expire them and recovery/fallback paths can drop them.
+                    if fc.get("name") == "search_my_documents":
+                        try:
+                            agent.client.responses.note_untrusted_call(fc.get("call_id", ""))
+                        except Exception:
+                            pass
                     # Check run liveness between tools, not only at round tops —
                     # each remaining call can burn its full guard budget (150 s
                     # default) after the stream is already dead, and a batch of
@@ -3010,6 +3365,34 @@ def _stream_response_api_impl(
                     except json.JSONDecodeError:
                         args = {}
                     args = _unescape_tool_args(args)
+                    if tool_name == _tool_packs.FIND_TOOLS:
+                        # Meta-tool (core/tool_packs.py): load more tools for
+                        # the next round; nothing external runs.
+                        # Only this request's allowed tools (web-stripped, allowlist)
+                        # can be found or loaded (guard CX-03).
+                        _found = _tool_packs.resolve_find_tools(
+                            args,
+                            [t for t in agent.tool_registry.list_tools() if t.name in _tp_all_by_name],
+                            [t.get("name") for t in tools],
+                        ) if _tp_active else {"add": [], "packs": [], "text": "Every tool is already loaded."}
+                        _need_txt = str(args.get("need", "") if isinstance(args, dict) else args)[:80]
+                        _added = _tp_offer(_found["add"], f"find_tools need={_need_txt!r}")
+                        print(f"[TOOL CALL] find_tools({args}) -> packs={_found['packs']} added={len(_added)}")
+                        if on_status:
+                            on_status("Loading more tools", "running")
+                            on_status("Loading more tools", "completed")
+                        result_str = json.dumps({"success": True, "loaded_tools": _added, "note": _found["text"]})
+                        agent._record_tool_trace(tool_name, args, result_str)
+                        tool_results.append({"type": "function_call_output", "call_id": fc["call_id"], "output": result_str})
+                        continue
+                    _tp_called.add(tool_name)
+                    if _tp_active and tool_name not in {t.get("name") for t in tools}:
+                        # A registered tool the model knew about but was not
+                        # offered: it still runs below; offer it (and its pack)
+                        # from the next round so later calls see its schema.
+                        _tp_offer([tool_name] + [n for p in _tool_packs.packs_for_tool(tool_name)
+                                                 for n in _tool_packs.PACKS[p]["tools"]],
+                                  f"model called unoffered {tool_name}")
                     _call_key = tool_call_key(tool_name, args)
                     _prior_call = _seen_tool_calls.get(_call_key)
                     _polling = bool(re.search(r"status|poll|wait|job", tool_name))
@@ -3164,7 +3547,7 @@ def _stream_response_api_impl(
                     _tool_timed_out = False
                     from core import bench_toolset as _bench_ts
 
-                    tool = _user_mcp_tools.get(tool_name) or (
+                    tool = _user_mcp_tools.get(tool_name) or _request_tools.get(tool_name) or (
                         agent.tool_registry.get_tool(tool_name) if _bench_ts.allowed(tool_name) else None
                     )
                     if not tool:
@@ -3321,9 +3704,6 @@ def _stream_response_api_impl(
                                     _payload = json.dumps({"_eager_result": True, "_idx": len(agent._accumulated_run_results) - 1, "_inline": True})
                                     on_status(f"__eager_data__{json.dumps(_paper_rc, default=str)}", "data")
                                     on_status(f"__data_ready__{_payload}", "ready")
-                            # Record tool calls for session memory
-                            agent.session_memory.record_tool_calls(1)
-
                             # Emit web_sources event for LLM-initiated web searches
                             # so source cards + images always appear in the UI.
                             if tool_name in {
@@ -3454,6 +3834,15 @@ def _stream_response_api_impl(
                             print(f"[PROMPT V2] follow-up playbooks={[p.id for p in _new_pbs]} after {_called}")
                     except Exception as _pv2_err:
                         print(f"[PROMPT V2] follow-up selection failed: {_pv2_err}")
+                if _dispatch_prefix is not None:
+                    # Directly dispatched round 0: the next request carries the
+                    # question, the calls and their outputs as one exchange.
+                    _next_input = [*_dispatch_prefix, *(_next_input if _next_input is not None else tool_results)]
+                    _dispatch_prefix = None
+
+            if _tp_active:
+                # every turn ages the sticky window, tool-free ones too (guard CX-10)
+                _tool_packs.remember_called(conversation_id, _tp_called)
 
             # A deadline/cancel break must not fall through into composition,
             # web-thread joins, and citation verification — that postprocessing
@@ -3765,16 +4154,6 @@ def _stream_response_api_impl(
                 verification_sink=_citation_metrics_sink,
             )
             output_text = safe_assistant_text(output_text)
-            if agent.long_term_memory and not _is_anonymous:
-                try:
-                    messages = [
-                        {"role": "user", "content": query},
-                        {"role": "assistant", "content": output_text}
-                    ]
-                    agent.long_term_memory.add(messages, user_id=user_id)
-                except Exception as e:
-                    print(f"[WARNING] mem0 memory add failed: {e}")
-            
             return safe_assistant_text(output_text)
             
         except QuotaExceededError as qe:
@@ -3860,6 +4239,8 @@ def _stream_response_api_impl(
                         model=selected_model,
                         run_token=run_token,
                         _history_recovery_attempted=True,
+                        web_search_mode=web_search_mode,
+                        turn_personalization=turn_personalization,
                     )
             # Log the full traceback server-side; the user only ever sees the
             # friendly message from _user_facing_provider_error.

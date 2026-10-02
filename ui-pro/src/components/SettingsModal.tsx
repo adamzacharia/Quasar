@@ -11,6 +11,7 @@ import { useChatStore } from "../lib/store";
 import { EVAL_MODE_ENABLED } from "../lib/use-eval-mode";
 import { useAvailableModels } from "../lib/useAvailableModels";
 import { MCPServersPanel as ConnectMCPServersPanel } from "./MCPServersPanel";
+import { MemoryPanel } from "./MemoryPanel";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -156,7 +157,17 @@ function PersonalizationPanel() {
             });
             const data = await res.json();
             if (res.ok) {
-                setUploadMsg({ type: "success", text: data.message || "Documents uploaded and indexed!" });
+                // The route answers 200 even when files fail ("0/3 indexed"):
+                // only an all-success upload is green, and each failure is named.
+                const results: { filename?: string; success?: boolean; error?: string }[] =
+                    Array.isArray(data.results) ? data.results : [];
+                const failed = results.filter(r => !r.success);
+                if (failed.length === 0) {
+                    setUploadMsg({ type: "success", text: data.message || "Documents uploaded and indexed!" });
+                } else {
+                    const detail = failed.map(r => `${r.filename || "file"}: ${r.error || "could not be indexed"}`).join("; ");
+                    setUploadMsg({ type: "error", text: `${data.message || "Some files failed."} ${detail}` });
+                }
                 fetchDocs();
             } else {
                 setUploadMsg({ type: "error", text: data.detail || "Upload failed." });
@@ -165,7 +176,7 @@ function PersonalizationPanel() {
             setUploadMsg({ type: "error", text: "Upload failed — is the backend running?" });
         }
         setUploading(false);
-        setTimeout(() => setUploadMsg(null), 4000);
+        setTimeout(() => setUploadMsg(prev => (prev && prev.type === "error" ? prev : null)), 4000);
     };
 
     const deleteDoc = async (docId: string, filename: string) => {
@@ -176,8 +187,15 @@ function PersonalizationPanel() {
                 method: "DELETE",
                 headers: authBearerHeaders(),
             });
-            if (res.ok) setDocs(prev => prev.filter(d => d.id !== docId));
-        } catch { /* noop */ }
+            if (res.ok) {
+                setDocs(prev => prev.filter(d => d.id !== docId));
+            } else {
+                const data = await res.json().catch(() => ({}));
+                setUploadMsg({ type: "error", text: data.detail || `Could not delete "${filename}".` });
+            }
+        } catch {
+            setUploadMsg({ type: "error", text: `Could not delete "${filename}" (is the backend running?).` });
+        }
     };
 
     const onDrop = (e: React.DragEvent) => {
@@ -194,7 +212,7 @@ function PersonalizationPanel() {
                 <div>
                     <p className="text-sm font-semibold text-slate-300">Sign in to use Personalization</p>
                     <p className="text-xs text-slate-500 mt-1.5 max-w-xs">
-                        Your personal knowledge base is tied to your account. Sign in to upload documents, books, and notes that Quasar will remember.
+                        Your personal knowledge base is tied to your account. Sign in to upload notes and documents Quasar can search for you.
                     </p>
                 </div>
             </div>
@@ -206,7 +224,7 @@ function PersonalizationPanel() {
             <div>
                 <h3 className="text-sm font-semibold text-white mb-1">Personal Knowledge Base</h3>
                 <p className="text-xs text-slate-400">
-                    Upload documents, PDFs, books, or notes. Quasar will index them and use them as part of your long-term memory during conversations. Only you can access your documents.
+                    Upload notes, drafts, papers or observing logs. Quasar searches them when a question refers to your own material (for example "my notes" or "my proposal"). Only you can access your documents. Preferences such as units and citation style live under Memory.
                 </p>
             </div>
 
@@ -220,7 +238,7 @@ function PersonalizationPanel() {
                     ${dragging ? "border-primary bg-primary/10" : "border-slate-700 hover:border-slate-500 hover:bg-slate-800/40"}`}
             >
                 <input ref={fileInputRef} type="file" multiple hidden
-                    accept=".pdf,.txt,.md,.csv,.json,.docx"
+                    accept=".pdf,.txt,.md"
                     onChange={e => e.target.files && uploadFiles(e.target.files)}
                 />
                 {uploading ? (
@@ -230,7 +248,7 @@ function PersonalizationPanel() {
                         <Upload className="w-8 h-8 text-slate-500" />
                         <div className="text-center">
                             <p className="text-sm font-medium text-slate-300">Drop files here or click to browse</p>
-                            <p className="text-xs text-slate-500 mt-1">Supports PDF, TXT, MD, CSV, JSON, DOCX</p>
+                            <p className="text-xs text-slate-500 mt-1">Supports PDF, TXT, MD</p>
                         </div>
                     </>
                 )}
@@ -1608,7 +1626,7 @@ interface SettingsModalProps {
     initialTab?: TabType;
 }
 
-type TabType = 'personalization' | 'providerKeys' | 'mcp' | 'analytics';
+type TabType = 'personalization' | 'memory' | 'providerKeys' | 'mcp' | 'analytics';
 
 export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps) {
     const backdropRef = useRef<HTMLDivElement>(null);
@@ -1661,6 +1679,14 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
                         >
                             <FileText className="w-4 h-4" />
                             Personalization
+                        </button>
+
+                        <button
+                            onClick={() => setCurrentTab('memory')}
+                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${currentTab === 'memory' ? "bg-primary/10 text-primary border border-primary/20" : "text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent"}`}
+                        >
+                            <Sparkles className="w-4 h-4" />
+                            Memory
                         </button>
 
                         <button
@@ -1740,11 +1766,13 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
                 <div className="flex-1 overflow-hidden flex flex-col">
                     <div className="px-6 py-5 border-b border-slate-700/50 shrink-0">
                         <h2 className="text-base font-semibold text-white">
-                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'providerKeys' ? "Provider Keys" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
+                            {currentTab === 'personalization' ? "Personalization" : currentTab === 'memory' ? "Memory" : currentTab === 'providerKeys' ? "Provider Keys" : currentTab === 'analytics' ? "Analytics" : "MCP Servers"}
                         </h2>
                         <p className="text-xs text-slate-400 mt-0.5">
-                            {currentTab === 'personalization' 
-                                ? "Your private knowledge base for smarter conversations" 
+                            {currentTab === 'personalization'
+                                ? "Your private knowledge base for smarter conversations"
+                                : currentTab === 'memory'
+                                ? "Preferences and research context Quasar keeps across chats"
                                 : currentTab === 'providerKeys'
                                 ? "Bring your own provider API keys and view included quota"
                                 : currentTab === 'analytics'
@@ -1755,6 +1783,7 @@ export function SettingsModal({ open, onClose, initialTab }: SettingsModalProps)
                     
                     <div className="flex-1 overflow-hidden">
                         {currentTab === 'personalization' && <PersonalizationPanel />}
+                        {currentTab === 'memory' && <MemoryPanel />}
                         {currentTab === 'providerKeys' && <ProviderKeysPanel />}
                         {currentTab === 'mcp' && <ConnectMCPServersPanel />}
                         {currentTab === 'analytics' && <AnalyticsPanel />}

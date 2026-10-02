@@ -81,6 +81,9 @@ logger = logging.getLogger(__name__)
 GENERAL_COLLECTION = "alma_general"
 RUBRICS_COLLECTION = "proposal_rubrics"
 
+_PERSONAL_INDEXED: set = set()
+
+
 def _personal_collection(user_id: str) -> str:
     """Return the Qdrant collection name for a user's personal docs."""
     return f"user_{user_id}_personal"
@@ -670,6 +673,12 @@ class RAGService:
         ensure_collection(self.general_collection)
         if self.personal_collection:
             ensure_collection(self.personal_collection)
+            # delete/count filters on doc_id and source_file need payload
+            # indexes on Qdrant Cloud strict mode (once per process+collection)
+            if self.personal_collection not in _PERSONAL_INDEXED:
+                from services.vector_db import ensure_personal_indexes
+                ensure_personal_indexes(self.personal_collection)
+                _PERSONAL_INDEXED.add(self.personal_collection)
         ensure_collection(self.rubrics_collection)
 
     # ------------------------------------------------------------------
@@ -1534,17 +1543,18 @@ class RAGService:
             print(f"Get personal documents failed: {e}")
         return []
 
-    def delete_personal_document(self, filename: str) -> bool:
-        """Delete a document from personal collection by filename"""
+    def delete_personal_document(self, filename: str, doc_id: Optional[str] = None,
+                                 legacy_by_filename: bool = True) -> int:
+        """Delete one personal document's vectors; return the number REMAINING.
+
+        Raises on a backend error so the caller never reports success for a
+        delete that did not happen (audit 2026-10-01: failures were swallowed).
+        """
         if not self.personal_collection:
-            return False
+            return 0
+        from services.vector_db import delete_personal_doc_points
 
-        try:
-            return delete_by_filter(self.personal_collection, {"source_file": filename})
-        except Exception as e:
-            print(f"Delete failed: {e}")
-
-        return False
+        return delete_personal_doc_points(self.personal_collection, doc_id, filename, legacy_by_filename)
 
 
 # Backwards compatibility alias

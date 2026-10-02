@@ -82,6 +82,14 @@ def _mast_query(fn, *args, **kwargs):
     return result
 
 
+def _with_cap_attrs(df: pd.DataFrame, max_results: int, total_rows: int) -> pd.DataFrame:
+    """Record the row cap and the exact pre-cap total so the tool can say
+    'N of TOTAL' instead of reporting the cap as the count (MANNA evals MQ22)."""
+    df.attrs["row_cap"] = int(max_results)
+    df.attrs["total_count"] = int(total_rows)
+    return df
+
+
 class MASTClient:
     """
     Deep query client for MAST archive (JWST, HST, TESS, Kepler).
@@ -197,11 +205,12 @@ class MASTClient:
             df = obs.to_pandas()
 
             # Limit results
+            total_rows = len(df)  # exact: astroquery returned every match
             if len(df) > max_results:
                 df = df.head(max_results)
 
             print(f"[MAST] Found {len(df)} observations")
-            return self._standardize_columns(df)
+            return _with_cap_attrs(self._standardize_columns(df), max_results, total_rows)
 
         except Exception as e:
             print(f"[MAST] Search error: {e}")
@@ -252,11 +261,12 @@ class MASTClient:
                 return pd.DataFrame()
 
             df = obs.to_pandas()
+            total_rows = len(df)  # exact: astroquery returned every match
             if len(df) > max_results:
                 df = df.head(max_results)
 
             print(f"[MAST] Found {len(df)} observations")
-            return self._standardize_columns(df)
+            return _with_cap_attrs(self._standardize_columns(df), max_results, total_rows)
 
         except Exception as e:
             print(f"[MAST] Position search error: {e}")
@@ -332,11 +342,12 @@ class MASTClient:
                 return pd.DataFrame()
 
             df = obs.to_pandas()
+            total_rows = len(df)  # exact: astroquery returned every match
             if len(df) > max_results:
                 df = df.head(max_results)
 
             print(f"[MAST] Found {len(df)} observations")
-            return self._standardize_columns(df)
+            return _with_cap_attrs(self._standardize_columns(df), max_results, total_rows)
 
         except Exception as e:
             print(f"[MAST] Criteria search error: {e}")

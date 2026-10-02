@@ -129,6 +129,8 @@ export interface StreamCallbacks {
         mode?: string; need_web: boolean; reason?: string; queries?: string[]; source?: string;
         planner_ms?: number | null; domain_pack?: string | null; freshness?: string | null; follow_up?: boolean;
     }) => void;
+    /** Long-term memory writes saved from this turn ("Memory updated" chip). */
+    onMemoryUpdate?: (events: import("./types").MemoryUpdateEvent[]) => void;
     onConversationMeta?: (meta: { conversation_id: string }) => void;
     onRunMeta?: (meta: ChatRunMeta) => void;
     onUsage?: (usage: {
@@ -382,6 +384,8 @@ export async function sendChatMessage(request: ChatRequest, callbacks: StreamCal
                             callbacks.onConversationMeta(parsed);
                         } else if (parsed.type === "usage" && callbacks.onUsage) {
                             callbacks.onUsage(parsed);
+                        } else if (parsed.type === "memory_update" && callbacks.onMemoryUpdate) {
+                            callbacks.onMemoryUpdate(Array.isArray(parsed.events) ? parsed.events : []);
                         } else if (parsed.type === "web_decision" && callbacks.onWebDecision) {
                             callbacks.onWebDecision(parsed);
                         } else if (parsed.type === "web_sources" && callbacks.onWebSources) {

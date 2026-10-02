@@ -33,8 +33,8 @@ class BrowseSchema(BaseCapability):
     description = (
         "Browse the curated schema profile of an archive BEFORE writing a query: "
         "canonical tables/columns with units, top pitfalls, and golden example tool calls. "
-        "Archives: datalab, alma, ads_openalex, sia_hips, vo, splatalogue, gaia, eso, cadc "
-        "(aliases accepted). "
+        "Archives: datalab, alma, ads_openalex, sia_hips, vo, splatalogue, gaia, eso, cadc, "
+        "nrao (VLA/VLBA/GBT) (aliases accepted). "
         "Pass table (e.g. 'des_dr1.main' or 'ivoa.obscore') for full column-level detail."
     )
     category = "archive"
@@ -51,7 +51,7 @@ class BrowseSchema(BaseCapability):
                 "description": (
                     "Archive slug or alias: datalab, alma, ads_openalex (ads/openalex/papers), "
                     "sia_hips (hips), vo (vizier), splatalogue, gaia (ESA Gaia archive), "
-                    "eso, cadc."
+                    "eso, cadc, nrao (vla/vlba/gbt)."
                 ),
             },
             "table": {

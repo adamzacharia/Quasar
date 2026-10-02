@@ -287,6 +287,40 @@ def _frame_attr(df: Any, key: str, default=None):
         return default
 
 
+_ERROR_META_KEYS = ("infrastructure_failure", "circuit_breaker", "host", "retry_after_s",
+                    "retry_after_seconds", "retry_hint")
+
+
+def _archive_error_fields(df: Any) -> Dict[str, Any]:
+    """Structured outage signals an archive client attached to a failed-search
+    frame (``attrs["quasar_error_meta"]``, e.g. integrations/tap.py), for the
+    ``success: False`` tool result: the runner and turn recovery key on
+    ``infrastructure_failure`` / ``host``, the model reads ``retry_hint``."""
+    meta = _frame_attr(df, "quasar_error_meta")
+    if not isinstance(meta, dict):
+        return {}
+    return {k: meta[k] for k in _ERROR_META_KEYS if k in meta}
+
+
+def _with_row_cap_info(out: Dict[str, Any], returned: int, cap: Any, total: Any = None) -> Dict[str, Any]:
+    from services.row_cap import with_row_cap
+
+    return with_row_cap(out, returned, cap, total)
+
+
+def _adql_row_cap(query: Any, results: Any) -> Any:
+    """The cap a model-written ALMA ADQL ran under: its own TOP n, else the
+    client's maxrec overflow flag (alminer_client sets attrs['truncated'])."""
+    from services.row_cap import adql_row_limit
+
+    top = adql_row_limit(query)
+    if top:
+        return top
+    if _frame_attr(results, "truncated"):
+        return len(results)
+    return None
+
+
 def _result_summary(df: Any) -> Dict[str, Any]:
     """rows / MOUS / EB / project counts plus the honest note (guardrail 1)."""
     counts = aggregate_counts(df)
@@ -389,6 +423,7 @@ class SearchByPosition(BaseCapability):
             # ALMA: the band goes into the cone query itself (TAP ADQL / full
             # ALminer frame before the cap); the post-filter below is idempotent.
             _band_kw = {"band": band} if facility_label == "ALMA" and band is not None else {}
+            _band_server_side = {"ok": bool(_band_kw)}
 
             def _cone(**extra):
                 try:
@@ -397,6 +432,9 @@ class SearchByPosition(BaseCapability):
                     # a service without the band keyword (older facade / fakes)
                     if not _band_kw or "band" not in str(exc):
                         raise
+                    # the band then runs ONLY in the post-filter below, after
+                    # the cap and the COUNT companion (Codex CX-01 round 2)
+                    _band_server_side["ok"] = False
                     return search_service.cone_search(ra, dec, radius, facility, max_results, **extra)
 
             if facility_label == "ALMA" and public_only:
@@ -423,20 +461,34 @@ class SearchByPosition(BaseCapability):
                         "data exist at this position — this is an archive/service error, "
                         "not a confirmed 'no data' result."
                     ),
+                    **_archive_error_fields(results),
                 })
 
             # Post-filter by band if specified (token match: band_list is space
             # delimited, '5 10' band-to-band rows must survive; A-08/A-47)
             band_note = None
+            post_filtered = False  # a scan-intent filter makes the COUNT companion a cone total (CX-01)
             if band is not None and not results.empty:
                 band_vals = requested_bands(band)
                 if band_vals:
                     b_col = next((c for c in ['band_list', 'Band', 'band'] if c in results.columns), None)
                     if b_col:
                         before = len(results)
+                        _attrs = dict(getattr(results, "attrs", {}) or {})
                         results = results[results[b_col].apply(lambda x: row_matches_band(x, band_vals))]
+                        results.attrs.update({k: v for k, v in _attrs.items() if k not in results.attrs})
                         _log(f"[FILTER] Band {band}: {before} → {len(results)} rows")
                         band_note = _band_filter_note(results, band_vals)
+                        # Idempotent when the client applied the band before its
+                        # COUNT companion (Codex CX-12); a real post-filter otherwise.
+                        # Ground truth is the cone the client EXECUTED: its recorded
+                        # filters are the ones its COUNT companion used, whatever any
+                        # compatibility layer in between dropped (CX-01 rounds 2-3).
+                        _executed = _frame_attr(results, "quasar_cone") or {}
+                        _band_in_count = (_band_server_side["ok"] and isinstance(_executed, dict)
+                                          and (_executed.get("filters") or {}).get("band") is not None)
+                        if not _band_in_count:
+                            post_filtered = True
 
             scan_filter_label = ""
             if facility_label == "ALMA" and scan_intent:
@@ -444,6 +496,7 @@ class SearchByPosition(BaseCapability):
                 results, scan_filter_label = filter_by_scan_intent(results, scan_intent)
                 if scan_filter_label:
                     _log(f"[FILTER] {scan_filter_label}: {before} → {len(results)} rows")
+                    post_filtered = True
 
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({
@@ -492,13 +545,45 @@ class SearchByPosition(BaseCapability):
             if _frame_attr(results, "scan_intent_warning"):
                 warnings_out.append(str(_frame_attr(results, "scan_intent_warning")))
             truncated = bool(_frame_attr(results, "truncated", False))
-            if truncated:
-                warnings_out.append(f"Row cap reached ({max_results}); the cone holds more rows than shown.")
+            # The parallel search already ran a COUNT(*) companion when the cap
+            # truncated (alminer_client attrs total_count / total_mous): report
+            # those, never the capped row and MOUS counts (MANNA evals MQ22).
+            total_rows = _frame_attr(results, "total_count")
+            total_mous = _frame_attr(results, "total_mous")
+            cap_fields: Dict[str, Any] = {}
+            if truncated and isinstance(total_rows, int) and post_filtered:
+                # The COUNT companion ran on the unfiltered cone; the band /
+                # scan-intent filter was applied to the capped rows afterwards,
+                # so the filtered total is unknown (Codex CX-01).
+                mous_txt = f" ({total_mous} distinct MOUS)" if isinstance(total_mous, int) else ""
+                warnings_out.append(
+                    f"Row cap reached ({max_results}): the UNFILTERED cone holds {total_rows} rows{mous_txt}; the "
+                    f"band/scan-intent filter then ran on the capped rows only, so the filtered total is unknown "
+                    f"(at least {len(results)}, at most {total_rows}). Report it as a range or lower bound."
+                )
+                cap_fields = {"returned": len(results), "total": "unknown", "count_is_lower_bound": True,
+                              "total_unfiltered_cone_rows": total_rows}
+                if isinstance(total_mous, int):
+                    cap_fields["total_unfiltered_cone_mous"] = total_mous
+            elif truncated and isinstance(total_rows, int):
+                mous_txt = f" ({total_mous} distinct MOUS)" if isinstance(total_mous, int) else ""
+                warnings_out.append(
+                    f"Row cap reached ({max_results}): the archive holds {total_rows} matching rows{mous_txt}; "
+                    f"showing {len(results)}. Report those totals; the counts in this summary cover the shown rows only."
+                )
+                cap_fields = {"returned": len(results), "total": total_rows, "count_is_lower_bound": False}
+                if isinstance(total_mous, int):
+                    cap_fields["total_mous"] = total_mous
+            elif truncated:
+                warnings_out.append(f"Row cap reached ({max_results}); the cone holds more rows than shown. "
+                                    "The counts here are lower bounds, not totals.")
+                cap_fields = {"returned": len(results), "total": "unknown", "count_is_lower_bound": True}
             return _native({
                 "success": True,
                 "total_results": len(results),
                 **summary,
                 "truncated": truncated,
+                **cap_fields,
                 "public_only": public_only,
                 "footprint_mode": (_frame_attr(results, "quasar_cone") or {}).get("footprint_mode"),
                 "ra": ra, "dec": dec, "radius_deg": radius,
@@ -667,6 +752,7 @@ class SearchByTarget(BaseCapability):
                 all_frames = []
                 searched_names = []
                 _sub_errs = []  # archive errors per target (C3 — don't mask outages)
+                _sub_meta = None  # first failed sub-search's outage meta (retry hint)
                 for _tgt, _tgt_bands in _per_target_specs:
                     if not _tgt:
                         continue
@@ -677,6 +763,7 @@ class SearchByTarget(BaseCapability):
                         _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
                         if _e:
                             _sub_errs.append(f"{_tgt}: {_e}")
+                            _sub_meta = _sub_meta or _frame_attr(df, "quasar_error_meta")
                         if not df.empty and _tgt_bands:
                             # Apply per-target band filter (token match)
                             b_col = next((c for c in ["band_list", "Band", "band"] if c in df.columns), None)
@@ -700,6 +787,8 @@ class SearchByTarget(BaseCapability):
                     results = pd.DataFrame()
                     if _sub_errs:  # preserve the archive-error signal (C3)
                         results.attrs["quasar_error"] = "; ".join(_sub_errs)
+                        if _sub_meta:
+                            results.attrs["quasar_error_meta"] = _sub_meta
                 # Skip shared band filtering below — bands already applied per target
                 band_list_input = []
 
@@ -708,6 +797,7 @@ class SearchByTarget(BaseCapability):
                 all_frames = []
                 searched_names = []
                 _sub_errs = []  # archive errors per target (C3 — don't mask outages)
+                _sub_meta = None  # first failed sub-search's outage meta (retry hint)
                 for name in raw_names[:10]:  # Cap at 10 targets
                     try:
                         df = search_service.search_by_target(
@@ -716,6 +806,7 @@ class SearchByTarget(BaseCapability):
                         _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
                         if _e:
                             _sub_errs.append(f"{name}: {_e}")
+                            _sub_meta = _sub_meta or _frame_attr(df, "quasar_error_meta")
                         if not df.empty:
                             all_frames.append(df)
                             searched_names.append(name)
@@ -733,6 +824,8 @@ class SearchByTarget(BaseCapability):
                     results = pd.DataFrame()
                     if _sub_errs:  # preserve the archive-error signal (C3)
                         results.attrs["quasar_error"] = "; ".join(_sub_errs)
+                        if _sub_meta:
+                            results.attrs["quasar_error_meta"] = _sub_meta
             else:
                 results = search_service.search_by_target(
                     target_name, facility, date_range, max_results, **_svc_kw
@@ -807,6 +900,7 @@ class SearchByTarget(BaseCapability):
                             "data exist for this target — this is an archive/service error, "
                             "not a confirmed 'no data' result."
                         ),
+                        **_archive_error_fields(results),
                     })
                 empty_out: Dict[str, Any] = {"success": True, "total_results": 0, "target": target_name, "note": "No results found."}
                 unresolved = _frame_attr(results, "resolver_unresolved")
@@ -1069,6 +1163,7 @@ class SearchByFrequency(BaseCapability):
                         "data exist in this frequency range — this is an archive/service "
                         "error, not a confirmed 'no data' result."
                     ),
+                    **_archive_error_fields(results),
                 })
             ctx.service("set_last_search_results")(results)
             ctx.service("set_last_run_result")({"type": "data", "data": results,
@@ -1225,7 +1320,7 @@ class SearchCadc(BaseCapability):
             if "access_url" in df.columns:
                 top_urls = df["access_url"].dropna().head(5).tolist()
 
-            return _native({
+            out = {
                 "success": True,
                 "total_results": len(df),
                 "telescopes": tel_summary,
@@ -1235,7 +1330,41 @@ class SearchCadc(BaseCapability):
                     f"{', '.join(f'{t} ({c})' for t, c in tel_summary.items())}. "
                     f"Full data with sky previews shown in UI table. Do NOT render a table — the UI already displays one."
                 )
-            })
+            }
+            # CADC ObsCore access_url is a DataLink document, not the FITS file
+            # (MANNA evals T12/MQ16): resolve the first few to their #this file URL.
+            if top_urls:
+                try:
+                    from services.datalink_resolve import resolve_many
+
+                    files = resolve_many(top_urls[:3])
+                except Exception:  # noqa: BLE001 - resolution is a bonus
+                    files = {}
+                out["top_access_urls_are"] = "DataLink documents (VOTable lists of files), not FITS files"
+                if files:
+                    out["fits_urls"] = files
+                    out["note"] += (" fits_urls maps each DataLink to its #this file URL: report THAT as the "
+                                    "direct access URL.")
+                else:
+                    out["note"] += (" top_access_urls are DataLink documents, not FITS files: open one "
+                                    "(web_extract_url) and use its #this row as the direct FITS URL.")
+            # Row cap (TOP max_results): ask CADC for the exact total on the same
+            # predicate instead of letting the cap read as a count (MQ22).
+            if len(df) >= int(max_results):
+                total = None
+                try:
+                    from integrations.tap import _TimeoutHTTPSession
+
+                    count_where = adql.split("WHERE", 1)[1]
+                    count_tap = pyvo.dal.TAPService(tap_url, session=_TimeoutHTTPSession(timeout=30.0))
+                    count_tab = count_tap.search(f"SELECT COUNT(*) AS n FROM ivoa.ObsCore WHERE {count_where}").to_table()
+                    total = int(count_tab[count_tab.colnames[0]][0])
+                except Exception:  # noqa: BLE001 - unknown total is reported as such
+                    total = None
+                out = _with_row_cap_info(out, len(df), max_results, total)
+                if isinstance(total, int) and total >= len(df):
+                    out["total_results"] = total
+            return _native(out)
         except ImportError:
             return _native({"success": False, "error": "pyvo library not installed. Run: pip install pyvo"})
         except Exception as e:
@@ -1437,6 +1566,14 @@ class AdvancedSearch(BaseCapability):
                         "(Gaia/DES/DESI/NSC/SMASH/...), use datalab_sql_query instead."
                     ),
                 })
+            # The ALMA archive has no VLA/VLBA/GBT rows; a filter on them is an
+            # NRAO question asked of the wrong archive (MANNA evals T10/T18/MQ14).
+            try:
+                from services.adql_preflight import PreflightRejection, check_alma_adql
+
+                check_alma_adql(query)
+            except PreflightRejection as rej:
+                return _native({"success": False, "error": str(rej), "hint": rej.hint, "query_sent": False})
             results = ctx.service("search_service").advanced_search(query)
             # Outage vs. genuinely-empty (C3 / scan CAP-03).
             _adv_err = results.attrs.get("quasar_error") if hasattr(results, "attrs") else None
@@ -1459,12 +1596,13 @@ class AdvancedSearch(BaseCapability):
             except Exception:  # noqa: BLE001
                 pass
 
-            return _native({
+            out = {
                 "success": True,
                 "count": len(results),
                 **_result_summary(results),
                 "results": results.to_dict("records") if not results.empty else []
-            })
+            }
+            return _native(_with_row_cap_info(out, len(results), _adql_row_cap(query, results)))
         except Exception as e:
             return _native({"success": False, "error": str(e)})
 

@@ -215,7 +215,8 @@ class GetSkyImage(BaseCapability):
         "and PNG preview from surveys like DSS2 (optical), 2MASS (near-IR), "
         "SDSS (optical), WISE (mid-IR), NVSS/FIRST (radio). "
         "Use this when users ask for 'an image of', 'show me', 'DSS image', "
-        "or 'what does X look like'."
+        "or 'what does X look like'. It renders a preview saved on the Quasar server; "
+        "it gives no archive access URL (for 'direct access/FITS URL' asks use vo_image_search)."
     )
     category = "general"
     InputModel = GetSkyImageInput
@@ -274,10 +275,14 @@ class GetSkyImage(BaseCapability):
                 "fits_path": result.get("fits_path", ""),
                 "preview_path": result.get("preview_path", ""),
                 "image_shape": result.get("image_shape"),
+                "paths_are_local": True,
                 "note": (
                     f"Fetched {result.get('survey')} image for {label}. "
                     f"FITS saved to: {result.get('fits_path', 'N/A')}. "
-                    f"Preview shown in UI."
+                    f"Preview shown in UI. fits_path and preview_path are files on the Quasar server, "
+                    "NOT archive URLs: never present them (or a file:// link) as a 'direct access URL'. "
+                    "For an archive FITS URL use vo_image_search, search_cadc_archive, datalab_sia_search "
+                    "or search_mast."
                 )
             })
         except Exception as e:

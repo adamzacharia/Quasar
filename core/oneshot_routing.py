@@ -146,6 +146,8 @@ def detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
             args["band"] = bands
         return {
             "tool": "alma_archive_link", "args": args,
+            # complete arguments: the runner may run it before the first model call
+            "dispatch": bool(args.get("target")),
             "directive": (
                 "\n\nMANDATORY INSTRUCTION: The user asked for a URL into the ALMA Science Archive. You MUST call "
                 f"`alma_archive_link` now (suggested arguments: {json.dumps(args)}). Give the returned `asa_url` and "
@@ -160,7 +162,7 @@ def detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
         if as_of:
             args["as_of"] = as_of
         return {
-            "tool": "alma_public_band_status", "args": args,
+            "tool": "alma_public_band_status", "args": args, "dispatch": True,
             "directive": (
                 "\n\nMANDATORY INSTRUCTION: The question asks about the CURRENT state of the ALMA archive. You MUST call "
                 f"`alma_public_band_status` now (suggested arguments: {json.dumps(args)}). Report the number of receiver bands "
@@ -175,7 +177,7 @@ def detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
         task = _code_task(q)
         calls = [{"task": task, "library": lib} for lib in libs]
         return {
-            "tool": "code_recipe", "args": calls[0], "calls": calls,
+            "tool": "code_recipe", "args": calls[0], "calls": calls, "dispatch": True,
             "directive": (
                 "\n\nMANDATORY INSTRUCTION: The user wants code to query the ALMA Science Archive. You MUST call `code_recipe` "
                 f"now -- once per library: {json.dumps(calls)}. Present each returned snippet VERBATIM in a ```python block "
@@ -405,11 +407,11 @@ def _datalab_intent(q: str) -> Optional[Dict[str, Any]]:
     if cov and re.search(r"\bwhich\s+of\s+(?:those|these|them)\b|\balso\b|\band\s+which\b", q, re.I):
         target = cov.group(1).strip()
         target = {"large magellanic cloud": "LMC", "small magellanic cloud": "SMC"}.get(target.lower(), target)
-        return _dl("datalab_list_catalogs", {"target": target},
+        return {**_dl("datalab_list_catalogs", {"target": target},
                    "Call it ONCE with the target and NO band filter: its `coverage_summary` lists every covering catalog "
                    "(`covered`, with `covered_footprints`) and the coverage-unverified ones, plus `by_wavelength_regime`. "
                    "Answer BOTH parts: first all catalogs that cover the region with their table names and why they cover "
-                   "it, then the subset with the requested photometry (from the catalogs' bands).")
+                   "it, then the subset with the requested photometry (from the catalogs' bands)."), "dispatch": True}
     # L07: an overdensity search inside a named SMASH field
     m = _SMASH_FIELD_RE.search(q)
     if m and (_OVERDENSITY_RE.search(q) or re.search(r"\bblue\b.{0,30}\bstars?\b", q, re.I)):
@@ -703,3 +705,22 @@ def overlay_directive(query: str) -> str:
         f"`archive_overlay` now (arguments: {json.dumps(args)}; set `field` to the named region or pass ra/dec). If it returns "
         "status='coverage_gap', do NOT search further: tell the user which side is missing and offer the alternatives it lists."
     )
+
+
+_MUST_CALL_RE = re.compile(
+    r"You MUST call `(?P<tool>[a-z0-9_]+)` now(?: \(suggested arguments: [^\n]*?\))?(?: -- once per library: \[[^\n]*?\])?\.")
+
+
+def dispatched_directive(directive: str) -> str:
+    """Directive text for an intent the runner already executed (direct
+    dispatch, token plan rank 6): 'You MUST call X now (...)' becomes 'X was
+    already called for you; its result follows, do not call it again'. The
+    rest of the instruction (how to present the result) is kept."""
+    def _sub(m: "re.Match") -> str:
+        return (f"`{m.group('tool')}` was ALREADY called for you with the arguments shown in the call below; its "
+                "result follows. Do NOT call it again -- answer from that result.")
+    out, n = _MUST_CALL_RE.subn(_sub, directive or "", count=1)
+    if n:
+        return out.replace("Call it ONCE with the target and NO band filter: its", "Its")
+    return (directive or "") + ("\n[SYSTEM NOTE: the tool named above was ALREADY called for you; its result follows. "
+                                "Do NOT call it again -- answer from that result.]")

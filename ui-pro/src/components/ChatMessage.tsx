@@ -24,6 +24,7 @@ import { citationIdFromHref, tokenizeWebCitations, webDecisionLabel, webDecision
 import { HipsImageCard } from "./HipsImageCard";
 import { PlotlyCard } from "./PlotlyCard";
 import { QueryProvenance } from "./QueryProvenance";
+import { MemoryUpdateChip } from "./MemoryPanel";
 import { BlockRating } from "./BlockRating";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
@@ -908,6 +909,11 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
                             <IconWebGlobe className="h-3 w-3" />
                             <span>{webDecisionLabel(message.webDecision)}</span>
                         </div>
+                    )}
+
+                    {/* Long-term memory saved from this turn, with per-change Undo. */}
+                    {hasContent && !isStreaming && message.memoryUpdates && message.memoryUpdates.length > 0 && (
+                        <div><MemoryUpdateChip events={message.memoryUpdates} /></div>
                     )}
 
                     {/* Live token estimate while the answer is still streaming */}

@@ -779,8 +779,13 @@ class VoRegistryService:
             if len(rows) > cap:
                 rows = rows[:cap]
                 warnings.append(f"Cone search returned more rows; showing first {cap}.")
+            elif len(rows) == cap:
+                # The service honoured maxrec=cap, so an exactly-full result is
+                # capped too (MANNA evals: a cap must never read as a count).
+                warnings.append(f"Result hit the row cap ({cap}); more sources may exist. "
+                                "This is a lower bound, not a count.")
             return {"success": True, "rows": rows, "count": len(rows),
-                    "columns": columns, "warnings": warnings,
+                    "columns": columns, "warnings": warnings, "truncated": len(rows) >= cap,
                     "provenance": {"service": f"SCS: {url}", "ra": ra_f, "dec": dec_f,
                                    "radius_deg": radius}}
         except Exception as exc:
@@ -883,9 +888,32 @@ class VoRegistryService:
                 warnings.append(f"The result reached max_rows ({cap}); more images may exist.")
             if any("datalink" in str(r.get("access_format") or "").lower()
                    or "/datalink" in str(r.get("access_url") or "").lower() for r in rows):
-                warnings.append("Some access_url values are DataLink documents (a VOTable "
-                                "listing the files), not the image itself: open the DataLink "
-                                "and pick the #this row to reach the FITS file.")
+                # Follow the first few DataLinks to their #this file (MANNA evals
+                # T12/MQ09/MQ16: a DataLink or a local path was reported as the
+                # "direct FITS URL"). fits_url is the URL a FITS reader opens.
+                from services.datalink_resolve import looks_like_datalink, resolve_many
+
+                links = [str(r.get("access_url") or "") for r in rows
+                         if looks_like_datalink(r.get("access_url"), r.get("access_format"))][:3]
+                try:
+                    resolved = resolve_many(links)
+                except Exception:  # noqa: BLE001 - resolution is a bonus
+                    resolved = {}
+                for r in rows:
+                    target = resolved.get(str(r.get("access_url") or ""))
+                    if target:
+                        r["fits_url"] = target
+                if resolved:
+                    if "fits_url" not in columns:
+                        columns = ["fits_url"] + list(columns)
+                    warnings.append(f"access_url values are DataLink documents (a VOTable listing the files), "
+                                    f"not images. fits_url holds the resolved #this file for {len(resolved)} "
+                                    "row(s): report fits_url as the direct access URL. Other rows still need "
+                                    "their DataLink opened.")
+                else:
+                    warnings.append("Some access_url values are DataLink documents (a VOTable "
+                                    "listing the files), not the image itself: open the DataLink "
+                                    "and pick the #this row to reach the FITS file.")
             return {"success": True, "rows": rows, "count": len(rows), "columns": columns,
                     "protocol": protocol, "truncated": total > cap or total >= cap,
                     "warnings": warnings,

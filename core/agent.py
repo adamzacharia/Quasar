@@ -4,7 +4,7 @@ QuasarAgent — Central orchestrator for Quasar AI.
 CALLED BY: ui/app.py (Streamlit), ui-pro/api/main.py (FastAPI SSE),
            core/cli.py (terminal REPL), telegram.py (webhook)
 CALLS:     All services/* modules, integrations/*, core/complexity.py,
-           core/sandbox.py, OpenAI API (GPT-4o), mem0 (long-term memory)
+           core/sandbox.py, OpenAI API (GPT-4o)
 
 This is the heart of Quasar. The QuasarAgent class:
   1. Registers 140+ tools as OpenAI function-calling schemas
@@ -58,7 +58,6 @@ from integrations.openalex_client import OpenAlexService
 from services.search import SearchService
 from services.analysis import RadioAnalysisService
 from services.rag_service import RAGService
-from services.memory_service import MemoryService
 from core.complexity import ComplexityDetector
 from core.sandbox import SandboxExecutor
 from services.browser import BrowserService
@@ -113,26 +112,16 @@ from core.recovery import RecoveryEngine
 from core.observability import QueryTracer
 
 # Phase 5: OpenClaude-inspired reliability & context management
-from core.session_memory import SessionMemory
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
 from core.health_monitor import HealthMonitor, get_health_monitor
 
-# mem0 DISABLED — it pulls in sentence-transformers + PyTorch (~1–1.5GB RAM),
-# which causes OOM on 2GB Render instances. The app already uses Qdrant + RAG
-# for knowledge persistence. Set ENABLE_MEM0=1 to re-enable if you have ≥4GB.
-import os as _os_mem0
-if _os_mem0.getenv("ENABLE_MEM0", "").strip() in ("1", "true", "yes"):
-    try:
-        from mem0 import Memory as Mem0Memory
-        MEM0_AVAILABLE = True
-        print("[INFO] mem0 long-term memory enabled (ENABLE_MEM0=1)")
-    except ImportError:
-        MEM0_AVAILABLE = False
-        print("[WARNING] mem0 not installed. Long-term memory disabled.")
-else:
-    MEM0_AVAILABLE = False
-    print("[INFO] mem0 disabled to save memory. Set ENABLE_MEM0=1 to enable.")
+# Long-term user memory lives in services/user_memory_service.py (typed,
+# per-user, request-scoped). The old dormant paths were removed in the
+# 2026-10 memory rebuild: mem0 (never installed; its hook stored the
+# doc-enriched query + answer), MemoryService (writer had no callers) and
+# the process-wide SessionMemory (aggregated every user's history, never
+# read). See tmp/personalization-audit-2026-10-01/REPORT.md.
 
 
 
@@ -378,8 +367,6 @@ class QuasarAgent:
         except Exception as _rag_err:
             print(f"[WARN] RAG service unavailable (Qdrant timeout?): {_rag_err}")
             self.rag_service = None
-        print("DEBUG: Init Memory Service (Long-Term)")
-        self.memory_service = MemoryService()
         print("DEBUG: Init ADS Client")
         import os as _os
         ads_key = getattr(self.config, 'ads_api_key', None) or _os.getenv("NASA_ADS_API_KEY")
@@ -437,14 +424,6 @@ class QuasarAgent:
         self._session_token_estimate = 0  # Running token count estimate (legacy — kept for compat)
         self._session_token_limit = 90000  # Legacy threshold (superseded by ContextManager)
         
-        # Initialize mem0 long-term memory (if available)
-        self.long_term_memory = None
-        if MEM0_AVAILABLE:
-            try:
-                print("DEBUG: Init mem0 Long-Term Memory")
-                self.long_term_memory = Mem0Memory()
-            except Exception as e:
-                print(f"[WARNING] mem0 initialization failed: {e}")
         
         # Initialize BrowserService for web browsing capabilities
         print("DEBUG: Init BrowserService")
@@ -489,8 +468,6 @@ class QuasarAgent:
         self.query_tracer = QueryTracer()
 
         # Phase 5: OpenClaude-inspired modules
-        print("DEBUG: Init SessionMemory")
-        self.session_memory = SessionMemory(client=self.client)
         print("DEBUG: Init HealthMonitor")
         # Process-shared instance (RE-A2): ResponsesShim records every LLM
         # call's outcome into it, so the runner's turn-start failover, the
@@ -1041,16 +1018,8 @@ class QuasarAgent:
         """
         # Note: For the Responses API path (previous_response_id chaining),
         # context management is handled server-side by OpenAI. This method
-        # updates the session_memory and tracks token growth for diagnostics.
+        # tracks token growth for diagnostics.
         self._session_token_estimate += self._estimate_tokens(query)
-
-        # Fire session memory extraction (runs in background thread)
-        try:
-            self.session_memory.extract_if_needed(
-                self.memory.get_history(),
-            )
-        except Exception as e:
-            print(f"[SESSION MEMORY] Background extraction failed: {e}")
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the agent"""
@@ -1069,6 +1038,14 @@ class QuasarAgent:
                 )
             except Exception as e:
                 print(f"[SCHEMA GROUNDING] profile index unavailable: {e}")
+        # Cross-archive accuracy rules (MANNA evals 2026-10-01: NRAO routing,
+        # row caps, tool-first capability answers, returned identifiers only,
+        # no local paths as URLs). NOT gated: both prompt paths carry them.
+        try:
+            from core.prompts.archive_rules import archive_rules_block
+            schema_grounding_block += archive_rules_block()
+        except Exception as e:
+            print(f"[ARCHIVE RULES] unavailable: {e}")
         # v2 bundle (core/prompts/system_core.py): compact core + the same
         # generated schema index + the ALMA kernel; no date in the static body
         # (the runner sends the date per turn). The legacy builder below stays
@@ -4292,6 +4269,18 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         because this request is standalone (no previous_response_id) and the
         static system prompt carries no date."""
         from core.turn_recovery import compact_tool_outputs
+        # This prompt is a USER-role string: personal-document excerpts
+        # (untrusted user-file text) never go into it, only a placeholder.
+        try:
+            _is_untrusted = self.client.responses.is_untrusted_call
+            tool_results = [
+                ({**r, "output": json.dumps({"source": "user_uploaded_documents",
+                                            "note": "excerpts withheld from this summary step"})}
+                 if isinstance(r, dict) and _is_untrusted(r.get("call_id", "")) else r)
+                for r in (tool_results or [])
+            ]
+        except Exception:
+            pass
         compact = compact_tool_outputs(tool_results or [])
         compact = [c for c in compact if c]
         if not compact:
@@ -6471,6 +6460,15 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         :meth:`_pop_provenance_sidecar`); it carries the EXACT executed
         query/endpoint, which the model-facing dict does not."""
         try:
+            # Personal-document excerpts never enter the persisted trace (message
+            # metadata, feedback snapshots): only file names and counts.
+            from services.personal_docs import TOOL_NAME as _PERSONAL_TOOL, trace_summary as _personal_summary
+            if tool_name == _PERSONAL_TOOL:
+                result_str = _personal_summary(result_str)
+                result_obj = None
+        except Exception:
+            pass
+        try:
             # Capture before the legacy 200-call/2,000-character display caps.
             # The request context propagates into guarded and conductor workers.
             from core.llm_client import get_llm_request_context
@@ -6774,6 +6772,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         run_token: Optional[str] = None,
         _history_recovery_attempted: bool = False,
         web_search_mode: Optional[str] = None,
+        turn_personalization: Optional[Dict[str, Any]] = None,
     ) -> str:
         from core.runner import stream_response_api as _stream_impl
         return _stream_impl(
@@ -6784,6 +6783,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             web_search=web_search, model=model, run_token=run_token,
             _history_recovery_attempted=_history_recovery_attempted,
             web_search_mode=web_search_mode,
+            turn_personalization=turn_personalization,
         )
 
     
@@ -6810,14 +6810,26 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
         if getattr(self, "prompt_bundle", "legacy") == "v2" and not _bench.active():
             from core.prompts.tool_description_overrides import effective_description as _amend
 
+        # Lossless schema compaction (core/tool_schema_compact.py), cached per
+        # schema object: the registry keeps the originals.
+        from core import tool_schema_compact as _compact
+
+        _do_compact = _compact.enabled()
+        _ccache = self.__dict__.setdefault("_compact_schema_cache", {})
         for tool in self.tool_registry.list_tools():
             if not _bench.allowed(tool.name):
                 continue  # benchmark arm allowlist (no-op unless configured)
+            params = tool.parameters
+            if _do_compact:
+                _key = (tool.name, id(params))
+                if _key not in _ccache:
+                    _ccache[_key] = _compact.compact_parameters(params)
+                params = _ccache[_key]
             tools.append({
                 "type": "function",
                 "name": tool.name,
                 "description": _amend(tool.name, tool.description) if _amend else tool.description,
-                "parameters": tool.parameters,
+                "parameters": params,
             })
         
         # Add MCP server connection if enabled
@@ -6860,7 +6872,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             except Exception:
                 pass
         self.memory.clear()
-        self.session_memory.clear()
         self._session_token_estimate = 0
         if self.config.verbose:
             print("[yellow]Conversation state reset[/yellow]")
@@ -7000,40 +7011,6 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             print(f"[cyan]Model changed to: {model} (provider: {new_provider})[/cyan]")
         if old_provider != new_provider:
             logger.info(f"Provider switch: {old_provider} → {new_provider}")
-
-    def _update_memory(self, query: str, user_id: str = "user"):
-        """Extract and save new memories from user interaction using Responses API"""
-        try:
-            # Simple extraction prompt
-            prompt = f"""
-            Extract any personal facts, preferences, or research interests from the user's message.
-            If there are none, return "NONE".
-            
-            User Message: "{query}"
-            
-            Output format: Just the fact string or "NONE".
-            Example: "User is interested in protoplanetary disks."
-            """
-            
-            response = self.client.responses.create(
-                # TACC gpt-oss-120b: free/unmetered here — the old gpt-4o-mini
-                # default rode the (quota-dead) OpenAI key.
-                model=os.getenv("QUASAR_PERSONAL_MEMORY_MODEL") or os.getenv("QUASAR_FAST_MODEL") or "gpt-oss-120b",
-                input=prompt,
-                temperature=0.1,
-                max_output_tokens=50
-            )
-            
-            fact = self._extract_response_text(response).strip()
-            
-            if fact != "NONE" and len(fact) > 5:
-                if self.config.verbose:
-                    print(f"[magenta]New Memory: {fact}[/magenta]")
-                self.memory_service.add_memory(fact, user_id=user_id)
-                
-        except Exception as e:
-            if self.config.verbose:
-                print(f"[red]Memory update failed: {e}[/red]")
 
     def search_papers(self, source_name: str) -> Optional[pd.DataFrame]:
         """Search for papers using NASA ADS or arXiv fallback"""

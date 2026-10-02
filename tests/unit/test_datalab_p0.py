@@ -137,8 +137,14 @@ def test_policy_rejects_unsafe_queries_and_accepts_box_ok_table():
     with pytest.raises(DatalabPolicyError, match="DDL/DML|Only SELECT"):
         validate("DELETE FROM gaia_dr3.gaia_source WHERE source_id = 1")
 
+    # MANNA evals 2026-10-01 (Fix B): a q3c-table box is no longer refused; it
+    # is rewritten to an index-backed q3c polygon AND its exact BETWEENs.
+    boxed = validate("SELECT * FROM gaia_dr3.gaia_source WHERE ra BETWEEN 1 AND 2 AND dec BETWEEN -1 AND 1 LIMIT 10")
+    assert "q3c_poly_query(ra, dec, ARRAY[" in boxed.sql
+    assert "(ra BETWEEN 1 AND 2 AND dec BETWEEN -1 AND 1)" in boxed.sql
+    # A box the rewrite cannot prove safe (OR escapes the bound) is still refused.
     with pytest.raises(DatalabPolicyError, match="BETWEEN"):
-        validate("SELECT * FROM gaia_dr3.gaia_source WHERE ra BETWEEN 1 AND 2 AND dec BETWEEN -1 AND 1 LIMIT 10")
+        validate("SELECT * FROM gaia_dr3.gaia_source WHERE ra BETWEEN 1 AND 2 AND dec BETWEEN -1 AND 1 OR parallax > 5 LIMIT 10")
 
     validated = validate("SELECT * FROM sdss_dr17.specobj WHERE ra BETWEEN 1 AND 2 AND dec BETWEEN -1 AND 1 LIMIT 10")
     assert validated.sql.endswith("LIMIT 10")

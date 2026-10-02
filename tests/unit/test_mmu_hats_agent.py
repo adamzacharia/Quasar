@@ -194,6 +194,7 @@ def test_tool_registration_category_and_prompt_rule():
     desc = agent.tool_registry.get_tool("search_mmu_hats_catalog").description.lower()
     assert "catalog/source properties" in desc
     assert "archive observations" in desc and "do not" in desc
+    agent.prompt_bundle = "legacy"  # these rules live in the legacy prompt; v2 is the default since 2026-10-02
     assert "MMU/HATS CATALOG RULE" in agent._build_system_prompt()
 
 
