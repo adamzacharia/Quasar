@@ -232,6 +232,9 @@ _NARRATION_HOLD_CHARS = _env_int("QUASAR_NARRATION_HOLD_CHARS", 500, minimum=0)
 # reasoning check rules. QUASAR_REASONING_LEAK_GUARD=0 disables it.
 _LEAK_HOLD_CHARS = _env_int("QUASAR_REASONING_LEAK_HOLD_CHARS", 400, minimum=50)
 _LEAK_GUARD_ON = os.getenv("QUASAR_REASONING_LEAK_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+# "Who pushed back on X": queue a find_citing_papers call for the likeliest
+# original paper right after the first search (core/turn_guards.queued_citing_note).
+_LIT_AUTO_CITING = os.getenv("QUASAR_LIT_AUTO_CITING", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _emit_narration_step(on_status, text: str) -> None:
@@ -3386,7 +3389,11 @@ def _stream_response_api_impl(
                 tool_results = []
                 _next_input = None
                 _round_duplicates = 0
-                for fc in function_calls.values():
+                # A list (not the dict view) so a synthetic follow-up call can be
+                # appended and executed in this same loop, through the normal path.
+                _fc_queue = list(function_calls.values())
+                _synthetic_items: List[Dict[str, Any]] = []
+                for fc in _fc_queue:
                     # Personal-document results are untrusted user-file text:
                     # registered by call id for EVERY provider, so the shim can
                     # expire them and recovery/fallback paths can drop them.
@@ -3859,6 +3866,11 @@ def _stream_response_api_impl(
                             )
                         else:
                             _closed_state = "error" if _tool_timed_out else "completed"
+                            if fc.get("_synthetic") and tool_result_failure_reason(
+                                    _trace_result_obj if _trace_result_obj is not None else result_str):
+                                # A failed Quasar-issued lookup closes as an error
+                                # (follow-up guard CX-12).
+                                _closed_state = "error"
                         on_status(step_label, _closed_state)
                         if _mcp_meta:
                             _emit_mcp_step(on_status, _mcp_done, _closed_state)
@@ -3869,9 +3881,41 @@ def _stream_response_api_impl(
                     _cite_hint = None if _cite_hinted else _turn_guards.citing_followup_hint(
                         _user_query, tool_name, result_str, _tp_called)
                     if _cite_hint:
-                        print("[LIT GUARD] pushback question: search_papers result points at find_citing_papers")
                         _cite_hinted = True
                         result_str = _cite_hint
+                        # gpt-oss ignored the hint in production (2026-10-03), so
+                        # the lookup is queued as a real find_citing_papers call
+                        # in this same loop: allowlist, tool guard, trace, cards
+                        # and status all apply (follow-up guard CX-01/02/10-13).
+                        try:
+                            _seed = _turn_guards.pick_original_candidate(json.loads(_cite_hint).get("papers"))
+                        except (TypeError, ValueError):
+                            _seed = None
+                        _cite_tool_ok = (
+                            _LIT_AUTO_CITING and _seed is not None
+                            # Anthropic's input translator forwards only tool
+                            # results, not a synthetic tool-use item, so the
+                            # result would be orphaned (follow-up guard CX-18).
+                            and detect_provider(selected_model) != "anthropic"
+                            and _bench_ts.allowed("find_citing_papers")
+                            and agent.tool_registry.get_tool("find_citing_papers") is not None
+                            # names compared after harmony repair (CX-13)
+                            and not any(_turn_guards.sanitize_tool_name(q.get("name")) == "find_citing_papers"
+                                        for q in _fc_queue)
+                        )
+                        if _cite_tool_ok:
+                            _syn_args = {"bibcode": _seed["bibcode"],
+                                         "focus": _turn_guards.responses_focus(_user_query), "max_results": 12}
+                            _syn_cid = f"call_qc{uuid.uuid4().hex[:14]}"
+                            _fc_queue.append({"name": "find_citing_papers", "arguments": json.dumps(_syn_args),
+                                              "call_id": _syn_cid, "_synthetic": True})
+                            _synthetic_items.append({"type": "function_call", "call_id": _syn_cid,
+                                                     "name": "find_citing_papers",
+                                                     "arguments": json.dumps(_syn_args)})
+                            result_str = _turn_guards.queued_citing_note(_cite_hint, _seed)
+                            print(f"[LIT GUARD] pushback question: queued find_citing_papers({_seed['bibcode']})")
+                        else:
+                            print("[LIT GUARD] pushback question: search_papers result points at find_citing_papers")
                     _seen_tool_calls[_call_key] = result_str
                     _lit_guard.record(tool_name, args, result_str)
                     _fail_reason = tool_result_failure_reason(
@@ -3916,6 +3960,15 @@ def _stream_response_api_impl(
                             print(f"[PROMPT V2] follow-up playbooks={[p.id for p in _new_pbs]} after {_called}")
                     except Exception as _pv2_err:
                         print(f"[PROMPT V2] follow-up selection failed: {_pv2_err}")
+                if _synthetic_items:
+                    # The provider never saw these calls (Quasar issued them):
+                    # put each function_call item right before the outputs,
+                    # which come last because the calls were queued last.
+                    _syn_ids = {it["call_id"] for it in _synthetic_items}
+                    _base = list(_next_input if _next_input is not None else tool_results)
+                    _at = next((k for k, it in enumerate(_base)
+                                if isinstance(it, dict) and it.get("call_id") in _syn_ids), len(_base))
+                    _next_input = _base[:_at] + _synthetic_items + _base[_at:]
                 if _dispatch_prefix is not None:
                     # Directly dispatched round 0: the next request carries the
                     # question, the calls and their outputs as one exchange.

@@ -241,6 +241,61 @@ def citing_followup_hint(user_query: Any, tool_name: str, result_str: Any,
     return json.dumps(obj, ensure_ascii=False)
 
 
+# A title that answers another paper is not the original claim.
+_RESPONSE_TITLE_RE = re.compile(
+    r"\b(?:no evidence|re-?analys\w*|reassess\w*|revisit\w*|upper limits?|non-?detection|reply|response|"
+    r"comment|matters arising|cannot|does not|not confirmed|insufficient|complications|addendum|erratum|"
+    r"corrigendum|retraction|challeng\w*|refut\w*|rebuttal|disput\w*|critique|critical\s+assessment|"
+    r"questioning|against|tension|caution|doubt\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def pick_original_candidate(papers: Any) -> Optional[Dict[str, Any]]:
+    """The likeliest ORIGINAL paper among search results: the most cited
+    paper whose title does not read as a response (a claim that drew
+    responses usually out-cites them, but a heavily cited rebuttal must not
+    be picked: follow-up guard CX-03), earliest year on a tie. Falls back to
+    all papers when every title reads as a response."""
+    rows = [p for p in (papers or []) if isinstance(p, dict) and p.get("bibcode")]
+    pool = [p for p in rows if not _RESPONSE_TITLE_RE.search(str(p.get("title") or ""))] or rows
+    best = None
+    for p in pool:
+        try:
+            cites = int(p.get("citations") or 0)
+        except (TypeError, ValueError):
+            cites = 0
+        try:
+            year = int(str(p.get("year") or p["bibcode"][:4])[:4])
+        except (TypeError, ValueError):
+            year = 9999
+        key = (cites, -year)
+        if best is None or key > best[0]:
+            best = (key, p)
+    return best[1] if best else None
+
+
+def responses_focus(user_query: Any) -> str:
+    """find_citing_papers focus for the user's angle."""
+    if re.search(r"\balternative\s+explanations?\b", str(user_query or ""), re.IGNORECASE):
+        return "alternative explanations"
+    return "rebuttals"
+
+
+def queued_citing_note(result_str: Any, seed: Dict[str, Any]) -> str:
+    """``result_str`` whose next_step says Quasar is running
+    find_citing_papers for ``seed`` (the next tool output in this round)."""
+    obj = json.loads(result_str) if isinstance(result_str, str) else dict(result_str or {})
+    obj["next_step"] = (
+        f"Quasar is also running find_citing_papers for {seed.get('bibcode')} "
+        f"({str(seed.get('title') or '')[:80]}), the likeliest original paper; its result comes after this "
+        "round's other tool outputs. Answer from it (bibcodes exactly as given; possible_rebuttals only after checking their "
+        "titles). If that is not the original paper, call find_citing_papers with the right bibcode instead of "
+        "re-searching."
+    )
+    return json.dumps(obj, ensure_ascii=False)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Leaked reasoning in a final answer
 # ─────────────────────────────────────────────────────────────────────────────

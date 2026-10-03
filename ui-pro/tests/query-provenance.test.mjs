@@ -84,3 +84,19 @@ test("copyPayload is the literal request text and never undefined", () => {
     assert.equal(copyPayload({}), "");
     assert.equal(copyPayload(undefined), "");
 });
+
+test("Show query is only for data queries: ADQL/SQL and archive HTTP, never ADS literature or args", () => {
+    const ads = { kind: "ads", text: 'title:(phosphine Venus)', q: 'title:(phosphine Venus)' };
+    const args = { kind: "args", text: '{"query": "x"}' };
+    const params = { kind: "params", text: "CO 1-0" };
+    assert.deepEqual(requestsFrom(ads, undefined, "search_papers"), []);
+    const trace = [
+        { name: "search_papers", request: ads },
+        { name: "lookup_researcher", request: args },
+        { name: "splatalogue", request: params },
+        { name: "datalab_sql_query", request: adqlReq },
+        { name: "hips_cutout", request: httpReq },
+    ];
+    assert.deepEqual(requestsFrom(undefined, trace, undefined).map((e) => e.name), ["datalab_sql_query", "hips_cutout"]);
+    assert.deepEqual(requestsFrom(undefined, trace, "search_papers"), []);
+});

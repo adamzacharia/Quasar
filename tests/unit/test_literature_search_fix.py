@@ -100,10 +100,28 @@ def test_builder_parses_harmony_and_fenced_json():
     assert seen["model"] == "gpt-oss-120b" and "NEVER put author names inside abstract" in seen["instructions"]
 
 
-def test_builder_explicit_caller_sort_wins():
-    llm = lambda *a: '{"query": "keyword:\\"disks\\"", "sort": "citation_count desc"}'
-    out = ADSQueryBuilder(llm_call=llm).build_query("recent disks", 10, "date desc", None)
+def test_caller_sort_is_only_a_preference():
+    seen = {}
+
+    def llm(instructions, prompt, model, max_tokens):
+        seen["prompt"] = prompt
+        return '{"query": "title:(phosphine Venus)", "sort": "score desc"}'
+
+    out = ADSQueryBuilder(llm_call=llm).build_query("phosphine detection Venus", 10, "date desc", None)
+    assert out["sort"] == "score desc", "the builder's relevance sort beats gpt-oss's habitual date desc"
+    assert '"caller_sort_preference": "date desc"' in seen["prompt"]
+    # no builder sort -> the caller's preference is used
+    out = ADSQueryBuilder(llm_call=lambda *a: '{"query": "x"}').build_query("recent x", 10, "date desc", None)
     assert out["sort"] == "date desc"
+
+
+def test_fallback_ignores_date_desc_unless_recent(monkeypatch):
+    monkeypatch.setenv("ADS_QUERY_BUILDER", "off")
+    ads = _FakeADS(default=[_paper("2021NatAs...5..655G")])
+    ads.search_natural_language("phosphine detection Venus", max_results=5, sort="date desc")
+    assert ads.calls[-1]["sort"] == "score desc"
+    ads.search_natural_language("recent papers on phosphine on Venus", max_results=5, sort="date desc")
+    assert ads.calls[-1]["sort"] == "date desc"
 
 
 @pytest.mark.parametrize("bad", [
@@ -692,7 +710,7 @@ def test_sort_shorthands_are_normalized():
     import os
     os.environ["ADS_QUERY_BUILDER"] = "off"
     try:
-        ads.search_natural_language("phosphine Venus", max_results=5, sort="date")
+        ads.search_natural_language("recent papers on phosphine Venus", max_results=5, sort="date")
     finally:
         del os.environ["ADS_QUERY_BUILDER"]
     assert ads.calls[-1]["sort"] == "date desc"
@@ -750,3 +768,71 @@ def test_unknown_total_is_reported_not_implied():
     out = ads.search_natural_language("How many papers cite 2018ApJ...869L..41A?", max_results=15)
     assert out["total"] is None and out["total_requested"] and len(out["papers"]) == 15
     assert any("503" in e for e in out["identifier_errors"])
+
+
+def test_auto_responses_helpers():
+    papers = [{"bibcode": "2020A&A...644L...2S", "year": "2020", "citations": 90, "title": "Re-analysis of ALMA"},
+              {"bibcode": "2021NatAs...5..655G", "year": "2021", "citations": 250, "title": "Phosphine gas"},
+              {"bibcode": "2024XYZ....1....1A", "year": "2024", "citations": 3, "title": "Later work"}]
+    assert tg.pick_original_candidate(papers)["bibcode"] == "2021NatAs...5..655G"
+    # a heavily cited rebuttal is never the seed (follow-up CX-03)
+    rebut = [{"bibcode": "2020ORIG.....1....1A", "year": "2020", "citations": 100, "title": "Detection of X"},
+             {"bibcode": "2021REBU.....1....1B", "year": "2021", "citations": 200, "title": "No evidence of X"}]
+    assert tg.pick_original_candidate(rebut)["bibcode"] == "2020ORIG.....1....1A"
+    assert tg.pick_original_candidate([]) is None
+    assert tg.responses_focus("which papers proposed alternative explanations?") == "alternative explanations"
+    assert tg.responses_focus("who pushed back?") == "rebuttals"
+    note = json.loads(tg.queued_citing_note(json.dumps({"success": True, "papers": papers}),
+                                            {"bibcode": "2021NatAs...5..655G", "title": "Phosphine gas"}))
+    assert "find_citing_papers for 2021NatAs...5..655G" in note["next_step"] and note["papers"] == papers
+
+
+def test_object_terms_and_same_object_rebuttals():
+    assert ac._object_terms("Phosphine gas in the cloud decks of Venus") == ["venus"]
+    assert "k2-18" in ac._object_terms("New Constraints on DMS and DMDS in the Atmosphere of K2-18 b from JWST MIRI")
+    assert "miri" not in ac._object_terms("New Constraints on DMS in K2-18 b from JWST MIRI")
+    assert ac._object_terms("Detection of B-Mode Polarization at Degree Angular Scales by BICEP2") == ["bicep2"]
+    src = _paper("2025ApJ...983L..40M", "New Constraints on DMS and DMDS in the Atmosphere of K2-18 b from JWST MIRI")
+    one_word = _paper("2025AJ....170..257S", "K2-18b Does Not Meet the Standards of Evidence for Life")
+    other_planet = _paper("2026AJ....171..251H", "Secondary eclipse upper limits of GJ 3473 b with JWST MIRI",
+                          abstract="Compared with DMS claims for K2-18 b.")
+    ads = _FakeADS({'bibcode:"2025ApJ...983L..40M"': [src],
+                    lambda q: q.startswith('citations(bibcode:"2025ApJ...983L..40M") AND ('): [one_word, other_planet]})
+    out = ads.find_citing_papers("2025ApJ...983L..40M")
+    assert [p["bibcode"] for p in out["rebuttals"]] == ["2025AJ....170..257S"]
+    assert "2026AJ....171..251H" not in [p["bibcode"] for p in out["rebuttals"]]
+
+
+def test_sort_follows_the_request_intent():
+    f = ac._intent_sort
+    assert f("recent papers on disks", "score desc", None) == "date desc"
+    assert f("most cited papers on disks", "score desc", "citation_count desc") == "citation_count desc"
+    assert f("phosphine detection Venus", None, "date desc") == "score desc"  # builder omitted sort
+    assert f("oldest papers on Venus", None, "date asc") == "date asc"
+    assert f("the first paper to propose a new interpretation", "date desc", None) == "score desc"
+    assert f("papers about HL Tau", "citation_count desc", None) == "citation_count desc"
+    assert "date desc" not in ADSQueryBuilder._SYSTEM_PROMPT.split('"papers about HL Tau"')[1].split("\n")[1]
+
+def test_builder_date_desc_is_dropped_unless_recent(monkeypatch):
+    monkeypatch.setattr(ac, "_default_builder_llm_call",
+                        lambda *a: '{"query": "\\"BICEP2\\" AND year:2014", "sort": "date desc"}')
+    ads = _FakeADS(default=[_paper("2014PhRvL.112x1101B")])
+    ads.search_natural_language("BICEP2 detection of B-mode polarization 2014", max_results=10, sort="date")
+    assert ads.calls[-1]["sort"] == "score desc"  # live BICEP2 seed failure
+    ads.search_natural_language("recent BICEP papers", max_results=10, sort="date")
+    assert ads.calls[-1]["sort"] == "date desc"
+
+
+def test_followup_reopen_sort_seed_and_object_rules():
+    f = ac._intent_sort
+    assert f("Which paper first reported current-induced spin torque?", "date desc", None) == "score desc"
+    assert f("Find new papers about phosphine on Venus", "score desc", "date desc") == "date desc"
+    challenged = [{"bibcode": "2020ORIG.....1....1A", "year": "2020", "citations": 100, "title": "Detection of X"},
+                  {"bibcode": "2021CHAL.....1....1B", "year": "2021", "citations": 200,
+                   "title": "Challenges to the detection of X"}]
+    assert tg.pick_original_candidate(challenged)["bibcode"] == "2020ORIG.....1....1A"
+    src = _paper("2025ApJ...983L..40M", "New Constraints on DMS and DMDS in the Atmosphere of K2-18 b from JWST MIRI")
+    near = _paper("2026XYZ.....1....1Z", "No evidence of life in K2-180 b")
+    ads = _FakeADS({'bibcode:"2025ApJ...983L..40M"': [src],
+                    lambda q: q.startswith('citations(bibcode:"2025ApJ...983L..40M") AND ('): [near]})
+    assert ads.find_citing_papers("2025ApJ...983L..40M")["rebuttals"] == []

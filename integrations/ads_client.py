@@ -288,10 +288,13 @@ class ADSService:
         else:
             builder_error = "query builder disabled (ADS_QUERY_BUILDER=off)"
         if structured is None:
-            structured = self._heuristic_query(topic, max_results, sort, filters)
+            structured = self._heuristic_query(topic, max_results, _intent_sort(topic, None, sort), filters)
 
         ads_query = structured.get("query", "")
-        resolved_sort = structured.get("sort") or sort or "score desc"
+        # Newest-first only for a request about recent work, whoever chose it:
+        # the builder echoes gpt-oss's habitual "date desc" despite prompt rule
+        # 11, which buried the BICEP2 detection paper (live 2026-10-03).
+        resolved_sort = _intent_sort(topic, structured.get("sort"), sort)
         resolved_filters = structured.get("filters", filters)
         try:
             rows = int(structured.get("rows") or max_results)
@@ -310,9 +313,9 @@ class ADSService:
                 raise
             attempts.append({"query": ads_query, "hits": 0, "error": str(exc)[:160]})
             builder_error = f"ADS rejected the builder query: {str(exc)[:120]}"
-            structured = self._heuristic_query(topic, max_results, sort, filters)
+            structured = self._heuristic_query(topic, max_results, _intent_sort(topic, None, sort), filters)
             ads_query = structured["query"]
-            resolved_sort = structured.get("sort") or "score desc"
+            resolved_sort = _intent_sort(topic, structured.get("sort"), sort)
             resolved_filters = structured.get("filters", filters)
             query_source = "fallback"
             papers = self.search_papers(ads_query, max_results=rows, sort=resolved_sort, filters=resolved_filters)
@@ -1589,6 +1592,7 @@ class ADSService:
             return result
 
         topic = _distinctive_terms(source.get("title") or "")
+        objects = _object_terms(source.get("title") or "")
         rebuttals: List[tuple] = []
         possible: List[tuple] = []
         replies: List[Dict[str, Any]] = []
@@ -1613,12 +1617,18 @@ class ADSService:
             score = 3 * min(r_title, 1) + min(r_abs, 2) + 3 * min(t_title, 3) + min(t_abs, 2)
             # Lexical overlap cannot tell "re-analysed the Venus data" from "set
             # Mars limits and compared them with Venus" (guard CX-08), so the
-            # verdict is tiered: two of the cited paper's topic words IN THE
-            # TITLE is a rebuttal; overlap only via the abstract is a possible
-            # rebuttal the model must check before calling it one.
-            if not (r_title or r_abs) or score < 4 or t_unique < min(2, len(topic)):
+            # verdict is tiered. A rebuttal shares two topic words IN THE TITLE
+            # or names the cited paper's OBJECT (Venus, K2-18 b, BICEP2,
+            # 'Oumuamua) in its title; "K2-18b Does Not Meet the Standards of
+            # Evidence for Life" shares one word but is plainly a rebuttal (live
+            # 2026-10-03). Overlap only via the abstract is a possible rebuttal
+            # the model must check before calling it one.
+            # Whole-token match: "K2-18" names "K2-18 b"/"K2-18b" but not
+            # "K2-180 b" (follow-up guard CX-17).
+            names_object = any(re.search(rf"(?<![a-z0-9]){re.escape(o)}(?![0-9])", tl) for o in objects)
+            if not (r_title or r_abs) or score < 4 or (t_unique < min(2, len(topic)) and not names_object):
                 other.append(p)
-            elif t_title >= min(2, len(topic)):
+            elif t_title >= min(2, len(topic)) or names_object:
                 rebuttals.append((score, p))
             else:
                 possible.append((score, p))
@@ -1698,6 +1708,41 @@ _SORT_ALIASES = {
     "cited": "citation_count desc", "most cited": "citation_count desc", "relevance": "score desc",
     "score": "score desc", "reads": "read_count desc", "read_count": "read_count desc",
 }
+
+
+# Recency wording only: "current-induced" / "a new interpretation" are
+# science, but "new papers" / "new results" ask for newly published work
+# (follow-up guard CX-08, CX-16).
+_RECENT_RE = re.compile(
+    r"\b(?:recent(?:ly)?|latest|newest|this\s+year|last\s+(?:year|\d+\s+years|few\s+years)|"
+    r"since\s+(?:19|20)\d{2}|upcoming|just\s+published|"
+    r"new\s+(?:papers?|results?|studies|publications?|preprints?|work|articles?|observations?))\b",
+    re.IGNORECASE,
+)
+_MOST_CITED_RE = re.compile(
+    r"\b(?:most[\s-]+cited|highly[\s-]+cited|top[\s-]+cited|most\s+influential|influential|seminal|landmark|"
+    r"best|most\s+important|classic)\b",
+    re.IGNORECASE,
+)
+_OLDEST_RE = re.compile(r"\boldest\b|\bin\s+chronological\s+order\b", re.IGNORECASE)
+
+
+def _intent_sort(question: str, chosen: Optional[str], caller: Optional[str] = None) -> str:
+    """The sort the REQUEST asks for, decided in code (the builder echoed
+    gpt-oss's habitual "date desc" despite its prompt rule, live 2026-10-03):
+    most-cited wording -> citation_count desc; recent wording -> date desc;
+    "oldest" -> date asc; otherwise the builder's / caller's choice, except
+    that "date desc" without recent wording becomes relevance (it ranked "the
+    paper that first reported X" off the first page)."""
+    q = str(question or "")
+    if _MOST_CITED_RE.search(q):
+        return "citation_count desc"
+    if _RECENT_RE.search(q):
+        return "date desc"
+    if _OLDEST_RE.search(q):
+        return "date asc"
+    pick = normalize_ads_sort(chosen) or normalize_ads_sort(caller) or "score desc"
+    return "score desc" if pick == "date desc" else pick
 
 
 def normalize_ads_sort(sort: Any) -> Optional[str]:
@@ -1997,7 +2042,33 @@ _GENERIC_TITLE_WORDS = {
     "new", "first", "results", "result", "data", "using", "model", "models", "constraints", "survey",
     "properties", "possible", "gas", "measurement", "measurements", "search", "jwst", "hst", "alma", "from",
     "with", "for", "the", "and", "towards", "toward", "between", "into", "via", "high", "low", "large", "small",
+    # instruments / facilities / generic nouns: shared by unrelated papers, never
+    # "the same object" (a GJ 3473 b JWST/MIRI paper is not a K2-18 b rebuttal)
+    "atmosphere", "atmospheres", "miri", "nirspec", "niriss", "nircam", "nirc", "vla", "vlba", "gbt", "sofia",
+    "jcmt", "vlt", "keck", "gemini", "chandra", "xmm", "spitzer", "tess", "kepler", "gaia", "sdss", "lsst",
+    "planck", "wmap", "euclid", "eht", "ska", "apex", "iram", "noema", "sma", "great",
 }
+
+
+def _object_terms(title: str) -> List[str]:
+    """The cited paper's object / experiment names (lowercase): words with a
+    digit (K2-18, BICEP2, 1I/2017), acronyms (DMS), and, when the title is not
+    in Title Case, capitalised words after the first (Venus, 'Oumuamua)."""
+    words = re.findall(r"[A-Za-z0-9'][A-Za-z0-9\-'/]*", str(title or ""))
+    letters = [w for w in words if w[:1].isalpha() or w[:1] == "'"]
+    title_case = bool(letters) and sum(1 for w in letters if w.lstrip("'")[:1].isupper()) > 0.6 * len(letters)
+    out: List[str] = []
+    for idx, w in enumerate(words):
+        lw = w.lower().strip("'").rstrip("/")
+        if len(lw) < 2 or lw in _HEURISTIC_STOP or lw in _GENERIC_TITLE_WORDS:
+            continue
+        core = w.strip("'")
+        is_obj = (any(ch.isdigit() for ch in core)
+                  or (len(core) >= 3 and core.isupper())
+                  or (not title_case and idx > 0 and core[:1].isupper()))
+        if is_obj and lw not in out:
+            out.append(lw)
+    return out[:6]
 
 
 def _distinctive_terms(title: str) -> List[str]:
@@ -2332,6 +2403,11 @@ Return JSON with exactly these keys:
     clause for a name the request does not contain. Use only what the request
     says; a wrong guess returns nothing.
 
+11. "caller_sort_preference", when present, is the calling model's guess. Use
+    "date desc" only when the request asks for recent / latest / new work, and
+    "citation_count desc" only for best / most-cited / influential; otherwise
+    sort "score desc", which keeps a specific paper on the first page.
+
 ═══ EXAMPLES ═══
 
 "recent papers on protoplanetary disks"
@@ -2341,7 +2417,7 @@ Return JSON with exactly these keys:
 → {"query": "bibgroup:ALMA AND (keyword:\\"protoplanetary disks\\" AND (title:\\"gap\\" OR title:\\"ring\\"))", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
 
 "papers about HL Tau"
-→ {"query": "\\"HL Tau\\"", "sort": "date desc", "rows": 15, "filters": ["property:refereed"]}
+→ {"query": "\\"HL Tau\\"", "sort": "score desc", "rows": 15, "filters": ["property:refereed"]}
 
 "what are people reading about FRBs right now"
 → {"query": "trending(keyword:\\"fast radio bursts\\")", "sort": "score desc", "rows": 15}
@@ -2350,7 +2426,7 @@ Return JSON with exactly these keys:
 → {"query": "useful(keyword:\\"planet formation\\" AND year:2015-2026)", "sort": "score desc", "rows": 20, "filters": ["property:refereed"]}
 
 "papers by Sean Andrews on ALMA disk surveys"
-→ {"query": "author:\\"Andrews, Sean\\" AND bibgroup:ALMA AND keyword:\\"protoplanetary disks\\"", "sort": "date desc", "rows": 20, "filters": ["property:refereed"]}
+→ {"query": "author:\\"Andrews, Sean\\" AND bibgroup:ALMA AND keyword:\\"protoplanetary disks\\"", "sort": "score desc", "rows": 20, "filters": ["property:refereed"]}
 
 "review articles on AGN feedback"
 → {"query": "reviews(keyword:\\"active galactic nuclei\\" AND keyword:\\"feedback\\")", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
@@ -2414,12 +2490,12 @@ Return JSON with exactly these keys:
         if default_rows:
             # Never more rows than the caller asked for (guard CX-12).
             structured["rows"] = min(structured["rows"], int(default_rows))
-        # An explicit caller sort (the chat model asked for "date desc") wins;
-        # otherwise the builder's choice, else relevance.
-        if sort:
-            structured["sort"] = sort
-        elif not isinstance(structured.get("sort"), str) or not structured.get("sort", "").strip():
-            structured["sort"] = "score desc"
+        # The builder's sort wins: gpt-oss sends sort="date desc" on nearly
+        # every call, which ranked "the paper that first reported X" off the
+        # page and made it re-search for it all turn (live 2026-10-03). The
+        # caller's sort is only a preference the builder may follow.
+        built_sort = normalize_ads_sort(structured.get("sort"))
+        structured["sort"] = built_sort or sort or "score desc"
         built_filters = structured.get("filters")
         if not isinstance(built_filters, list) or not all(isinstance(f, str) for f in built_filters):
             structured["filters"] = filters or ["property:refereed"]
@@ -2446,10 +2522,14 @@ Return JSON with exactly these keys:
             "question": question,
             "defaults": {
                 "rows": default_rows,
-                "sort": sort or "score desc",
+                "sort": "score desc",
                 "filters": filters or ["property:refereed"],
             },
         }
+        if sort:
+            # Only a preference: follow it when the request itself is about
+            # recent / most-cited work (prompt rule 11).
+            user_payload["caller_sort_preference"] = sort
         prompt = "Respond with ONE JSON object only. Natural-language request:\n" + json.dumps(user_payload)
         timeout = ads_query_builder_timeout()
         box: Dict[str, Any] = {}
