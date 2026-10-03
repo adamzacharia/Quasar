@@ -1531,6 +1531,15 @@ class ADSService:
             return None, f"no ADS paper matches the title {ref!r}"
         return papers[0], None
 
+    def _author_surnames(self, bibcode: str) -> set:
+        """Lower-case surnames of every author of ``bibcode`` (empty on any
+        failure: the grouping is then skipped, never guessed)."""
+        try:
+            details = self.get_paper_details(bibcode) or {}
+        except Exception:  # pragma: no cover - get_paper_details already swallows ADS errors
+            return set()
+        return {_first_author_surname(a) for a in (details.get("authors") or []) if _first_author_surname(a)}
+
     def find_citing_papers(
         self,
         bibcode: str,
@@ -1596,12 +1605,21 @@ class ADSService:
         rebuttals: List[tuple] = []
         possible: List[tuple] = []
         replies: List[Dict[str, Any]] = []
+        own_team: List[Dict[str, Any]] = []
         other: List[Dict[str, Any]] = []
+        # A citing paper LED by an author of the cited paper defends or extends
+        # it; it is not pushback (live 2026-10-03: Greaves et al. 2022 on SO2
+        # contamination and Bains et al. 2021, a co-author, were listed as
+        # rebuttals of Greaves et al. 2021).
+        team = self._author_surnames(bib)
         for p in found:
             tl = str(p.get("title") or "").lower()
             al = str(p.get("abstract") or "").lower()
             if _REPLY_TITLE_RE.match(tl):
                 replies.append(p)
+                continue
+            if team and _first_author_surname(p.get("authors")) in team:
+                own_team.append(p)
                 continue
             r_title = sum(1 for t in _REBUTTAL_TERMS if t in tl)
             r_abs = sum(1 for t in _REBUTTAL_TERMS if t in al)
@@ -1628,7 +1646,10 @@ class ADSService:
             names_object = any(re.search(rf"(?<![a-z0-9]){re.escape(o)}(?![0-9])", tl) for o in objects)
             if not (r_title or r_abs) or score < 4 or (t_unique < min(2, len(topic)) and not names_object):
                 other.append(p)
-            elif t_title >= min(2, len(topic)) or names_object:
+            elif t_title >= min(2, len(topic)) or (names_object and (r_title or r_abs >= 2)):
+                # naming the object counts only with rebuttal wording in the
+                # TITLE: "A water-rich interior in ... K2-18 b" studies the same
+                # planet but does not push back on the claim
                 rebuttals.append((score, p))
             else:
                 possible.append((score, p))
@@ -1641,6 +1662,10 @@ class ADSService:
                                        "they may discuss a different object. Check each title before calling it "
                                        "a rebuttal.")
         result["replies"] = [_slim(p) for p in replies[:5]]
+        if own_team:
+            result["by_original_authors"] = [_slim(p) for p in own_team[:5]]
+            result["by_original_authors_note"] = (
+                "Led by an author of the cited paper: defences, follow-ups or extensions, not pushback.")
         result["other_citing"] = [_slim(p) for p in other[:5]]
         result["count"] = len(result["rebuttals"])
         result["scanned"] = len(found)
@@ -1648,7 +1673,8 @@ class ADSService:
             # guard CX-15: say the scan was bounded instead of implying completeness.
             result["scan_note"] = ("Ranked among the 100 most-cited citing papers that use rebuttal language; "
                                    "a less-cited response can be missing. Use focus with a topic to narrow.")
-        result["papers"] = [p for _, p in rebuttals[:cap]] + replies[:5] + [p for _, p in possible[:cap]]
+        result["papers"] = ([p for _, p in rebuttals[:cap]] + replies[:5] + [p for _, p in possible[:cap]]
+                            + own_team[:5])
         if not rebuttals and not replies and not possible:
             # Nothing argued with it in so many words: show who cites it most.
             fallback = self.search_papers(base, max_results=min(cap, 10), sort="citation_count desc", filters=None)
@@ -2048,6 +2074,14 @@ _GENERIC_TITLE_WORDS = {
     "jcmt", "vlt", "keck", "gemini", "chandra", "xmm", "spitzer", "tess", "kepler", "gaia", "sdss", "lsst",
     "planck", "wmap", "euclid", "eht", "ska", "apex", "iram", "noema", "sma", "great",
 }
+
+
+def _first_author_surname(authors: Any) -> str:
+    """"Greaves, Jane S. et al." / "Greaves, J. S." / ["Greaves, J."] -> "greaves"."""
+    if isinstance(authors, (list, tuple)):
+        authors = authors[0] if authors else ""
+    text = re.sub(r"\s+et\s+al\.?$", "", str(authors or "").strip(), flags=re.IGNORECASE)
+    return text.split(",")[0].strip().lower()
 
 
 def _object_terms(title: str) -> List[str]:

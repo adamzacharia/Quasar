@@ -60,6 +60,9 @@ class _FakeADS(ADSService):
     def count_matches(self, query, filters=None):
         return None  # offline: no numFound (subclasses override)
 
+    def get_paper_details(self, bibcode):
+        return self.details.get(bibcode) if hasattr(self, "details") else None  # offline
+
 
 @pytest.fixture(autouse=True)
 def _clear_builder_cache(monkeypatch):
@@ -836,3 +839,26 @@ def test_followup_reopen_sort_seed_and_object_rules():
     ads = _FakeADS({'bibcode:"2025ApJ...983L..40M"': [src],
                     lambda q: q.startswith('citations(bibcode:"2025ApJ...983L..40M") AND ('): [near]})
     assert ads.find_citing_papers("2025ApJ...983L..40M")["rebuttals"] == []
+
+
+def test_papers_led_by_the_original_team_are_not_pushback():
+    src = _paper("2021NatAs...5..655G", "Phosphine gas in the cloud decks of Venus")
+    so2 = dict(_paper("2022MNRAS.514.2994G", "Low levels of sulphur dioxide contamination of Venusian phosphine spectra"),
+               authors="Greaves, Jane S. et al.")
+    bains = dict(_paper("2021AsBio..21.1277B", "Phosphine on Venus Cannot Be Explained by Conventional Processes"),
+                 authors="Bains, William et al.")
+    vill = dict(_paper("2021NatAs...5..631V", "No evidence of phosphine in the atmosphere of Venus"),
+                authors="Villanueva, G. L. et al.")
+    ads = _FakeADS({'bibcode:"2021NatAs...5..655G"': [src],
+                    lambda q: q.startswith('citations(bibcode:"2021NatAs...5..655G") AND ('): [so2, bains, vill]})
+    ads.details = {"2021NatAs...5..655G": {"authors": ["Greaves, Jane S.", "Richards, Anita M. S.",
+                                                        "Bains, William", "Seager, Sara"]}}
+    out = ads.find_citing_papers("2021NatAs...5..655G")
+    assert [p["bibcode"] for p in out["rebuttals"]] == ["2021NatAs...5..631V"]
+    assert {p["bibcode"] for p in out["by_original_authors"]} == {"2022MNRAS.514.2994G", "2021AsBio..21.1277B"}
+    assert "not pushback" in out["by_original_authors_note"]
+    # no author list -> no grouping, never a guess
+    ads.details = {}
+    assert "by_original_authors" not in ads.find_citing_papers("2021NatAs...5..655G")
+    assert ac._first_author_surname("Greaves, Jane S. et al.") == "greaves"
+    assert ac._first_author_surname(["Bains, W."]) == "bains"
