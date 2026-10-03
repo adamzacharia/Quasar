@@ -109,8 +109,10 @@ def test_ads_heuristic_fields_instead_of_one_phrase():
     q = h("How many refereed papers did Jane Q Doe publish in the Astronomical Journal between 2011 and 2013?")
     assert 'year:[2011 TO 2013]' in q and 'bibstem:"AJ"' in q and 'author:"Q Doe, Jane"' in q
     assert '"How many' not in q
+    # Unfielded terms since 2026-10-03 (ADS matches them in abstract, title,
+    # keywords and authors; abs:(...) lost author surnames).
     q2 = h("first detection of a molecule in a comet coma")
-    assert q2 == "abs:(detection AND molecule AND comet AND coma)"
+    assert q2 == "detection AND molecule AND comet AND coma"
     assert h("") == "*:*"
     assert 'bibstem:"MNRAS"' in h("stellar streams MNRAS 2019") and "year:2019" in h("stellar streams MNRAS 2019")
 

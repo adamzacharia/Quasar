@@ -167,27 +167,26 @@ class SearchPapersInput(_In):
     # The legacy registration lambda's defaults (max_results=15), NOT the
     # method signature's (10) — the lambda was the wire surface.
     max_results: Optional[int] = 15
-    sort: Optional[str] = "date desc"
+    # None = the query builder picks (relevance for a lookup, newest first for
+    # "recent"). A fixed "date desc" ranked "the first paper that reported X"
+    # newest-first (2026-10-03).
+    sort: Optional[str] = None
+
+
+SEARCH_PAPERS_DESCRIPTION = (
+    "Search NASA ADS for astronomy papers (titles, authors, abstracts, citations, DOIs, ADS links). Pass the "
+    "request in natural language; a query builder writes the ADS syntax. Examples: 'recent papers on "
+    "protoplanetary disks', 'best ALMA papers on disk gaps', 'papers by Sean Andrews on disk surveys', "
+    "'Phosphine gas in the cloud decks of Venus Greaves' (one known paper: title words + first-author surname, "
+    "no year you are unsure of). Bibcodes, DOIs and arXiv ids are looked up directly; a wrong-year bibcode is "
+    "recovered (resolved_from). Never invent bibcodes. An empty result lists what was relaxed: do not re-run "
+    "small rewordings. For papers that disputed or responded to X, find X here, then call find_citing_papers."
+)
 
 
 class SearchPapers(BaseCapability):
     name = "search_papers"
-    description = (
-        "Search the NASA ADS database for astronomical papers. "
-        "Returns titles, authors, abstracts, citation counts, DOIs, and a direct link to each paper on NASA ADS. "
-        "IMPORTANT: Pass the user's request as natural language — an internal AI query builder will "
-        "automatically translate it into optimal ADS syntax using keyword searches, bibgroup filters, "
-        "SIMBAD object linking, second-order discovery operators (trending, similar, useful), and more.\n"
-        "Examples of what to pass as query:\n"
-        "- 'recent papers on protoplanetary disks'\n"
-        "- 'best ALMA papers on disk gaps'\n"
-        "- 'papers about HL Tau'\n"
-        "- 'what are people reading about FRBs right now'\n"
-        "- 'foundational papers on planet formation'\n"
-        "- 'review articles on AGN feedback'\n"
-        "- 'papers by Sean Andrews on disk surveys'\n"
-        "Do NOT try to construct ADS field syntax yourself — just pass the natural language query."
-    )
+    description = SEARCH_PAPERS_DESCRIPTION
     category = "literature"
     InputModel = SearchPapersInput
     annotations = {"read_only": True, "cost": "network"}
@@ -249,15 +248,124 @@ class SearchPapers(BaseCapability):
                 "papers": papers_list,
                 "source": f"ADS: {ads_query}",
             })
-            return _native({
+            out = {
                 "success": True,
                 "count": len(papers_list),
                 "ads_query": ads_query,
                 "papers": papers_list,
                 "top_title": papers_list[0]["title"] if papers_list else "No results",
-            }, ads_query=ads_query)
+            }
+            out.update(_search_provenance(result, papers_list))
+            return _native(out, ads_query=ads_query)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
+
+
+def _search_provenance(result: Dict[str, Any], papers_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """How an ADS search was built and relaxed, for the model (2026-10-03).
+
+    Without this the model could not tell "ADS has no such paper" from "the
+    query was bad", so it re-ran near-identical searches until the tool budget
+    ran out."""
+    extra: Dict[str, Any] = {}
+    if result.get("query_source"):
+        extra["query_source"] = result["query_source"]
+    if result.get("resolved_from"):
+        extra["resolved_from"] = result["resolved_from"]
+        extra["resolved_note"] = (
+            "The requested identifier did not exist as written; it resolved to the bibcode shown. "
+            "Report the resolved bibcode."
+        )
+    if result.get("matched_ids"):
+        extra["matched_ids"] = result["matched_ids"]
+    if result.get("next_step"):
+        extra["next_step"] = result["next_step"]
+    if result.get("relaxed"):
+        extra["relaxed"] = result["relaxed"]
+    if result.get("identifier_errors"):
+        # guard CX-04: some identifier lookups failed; the result is partial.
+        extra["partial"] = True
+        extra["identifier_errors"] = list(result["identifier_errors"])[:5]
+    if result.get("total_requested") and not isinstance(result.get("total"), int):
+        # guard CX-25 round 4: ADS gave no total (missing numFound or the count
+        # request failed). Say so; count is only the page.
+        extra["total_unknown"] = True
+        extra["partial"] = True
+        extra["returned"] = len(papers_list)
+        extra["total_note"] = ("ADS did not report the total number of matches; count is only the number of "
+                               "papers returned here, not the total. Do not present it as a total.")
+    if isinstance(result.get("total"), int):
+        # guard CX-25: count is the ADS total, returned is the page length.
+        extra["count"] = result["total"]
+        extra["returned"] = len(papers_list)
+        extra["total_note"] = ("count is the total number of ADS records matching the query; papers lists the "
+                               f"first {len(papers_list)}.")
+    if result.get("cited_papers"):
+        extra["cited_papers"] = [{k: p.get(k) for k in ("bibcode", "title", "year")} for p in result["cited_papers"]]
+    if result.get("relaxed_results"):
+        # guard CX-03: these papers answer a LOOSER query than the one asked,
+        # so they are not matches: count stays 0 (no contradiction with the note).
+        extra["count"] = 0
+        extra["relaxed_count"] = len(papers_list)
+        extra["relaxed_note"] = (
+            "Nothing matched the query as asked; these papers come from the relaxed query listed in relaxed "
+            "(for example a wider year range). They do not satisfy the original constraints; say so, and do "
+            "not count them as matches."
+        )
+    attempts = result.get("attempts") or []
+    if len(attempts) > 1:
+        extra["attempts"] = [
+            {k: a.get(k) for k in ("query", "hits", "error") if a.get(k) is not None} for a in attempts[:6]
+        ]
+    if not papers_list:
+        extra["hint"] = (
+            "No ADS records matched, including the relaxed variants listed. Do not re-run this search with "
+            "small rewordings. Either search once with a substantially different query (distinctive title "
+            "words plus the first author's surname, or a bibcode/DOI/arXiv id from the user), or answer with "
+            "what you have and say the search found nothing."
+        )
+    return extra
+
+
+class FindCitingPapersInput(_In):
+    bibcode: Optional[str]
+    focus: Optional[str] = "rebuttals"
+    max_results: Optional[int] = 15
+
+
+class FindCitingPapers(BaseCapability):
+    name = "find_citing_papers"
+    description = (
+        "Papers that responded to one paper: disputed, re-analysed, set upper limits on, commented on or replied "
+        "to it. Pass its ADS bibcode (a DOI, arXiv id or exact title also works). focus='rebuttals' (default): "
+        "topic-matched rebuttals ranked by relevance, plus the authors' replies; 'all': its most-cited citing "
+        "papers; other text narrows the citing papers to that topic. Use after search_papers found the paper."
+    )
+    category = "literature"
+    InputModel = FindCitingPapersInput
+    annotations = {"read_only": True, "cost": "network"}
+
+    def run(self, inp, ctx) -> ToolResult:
+        ads_client = ctx.services.get("ads_client")
+        if not ads_client:
+            return _native({"success": False, "error": "NASA ADS Client not initialized (check API Key)"})
+        set_last_run_result = ctx.service("set_last_run_result")
+        try:
+            result = ads_client.find_citing_papers(
+                inp.bibcode or "", focus=inp.focus or "rebuttals", max_results=inp.max_results or 15,
+            )
+        except Exception as e:
+            return _native({"success": False, "error": str(e)})
+        if not result.get("success"):
+            return _native(result)
+        papers = result.pop("papers", []) or []
+        if papers:
+            set_last_run_result({
+                "type": "papers",
+                "papers": papers,
+                "source": f"ADS: papers citing {result.get('bibcode')}",
+            })
+        return _native(result, ads_query=result.get("query"))
 
 
 class SearchPapersByObservationIdInput(_In):
@@ -805,6 +913,7 @@ class ReproducePaperMethods(BaseCapability):
 
 CAPABILITIES: List[BaseCapability] = [
     SearchPapers(),
+    FindCitingPapers(),
     SearchPapersByObservationId(),
     LookupResearcher(),
     GetResearchTrends(),
@@ -816,7 +925,8 @@ CAPABILITIES: List[BaseCapability] = [
 __all__ = [
     "CAPABILITIES",
     "derive_archive_identifiers_for_paper_search",
-    "SearchPapers", "SearchPapersByObservationId", "LookupResearcher",
+    "SearchPapers", "FindCitingPapers", "SEARCH_PAPERS_DESCRIPTION", "SearchPapersByObservationId",
+    "LookupResearcher",
     "GetResearchTrends", "EvaluateConsensus", "ExtractPaperDetails",
     "ReproducePaperMethods",
 ]

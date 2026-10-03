@@ -384,6 +384,8 @@ test("activity names what the running turn is doing right now", () => {
     assert.equal(at([{ text: "DeepWiki: ask_question", status: "running", mcp: { server: "DeepWiki", state: "running" } }]), "mcp");
     assert.equal(at([{ text: "Reading 3 pages", status: "running" }]), "reading");
     assert.equal(at([{ text: "Composing final answer", status: "running" }]), "wrapping");
+    // The budget step now names the limit (core/turn_guards.budget_status_text).
+    assert.equal(at([{ text: "Tool budget reached (all 8 tool rounds used), composing the final answer from collected results", status: "running" }]), "wrapping");
     assert.equal(at([{ text: "gpt-oss is degraded, using DeepSeek", status: "running" }]), "notice");
     assert.equal(at([{ text: "Querying ALMA by target", status: "running", elapsedSeconds: 20 }]), "waiting");
     // Between calls: something already ran, nothing is running now.

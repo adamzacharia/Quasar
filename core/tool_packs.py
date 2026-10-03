@@ -164,14 +164,16 @@ _pack(
     "Literature: fielded NASA ADS search with counts, abstracts, metrics, BibTeX, author papers and metrics, "
     "researcher profiles (OpenAlex), trends, consensus, paper method extraction, ADS libraries",
     (
-        "ads_search", "get_paper_abstract", "get_paper_metrics", "export_bibtex", "get_author_papers",
+        "ads_search", "find_citing_papers", "get_paper_abstract", "get_paper_metrics", "export_bibtex",
+        "get_author_papers",
         "get_author_metrics", "lookup_researcher", "get_research_trends", "evaluate_consensus",
         "extract_paper_details", "reproduce_paper_methods", "search_papers_by_observation_id", "alma_bibliography",
         "list_ads_libraries", "get_ads_library_papers", "create_ads_library", "add_to_ads_library",
     ),
     r"\bpapers?\b|publication|\barticles?\b|literature|\bads\b|arxiv|bibcode|bibtex|\bcit(?:e|ed|ation)|"
     r"h-?index|\bauthors?\b|researcher|professor|\borcid\b|consensus|\btrends?\b|\blibrar(?:y|ies)\b|"
-    r"published|\bjournal\b|\bstudies\b|\bstudy\b|who\s+is\b",
+    r"published|\bjournal\b|\bstudies\b|\bstudy\b|who\s+is\b|"
+    r"disput|challeng|rebut|refut|push(?:ed)?\s+back|responded|re-?analys",
 )
 _pack(
     "imaging",

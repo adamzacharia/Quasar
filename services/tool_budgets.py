@@ -861,7 +861,7 @@ def _openalex() -> Dict[str, float]:
 
 
 def _ads_llm() -> Dict[str, float]:
-    return {"ADS query-builder LLM": _env_f("ADS_QUERY_BUILDER_TIMEOUT_SECONDS", 30.0)}
+    return {"ADS query-builder LLM": _env_f("ADS_QUERY_BUILDER_TIMEOUT_SECONDS", 15.0)}
 
 
 def _papers_llm() -> Dict[str, float]:
@@ -1112,7 +1112,12 @@ def _declare_defaults() -> None:
     declare(["navigate_to_url"], _fixed("Playwright goto", 20.0))
     declare(["read_page", "click_element"], _fixed("Playwright action", 5.0))
     # ── literature ────────────────────────────────────────────────────
-    declare(["search_papers"], _merge(_ads_llm, _ads, _openalex), ADS_HOSTS + OPENALEX_HOSTS)
+    declare_loop(["search_papers"], _merge(_ads_llm, _ads, _openalex), ADS_HOSTS + OPENALEX_HOSTS,
+                 reason="identifier lookups (bibcode/DOI/arXiv, fuzzy bibcode recovery), the search, and at most "
+                        "3 zero-hit relaxations; each ADS request is bounded by the per-request timeout")
+    declare_loop(["find_citing_papers"], _ads, ADS_HOSTS,
+                 reason="resolve the cited paper (identifier or title), the citations() query, and a most-cited "
+                        "fallback when nothing uses rebuttal language")
     declare_loop(["search_papers_by_observation_id"], _merge(_ads, _openalex, _alma_tap), ADS_HOSTS + ALMA_TAP_HOSTS,
                  reason="one ADS lookup per derived identifier, then OpenAlex and a reverse ALMA TAP query")
     declare(["evaluate_consensus"], _merge(_ads_llm, _ads, _papers_llm), ADS_HOSTS)

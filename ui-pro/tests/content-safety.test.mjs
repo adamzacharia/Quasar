@@ -60,3 +60,13 @@ test("stored assistant text with explicit web content is replaced", () => {
     );
     assert.equal(safeAssistantWebText("ALMA Band 6 calibration guide."), "ALMA Band 6 calibration guide.");
 });
+
+test("a Roman-numeral XXX in a paper series is not explicit (Planck intermediate results. XXX.)", () => {
+    for (const ok of ["Planck intermediate results. XXX. The angular power spectrum", "Planck 2013 results. XXX. Cosmological parameters"]) {
+        assert.equal(looksExplicitWebText(ok), false, ok);
+        assert.equal(safeAssistantWebText(ok), ok);
+    }
+    for (const bad of ["free xxx videos", "XXX movies tonight", "results xxx videos", "Search results XXX videos", "Search results XXX. videos.", "Search results XXX. Videos", "results. XXX. Videos here", "Adult search results. XXX.", "Search results. XXX. Galleries", "see Paper XXX: methods", "2025 results. XXX. Explicit Galleries", "Planck 2025 results. XXX. Explicit Galleries"]) {
+        assert.equal(looksExplicitWebText(bad), true, bad);
+    }
+});

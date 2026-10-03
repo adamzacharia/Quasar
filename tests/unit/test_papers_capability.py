@@ -179,10 +179,13 @@ def test_search_papers_lambda_gate_dict_is_verbatim():
 
 
 def test_search_papers_wire_default_is_the_lambdas_15():
+    # Sort default changed on purpose 2026-10-03: None lets the query builder
+    # choose (a fixed "date desc" ranked "the first paper that reported X"
+    # newest-first).
     ads = _FakeAds()
     ctx, _ = _ctx(ads_client=ads)
     _run(SearchPapers(), ctx, query="q")
-    assert ads.calls[0] == ("nl", "q", 15, "date desc")
+    assert ads.calls[0] == ("nl", "q", 15, None)
 
 
 def test_search_papers_null_query_flows_into_the_legacy_body():
@@ -518,7 +521,14 @@ def test_papers_registrations_keep_their_legacy_surface():
     sp = agent.tool_registry.get_tool("search_papers")
     assert sp is not None and sp.category == "literature"
     assert sp.parameters["required"] == ["query"]
-    assert "Do NOT try to construct ADS field syntax yourself" in sp.description
+    # 2026-10-03: natural language still, plus direct identifier lookups and
+    # the hand-off to find_citing_papers for "who disputed X" questions.
+    assert "Pass the request in natural language" in sp.description
+    assert "find_citing_papers" in sp.description and "arXiv" in sp.description
+
+    fc = agent.tool_registry.get_tool("find_citing_papers")
+    assert fc is not None and fc.category == "literature"
+    assert fc.parameters["required"] == ["bibcode"]
 
     obs = agent.tool_registry.get_tool("search_papers_by_observation_id")
     assert obs.parameters["required"] == ["identifier"]

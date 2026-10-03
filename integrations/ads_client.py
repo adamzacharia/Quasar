@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -117,6 +118,15 @@ class ADSService:
     # biblib library ids are URL-safe tokens; anything else is refused before
     # it can reach the path.
     _LIBRARY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+    # Extra ADS calls a zero-hit literature search may spend on relaxing its
+    # query (each is one fast search; the tool guard is 150 s).
+    _MAX_RELAXATIONS = 4
+    # Wall clock after which no EXTRA request (fuzzy bibcode recovery,
+    # relaxation) starts, measured from the start of search_natural_language:
+    # the main path plus extras stays inside the 150 s tool guard even at the
+    # 21 s per-request worst case (guard CX-14).
+    _EXTRA_REQUESTS_WALL_S = 45.0
+    _MAX_FUZZY_LOOKUPS = 2
 
     def __init__(
         self,
@@ -203,29 +213,143 @@ class ADSService:
         filters: Optional[List[str]] = None,
         query_model: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Convert a natural-language question into an ADS query and execute it."""
+        """Convert a natural-language question into an ADS query and execute it.
 
-        builder = ADSQueryBuilder(model=query_model)
+        Order (2026-10-03 literature-search fix):
+        1. Bibcodes, DOIs and arXiv ids in the question are looked up directly
+           (a wrong-year bibcode is recovered from bibstem/volume/page). A
+           question that is only identifiers returns here.
+        2. The LLM query builder (``ADS_QUERY_MODEL``, default gpt-oss-120b on
+           TACC) translates the rest; when it fails or is off, the
+           deterministic ``heuristic_ads_query`` does.
+        3. A zero-hit query is relaxed (year widened, then dropped, journal
+           dropped, refereed filter dropped), at most ``_MAX_RELAXATIONS``
+           extra ADS calls.
+        The result says which path built the query (``query_source``) and what
+        was relaxed, so the model can tell an empty literature from a bad query
+        instead of re-phrasing the same search.
+        """
+        question = str(question or "").strip()
+        sort = normalize_ads_sort(sort)
+        attempts: List[Dict[str, Any]] = []
+        deadline = time.monotonic() + self._EXTRA_REQUESTS_WALL_S
+        ids = extract_literature_identifiers(question)
+        id_papers: List[Dict[str, Any]] = []
+        resolved: Dict[str, str] = {}
+        matched: Dict[str, str] = {}
+        id_errors: List[str] = []
+        if ids["any"]:
+            id_papers, resolved, matched, id_errors = self.lookup_identifiers(
+                ids, attempts=attempts, deadline=deadline)
+            if not id_papers and id_errors:
+                # A failed lookup is not "ADS has no such paper" (guard CX-04).
+                raise ADSServiceError(f"ADS identifier lookup failed: {id_errors[0]}")
+            if id_papers and _CITATION_INTENT_RE.search(question):
+                # "Which papers cited A (and B) [on topic]?" answers with the
+                # citing papers of EVERY resolved identifier, narrowed by any
+                # topic words (guard CX-11, CX-23).
+                return self._citing_papers_answer(question, ids, id_papers, resolved, matched, id_errors,
+                                                  attempts, max_results, deadline)
+            if ids["only"] or not ids["rest"]:
+                out = {
+                    "query": attempts[0]["query"] if attempts else question,
+                    "sort": "score desc",
+                    "filters": None,
+                    "rows": len(id_papers),
+                    "papers": id_papers,
+                    "query_source": "identifier",
+                    "resolved_from": resolved,
+                    "matched_ids": matched,
+                    "relaxed": [],
+                    "attempts": attempts,
+                    "builder_error": None,
+                    "identifier_errors": id_errors,
+                }
+                return out
+        topic = ids["rest"] if ids["any"] else question
+        # Counting questions keep their year exactly: a widened year would
+        # answer "how many in 2020" with 2021 papers (guard CX-03).
+        keep_year = bool(_COUNT_INTENT_RE.search(topic))
 
-        try:
-            structured = builder.build_query(question, max_results, sort, filters)
-        except ADSQueryBuilderError as exc:
-            logger.warning(
-                "Query builder failed (%s); falling back to heuristic query.", exc
-            )
-            structured = self._heuristic_query(question, max_results, sort, filters)
+        builder_error: Optional[str] = None
+        structured: Optional[Dict[str, Any]] = None
+        query_source = "fallback"
+        if ids["any"] and time.monotonic() > deadline:
+            # The identifier lookups used the time budget: skip the LLM call
+            # and use the deterministic query (guard CX-14).
+            builder_error = "skipped: tool time budget"
+        elif ads_query_builder_enabled():
+            try:
+                structured = ADSQueryBuilder(model=query_model).build_query(topic, max_results, sort, filters)
+                query_source = "llm_builder"
+            except ADSQueryBuilderError as exc:
+                builder_error = str(exc)[:200]
+                logger.warning("Query builder failed (%s); falling back to heuristic query.", exc)
+        else:
+            builder_error = "query builder disabled (ADS_QUERY_BUILDER=off)"
+        if structured is None:
+            structured = self._heuristic_query(topic, max_results, sort, filters)
 
         ads_query = structured.get("query", "")
-        resolved_sort = structured.get("sort", sort or "date desc")
+        resolved_sort = structured.get("sort") or sort or "score desc"
         resolved_filters = structured.get("filters", filters)
-        rows = int(structured.get("rows", max_results))
+        try:
+            rows = int(structured.get("rows") or max_results)
+        except (TypeError, ValueError):
+            rows = int(max_results or 10)
+        # Never more rows than the caller asked for (guard CX-12).
+        rows = max(1, min(rows, int(max_results or rows)))
 
-        papers = self.search_papers(
-            ads_query,
-            max_results=rows,
-            sort=resolved_sort,
-            filters=resolved_filters,
-        )
+        try:
+            papers = self.search_papers(ads_query, max_results=rows, sort=resolved_sort, filters=resolved_filters)
+        except ADSServiceError as exc:
+            # Only a syntax rejection of the builder's query gets the
+            # deterministic retry; an outage, 401 or 429 is reported as is
+            # (guard CX-13).
+            if query_source != "llm_builder" or not _is_query_syntax_error(exc):
+                raise
+            attempts.append({"query": ads_query, "hits": 0, "error": str(exc)[:160]})
+            builder_error = f"ADS rejected the builder query: {str(exc)[:120]}"
+            structured = self._heuristic_query(topic, max_results, sort, filters)
+            ads_query = structured["query"]
+            resolved_sort = structured.get("sort") or "score desc"
+            resolved_filters = structured.get("filters", filters)
+            query_source = "fallback"
+            papers = self.search_papers(ads_query, max_results=rows, sort=resolved_sort, filters=resolved_filters)
+        attempts.append({"query": ads_query, "hits": len(papers)})
+        total: Optional[int] = None
+        if keep_year and time.monotonic() < deadline:
+            # A counting question needs ADS's numFound, not the page size
+            # (guard CX-25).
+            try:
+                total = self.count_matches(ads_query, filters=resolved_filters)
+            except ADSServiceError as exc:
+                attempts.append({"query": ads_query, "hits": len(papers), "error": f"count: {str(exc)[:120]}"})
+
+        relaxed: List[str] = []
+        if not papers and not keep_year:
+            # A counting question is never relaxed: any looser match would be
+            # counted as an answer to a different question (guard CX-03).
+            rebuild = heuristic_ads_query(topic) if query_source == "llm_builder" else None
+            steps = relaxation_steps(ads_query, resolved_filters, keep_year=keep_year, rebuild=rebuild)
+            for label, q2, f2 in steps[: self._MAX_RELAXATIONS]:
+                if time.monotonic() > deadline:
+                    attempts.append({"query": q2, "hits": 0, "error": "skipped: tool time budget"})
+                    break
+                try:
+                    found = self.search_papers(q2, max_results=rows, sort=resolved_sort, filters=f2)
+                except ADSServiceError as exc:
+                    attempts.append({"query": q2, "hits": 0, "error": str(exc)[:160]})
+                    break
+                attempts.append({"query": q2, "hits": len(found)})
+                relaxed.append(label)
+                if found:
+                    papers, ads_query, resolved_filters = found, q2, f2
+                    break
+
+        if id_papers:
+            seen = {p.get("bibcode") for p in id_papers}
+            papers = id_papers + [p for p in papers if p.get("bibcode") not in seen]
 
         return {
             "query": ads_query,
@@ -233,6 +357,16 @@ class ADSService:
             "filters": resolved_filters,
             "rows": rows,
             "papers": papers,
+            "query_source": query_source,
+            "resolved_from": resolved,
+            "matched_ids": matched,
+            "relaxed": relaxed,
+            "relaxed_results": bool(relaxed and papers and not id_papers),
+            "total": total,
+            "total_requested": keep_year,
+            "attempts": attempts,
+            "builder_error": builder_error,
+            "identifier_errors": id_errors if ids["any"] else [],
         }
     
     def search_by_target(self, target_name: str, max_results: int = 10) -> List[Dict[str, Any]]:
@@ -1201,6 +1335,620 @@ class ADSService:
             "filters": filters or ["property:refereed"],
         }
 
+    # ------------------------------------------------------------------
+    # Identifier lookups (bibcode / DOI / arXiv id)
+    # ------------------------------------------------------------------
+    def count_matches(self, query: str, filters: Optional[List[str]] = None) -> Optional[int]:
+        """ADS numFound for a query (rows=0); None when ADS does not report it."""
+        params: Dict[str, Union[str, int, List[str]]] = {"q": query, "fl": "bibcode", "rows": 0}
+        if filters:
+            params["fq"] = filters
+        data = self._perform_get("/search/query", params)
+        found = (data or {}).get("response", {}).get("numFound") if isinstance(data, dict) else None
+        return int(found) if isinstance(found, int) else None
+
+    def lookup_identifiers(
+        self,
+        ids: Dict[str, Any],
+        *,
+        attempts: Optional[List[Dict[str, Any]]] = None,
+        deadline: Optional[float] = None,
+    ) -> "tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str], List[str]]":
+        """Look up the identifiers ``extract_literature_identifiers`` found.
+
+        Exact ``bibcode:`` / ``doi:`` / ``identifier:"arXiv:..."`` queries with
+        no refereed filter (an arXiv-only paper is still the paper asked for).
+        A bibcode that does not exist is recovered from its bibstem, volume and
+        page, which do not depend on the year: Nature Astronomy published
+        2021NatAs...5..655G online in 2020, so a model that writes
+        ``2020NatAs...5..655G`` gets the real record and a ``resolved_from``
+        note instead of an empty result.
+
+        Returns (papers, resolved_from, matched_ids, errors):
+        resolved_from maps a requested identifier that did NOT exist as written
+        to the bibcode it was recovered as; matched_ids maps a valid DOI/arXiv
+        id to its bibcode (not a correction, guard CX-17); errors lists ADS
+        failures so the caller does not report them as "no such paper"
+        (guard CX-04).
+        """
+        attempts = attempts if attempts is not None else []
+        papers: List[Dict[str, Any]] = []
+        resolved: Dict[str, str] = {}
+        matched: Dict[str, str] = {}
+        errors: List[str] = []
+        seen: set = set()
+
+        def _add(found: List[Dict[str, Any]]) -> None:
+            for paper in found:
+                bib = paper.get("bibcode") or ""
+                if bib and bib not in seen:
+                    seen.add(bib)
+                    papers.append(paper)
+
+        def _run(query: str, rows: int) -> Optional[List[Dict[str, Any]]]:
+            try:
+                found = self.search_papers(query, max_results=rows, sort="score desc", filters=None)
+            except ADSServiceError as exc:
+                attempts.append({"query": query, "hits": 0, "error": str(exc)[:160]})
+                errors.append(str(exc)[:160])
+                return None
+            attempts.append({"query": query, "hits": len(found)})
+            return found
+
+        bibcodes = list(ids.get("bibcodes") or [])[:5]
+        if bibcodes:
+            found = _run(" OR ".join(f'bibcode:"{b}"' for b in bibcodes), len(bibcodes))
+            if found is not None:
+                _add(found)
+                hit = {p.get("bibcode") for p in found}
+                missed = [b for b in bibcodes if b not in hit]
+                for bib in missed[self._MAX_FUZZY_LOOKUPS:]:
+                    # Never silent (guard CX-24): the model can look these up singly.
+                    errors.append(f"{bib}: not found as written; wrong-year recovery skipped "
+                                  f"(at most {self._MAX_FUZZY_LOOKUPS} per call)")
+                for bib in missed[: self._MAX_FUZZY_LOOKUPS]:
+                    if deadline is not None and time.monotonic() > deadline:
+                        errors.append(f"{bib}: wrong-year recovery skipped (tool time budget)")
+                        continue
+                    fuzzy = bibcode_fuzzy_query(bib)
+                    if not fuzzy:
+                        continue
+                    best = pick_fuzzy_bibcode_match(bib, _run(fuzzy, 5) or [])
+                    if best:
+                        resolved[bib] = best.get("bibcode", "")
+                        _add([best])
+        def _late() -> bool:
+            return deadline is not None and time.monotonic() > deadline
+
+        dois = list(ids.get("dois") or [])[:5]
+        if dois and _late():
+            errors.append("DOI lookup skipped: tool time budget")
+        elif dois:
+            # doi:("...") with parentheses is a Solr 400 (live 2026-10-03): one clause each.
+            found = _run(" OR ".join(f'doi:"{d}"' for d in dois), len(dois))
+            if found is not None:
+                if len(dois) == 1 and len(found) == 1 and found[0].get("bibcode"):
+                    matched[dois[0]] = found[0]["bibcode"]
+                _add(found)
+        arxiv = list(ids.get("arxiv") or [])[:5]
+        if arxiv and _late():
+            errors.append("arXiv lookup skipped: tool time budget")
+        elif arxiv:
+            found = _run(" OR ".join(f'identifier:"arXiv:{a}"' for a in arxiv), len(arxiv))
+            if found is not None:
+                # Formatted papers do not carry the identifier list (kept out of
+                # the model's context); a single id maps to its single record.
+                if len(arxiv) == 1 and len(found) == 1 and found[0].get("bibcode"):
+                    matched[f"arXiv:{arxiv[0]}"] = found[0]["bibcode"]
+                _add(found)
+        return papers, resolved, matched, errors
+
+    def _citing_papers_answer(self, question, ids, id_papers, resolved, matched, id_errors, attempts,
+                              max_results, deadline) -> Dict[str, Any]:
+        bibs = [p.get("bibcode") for p in id_papers if p.get("bibcode")][:5]
+        if len(bibs) > 1 and _ALL_OF_RE.search(question):
+            # papers citing every one of them: intersect the citation sets
+            cq = " AND ".join(f'citations(bibcode:"{b}")' for b in bibs)
+            combine = "all"
+        else:
+            cq = "citations(" + " OR ".join(f'bibcode:"{b}"' for b in bibs) + ")"
+            combine = "any"
+        if len(bibs) > 1 and combine == "all":
+            cq = f"({cq})"
+        topic_text = _CONNECTIVE_RE.sub(" ", _CITATION_INTENT_RE.sub(" ", ids.get("rest") or ""))
+        topic_q = heuristic_ads_query(topic_text) if topic_text.strip() else "*:*"
+        if topic_q != "*:*":
+            cq = f"{cq} AND ({topic_q})"
+        errors = list(id_errors)
+        papers: List[Dict[str, Any]] = []
+        total: Optional[int] = None
+        if time.monotonic() < deadline:
+            try:
+                papers = self.search_papers(cq, max_results=max_results, sort="citation_count desc", filters=None)
+                attempts.append({"query": cq, "hits": len(papers)})
+                # The real number of citing papers, not the page size (guard CX-25).
+                total = self.count_matches(cq)
+            except ADSServiceError as exc:
+                attempts.append({"query": cq, "hits": 0, "error": str(exc)[:160]})
+                errors.append(str(exc)[:160])
+        else:
+            errors.append("citations lookup skipped: tool time budget")
+        return {
+            "total": total,
+            "total_requested": True,
+            "combine": combine,
+            "query": cq,
+            "sort": "citation_count desc",
+            "filters": None,
+            "rows": len(papers),
+            "papers": papers,
+            "query_source": "citations",
+            "cited_papers": id_papers,
+            "resolved_from": resolved,
+            "matched_ids": matched,
+            "relaxed": [],
+            "attempts": attempts,
+            "builder_error": None,
+            "identifier_errors": errors,
+            "next_step": ("These are the most-cited papers citing the requested paper(s). For the ones that "
+                          "disputed or re-analysed a paper, call find_citing_papers with its bibcode."),
+        }
+
+    # ------------------------------------------------------------------
+    # Papers that responded to a paper (2026-10-03)
+    # ------------------------------------------------------------------
+    def resolve_paper_reference(self, reference: str) -> "tuple[Optional[Dict[str, Any]], Optional[str]]":
+        """A bibcode / DOI / arXiv id / title -> (ADS paper record, note).
+
+        Identifiers go through :meth:`lookup_identifiers` (so a wrong-year
+        bibcode is recovered); anything else is treated as a title."""
+        ref = str(reference or "").strip()
+        if not ref:
+            return None, "no paper given"
+        ids = extract_literature_identifiers(ref)
+        if ids["any"]:
+            papers, resolved, _matched, errors = self.lookup_identifiers(ids)
+            if not papers and errors:
+                raise ADSServiceError(f"ADS identifier lookup failed: {errors[0]}")
+            if papers:
+                note = None
+                if resolved:
+                    note = "; ".join(f"{k} resolved to {v}" for k, v in resolved.items())
+                return papers[0], note
+            return None, f"no ADS record for {ref}"
+        title = re.sub(r'["()]', " ", ref)
+        title = re.sub(r"\s+", " ", title).strip()
+        papers = self.search_papers(f'title:"{title}"', max_results=3, sort="score desc")
+        if not papers:
+            words = [w for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", title) if w.lower() not in _HEURISTIC_STOP]
+            if words:
+                papers = self.search_papers("title:(" + " AND ".join(words[:8]) + ")", max_results=3,
+                                            sort="citation_count desc")
+        if not papers:
+            return None, f"no ADS paper matches the title {ref!r}"
+        return papers[0], None
+
+    def find_citing_papers(
+        self,
+        bibcode: str,
+        focus: str = "rebuttals",
+        max_results: int = 15,
+    ) -> Dict[str, Any]:
+        """Papers that cite ``bibcode``, grouped for "who pushed back on X".
+
+        ``focus="rebuttals"`` (default) pulls the citing papers whose title or
+        abstract uses rebuttal language ("no evidence", "re-analysis", "upper
+        limit", "reply to", ...) and re-ranks them by how much of the cited
+        paper's own topic they share: rebuttal words alone also match unrelated
+        papers that cite X in passing (live 2026-10-03: a K2-18b paper titled
+        "Does Not ..." citing the Venus phosphine paper). ``focus="all"``
+        returns the most-cited citing papers; any other text is AND-ed onto
+        the citation set as unfielded terms.
+        """
+        self._require_api_key()
+        source, note = self.resolve_paper_reference(bibcode)
+        if not source:
+            return {"success": False, "error": note or "paper not found", "requested": bibcode}
+        bib = source.get("bibcode", "")
+        cap = self._clamp_int(max_results, default=15, lo=1, hi=50)
+        mode = str(focus or "rebuttals").strip()
+        mode_key = mode.lower()
+        rebuttal_mode = mode_key in _REBUTTAL_FOCUS
+        base = f'citations(bibcode:"{bib}")'
+        if mode_key in ("all", "any", "everything"):
+            query, rows = base, cap
+        elif rebuttal_mode:
+            terms = " OR ".join(f'"{t}"' if (" " in t or "-" in t) else t for t in _REBUTTAL_TERMS)
+            query, rows = f"{base} AND (title:({terms}) OR abs:({terms}))", 100
+        else:
+            extra = heuristic_ads_query(mode)
+            query = base if extra == "*:*" else f"{base} AND ({extra})"
+            rows = cap
+        found = self.search_papers(query, max_results=rows, sort="citation_count desc", filters=None)
+
+        def _slim(p: Dict[str, Any], score: Optional[int] = None) -> Dict[str, Any]:
+            out = {k: p.get(k) for k in ("bibcode", "title", "authors", "year", "journal", "citations", "link")}
+            if score is not None:
+                out["relevance"] = score
+            return out
+
+        result: Dict[str, Any] = {
+            "success": True,
+            "bibcode": bib,
+            "source_title": source.get("title"),
+            "source_year": source.get("year"),
+            "focus": mode or "rebuttals",
+            "query": query,
+        }
+        if note:
+            result["resolved_from"] = note
+        if not rebuttal_mode:
+            result["citing"] = [_slim(p) for p in found[:cap]]
+            result["count"] = len(result["citing"])
+            result["papers"] = found[:cap]
+            return result
+
+        topic = _distinctive_terms(source.get("title") or "")
+        rebuttals: List[tuple] = []
+        possible: List[tuple] = []
+        replies: List[Dict[str, Any]] = []
+        other: List[Dict[str, Any]] = []
+        for p in found:
+            tl = str(p.get("title") or "").lower()
+            al = str(p.get("abstract") or "").lower()
+            if _REPLY_TITLE_RE.match(tl):
+                replies.append(p)
+                continue
+            r_title = sum(1 for t in _REBUTTAL_TERMS if t in tl)
+            r_abs = sum(1 for t in _REBUTTAL_TERMS if t in al)
+            t_title = sum(1 for t in topic if t in tl)
+            t_abs = sum(1 for t in topic if t in al)
+            # Distinct topic words across title AND abstract: "phosphine" in
+            # both a Mars paper's title and abstract is still ONE (CX-08 reopen).
+            t_unique = sum(1 for t in topic if t in tl or t in al)
+            # Sharing the cited paper's topic IN THE TITLE matters most: "upper
+            # limits for phosphine on Mars" cites the Venus paper too.
+            # Rebuttal language counts once ("upper limit" and "upper limits"
+            # overlap); topic overlap decides the order.
+            score = 3 * min(r_title, 1) + min(r_abs, 2) + 3 * min(t_title, 3) + min(t_abs, 2)
+            # Lexical overlap cannot tell "re-analysed the Venus data" from "set
+            # Mars limits and compared them with Venus" (guard CX-08), so the
+            # verdict is tiered: two of the cited paper's topic words IN THE
+            # TITLE is a rebuttal; overlap only via the abstract is a possible
+            # rebuttal the model must check before calling it one.
+            if not (r_title or r_abs) or score < 4 or t_unique < min(2, len(topic)):
+                other.append(p)
+            elif t_title >= min(2, len(topic)):
+                rebuttals.append((score, p))
+            else:
+                possible.append((score, p))
+        rebuttals.sort(key=lambda sp: (-sp[0], -(sp[1].get("citations") or 0)))
+        possible.sort(key=lambda sp: (-sp[0], -(sp[1].get("citations") or 0)))
+        result["rebuttals"] = [_slim(p, s) for s, p in rebuttals[:cap]]
+        result["possible_rebuttals"] = [_slim(p, s) for s, p in possible[:cap]]
+        if possible:
+            result["possible_note"] = ("possible_rebuttals share the cited paper's topic only partly in the title; "
+                                       "they may discuss a different object. Check each title before calling it "
+                                       "a rebuttal.")
+        result["replies"] = [_slim(p) for p in replies[:5]]
+        result["other_citing"] = [_slim(p) for p in other[:5]]
+        result["count"] = len(result["rebuttals"])
+        result["scanned"] = len(found)
+        if len(found) >= 100:
+            # guard CX-15: say the scan was bounded instead of implying completeness.
+            result["scan_note"] = ("Ranked among the 100 most-cited citing papers that use rebuttal language; "
+                                   "a less-cited response can be missing. Use focus with a topic to narrow.")
+        result["papers"] = [p for _, p in rebuttals[:cap]] + replies[:5] + [p for _, p in possible[:cap]]
+        if not rebuttals and not replies and not possible:
+            # Nothing argued with it in so many words: show who cites it most.
+            fallback = self.search_papers(base, max_results=min(cap, 10), sort="citation_count desc", filters=None)
+            result["other_citing"] = [_slim(p) for p in fallback]
+            result["papers"] = fallback
+            result["note"] = ("No citing paper uses rebuttal language together with this paper's topic; "
+                              "other_citing lists its most-cited citing papers instead.")
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Literature identifiers (2026-10-03 literature-search fix)
+# ─────────────────────────────────────────────────────────────────────────────
+# A canonical ADS bibcode is EXACTLY 19 characters: YYYY + 5 bibstem + 4 volume
+# + 1 qualifier + 4 page + 1 author initial, '.'-padded.
+_BIBCODE_IN_TEXT_RE = re.compile(r"(?<![A-Za-z0-9&.])((?:1[6-9]|20)\d{2}[A-Za-z][A-Za-z0-9&.]{13}[A-Za-z.])(?![A-Za-z0-9&.])")
+_DOI_IN_TEXT_RE = re.compile(r"(?<![\w/.])(10\.\d{4,9}/[^\s\"'<>,;()\[\]]+)")
+# An arXiv id inside a sentence needs its 'arXiv' prefix (a bare 1420.4058 is a
+# frequency); old-style archive/NNNNNNN ids carry their own prefix.
+_ARXIV_PREFIXED_RE = re.compile(
+    r"\barxiv\s*[:/]?\s*(?:abs/)?(\d{4}\.\d{4,5}|[a-z][a-z\-]+(?:\.[A-Za-z]{2})?/\d{7})(?:v\d+)?\b",
+    re.IGNORECASE,
+)
+_ARXIV_OLD_RE = re.compile(
+    r"(?<![\w/])((?:astro-ph|gr-qc|hep-ph|hep-th|hep-ex|nucl-th|nucl-ex|physics|math-ph|cond-mat|quant-ph)"
+    r"(?:\.[A-Za-z]{2})?/\d{7})(?:v\d+)?\b"
+)
+_ARXIV_BARE_RE = re.compile(r"^\s*(\d{2}(?:0[1-9]|1[0-2])\.\d{4,5})(?:v\d+)?\s*$")
+# Words that only frame a lookup ("look up X and give its title"). A question
+# that is identifiers plus these words is a pure lookup: no topic search.
+_LOOKUP_FILLER = {
+    "look", "up", "lookup", "find", "get", "fetch", "show", "give", "tell", "me", "us", "the", "a", "an", "of",
+    "its", "it", "is", "what", "which", "who", "whose", "and", "or", "with", "for", "to", "in", "on", "this",
+    "that", "paper", "papers", "article", "articles", "record", "records", "entry", "title", "titles", "author",
+    "authors", "first", "bibcode", "bibcodes", "doi", "dois", "arxiv", "id", "ids", "identifier", "identifiers",
+    "journal", "reference", "references", "ref", "published", "publication", "details", "abstract", "abstracts",
+    "citation", "citations", "cited", "metadata", "info", "information", "about", "please", "can", "you", "ads",
+    "nasa", "full", "list", "year", "link", "links", "corresponding", "same", "by", "from", "has", "have",
+}
+
+
+# "Which papers cited X" / "how many papers ..." (guard CX-11, CX-03).
+_CITATION_INTENT_RE = re.compile(r"\b(?:cit(?:e|ed|es|ing|ation|ations)|cited\s+by)\b", re.IGNORECASE)
+# "papers citing BOTH A and B" means the intersection (guard CX-23 round 3).
+_ALL_OF_RE = re.compile(r"\bboth\b|\ball\s+(?:of\s+)?(?:these|them|those|the\s+(?:two|three|papers))\b|\beach\s+of\b",
+                        re.IGNORECASE)
+_CONNECTIVE_RE = re.compile(r"\b(?:both|either|each|all|these|those|them|of|and|or|which|what|papers?)\b",
+                            re.IGNORECASE)
+_COUNT_INTENT_RE = re.compile(r"\bhow\s+many\b|\bnumber\s+of\b|\bcount(?:s|ing)?\b|\btotal\b", re.IGNORECASE)
+
+
+_VALID_SORTS = ("date desc", "date asc", "citation_count desc", "citation_count_norm desc", "score desc",
+                "read_count desc", "citation_count asc")
+_SORT_ALIASES = {
+    "date": "date desc", "newest": "date desc", "recent": "date desc", "latest": "date desc",
+    "oldest": "date asc", "citations": "citation_count desc", "citation_count": "citation_count desc",
+    "cited": "citation_count desc", "most cited": "citation_count desc", "relevance": "score desc",
+    "score": "score desc", "reads": "read_count desc", "read_count": "read_count desc",
+}
+
+
+def normalize_ads_sort(sort: Any) -> Optional[str]:
+    """A valid ADS sort or None (let the builder choose). gpt-oss sends
+    shorthands such as "date" (live 2026-10-03), which ADS does not accept."""
+    text = re.sub(r"\s+", " ", str(sort or "").strip().lower())
+    if not text:
+        return None
+    if text in _VALID_SORTS:
+        return text
+    return _SORT_ALIASES.get(text)
+
+
+def _is_query_syntax_error(exc: Exception) -> bool:
+    """ADS rejected the query string itself, not the service.
+
+    A 400 is always the query. A 500 counts only when it carries a Solr
+    response body (the dotted ``abs:(...)`` failure of 2026-10-03 did); a bare
+    "500: Internal Server Error" is the service (guard CX-13 reopen)."""
+    text = str(exc)
+    if re.search(r"\berror 400\b|SyntaxError|ParseException|org\.apache\.solr", text):
+        return True
+    return bool(re.search(r"\berror 500\b", text) and re.search(r"responseHeader|error-class|SolrException", text))
+
+
+def _clean_doi(doi: str) -> str:
+    return doi.rstrip(".,;:)]}'\"?!")
+
+
+def extract_literature_identifiers(text: str) -> Dict[str, Any]:
+    """Find ADS bibcodes, DOIs and arXiv ids in a literature request.
+
+    ``only`` is True when nothing but identifiers and lookup filler words is
+    left (``"2020NatAs...5..655G"``, ``"look up 2018ApJ...869L..41A"``), so the
+    caller can skip the topic search. ``rest`` is the request with the
+    identifiers removed (what a topic search should use)."""
+    raw = str(text or "")
+    rest = raw
+    bibcodes: List[str] = []
+    dois: List[str] = []
+    arxiv: List[str] = []
+
+    for m in _DOI_IN_TEXT_RE.finditer(raw):
+        doi = _clean_doi(m.group(1))
+        if doi and doi not in dois:
+            dois.append(doi)
+        rest = rest.replace(m.group(1), " ")
+    rest = re.sub(r"\bdoi\s*:\s*", " ", rest, flags=re.IGNORECASE)
+    for m in _ARXIV_PREFIXED_RE.finditer(rest):
+        if m.group(1) not in arxiv:
+            arxiv.append(m.group(1))
+    rest = _ARXIV_PREFIXED_RE.sub(" ", rest)
+    for m in _ARXIV_OLD_RE.finditer(rest):
+        if m.group(1) not in arxiv:
+            arxiv.append(m.group(1))
+    rest = _ARXIV_OLD_RE.sub(" ", rest)
+    bare = _ARXIV_BARE_RE.match(rest)
+    if bare and not arxiv:
+        arxiv.append(bare.group(1))
+        rest = " "
+    for m in _BIBCODE_IN_TEXT_RE.finditer(rest):
+        bib = m.group(1)
+        # A real bibcode is padded with '.' or carries a volume/page; plain
+        # 19-letter words never reach here (they need a 4-digit year first).
+        if bib not in bibcodes:
+            bibcodes.append(bib)
+    rest = _BIBCODE_IN_TEXT_RE.sub(" ", rest)
+
+    found = bool(bibcodes or dois or arxiv)
+    words = [w.lower() for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", rest)]
+    content = [w for w in words if w not in _LOOKUP_FILLER and w not in _HEURISTIC_STOP]
+    rest = re.sub(r"\s+", " ", rest).strip(" ,;:.?!")
+    return {
+        "bibcodes": bibcodes,
+        "dois": dois,
+        "arxiv": arxiv,
+        "any": found,
+        "only": found and not content,
+        "rest": rest if content else "",
+    }
+
+
+def bibcode_fuzzy_query(bibcode: str) -> Optional[str]:
+    """ADS query for a bibcode's bibstem + volume + page with NO year.
+
+    ``2020NatAs...5..655G`` -> ``bibstem:"NatAs" AND volume:"5" AND page:"655"``.
+    The qualifier letter (L for Letters, A for A&A article numbers) is part of
+    the ADS page (``L41``, ``A133``)."""
+    bib = str(bibcode or "").strip()
+    if len(bib) != 19:
+        return None
+    bibstem = bib[4:9].strip(".")
+    volume = bib[9:13].strip(".")
+    qualifier = bib[13]
+    page = bib[14:18].strip(".")
+    if not bibstem or not page:
+        return None
+    if qualifier.isalpha():
+        page = qualifier + page
+    parts = [f'bibstem:"{bibstem}"']
+    if volume:
+        parts.append(f'volume:"{volume}"')
+    parts.append(f'page:"{page}"')
+    return " AND ".join(parts)
+
+
+def pick_fuzzy_bibcode_match(requested: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Choose the record a mistyped bibcode meant: same bibstem/volume/page
+    (the query already guarantees that), first-author initial equal, and the
+    year within two of the requested one. None when nothing qualifies."""
+    req = str(requested or "")
+    try:
+        req_year = int(req[:4])
+    except ValueError:
+        return None
+    best = None
+    best_gap = None
+    for paper in candidates or []:
+        bib = str(paper.get("bibcode") or "")
+        if len(bib) != 19:
+            continue
+        try:
+            year = int(bib[:4])
+        except ValueError:
+            continue
+        gap = abs(year - req_year)
+        if gap > 2 or bib[18].upper() != req[18].upper():
+            continue
+        if best is None or gap < best_gap:
+            best, best_gap = paper, gap
+    return best
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zero-hit relaxation (2026-10-03)
+# ─────────────────────────────────────────────────────────────────────────────
+_CLAUSE_VALUE = r'(?:\[[^\]]*\]|"[^"]*"|\([^()]*\)|[^\s()]+)'
+
+
+def _balanced(query: str) -> bool:
+    depth = 0
+    in_quote = False
+    for ch in query:
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote and ch == "(":
+            depth += 1
+        elif not in_quote and ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_quote
+
+
+def _tidy_connectives(query: str) -> str:
+    q = re.sub(r"\s+", " ", query).strip()
+    for _ in range(4):
+        q = re.sub(r"\b(AND|OR|NOT)\s+(?=(AND|OR)\b)", "", q)
+        q = re.sub(r"\(\s*(AND|OR)\s+", "(", q)
+        q = re.sub(r"\s+(AND|OR|NOT)\s*\)", ")", q)
+        q = re.sub(r"^\s*(AND|OR)\s+", "", q)
+        q = re.sub(r"\s+(AND|OR|NOT)\s*$", "", q)
+        q = re.sub(r"\(\s*\)", "", q)
+        q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def drop_query_clause(query: str, field: str) -> Optional[str]:
+    """Remove every ``field:value`` clause (and its dangling AND/OR) from an
+    ADS query. None when the field is absent or the result is empty or
+    unbalanced (then that relaxation is skipped)."""
+    pattern = re.compile(rf"(?<![\w:])\^?{re.escape(field)}:\s*{_CLAUSE_VALUE}", re.IGNORECASE)
+    if not pattern.search(query or ""):
+        return None
+    out = _tidy_connectives(pattern.sub(" ", query))
+    if not out or not _balanced(out) or out == query:
+        return None
+    return out
+
+
+def widen_year_clause(query: str) -> Optional["tuple[str, str]"]:
+    """``year:2020`` / ``year:2020-2021`` / ``year:[2020 TO 2021]`` widened by
+    one year each side. Returns (new_query, label) or None."""
+    q = query or ""
+    m = re.search(r"\byear:\s*\[\s*(\d{4})\s+TO\s+(\d{4}|\*)\s*\]", q, re.IGNORECASE)
+    if m:
+        lo = int(m.group(1)) - 1
+        hi = m.group(2) if m.group(2) == "*" else str(int(m.group(2)) + 1)
+        label = f"widened year {m.group(1)}-{m.group(2)} to {lo}-{hi}"
+        return q[:m.start()] + f"year:[{lo} TO {hi}]" + q[m.end():], label
+    m = re.search(r'\byear:\s*"?(\d{4})(?:\s*-\s*(\d{4}))?"?(?![\d\-])', q)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        shown = m.group(1) if not m.group(2) else f"{m.group(1)}-{m.group(2)}"
+        return q[:m.start()] + f"year:[{lo - 1} TO {hi + 1}]" + q[m.end():], f"widened year {shown} to {lo - 1}-{hi + 1}"
+    return None
+
+
+def relaxation_steps(
+    query: str,
+    filters: Optional[List[str]],
+    *,
+    keep_year: bool = False,
+    rebuild: Optional[str] = None,
+) -> List["tuple[str, str, Optional[List[str]]]"]:
+    """Ordered (label, query, filters) relaxations for a zero-hit ADS query:
+    widen the year, drop the year and the journal, rebuild the query without
+    the LLM (``rebuild``), include non-refereed records. ``keep_year`` (a
+    counting question) never touches the year (guard CX-03). Four steps at
+    most, so the ``_MAX_RELAXATIONS`` cap never hides one (guard CX-07)."""
+    steps: List["tuple[str, str, Optional[List[str]]]"] = []
+    current = query
+    if not keep_year:
+        widened = widen_year_clause(current)
+        if widened and widened[0] != current:
+            steps.append((widened[1], widened[0], filters))
+    loosest = current
+    dropped_parts = []
+    if not keep_year:
+        no_year = drop_query_clause(loosest, "year")
+        if no_year:
+            loosest, dropped_parts = no_year, ["the year"]
+    no_journal = drop_query_clause(loosest, "bibstem")
+    if no_journal:
+        loosest = no_journal
+        dropped_parts.append("the journal")
+    if dropped_parts:
+        steps.append(("dropped " + " and ".join(dropped_parts), loosest, filters))
+    if rebuild and rebuild not in ("*:*", query, loosest):
+        steps.append(("rebuilt the query without the LLM", rebuild, filters))
+    if filters and any(str(f).strip().lower() == "property:refereed" for f in filters):
+        rest = [f for f in filters if str(f).strip().lower() != "property:refereed"]
+        steps.append(("included non-refereed records", loosest, rest or None))
+    return steps
+
+
+def validate_ads_query(query: str) -> Optional[str]:
+    """Why an ADS query string is unusable, or None when it looks fine."""
+    q = str(query or "").strip()
+    if not q:
+        return "empty query"
+    if len(q) > 1500:
+        return "query too long"
+    if re.search(r"(?<![\w])(object|simbad):", q, re.IGNORECASE):
+        return "object:/simbad: fields are not supported by the search API"
+    if q.count('"') % 2:
+        return "unbalanced quotes"
+    if not _balanced(q):
+        return "unbalanced parentheses"
+    return None
+
 
 _HEURISTIC_JOURNALS = (
     ("astrophysical journal letters", "ApJL"), ("astrophysical journal supplement", "ApJS"),
@@ -1218,19 +1966,76 @@ _HEURISTIC_STOP = {
     "publish", "refereed", "peer", "reviewed", "journal", "between", "since", "after", "before", "inclusive",
     "year", "years", "first", "reported", "report", "any", "all", "some", "about", "into", "please", "can", "you",
     "i", "my", "our", "we", "bibcode", "bibcodes", "doi", "dois", "also", "than", "more", "most", "recent",
+    "not", "no", "nor", "near", "to", "via", "using", "use", "used",
 }
 _NAME_PARTICLES = {"van", "von", "de", "der", "den", "da", "di", "du", "del", "la", "le", "st"}
+# A capitalised run is only an AUTHOR when a cue says so ("by Jane Doe",
+# "did Jane Doe publish", "Doe et al."). Without a cue, "Venus Greaves" stays
+# two topic words: unfielded search matches author names anyway.
+_AUTHOR_CUE_BEFORE = {"by", "did", "does", "author", "authors", "authored", "coauthor", "coauthored", "co-authored"}
+_AUTHOR_CUE_AFTER = {"et", "publish", "published", "publishes", "wrote", "writes", "authored"}
+# Capitalised runs that name a facility or a team, never a person.
+_NOT_A_PERSON = {"telescope", "observatory", "space", "array", "survey", "mission", "satellite", "explorer",
+                 "interferometer", "collaboration", "team", "project", "consortium", "experiment", "network"}
+
+
+# Rebuttal language for find_citing_papers (titles and abstracts, lowercase).
+# The bare word "not" is excluded: it pulled an unrelated K2-18b paper into
+# the Venus phosphine responses (live 2026-10-03).
+_REBUTTAL_TERMS = (
+    "no evidence", "insufficient evidence", "non-detection", "nondetection", "upper limit", "upper limits",
+    "re-analysis", "reanalysis", "reanalyses", "reassessment", "reassessing", "re-examination", "reexamination",
+    "revisit", "revisiting", "statistical reliability", "no statistically significant", "complications",
+    "comment on", "reply to", "matters arising", "spurious", "artefact", "artifact", "alternative explanation",
+    "not confirmed", "unconfirmed", "challenge", "challenges", "does not", "cannot be", "contamination",
+    "refute", "refuting", "rebuttal", "inconsistent with", "doubt", "caution", "tension with",
+)
+_REBUTTAL_FOCUS = {"rebuttals", "rebuttal", "pushback", "criticism", "challenges", "responses", "disputes", ""}
+_REPLY_TITLE_RE = re.compile(r"^\s*(reply to|response to|authors?['’]? reply|author['’]s reply)")
+_GENERIC_TITLE_WORDS = {
+    "detection", "detections", "observations", "observation", "observed", "evidence", "analysis", "study",
+    "new", "first", "results", "result", "data", "using", "model", "models", "constraints", "survey",
+    "properties", "possible", "gas", "measurement", "measurements", "search", "jwst", "hst", "alma", "from",
+    "with", "for", "the", "and", "towards", "toward", "between", "into", "via", "high", "low", "large", "small",
+}
+
+
+def _distinctive_terms(title: str) -> List[str]:
+    """Topic words of a paper title a response would share (lowercase)."""
+    out: List[str] = []
+    for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']*", str(title or "")):
+        lw = w.lower().strip("'")
+        if len(lw) < 3 or lw in _HEURISTIC_STOP or lw in _GENERIC_TITLE_WORDS:
+            continue
+        if lw not in out:
+            out.append(lw)
+    return out[:8]
+
+def _unfielded_term(word: str) -> str:
+    """One topic word as an unfielded ADS term; anything beyond letters and
+    digits (K2-18, J1234+5678) is quoted so Solr does not read an operator."""
+    if re.fullmatch(r"[A-Za-z0-9]+", word):
+        return word
+    return '"' + word.replace('"', "") + '"'
 
 
 def heuristic_ads_query(question: str) -> str:
     """Turn a natural-language literature question into a fielded ADS query
     without an LLM: year range -> year:[a TO b], journal name -> bibstem:,
-    a capitalised personal name -> author:"Last, First", everything else ->
-    abs:(w1 AND w2 ...). Falls back to *:* only for an empty question."""
+    a cued personal name -> author:"Last, First", everything else -> unfielded
+    terms AND-ed together (ADS searches abstract, title, keywords and authors
+    for an unfielded term; measured 2026-10-03: ``Greaves phosphine Venus``
+    ranks the right paper first where ``abs:(Greaves AND ...)`` finds nothing).
+    Falls back to *:* only for an empty question."""
     import re as _re
 
     text = str(question or "").replace('"', " ").strip()
-    if not text:
+    # Identifiers are looked up separately; inside a field query their dots
+    # make Solr answer HTTP 500.
+    text = _BIBCODE_IN_TEXT_RE.sub(" ", text)
+    text = _DOI_IN_TEXT_RE.sub(" ", text)
+    text = _ARXIV_PREFIXED_RE.sub(" ", text)
+    if not text.strip():
         return "*:*"
     parts: List[str] = []
     low = text.lower()
@@ -1266,10 +2071,11 @@ def heuristic_ads_query(question: str) -> str:
                 parts.append(f'bibstem:"{stem}"')
                 text = _re.sub(r"\b" + _re.escape(tok) + r"\b", " ", text, count=1)
                 break
-    # a personal name: 2-4 capitalised tokens (particles allowed), not the first word of the sentence
+    # a personal name: 1-4 capitalised tokens (particles allowed) with an
+    # author cue right before or after it
     tokens = _re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
     name = None
-    for i in range(1, len(tokens)):
+    for i in range(0, len(tokens)):
         run = []
         j = i
         while j < len(tokens) and (tokens[j][0].isupper() or tokens[j].lower() in _NAME_PARTICLES) and \
@@ -1277,21 +2083,121 @@ def heuristic_ads_query(question: str) -> str:
             run.append(tokens[j])
             j += 1
         caps = [t for t in run if t[0].isupper()]
-        if 2 <= len(run) <= 4 and len(caps) >= 2 and run[0][0].isupper() and run[-1][0].isupper() \
-                and not any(t.isupper() and len(t) > 1 for t in run):
+        if not (1 <= len(run) <= 4 and caps and run[0][0].isupper() and run[-1][0].isupper()
+                and not any(t.isupper() and len(t) > 1 for t in run)
+                and not any(t.lower() in _NOT_A_PERSON for t in run)):
+            continue
+        before = tokens[i - 1].lower() if i > 0 else ""
+        after = tokens[j].lower() if j < len(tokens) else ""
+        if before in _AUTHOR_CUE_BEFORE or after in _AUTHOR_CUE_AFTER:
             name = run
             break
     if name:
-        first, last = name[0], " ".join(name[1:])
-        parts.append(f'author:"{last}, {first}"')
+        if len(name) == 1:
+            parts.append(f'author:"{name[0]}"')
+        else:
+            first, last = name[0], " ".join(name[1:])
+            parts.append(f'author:"{last}, {first}"')
         for t in name:
             text = _re.sub(r"\b" + _re.escape(t) + r"\b", " ", text, count=1)
-    words = [w for w in _re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\.]*", text)
-             if w.lower() not in _HEURISTIC_STOP and len(w) > 1]
+        text = _re.sub(r"\bet\s+al\b\.?", " ", text, flags=_re.IGNORECASE)
+    words = []
+    for w in _re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\+\.]*", text):
+        w = w.rstrip(".")
+        if ".." in w or len(w) <= 1 or w.lower() in _HEURISTIC_STOP or w.upper() in ("AND", "OR", "NOT"):
+            continue
+        words.append(w)
     words = list(dict.fromkeys(words))[:8]
     if words:
-        parts.append("abs:(" + " AND ".join(words) + ")")
+        parts.append(" AND ".join(_unfielded_term(w) for w in words))
     return " AND ".join(parts) if parts else "*:*"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM query builder
+# ─────────────────────────────────────────────────────────────────────────────
+def ads_query_builder_model() -> str:
+    """The builder's model. ``ADS_QUERY_MODEL``, else the free TACC
+    gpt-oss-120b. It deliberately does NOT follow DEFAULT_LLM_MODEL: a paid
+    chat default must never become the background translator, and the old
+    code sent that name to the OpenAI SDK, where ``deepseek-v4-pro`` answered
+    404 on every call (2026-10-03)."""
+    return (os.getenv("ADS_QUERY_MODEL") or "gpt-oss-120b").strip()
+
+
+def ads_query_builder_enabled() -> bool:
+    """``ADS_QUERY_BUILDER=off`` skips the LLM and uses the deterministic path."""
+    return os.getenv("ADS_QUERY_BUILDER", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def ads_query_builder_timeout() -> float:
+    try:
+        return max(1.0, float(os.getenv("ADS_QUERY_BUILDER_TIMEOUT_SECONDS", "15") or 15))
+    except ValueError:
+        return 15.0
+
+
+_BUILDER_CACHE: "Dict[tuple, tuple]" = {}
+# At most two builder calls in flight: a timed-out call keeps running in its
+# daemon thread (the provider SDK has no per-call cancel), so a busy builder
+# falls back to the deterministic query instead of stacking calls (guard CX-02).
+_BUILDER_SLOTS = threading.BoundedSemaphore(2)
+_BUILDER_CACHE_MAX = 256
+_BUILDER_CACHE_TTL_S = 3600.0
+_BUILDER_CLIENTS: Dict[str, Any] = {}
+
+
+def _first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """The first balanced {...} in ``text`` parsed as JSON (strings respected)."""
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+                    return obj if isinstance(obj, dict) else None
+        start = text.find("{", start + 1)
+    return None
+
+
+def _default_builder_llm_call(instructions: str, prompt: str, model: str, max_tokens: int) -> str:
+    """One provider-aware call (TACC / DeepSeek / OpenAI / Anthropic routed by
+    model name), the same shape as core/web_planner.py's planner call."""
+    from core.llm_client import LLMClient
+
+    client = _BUILDER_CLIENTS.get(model)
+    if client is None:
+        client = LLMClient(model=model)
+        _BUILDER_CLIENTS[model] = client
+    # gpt-oss reasoning effort for this short translation call (ignored by
+    # other providers). Measured 2026-10-03 on TACC: see the plan folder.
+    effort = (os.getenv("ADS_QUERY_BUILDER_REASONING") or "low").strip().lower()
+    extra = {"_gpt_oss_reasoning": effort} if effort in ("low", "medium", "high") else {}
+    resp = client.responses.create(
+        model=model, instructions=instructions, input=prompt,
+        temperature=0, max_output_tokens=max_tokens, **extra,
+    )
+    return str(getattr(resp, "output_text", "") or "")
 
 
 class ADSQueryBuilder:
@@ -1310,17 +2216,20 @@ Return JSON with exactly these keys:
 
 ═══ FIELD SYNTAX (use the most specific field available) ═══
 
-  keyword:"protoplanetary disks"   — ADS controlled-vocabulary keywords (BEST for topic search)
+  phosphine Venus                  — UNFIELDED terms: searched in abstract, title, keywords AND author names
+  keyword:"protoplanetary disks"   — ADS controlled-vocabulary keywords (good for broad topic search)
   title:"disk gaps"                — words in paper title (high precision)
   abstract:"dust continuum"        — words in abstract (medium precision, catches tangential mentions)
   body:"gap opening mechanism"     — full-text search inside the paper (use when abstract is too narrow)
   "HL Tau"                         — plain text search/object name (best for target/object searches)
-  author:"Andrews, Sean"           — author name (Last, First)
+  author:"Andrews, Sean"           — author name (Last, First); author:"Greaves" for a surname only
   ^author:"Andrews, Sean"          — FIRST author only
   orcid:0000-0001-2345-6789        — search by ORCID
   year:2020-2024                   — year range
   bibcode:"2018ApJ...869L..41A"    — specific paper
   doi:"10.3847/..."                — DOI lookup
+  identifier:"arXiv:1812.04040"    — arXiv id lookup
+  bibstem:"NatAs"                  — journal (ApJ, ApJL, MNRAS, A&A, AJ, NatAs, Natur, Sci, PhRvL ...)
   inst:"Harvard"                   — institution/affiliation
   aff:"Max Planck"                 — affiliation text search
   facility:"ALMA"                  — facility metadata field (precise)
@@ -1404,6 +2313,25 @@ Return JSON with exactly these keys:
    When the user asks for "review papers/reviews", use reviews(query) or add doctype filter.
    When the user asks for "similar papers to X", use similar(query).
 
+7. For ONE SPECIFIC PAPER ("the paper that first reported X", a remembered title,
+   "Greaves 2020 Nature Astronomy"): use distinctive title words with title:(...)
+   or unfielded terms, plus the first author's surname as author:"Surname" when
+   given, sort "score desc". NEVER put author names inside abstract:/abs:.
+
+8. A single year the user remembers is often off by one (online vs print
+   publication): use year:[Y-1 TO Y+1], never a hard year:Y, when looking for
+   one specific paper. Exact years are fine for counting questions
+   ("how many papers in 2019").
+
+9. For "who disputed / challenged / pushed back on / responded to X": if the
+   bibcode of X is known, use citations(bibcode:"X") AND title:("no evidence"
+   OR "re-analysis" OR "upper limit" OR "reply to" OR "comment on" ...) with
+   sort "citation_count desc"; otherwise search the topic with those words.
+
+10. Never invent bibcodes, DOIs or arXiv ids, and never add an author:
+    clause for a name the request does not contain. Use only what the request
+    says; a wrong guess returns nothing.
+
 ═══ EXAMPLES ═══
 
 "recent papers on protoplanetary disks"
@@ -1432,13 +2360,20 @@ Return JSON with exactly these keys:
 
 "full text search for gap opening mechanism in disks"
 → {"query": "body:\\"gap opening\\" AND keyword:\\"protoplanetary disks\\"", "sort": "score desc", "rows": 15, "filters": ["property:refereed"]}
+
+"Greaves phosphine Venus Nature Astronomy 2020"
+→ {"query": "title:(phosphine Venus) AND author:\\"Greaves\\" AND year:[2019 TO 2021]", "sort": "score desc", "rows": 10, "filters": ["property:refereed"]}
+
+"first paper reporting phosphine in the atmosphere of Venus"
+→ {"query": "title:(phosphine Venus)", "sort": "score desc", "rows": 15, "filters": ["property:refereed"]}
+
+"papers that disputed the BICEP2 B-mode detection"
+→ {"query": "BICEP2 AND (title:(dust OR foreground OR \\"joint analysis\\") OR abs:(\\"no evidence\\" OR \\"dust contamination\\"))", "sort": "citation_count desc", "rows": 15, "filters": ["property:refereed"]}
 """
 
-    def __init__(self, model: Optional[str] = None) -> None:
-        self.model = model or os.getenv("ADS_QUERY_MODEL") or os.getenv(
-            "DEFAULT_LLM_MODEL", "gpt-4o-mini"
-        )
-        self._client: Optional[Any] = None
+    def __init__(self, model: Optional[str] = None, llm_call: Optional[Any] = None) -> None:
+        self.model = (model or ads_query_builder_model()).strip()
+        self._llm_call = llm_call or _default_builder_llm_call
 
     def build_query(
         self,
@@ -1447,26 +2382,54 @@ Return JSON with exactly these keys:
         sort: Optional[str],
         filters: Optional[List[str]],
     ) -> Dict[str, Any]:
-        if not question.strip():
+        if not str(question or "").strip():
             raise ADSQueryBuilderError("Empty natural-language question")
 
+        key = (self.model, question.strip(), int(default_rows or 0), sort or "", tuple(filters or ()))
+        hit = _BUILDER_CACHE.get(key)
+        if hit and time.monotonic() - hit[0] < _BUILDER_CACHE_TTL_S:
+            logger.info("[ADS BUILDER] cache hit query=%s", hit[1].get("query"))
+            return json.loads(json.dumps(hit[1]))
+
+        t0 = time.monotonic()
         try:
             response = self._call_model(question, default_rows, sort, filters)
-        except ADSQueryBuilderError:
+            structured = self._parse_response(response)
+            query = str(structured.get("query") or "").strip()
+            problem = validate_ads_query(query)
+            if problem:
+                raise ADSQueryBuilderError(f"builder produced an unusable query ({problem}): {query[:160]}")
+        except ADSQueryBuilderError as exc:
+            print(f"[ADS BUILDER] model={self.model} ms={(time.monotonic() - t0) * 1000:.0f} fail({str(exc)[:160]})")
             raise
         except Exception as exc:  # pragma: no cover - defensive
+            print(f"[ADS BUILDER] model={self.model} ms={(time.monotonic() - t0) * 1000:.0f} fail({type(exc).__name__}: {str(exc)[:160]})")
             raise ADSQueryBuilderError(str(exc)) from exc
 
-        structured = self._parse_response(response)
-
-        if "query" not in structured or not structured["query"].strip():
-            raise ADSQueryBuilderError("Model response missing query field")
-
-        structured.setdefault("rows", default_rows)
-        structured.setdefault("sort", sort or "date desc")
-        if filters and "filters" not in structured:
-            structured["filters"] = filters
-
+        structured["query"] = query
+        try:
+            structured["rows"] = max(1, min(int(structured.get("rows") or default_rows), 200))
+        except (TypeError, ValueError):
+            structured["rows"] = max(1, int(default_rows or 10))
+        if default_rows:
+            # Never more rows than the caller asked for (guard CX-12).
+            structured["rows"] = min(structured["rows"], int(default_rows))
+        # An explicit caller sort (the chat model asked for "date desc") wins;
+        # otherwise the builder's choice, else relevance.
+        if sort:
+            structured["sort"] = sort
+        elif not isinstance(structured.get("sort"), str) or not structured.get("sort", "").strip():
+            structured["sort"] = "score desc"
+        built_filters = structured.get("filters")
+        if not isinstance(built_filters, list) or not all(isinstance(f, str) for f in built_filters):
+            structured["filters"] = filters or ["property:refereed"]
+        print(
+            f"[ADS BUILDER] model={self.model} ms={(time.monotonic() - t0) * 1000:.0f} ok "
+            f"query={query[:200]!r} sort={structured['sort']!r}"
+        )
+        if len(_BUILDER_CACHE) >= _BUILDER_CACHE_MAX:
+            _BUILDER_CACHE.pop(next(iter(_BUILDER_CACHE)), None)
+        _BUILDER_CACHE[key] = (time.monotonic(), json.loads(json.dumps(structured)))
         return structured
 
     # ------------------------------------------------------------------
@@ -1479,47 +2442,64 @@ Return JSON with exactly these keys:
         sort: Optional[str],
         filters: Optional[List[str]],
     ) -> str:
-        client = self._get_client()
-
         user_payload = {
             "question": question,
             "defaults": {
                 "rows": default_rows,
-                "sort": sort or "date desc",
+                "sort": sort or "score desc",
                 "filters": filters or ["property:refereed"],
             },
         }
+        prompt = "Respond with ONE JSON object only. Natural-language request:\n" + json.dumps(user_payload)
+        timeout = ads_query_builder_timeout()
+        box: Dict[str, Any] = {}
+        # The request-local LLM context (BYOK keys, quota admission, usage
+        # recording) is thread-local: carry it into the worker (guard CX-01).
+        try:
+            from core.llm_client import get_llm_request_context, reinstall_llm_request_context
+            request_ctx = get_llm_request_context()
+        except Exception:  # pragma: no cover - core not importable
+            request_ctx, reinstall_llm_request_context = None, None
+        slots = _BUILDER_SLOTS  # release THIS object even if the global is swapped (CX-22)
+        if not slots.acquire(blocking=False):
+            raise ADSQueryBuilderError("query builder busy (2 calls in flight)")
 
-        response = client.responses.create(
-            model=self.model,
-            input="Respond with JSON only. Natural-language request:\n" + json.dumps(user_payload),
-            instructions=self._SYSTEM_PROMPT,
-            temperature=0.2,
-            text={"format": {"type": "json_object"}}
-        )
+        def _run() -> None:
+            try:
+                if reinstall_llm_request_context is not None:
+                    with reinstall_llm_request_context(request_ctx):
+                        box["text"] = self._llm_call(self._SYSTEM_PROMPT, prompt, self.model, 1200)
+                else:
+                    box["text"] = self._llm_call(self._SYSTEM_PROMPT, prompt, self.model, 1200)
+            except BaseException as exc:  # pragma: no cover - re-raised below
+                box["error"] = exc
+            finally:
+                slots.release()
 
-        # Extract text from Responses API
-        if hasattr(response, 'output_text'):
-            return response.output_text
-        elif hasattr(response, 'output'):
-            for item in response.output:
-                if hasattr(item, 'content') and getattr(item, 'type', None) == "text":
-                    return item.content
-        return str(response)
+        worker = threading.Thread(target=_run, name="ads-query-builder", daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise ADSQueryBuilderError(f"query builder timed out after {timeout:.0f}s ({self.model})")
+        if "error" in box:
+            raise ADSQueryBuilderError(f"{type(box['error']).__name__}: {str(box['error'])[:200]}")
+        return str(box.get("text") or "")
 
     def _parse_response(self, content: str) -> Dict[str, Any]:
-        if not content:
+        if not content or not content.strip():
             raise ADSQueryBuilderError("Empty response from model")
 
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.strip("`")
-            if content.lower().startswith("json"):
-                content = content[4:]
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ADSQueryBuilderError(f"Could not parse model JSON: {exc}") from exc
+        text = content.strip()
+        if "<|" in text:
+            try:
+                from core.harmony_filter import strip_harmony_markup
+
+                text = strip_harmony_markup(text)
+            except Exception:  # pragma: no cover - optional dependency
+                pass
+        data = _first_json_object(text)
+        if data is None:
+            raise ADSQueryBuilderError(f"Could not parse model JSON: {text[:120]!r}")
 
         # Normalise filters to list
         filters = data.get("filters")
@@ -1527,24 +2507,3 @@ Return JSON with exactly these keys:
             data["filters"] = [filters]
 
         return data
-
-    def _get_client(self) -> Any:
-        if self._client:
-            return self._client
-
-        if OpenAI is None:
-            raise ADSQueryBuilderError("OpenAI SDK not installed")
-
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ADSQueryBuilderError("OPENAI_API_KEY not configured")
-
-        # Budget hierarchy (2026-09-21): the SDK default is a 600 s timeout with
-        # 2 retries — under a 150 s tool guard the query-builder call alone
-        # could outlast the tool. Building an ADS query is a 2-5 s completion.
-        try:
-            _timeout = float(os.getenv("ADS_QUERY_BUILDER_TIMEOUT_SECONDS", "30") or 30)
-        except ValueError:
-            _timeout = 30.0
-        self._client = OpenAI(api_key=api_key, timeout=_timeout, max_retries=0)
-        return self._client

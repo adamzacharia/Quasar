@@ -130,3 +130,22 @@ def test_sanitizer_is_idempotent(monkeypatch):
     assert twice["answer"] == FILTER_NOTICE
     assert twice["content_filter"]["filtered"] is True
     assert twice["content_filter"]["blocked_results"] == 1
+
+
+def test_roman_numeral_xxx_in_a_paper_series_is_not_explicit():
+    """2026-10-03: "Planck intermediate results. XXX." (the main BICEP2
+    rebuttal) made the old blanket xxx pattern replace a whole correct
+    literature answer with FILTER_NOTICE."""
+    from services.content_safety import looks_explicit_text, safe_assistant_text
+
+    for ok in ("Planck intermediate results. XXX. The angular power spectrum of polarized dust",
+               "Planck 2013 results. XXX. Cosmological parameters"):
+        assert not looks_explicit_text(ok), ok
+        assert safe_assistant_text(ok) == ok
+    for bad in ("free xxx videos", "XXX movies tonight", "watch XXX now", "results xxx videos",
+                "Search results XXX videos", "Paper XXX of the series", "Search results XXX. videos.",
+                "Search results XXX. Videos", "results. XXX. Videos here", "Adult search results. XXX.",
+                "Planck results. XXX.", "Search results. XXX. Galleries", "see Paper XXX: methods",
+                "Part XXX: Galleries", "2025 results. XXX. Explicit Galleries",
+                "Planck 2025 results. XXX. Explicit Galleries", "intermediate results. XXX. The"):
+        assert looks_explicit_text(bad), bad

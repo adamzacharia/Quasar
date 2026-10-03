@@ -162,3 +162,22 @@ def test_extract_citations_handles_unicode_dashes_in_dois():
     # Plain-ASCII DOIs still extract exactly, without trailing punctuation.
     plain = extract_citations("see https://doi.org/10.1051/0004-6361/202243940, Fig 2.")
     assert plain["dois"] == ["10.1051/0004-6361/202243940"]
+
+
+def test_bibcode_the_user_typed_is_not_flagged():
+    """2026-10-03 (L05): the user asked for 2020NatAs...5..655G, the answer said
+    it resolved to 2021NatAs...5..655G, and the footer then called the user's
+    own input an unverified citation."""
+    from services.citation_verifier import append_citation_warning
+
+    ads = FakeADSClient(details={"2021NatAs...5..655G": {"title": "Phosphine gas in the cloud decks of Venus"}})
+    answer = "2020NatAs...5..655G was not found as written; it resolved to 2021NatAs...5..655G."
+    out = append_citation_warning(answer, ads, user_text="Find the paper 2020NatAs...5..655G")
+    # still verified (guard CX-18), but worded as the user's identifier
+    assert ("bibcode", "2020NatAs...5..655G") in ads.calls
+    assert "Unverified citations" not in out
+    assert "the identifier you gave (`2020NatAs...5..655G`) is not in ADS as written" in out
+    # an invented bibcode the user did not type is still flagged
+    out = append_citation_warning(answer + " See also 2019ApJ...999L..99Z.", ads,
+                                  user_text="Find the paper 2020NatAs...5..655G")
+    assert "Unverified citations" in out and "2019ApJ...999L..99Z" in out

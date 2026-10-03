@@ -65,7 +65,6 @@ _EXPLICIT_PATTERNS = tuple(
     for pattern in (
         r"\b(?:hardcore|softcore)\s+(?:porn|video|scene|content)\b",
         r"\b(?:porn|pornographic|pornography)\b",
-        r"\bxxx\b",
         r"\bnsfw\b",
         r"\bhentai\b",
         r"\brule\s*34\b",
@@ -80,6 +79,50 @@ _EXPLICIT_PATTERNS = tuple(
         r"\b(?:onlyfans|pornhub|xvideos|xnxx|xhamster|redtube|youporn|spankbang)\b",
     )
 )
+# "xxx" is explicit EXCEPT as a Roman numeral in a paper series: the main
+# BICEP2 rebuttal is "Planck intermediate results. XXX." and the old blanket
+# \bxxx\b replaced a whole correct literature answer with FILTER_NOTICE
+# (2026-10-03, tmp/literature-search-fix-2026-10-03).
+_XXX_RE = re.compile(r"\bxxx\b", re.IGNORECASE)
+# The ONLY exemption: the Planck paper series ("Planck 2013
+# results. XXX." or "Planck intermediate results. XXX." (a year or a series
+# word right before "results."). Generic contexts ("Search results. XXX",
+# "Paper XXX") were probed past every narrower rule (guard CX-19 rounds 1-4),
+# so they stay explicit.
+_ROMAN_XXX_CONTEXT_RE = re.compile(
+    r"\bPlanck\s+(?:(?:19|20)\d{2}|intermediate|early|legacy)\s+results\.\s*$",
+    re.IGNORECASE,
+)
+_ADULT_NEXT_WORDS = frozenset({"explicit", "hot", "gallery", "galleries", "adult", "nude", "naked", "video", "videos", "movie", "movies", "clip", "clips", "pics", "photos", "porn",
+                               "sex", "girls", "cams", "cam", "tube", "site", "sites", "content", "stream", "streams"})
+
+
+# Numbering punctuation right after the numeral ("XXX." / "XXX:" / "XXX,"),
+# so "results XXX videos" stays explicit (guard CX-19).
+# A period must start a capitalised title ("XXX. The angular ...") so
+# "XXX. videos." stays explicit (guard CX-19 reopen).
+_ROMAN_XXX_AFTER_RE = re.compile(r"^(?:\.\s+[A-Z]|:\s*\S)")
+# Adult wording just before it makes it explicit whatever follows (guard
+# CX-19 round 3: "Adult search results. XXX.").
+_ADULT_BEFORE_RE = re.compile(r"\b(?:adult|porn\w*|sex\w*|nsfw|nude|naked|erotic\w*|hentai|escort)\b", re.IGNORECASE)
+
+
+def _adult_next_word(after: str) -> bool:
+    words = re.findall(r"[A-Za-z]+", after)
+    return bool(words) and words[0].lower() in _ADULT_NEXT_WORDS
+
+
+def _explicit_xxx(text: str) -> bool:
+    for m in _XXX_RE.finditer(text):
+        if (m.group(0).isupper()
+                and _ROMAN_XXX_CONTEXT_RE.search(text[max(0, m.start() - 60):m.start()])
+                and _ROMAN_XXX_AFTER_RE.match(text[m.end():m.end() + 6])
+                and not _adult_next_word(text[m.end():m.end() + 30])
+                and not _ADULT_BEFORE_RE.search(text[max(0, m.start() - 60):m.start()])):
+            continue
+        return True
+    return False
+
 
 _SOURCE_TEXT_FIELDS = (
     "title",
@@ -138,7 +181,7 @@ def looks_explicit_text(value: Any) -> bool:
     text = str(value or "")
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _EXPLICIT_PATTERNS)
+    return any(pattern.search(text) for pattern in _EXPLICIT_PATTERNS) or _explicit_xxx(text)
 
 
 def is_explicit_query(query: Any) -> bool:

@@ -133,7 +133,11 @@ OVERRIDES: Dict[str, str] = {
         "cards. When the user asks which paper(s) or for bibcodes / DOIs, name each one with its bibcode as "
         "returned. Report an empty or failed search briefly. If the user gave a proposal ID, project code, MOUS, "
         "ASDM UID, or dataset identifier, use search_papers_by_observation_id instead. Never use web_search "
-        "for paper requests."
+        "for paper requests. When resolved_from is present, report the resolved bibcode, not the one asked for."
+    ),
+    "find_citing_papers": (
+        "Results render as paper cards. Name the original paper and each responding paper with its bibcode as "
+        "returned, grouped as the tool groups them (rebuttals, replies). Only cite bibcodes the tool returned."
     ),
     "search_papers_by_observation_id": (
         "Call it only when the user explicitly asks for papers connected to a specific identifier. The backend "

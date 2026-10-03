@@ -2457,33 +2457,36 @@ def register_tools(agent: "QuasarAgent") -> None:
     # ── NASA ADS Literature Tools ──────────────────────────────────────
     _ads = agent.ads_client  # may be None if no key
 
+    from capabilities.papers import SEARCH_PAPERS_DESCRIPTION, FindCitingPapers
+
     agent.tool_registry.register(Tool(
         name="search_papers",
-        description=(
-            "Search the NASA ADS database for astronomical papers. "
-            "Returns titles, authors, abstracts, citation counts, DOIs, and a direct link to each paper on NASA ADS. "
-            "IMPORTANT: Pass the user's request as natural language — an internal AI query builder will "
-            "automatically translate it into optimal ADS syntax using keyword searches, bibgroup filters, "
-            "SIMBAD object linking, second-order discovery operators (trending, similar, useful), and more.\n"
-            "Examples of what to pass as query:\n"
-            "- 'recent papers on protoplanetary disks'\n"
-            "- 'best ALMA papers on disk gaps'\n"
-            "- 'papers about HL Tau'\n"
-            "- 'what are people reading about FRBs right now'\n"
-            "- 'foundational papers on planet formation'\n"
-            "- 'review articles on AGN feedback'\n"
-            "- 'papers by Sean Andrews on disk surveys'\n"
-            "Do NOT try to construct ADS field syntax yourself — just pass the natural language query."
-        ),
+        description=SEARCH_PAPERS_DESCRIPTION,
         function=agent._papers_tool_fn("search_papers", log_name="_search_papers"),
         parameters={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Natural language search query describing what papers the user wants (e.g. 'recent ALMA papers on protoplanetary disk gaps')"},
+                "query": {"type": "string", "description": "Natural-language request, or a bibcode / DOI / arXiv id"},
                 "max_results": {"type": "integer", "description": "Number of results to return (default 15, max 50)"},
-                "sort": {"type": "string", "description": "Sort order: 'date desc' (newest first), 'citation_count desc' (most cited), 'score desc' (relevance). Default: 'date desc'"},
+                "sort": {"type": "string", "description": "Optional: 'date desc' (recent), 'citation_count desc', 'score desc'. Omit to let the builder choose."},
             },
             "required": ["query"]
+        },
+        category="literature"
+    ))
+
+    agent.tool_registry.register(Tool(
+        name="find_citing_papers",
+        description=FindCitingPapers.description,
+        function=agent._papers_tool_fn("find_citing_papers", log_name="_find_citing_papers"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "bibcode": {"type": "string", "description": "ADS bibcode of the paper (or DOI, arXiv id, exact title)"},
+                "focus": {"type": "string", "description": "'rebuttals' (default), 'all', or a topic"},
+                "max_results": {"type": "integer", "description": "Max papers per group (default 15)"},
+            },
+            "required": ["bibcode"]
         },
         category="literature"
     ))

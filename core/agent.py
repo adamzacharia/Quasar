@@ -2528,6 +2528,10 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
 
     def _tool_status_label(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Return archive-aware status labels for the live run phase UI."""
+        # Backstop for gpt-oss harmony residue in a tool name
+        # ("search_papers<|channel|>commentary" was shown verbatim, 2026-10-03).
+        from core.turn_guards import sanitize_tool_name
+        tool_name = sanitize_tool_name(tool_name)
         if tool_name.startswith("web_") or tool_name == "web_search":
             return self._web_tool_status_label(tool_name, args)
 
@@ -2572,6 +2576,7 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             "compute_moment_map": "Computing moment map",
             "fit_spectral_line": "Fitting spectral line",
             "search_papers": "Searching astronomy literature",
+            "find_citing_papers": f"Finding papers that responded to {str(args.get('bibcode') or 'the paper').strip()[:60]}",
             "search_papers_by_observation_id": "Searching papers linked to observation",
             "lookup_researcher": "Looking up researcher profile",
             "list_mmu_hats_catalogs": "Listing Multimodal Universe catalogs",

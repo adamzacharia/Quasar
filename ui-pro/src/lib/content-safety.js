@@ -33,7 +33,6 @@ const BLOCKED_HOSTS = new Set([
 const EXPLICIT_PATTERNS = [
     /\b(?:hardcore|softcore)\s+(?:porn|video|scene|content)\b/i,
     /\b(?:porn|pornographic|pornography)\b/i,
-    /\bxxx\b/i,
     /\bnsfw\b/i,
     /\bhentai\b/i,
     /\brule\s*34\b/i,
@@ -65,9 +64,41 @@ export function isBlockedWebUrl(value) {
     return [...BLOCKED_HOSTS].some(blocked => host === blocked || host.endsWith(`.${blocked}`));
 }
 
+// "xxx" is explicit EXCEPT as a Roman numeral in a paper series ("Planck
+// intermediate results. XXX." is the main BICEP2 rebuttal); mirrors
+// services/content_safety.py _explicit_xxx (2026-10-03).
+// The ONLY exemption: the Planck paper series ("Planck 2013
+// results. XXX." or "Planck intermediate results. XXX."; mirrors
+// services/content_safety.py (guard CX-19 rounds 1-4).
+const ROMAN_XXX_CONTEXT = /\bPlanck\s+(?:(?:19|20)\d{2}|intermediate|early|legacy)\s+results\.\s*$/i;
+const ADULT_NEXT_WORDS = new Set(["explicit", "hot", "gallery", "galleries", "adult", "nude", "naked", "video", "videos", "movie", "movies", "clip", "clips", "pics", "photos", "porn",
+    "sex", "girls", "cams", "cam", "tube", "site", "sites", "content", "stream", "streams"]);
+
+// Numbering punctuation right after the numeral ("XXX." / "XXX:"), so
+// "results XXX videos" stays explicit (guard CX-19).
+// A period must start a capitalised title ("XXX. The angular ...") so
+// "XXX. videos." stays explicit (guard CX-19 reopen).
+const ROMAN_XXX_AFTER = /^(?:\.\s+[A-Z]|:\s*\S)/;
+// Adult wording just before it makes it explicit whatever follows (guard
+// CX-19 round 3: "Adult search results. XXX.").
+const ADULT_BEFORE = /\b(?:adult|porn\w*|sex\w*|nsfw|nude|naked|erotic\w*|hentai|escort)\b/i;
+
+function explicitXxx(text) {
+    for (const m of text.matchAll(/\bxxx\b/gi)) {
+        const before = text.slice(Math.max(0, m.index - 60), m.index);
+        const after = text.slice(m.index + m[0].length, m.index + m[0].length + 6);
+        const nextWord = (text.slice(m.index + m[0].length, m.index + m[0].length + 30).match(/[A-Za-z]+/) || [""])[0];
+        if (m[0] === m[0].toUpperCase() && ROMAN_XXX_CONTEXT.test(before) && ROMAN_XXX_AFTER.test(after)
+            && !ADULT_NEXT_WORDS.has(nextWord.toLowerCase())
+            && !ADULT_BEFORE.test(text.slice(Math.max(0, m.index - 60), m.index))) continue;
+        return true;
+    }
+    return false;
+}
+
 export function looksExplicitWebText(value) {
     const text = String(value || "");
-    return Boolean(text) && EXPLICIT_PATTERNS.some(pattern => pattern.test(text));
+    return Boolean(text) && (EXPLICIT_PATTERNS.some(pattern => pattern.test(text)) || explicitXxx(text));
 }
 
 export function safeAssistantWebText(value) {

@@ -138,12 +138,17 @@ def append_citation_warning(
     cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     deadline_seconds: Optional[float] = 8.0,
     verification_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+    user_text: Optional[str] = None,
 ) -> str:
     """Append and optionally stream the citation warning; never raises.
 
     ``verification_sink`` (R3) receives the raw ``verify_citations`` result so
     callers can derive citation recall/precision metrics without a second
     round of ADS lookups. Sink failures never affect the answer.
+    ``user_text`` is the user's question. An identifier it contains is still
+    verified, but when it does not resolve the footer says the user's own
+    identifier is not in ADS instead of calling it the answer's unverified
+    citation (2026-10-03; guard CX-18: never hide it).
     """
 
     if not text or "Unverified citations:" in text:
@@ -162,7 +167,17 @@ def append_citation_warning(
                 verification_sink(verification)
             except Exception:
                 logger.debug("Citation verification sink failed", exc_info=True)
-        warning = format_unverified_citation_warning(verification)
+        typed: set = set()
+        if user_text:
+            found = extract_citations(user_text)
+            typed = {x.lower() for x in found["bibcodes"] + found["dois"]}
+        unresolved = list(verification.get("unresolved") or [])
+        own = [u for u in unresolved if str(u.get("id", "")).lower() in typed]
+        others = [u for u in unresolved if str(u.get("id", "")).lower() not in typed]
+        warning = format_unverified_citation_warning({**verification, "unresolved": others})
+        if own:
+            ids = ", ".join(f"`{u.get('id', '')}`" for u in own[:5])
+            warning += f"\n\n> **Note:** the identifier you gave ({ids}) is not in ADS as written."
     except Exception:
         logger.warning("Citation verification failed; continuing without warning", exc_info=True)
         return text

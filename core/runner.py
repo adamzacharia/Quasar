@@ -22,6 +22,7 @@ from core.retry import _is_retryable as _retry_is_retryable
 from services.usage_quota_service import QuotaExceededError
 from core.token_budget import TokenBudget
 from core.tool_budget import apply_tool_result_budget
+from core import turn_guards as _turn_guards
 from core.turn_recovery import (
     canonical_tool_call_key,
     partial_tool_answer,
@@ -226,6 +227,11 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 # and, when a tool call follows, shown as a thinking step instead of answer
 # prose. Longer text is treated as answer and streams live. 0 disables.
 _NARRATION_HOLD_CHARS = _env_int("QUASAR_NARRATION_HOLD_CHARS", 500, minimum=0)
+# Forced-final-round leak guard (core/turn_guards.py): for gpt-oss models the
+# first this-many characters of the forced answer are held until the leaked-
+# reasoning check rules. QUASAR_REASONING_LEAK_GUARD=0 disables it.
+_LEAK_HOLD_CHARS = _env_int("QUASAR_REASONING_LEAK_HOLD_CHARS", 400, minimum=50)
+_LEAK_GUARD_ON = os.getenv("QUASAR_REASONING_LEAK_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _emit_narration_step(on_status, text: str) -> None:
@@ -247,11 +253,12 @@ def _emit_narration_step(on_status, text: str) -> None:
 # must summarise -- never invent -- what the collected results support.
 TOOL_BUDGET_FINAL_NOTE = (
     "[SYSTEM CONTINUATION] The tool budget for this turn is spent ({reason}). Answer the user NOW, "
-    "in the output format they asked for, using ONLY the tool results collected above. Structure it as: "
-    "(1) what was tried -- the queries/tools, in plain language, no internal tool names; "
-    "(2) what succeeded and the concrete results obtained (numbers, tables, cards); "
-    "(3) what failed or stayed incomplete and why (timeout, service outage, empty result, row cap); "
-    "(4) the single most useful next step the user can ask for. "
+    "in the output format they asked for, using ONLY the tool results collected above. Lead with the "
+    "direct answer the results support (names, identifiers such as bibcodes, numbers, tables). Then add a "
+    "short note: what was tried (plain language, no internal tool names), what succeeded, what failed or "
+    "stayed incomplete and why (timeout, service outage, empty result, row cap), and the single most useful "
+    "next step the user can ask for; keep that note to a few lines when the results already answer the "
+    "question. Write only the answer for the user: do not restate the question or describe your reasoning. "
     "Do not call more tools. Do not claim results, figures, or counts you do not have."
 )
 
@@ -2811,6 +2818,11 @@ def _stream_response_api_impl(
             # identical call after a failure (UI benchmark 2026-09-22: L06, D19).
             _canon_seen: Dict[Any, Dict[str, Any]] = {}
             _duplicate_rounds = 0
+            # Empty-literature-search streak (core/turn_guards.py): a rewording
+            # of searches that all came back empty is answered with a hint.
+            _lit_guard = _turn_guards.LiteratureSearchGuard()
+            _leak_retries = 0  # forced-final-round leaked-reasoning re-samples used
+            _cite_hinted = False  # find_citing_papers follow-up hint given this turn
             _finalize_next = False
             _turn_exit_reason = None
             # Tool rounds end at the per-turn soft deadline (min of 30 % before
@@ -2937,10 +2949,11 @@ def _stream_response_api_impl(
                 if _finalizing:
                     print("[RECOVERY] Tool-loop budget reached — composing final answer")
                     _final_note = TOOL_BUDGET_FINAL_NOTE.format(reason=_turn_exit_reason or "tool budget reached")
-                    if on_status:
+                    if on_status and _leak_retries == 0:
                         try:
-                            on_status("Tool budget reached — composing the final answer from collected results", "running")
-                            on_status("Tool budget reached — composing the final answer from collected results", "completed")
+                            _budget_step = _turn_guards.budget_status_text(_turn_exit_reason)
+                            on_status(_budget_step, "running")
+                            on_status(_budget_step, "completed")
                         except Exception:
                             pass
                     _pending = request_kwargs["input"]
@@ -3004,6 +3017,12 @@ def _stream_response_api_impl(
                     # call follows (ArchiveBench AB-D-59, WebBench TRN-02).
                     _hold_narration = (
                         not _buffer_round_text and not _finalizing and _NARRATION_HOLD_CHARS > 0
+                    )
+                    # gpt-oss can write its analysis as the forced answer ("The
+                    # user asks: ... We need to ..."): hold the start of that
+                    # round until core/turn_guards.py rules on it.
+                    _leak_hold = (
+                        _finalizing and _LEAK_GUARD_ON and _turn_guards.model_leaks_reasoning(selected_model)
                     )
 
                     _reasoning_summary_text = ""  # Accumulate reasoning summary for this round
@@ -3088,6 +3107,17 @@ def _stream_response_api_impl(
                                     _reasoning_emitted = False
                                 if _buffer_round_text:
                                     _round_text_buffer += event.delta
+                                elif _leak_hold:
+                                    _round_text_buffer += event.delta
+                                    if (len(_round_text_buffer) > _LEAK_HOLD_CHARS
+                                            and not _turn_guards.looks_like_leaked_reasoning(_round_text_buffer)):
+                                        # A clean start: stream the rest live. A
+                                        # leaky one stays held to the round end.
+                                        _leak_hold = False
+                                        output_text += _round_text_buffer
+                                        if on_token:
+                                            on_token(_round_text_buffer)
+                                        _round_text_buffer = ""
                                 elif _hold_narration:
                                     _round_text_buffer += event.delta
                                     if len(_round_text_buffer) > _NARRATION_HOLD_CHARS:
@@ -3249,6 +3279,25 @@ def _stream_response_api_impl(
                         continue
                     if _tp_active and _tool_packs.says_lacks_tool(output_text[_round_text_len_before:] + _round_text_buffer):
                         print("[TOOL PACKS] answer says a tool is missing but text already streamed — no retry")
+                    if (_finalizing and _round_text_buffer and _LEAK_GUARD_ON
+                            and _turn_guards.model_leaks_reasoning(selected_model)
+                            and _turn_guards.looks_like_leaked_reasoning(_round_text_buffer)):
+                        if _leak_retries < 1:
+                            # Nothing of it reached the user: re-sample the forced
+                            # round once from the pre-round state, still forced.
+                            _leak_retries += 1
+                            print(f"[LEAK GUARD] forced final round wrote its reasoning as the answer "
+                                  f"({_round_text_buffer[:120]!r}) — re-sampling once")
+                            _round_offset += 1
+                            last_id = _round_prev_last_id
+                            agent._set_response_id(conversation_id, _round_prev_last_id, selected_model, run_token)
+                            _finalize_next = True
+                            _resample_note = _turn_guards.LEAK_RESAMPLE_NOTE
+                            continue
+                        _kept = _turn_guards.strip_leaked_reasoning(_round_text_buffer)
+                        print(f"[LEAK GUARD] re-sample leaked again — stripped {len(_round_text_buffer) - len(_kept)} "
+                              f"chars of reasoning, kept {len(_kept)}")
+                        _round_text_buffer = _kept
                     if _round_text_buffer:  # round-0 route buffer or held narration
                         output_text += _round_text_buffer
                         if on_token:
@@ -3359,6 +3408,18 @@ def _stream_response_api_impl(
                             _turn_cancel.cancel(f"turn hard cap {_turn_hard_seconds:.0f}s (mid-batch)")
                         break
                     tool_name = fc["name"]
+                    if tool_name and ("<|" in tool_name or tool_name.startswith("functions.")):
+                        # gpt-oss harmony residue in the name (live 2026-10-03:
+                        # "search_papers<|channel|>commentary" -> Unknown tool).
+                        # Every name this turn can execute: registry, request-scoped
+                        # and user-MCP tools (guard CX-16).
+                        _repaired = _turn_guards.repair_tool_name(
+                            tool_name,
+                            [t.name for t in agent.tool_registry.list_tools()] + [_tool_packs.FIND_TOOLS]
+                            + list(_user_mcp_tools) + list(_request_tools) + [t.get("name") for t in tools])
+                        if _repaired != tool_name:
+                            print(f"[TOOL NAME] repaired {tool_name!r} -> {_repaired!r}")
+                            tool_name = fc["name"] = _repaired
                     try:
                         args_str = fc["arguments"]
                         args = json.loads(args_str) if args_str else {}
@@ -3521,6 +3582,20 @@ def _stream_response_api_impl(
                         _finalize_next = True
                         tool_results.append({"type": "function_call_output", "call_id": fc["call_id"],
                                              "output": json.dumps({"partial": True, "error": "Tool budget reached; answer from collected results now."})})
+                        continue
+
+                    _lit_hint = _lit_guard.check(tool_name, args)
+                    if _lit_hint:
+                        # Counts as a repeat, so a turn stuck re-wording an
+                        # empty literature search wraps up instead of spending
+                        # every tool round (live 2026-10-03, 8/8 rounds).
+                        _round_duplicates += 1
+                        print(f"[LIT GUARD] {tool_name} rewording of empty searches not run: {args.get('query')!r}")
+                        if on_status:
+                            on_status("Skipped a reworded literature search that already came back empty", "completed")
+                        result_str = serialize_tool_result({"success": False, "repeated_call": True, "error": _lit_hint})
+                        agent._record_tool_trace(tool_name, args, result_str)
+                        tool_results.append({"type": "function_call_output", "call_id": fc["call_id"], "output": result_str})
                         continue
 
                     print(f"[TOOL CALL] {tool_name}({args})")
@@ -3791,7 +3866,14 @@ def _stream_response_api_impl(
                     agent._record_tool_trace(tool_name, args, result_str,
                                             result_obj=_trace_result_obj,
                                             provenance=_tool_sidecar)
+                    _cite_hint = None if _cite_hinted else _turn_guards.citing_followup_hint(
+                        _user_query, tool_name, result_str, _tp_called)
+                    if _cite_hint:
+                        print("[LIT GUARD] pushback question: search_papers result points at find_citing_papers")
+                        _cite_hinted = True
+                        result_str = _cite_hint
                     _seen_tool_calls[_call_key] = result_str
+                    _lit_guard.record(tool_name, args, result_str)
                     _fail_reason = tool_result_failure_reason(
                         _trace_result_obj if _trace_result_obj is not None else result_str
                     )
@@ -3926,6 +4008,13 @@ def _stream_response_api_impl(
                 )
                 if on_status:
                     on_status("Composing final answer from tool results", "completed")
+                if (output_text and _LEAK_GUARD_ON and _turn_guards.model_leaks_reasoning(selected_model)
+                        and _turn_guards.looks_like_leaked_reasoning(output_text)):
+                    # This recovery call is the last model text of the turn and
+                    # is shown unchecked otherwise (guard CX-10).
+                    _kept = _turn_guards.strip_leaked_reasoning(output_text)
+                    print(f"[LEAK GUARD] composed answer leaked reasoning — kept {len(_kept)} of {len(output_text)} chars")
+                    output_text = _kept
                 if output_text and on_token:
                     on_token(output_text)
             if not output_text and _had_tool_calls:
@@ -3974,6 +4063,12 @@ def _stream_response_api_impl(
                         )
                         if on_status:
                             on_status("Adding the requested details to the answer", "completed")
+                        if (_reask_text and _LEAK_GUARD_ON and _turn_guards.model_leaks_reasoning(selected_model)
+                                and _turn_guards.looks_like_leaked_reasoning(_reask_text)):
+                            # Same leak check as the forced round and the first
+                            # composition (guard CX-10 reopen).
+                            _reask_text = _turn_guards.strip_leaked_reasoning(_reask_text)
+                            print(f"[LEAK GUARD] requested-items re-ask leaked reasoning — kept {len(_reask_text)} chars")
                         if _reask_text and not requested_items_missing(_user_query, _reask_text, _all_tool_results):
                             output_text = _reask_text
                             print(f"[VERIFY] synthesis re-ask supplied the {_missing_str} ({len(output_text)} chars)")
@@ -4152,6 +4247,7 @@ def _stream_response_api_impl(
                 agent.ads_client,
                 on_token=on_token,
                 verification_sink=_citation_metrics_sink,
+                user_text=_user_query,
             )
             output_text = safe_assistant_text(output_text)
             return safe_assistant_text(output_text)
