@@ -1191,6 +1191,53 @@ export async function setConversationStarred(conversationId: string, starred: bo
     }
 }
 
+// ── Saved papers (bookmarks) ────────────────────────────────────
+// Server state, not browser state: bookmarks kept only in memory vanished on
+// every reload, which in practice meant every redeploy.
+
+/** The signed-in user's bookmarks, or null when the request failed (so the
+ *  caller can tell "none saved" from "could not load"). */
+export async function fetchSavedPapers(): Promise<Record<string, unknown>[] | null> {
+    try {
+        const res = await fetch(`${API_BASE}/api/saved-papers`, { credentials: "include", headers: authHeaders() });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return Array.isArray(data.papers) ? data.papers : [];
+    } catch {
+        return null;
+    }
+}
+
+/** Persist a bookmark. Returns false on any failure (the caller reverts). */
+export async function saveSavedPaper(key: string, paper: object): Promise<boolean> {
+    try {
+        const res = await fetch(`${API_BASE}/api/saved-papers`, {
+            credentials: "include",
+            method: "PUT",
+            headers: authHeaders(),
+            body: JSON.stringify({ key, paper }),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/** Remove a bookmark. The key goes in the query string because DOI keys
+ *  contain "/". Returns false on any failure (the caller reverts). */
+export async function deleteSavedPaper(key: string): Promise<boolean> {
+    try {
+        const res = await fetch(`${API_BASE}/api/saved-papers?key=${encodeURIComponent(key)}`, {
+            credentials: "include",
+            method: "DELETE",
+            headers: authHeaders(),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
 export interface ServerMessage {
     role: string;
     content: string;

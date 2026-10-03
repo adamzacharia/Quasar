@@ -300,6 +300,7 @@ from api.routers import (  # noqa: E402
     proposals,
     provider_keys,
     results,
+    saved_papers,
     spectral_lines,
     tools,
     usage,
@@ -317,6 +318,7 @@ app.include_router(datalab.router)
 app.include_router(results.router)
 app.include_router(workbench.router)
 app.include_router(conversations.router)
+app.include_router(saved_papers.router)
 app.include_router(chat.router)
 app.include_router(personalization.router)
 app.include_router(memory.router)

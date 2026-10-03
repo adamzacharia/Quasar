@@ -152,6 +152,11 @@ class ConversationStarUpdate(BaseModel):
     starred: bool
 
 
+class SavedPaperUpsert(BaseModel):
+    key: str
+    paper: Dict[str, Any]
+
+
 class PlanFeedbackRequest(BaseModel):
     conversation_id: str
     approve: bool = False

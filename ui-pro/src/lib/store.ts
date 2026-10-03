@@ -9,6 +9,9 @@ import {
     fetchBlockRatings as apiFetchBlockRatings,
     deleteConversationApi,
     setConversationStarred as apiSetConversationStarred,
+    fetchSavedPapers as apiFetchSavedPapers,
+    saveSavedPaper as apiSaveSavedPaper,
+    deleteSavedPaper as apiDeleteSavedPaper,
     type ServerConversation,
     type ServerMessage,
 } from "./api";
@@ -22,7 +25,8 @@ import {
 } from "./chat-message-updaters";
 import { mergeEvidenceQuality, rankWebSources } from "./evidence-quality";
 import { hasEvidenceIds, mergeTurnWebSources } from "./web-citations.js";
-import { registerSessionScrubber } from "./auth-store";
+import { registerSessionScrubber, useAuthStore } from "./auth-store";
+import { mergeSavedPapers, savedPaperKey } from "./saved-papers.js";
 import { currentAuthGeneration } from "./auth-generation";
 import { DEFAULT_AVAILABLE_MODELS, mergeAvailableModels } from "./models";
 import { normalizeHipsImageMeta } from "./hips-imagery";
@@ -43,7 +47,11 @@ interface ChatStore {
     taskItems: Map<string, TaskItem>;
     taskChecklist: TaskChecklist | null;
     taskExecutionActive: boolean;
+    /** Bookmarks. Each paper's `id` is its savedPaperKey, not the card id. */
     savedPapers: Paper[];
+    /** Keys whose DELETE is in flight, so a bookmark list fetched before the
+     *  removal landed cannot bring the paper back. */
+    _pendingPaperRemovals: Set<string>;
     // Eval mode (Feature 4) — per-user client state, admin-gated at the toggle.
     evalMode: boolean;
     /** blockId -> this user's CONFIRMED 1-5 rating (the server stored it).
@@ -105,7 +113,9 @@ interface ChatStore {
     handleTaskList: (list: Record<string, unknown>) => void;
     clearTaskExecution: () => void;
     savePaper: (paper: Paper) => void;
-    removePaper: (paperId: string) => void;
+    /** Takes the bookmark key (savedPaperKey), which is a saved paper's id. */
+    removePaper: (paperKey: string) => void;
+    loadSavedPapers: () => Promise<void>;
     // Eval mode actions
     setEvalMode: (on: boolean) => void;
     setBlockRating: (blockId: string, rating: number) => void;
@@ -603,6 +613,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     taskChecklist: null,
     taskExecutionActive: false,
     savedPapers: [],
+    _pendingPaperRemovals: new Set(),
     evalMode: getInitialEvalMode(),
     blockRatings: {},
     pendingRatings: {},
@@ -1078,14 +1089,64 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         taskExecutionActive: false,
     }),
 
-    savePaper: (paper) => set((s) => {
-        if (s.savedPapers.some(p => p.id === paper.id)) return {};
-        return { savedPapers: [...s.savedPapers, paper] };
-    }),
+    // Bookmarks are server state (they used to be memory-only and vanished on
+    // every reload, i.e. every redeploy). Optimistic like stars: the click
+    // shows at once and is reverted if the server refuses it. Signed out,
+    // there is no account to save to, so the bookmark stays local.
+    savePaper: (paper) => {
+        const key = savedPaperKey(paper);
+        if (!key || get().savedPapers.some(p => p.id === key)) return;
+        const saved: Paper = { ...paper, id: key };
+        set((s) => ({ savedPapers: [...s.savedPapers, saved] }));
+        if (!useAuthStore.getState().isAuthenticated) return;
+        const generation = currentAuthGeneration();
+        void apiSaveSavedPaper(key, saved).then((ok) => {
+            if (ok || generation !== currentAuthGeneration()) return;
+            set((s) => ({ savedPapers: s.savedPapers.filter(p => p.id !== key) }));
+        });
+    },
 
-    removePaper: (paperId) => set((s) => ({
-        savedPapers: s.savedPapers.filter(p => p.id !== paperId),
-    })),
+    removePaper: (paperKey) => {
+        const index = get().savedPapers.findIndex(p => p.id === paperKey);
+        if (index < 0) return;
+        const removed = get().savedPapers[index];
+        set((s) => ({
+            savedPapers: s.savedPapers.filter(p => p.id !== paperKey),
+            _pendingPaperRemovals: new Set(s._pendingPaperRemovals).add(paperKey),
+        }));
+        const settle = () => set((s) => {
+            const pending = new Set(s._pendingPaperRemovals);
+            pending.delete(paperKey);
+            return { _pendingPaperRemovals: pending };
+        });
+        if (!useAuthStore.getState().isAuthenticated) { settle(); return; }
+        const generation = currentAuthGeneration();
+        void apiDeleteSavedPaper(paperKey).then((ok) => {
+            if (generation !== currentAuthGeneration()) return;
+            settle();
+            if (ok) return;
+            // Put it back where it was.
+            set((s) => {
+                if (s.savedPapers.some(p => p.id === paperKey)) return {};
+                const next = [...s.savedPapers];
+                next.splice(Math.min(index, next.length), 0, removed);
+                return { savedPapers: next };
+            });
+        });
+    },
+
+    loadSavedPapers: async () => {
+        const generation = currentAuthGeneration();
+        const serverPapers = await apiFetchSavedPapers();
+        if (generation !== currentAuthGeneration()) return; // account changed mid-flight
+        if (serverPapers === null) return; // keep what is on screen; never blank on a failed load
+        set((s) => ({
+            savedPapers: mergeSavedPapers(
+                serverPapers.filter((p) => !s._pendingPaperRemovals.has(String(p.id ?? ""))),
+                s.savedPapers,
+            ) as Paper[],
+        }));
+    },
 
     // ── Eval mode (Feature 4) ───────────────────────────────────────────────
 
@@ -1273,5 +1334,5 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 // via a React effect, which would race component unmount.
 registerSessionScrubber(() => {
     useChatStore.getState().clearAllConversations();
-    useChatStore.setState({ _pendingDeletes: new Set() });
+    useChatStore.setState({ _pendingDeletes: new Set(), savedPapers: [], _pendingPaperRemovals: new Set() });
 });

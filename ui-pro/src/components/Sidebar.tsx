@@ -415,7 +415,7 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
         conversations, activeConversationId, setActiveConversation,
         createNewConversation, selectedModel, setSelectedModel,
         fetchModels, loadConversations, loadConversationMessages,
-        deleteConversation, clearAllConversations,
+        deleteConversation, clearAllConversations, loadSavedPapers,
     } = useChatStore();
 
     const { user, logout, isAuthenticated, openAuthModal } = useAuthStore();
@@ -431,10 +431,11 @@ export function Sidebar({ collapsed = false, onToggle, variant = "panel", onClos
     useEffect(() => {
         if (isAuthenticated) {
             loadConversations();
+            loadSavedPapers();
         } else {
             clearAllConversations();
         }
-    }, [isAuthenticated, loadConversations, clearAllConversations]);
+    }, [isAuthenticated, loadConversations, clearAllConversations, loadSavedPapers]);
 
     const [activePanel, setActivePanel] = useState<"papers" | "datalab" | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);

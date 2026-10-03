@@ -4,6 +4,7 @@ import { ArrowRight, Quote, ChevronDown, ChevronUp, ExternalLink, Bookmark, Awar
 import { useState } from "react";
 import type { Paper } from "../lib/types";
 import { useChatStore } from "../lib/store";
+import { savedPaperKey } from "../lib/saved-papers.js";
 import { QueryProvenance } from "./QueryProvenance";
 
 const TYPE_STYLES: Record<string, string> = {
@@ -23,7 +24,10 @@ interface PaperCardProps {
 export function PaperCard({ paper, request }: PaperCardProps) {
     const [expanded, setExpanded] = useState(false);
     const { savedPapers, savePaper, removePaper } = useChatStore();
-    const isSaved = savedPapers.some(p => p.id === paper.id);
+    // Bookmarks are keyed on the paper's identifiers, not the card id, which
+    // is positional ("paper-0") for papers without a bibcode.
+    const saveKey = savedPaperKey(paper);
+    const isSaved = !!saveKey && savedPapers.some(p => p.id === saveKey);
     const typeLabel = paper.type === "journal" ? "Journal" : paper.type === "arxiv" ? "ArXiv" : "Radio";
 
     // Build ADS link from bibcode, fallback to DOI
@@ -39,7 +43,7 @@ export function PaperCard({ paper, request }: PaperCardProps) {
         e.preventDefault();
         e.stopPropagation();
         if (isSaved) {
-            removePaper(paper.id);
+            removePaper(saveKey);
         } else {
             savePaper(paper);
         }

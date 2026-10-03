@@ -27,6 +27,7 @@ from core.logger import logger
 # ── Service layer imports (re-exported for routers / sse) ─────────────────────
 from services.auth import AuthService
 from services.conversation_service import ConversationService
+from services.saved_papers_service import SavedPapersService
 from services.cube_workbench import (
     CubeWorkbenchForbidden,
     CubeWorkbenchNotFound,
@@ -60,6 +61,7 @@ from core.llm_client import (
 # ── Service singletons ────────────────────────────────────────────────────────
 auth_service = AuthService()
 conversation_service = ConversationService()
+saved_papers_service = SavedPapersService()
 cube_workbench_service = CubeWorkbenchService()
 spectral_line_job_service = SpectralLineJobService()
 provider_file_service = ProviderFileService()
