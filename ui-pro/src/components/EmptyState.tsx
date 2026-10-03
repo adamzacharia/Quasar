@@ -3,14 +3,18 @@
 import { useEffect, useState } from "react";
 import { Radio, FileText, HelpCircle, BarChart3 } from "lucide-react";
 
+import { RECIPES } from "@/lib/recipes";
+
 interface Category {
     key: string;
     icon: React.ReactNode;
     title: string;
-    example: string;
+    /** Recipe ids (src/lib/recipes.ts): benchmark questions Quasar answered
+     * well. One is picked at random each time the cards are shown. */
+    recipeIds: string[];
 }
 
-// Orbita empty state: example prompts per the QUASAR design handoff.
+// Orbita empty state: one card per kind of request.
 const ICON_CLASS = "size-4";
 const ICON_STROKE = 1.75;
 
@@ -19,27 +23,37 @@ const CATEGORIES: Category[] = [
         key: "archive",
         icon: <Radio className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Search the archive",
-        example: "Find ALMA observations of Sz65 in Band 6.",
+        recipeIds: ["nos-02", "ab-d-52", "am-m-03"],
     },
     {
         key: "lit",
         icon: <FileText className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Search the literature",
-        example: "Recent papers on protoplanetary disk substructure.",
+        recipeIds: ["ab-d-59", "ab-d-60"],
     },
     {
         key: "policy",
         icon: <HelpCircle className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Policy & guidance",
-        example: "What is the current ALMA proprietary period?",
+        recipeIds: ["pol-01", "pol-03", "pol-06"],
     },
     {
         key: "spectral",
         icon: <BarChart3 className={ICON_CLASS} strokeWidth={ICON_STROKE} />,
         title: "Spectral coverage",
-        example: "Check CO(2-1) line coverage for M87.",
+        recipeIds: ["ab-d-51"],
     },
 ];
+
+const PROMPTS_BY_ID = new Map(RECIPES.map((r) => [r.id, r.prompt]));
+
+/** One benchmark prompt per category, chosen at random. */
+function pickPrompts(): string[] {
+    return CATEGORIES.map((c) => {
+        const id = c.recipeIds[Math.floor(Math.random() * c.recipeIds.length)];
+        return PROMPTS_BY_ID.get(id) ?? "";
+    });
+}
 
 const STORAGE_KEY = "quasar_starting_points_day";
 
@@ -60,7 +74,8 @@ interface EmptyStateProps {
 }
 
 export function EmptyState({ onSuggestionClick, composer, hitCount = null, showDisclaimer = true }: EmptyStateProps) {
-    const [showStartingPoints, setShowStartingPoints] = useState(false);
+    // null until mounted; set only on the first chat opened each day.
+    const [prompts, setPrompts] = useState<string[] | null>(null);
 
     // Starting points are shown on the first chat opened each day, then stay hidden.
     useEffect(() => {
@@ -69,7 +84,7 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
         localStorage.setItem(STORAGE_KEY, today);
         // localStorage is only available after the component mounts.
         // eslint-disable-next-line react-hooks/set-state-in-effect
-        setShowStartingPoints(true);
+        setPrompts(pickPrompts());
     }, []);
 
     return (
@@ -102,7 +117,7 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
 
                     {/* Starting points */}
                     <div className="w-full max-w-[var(--q-suggestion-grid-width)]">
-                        {showStartingPoints && (
+                        {prompts && (
                             <>
                                 <div className="mb-2.5 px-1 text-[13px] text-[var(--q-text-faint)]">
                                     Try a starting point
@@ -111,7 +126,7 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
                                     {CATEGORIES.map((c, i) => (
                                         <button
                                             key={c.key}
-                                            onClick={() => onSuggestionClick(c.example)}
+                                            onClick={() => onSuggestionClick(prompts[i])}
                                             style={{ animationDelay: `${i * 40}ms` }}
                                             className="q-rise group flex flex-col gap-2 rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] p-3 text-left shadow-[var(--q-glass-shadow)] transition-colors hover:border-[var(--q-border-strong)] md:flex-row md:items-start md:gap-3 md:p-3.5"
                                         >
@@ -123,7 +138,7 @@ export function EmptyState({ onSuggestionClick, composer, hitCount = null, showD
                                                     {c.title}
                                                 </h3>
                                                 <p className="text-[12px] leading-[1.45] text-[var(--q-text-muted)]">
-                                                    {c.example}
+                                                    {prompts[i]}
                                                 </p>
                                             </div>
                                         </button>

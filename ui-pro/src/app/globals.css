@@ -610,6 +610,11 @@ html {
   color: #6d28d9;
 }
 [data-theme="light"] .q-mcp-icon { color: #7c3aed; }
+/* Partner logos ship a light and a dark file; show the one for the theme. */
+.q-logo-light { display: none; }
+.q-logo-dark { display: block; }
+[data-theme="light"] .q-logo-light { display: block; }
+[data-theme="light"] .q-logo-dark { display: none; }
 /* Timeline dot; the live one sends out a soft ping. */
 .q-dot { background: currentColor; }
 .q-dot-live::after {
