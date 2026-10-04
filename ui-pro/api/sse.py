@@ -44,6 +44,7 @@ from services.image_generation import (
 )
 from services.model_pricing import TurnCostAccumulator, estimate_cost
 from services.feedback_snapshot_service import FeedbackToolTrace
+from core.llm_client import google_platform_uses_vertex, platform_included_providers
 
 from api import deps
 from api.deps import (
@@ -646,7 +647,8 @@ async def _stream_chat_response(
         provider = model_providers.get(requested_model, provider)
         if model_providers and requested_model not in model_providers and not requested_model.startswith("local/"):
             raise HTTPException(status_code=403, detail="Model is not available. Refresh models or add a provider API key.")
-        if provider in {"anthropic", "google"} and not llm_context["provider_api_keys"].get(provider):
+        if (provider in {"anthropic", "google"} and provider not in platform_included_providers()
+                and not llm_context["provider_api_keys"].get(provider)):
             raise HTTPException(status_code=403, detail="Add a provider API key to use this model.")
         selected_key_source = llm_context["key_source_by_provider"].get(provider, "platform")
         usage_quota_service.ensure_allowed(
@@ -743,7 +745,12 @@ async def _stream_chat_response(
             logger.warning(f"[CHAT] Failed to persist user message: {e}")
         conv_id = _conv_holder["id"]
 
-    if attachment_context is None and provider in {"openai", "anthropic", "google"}:
+    # Platform Gemini on Vertex can't read AI Studio file URIs; its documents
+    # travel as extracted text (routers/chat.py), so there are no refs to reuse.
+    vertex_platform_google = (provider == "google" and not selected_provider_api_key
+                              and google_platform_uses_vertex())
+    if (attachment_context is None and provider in {"openai", "anthropic", "google"}
+            and not vertex_platform_google):
         attachment_context = provider_file_service.get_active_files(
             provider=provider,
             conversation_id=request.conversation_id,

@@ -417,7 +417,8 @@ def tool_image_model() -> Optional[str]:
                                    ("openai", "QUASAR_IMAGE_TOOL_OPENAI_MODEL", "gpt-image-2")):
         byok = bool(keys.get(provider)) and sources.get(provider, "byok") == "byok"
         if byok or (platform_images_allowed() and provider == "openai" and os.getenv("OPENAI_API_KEY")) or (
-                platform_images_allowed() and provider == "google" and os.getenv("GEMINI_API_KEY")):
+                platform_images_allowed() and provider == "google"
+                and ((os.getenv("VERTEX_API_KEY") or "").strip() or (os.getenv("GEMINI_API_KEY") or "").strip())):
             model = os.getenv(env, "").strip() or default
             if image_model_provider(model, provider):
                 return model

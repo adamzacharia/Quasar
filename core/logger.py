@@ -28,9 +28,15 @@ _LOG_DIR.mkdir(exist_ok=True)
 # ── Remove default loguru sink so we control formatting ───────────────────────
 _loguru_logger.remove()
 
+# Loguru's diagnose mode prints every local variable in a traceback, which
+# includes request headers holding provider API keys (a Vertex key showed up
+# in a Gemini 400 traceback, 2026-10-04). Off unless explicitly enabled.
+_DIAGNOSE = os.getenv("QUASAR_LOG_DIAGNOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+
 # ── Console sink (colored, human-readable) ────────────────────────────────────
 _loguru_logger.add(
     sys.stderr,
+    diagnose=_DIAGNOSE,
     level="DEBUG",
     format=(
         "<green>{time:HH:mm:ss}</green> | "
@@ -44,6 +50,7 @@ _loguru_logger.add(
 # ── File sink (structured, rotating, 7-day retention) ─────────────────────────
 _loguru_logger.add(
     _LOG_DIR / "quasar_{time:YYYY-MM-DD}.log",
+    diagnose=_DIAGNOSE,
     level="DEBUG",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} — {message}",
     rotation="10 MB",
@@ -55,6 +62,7 @@ _loguru_logger.add(
 # ── Error-only sink (separate file for quick triage) ─────────────────────────
 _loguru_logger.add(
     _LOG_DIR / "quasar_errors.log",
+    diagnose=_DIAGNOSE,
     level="ERROR",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} — {message}\n{exception}",
     rotation="5 MB",

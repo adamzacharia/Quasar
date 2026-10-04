@@ -292,11 +292,38 @@ def providers_accepting_attachments(attachments) -> frozenset:
 PROVIDER_KEY_ENV_VARS: Dict[str, tuple] = {
     "openai": ("OPENAI_API_KEY",),
     "anthropic": ("ANTHROPIC_API_KEY",),
-    "google": ("GEMINI_API_KEY",),
+    "google": ("VERTEX_API_KEY", "GEMINI_API_KEY"),
     "deepseek": ("DEEPSEEK_API_KEY",),
     "tacc": ("TACC_API_KEY", "TEJAS_API_KEY", "TEXAS_AI_API_KEY"),
     "local": ("LOCAL_LLM_BASE_URL",),
 }
+
+# Providers every signed-in user can call on the platform key (under the
+# platform quota). Anthropic and Google are BYOK-only unless opted in below.
+PLATFORM_INCLUDED_PROVIDERS = frozenset({"openai", "deepseek", "tacc", "local"})
+
+
+def google_platform_uses_vertex() -> bool:
+    """Platform (non-BYOK) Gemini calls go to Vertex AI when VERTEX_API_KEY is
+    set: Google Cloud credits pay for Vertex but not for the AI Studio
+    GEMINI_API_KEY. BYOK Google keys always stay on AI Studio."""
+    return bool((os.getenv("VERTEX_API_KEY", "") or "").strip())
+
+
+def platform_gemini_enabled() -> bool:
+    """QUASAR_PLATFORM_GEMINI=1 lets users without their own Google key use
+    Gemini on the platform key. Off by default (Gemini stays BYOK-only), and
+    it needs a platform Google key to mean anything."""
+    flag = os.getenv("QUASAR_PLATFORM_GEMINI", "").strip().lower() in {"1", "true", "yes", "on"}
+    return flag and any((os.getenv(name, "") or "").strip() for name in PROVIDER_KEY_ENV_VARS["google"])
+
+
+def platform_included_providers() -> frozenset:
+    """PLATFORM_INCLUDED_PROVIDERS plus Google when platform Gemini is on.
+    Read per call so a deploy-time env change needs no code path of its own."""
+    if platform_gemini_enabled():
+        return PLATFORM_INCLUDED_PROVIDERS | {"google"}
+    return PLATFORM_INCLUDED_PROVIDERS
 
 
 def provider_has_key_path(provider: str, client: Optional["LLMClient"] = None) -> bool:
@@ -1935,6 +1962,13 @@ class ResponsesShim:
 
         if not contents:
             contents = [{"role": "user", "parts": [{"text": ""}]}]
+        elif contents[-1]["role"] == "model":
+            # Vertex AI 400s "Requests ending with a model turn are not
+            # supported" (live 2026-10-04); AI Studio tolerated it. Ask the
+            # model to carry on from its own last turn instead.
+            print(f"[PROVIDER] google contents ended with a model turn "
+                  f"({len(contents)} turns); appending a user continuation")
+            contents.append({"role": "user", "parts": [{"text": "Continue."}]})
         return system_text, contents
 
     _GEMINI_ATTACHMENTS_KEY = "_gemini_attachments"
@@ -3232,6 +3266,8 @@ class LLMClient:
             return context_key, "byok"
         api_key = os.getenv(env_name, "")
         if not api_key:
+            if provider == "google":
+                env_name = "VERTEX_API_KEY or GEMINI_API_KEY"
             raise ValueError(
                 f"{env_name} is required for {provider} models. "
                 "Set it in .env or add your own provider API key in Quasar settings."
@@ -3301,14 +3337,20 @@ class LLMClient:
             from google import genai as ggenai
         except ImportError:
             raise ImportError("Install 'google-genai' package: pip install google-genai")
+        # vertexai=False is explicit on the AI Studio clients: the SDK would
+        # otherwise follow GOOGLE_GENAI_USE_VERTEXAI and send a BYOK key to Vertex.
         context_key = self._resolve_context_api_key("google")
         if context_key:
-            return ggenai.Client(api_key=context_key)
+            return ggenai.Client(api_key=context_key, vertexai=False)
         if self._google_client is None:
+            if google_platform_uses_vertex():
+                self._google_client = ggenai.Client(
+                    vertexai=True, api_key=os.environ["VERTEX_API_KEY"].strip())
+                return self._google_client
             api_key, key_source = self._resolve_api_key("google", "GEMINI_API_KEY")
             if key_source == "byok":
-                return ggenai.Client(api_key=api_key)
-            self._google_client = ggenai.Client(api_key=api_key)
+                return ggenai.Client(api_key=api_key, vertexai=False)
+            self._google_client = ggenai.Client(api_key=api_key, vertexai=False)
         return self._google_client
 
     def _get_local_client(self):

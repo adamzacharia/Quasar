@@ -23,6 +23,8 @@ PLATFORM_TOKEN_LIMITS = {
     "deepseek": 500_000,
     "openai": 100_000,
     "tacc": 1_000_000,
+    # Only reachable with QUASAR_PLATFORM_GEMINI=1; spends Google Cloud credits.
+    "google": 300_000,
 }
 
 

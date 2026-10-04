@@ -6,6 +6,7 @@ from typing import Mapping
 
 from pydantic import TypeAdapter, ValidationError
 
+from core.llm_client import platform_included_providers
 from services.provider_key_service import (
     CatalogRateLimitError, ProviderKeyError, ProviderKeyService, StoredCatalog, _normalize_provider,
 )
@@ -60,7 +61,7 @@ class ProviderCatalogService:
 
     def catalog(self, user_id: str, provider: Provider, *, refresh: bool = False,
                 cached_only: bool = False) -> ProviderCatalog:
-        included = provider in {"openai", "deepseek", "tacc", "local"}
+        included = provider in platform_included_providers()
         disconnected = ProviderCatalog(provider=provider, status="included_quota" if included else "not_connected",
                                        models=self.static_models(provider) if included else [],
                                        unlockCount=len(self.curated.get(provider, [])))
@@ -126,8 +127,9 @@ class ProviderCatalogService:
         # at save/refresh/picker load, with cache fallback on provider outages.
         catalogs = self.keys.list_catalogs(user_id)
         routes: dict[str, str] = {}
+        included = platform_included_providers()
         for provider in self.curated:
-            if provider not in connected and provider not in {"openai", "deepseek", "tacc", "local"}:
+            if provider not in connected and provider not in included:
                 continue
             models = self.static_models(provider)
             if provider in connected and provider in catalogs:

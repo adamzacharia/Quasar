@@ -6,6 +6,7 @@ from typing import List as PyList, Optional
 from fastapi import APIRouter, File, Form, Header, UploadFile
 from starlette.requests import Request
 
+from core.llm_client import google_platform_uses_vertex, platform_included_providers
 from services.auth_cookie import read_auth_cookie
 from api.deps import (
     ProviderFileError,
@@ -77,7 +78,8 @@ async def chat_with_files(
         provider = model_providers.get(selected_model, provider)
         if model_providers and selected_model not in model_providers and not selected_model.startswith("local/"):
             return _sse_error_response("Model is not available. Refresh models or add a provider API key.")
-        if provider in {"anthropic", "google"} and not upload_llm_context["provider_api_keys"].get(provider):
+        if (provider in {"anthropic", "google"} and provider not in platform_included_providers()
+                and not upload_llm_context["provider_api_keys"].get(provider)):
             return _sse_error_response("Add a provider API key to use this model.")
         upload_user_email = _current_user_email(current_user)
         upload_key_source = upload_llm_context["key_source_by_provider"].get(provider, "platform")
@@ -159,8 +161,12 @@ async def chat_with_files(
         mixed_document_previews.append(_extract_document_preview_text(filename, content_type, raw))
 
     attachment_context = None
+    # Gemini's Files API is AI Studio only, so platform Gemini on Vertex gets
+    # extracted text like DeepSeek does (BYOK Google keys keep native upload).
+    native_upload = provider in {"openai", "anthropic", "google"} and not (
+        provider == "google" and not selected_provider_api_key and google_platform_uses_vertex())
     if document_uploads:
-        if provider in {"openai", "anthropic", "google"}:
+        if native_upload:
             try:
                 attachment_context = provider_file_service.prepare_files(
                     provider=provider,
