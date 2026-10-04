@@ -28,7 +28,6 @@ import { MemoryUpdateChip } from "./MemoryPanel";
 import { BlockRating } from "./BlockRating";
 import { useChatStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme-store";
-import { ObservationPaperGraph, type ResearchGraph } from "./ObservationPaperGraph";
 import {
     CONTEXT_CONSENT_LABEL,
     FEEDBACK_PREVIEW_LIMITS,
@@ -484,7 +483,6 @@ interface ChatMessageProps {
     thinkingSteps?: ThoughtStep[];
     thinkingStatus?: "idle" | "running" | "completed";
     taskExecutionState?: TaskExecutionState | null;
-    observationGraph?: ResearchGraph;
     reportPrompt?: string;
     /** Grounded web evidence of this turn (sources with W# ids): renders the
      *  sources strip, the inline [W#] chips and the cited-first grid. */
@@ -496,7 +494,7 @@ interface ChatMessageProps {
     researchPaperCount?: number;
 }
 
-export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, observationGraph, reportPrompt, turnWebSources, researchSources, researchPaperCount }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatus, taskExecutionState, reportPrompt, turnWebSources, researchSources, researchPaperCount }: ChatMessageProps) {
     const isUser = message.role === "user";
     const displayContent = isUser ? message.content : safeAssistantWebText(message.content);
     const hasContent = !!displayContent;
@@ -609,25 +607,15 @@ export function ChatMessage({ message, isStreaming, thinkingSteps, thinkingStatu
         const rows = message.dataTable.rows;
         if (!rows || rows.length === 0) return null;
         return (
-            <>
-                <div className="min-w-0">
-                    <DataTableCard data={message.dataTable} />
-                    <BlockRating blockId={message.blockId} blockKind={message.blockKind}
-                        runId={message.runMeta?.run_id} model={message.runMeta?.model} />
-                </div>
-                {observationGraph && (
-                    <div className="mt-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
-                        <ObservationPaperGraph graph={observationGraph} />
-                    </div>
-                )}
-            </>
+            <div className="min-w-0">
+                <DataTableCard data={message.dataTable} />
+                <BlockRating blockId={message.blockId} blockKind={message.blockKind}
+                    runId={message.runMeta?.run_id} model={message.runMeta?.model} />
+            </div>
         );
     }
 
     if (message.type === "papers" && message.papers && message.papers.length > 0) {
-        if (observationGraph) {
-            return null;
-        }
         const shouldScroll = message.papers.length > 6;
         return (
             <div className="min-w-0">

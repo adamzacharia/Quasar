@@ -1185,7 +1185,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     /* The gate may only demand a rating for a block the user can actually see,
        and the ONLY thing that knows that is the rating widget itself: a block
        can carry a stable id and still render nothing (a 0-row data card is
-       suppressed; a papers grid is swallowed by the ObservationPaperGraph).
+       suppressed; an empty prose bubble renders nothing).
        Mirroring those conditions in the gate would work until someone adds the
        next suppression rule to ChatMessage and silently wedges the composer —
        an unrateable-but-required block blocks sending with no way out. So the

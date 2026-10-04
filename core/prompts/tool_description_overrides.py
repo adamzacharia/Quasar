@@ -142,7 +142,7 @@ OVERRIDES: Dict[str, str] = {
     "search_papers_by_observation_id": (
         "Call it only when the user explicitly asks for papers connected to a specific identifier. The backend "
         "already auto-links the top ALMA project codes of search_by_target and search_by_position results to "
-        "ADS for the Observation-Paper Graph; do not call this merely to reproduce that linking. Results render "
+        "ADS; do not call this merely to reproduce that linking. Results render "
         "as paper cards; do not repeat the whole list in text, but name the papers with their bibcodes when the "
         "user asks for them."
     ),

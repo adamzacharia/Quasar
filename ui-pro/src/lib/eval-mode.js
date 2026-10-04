@@ -65,8 +65,7 @@ export function isRateableBlock(message) {
  *
  * THE INVISIBLE-BLOCK TRAP: a block can hold a perfectly good stable id and
  * still render nothing — an empty prose bubble on a table-only answer, a 0-row
- * data card (ChatMessage suppresses it), a papers grid swallowed by the
- * ObservationPaperGraph. Demanding a star on one of those wedges the composer
+ * data card (ChatMessage suppresses it). Demanding a star on one of those wedges the composer
  * forever: unrated, unrateable, unsendable. Gating on what actually mounted a
  * widget makes that impossible by construction, and keeps working when someone
  * adds the next suppression rule to ChatMessage.

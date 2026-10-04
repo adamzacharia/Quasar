@@ -1,7 +1,7 @@
 /**
  * Pure spherical-geometry helpers for the interactive sky view.
  *
- * Plain JS (like research-graph.js) so `node --test` can import it directly;
+ * Plain JS so `node --test` can import it directly;
  * consumed by AladinSkyView.tsx. All angles are ICRS degrees.
  */
 

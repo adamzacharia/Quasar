@@ -378,7 +378,6 @@ ui-pro/src/
     PlanReviewWidget.tsx    # Research plan review
     TaskExecutionWidget.tsx # Task execution progress
     ThoughtProcessWidget.tsx# Thinking/reasoning display
-    ObservationPaperGraph.tsx # Research graph visualization
     icons/QuasarIcons.tsx   # Custom SVG icons
   lib/
     store.ts                # Main Zustand store
@@ -390,6 +389,5 @@ ui-pro/src/
     content-safety.js       # Content filtering
     evidence-quality.js     # Evidence scoring
     chat-message-updaters.js# Message state helpers
-    research-graph.js       # Graph data structures
     feedback-report.js      # Feedback utilities
 ```

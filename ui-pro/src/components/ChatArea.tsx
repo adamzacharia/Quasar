@@ -9,7 +9,6 @@ import { ChatInput } from "./ChatInput";
 import { ChatMessage } from "./ChatMessage";
 import { MobileHomeBar } from "./MobileHomeBar";
 import { useIsMobile } from "../lib/use-is-mobile";
-import type { ResearchGraph } from "./ObservationPaperGraph";
 import { DownloadProgress } from "./DownloadProgress";
 import { PlanReviewWidget } from "./PlanReviewWidget";
 import type { PlanReviewData } from "./PlanReviewWidget";
@@ -29,7 +28,6 @@ import {
 import { turnPaperCount } from "../lib/research-timeline.js";
 
 const WEB_SEARCH_MODE_KEY = "quasar-web-search-mode";
-import { buildObservationPaperGraph } from "../lib/research-graph";
 import { useAuthStore, verifyAuth } from "../lib/auth-store";
 import { shouldBlockSend, unratedBlocks, nudgeText } from "../lib/eval-mode";
 import { useEvalModeActive } from "../lib/use-eval-mode";
@@ -161,54 +159,6 @@ export function ChatArea() {
     const activeConversation = conversations.find(c => c.id === activeConversationId);
     const isStarred = activeConversation?.isStarred || false;
     const scrollRef = useRef<HTMLDivElement>(null);
-
-    const turnGraphs = useMemo(() => {
-        const graphs: Record<string, ResearchGraph> = {};
-        let currentTurnMessages: Message[] = [];
-        let currentTurnDataMessageIds: string[] = [];
-        let currentTurnMessageIds: string[] = [];
-
-        // UI-06: data messages RENDER the graph inline (ChatMessage's data
-        // branch), so only the LAST data card of the turn carries it — a
-        // multi-table turn used to stack the identical graph once per table.
-        // Non-data ids still carry it: the papers grid keys its
-        // self-suppression off having a graph for its own message id.
-        const assignTurnGraph = (
-            turnMessages: Message[],
-            turnMessageIds: string[],
-            dataMessageIds: string[],
-        ) => {
-            const graph = buildObservationPaperGraph(turnMessages) as ResearchGraph | null;
-            if (!graph) return;
-            const anchorDataId = dataMessageIds[dataMessageIds.length - 1];
-            for (const id of turnMessageIds) {
-                if (dataMessageIds.includes(id) && id !== anchorDataId) continue;
-                graphs[id] = graph;
-            }
-        };
-
-        for (const msg of messages) {
-            if (msg.role === "user") {
-                if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
-                    assignTurnGraph(currentTurnMessages, currentTurnMessageIds, currentTurnDataMessageIds);
-                }
-                currentTurnMessages = [];
-                currentTurnDataMessageIds = [];
-                currentTurnMessageIds = [];
-            }
-            currentTurnMessages.push(msg);
-            currentTurnMessageIds.push(msg.id);
-            if (msg.type === "data") {
-                currentTurnDataMessageIds.push(msg.id);
-            }
-        }
-
-        if (currentTurnMessages.length > 0 && currentTurnDataMessageIds.length > 0) {
-            assignTurnGraph(currentTurnMessages, currentTurnMessageIds, currentTurnDataMessageIds);
-        }
-
-        return graphs;
-    }, [messages]);
 
     // ── Smart auto-scroll ──────────────────────────────────────
     // Only scroll to bottom if the user hasn't manually scrolled up.
@@ -1072,7 +1022,6 @@ export function ChatArea() {
                                         thinkingSteps={isLastAssistant ? thinkingSteps : msg.thinkingSteps}
                                         thinkingStatus={isLastAssistant ? thinkingStatus : (msg.thinkingSteps ? "completed" : undefined)}
                                         taskExecutionState={execState}
-                                        observationGraph={turnGraphs[msg.id]}
                                         reportPrompt={reportPrompt}
                                         turnWebSources={msg.type === "text" && groundedWeb ? webForTurn : undefined}
                                         // Reloaded answers come back typed "general", not "text",
