@@ -216,7 +216,7 @@ def detect_provider(model: str) -> str:
         return "local"
     if model.startswith("claude-"):
         return "anthropic"
-    if model.startswith("gemini-") or model.startswith("gemma-"):
+    if model.startswith(("gemini-", "gemma-", "nano-banana")):
         return "google"
     if "deepseek" in model.lower():
         return "deepseek"
@@ -226,7 +226,7 @@ def detect_provider(model: str) -> str:
 
 def model_accepts_direct_image_input(model: str) -> bool:
     """Return True when Quasar can pass uploaded images directly to the model."""
-    return detect_provider(model) == "openai"
+    return detect_provider(model) in ("openai", "google")
 
 
 # Attachment support is KIND-specific, not provider-wide (CX-21). Uploaded
@@ -247,7 +247,7 @@ ATTACHMENT_KIND_PROVIDERS: Dict[str, frozenset] = {
     "openai_input_file": frozenset({"openai"}),
     "anthropic_document_file": frozenset({"anthropic"}),
     "gemini_file": frozenset({"google"}),
-    "image_url": frozenset({"openai", "tacc"}),
+    "image_url": frozenset({"openai", "tacc", "google"}),
 }
 
 
@@ -775,7 +775,7 @@ class ResponsesShim:
                         _hist = list(self._history_cache.get(_prev, [])) if _prev else []
                     # What is actually sent: the shim compacts on a new user
                     # turn (guard CX-08).
-                    if _hist and provider in ("tacc", "deepseek") and _is_new_user_turn(kwargs.get("input")):
+                    if _hist and provider in ("tacc", "deepseek", "google") and _is_new_user_turn(kwargs.get("input")):
                         try:
                             from core import history_compact as _hc
 
@@ -1559,6 +1559,63 @@ class ResponsesShim:
         )
 
     # ── Google Gemini ────────────────────────────────────────────────────
+    #
+    # Gemini rides the same chat-history pipeline as DeepSeek/TACC
+    # (_chat_messages_for_input: cached chain per previous_response_id, broken-
+    # chain healing, personal-document expiry, compaction). The cached history
+    # is stored in Chat Completions form; _google_contents converts it to
+    # Gemini `contents` on every round. Gemini 3 rejects a function-calling
+    # turn whose function_call parts lost their thought signature, so each
+    # cached tool call carries the signature Gemini returned (base64) under
+    # _GEMINI_SIG_KEY.
+
+    _GEMINI_SIG_KEY = "_gemini_thought_signature"
+    _GEMINI_UNSIGNED_CALL = b"skip_thought_signature_validator"
+    # Models that accept thinking_config (thought summaries are streamed as
+    # reasoning). Gemini 3+ (_GEMINI3_RE) wants its default temperature of
+    # 1.0 (lower values can make it loop, so the agent's 0.7 is only sent to
+    # 2.x) and a thought signature on every function call it is shown.
+    _GEMINI_THINKING_RE = re.compile(r"^gemini-(?:2\.5|[3-9]|\d{2,})|^gemini-(?:flash|flash-lite|pro)-latest$")
+    _GEMINI3_RE = re.compile(r"^gemini-(?:[3-9]|\d{2,})|^gemini-(?:flash|flash-lite|pro)-latest$")
+
+    def _google_request(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None):
+        """Build (messages, call_kwargs) for a Gemini generate_content call."""
+        model = kwargs.get("model", self._llm.default_model)
+        instructions = kwargs.get("instructions", "")
+        input_data = kwargs.get("input", "")
+        max_tokens = kwargs.get("max_output_tokens", 2000)
+        tools_raw = kwargs.get("tools", None)
+        prev_id = kwargs.get("previous_response_id", None)
+        json_mode = False
+        text_opt = kwargs.get("text", None)
+        if text_opt and isinstance(text_opt, dict):
+            fmt = text_opt.get("format", {})
+            if fmt.get("type") == "json_object":
+                json_mode = True
+
+        messages = self._chat_messages_for_input(prev_id, instructions, input_data, json_mode)
+        messages = self._google_stash_attachments(messages, attachments, _is_new_user_turn(input_data))
+        system_text, contents = self._google_contents(messages, model=model)
+
+        config: Dict[str, Any] = {"max_output_tokens": max_tokens}
+        if system_text:
+            config["system_instruction"] = system_text
+        if not self._GEMINI3_RE.search(str(model)):
+            config["temperature"] = kwargs.get("temperature", 0.7)
+        if self._GEMINI_THINKING_RE.search(str(model)):
+            config["thinking_config"] = {"include_thoughts": True}
+        if json_mode:
+            config["response_mime_type"] = "application/json"
+        gemini_tools = self._translate_tools_for_google(tools_raw) if tools_raw else None
+        if gemini_tools:
+            config["tools"] = gemini_tools
+        tool_choice = kwargs.get("tool_choice")
+        if tool_choice == "none":
+            config["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
+        elif tool_choice == "required" and gemini_tools:
+            config["tool_config"] = {"function_calling_config": {"mode": "ANY"}}
+
+        return messages, {"model": model, "contents": contents, "config": config}
 
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_google(
@@ -1568,50 +1625,11 @@ class ResponsesShim:
     ) -> LLMResponse:
         """Translate responses.create() to Google GenAI API."""
         client = self._llm._get_google_client()
-        model = kwargs.get("model", self._llm.default_model)
-        instructions = kwargs.get("instructions", "")
-        input_data = kwargs.get("input", "")
-        temperature = kwargs.get("temperature", 0.7)
-        max_tokens = kwargs.get("max_output_tokens", 2000)
-        tools_raw = kwargs.get("tools", None)
-        json_mode = False
-        text_opt = kwargs.get("text", None)
-        if text_opt and isinstance(text_opt, dict):
-            fmt = text_opt.get("format", {})
-            if fmt.get("type") == "json_object":
-                json_mode = True
-
-        # Build content
-        user_text = input_data if isinstance(input_data, str) else json.dumps(input_data, default=str)
-        full_prompt = f"{instructions}\n\n{user_text}" if instructions else user_text
-        if json_mode:
-            full_prompt += "\n\nRespond with valid JSON only."
-
-        # Translate tools for Gemini
-        gemini_tools = None
-        if tools_raw:
-            gemini_tools = self._translate_tools_for_google(tools_raw)
-
-        gen_config = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-        if json_mode:
-            gen_config["response_mime_type"] = "application/json"
-
-        call_kwargs = {
-            "model": model,
-            "contents": self._build_google_contents(full_prompt, attachments=attachments),
-            "config": gen_config,
-        }
-        if gemini_tools:
-            call_kwargs["config"]["tools"] = gemini_tools
-        if kwargs.get("tool_choice") == "none":
-            call_kwargs["config"]["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
-
+        messages, call_kwargs = self._google_request(kwargs, attachments=attachments)
         resp = client.models.generate_content(**call_kwargs)
-
-        return self._google_to_llm_response(resp)
+        result, signatures = self._google_to_llm_response(resp)
+        self._cache_google_turn(result.id, messages, result.output_text, result.output, signatures)
+        return result
 
     def _stream_google(
         self,
@@ -1620,159 +1638,370 @@ class ResponsesShim:
     ):
         """Streaming Google GenAI call — returns an iterator of StreamEvents."""
         client = self._llm._get_google_client()
-        model = kwargs.get("model", self._llm.default_model)
-        instructions = kwargs.get("instructions", "")
-        input_data = kwargs.get("input", "")
-        temperature = kwargs.get("temperature", 0.7)
-        max_tokens = kwargs.get("max_output_tokens", 2000)
-        tools_raw = kwargs.get("tools", None)
+        messages, call_kwargs = self._google_request(kwargs, attachments=attachments)
 
-        user_text = input_data if isinstance(input_data, str) else json.dumps(input_data, default=str)
-        full_prompt = f"{instructions}\n\n{user_text}" if instructions else user_text
-
-        gemini_tools = self._translate_tools_for_google(tools_raw) if tools_raw else None
-
-        gen_config = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-        call_kwargs = {
-            "model": model,
-            "contents": self._build_google_contents(full_prompt, attachments=attachments),
-            "config": gen_config,
-        }
-        if gemini_tools:
-            call_kwargs["config"]["tools"] = gemini_tools
-        if kwargs.get("tool_choice") == "none":
-            call_kwargs["config"]["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
-
-        # Emit response.created
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         yield StreamEvent(type="response.created", response=LLMResponse(id=resp_id))
 
         usage_obj = None
-        function_calls = []
+        finish_reason = None
+        output_text = ""
+        function_calls: List[FunctionCallItem] = []
+        signatures: Dict[str, str] = {}
+        reasoning_done_emitted = False
 
         stream = client.models.generate_content_stream(**call_kwargs)
         for chunk in stream:
-            if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
-                usage_obj = LLMUsage(
-                    input_tokens=getattr(chunk.usage_metadata, 'prompt_token_count', 0),
-                    output_tokens=getattr(chunk.usage_metadata, 'candidates_token_count', 0),
-                )
+            chunk_usage = self._google_usage(chunk)
+            if chunk_usage is not None:
+                usage_obj = chunk_usage
+            for candidate in (getattr(chunk, "candidates", None) or [])[:1]:
+                reason = self._google_finish_reason(candidate)
+                if reason:
+                    finish_reason = reason
+                content = getattr(candidate, "content", None)
+                for part in (getattr(content, "parts", None) or []):
+                    text = getattr(part, "text", None)
+                    if getattr(part, "thought", False):
+                        if text:
+                            yield StreamEvent(type="response.reasoning_summary_text.delta", delta=text)
+                        continue
+                    fc_part = getattr(part, "function_call", None)
+                    if (text or fc_part) and not reasoning_done_emitted:
+                        yield StreamEvent(type="response.reasoning_summary_text.done")
+                        reasoning_done_emitted = True
+                    if text:
+                        output_text += text
+                        yield StreamEvent(type="response.output_text.delta", delta=text)
+                    if fc_part:
+                        fc = self._google_function_call_item(fc_part)
+                        sig = self._google_signature_b64(part)
+                        if sig:
+                            signatures[fc.call_id] = sig
+                        function_calls.append(fc)
+                        yield StreamEvent(type="response.output_item.added", item=fc)
+                        yield StreamEvent(type="response.function_call_arguments.delta", delta=fc.arguments, item=fc)
+                        yield StreamEvent(type="response.output_item.done", item=fc)
+            # Some test doubles (and older SDKs) expose only chunk.text.
+            if not getattr(chunk, "candidates", None):
+                text = getattr(chunk, "text", None)
+                if text:
+                    output_text += text
+                    yield StreamEvent(type="response.output_text.delta", delta=text)
 
-            text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
-            if text:
-                yield StreamEvent(type="response.output_text.delta", delta=text)
-
-            # Handle function calls in streaming
-            if hasattr(chunk, 'candidates'):
-                for candidate in chunk.candidates:
-                    if hasattr(candidate, 'content') and candidate.content:
-                        for part in candidate.content.parts:
-                            if hasattr(part, 'function_call') and part.function_call:
-                                fc = FunctionCallItem(
-                                    name=part.function_call.name,
-                                    arguments=json.dumps(dict(part.function_call.args)) if part.function_call.args else "{}",
-                                )
-                                function_calls.append(fc)
-                                yield StreamEvent(type="response.output_item.added", item=fc)
-
+        if not reasoning_done_emitted:
+            yield StreamEvent(type="response.reasoning_summary_text.done")
+        if function_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
+        print(
+            f"[PROVIDER] google stream model={call_kwargs.get('model')} finish_reason={finish_reason!r} "
+            f"output_chars={len(output_text)} tool_calls={len(function_calls)} "
+            f"in={getattr(usage_obj, 'input_tokens', None)} out={getattr(usage_obj, 'output_tokens', None)}"
+        )
         yield StreamEvent(
             type="response.completed",
             response=LLMResponse(
                 id=resp_id,
-                output=function_calls,
+                output=list(function_calls),
                 usage=usage_obj,
+                finish_reason=finish_reason,
             )
         )
+        self._cache_google_turn(resp_id, messages, output_text, function_calls, signatures)
+
+    def _cache_google_turn(self, response_id, messages, output_text, output_items, signatures) -> None:
+        """Store the chat-form history (with thought signatures) for the next round."""
+        tool_calls = [o for o in (output_items or []) if getattr(o, "type", None) == "function_call"]
+        new_messages = list(messages)
+        if tool_calls:
+            calls = []
+            for tc in tool_calls:
+                call = {
+                    "id": tc.call_id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                if signatures.get(tc.call_id):
+                    call[self._GEMINI_SIG_KEY] = signatures[tc.call_id]
+                calls.append(call)
+            new_messages.append({"role": "assistant", "content": output_text or None, "tool_calls": calls})
+        else:
+            new_messages.append({"role": "assistant", "content": output_text or ""})
+        with self._history_lock:
+            self._history_cache[response_id] = new_messages
+            self._note_untrusted_from(new_messages)
+
+    @staticmethod
+    def _google_signature_b64(part) -> Optional[str]:
+        sig = getattr(part, "thought_signature", None)
+        if not sig:
+            return None
+        import base64
+        if isinstance(sig, str):
+            return sig
+        return base64.b64encode(bytes(sig)).decode("ascii")
+
+    @staticmethod
+    def _google_function_call_item(fc_part) -> "FunctionCallItem":
+        args = getattr(fc_part, "args", None)
+        try:
+            arguments = json.dumps(dict(args), default=str) if args else "{}"
+        except Exception:
+            arguments = "{}"
+        return FunctionCallItem(
+            name=getattr(fc_part, "name", "") or "",
+            arguments=arguments,
+            call_id=getattr(fc_part, "id", None) or "",
+        )
+
+    @staticmethod
+    def _google_finish_reason(candidate) -> Optional[str]:
+        reason = getattr(candidate, "finish_reason", None)
+        if reason is None:
+            return None
+        name = str(getattr(reason, "value", None) or getattr(reason, "name", None) or reason).upper()
+        if name in ("", "FINISH_REASON_UNSPECIFIED"):
+            return None
+        if name == "STOP":
+            return "stop"
+        if name == "MAX_TOKENS":
+            return "length"
+        return name.lower()
+
+    @staticmethod
+    def _google_usage(resp) -> Optional[LLMUsage]:
+        """Gemini usage. Thinking tokens bill as output, so they count as output."""
+        meta = getattr(resp, "usage_metadata", None)
+        if not meta:
+            return None
+        prompt = getattr(meta, "prompt_token_count", None) or 0
+        tool_prompt = getattr(meta, "tool_use_prompt_token_count", None) or 0
+        candidates = getattr(meta, "candidates_token_count", None) or 0
+        thoughts = getattr(meta, "thoughts_token_count", None) or 0
+        if not (prompt or tool_prompt or candidates or thoughts):
+            return None
+        return LLMUsage(input_tokens=int(prompt) + int(tool_prompt), output_tokens=int(candidates) + int(thoughts))
 
     def _translate_tools_for_google(self, tools: list) -> list:
-        """Convert OpenAI tool format to Google GenAI function declarations."""
+        """Convert OpenAI tool format to Google GenAI function declarations.
+
+        Quasar's schemas use full JSON Schema (type arrays such as
+        ["integer", "null"], $ref/$defs). The SDK's typed `parameters` field
+        rejects those client-side, so every Gemini turn failed before reaching
+        Google; `parameters_json_schema` takes the schema as-is.
+        """
         from google.genai import types as genai_types
 
         function_declarations = []
         for t in tools:
             if t.get("type") == "function" or "name" in t:
-                params = t.get("parameters", {})
+                params = t.get("parameters") or {"type": "object", "properties": {}}
                 function_declarations.append(
                     genai_types.FunctionDeclaration(
                         name=t.get("name", ""),
                         description=t.get("description", ""),
-                        parameters=params,
+                        parameters_json_schema=params,
                     )
                 )
         if function_declarations:
             return [genai_types.Tool(function_declarations=function_declarations)]
         return []
 
-    def _google_to_llm_response(self, resp) -> LLMResponse:
-        """Convert Google GenAI response to LLMResponse."""
+    def _google_to_llm_response(self, resp):
+        """Convert a Google GenAI response to (LLMResponse, {call_id: signature})."""
         output_text = ""
         output_items = []
-
-        if hasattr(resp, 'text') and resp.text:
-            output_text = resp.text
-
-        # Handle function calls
-        if hasattr(resp, 'candidates'):
-            for candidate in resp.candidates:
-                if hasattr(candidate, 'content') and candidate.content:
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            if not output_text:
-                                output_text = part.text
-                        if hasattr(part, 'function_call') and part.function_call:
-                            fc = FunctionCallItem(
-                                name=part.function_call.name,
-                                arguments=json.dumps(dict(part.function_call.args)) if part.function_call.args else "{}",
-                            )
-                            output_items.append(fc)
-
-        usage = None
-        if hasattr(resp, 'usage_metadata') and resp.usage_metadata:
-            usage = LLMUsage(
-                input_tokens=getattr(resp.usage_metadata, 'prompt_token_count', 0),
-                output_tokens=getattr(resp.usage_metadata, 'candidates_token_count', 0),
-            )
+        signatures: Dict[str, str] = {}
+        finish_reason = None
+        candidates = getattr(resp, "candidates", None) or []
+        for candidate in candidates[:1]:
+            finish_reason = self._google_finish_reason(candidate)
+            content = getattr(candidate, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                if getattr(part, "thought", False):
+                    continue
+                text = getattr(part, "text", None)
+                if text:
+                    output_text += text
+                fc_part = getattr(part, "function_call", None)
+                if fc_part:
+                    fc = self._google_function_call_item(fc_part)
+                    sig = self._google_signature_b64(part)
+                    if sig:
+                        signatures[fc.call_id] = sig
+                    output_items.append(fc)
+        if not candidates:
+            output_text = getattr(resp, "text", None) or ""
+        if output_items and finish_reason == "stop":
+            finish_reason = "tool_calls"
+        if not candidates and not output_text:
+            feedback = getattr(resp, "prompt_feedback", None)
+            block = getattr(feedback, "block_reason", None) if feedback else None
+            if block:
+                logger.warning("Gemini blocked the prompt: %s", block)
 
         return LLMResponse(
             output_text=output_text,
             output=output_items or [MessageOutputItem(content=[TextContentItem(text=output_text)])],
-            usage=usage,
-        )
+            usage=self._google_usage(resp),
+            finish_reason=finish_reason,
+        ), signatures
 
-    def _build_google_contents(
-        self,
-        prompt_text: str,
-        attachments: Optional[List[Dict[str, Any]]] = None,
-    ):
-        """Build Gemini contents with file_data parts for uploaded documents."""
-        if not attachments:
-            return prompt_text
+    def _google_contents(self, messages: list, attachments=None, model: str = ""):
+        """Chat Completions messages -> (system_instruction, Gemini contents).
 
-        parts = []
-        for attachment in attachments:
-            if attachment.get("kind") != "gemini_file":
+        user -> role "user"; assistant -> role "model" (text + function_call
+        parts, thought signature restored); tool -> function_response parts in
+        a "user" turn. Adjacent turns of one role are merged, as Gemini wants
+        all responses to one step's calls together. Uploaded files and images
+        ride on the user message they were stashed on (_google_stash_attachments).
+        """
+        import base64
+
+        if attachments:
+            messages = self._google_stash_attachments(messages, attachments, False)
+
+        system_parts: List[str] = []
+        contents: List[Dict[str, Any]] = []
+        names_by_call: Dict[str, str] = {}
+        needs_signature = bool(self._GEMINI3_RE.search(str(model)))
+
+        def add(role: str, parts: List[Dict[str, Any]]):
+            if not parts:
+                return
+            if contents and contents[-1]["role"] == role:
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": role, "parts": list(parts)})
+
+        for m in messages or []:
+            if not isinstance(m, dict):
                 continue
-            file_uri = attachment.get("file_uri")
-            mime_type = attachment.get("mime_type")
-            if not file_uri or not mime_type:
-                raise ValueError("Gemini attachment is missing file_uri or mime_type.")
-            parts.append({
-                "file_data": {
-                    "mime_type": mime_type,
-                    "file_uri": file_uri,
-                }
-            })
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system":
+                if content:
+                    system_parts.append(str(content))
+            elif role == "user":
+                add("user", self._google_attachment_parts(m.get(self._GEMINI_ATTACHMENTS_KEY))
+                    + self._google_user_parts(content))
+            elif role == "assistant":
+                parts: List[Dict[str, Any]] = []
+                if isinstance(content, str) and content:
+                    parts.append({"text": content})
+                for tc in m.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    name = fn.get("name", "")
+                    names_by_call[str(tc.get("id", ""))] = name
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except (TypeError, ValueError):
+                        args = {"_raw_arguments": str(fn.get("arguments"))}
+                    if not isinstance(args, dict):
+                        args = {"value": args}
+                    fc_part: Dict[str, Any] = {"function_call": {"name": name, "args": args}}
+                    if tc.get("id") and not str(tc["id"]).startswith("call_"):
+                        fc_part["function_call"]["id"] = tc["id"]
+                    sig = tc.get(self._GEMINI_SIG_KEY)
+                    if sig:
+                        try:
+                            fc_part["thought_signature"] = base64.b64decode(sig)
+                        except Exception:
+                            pass
+                    if "thought_signature" not in fc_part and needs_signature:
+                        # A call Gemini did not generate (the runner's document
+                        # prefetch / one-shot dispatch exchanges): Gemini 3 400s
+                        # on an unsigned call ("missing a thought_signature",
+                        # live 2026-10-04) and documents this placeholder for it.
+                        fc_part["thought_signature"] = self._GEMINI_UNSIGNED_CALL
+                    parts.append(fc_part)
+                add("model", parts)
+            elif role == "tool":
+                call_id = str(m.get("tool_call_id", ""))
+                output = content if isinstance(content, str) else json.dumps(content, default=str)
+                fr: Dict[str, Any] = {"name": names_by_call.get(call_id) or "tool", "response": {"output": output}}
+                if call_id and not call_id.startswith("call_"):
+                    fr["id"] = call_id
+                add("user", [{"function_response": fr}])
 
-        if prompt_text:
-            parts.append({"text": prompt_text})
+        system_text = "\n\n".join(system_parts)
+        # Gemma on the Gemini API has no system-instruction support.
+        if system_text and str(model).startswith("gemma-"):
+            if contents and contents[0]["role"] == "user":
+                contents[0]["parts"].insert(0, {"text": system_text})
+            else:
+                contents.insert(0, {"role": "user", "parts": [{"text": system_text}]})
+            system_text = ""
 
-        if not parts:
-            return prompt_text
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": ""}]}]
+        return system_text, contents
 
-        return [{"role": "user", "parts": parts}]
+    _GEMINI_ATTACHMENTS_KEY = "_gemini_attachments"
+
+    def _google_stash_attachments(self, messages: list, attachments, new_turn: bool) -> list:
+        """Keep a turn's uploads on its user message in the cached history.
+
+        The runner passes attachments on round 0 only; Gemini is stateless, so
+        later tool rounds must replay them from history or the model loses the
+        image/PDF mid-turn. On a NEW user turn earlier stashes are dropped:
+        active documents are re-attached every turn by the SSE layer, and old
+        inline images would otherwise grow every replay. Copies; never mutates
+        the cached dicts.
+        """
+        key = self._GEMINI_ATTACHMENTS_KEY
+        out = list(messages or [])
+        if new_turn:
+            out = [{k: v for k, v in m.items() if k != key} if isinstance(m, dict) and key in m else m
+                   for m in out]
+        if attachments:
+            for i in range(len(out) - 1, -1, -1):
+                m = out[i]
+                if isinstance(m, dict) and m.get("role") == "user":
+                    out[i] = {**m, key: list(attachments)}
+                    break
+            else:
+                out.append({"role": "user", "content": "", key: list(attachments)})
+        return out
+
+    @staticmethod
+    def _google_user_parts(content) -> List[Dict[str, Any]]:
+        if isinstance(content, str):
+            return [{"text": content}] if content else []
+        parts: List[Dict[str, Any]] = []
+        for item in content or []:
+            if isinstance(item, str):
+                parts.append({"text": item})
+            elif isinstance(item, dict) and item.get("type") in ("text", "input_text"):
+                if item.get("text"):
+                    parts.append({"text": item["text"]})
+        return parts
+
+    @staticmethod
+    def _google_attachment_parts(attachments) -> List[Dict[str, Any]]:
+        """Uploaded Gemini files and inline (data: URL) images as Gemini parts."""
+        import base64
+
+        parts: List[Dict[str, Any]] = []
+        for attachment in attachments or []:
+            if not isinstance(attachment, dict):
+                continue
+            kind = attachment_kind(attachment)
+            if kind == "gemini_file":
+                file_uri = attachment.get("file_uri")
+                mime_type = attachment.get("mime_type")
+                if not file_uri or not mime_type:
+                    raise ValueError("Gemini attachment is missing file_uri or mime_type.")
+                parts.append({"file_data": {"mime_type": mime_type, "file_uri": file_uri}})
+            elif kind == "image_url":
+                payload = attachment.get("image_url") or attachment
+                url = payload.get("url") or payload.get("image_url") if isinstance(payload, dict) else str(payload)
+                match = re.match(r"^data:([\w/+.-]+);base64,(.*)$", str(url or ""), re.S)
+                if not match:
+                    logger.warning("Gemini image attachment is not a data: URL; skipped.")
+                    continue
+                parts.append({"inline_data": {"mime_type": match.group(1), "data": base64.b64decode(match.group(2))}})
+        return parts
 
     # ── Local LLM (Ollama / LM Studio via OpenAI-compat API) ────────────
 

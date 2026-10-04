@@ -3943,6 +3943,23 @@ def register_tools(agent: "QuasarAgent") -> None:
         category="archive"
     ))
 
+    # AI image generation on the user's own Gemini/OpenAI key (services/image_generation.py).
+    from services import image_generation as _imagegen
+
+    def _generate_image_tool(**kwargs):
+        result = _imagegen.run_generate_image_tool(**kwargs)
+        for card in result.pop("_cards", None) or []:
+            agent._accumulated_run_results.append(card)
+        return result
+
+    agent.tool_registry.register(Tool(
+        name="generate_image",  # == _imagegen.TOOL_NAME; literal for the budget-coverage scan
+        description=_imagegen.TOOL_DESCRIPTION,
+        function=_generate_image_tool,
+        parameters=_imagegen.TOOL_PARAMETERS,
+        category="analysis"
+    ))
+
 
 # ── Archive catalogue tools (capabilities/catalogs.py, ArchiveBench gap closing 2026-09) ──
 _POS = {

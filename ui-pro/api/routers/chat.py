@@ -179,7 +179,8 @@ async def chat_with_files(
             for preview in mixed_document_previews:
                 enriched_text += preview
 
-    if image_contents and provider == "openai":
+    # OpenAI and Gemini read images natively; other providers get a text pre-pass.
+    if image_contents and provider in ("openai", "google"):
         attachment_context = attachment_context or {
             "provider": provider,
             "attachments": [],

@@ -334,6 +334,15 @@ export function ModelDropdown({
                                                             {tag}
                                                         </span>
                                                     )}
+                                                    {model.capabilities?.imageGeneration && (
+                                                        <span
+                                                            data-model-tag="image"
+                                                            title="Image model: generates pictures instead of running Quasar's research tools"
+                                                            className="mt-1 inline-flex items-center rounded border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-violet-200"
+                                                        >
+                                                            Image
+                                                        </span>
+                                                    )}
                                                     {ctx && (
                                                         <span className="mt-1 inline-flex items-center rounded border border-slate-600/60 bg-slate-700/40 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-slate-300">
                                                             {ctx}

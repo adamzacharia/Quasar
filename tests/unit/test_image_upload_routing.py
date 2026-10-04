@@ -94,3 +94,4 @@ def test_image_direct_input_capability_matches_current_provider_paths():
     assert model_accepts_direct_image_input("gpt-4o-mini")
     assert not model_accepts_direct_image_input("deepseek-v4-pro")
     assert not model_accepts_direct_image_input("deepseek-v4-flash")
+    assert model_accepts_direct_image_input("gemini-3.8-flash")

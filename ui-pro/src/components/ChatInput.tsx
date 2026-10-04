@@ -25,6 +25,8 @@ interface ChatInputProps {
     webSearchMode: WebSearchMode;
     onWebSearchModeChange: (mode: WebSearchMode) => void;
     hitCount?: number | null;
+    /** The selected model generates images: the message is an image prompt. */
+    imageModel?: boolean;
 }
 
 const WEB_SEARCH_MODE_OPTIONS: { value: WebSearchMode; label: string; hint: string }[] = [
@@ -42,6 +44,7 @@ const MENU_ROW =
 export function ChatInput({
     onSend, onStop, isStreaming, initialValue = "", variant = "docked",
     grounded: groundedSummary, onGroundedChange, webSearchMode, onWebSearchModeChange, hitCount = null,
+    imageModel = false,
 }: ChatInputProps) {
     const isHero = variant === "hero";
     const webSearch = webSearchMode !== "off";
@@ -190,7 +193,11 @@ export function ChatInput({
                                 value={value}
                                 onChange={(e) => setValue(e.target.value)}
                                 onKeyDown={handleKeyDown}
-                                placeholder={isStreaming ? "Quasar is thinking…" : "Ask Quasar about observations, data, or literature…"}
+                                placeholder={isStreaming
+                                    ? (imageModel ? "Generating image…" : "Quasar is thinking…")
+                                    : imageModel
+                                      ? "Describe the image to generate, or attach one to edit…"
+                                      : "Ask Quasar about observations, data, or literature…"}
                                 className="min-w-0 flex-1 border-none bg-transparent text-[14px] text-[var(--q-text)] outline-none placeholder:text-[var(--q-text-faint)] focus:ring-0"
                                 disabled={isStreaming}
                             />

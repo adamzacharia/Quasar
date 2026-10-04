@@ -10,6 +10,7 @@ from typing import Literal, Protocol
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+from services.image_generation import is_image_generation_model
 from services.model_pricing import CATALOG_UNVERIFIED_PRICES, get_model_pricing
 
 Provider = Literal["openai", "deepseek", "anthropic", "google", "tacc", "local"]
@@ -21,6 +22,9 @@ class Capabilities(BaseModel):
     vision: bool | None = None
     tools: bool | None = None
     reasoning: bool | None = None
+    # Image-generation model (Gemini "Nano Banana", OpenAI gpt-image): a chat
+    # turn on it returns images instead of running the agent.
+    imageGeneration: bool | None = None
 
 
 class ModelInfo(BaseModel):
@@ -115,6 +119,28 @@ def is_openai_chat_model(model_id: str) -> bool:
     return not (any(word in lowered for word in EXCLUDED) or any(
         lowered == name or lowered.startswith(name + "-") for name in NON_STREAMING_OPENAI
     ))
+
+
+# Gemini models that cannot serve a Quasar chat turn: embeddings, media and
+# speech generation, Live/Interactions-API-only and agent products, and the
+# computer-use/robotics models that need their own tools. Image models
+# ("-image", "nano-banana") stay: they serve image-generation turns.
+GOOGLE_EXCLUDED = ("embedding", "aqa", "imagen", "veo", "tts", "lyria", "live", "native-audio",
+                   "transcribe", "computer-use", "robotics", "antigravity", "deep-research", "omni")
+
+
+def is_google_selectable_model(model_id: str) -> bool:
+    lowered = model_id.lower()
+    return not any(word in lowered for word in GOOGLE_EXCLUDED)
+
+
+def with_capability_flags(model: ModelInfo) -> ModelInfo:
+    """Stamp capabilities that follow from the model id alone (old caches and
+    curated static entries carry none)."""
+    if is_image_generation_model(model.id, model.provider) and not model.capabilities.imageGeneration:
+        caps = model.capabilities.model_copy(update={"imageGeneration": True, "tools": False})
+        return model.model_copy(update={"capabilities": caps})
+    return model
 FAMILY_ORDER: dict[str, tuple[str, ...]] = {
     "anthropic": ("claude-opus", "claude-sonnet", "claude-haiku"),
     "openai": ("gpt-", "o4", "o3", "o1"),
@@ -157,13 +183,13 @@ def chat_models(models: list[ModelInfo]) -> list[ModelInfo]:
     """Apply current chat compatibility to old caches as well as discovery."""
     def supported(model: ModelInfo) -> bool:
         if model.provider == "openai":
-            return is_openai_chat_model(model.id)
+            return is_openai_chat_model(model.id) or is_image_generation_model(model.id, "openai")
         if model.provider == "deepseek":
             return not any(word in model.id.lower() for word in EXCLUDED)
         if model.provider == "google":
-            return not any(word in model.id.lower() for word in ("embedding", "aqa", "imagen", "veo", "tts"))
+            return is_google_selectable_model(model.id)
         return True
-    return sort_models([model for model in models if supported(model)])
+    return sort_models([with_capability_flags(model) for model in models if supported(model)])
 
 
 class _Adapter:
@@ -181,14 +207,13 @@ class _Adapter:
             capabilities = Capabilities()
             if self.provider == "google":
                 model_id = row.name.removeprefix("models/")
-                if "generateContent" not in row.supportedGenerationMethods or any(
-                    word in model_id.lower() for word in ("embedding", "aqa", "imagen", "veo", "tts")
-                ):
+                if "generateContent" not in row.supportedGenerationMethods or not is_google_selectable_model(model_id):
                     continue
             elif self.provider in {"openai", "deepseek"}:
-                if any(word in model_id.lower() for word in EXCLUDED):
+                image_model = self.provider == "openai" and is_image_generation_model(model_id, "openai")
+                if any(word in model_id.lower() for word in EXCLUDED) and not image_model:
                     continue
-                if self.provider == "openai" and not is_openai_chat_model(model_id):
+                if self.provider == "openai" and not (is_openai_chat_model(model_id) or image_model):
                     continue
                 alias = SNAPSHOT.sub("", model_id)
                 if alias != model_id and alias in ids:
@@ -205,13 +230,13 @@ class _Adapter:
             created = row.created_at
             if created is None and row.created is not None:
                 created = datetime.fromtimestamp(row.created, timezone.utc)
-            result.append(price_model(ModelInfo(
+            result.append(with_capability_flags(price_model(ModelInfo(
                 provider=self.provider, id=model_id,
                 displayName=row.display_name or row.displayName or model_id,
                 contextWindow=row.max_input_tokens or row.inputTokenLimit,
                 maxOutput=row.max_tokens or row.outputTokenLimit,
                 capabilities=capabilities, createdAt=created,
-            )))
+            ))))
         return sort_models(result)
 
     def list_models(self, api_key: str) -> list[ModelInfo]:

@@ -60,7 +60,12 @@ def test_chat_filter_and_snapshot_aliases(cls):
            "gpt-realtime", "gpt-audio", "gpt-image-1", "gpt-transcribe", "babbage-002", "davinci-002"]
     page = _Page.model_validate({"data": [{"id": model} for model in ids]})
     models = cls().normalize(page.data)
-    assert {m.id for m in models} == {"gpt-4.1", "gpt-4o-mini-2024-07-18", "o3-mini"}
+    expected = {"gpt-4.1", "gpt-4o-mini-2024-07-18", "o3-mini"}
+    if cls is OpenAIAdapter:
+        # Image-generation models are selectable (image turns), flagged as such.
+        expected.add("gpt-image-1")
+        assert next(m for m in models if m.id == "gpt-image-1").capabilities.imageGeneration is True
+    assert {m.id for m in models} == expected
 
 
 def test_google_filter():
@@ -77,7 +82,7 @@ def test_openai_latest_generations_sort_before_old_models_and_keep_aliases():
     models = OpenAIAdapter().normalize(page.data)
     assert [m.id for m in models[:4]] == ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
     assert "gpt-6-sol-2026-09-01" not in [m.id for m in models]
-    assert "gpt-image-2" not in [m.id for m in models]
+    assert "gpt-image-2" in [m.id for m in models]  # image model, listed after chat models
     assert "gpt-live-1" not in [m.id for m in models]
     assert "gpt-5.5-pro" not in [m.id for m in models]
     assert "o3-pro-2025-06-10" not in [m.id for m in models]
@@ -199,11 +204,12 @@ def test_legacy_openai_cache_filters_unsupported_models_on_read_and_routing(cata
     models = [ModelInfo(provider="openai", id=id, displayName=id) for id in ids]
     raw = StoredCatalog(json.dumps([m.model_dump(mode="json") for m in models]), datetime.now(timezone.utc).isoformat())
     catalog.keys.save_key("alice", "openai", "unit-secret-key", catalog=raw)
-    assert [m.id for m in catalog.catalog("alice", "openai", cached_only=True).models] == ["gpt-6-sol"]
-    assert [m.id for m in catalog.catalog("alice", "openai").models] == ["gpt-6-sol"]
+    # gpt-image-2 is an image-generation model: selectable since 2026-10-04.
+    assert [m.id for m in catalog.catalog("alice", "openai", cached_only=True).models] == ["gpt-6-sol", "gpt-image-2"]
+    assert [m.id for m in catalog.catalog("alice", "openai").models] == ["gpt-6-sol", "gpt-image-2"]
     routes = catalog.model_providers("alice", ["openai"])
-    assert routes["gpt-6-sol"] == "openai"
-    assert not set(ids[:-1]) & routes.keys()
+    assert routes["gpt-6-sol"] == "openai" and routes["gpt-image-2"] == "openai"
+    assert not {"gpt-5.5-pro", "o3-pro-2025-06-10", "gpt-live-1"} & routes.keys()
 
 
 @pytest.mark.parametrize("provider,good,bad", [

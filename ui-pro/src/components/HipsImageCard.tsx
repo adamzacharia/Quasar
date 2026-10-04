@@ -11,6 +11,7 @@ import { IllustrativeBadge } from "./IllustrativeBadge";
 import type { HipsImageMeta } from "../lib/types";
 import { clampHipsFov, hips2fitsUrl, normalizeHipsSurveyId } from "../lib/hips-imagery";
 import { previewBadgeFacts } from "../lib/export-decision";
+import { saveImage } from "../lib/save-image";
 
 type HipsImageCardProps = {
     imageUrl: string;
@@ -76,6 +77,60 @@ function PlainImageCard({ imageUrl, caption, fitsHref }: { imageUrl: string; cap
                     </div>
                 )}
             </div>
+            {lightboxOpen && (
+                <ImageLightbox src={imageUrl} caption={caption} onClose={() => setLightboxOpen(false)} />
+            )}
+        </div>
+    );
+}
+
+/** An image an AI image model generated (kind "generated"): artwork, not data,
+ *  so it carries an AI-generated label instead of the cite-the-table note. */
+function GeneratedImageCard({ imageUrl, caption, model }: { imageUrl: string; caption?: string; model?: string }) {
+    const [lightboxOpen, setLightboxOpen] = useState(false);
+    const [failed, setFailed] = useState(false);
+    return (
+        <div className="pl-11" data-image-kind="generated">
+            <div className="mt-4 max-w-[640px] rounded-2xl border border-[var(--q-border)] bg-[var(--q-card)] overflow-hidden">
+                {failed ? (
+                    <div className="flex h-40 items-center justify-center px-4 text-center text-xs text-[var(--q-text-faint)]">
+                        This image is no longer available on the server.
+                    </div>
+                ) : (
+                    <img
+                        src={imageUrl}
+                        alt={caption || "AI-generated image"}
+                        className="w-full max-h-[640px] object-contain bg-[var(--q-bg)] cursor-zoom-in hover:brightness-105 transition"
+                        loading="lazy"
+                        onClick={() => setLightboxOpen(true)}
+                        onError={() => setFailed(true)}
+                    />
+                )}
+                <div className="px-4 py-2.5 border-t border-[var(--q-border)] flex items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                        <span className="q-gen-badge inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                            AI-generated
+                        </span>
+                        <span className="min-w-0 truncate text-xs text-[var(--q-text-faint)]">{model || caption}</span>
+                    </div>
+                    {!failed && (
+                        <div className="flex shrink-0 items-center gap-3">
+                            <button
+                                type="button"
+                                onClick={() => void saveImage(imageUrl, model)}
+                                className="text-xs text-primary hover:underline underline-offset-2 transition-colors flex items-center gap-1"
+                            >
+                                <Download className="w-3.5 h-3.5" />
+                                Download
+                            </button>
+                            <FullSizeLink href={imageUrl} />
+                        </div>
+                    )}
+                </div>
+            </div>
+            <p className="mt-1.5 text-[11px] text-[var(--q-text-faint)]">
+                Generated artwork, not an observation or real data.
+            </p>
             {lightboxOpen && (
                 <ImageLightbox src={imageUrl} caption={caption} onClose={() => setLightboxOpen(false)} />
             )}
@@ -158,6 +213,10 @@ export function HipsImageCard({ imageUrl, caption = "", imageMeta, request }: Hi
     // epochs) played in place; the static panel rides along as the summary.
     // NB: these supported variants return early — render the provenance block
     // alongside them or they lose their request surface entirely (CX-15).
+    if (kind === "generated") {
+        return <GeneratedImageCard imageUrl={imageUrl} caption={caption} model={imageMeta?.model} />;
+    }
+
     if (kind === "blink" && (imageMeta?.frames?.length ?? 0) >= 2) {
         return (
             <>

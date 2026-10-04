@@ -11,11 +11,15 @@ from services.provider_key_service import (
 )
 from services.provider_models import (
     ADAPTERS, AvailableModels, CatalogError, ModelInfo, Provider, ProviderAdapter,
-    ProviderCatalog, chat_models, price_model, sort_models,
+    ProviderCatalog, chat_models, price_model, sort_models, with_capability_flags,
 )
 
 _MODELS = TypeAdapter(list[ModelInfo])
 DEFAULT_MODEL = "gpt-oss-120b"
+# Catalogs cached before this instant were filtered by older discovery rules
+# (OpenAI gpt-image models dropped, Gemini Live/agent models kept): treat them
+# as stale so the next picker load re-discovers. Bump when the rules change.
+CATALOG_RULES_SINCE = datetime(2026, 10, 4, tzinfo=timezone.utc)
 
 
 class ProviderCatalogService:
@@ -28,7 +32,8 @@ class ProviderCatalogService:
     def static_models(self, provider: Provider) -> list[ModelInfo]:
         # Curated IDs can be explicit deployment overrides. Discovery filtering
         # applies to provider payloads/caches; do not silently rewrite config.
-        return sort_models([price_model(ModelInfo(provider=provider, id=model, displayName=model, source="static"))
+        return sort_models([with_capability_flags(price_model(ModelInfo(
+                                provider=provider, id=model, displayName=model, source="static")))
                             for model in self.curated.get(provider, [])])
 
     @staticmethod
@@ -79,7 +84,8 @@ class ProviderCatalogService:
                 fetched = fetched.replace(tzinfo=timezone.utc)
         except (ValidationError, ValueError):
             models, fetched = self.static_models(provider), None
-        fresh = fetched is not None and datetime.now(timezone.utc) - fetched < timedelta(hours=24)
+        fresh = (fetched is not None and fetched >= CATALOG_RULES_SINCE
+                 and datetime.now(timezone.utc) - fetched < timedelta(hours=24))
         if (fresh and not refresh) or cached_only:
             return ProviderCatalog(provider=provider, status="connected", models=models,
                                    fetchedAt=fetched, stale=not fresh)

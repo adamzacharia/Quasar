@@ -241,6 +241,17 @@ export function modelLabel(model) {
     return name.startsWith("local/") ? name.slice("local/".length) : name;
 }
 
+/**
+ * Image-generation model (Gemini "Nano Banana" image models, OpenAI gpt-image).
+ * Mirrors services/image_generation.py image_model_provider so the composer
+ * can switch to "describe the image" before the catalog has loaded.
+ */
+export function isImageGenerationModelId(id) {
+    const model = String(id || "").trim().toLowerCase();
+    return /^(?:gemini-[\w.-]+-image(?:-preview)?(?:-\d+)*|nano-banana[\w.-]*)$/.test(model)
+        || /^(?:gpt-image-[\w.-]+|chatgpt-image-[\w.-]+)$/.test(model);
+}
+
 function orderProviders(providers) {
     const known = [];
     for (const provider of PROVIDER_ORDER) {

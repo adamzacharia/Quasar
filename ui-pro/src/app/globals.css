@@ -610,6 +610,17 @@ html {
   color: #6d28d9;
 }
 [data-theme="light"] .q-mcp-icon { color: #7c3aed; }
+/* AI-generated image card label (image models, generate_image tool). */
+.q-gen-badge {
+  background: rgba(167, 139, 250, 0.15);
+  border: 1px solid rgba(167, 139, 250, 0.4);
+  color: #c4b5fd;
+}
+[data-theme="light"] .q-gen-badge {
+  background: rgba(124, 58, 237, 0.08);
+  border-color: rgba(124, 58, 237, 0.3);
+  color: #6d28d9;
+}
 /* Partner logos ship a light and a dark file; show the one for the theme. */
 .q-logo-light { display: none; }
 .q-logo-dark { display: block; }
@@ -772,6 +783,10 @@ html {
 }
 [data-theme="light"] .text-violet-300 {
   color: #7c3aed !important;
+}
+/* violet = image-generation model badge (model selector) */
+[data-theme="light"] .text-violet-200 {
+  color: #6d28d9 !important;
 }
 
 /* Table micro-headers (thead carries text-slate-500 in the dark skin); the

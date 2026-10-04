@@ -709,10 +709,10 @@ def test_attachment_kind_provider_mapping():
     assert ATTACHMENT_KIND_PROVIDERS["openai_input_file"] == frozenset({"openai"})
     assert ATTACHMENT_KIND_PROVIDERS["anthropic_document_file"] == frozenset({"anthropic"})
     assert ATTACHMENT_KIND_PROVIDERS["gemini_file"] == frozenset({"google"})
-    assert ATTACHMENT_KIND_PROVIDERS["image_url"] == frozenset({"openai", "tacc"})
+    assert ATTACHMENT_KIND_PROVIDERS["image_url"] == frozenset({"openai", "tacc", "google"})
 
     image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
-    assert providers_accepting_attachments([image]) == frozenset({"openai", "tacc"})
+    assert providers_accepting_attachments([image]) == frozenset({"openai", "tacc", "google"})
     # Mixed kinds intersect: an OpenAI file ref + an image → only openai.
     mixed = [{"kind": "openai_input_file", "file_id": "f"}, image]
     assert providers_accepting_attachments(mixed) == frozenset({"openai"})

@@ -69,6 +69,8 @@ export interface HipsImageMeta {
     /** Registration/coverage caveats from the epoch service (CX-18) — shown
      *  on the card so an unregistered frame can't read as a real transient. */
     warnings?: string[];
+    /** Image model that made a kind "generated" (AI-generated) image. */
+    model?: string;
 }
 
 export interface Message {

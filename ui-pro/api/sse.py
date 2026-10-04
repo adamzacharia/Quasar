@@ -35,6 +35,13 @@ from services.evidence_quality import (
 from services.block_identity import BlockIdAllocator
 from services.content_safety import is_safe_web_image, is_safe_web_source
 from services.web_evidence import canonicalize_url
+from services.image_generation import (
+    ImageGenerationError,
+    decode_data_url,
+    generate_image,
+    image_model_provider,
+    load_generated_image,
+)
 from services.model_pricing import TurnCostAccumulator, estimate_cost
 from services.feedback_snapshot_service import FeedbackToolTrace
 
@@ -116,6 +123,45 @@ def _stream_headers() -> Dict[str, str]:
 
 def _sse_status(step: str, state: str = "running") -> str:
     return f"data: {json.dumps({'type': 'status', 'step': step, 'state': state})}\n\n"
+
+
+def _image_generation_references(attachment_context: Optional[Dict[str, Any]]) -> List[tuple]:
+    """Images uploaded with this turn, as (bytes, mime), for an image model."""
+    ctx = attachment_context or {}
+    candidates = list(ctx.get("attachments") or []) + list((ctx.get("image_prepass") or {}).get("images") or [])
+    refs = []
+    for att in candidates:
+        if not isinstance(att, dict):
+            continue
+        payload = att.get("image_url")
+        url = payload.get("url") if isinstance(payload, dict) else payload
+        decoded = decode_data_url(url or "")
+        if decoded:
+            refs.append(decoded)
+    return refs
+
+
+def _previous_generated_image(conv_id: str) -> Optional[tuple]:
+    """The image the chat's most recent assistant turn generated, if any, so
+    a follow-up ("make it green") can edit it. Only the latest assistant turn
+    counts: after a text answer the next prompt starts fresh."""
+    try:
+        messages = conversation_service.get_conversation_messages(conv_id, last_n=6)
+    except Exception as exc:  # noqa: BLE001 - a missing reference is not fatal
+        logger.warning(f"[IMAGE] could not read previous turn: {exc}")
+        return None
+    for msg in reversed(messages or []):
+        if msg.get("role") != "assistant":
+            continue
+        meta = msg.get("metadata") or {}
+        images = meta.get("images") or ([meta["image"]] if isinstance(meta.get("image"), dict) else [])
+        for img in reversed(images):
+            if isinstance(img, dict) and (img.get("meta") or {}).get("kind") == "generated":
+                loaded = load_generated_image(img.get("url", ""))
+                if loaded:
+                    return loaded
+        return None
+    return None
 
 
 # core/runner.py MCP_STEP_SENTINEL (kept literal: this module must not import
@@ -938,7 +984,11 @@ async def _stream_chat_response(
             # actively-progressing backend at the base value.
             "turn_timeout_seconds": hard_max_timeout,
         }
-        yield f"data: {json.dumps(run_meta)}\n\n"
+        # An image-model turn yields run_meta inside its own cleanup block
+        # (a close at this first yield must still finalize its run row).
+        _image_turn = bool(image_model_provider(requested_model, provider))
+        if not _image_turn:
+            yield f"data: {json.dumps(run_meta)}\n\n"
 
         def _terminal_run_meta_line() -> str:
             """Re-emit run_meta with the turn's FINAL status (Feature 4).
@@ -961,6 +1011,180 @@ async def _stream_chat_response(
             final["status"] = run_status
             final["errorCode"] = run_error_code
             return f"data: {json.dumps(final)}\n\n"
+
+        # ── Image-generation model: no agent loop ────────────────────────
+        # The message is the prompt; the provider returns images that render
+        # as image cards and persist with the turn (services/image_generation).
+        if _image_turn:
+            _img_text = ""
+            _img_entries: List[Dict[str, Any]] = []
+            _img_state = {"persisted": False, "done": False}
+            _img_lock = threading.Lock()
+            _img_future = None
+
+            def _persist_image_turn() -> None:
+                """Save the assistant turn once (normal end or teardown; the
+                two can race on different threads, hence the lock)."""
+                with _img_lock:
+                    if _img_state["persisted"] or not conv_id:
+                        return
+                    _img_state["persisted"] = True
+                meta: Dict[str, Any] = {"runMeta": {
+                    "run_id": run_id, "trace_id": trace_id, "model": requested_model,
+                    "provider": provider, "conversation_id": conv_id, "text_block_id": _text_block_id,
+                }}
+                if _img_entries:
+                    meta["images"] = list(_img_entries)
+                    meta["image"] = _img_entries[-1]
+                if run_status != "completed":
+                    meta["runMeta"]["status"] = run_status
+                    meta["runMeta"]["errorCode"] = run_error_code
+                try:
+                    conversation_service.save_message(conv_id, "assistant", _img_text, "general", meta)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"[CHAT] Failed to persist image turn: {exc}")
+
+            try:
+                yield f"data: {json.dumps(run_meta)}\n\n"
+                if conv_id:
+                    yield "data: " + json.dumps({"type": "conversation_meta", "conversation_id": conv_id}) + "\n\n"
+                yield _sse_status("Generating image", "running")
+                _img_prompt = request.message or ""
+                _img_refs = _image_generation_references(attachment_context)
+                _img_previous = None
+                if not _img_refs and conv_id:
+                    _img_previous = await asyncio.to_thread(_previous_generated_image, conv_id)
+                loop = asyncio.get_running_loop()
+                _img_future = loop.run_in_executor(
+                    _chat_executor,
+                    lambda: _run_with_llm_context(
+                        llm_context, current_user_id, current_user_email, usage_recorder,
+                        quota_checker,
+                        lambda: generate_image(requested_model, _img_prompt, references=_img_refs,
+                                               previous_image=_img_previous),
+                        quota_releaser=quota_releaser,
+                    ),
+                )
+                # A run_progress heartbeat every 15 s while the provider works:
+                # the client's inactivity watchdog counts only parsed data
+                # events (an SSE comment would not reset it). Bounded by a turn
+                # deadline; a timed-out call that already started finishes in
+                # its worker and records its own usage, a queued one is cancelled.
+                _img_deadline = _time.perf_counter() + float(os.getenv("CHAT_IMAGE_TIMEOUT_SECONDS", "240"))
+                _img_result = None
+                _img_error: Optional[str] = None
+                while True:
+                    try:
+                        _img_result = await asyncio.wait_for(asyncio.shield(_img_future), timeout=15)
+                        break
+                    except asyncio.TimeoutError:
+                        if _time.perf_counter() >= _img_deadline:
+                            _img_error = "timeout"
+                            _img_future.cancel()
+                            break
+                        yield ": keepalive\n\n"
+                        yield "data: " + json.dumps({"type": "run_progress", "phase": "Generating image",
+                                                     "tool": requested_model}) + "\n\n"
+                    except ImageGenerationError as exc:
+                        _img_error = str(exc)
+                        run_error_code = "image_generation_failed"
+                        break
+                    except QuotaExceededError as exc:
+                        _img_error = str(redact_secrets(exc))
+                        run_error_code = "quota_exceeded"
+                        break
+                    except Exception as exc:  # noqa: BLE001 - shown as a chat message
+                        logger.warning(f"[IMAGE] generation failed: {redact_secrets(exc)}")
+                        _img_error = "The image could not be generated. Please try again."
+                        run_error_code = "image_generation_error"
+                        break
+
+                if _img_error == "timeout":
+                    run_status = "timed_out"
+                    run_error_code = "image_generation_timeout"
+                    _img_text = "The image model took too long to answer. Please try again."
+                elif _img_error is not None:
+                    run_status = "failed"
+                    _img_text = _img_error
+                else:
+                    _img_text = _img_result.text
+                    for _gen in _img_result.images:
+                        _img_entries.append({
+                            "url": _gen.url,
+                            "caption": f"Generated by {requested_model}",
+                            "meta": {"kind": "generated", "model": requested_model},
+                            "blockId": _blocks.next("image"),
+                            "blockKind": "image",
+                        })
+                    if _img_entries:
+                        run_status = "completed"
+                    else:
+                        # Text only: the model answered (asked a question or
+                        # declined) without an image. Not a successful run.
+                        run_status = "failed"
+                        run_error_code = "image_not_generated"
+                        _img_text = _img_text or "The image model returned no image."
+                run_error_message = "" if run_status == "completed" else _img_text[:500]
+                yield _sse_status("Generating image", "completed")
+                if _img_text:
+                    if first_token_ms is None:
+                        first_token_ms = int((_time.perf_counter() - run_started_at) * 1000)
+                    yield f"data: {json.dumps({'type': 'token', 'content': _img_text})}\n\n"
+                for _gen_entry in _img_entries:
+                    yield "data: " + json.dumps({"type": "image", **_gen_entry}) + "\n\n"
+                await asyncio.to_thread(_persist_image_turn)
+                _img_usage = usage_sse_line()
+                if _img_usage:
+                    yield _img_usage
+                _img_terminal = _terminal_run_meta_line()
+                if _img_terminal:
+                    yield _img_terminal
+                _img_state["done"] = True  # a close after this point is not a cancellation
+                yield "data: [DONE]\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                # Client gone. A queued provider call is cancelled; one already
+                # running cannot be stopped and finishes (recording its usage)
+                # in the worker. Save what exists and finalize off-loop, never
+                # awaiting during teardown.
+                if _img_future is not None:
+                    _img_future.cancel()
+                if not _img_state["done"]:
+                    run_status = "cancelled"
+                    run_error_code = "client_cancelled"
+                    run_error_message = "The client cancelled the chat run."
+                try:
+                    asyncio.get_running_loop().run_in_executor(None, _persist_image_turn)
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:  # noqa: BLE001 - unexpected bug in this branch
+                run_status = "failed"
+                run_error_code = "chat_error"
+                run_error_message = str(redact_secrets(exc))
+                logger.warning(f"[IMAGE] turn failed: {run_error_message}")
+                _err_usage_line = usage_sse_line()
+                if _err_usage_line:
+                    yield _err_usage_line
+                yield "data: " + json.dumps({"type": "error", "code": run_error_code,
+                                             "content": run_error_message, "run_id": run_id}) + "\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                # Same rule as the agent path (CX-14): await the run-row write
+                # on a normal end so readers see it after [DONE]; during
+                # teardown schedule it off-loop instead.
+                if sys.exc_info()[1] is None:
+                    try:
+                        await asyncio.to_thread(finalize_run_record)
+                    except asyncio.CancelledError:
+                        raise
+                    except RuntimeError:
+                        finalize_run_record()
+                else:
+                    try:
+                        asyncio.get_running_loop().run_in_executor(None, finalize_run_record)
+                    except Exception:
+                        finalize_run_record()
+            return
 
         if agent is None:
             err = get_agent_error() or "Unknown initialization error"

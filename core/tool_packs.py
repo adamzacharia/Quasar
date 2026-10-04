@@ -295,6 +295,15 @@ _pack(
     r"\bconvert|\bcalculat|\bcompute|velocity\s+frame|\blsr\b|\bgsr\b|\bcmb\s+frame|hubble\s+flow|"
     r"luminosity\s+distance|lookback|angular\s+(?:size|diameter)|\bkpc\b|\bmpc\b",
 )
+_pack(
+    "image_generation",
+    "AI image generation (illustrations, artist's impressions) on the user's own Gemini/OpenAI key",
+    ("generate_image",),
+    r"\b(?:generate|create|draw|make|render|paint|design|sketch|illustrate)\w*\b.{0,40}"
+    r"\b(?:images?|pictures?|illustrations?|drawings?|artwork|art|logo|poster|icon|cartoon|sketch|"
+    r"artist'?s\s+(?:impression|concept|rendering))\b|"
+    r"\bartist'?s\s+(?:impression|concept)\b|\bnano[- ]?banana\b|\bgpt-image\b|\bimage\s+generation\b",
+)
 
 PACK_ORDER: Sequence[str] = tuple(PACKS.keys())
 

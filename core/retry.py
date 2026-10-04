@@ -70,16 +70,21 @@ NON_RETRYABLE_MESSAGE_RE = re.compile(
 
 
 def _extract_status_code(error: Exception) -> Optional[int]:
-    """Extract HTTP status code from various API error types."""
-    # OpenAI errors
-    if hasattr(error, 'status_code'):
-        return getattr(error, 'status_code')
-    # Anthropic errors
-    if hasattr(error, 'status'):
-        return getattr(error, 'status')
+    """Extract HTTP status code from various API error types.
+
+    Only integers count: google-genai's APIError carries the HTTP code in
+    ``code`` and a status NAME ("NOT_FOUND") in ``status``, and comparing that
+    string with ints raised a TypeError that masked the real error."""
+    # OpenAI errors (status_code), Anthropic errors (status), google-genai (code)
+    for attr in ('status_code', 'status', 'code'):
+        value = getattr(error, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
     # httpx / requests errors
-    if hasattr(error, 'response') and hasattr(error.response, 'status_code'):
-        return error.response.status_code
+    response = getattr(error, 'response', None)
+    value = getattr(response, 'status_code', None)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
     return None
 
 

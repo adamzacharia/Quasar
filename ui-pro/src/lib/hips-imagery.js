@@ -132,6 +132,11 @@ export function normalizeHipsImageMeta(meta) {
         if (warnings.length) out.warnings = warnings;
     }
 
+    // AI-generated images (image models / generate_image) name their model.
+    if (kind === "generated" && typeof meta.model === "string" && meta.model.trim()) {
+        out.model = meta.model.trim().slice(0, 120);
+    }
+
     // Survey footprint overlays (MOC geometry) for the interactive view.
     if (Array.isArray(meta.mocs)) {
         const mocs = [];

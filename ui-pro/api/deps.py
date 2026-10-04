@@ -181,7 +181,8 @@ provider_catalog_service = ProviderCatalogService(provider_key_service, {
     "deepseek": DEEPSEEK_VISIBLE_MODEL_IDS,
     "tacc": TACC_MENU_MODEL_IDS,
     "anthropic": _visible_model_list("QUASAR_ANTHROPIC_MODELS", ANTHROPIC_DEFAULT_MODEL_IDS),
-    "google": _visible_model_list("QUASAR_GOOGLE_MODELS", ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]),
+    # Gemini 2.x answers 404 "no longer available to new users" (live 2026-10-04).
+    "google": _visible_model_list("QUASAR_GOOGLE_MODELS", ["gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite"]),
 })
 
 

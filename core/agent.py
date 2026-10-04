@@ -4232,8 +4232,24 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
                 "models such as gpt-oss-120b — please resend the question (a retry usually "
                 "succeeds), or switch to another model if it persists."
             )
-        status = getattr(error, "status_code", None)
+        from core.retry import _extract_status_code
+
+        status = _extract_status_code(error)
         detail = f" (HTTP {status})" if status else ""
+        lowered = text.lower()
+        # Retired/unavailable models and rejected keys are not transient:
+        # "try again" would just fail the same way.
+        if status == 404 and ("no longer available" in lowered or "not found" in lowered):
+            return (
+                f"The provider reports that this model is not available to your API key{detail}: "
+                "it may have been retired or not enabled for your account. Please pick a different model."
+            )
+        if ("api key not valid" in lowered or "api_key_invalid" in lowered
+                or "invalid api key" in lowered or "incorrect api key" in lowered):
+            return (
+                f"The provider rejected the API key{detail}. Check the key in Settings > Provider Keys, "
+                "or pick a model from another provider."
+            )
         # Name the failure class when it is recognizable — "returned an error"
         # alone gives the user nothing to distinguish a timeout from an outage.
         error_name = type(error).__name__.lower()

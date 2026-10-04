@@ -104,3 +104,48 @@ test("the dropdown does not claim a provider or price for cross-provider duplica
     assert.doesNotMatch(markup, /data-provider-logo=/);
     assert.doesNotMatch(markup, /US hosted|In: \$|Out: \$/);
 });
+
+test("Gemini, Gemma and Nano Banana models render the Gemini mark", () => {
+    for (const model of ["gemini-3.8-flash", "gemma-4-31b-it", "nano-banana-pro-preview"]) {
+        const markup = render({ model });
+        assert.match(markup, /data-provider-logo="google"/);
+        assert.doesNotMatch(markup, /lucide-bot/);
+    }
+    assert.match(render({ model: "custom-id", provider: "google" }), /data-provider-logo="google"/);
+    // A TACC-served Gemma keeps the TACC wordmark.
+    assert.match(render({ model: "gemma-4-31B-it" }), /data-provider-logo="tacc"/);
+});
+
+test("image-generation models get an Image tag in the dropdown; chat models do not", () => {
+    dropdownCatalog = [{ provider: "google", status: "connected", models: [
+        { provider: "google", id: "gemini-3.1-flash-image", displayName: "Nano Banana 2", source: "live",
+          capabilities: { imageGeneration: true } },
+        { provider: "google", id: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash", source: "live", capabilities: {} },
+    ] }];
+    // The list only renders while open: a copy whose first useState(false) (the
+    // `open` flag) starts true renders the rows statically.
+    let forceOpen = true;
+    const ReactOpen = { ...React, useState: init => {
+        if (forceOpen && init === false) { forceOpen = false; return React.useState(true); }
+        return React.useState(init);
+    } };
+    const { ModelDropdown: OpenDropdown } = loadTs("../src/components/ModelDropdown.tsx", {
+        "react/jsx-runtime": jsxRuntime, react: ReactOpen, "lucide-react": lucide, "./ModelIcon": { ModelIcon },
+        "../lib/models": models, "../lib/model-catalog": catalogLogic,
+        "../lib/useAvailableModels": { useAvailableModels: () => ({ providers: dropdownCatalog }) },
+    });
+    const markup = renderToStaticMarkup(React.createElement(OpenDropdown, { selectedModel: "gemini-3.8-flash", onSelect() {} }));
+    assert.match(markup, /Nano Banana 2/);
+    assert.equal((markup.match(/data-model-tag="image"/g) || []).length, 1);
+    assert.match(markup, /data-provider-logo="google"/);
+});
+
+test("isImageGenerationModelId mirrors the backend detector", () => {
+    for (const id of ["gemini-3.1-flash-image", "gemini-3-pro-image-preview", "nano-banana-pro-preview",
+        "gpt-image-2", "chatgpt-image-latest"]) {
+        assert.equal(catalogLogic.isImageGenerationModelId(id), true, id);
+    }
+    for (const id of ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gpt-5.4", "", null]) {
+        assert.equal(catalogLogic.isImageGenerationModelId(id), false, String(id));
+    }
+});

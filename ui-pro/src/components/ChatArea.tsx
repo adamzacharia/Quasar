@@ -15,6 +15,7 @@ import type { PlanReviewData } from "./PlanReviewWidget";
 import type { Message, DataTableResult, Paper, ToolCall, NotebookData, WebImage, WebSearchMode, WebSource } from "../lib/types";
 import { normalizeEvidenceQuality } from "../lib/evidence-quality";
 import { normalizeHipsImageMeta } from "../lib/hips-imagery";
+import { isImageGenerationModelId } from "../lib/model-catalog";
 import { PREFILL_PROMPT_EVENT } from "../lib/prompt-dispatch";
 import { isSafeWebImage, isSafeWebSource } from "../lib/content-safety";
 import {
@@ -1082,6 +1083,7 @@ export function ChatArea() {
                     onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
                     grounded={grounded} onGroundedChange={setGrounded}
                     webSearchMode={webSearchMode} onWebSearchModeChange={setWebSearchMode} hitCount={hitCount}
+                    imageModel={isImageGenerationModelId(selectedModel)}
                 />
               </>
             ) : (
@@ -1097,6 +1099,7 @@ export function ChatArea() {
                             variant="hero" onSend={handleSend} onStop={handleStop} isStreaming={isStreaming} initialValue={inputValue}
                             grounded={grounded} onGroundedChange={setGrounded}
                             webSearchMode={webSearchMode} onWebSearchModeChange={setWebSearchMode} hitCount={hitCount}
+                            imageModel={isImageGenerationModelId(selectedModel)}
                         />
                     )}
                 />

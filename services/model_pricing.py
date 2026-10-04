@@ -113,6 +113,17 @@ MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
         "text-embedding-ada-002": {"input_per_mtok": 0.10, "output_per_mtok": 0.0},
         "text-embedding-3-small": {"input_per_mtok": 0.02, "output_per_mtok": 0.0},
         "text-embedding-3-large": {"input_per_mtok": 0.13, "output_per_mtok": 0.0},
+        # Image generation, verified 2026-10-04 (developers.openai.com/api/docs/
+        # pricing, standard tier). Input = the TEXT input rate (prompts); image
+        # inputs on an edit cost more (gpt-image-1 $10, the others $8/$2.50),
+        # so edits are under-estimated. Output = the image output rate.
+        "gpt-image-1": {"input_per_mtok": 5.00, "output_per_mtok": 40.00},
+        "gpt-image-1-mini": {"input_per_mtok": 2.00, "output_per_mtok": 8.00},
+        "gpt-image-1.5": {"input_per_mtok": 5.00, "output_per_mtok": 32.00},
+        "gpt-image-2": {"input_per_mtok": 5.00, "output_per_mtok": 30.00},
+        "gpt-image-2.5-flare": {"input_per_mtok": 5.00, "output_per_mtok": 30.00},
+        "gpt-image-2.5-sunburst": {"input_per_mtok": 5.00, "output_per_mtok": 30.00},
+        "chatgpt-image-latest": {"input_per_mtok": 5.00, "output_per_mtok": 32.00},
     },
     "deepseek": {
         "deepseek-chat": {"input_per_mtok": 0.27, "output_per_mtok": 1.10},
@@ -138,6 +149,17 @@ MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
         "gemini-2.5-pro": {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
         "gemini-2.5-flash": {"input_per_mtok": 0.30, "output_per_mtok": 2.50},
         "gemini-2.0-flash": {"input_per_mtok": 0.10, "output_per_mtok": 0.40},
+        # Image models ("Nano Banana"), verified 2026-10-04 (same page, updated
+        # 2026-10-01). Output = the IMAGE output rate; the few text/thinking
+        # output tokens bill at the lower text rate, so this over-estimates
+        # slightly. 2.5 Flash Image is listed as $0.039 per image = $30/1M.
+        "gemini-3-pro-image": {"input_per_mtok": 2.00, "output_per_mtok": 120.00},
+        "gemini-3-pro-image-preview": {"input_per_mtok": 2.00, "output_per_mtok": 120.00},
+        "nano-banana-pro-preview": {"input_per_mtok": 2.00, "output_per_mtok": 120.00},
+        "gemini-3.1-flash-image": {"input_per_mtok": 0.50, "output_per_mtok": 60.00},
+        "gemini-3.1-flash-image-preview": {"input_per_mtok": 0.50, "output_per_mtok": 60.00},
+        "gemini-3.1-flash-lite-image": {"input_per_mtok": 0.25, "output_per_mtok": 30.00},
+        "gemini-2.5-flash-image": {"input_per_mtok": 0.30, "output_per_mtok": 30.00},
     },
 }
 

@@ -1110,6 +1110,10 @@ def _declare_defaults() -> None:
     declare_deadline_only(["web_map_site", "web_crawl_site", "web_research"], TAVILY_HOSTS,
                           reason="Tavily SDK call defaults (150 s / None) are not configurable per call; clamped by hook")
     declare(["navigate_to_url"], _fixed("Playwright goto", 20.0))
+    # ── AI image generation (services/image_generation.py) ───────────
+    # One provider request; its SDK timeout is bounded_timeout(120 s), so a
+    # late result cannot outlive the guard and bill an abandoned card.
+    declare(["generate_image"], lambda: {"image provider request": _env_f("QUASAR_IMAGE_TIMEOUT_SECONDS", 120.0)})
     declare(["read_page", "click_element"], _fixed("Playwright action", 5.0))
     # ── literature ────────────────────────────────────────────────────
     declare_loop(["search_papers"], _merge(_ads_llm, _ads, _openalex), ADS_HOSTS + OPENALEX_HOSTS,

@@ -2045,9 +2045,9 @@ def _stream_response_api_impl(
             # Personal tools for this request only (search_my_documents),
             # bound to the authenticated user by the SSE layer. Offered only on
             # providers whose history Quasar can expire (chat shim: TACC,
-            # DeepSeek; Anthropic): OpenAI-native chains keep tool outputs
+            # DeepSeek, Gemini; Anthropic): OpenAI-native chains keep tool outputs
             # server-side via previous_response_id, so excerpts would persist.
-            _pt_provider_ok = detect_provider(selected_model) in ("tacc", "deepseek", "anthropic")
+            _pt_provider_ok = detect_provider(selected_model) in ("tacc", "deepseek", "anthropic", "google")
             if (_personal.get("tools") and not _pt_provider_ok):
                 print(f"[PERSONAL_DOCS] tool not offered on provider {detect_provider(selected_model)!r} "
                       "(history cannot be expired there)")
@@ -2125,10 +2125,10 @@ def _stream_response_api_impl(
         # authenticated user. It travels as a tool EXCHANGE after the user turn
         # (assistant tool_call + tool output), never as user-role text, so the
         # excerpt keeps the lower-trust tool role and the chat shim can expire
-        # it next turn. Only the chat-completions shims (TACC, DeepSeek) build
+        # it next turn. Only the chat-history shims (TACC, DeepSeek, Gemini) build
         # that exchange; other providers get the tool + hint instead.
         _prefetch = [] if _bench_ts.active() else list(_personal.get("prefetch") or [])
-        if _prefetch and detect_provider(selected_model) not in ("tacc", "deepseek"):
+        if _prefetch and detect_provider(selected_model) not in ("tacc", "deepseek", "google"):
             _prefetch = []
 
         def _round0_input(text):
@@ -2149,7 +2149,7 @@ def _stream_response_api_impl(
                 except Exception as _seed_err:
                     print(f"[HISTORY] rebuild failed (non-fatal): {_seed_err}")
                     seed = []
-            if seed and detect_provider(selected_model) not in ("tacc", "deepseek"):
+            if seed and detect_provider(selected_model) not in ("tacc", "deepseek", "google"):
                 from core.history_rebuild import as_recap_text
 
                 text = as_recap_text(seed) + text
@@ -2741,7 +2741,7 @@ def _stream_response_api_impl(
         if (
             _oneshot_intent and _oneshot_intent.get("dispatch") and not attachments
             and os.getenv("QUASAR_ONESHOT_DISPATCH", "1").strip().lower() not in ("0", "false", "no", "off")
-            and detect_provider(selected_model) in ("tacc", "deepseek", "openai")
+            and detect_provider(selected_model) in ("tacc", "deepseek", "openai", "google")
             and not _bench_ts.active()
         ):
             _dtool = _oneshot_intent.get("tool")

@@ -23,6 +23,8 @@ export interface ModelCapabilities {
     vision?: boolean;
     tools?: boolean;
     reasoning?: boolean;
+    /** Image-generation model: a turn returns pictures, not a research answer. */
+    imageGeneration?: boolean;
 }
 
 export interface ModelInfo {
@@ -115,6 +117,7 @@ export declare function scoreModel(
 export declare function priceLine(model: ModelInfo | null | undefined): string | null;
 export declare function contextChip(model: ModelInfo | null | undefined): string | null;
 export declare function modelLabel(model: ModelInfo | null | undefined): string;
+export declare function isImageGenerationModelId(id: string | null | undefined): boolean;
 export declare function isSelectable(catalog: ProviderCatalog | null | undefined): boolean;
 export declare function buildGroups(
     query: string,

@@ -120,3 +120,9 @@ test("blink meta warnings survive the normalizer to the card (A3 CX-18/CX-32)", 
     const none = normalizeHipsImageMeta({ kind: "blink", frames: [{ url: "/p.png" }], warnings: ["", null, {}, 42, true] });
     assert.equal(none.warnings, undefined);
 });
+
+test("generated image meta keeps its model and nothing sky-specific", () => {
+    const meta = normalizeHipsImageMeta({ kind: "generated", model: "gpt-image-2", ra: "x" });
+    assert.deepEqual(meta, { kind: "generated", model: "gpt-image-2" });
+    assert.equal(normalizeHipsImageMeta({ kind: "hips", model: "gpt-image-2" }).model, undefined);
+});
