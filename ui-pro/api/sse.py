@@ -44,7 +44,7 @@ from services.image_generation import (
 )
 from services.model_pricing import TurnCostAccumulator, estimate_cost
 from services.feedback_snapshot_service import FeedbackToolTrace
-from core.llm_client import google_platform_uses_vertex, platform_included_providers
+from core.llm_client import attachment_kind, google_key_routes_to_vertex, platform_included_providers
 
 from api import deps
 from api.deps import (
@@ -745,12 +745,20 @@ async def _stream_chat_response(
             logger.warning(f"[CHAT] Failed to persist user message: {e}")
         conv_id = _conv_holder["id"]
 
-    # Platform Gemini on Vertex can't read AI Studio file URIs; its documents
-    # travel as extracted text (routers/chat.py), so there are no refs to reuse.
-    vertex_platform_google = (provider == "google" and not selected_provider_api_key
-                              and google_platform_uses_vertex())
+    # Gemini on Vertex can't read AI Studio file URIs; its documents travel as
+    # extracted text (routers/chat.py), so there are no refs to reuse. The
+    # upload route read the user's keys earlier, so a key added or removed in
+    # between can still hand us AI Studio refs: drop those (guard CX-03).
+    vertex_google = provider == "google" and google_key_routes_to_vertex(selected_provider_api_key)
+    if vertex_google and attachment_context:
+        attachments = attachment_context.get("attachments") or []
+        kept = [a for a in attachments if attachment_kind(a) != "gemini_file"]
+        if len(kept) != len(attachments):
+            attachment_context = {**attachment_context, "attachments": kept, "messages": [
+                *(attachment_context.get("messages") or []),
+                "Your Google key changed while uploading; attach the document again."]}
     if (attachment_context is None and provider in {"openai", "anthropic", "google"}
-            and not vertex_platform_google):
+            and not vertex_google):
         attachment_context = provider_file_service.get_active_files(
             provider=provider,
             conversation_id=request.conversation_id,

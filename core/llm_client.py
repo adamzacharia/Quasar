@@ -299,23 +299,38 @@ PROVIDER_KEY_ENV_VARS: Dict[str, tuple] = {
 }
 
 # Providers every signed-in user can call on the platform key (under the
-# platform quota). Anthropic and Google are BYOK-only unless opted in below.
+# platform quota). Anthropic is BYOK-only; Google joins via platform_gemini_enabled.
 PLATFORM_INCLUDED_PROVIDERS = frozenset({"openai", "deepseek", "tacc", "local"})
 
 
 def google_platform_uses_vertex() -> bool:
     """Platform (non-BYOK) Gemini calls go to Vertex AI when VERTEX_API_KEY is
     set: Google Cloud credits pay for Vertex but not for the AI Studio
-    GEMINI_API_KEY. BYOK Google keys always stay on AI Studio."""
+    GEMINI_API_KEY."""
     return bool((os.getenv("VERTEX_API_KEY", "") or "").strip())
 
 
+def google_key_routes_to_vertex(byok_key: Optional[str] = None) -> bool:
+    """Whether a Google call made with `byok_key` (None = the platform key)
+    goes to Vertex AI. A user's own key goes wherever its type belongs."""
+    if byok_key:
+        from services.provider_models import google_key_is_vertex
+
+        return google_key_is_vertex(byok_key)
+    return google_platform_uses_vertex()
+
+
 def platform_gemini_enabled() -> bool:
-    """QUASAR_PLATFORM_GEMINI=1 lets users without their own Google key use
-    Gemini on the platform key. Off by default (Gemini stays BYOK-only), and
-    it needs a platform Google key to mean anything."""
-    flag = os.getenv("QUASAR_PLATFORM_GEMINI", "").strip().lower() in {"1", "true", "yes", "on"}
-    return flag and any((os.getenv(name, "") or "").strip() for name in PROVIDER_KEY_ENV_VARS["google"])
+    """Whether users without their own Google key may use Gemini on the
+    platform key (under the platform quota). On whenever VERTEX_API_KEY is set,
+    since Google Cloud credits pay for it; QUASAR_PLATFORM_GEMINI=0 turns it
+    off, and =1 also opens the AI Studio GEMINI_API_KEY to everyone."""
+    flag = os.getenv("QUASAR_PLATFORM_GEMINI", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    if google_platform_uses_vertex():
+        return True
+    return flag in {"1", "true", "yes", "on"} and bool((os.getenv("GEMINI_API_KEY", "") or "").strip())
 
 
 def platform_included_providers() -> frozenset:
@@ -1682,6 +1697,12 @@ class ResponsesShim:
             chunk_usage = self._google_usage(chunk)
             if chunk_usage is not None:
                 usage_obj = chunk_usage
+                # Usage so far rides on a progress event (consumers ignore its
+                # type): _wrap_usage_stream settles the last usage it saw, so a
+                # stream that dies or is closed before response.completed is
+                # still counted against the user's Gemini quota (guard CX-02).
+                yield StreamEvent(type="response.in_progress",
+                                  response=LLMResponse(id=resp_id, usage=usage_obj))
             for candidate in (getattr(chunk, "candidates", None) or [])[:1]:
                 reason = self._google_finish_reason(candidate)
                 if reason:
@@ -3337,11 +3358,14 @@ class LLMClient:
             from google import genai as ggenai
         except ImportError:
             raise ImportError("Install 'google-genai' package: pip install google-genai")
-        # vertexai=False is explicit on the AI Studio clients: the SDK would
-        # otherwise follow GOOGLE_GENAI_USE_VERTEXAI and send a BYOK key to Vertex.
+        # vertexai is always explicit: the SDK would otherwise follow
+        # GOOGLE_GENAI_USE_VERTEXAI and could send an AI Studio key to Vertex.
         context_key = self._resolve_context_api_key("google")
         if context_key:
-            return ggenai.Client(api_key=context_key, vertexai=False)
+            # A user's own key: Vertex (Agent Platform) keys go to Vertex, AI
+            # Studio keys to AI Studio.
+            return ggenai.Client(api_key=context_key.strip(),
+                                 vertexai=google_key_routes_to_vertex(context_key))
         if self._google_client is None:
             if google_platform_uses_vertex():
                 self._google_client = ggenai.Client(

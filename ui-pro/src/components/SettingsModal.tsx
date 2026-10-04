@@ -53,6 +53,8 @@ interface QuotaBucket {
     limit_tokens?: number | null;
     unlimited: boolean;
     exhausted: boolean;
+    /** Rolling window the platform cap covers (7, or 30 for Gemini). */
+    window_days?: number;
 }
 
 interface DailyBucket {
@@ -640,13 +642,14 @@ const PROVIDER_OPTIONS = [
     { id: "deepseek", label: "DeepSeek", quotaLabel: "500K/week included tokens" },
     { id: "openai", label: "OpenAI", quotaLabel: "100K/week included tokens" },
     { id: "anthropic", label: "Anthropic", quotaLabel: "BYOK only" },
-    { id: "google", label: "Google Gemini", quotaLabel: "BYOK only" },
+    { id: "google", label: "Google Gemini", quotaLabel: "1M/month included tokens" },
 ];
 
 const PLATFORM_PROVIDER_LABELS: Record<string, string> = {
     deepseek: "DeepSeek",
     openai: "OpenAI",
     tacc: "TACC Tejas",
+    google: "Gemini",
 };
 
 function ProviderKeysPanel() {
@@ -897,13 +900,14 @@ function ProviderKeysPanel() {
             )}
 
             <div className="grid grid-cols-2 gap-3">
-                {["deepseek", "openai", "tacc"].map(provider => {
+                {["deepseek", "openai", "tacc", "google"].filter(p => p !== "google" || quota?.platform?.google).map(provider => {
                     const bucket = quota?.platform?.[provider];
                     const pct = bucket?.limit_tokens ? Math.min(100, Math.round((bucket.used_tokens / bucket.limit_tokens) * 100)) : 0;
+                    const windowLabel = (bucket?.window_days ?? 7) >= 28 ? "monthly" : "weekly";
                     return (
                         <div key={provider} className="glass-control rounded-xl px-4 py-3">
                             <div className="flex items-center justify-between text-xs mb-2">
-                                <span className="font-semibold text-slate-300">{PLATFORM_PROVIDER_LABELS[provider] || provider} weekly quota</span>
+                                <span className="font-semibold text-slate-300">{PLATFORM_PROVIDER_LABELS[provider] || provider} {windowLabel} quota</span>
                                 <span className={bucket?.exhausted ? "text-red-300" : "text-slate-400"}>
                                     {bucket?.unlimited ? "Unlimited" : `${formatTokens(bucket?.used_tokens)} / ${formatTokens(bucket?.limit_tokens)}`}
                                 </span>
@@ -936,7 +940,8 @@ function ProviderKeysPanel() {
                                         )}
                                     </div>
                                     <p className="text-xs text-slate-500 mt-1">
-                                        {meta ? `Key ending ${meta.key_last4} - ${meta.status}${meta.last_tested_at ? ` - tested ${formatDate(meta.last_tested_at)}` : ""}` : providerInfo.quotaLabel}
+                                        {meta ? `Key ending ${meta.key_last4} - ${meta.status}${meta.last_tested_at ? ` - tested ${formatDate(meta.last_tested_at)}` : ""}`
+                                            : providerInfo.id === "google" && !quota?.platform?.google ? "BYOK only" : providerInfo.quotaLabel}
                                     </p>
                                     {meta && (
                                         <div className="text-xs text-slate-400 mt-1 flex items-center gap-1.5">
@@ -970,7 +975,8 @@ function ProviderKeysPanel() {
                                     type="password"
                                     value={apiKeys[providerInfo.id] || ""}
                                     onChange={e => setApiKeys(prev => ({ ...prev, [providerInfo.id]: e.target.value }))}
-                                    placeholder={meta ? "Rotate key" : "Paste API key"}
+                                    placeholder={meta ? "Rotate key" : providerInfo.id === "google"
+                                        ? "Paste a Vertex AI or AI Studio key" : "Paste API key"}
                                     className="bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 outline-none focus:border-primary"
                                 />
                                 <input

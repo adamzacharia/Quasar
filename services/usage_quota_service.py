@@ -23,8 +23,8 @@ PLATFORM_TOKEN_LIMITS = {
     "deepseek": 500_000,
     "openai": 100_000,
     "tacc": 1_000_000,
-    # Only reachable with QUASAR_PLATFORM_GEMINI=1; spends Google Cloud credits.
-    "google": 300_000,
+    # Per 30-day window (PLATFORM_PROVIDER_WINDOW_DAYS); spends Google Cloud credits.
+    "google": 1_000_000,
 }
 
 
@@ -61,6 +61,26 @@ def platform_token_limit(provider: str) -> Optional[int]:
 
 
 PLATFORM_QUOTA_WINDOW_DAYS = 7
+# Providers whose platform allowance runs over a different rolling window.
+# Gemini is paid from Google Cloud credits and budgeted per month.
+PLATFORM_PROVIDER_WINDOW_DAYS: Dict[str, int] = {"google": 30}
+
+
+def platform_window_days(provider: str) -> int:
+    """Length in days of the rolling window a provider's platform cap covers."""
+    return PLATFORM_PROVIDER_WINDOW_DAYS.get(provider, PLATFORM_QUOTA_WINDOW_DAYS)
+
+
+def configured_gemini_unlimited_emails() -> set:
+    """Accounts with no cap on platform Gemini (env only, comma-separated):
+    QUASAR_GEMINI_UNLIMITED_EMAILS. Their own BYOK key still bills first."""
+    return {email.strip().lower()
+            for email in os.getenv("QUASAR_GEMINI_UNLIMITED_EMAILS", "").split(",") if email.strip()}
+
+
+def provider_quota_exempt(provider: str, email: str) -> bool:
+    """True when `email` has no platform cap for this one provider."""
+    return provider == "google" and bool(email) and email.strip().lower() in configured_gemini_unlimited_emails()
 
 # Optional per-provider daily caps, mirroring PLATFORM_TOKEN_LIMITS' shape.
 # Intentionally EMPTY: the daily cap ships disabled and is opt-in via
@@ -255,6 +275,11 @@ class UsageQuotaService:
         return datetime.now(timezone.utc) - timedelta(days=PLATFORM_QUOTA_WINDOW_DAYS)
 
     @staticmethod
+    def platform_window_start(provider: str) -> datetime:
+        """Start of `provider`'s rolling platform window (7 days, Gemini 30)."""
+        return datetime.now(timezone.utc) - timedelta(days=platform_window_days(provider))
+
+    @staticmethod
     def daily_window_start() -> datetime:
         """Start of the rolling daily window (matches the weekly window's
         rolling semantics — not a calendar day, so there is no midnight reset
@@ -352,7 +377,7 @@ class UsageQuotaService:
             caps.append((provider, self.daily_window_start(), provider_daily))
         weekly = platform_token_limit(provider)
         if weekly is not None:
-            caps.append((provider, self.weekly_window_start(), weekly))
+            caps.append((provider, self.platform_window_start(provider), weekly))
         return caps
 
     def _try_reserve(
@@ -537,18 +562,19 @@ class UsageQuotaService:
             user_id,
             provider,
             "platform",
-            since=self.weekly_window_start(),
+            since=self.platform_window_start(provider),
         )
         if used >= limit:
-            # The window is ROLLING (weekly_window_start = now − 7 days):
-            # there is no reset instant, headroom trickles back as old usage
-            # ages out — the message must not promise a "reset" (robert-eval
-            # A1: the old wording sent the evaluator waiting for one).
+            # The window is ROLLING (now − 7 days, 30 for Gemini): there is
+            # no reset instant, headroom trickles back as old usage ages out —
+            # the message must not promise a "reset" (robert-eval A1: the old
+            # wording sent the evaluator waiting for one).
+            days = platform_window_days(provider)
             raise QuotaExceededError(
                 "You have exhausted your included Quasar token allowance. "
                 f"Your {_provider_label(provider)} platform-key allowance is "
-                f"{limit:,} tokens per ROLLING 7-day window. Headroom returns "
-                "gradually as your usage from the past 7 days ages out of the "
+                f"{limit:,} tokens per ROLLING {days}-day window. Headroom returns "
+                f"gradually as your usage from the past {days} days ages out of the "
                 "window — there is no fixed reset time. You can also add your "
                 "own API key in Settings to continue immediately."
             )
@@ -577,6 +603,9 @@ class UsageQuotaService:
         key_source = self.normalize_key_source(key_source)
 
         if is_quota_exempt_email(user_email):
+            return None
+
+        if key_source == "platform" and provider_quota_exempt(provider, user_email):
             return None
 
         if key_source == "platform":
@@ -835,16 +864,23 @@ class UsageQuotaService:
         byok: Dict[str, Dict] = {}
         quota_exempt = is_quota_exempt_email(user_email)
         admin = is_admin_email(user_email)
-        window_start = self.weekly_window_start()
+        from core.llm_client import platform_included_providers
+
+        included = platform_included_providers()
+        window_start = self.weekly_window_start()  # the cost block's "week"
         for provider in providers:
+            exempt = quota_exempt or provider_quota_exempt(provider, user_email)
             platform_limit = platform_token_limit(provider)
-            platform_used = self.get_used_tokens(user_id, provider, "platform", since=window_start)
-            platform[provider] = {
-                "used_tokens": platform_used,
-                "limit_tokens": None if quota_exempt else platform_limit,
-                "unlimited": quota_exempt or platform_limit is None,
-                "exhausted": False if quota_exempt or platform_limit is None else platform_used >= platform_limit,
-            }
+            if provider != "google" or provider in included:  # no Gemini row while platform Gemini is off
+                platform_used = self.get_used_tokens(
+                    user_id, provider, "platform", since=self.platform_window_start(provider))
+                platform[provider] = {
+                    "used_tokens": platform_used,
+                    "limit_tokens": None if exempt else platform_limit,
+                    "unlimited": exempt or platform_limit is None,
+                    "exhausted": False if exempt or platform_limit is None else platform_used >= platform_limit,
+                    "window_days": platform_window_days(provider),
+                }
             byok_limit = byok_limits.get(provider)
             byok_used = self.get_used_tokens(user_id, provider, "byok")
             byok[provider] = {

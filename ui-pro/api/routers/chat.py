@@ -6,7 +6,7 @@ from typing import List as PyList, Optional
 from fastapi import APIRouter, File, Form, Header, UploadFile
 from starlette.requests import Request
 
-from core.llm_client import google_platform_uses_vertex, platform_included_providers
+from core.llm_client import google_key_routes_to_vertex, platform_included_providers
 from services.auth_cookie import read_auth_cookie
 from api.deps import (
     ProviderFileError,
@@ -161,10 +161,10 @@ async def chat_with_files(
         mixed_document_previews.append(_extract_document_preview_text(filename, content_type, raw))
 
     attachment_context = None
-    # Gemini's Files API is AI Studio only, so platform Gemini on Vertex gets
-    # extracted text like DeepSeek does (BYOK Google keys keep native upload).
+    # Gemini's Files API is AI Studio only, so Gemini on Vertex (the platform
+    # key or a user's Vertex key) gets extracted text like DeepSeek does.
     native_upload = provider in {"openai", "anthropic", "google"} and not (
-        provider == "google" and not selected_provider_api_key and google_platform_uses_vertex())
+        provider == "google" and google_key_routes_to_vertex(selected_provider_api_key))
     if document_uploads:
         if native_upload:
             try:

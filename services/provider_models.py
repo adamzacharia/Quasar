@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -323,9 +324,49 @@ class AnthropicAdapter(_Adapter):
     url = "https://api.anthropic.com/v1/models"
 
 
+def google_key_is_vertex(api_key: str) -> bool:
+    """Vertex AI (Agent Platform) API keys, which are bound to a service
+    account, start with "AQ."; AI Studio keys start with "AIza"."""
+    return (api_key or "").strip().startswith("AQ.")
+
+
+# Offered for a Vertex key, which cannot list models (Vertex answers 401 "API
+# keys are not supported by this API" to models.list, live 2026-10-05).
+VERTEX_GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite")
+VERTEX_COUNT_TOKENS_URL = ("https://aiplatform.googleapis.com/v1/publishers/google/models/"
+                           "{model}:countTokens")
+
+
 class GoogleAdapter(_Adapter):
     provider: KeyProvider = "google"
     url = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def list_models(self, api_key: str) -> list[ModelInfo]:
+        if not google_key_is_vertex(api_key):
+            return super().list_models(api_key)
+        return self._vertex_models(api_key.strip())
+
+    def _vertex_models(self, api_key: str) -> list[ModelInfo]:
+        """Validate a Vertex key with a free countTokens call, then offer the
+        curated Gemini models (QUASAR_GOOGLE_MODELS overrides them)."""
+        configured = [m.strip() for m in os.getenv("QUASAR_GOOGLE_MODELS", "").split(",") if m.strip()]
+        models = configured or list(VERTEX_GEMINI_MODELS)
+        try:
+            with httpx.Client(timeout=10, follow_redirects=False, transport=self.transport) as client:
+                response = client.post(VERTEX_COUNT_TOKENS_URL.format(model=models[0]),
+                                       headers={"x-goog-api-key": api_key},
+                                       json={"contents": [{"role": "user", "parts": [{"text": "ping"}]}]})
+        except httpx.HTTPError as exc:
+            logger.warning("Model discovery failed: provider=google-vertex error_type=%s", type(exc).__name__)
+            raise CatalogError("Provider model service unavailable. Please try again.") from None
+        if response.status_code in (400, 401, 403):
+            # Never echo the body: it can quote the request.
+            logger.warning("Model discovery failed: provider=google-vertex status=%s", response.status_code)
+            raise CatalogError("Invalid Vertex AI API key, or the key cannot call Gemini on Vertex AI.", True)
+        if response.status_code >= 300:
+            raise CatalogError("Provider model service unavailable. Please try again.")
+        return sort_models([with_capability_flags(price_model(ModelInfo(
+            provider="google", id=model, displayName=model))) for model in models])
 
 
 ADAPTERS: dict[str, ProviderAdapter] = {
