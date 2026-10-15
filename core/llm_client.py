@@ -31,12 +31,15 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
+import itertools
 import json
 import os
 import re
 import time
 import uuid
 import logging
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -48,6 +51,12 @@ from core.langfuse_integration import get_langfuse, _safe_serialize
 from services.secret_redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
+
+# Emulates tool_choice="required" for providers or calls that only get "auto".
+REQUIRED_TOOL_NUDGE = (
+    "Tool use is REQUIRED for this turn: call the most appropriate tool "
+    "now instead of answering in plain text."
+)
 
 # ── Thread-local Langfuse trace context ──────────────────────────────────
 # The Conductor sets this before executing DAG nodes so that LLM calls
@@ -414,6 +423,10 @@ class LLMUsage:
     # DeepSeek cache-aware breakdown (None = not applicable / unknown)
     cache_hit_tokens: Optional[int] = None
     cache_miss_tokens: Optional[int] = None
+    # Anthropic cache writes (cache_creation_input_tokens, billed at 1.25x).
+    # Informational only: already included in input_tokens, which quota and
+    # cost read. None = the provider does not report writes.
+    cache_write_tokens: Optional[int] = None
 
 
 @dataclass
@@ -521,6 +534,32 @@ def _build_langfuse_usage(result: Any, provider: str) -> Optional[Dict[str, Any]
     return None
 
 
+# Private key the runner sets on the last tool of the fixed CORE block
+# (core/tool_packs.py). Anthropic renders tools before the system prompt, so
+# a prompt-cache breakpoint there lets the core tools hit the cache across
+# questions whose tool packs differ. create() strips it from every request.
+CACHE_BREAKPOINT_KEY = "_quasar_cache_breakpoint"
+
+
+def _pop_tool_cache_breakpoint(kwargs: dict) -> Optional[str]:
+    """Name of the first tool marked with CACHE_BREAKPOINT_KEY, removing the
+    marker from kwargs["tools"] (copied, never mutated). Unmarked tool lists
+    are left as they are, the same list object."""
+    tools = kwargs.get("tools")
+    if not isinstance(tools, list) or not any(isinstance(t, dict) and CACHE_BREAKPOINT_KEY in t for t in tools):
+        return None
+    name = None
+    clean = []
+    for t in tools:
+        if isinstance(t, dict) and CACHE_BREAKPOINT_KEY in t:
+            if name is None and t.get(CACHE_BREAKPOINT_KEY):
+                name = t.get("name") or None
+            t = {k: v for k, v in t.items() if k != CACHE_BREAKPOINT_KEY}
+        clean.append(t)
+    kwargs["tools"] = clean
+    return name
+
+
 # ---------------------------------------------------------------------------
 # Responses Shim — makes `client.responses.create(...)` work
 # ---------------------------------------------------------------------------
@@ -536,6 +575,13 @@ class ResponsesShim:
         self._history_cache = {}  # response_id -> list of chat messages
         self._resp_history_tokens = {}  # response_id -> history tokens a chained call carries (estimate)
         self._history_lock = _threading.Lock()
+        # OpenAI cache layout (_openai_cache_layout): response_id -> what that
+        # server-side chain already holds (added tool names, system tail).
+        self._openai_chain_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Anthropic deferred layout: response_id -> that conversation's own
+        # definitions of the tools its tool_addition blocks reference, so a
+        # later request in the SAME conversation can declare them.
+        self._anthropic_chain_tools: "OrderedDict[str, Dict[str, Dict[str, Any]]]" = OrderedDict()
         # Call ids of personal-document tool calls (services/personal_docs.py).
         # Their outputs are untrusted user-file excerpts: expired from cached
         # history on the next user turn and never promoted into user-role text
@@ -579,8 +625,10 @@ class ResponsesShim:
         with self._history_lock:
             if response_id:
                 self._history_cache.pop(response_id, None)
+                self._anthropic_chain_tools.pop(response_id, None)
             else:
                 self._history_cache.clear()
+                self._anthropic_chain_tools.clear()
 
     def _release_quota(self, reservation_id: Optional[str]) -> None:
         """Hand a reservation back unused. Idempotent and never raises."""
@@ -799,6 +847,14 @@ class ResponsesShim:
 
         t0 = _time.perf_counter()
 
+        # Runner-only marker on the last core tool: stripped here, before the
+        # token estimate and any provider branch, so only the Anthropic and
+        # OpenAI cache layouts ever see it.
+        cache_breakpoint_tool = _pop_tool_cache_breakpoint(kwargs)
+        # Runner-only hint: instructions[:n] is the static system prompt, the
+        # rest a per-turn tail (RAG scaffold, user memory suffix). Never sent.
+        instructions_static_len = kwargs.pop("_instructions_static_len", None)
+
         # Per-call input breakdown (core/call_tokens.py). Runner-only hint,
         # never forwarded to a provider SDK.
         call_meta = kwargs.pop("_call_meta", None) or {}
@@ -855,14 +911,20 @@ class ResponsesShim:
                 # (across chats and users) to the same cache. A per-chat key
                 # spread chats over machines (first calls showed cached=0).
                 # QUASAR_OPENAI_PROMPT_CACHE_KEY=0 disables.
+                _own_key = False
                 if "prompt_cache_key" not in kwargs and os.getenv(
                         "QUASAR_OPENAI_PROMPT_CACHE_KEY", "1").strip().lower() not in ("0", "false", "no", "off"):
-                    import hashlib as _hashlib
-
                     _sig = "|".join([str(model)] + [str(t.get("name", t.get("type", ""))) for t in (kwargs.get("tools") or [])
                                                     if isinstance(t, dict)])
-                    kwargs["prompt_cache_key"] = "quasar-" + _hashlib.sha256(_sig.encode("utf-8")).hexdigest()[:24]
-                result = self._call_openai(kwargs, attachments=attachments)
+                    kwargs["prompt_cache_key"] = "quasar-" + hashlib.sha256(_sig.encode("utf-8")).hexdigest()[:24]
+                    _own_key = True
+                if cache_breakpoint_tool:  # unmarked callers keep the exact old call
+                    result = self._call_openai(kwargs, attachments=attachments,
+                                               cache_layout={"core_tool": cache_breakpoint_tool,
+                                                             "static_len": instructions_static_len,
+                                                             "own_cache_key": _own_key})
+                else:
+                    result = self._call_openai(kwargs, attachments=attachments)
             elif provider == "tacc":
                 if gpt_oss_reasoning:
                     kwargs["_gpt_oss_reasoning"] = gpt_oss_reasoning
@@ -879,9 +941,13 @@ class ResponsesShim:
                     result = self._call_deepseek(kwargs, attachments=attachments)
             elif provider == "anthropic":
                 if stream:
-                    result = self._stream_anthropic(kwargs, attachments=attachments)
+                    result = self._stream_anthropic(kwargs, attachments=attachments,
+                                                    cache_breakpoint_tool=cache_breakpoint_tool,
+                                                    instructions_static_len=instructions_static_len)
                 else:
-                    result = self._call_anthropic(kwargs, attachments=attachments)
+                    result = self._call_anthropic(kwargs, attachments=attachments,
+                                                  cache_breakpoint_tool=cache_breakpoint_tool,
+                                                  instructions_static_len=instructions_static_len)
             elif provider == "google":
                 if stream:
                     result = self._stream_google(kwargs, attachments=attachments)
@@ -1047,14 +1113,29 @@ class ResponsesShim:
                 kwargs["reasoning"] = reasoning
         return kwargs
 
-    @with_retry(max_retries=3, backoff_base=1.0)
-    def _call_openai(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None) -> Any:
-        """Direct passthrough to OpenAI Responses API."""
-        client = self._llm._get_openai_client()
+    def _call_openai(self, kwargs: dict, attachments: Optional[List[Dict[str, Any]]] = None,
+                     cache_layout: Optional[Dict[str, Any]] = None) -> Any:
+        """Direct passthrough to OpenAI Responses API. The request (incl. the
+        cache layout, which reads mutable chain state) is built ONCE, so every
+        retry in _openai_send resends exactly the same payload."""
         kwargs = self._strip_unsupported_params(kwargs)
         if attachments:
             kwargs = dict(kwargs)
             kwargs["input"] = self._build_openai_input(kwargs.get("input", ""), attachments)
+        chain_state = None
+        if cache_layout:
+            kwargs, chain_state = self._openai_cache_layout(kwargs, cache_layout)
+        result = self._openai_send(kwargs)
+        if chain_state is None:
+            return result
+        if kwargs.get("stream"):
+            return self._openai_record_chain_stream(result, chain_state)
+        self._openai_remember_chain(getattr(result, "id", None), chain_state)
+        return result
+
+    @with_retry(max_retries=3, backoff_base=1.0)
+    def _openai_send(self, kwargs: dict) -> Any:
+        client = self._llm._get_openai_client()
         try:
             return client.responses.create(**kwargs)
         except Exception as exc:
@@ -1064,6 +1145,139 @@ class ResponsesShim:
                 print(f"[PROVIDER] openai rejected prompt_cache_key ({str(exc)[:120]}); retrying without it")
                 return client.responses.create(**{k: v for k, v in kwargs.items() if k != "prompt_cache_key"})
             raise
+
+    # ── OpenAI prompt-cache layout (GPT-5.6+ / GPT-6) ─────────────────────
+    # These models cache only at breakpoints: the end of the newest message,
+    # plus explicit `prompt_cache_breakpoint`s, which top-level `instructions`
+    # cannot carry. Quasar's per-question tool packs also change `tools`,
+    # which sits in the cached prefix. So a new question never read the
+    # system prompt or core tools from cache (live probe: 0 cached).
+    # The layout keeps `tools` to the fixed core, sends the static system
+    # prompt as the first developer message with an explicit breakpoint, the
+    # per-turn tail as a second developer message, and the pack as an
+    # `additional_tools` item, which OpenAI places after the cached prefix.
+    # Later calls in the chain add only tools the chain does not hold yet.
+    _OPENAI_LAYOUT_MODEL_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?")
+    _OPENAI_CHAIN_STATE_MAX = 4000
+
+    @classmethod
+    def _openai_layout_supported(cls, model: str) -> bool:
+        if os.getenv("QUASAR_OPENAI_CACHE_LAYOUT", "1").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        m = cls._OPENAI_LAYOUT_MODEL_RE.match(str(model or "").strip().lower())
+        if not m:
+            return False
+        major, minor = int(m.group(1)), int(m.group(2) or 0)
+        return (major, minor) >= (5, 6)
+
+    def _openai_cache_layout(self, kwargs: dict, layout: Dict[str, Any]):
+        """-> (kwargs to send, chain state to remember) or (kwargs, None) when
+        the layout does not apply (old model, flag off, unknown chain, core
+        tool missing); then the request is exactly the old one."""
+        if not self._openai_layout_supported(kwargs.get("model", "")):
+            return kwargs, None
+        tools = kwargs.get("tools")
+        core_tool = layout.get("core_tool")
+        if not isinstance(tools, list) or not core_tool:
+            return kwargs, None
+        idx = next((i for i, t in enumerate(tools)
+                    if isinstance(t, dict) and t.get("type") == "function" and t.get("name") == core_tool), None)
+        if idx is None:
+            return kwargs, None
+        prev = kwargs.get("previous_response_id")
+        with self._history_lock:
+            state = self._openai_chain_state.get(prev) if prev else None
+            if state is not None:
+                self._openai_chain_state.move_to_end(prev)  # LRU: an active chain is never the next eviction
+        if prev and state is None:
+            # A chain this process did not build with the layout (old layout,
+            # or built before a restart): keep sending it the old way.
+            return kwargs, None
+        rest = tools[idx + 1:]
+        pack = [t for t in rest if isinstance(t, dict) and t.get("type") == "function"]
+        others = [t for t in rest if not (isinstance(t, dict) and t.get("type") == "function")]
+        instructions = str(kwargs.get("instructions") or "")
+        static_len = layout.get("static_len")
+        if isinstance(static_len, int) and 0 < static_len <= len(instructions):
+            static, tail = instructions[:static_len], instructions[static_len:]
+        else:
+            static, tail = instructions, ""
+        static_sig = hashlib.sha256(static.encode("utf-8")).hexdigest()[:16]
+
+        def _dev(text: str) -> Dict[str, Any]:
+            return {"role": "developer", "content": [{"type": "input_text", "text": text}]}
+
+        def _tool_sig(t: Dict[str, Any]) -> str:
+            return hashlib.sha256(json.dumps(t, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+        items: List[Dict[str, Any]] = []
+        have: Dict[str, str] = dict(state["tools"]) if state else {}
+        if state is None:  # the first request of a chain
+            if static:
+                items.append({"role": "developer", "content": [
+                    {"type": "input_text", "text": static, "prompt_cache_breakpoint": {"mode": "explicit"}}]})
+            if tail.strip():
+                items.append(_dev(tail))
+        elif static_sig != state["static_sig"]:
+            # Should not happen within a chain; never silently drop it.
+            items.append(_dev("These instructions replace the earlier system instructions in this conversation:"
+                              "\n\n" + static + tail))
+        elif tail != state["tail"]:
+            # `instructions` used to be replaced on every request; in a chain the
+            # earlier turn's tail stays in history, so the new one says it
+            # supersedes it (a dropped preference or RAG note must not linger).
+            items.append(_dev("These turn-specific instructions replace all turn-specific instructions given "
+                              "earlier in this conversation:\n\n" + tail) if tail.strip() else
+                         _dev("The turn-specific instructions given earlier in this conversation no longer apply."))
+        added = [t for t in pack if have.get(t.get("name")) != _tool_sig(t)]
+        changed = [t.get("name") for t in added if t.get("name") in have]
+        if changed:
+            # Same name, new definition (e.g. an MCP server changed a schema):
+            # send it again, after the old one, and say which one counts.
+            items.append(_dev("Updated tool definitions follow; for these tools use only the new definition: "
+                              + ", ".join(changed) + "."))
+        if added:
+            items.append({"type": "additional_tools", "role": "developer", "tools": added})
+        for t in added:
+            have[t.get("name")] = _tool_sig(t)
+        inp = kwargs.get("input")
+        if isinstance(inp, str):
+            inp = [{"role": "user", "content": inp}] if inp else []
+        elif not isinstance(inp, list):
+            inp = [inp] if inp else []
+        out = {k: v for k, v in kwargs.items() if k != "instructions"}
+        out["tools"] = tools[:idx + 1] + others
+        out["input"] = items + list(inp)
+        if layout.get("own_cache_key") and out.get("prompt_cache_key"):
+            # create() generated this key from the whole per-question tool
+            # list; on these models the key partitions cache accounting, so
+            # key on the stable part instead. A caller's own key is kept.
+            sig = "|".join([str(out.get("model"))] + [str(t.get("name", t.get("type", ""))) for t in out["tools"]
+                                                       if isinstance(t, dict)])
+            out["prompt_cache_key"] = "quasar-" + hashlib.sha256(sig.encode("utf-8")).hexdigest()[:24]
+        new_state = {"tools": tuple(have.items()), "tail": tail, "static_sig": static_sig}
+        return out, new_state
+
+    def _openai_remember_chain(self, response_id: Optional[str], state: Dict[str, Any]) -> None:
+        if not response_id:
+            return
+        with self._history_lock:
+            self._openai_chain_state[response_id] = state
+            self._openai_chain_state.move_to_end(response_id)
+            while len(self._openai_chain_state) > self._OPENAI_CHAIN_STATE_MAX:
+                self._openai_chain_state.popitem(last=False)
+
+    def _openai_record_chain_stream(self, stream, state: Dict[str, Any]):
+        """Pass a Responses stream through, remembering the chain state under
+        the response id it reports (response.created / response.completed)."""
+        seen = False
+        for event in stream:
+            if not seen:
+                rid = getattr(getattr(event, "response", None), "id", None)
+                if rid:
+                    self._openai_remember_chain(rid, state)
+                    seen = True
+            yield event
 
     def _build_openai_input(
         self,
@@ -1236,22 +1450,34 @@ class ResponsesShim:
             return self._build_anthropic_messages(recovery_text, attachments=attachments)
         return self._build_anthropic_messages(input_data, attachments=attachments)
 
-    def _cache_anthropic_turn(self, response_id: str, messages: list, assistant_content) -> None:
-        """Store the conversation so the next round can replay tool_use blocks."""
+    def _cache_anthropic_turn(self, response_id: str, messages: list, assistant_content,
+                              turn_tools: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        """Store the conversation so the next round can replay tool_use blocks.
+        ``turn_tools``: this conversation's definitions of the tools its
+        tool_addition blocks reference (deferred layout), kept with the chain
+        so a later request can declare them; never shared across chains."""
         if not response_id or assistant_content is None:
             return
         new_messages = list(messages)
         new_messages.append({"role": "assistant", "content": assistant_content})
         with self._history_lock:
             self._history_cache[response_id] = new_messages
+            if turn_tools:
+                # Same lifetime as the history entry it belongs to (both go in
+                # clear_history), so a replayed history never outlives the
+                # definitions its tool_addition blocks need.
+                self._anthropic_chain_tools[response_id] = dict(turn_tools)
 
-    @with_retry(max_retries=3, backoff_base=1.0)
     def _call_anthropic(
         self,
         kwargs: dict,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        cache_breakpoint_tool: Optional[str] = None,
+        instructions_static_len: Optional[int] = None,
     ) -> LLMResponse:
-        """Translate responses.create() to Anthropic Messages API."""
+        """Translate responses.create() to Anthropic Messages API. The request
+        is built ONCE (it reads mutable history and chain state); only the
+        send is retried (_anthropic_send), so every attempt is identical."""
         client = self._llm._get_anthropic_client()
         model = kwargs.get("model", self._llm.default_model)
         instructions = kwargs.get("instructions", "")
@@ -1300,24 +1526,34 @@ class ResponsesShim:
                 call_kwargs["tool_choice"] = {"type": "none"}
         if self._anthropic_has_document(attachments):
             call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
-        call_kwargs = self._apply_anthropic_cache_control(call_kwargs)
-
-        try:
-            resp = client.messages.create(**call_kwargs)
-        except Exception as exc:
-            if not self._strip_sampling_after_rejection(call_kwargs, exc):
-                raise
-            resp = client.messages.create(**call_kwargs)
+        with self._history_lock:
+            chain_tools = dict(self._anthropic_chain_tools.get(prev_id) or {}) if prev_id else {}
+        call_kwargs, turn_tools = self._anthropic_cache_layout(call_kwargs, cache_breakpoint_tool,
+                                                               instructions_static_len, chain_tools)
+        messages = call_kwargs["messages"]  # incl. any tool_addition message: the next round replays it
+        call_kwargs = self._apply_anthropic_cache_control(call_kwargs, core_tool=cache_breakpoint_tool)
+        resp = self._anthropic_send(client, call_kwargs)
 
         # Convert to LLMResponse and cache the turn for the next round.
         result = self._anthropic_to_llm_response(resp)
-        self._cache_anthropic_turn(result.id, messages, getattr(resp, "content", None))
+        self._cache_anthropic_turn(result.id, messages, getattr(resp, "content", None), turn_tools=turn_tools)
         return result
+
+    @with_retry(max_retries=3, backoff_base=1.0)
+    def _anthropic_send(self, client, call_kwargs: dict):
+        try:
+            return client.messages.create(**call_kwargs)
+        except Exception as exc:
+            if not self._strip_sampling_after_rejection(call_kwargs, exc):
+                raise
+            return client.messages.create(**call_kwargs)
 
     def _stream_anthropic(
         self,
         kwargs: dict,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        cache_breakpoint_tool: Optional[str] = None,
+        instructions_static_len: Optional[int] = None,
     ):
         """Streaming Anthropic call — returns an iterator of StreamEvents."""
         client = self._llm._get_anthropic_client()
@@ -1349,10 +1585,16 @@ class ResponsesShim:
                 call_kwargs["tool_choice"] = {"type": "none"}
         if self._anthropic_has_document(attachments):
             call_kwargs["extra_headers"] = dict(self._ANTHROPIC_FILES_BETA_HEADER)
-        call_kwargs = self._apply_anthropic_cache_control(call_kwargs)
+        with self._history_lock:
+            chain_tools = dict(self._anthropic_chain_tools.get(prev_id) or {}) if prev_id else {}
+        call_kwargs, turn_tools = self._anthropic_cache_layout(call_kwargs, cache_breakpoint_tool,
+                                                               instructions_static_len, chain_tools)
+        call_kwargs = self._apply_anthropic_cache_control(call_kwargs, core_tool=cache_breakpoint_tool)
 
         # Return a generator that yields StreamEvent objects
-        return self._anthropic_stream_generator(client, call_kwargs)
+        if turn_tools:
+            return self._anthropic_stream_generator(client, call_kwargs, turn_tools=turn_tools)
+        return self._anthropic_stream_generator(client, call_kwargs)  # unmarked callers: the old call
 
     @contextmanager
     def _anthropic_stream_cm(self, client, call_kwargs):
@@ -1390,7 +1632,7 @@ class ResponsesShim:
             return
         logger.warning("Anthropic served model=%s but %s was requested.", served, requested)
 
-    def _anthropic_stream_generator(self, client, call_kwargs):
+    def _anthropic_stream_generator(self, client, call_kwargs, turn_tools=None):
         """Generate StreamEvent objects from Anthropic streaming."""
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
 
@@ -1474,7 +1716,8 @@ class ResponsesShim:
         try:
             if final_msg is not None:
                 self._cache_anthropic_turn(
-                    resp_id, call_kwargs.get("messages", []), getattr(final_msg, "content", None)
+                    resp_id, call_kwargs.get("messages", []), getattr(final_msg, "content", None),
+                    turn_tools=turn_tools,
                 )
         except Exception:
             pass
@@ -1525,6 +1768,122 @@ class ResponsesShim:
             return messages
         return [{"role": "user", "content": str(input_data)}]
 
+    # ── Anthropic deferred-tool layout ─────────────────────────────────────
+    # Tools render before the system prompt, so the per-question packs broke
+    # the cache for the system prompt too. With the layout, `tools` holds the
+    # core plus the pack marked defer_loading (deferred tools are not part of
+    # the cached prefix), the pack is surfaced by a mid-conversation system
+    # message of tool_addition blocks after the user's turn, and the system
+    # prompt is split into its static part and the per-turn tail. A new
+    # question then reads core + static system prompt from cache (live probe:
+    # 16,079 vs 8,559 tokens with only the core breakpoint).
+    # Beta mid-conversation-tool-changes-2026-07-01; models from the docs plus
+    # Claude Haiku 5.5 (probed 2026-10-09). QUASAR_ANTHROPIC_DEFERRED_TOOLS=0 disables.
+    _ANTHROPIC_TOOL_CHANGES_BETA = "mid-conversation-tool-changes-2026-07-01"
+    _ANTHROPIC_DEFERRED_MODEL_PREFIXES = (
+        "claude-opus-5", "claude-opus-4-8", "claude-fable-5", "claude-mythos-5",
+        "claude-sonnet-5-5", "claude-haiku-5-5",
+    )
+
+    @classmethod
+    def _anthropic_deferred_supported(cls, model: str) -> bool:
+        if os.getenv("QUASAR_ANTHROPIC_DEFERRED_TOOLS", "1").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        return str(model or "").strip().lower().startswith(cls._ANTHROPIC_DEFERRED_MODEL_PREFIXES)
+
+    @staticmethod
+    def _anthropic_added_names(messages: list) -> List[str]:
+        """Tool names surfaced by tool_addition blocks anywhere in a history."""
+        names: List[str] = []
+        for m in messages or []:
+            if isinstance(m, dict) and m.get("role") == "system" and isinstance(m.get("content"), list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_addition":
+                        n = (b.get("tool") or {}).get("name")
+                        if n and n not in names:
+                            names.append(n)
+        return names
+
+    def _anthropic_cache_layout(self, call_kwargs: dict, core_tool: Optional[str],
+                                static_len: Optional[int],
+                                chain_tools: Optional[Dict[str, Dict[str, Any]]] = None):
+        """-> (call_kwargs, turn_tools). Split the system prompt and, where
+        supported, defer the non-core tools. ``chain_tools`` holds THIS
+        conversation's definitions of tools added earlier (never another
+        conversation's: user MCP tools can share names across users).
+
+        A history that already holds tool_addition blocks always gets every
+        referenced tool declared deferred plus the beta header, even on a
+        request the layout would otherwise skip (core-only turn, flag turned
+        off, unsupported model): an undeclared reference is a 400 and the
+        history must stay append-only. A definition this conversation never
+        recorded is declared as an inert stub so the reference resolves.
+        With no core marker and no such history, call_kwargs is unchanged."""
+        msgs = list(call_kwargs.get("messages") or [])
+        added_before = self._anthropic_added_names(msgs)
+        defs: Dict[str, Dict[str, Any]] = dict(chain_tools or {})
+        if not core_tool and not added_before:
+            return call_kwargs, {}
+        system = call_kwargs.get("system")
+        if core_tool and isinstance(system, str) and isinstance(static_len, int) and 0 < static_len < len(system) \
+                and system[static_len:].strip():
+            # Static part first (it carries the breakpoint), then the tail.
+            call_kwargs["system"] = [{"type": "text", "text": system[:static_len]},
+                                     {"type": "text", "text": system[static_len:]}]
+        tools = [t for t in (call_kwargs.get("tools") or []) if isinstance(t, dict)]
+        for t in tools:
+            if t.get("name"):
+                defs[t["name"]] = {k: v for k, v in t.items() if k not in ("defer_loading", "cache_control")}
+        idx = next((i for i, t in enumerate(tools) if core_tool and t.get("name") == core_tool), None)
+        layout = (idx is not None and self._anthropic_deferred_supported(call_kwargs.get("model", ""))
+                  and bool(msgs) and isinstance(msgs[-1], dict) and msgs[-1].get("role") == "user")
+        if layout:
+            eager, pack = tools[:idx + 1], [t for t in tools[idx + 1:] if t.get("name")]
+        else:
+            eager, pack = tools, []
+        # Tools an earlier tool_addition references must be deferred, never eager.
+        must_defer = set(added_before)
+        eager = [t for t in eager if t.get("name") not in must_defer]
+        earlier = {n: d for n, d in defs.items() if n in must_defer}
+        if not eager:
+            # A request with no tools of its own (e.g. a prose continuation) on
+            # a history with additions: the API needs one non-deferred tool, so
+            # add an inert placeholder; with no tools offered, none may be called.
+            taken = set(must_defer) | {t.get("name") for t in tools}
+            placeholder = next(f"quasar_no_tool{'' if i == 0 else f'_{i}'}" for i in itertools.count()
+                               if f"quasar_no_tool{'' if i == 0 else f'_{i}'}" not in taken)
+            eager = [{"name": placeholder, "description": "Placeholder. Never call this tool.",
+                      "input_schema": {"type": "object", "properties": {}}}]
+            if not tools:
+                call_kwargs["tool_choice"] = {"type": "none"}
+        declared, seen = [], {t.get("name") for t in eager}
+        for t in pack + [t for t in tools if t.get("name") in must_defer]:
+            if t["name"] not in seen:
+                declared.append({**defs[t["name"]], "defer_loading": True})
+                seen.add(t["name"])
+        for name in added_before:
+            if name not in seen:
+                declared.append({**(defs.get(name) or {
+                    "name": name, "description": "This tool is no longer available in this conversation.",
+                    "input_schema": {"type": "object", "properties": {}}}), "defer_loading": True})
+                seen.add(name)
+        new = [t["name"] for t in pack if t["name"] not in must_defer]
+        if new:
+            msgs.append({"role": "system", "content": [
+                {"type": "tool_addition", "tool": {"type": "tool_reference", "name": n}} for n in new]})
+        if not declared:
+            return call_kwargs, earlier
+        call_kwargs["tools"] = eager + declared
+        call_kwargs["messages"] = msgs
+        headers = dict(call_kwargs.get("extra_headers") or {})
+        betas = [b.strip() for b in str(headers.get("anthropic-beta", "")).split(",") if b.strip()]
+        if self._ANTHROPIC_TOOL_CHANGES_BETA not in betas:
+            betas.append(self._ANTHROPIC_TOOL_CHANGES_BETA)
+        headers["anthropic-beta"] = ",".join(betas)
+        call_kwargs["extra_headers"] = headers
+        keep = set(added_before) | set(new)
+        return call_kwargs, {n: d for n, d in defs.items() if n in keep}
+
     def _translate_tools_for_anthropic(self, tools: list) -> list:
         """Convert OpenAI tool format to Anthropic tool format."""
         anthropic_tools = []
@@ -1538,21 +1897,67 @@ class ResponsesShim:
         return anthropic_tools
 
     @staticmethod
-    def _apply_anthropic_cache_control(call_kwargs: dict) -> dict:
-        """Prompt-cache breakpoints (token plan rank 5): the last tool (caches
-        the whole tool block), the system prompt, and the newest message (the
-        conversation so far). Anthropic allows 4 breakpoints, so markers left
-        on older messages are removed first. Copies; never mutates the
-        caller's tools/messages. QUASAR_ANTHROPIC_PROMPT_CACHE=0 disables."""
+    def _apply_anthropic_cache_control(call_kwargs: dict, core_tool: Optional[str] = None) -> dict:
+        """Prompt-cache breakpoints (token plan rank 5). Anthropic renders
+        tools, then system, then messages, and allows 4 breakpoints:
+
+        1. ``core_tool``, the last tool of the fixed CORE block (the runner
+           marks it, see CACHE_BREAKPOINT_KEY). The tool packs after it vary
+           per question, so without this every first call of a question
+           rewrote the core tools at 1.25x; with it they are read at 0.1x
+           across questions, chats and users. QUASAR_ANTHROPIC_CORE_BREAKPOINT=0
+           turns only this one off. QUASAR_ANTHROPIC_CORE_CACHE_TTL=1h gives
+           this entry the 1-hour TTL (writes 2x instead of 1.25x) so sparse
+           traffic, questions more than 5 minutes apart, still reads it; it
+           is the first breakpoint, so the longer TTL comes before the
+           5-minute ones as the API requires. Default: 5 minutes.
+        2. The last non-deferred tool: the whole tool block. Kept although (3)
+           also covers the tools, because the system prompt varies when the
+           tools do not (per-user memory suffix, the RAG scaffold): two
+           questions with the same packs but different system text still
+           share this entry. Breakpoints cost nothing extra; writes bill
+           once, past the highest hit. With the deferred layout
+           (_anthropic_cache_layout) this is the core tool, so one marker.
+        3. The system prompt (tools + system); when the layout split it, the
+           static first block, so the per-turn tail never invalidates it.
+        4. The newest message (the conversation so far, or the tool_addition
+           message that follows it). Markers left on older messages are
+           removed first so there is only ever one here.
+
+        Callers that mark no core tool get exactly 2-4 as before. Copies;
+        never mutates the caller's tools/messages.
+        QUASAR_ANTHROPIC_PROMPT_CACHE=0 disables all of it."""
         if os.getenv("QUASAR_ANTHROPIC_PROMPT_CACHE", "1").strip().lower() in ("0", "false", "no", "off"):
             return call_kwargs
         eph = {"type": "ephemeral"}
         tools = call_kwargs.get("tools")
         if tools:
-            call_kwargs["tools"] = [*tools[:-1], {**tools[-1], "cache_control": eph}]
+            # The "last tool" breakpoint goes on the last NON-deferred tool: a
+            # defer_loading tool cannot carry cache_control (400). With the
+            # deferred layout that is the core tool itself.
+            last = max((i for i, t in enumerate(tools) if not (isinstance(t, dict) and t.get("defer_loading"))),
+                       default=None)
+            tools = list(tools)
+            if last is not None:
+                tools[last] = {**tools[last], "cache_control": eph}
+            if core_tool and os.getenv("QUASAR_ANTHROPIC_CORE_BREAKPOINT", "1").strip().lower() not in (
+                    "0", "false", "no", "off"):
+                idx = next((i for i, t in enumerate(tools)
+                            if isinstance(t, dict) and t.get("name") == core_tool and not t.get("defer_loading")),
+                           None)
+                if idx is not None:  # may be `last` too: same marker, or the 1h one
+                    core_eph = dict(eph)
+                    if os.getenv("QUASAR_ANTHROPIC_CORE_CACHE_TTL", "").strip().lower() == "1h":
+                        core_eph["ttl"] = "1h"
+                    tools[idx] = {**tools[idx], "cache_control": core_eph}
+            call_kwargs["tools"] = tools
         system = call_kwargs.get("system")
         if isinstance(system, str) and system:
             call_kwargs["system"] = [{"type": "text", "text": system, "cache_control": eph}]
+        elif isinstance(system, list) and system and isinstance(system[0], dict):
+            # Split by _anthropic_cache_layout: the static part carries the
+            # breakpoint so the per-turn tail never invalidates it.
+            call_kwargs["system"] = [{**system[0], "cache_control": eph}, *system[1:]]
 
         def _strip(m):
             c = m.get("content") if isinstance(m, dict) else None
@@ -1659,6 +2064,39 @@ class ResponsesShim:
 
         return messages, {"model": model, "contents": contents, "config": config}
 
+    @staticmethod
+    def _google_any_rejected(exc: Exception, call_kwargs: dict) -> bool:
+        """A 400 on a call that forced a tool call (function calling mode ANY)."""
+        cfg = ((call_kwargs.get("config") or {}).get("tool_config") or {}).get("function_calling_config") or {}
+        return cfg.get("mode") == "ANY" and getattr(exc, "code", None) == 400
+
+    @staticmethod
+    def _google_required_fallback(call_kwargs: dict) -> dict:
+        """Vertex 400s mode ANY ("Request contains an invalid argument", live
+        2026-10-05) when the offered toolset is too large for constrained
+        decoding: the first 105 of the 202 tools fail, any 101 pass, AUTO takes
+        all of them. Emulate "required" the way TACC does: AUTO plus the nudge."""
+        config = dict(call_kwargs.get("config") or {})
+        config["tool_config"] = {"function_calling_config": {"mode": "AUTO"}}
+        config["system_instruction"] = "\n\n".join(
+            s for s in (config.get("system_instruction"), REQUIRED_TOOL_NUDGE) if s)
+        print("[PROVIDER] google rejected function calling mode ANY (400); retrying with AUTO + the required-tool nudge")
+        return {**call_kwargs, "config": config}
+
+    def _google_open_stream(self, client, call_kwargs: dict):
+        """generate_content_stream with the mode-ANY fallback. The SDK raises a
+        request error on the first chunk, before anything reached the user."""
+        try:
+            stream = iter(client.models.generate_content_stream(**call_kwargs))
+            first = next(stream)
+        except StopIteration:
+            return iter(())
+        except Exception as exc:
+            if not self._google_any_rejected(exc, call_kwargs):
+                raise
+            return iter(client.models.generate_content_stream(**self._google_required_fallback(call_kwargs)))
+        return itertools.chain([first], stream)
+
     @with_retry(max_retries=3, backoff_base=1.0)
     def _call_google(
         self,
@@ -1668,7 +2106,12 @@ class ResponsesShim:
         """Translate responses.create() to Google GenAI API."""
         client = self._llm._get_google_client()
         messages, call_kwargs = self._google_request(kwargs, attachments=attachments)
-        resp = client.models.generate_content(**call_kwargs)
+        try:
+            resp = client.models.generate_content(**call_kwargs)
+        except Exception as exc:
+            if not self._google_any_rejected(exc, call_kwargs):
+                raise
+            resp = client.models.generate_content(**self._google_required_fallback(call_kwargs))
         result, signatures = self._google_to_llm_response(resp)
         self._cache_google_turn(result.id, messages, result.output_text, result.output, signatures)
         return result
@@ -1692,7 +2135,7 @@ class ResponsesShim:
         signatures: Dict[str, str] = {}
         reasoning_done_emitted = False
 
-        stream = client.models.generate_content_stream(**call_kwargs)
+        stream = self._google_open_stream(client, call_kwargs)
         for chunk in stream:
             chunk_usage = self._google_usage(chunk)
             if chunk_usage is not None:
@@ -1818,7 +2261,12 @@ class ResponsesShim:
 
     @staticmethod
     def _google_usage(resp) -> Optional[LLMUsage]:
-        """Gemini usage. Thinking tokens bill as output, so they count as output."""
+        """Gemini usage. Thinking tokens bill as output, so they count as output.
+
+        prompt_token_count already includes implicit-cache hits; those are also
+        reported as cached_content_token_count, carried as cache_hit_tokens so the
+        per-call token log can show them (input totals, quota and cost unchanged).
+        """
         meta = getattr(resp, "usage_metadata", None)
         if not meta:
             return None
@@ -1826,9 +2274,11 @@ class ResponsesShim:
         tool_prompt = getattr(meta, "tool_use_prompt_token_count", None) or 0
         candidates = getattr(meta, "candidates_token_count", None) or 0
         thoughts = getattr(meta, "thoughts_token_count", None) or 0
+        cached = getattr(meta, "cached_content_token_count", None)
         if not (prompt or tool_prompt or candidates or thoughts):
             return None
-        return LLMUsage(input_tokens=int(prompt) + int(tool_prompt), output_tokens=int(candidates) + int(thoughts))
+        return LLMUsage(input_tokens=int(prompt) + int(tool_prompt), output_tokens=int(candidates) + int(thoughts),
+                        cache_hit_tokens=int(cached) if cached is not None else None)
 
     def _translate_tools_for_google(self, tools: list) -> list:
         """Convert OpenAI tool format to Google GenAI function declarations.
@@ -1914,10 +2364,18 @@ class ResponsesShim:
         names_by_call: Dict[str, str] = {}
         needs_signature = bool(self._GEMINI3_RE.search(str(model)))
 
+        def is_tool_turn(ps: List[Dict[str, Any]]) -> bool:
+            return any("function_response" in p for p in ps)
+
         def add(role: str, parts: List[Dict[str, Any]]):
             if not parts:
                 return
-            if contents and contents[-1]["role"] == role:
+            # Vertex 400s a user turn that mixes function_response parts with
+            # text ("Requests ending with a model turn are not supported",
+            # live 2026-10-05 on the tool-budget compose round), so tool
+            # results and a following user note stay separate user turns.
+            if (contents and contents[-1]["role"] == role
+                    and is_tool_turn(contents[-1]["parts"]) == is_tool_turn(parts)):
                 contents[-1]["parts"].extend(parts)
             else:
                 contents.append({"role": role, "parts": list(parts)})
@@ -2769,10 +3227,7 @@ class ResponsesShim:
         message on a call-only copy (the conversation history cache keeps the
         original messages so the pressure does not leak into later rounds).
         """
-        nudge = (
-            "Tool use is REQUIRED for this turn: call the most appropriate tool "
-            "now instead of answering in plain text."
-        )
+        nudge = REQUIRED_TOOL_NUDGE
         call_messages = [dict(m) if isinstance(m, dict) else m for m in messages]
         first = call_messages[0] if call_messages else None
         if isinstance(first, dict) and first.get("role") == "system" and isinstance(first.get("content"), str):
@@ -3458,7 +3913,8 @@ def _anthropic_usage(u) -> "LLMUsage":
     writes; total input is their sum (guard CX-01). cache_hit_tokens = reads."""
     base = int(getattr(u, "input_tokens", 0) or 0)
     read = int(getattr(u, "cache_read_input_tokens", 0) or 0)
-    write = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
+    write_raw = getattr(u, "cache_creation_input_tokens", None)
+    write = int(write_raw or 0)
     # Quota and the token totals need ACTUAL tokens (guard CX-15), and the one
     # recorder feeds both quota and cost, so the USD estimate prices cache
     # tokens at the uncached rate: cache READS are over-priced (real rate 0.1x)
@@ -3468,6 +3924,9 @@ def _anthropic_usage(u) -> "LLMUsage":
         input_tokens=base + read + write,
         output_tokens=int(getattr(u, "output_tokens", 0) or 0),
         cache_hit_tokens=read if (read or write) else None,
+        # A reported 0 stays 0 (nothing written); a missing field stays None
+        # (unknown), so the call log never invents or hides a value.
+        cache_write_tokens=write if write_raw is not None else None,
     )
 
 

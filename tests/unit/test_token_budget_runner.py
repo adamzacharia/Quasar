@@ -109,3 +109,54 @@ def test_direct_dispatch_runs_the_tool_and_sends_one_exchange(monkeypatch):
     assert [o["call_id"] for o in outs] == [c["call_id"] for c in calls]
     assert "ALREADY called" in inp[0]["content"] and "You MUST call `alma_public_band_status`" not in inp[0]["content"]
     assert "Nine bands" in out
+
+
+def test_runner_marks_the_last_core_tool_for_anthropic_and_openai_only(monkeypatch):
+    from core.llm_client import CACHE_BREAKPOINT_KEY
+
+    monkeypatch.setenv("QUASAR_TOOL_PACKS", "1")
+    names = [n for n in tp.CORE if n != tp.FIND_TOOLS] + ["query_alma_science_archive"]
+    q = "How many ALMA Band 6 projects observed HD 163296?"
+    for model, expect in (("claude-haiku-5-5", True), ("gpt-6-luna", True), ("gpt-oss-120b", False),
+                          ("deepseek-v4-flash", False)):
+        agent, fake = _make_agent(["Done."], names)
+        agent.stream_response_api(q, conversation_id="conv-tp", model=model)
+        kw = fake.calls[0]["kwargs"]
+        assert kw["_instructions_static_len"] == len("system prompt"), "static system prompt length is passed"
+        assert kw["instructions"].startswith("system prompt")
+        tools = kw["tools"]
+        marked = [t["name"] for t in tools if CACHE_BREAKPOINT_KEY in t]
+        n_core = tp.core_prefix_len(tools)
+        assert "query_alma_science_archive" in [t["name"] for t in tools][n_core:], "a pack follows the core"
+        if expect:
+            assert marked == [tools[n_core - 1]["name"]] == ["calculate_doppler_shift"], model
+        else:
+            assert marked == [], f"{model}: no marker outside Anthropic"
+
+
+def test_anthropic_marker_survives_toolset_growth_and_never_touches_shared_dicts(monkeypatch):
+    """CX-04: the full-toolset re-sample appends through the same _tp_offer path
+    as a find_tools expansion; the marker must stay on the last core tool, and
+    the registry's own dicts must never be marked."""
+    from core.llm_client import CACHE_BREAKPOINT_KEY
+
+    monkeypatch.setenv("QUASAR_TOOL_PACKS", "1")
+    names = [n for n in tp.CORE if n != tp.FIND_TOOLS] + ["query_alma_science_archive", "moving_object_check"]
+    originals = [_tool(n) for n in names]
+    agent, fake = _make_agent(["I don't have a tool for listing minor bodies.", "Final answer."], names)
+    agent._build_tools_for_responses_api = lambda: list(originals)  # the same dict objects every time
+
+    out = agent.stream_response_api("How many ALMA Band 6 projects observed HD 163296?",
+                                    conversation_id="conv-tp", model="claude-haiku-5-5")
+
+    assert out.strip() == "Final answer." and len(fake.calls) == 2
+    first, second = (c["kwargs"]["tools"] for c in fake.calls)
+    assert "moving_object_check" not in [t["name"] for t in first]
+    assert "moving_object_check" in [t["name"] for t in second], "re-sample offered more tools"
+    for tools in (first, second):
+        n_core = tp.core_prefix_len(tools)
+        assert [t["name"] for t in tools if CACHE_BREAKPOINT_KEY in t] == ["calculate_doppler_shift"]
+        assert tools[n_core - 1]["name"] == "calculate_doppler_shift", "marker stays at the core boundary"
+    assert second[: tp.core_prefix_len(first)] == first[: tp.core_prefix_len(first)], "core prefix unchanged"
+    assert all(CACHE_BREAKPOINT_KEY not in t for t in originals), "shared tool dicts are never mutated"
+    assert all(t is not o for t in first for o in originals if CACHE_BREAKPOINT_KEY in t)

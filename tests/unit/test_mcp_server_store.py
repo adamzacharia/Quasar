@@ -184,3 +184,177 @@ def test_connect_rate_limit(tmp_path, monkeypatch):
     with pytest.raises(mos.ConnectRateLimited):
         store.admit_connect("alice")
     store.admit_connect("bob")  # per user
+
+
+# ── default servers (MANNA in every account) ──────────────────────────────
+
+DEFAULT_URL = "https://manna.example/manna/mcp"
+
+
+@pytest.fixture()
+def manna_default(monkeypatch):
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", DEFAULT_URL)
+    monkeypatch.delenv("QUASAR_ENABLE_MANNA", raising=False)
+    mss._DEFAULTS_SEEDED.clear()
+    mss._MARKS_READY.clear()
+    yield
+    mss._DEFAULTS_SEEDED.clear()
+    mss._MARKS_READY.clear()
+
+
+def _urls(svc, user):
+    return [(s["name"], s["url"]) for s in svc.load_servers(user)]
+
+
+def test_every_account_starts_with_manna(svc, manna_default):
+    for user in ("alice", "bob"):
+        servers = svc.load_servers(user)
+        assert [(s["name"], s["transport"], s["url"], s["auth"]) for s in servers] == [
+            ("manna", "streamable_http", DEFAULT_URL, "none")]
+    mss._DEFAULTS_SEEDED.clear()  # a new process adds nothing twice
+    assert len(svc.load_servers("alice")) == 1
+
+
+def test_removed_default_stays_removed(svc, manna_default):
+    svc.load_servers("alice")
+    assert svc.delete_server("alice", "manna") is True
+    mss._DEFAULTS_SEEDED.clear()  # e.g. after a restart
+    assert svc.load_servers("alice") == []
+
+
+def test_stale_seed_after_removal_does_not_resurrect(svc, manna_default, tmp_path):
+    """CX-02: a request that had not seen the seed (another worker, empty
+    memo) runs after the user removed MANNA: the mark still blocks it."""
+    svc.load_servers("alice")
+    svc.delete_server("alice", "manna")
+    other_worker = mss.MCPServerService(base_dir=str(tmp_path))
+    mss._DEFAULTS_SEEDED.clear()
+    other_worker._seed_defaults("alice")
+    assert other_worker.load_servers("alice") == []
+
+
+def test_users_own_manna_entry_is_left_alone(svc, manna_default, monkeypatch):
+    svc.save_server("alice", mss.MCPServerConfig(name="manna", transport="streamable_http",
+                                                 url="https://mine.example/mcp"))
+    mss._DEFAULTS_SEEDED.clear()
+    assert _urls(svc, "alice") == [("manna", "https://mine.example/mcp")]
+    # Even when the default later happens to equal, then leave, that URL.
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", "https://mine.example/mcp")
+    svc.load_servers("alice")
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", "https://moved.example/mcp")
+    assert _urls(svc, "alice") == [("manna", "https://mine.example/mcp")]
+
+
+def test_preexisting_row_at_the_default_url_is_not_taken_over(svc, manna_default, monkeypatch):
+    """CX-01: same URL as the default, but saved by the user: never follows."""
+    svc.save_server("alice", mss.MCPServerConfig(name="manna", transport="streamable_http", url=DEFAULT_URL))
+    mss._DEFAULTS_SEEDED.clear()
+    svc.load_servers("alice")
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", "https://moved.example/mcp")
+    assert _urls(svc, "alice") == [("manna", DEFAULT_URL)]
+
+
+def test_untouched_default_follows_url_changes_both_ways(svc, manna_default, monkeypatch):
+    """CX-04/05: the URL is resolved per load, so A -> B -> A works inside one
+    process and nothing is written back for workers to fight over."""
+    svc.load_servers("alice")
+    for url in ("https://b.example/mcp", DEFAULT_URL):
+        monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", url)
+        assert _urls(svc, "alice") == [("manna", url)]
+    con = sqlite3.connect(str(svc._db_path))
+    try:
+        assert con.execute("SELECT url FROM user_mcp_servers WHERE name = 'manna'").fetchone()[0] == DEFAULT_URL
+    finally:
+        con.close()
+
+
+def test_any_edit_stops_following(svc, manna_default, monkeypatch):
+    """CX-01: a header-only edit (same URL) makes the row the user's own."""
+    svc.load_servers("alice")
+    svc.save_server("alice", mss.MCPServerConfig(name="manna", transport="streamable_http", url=DEFAULT_URL,
+                                                 headers={"Authorization": f"Bearer {SECRET}"}))
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", "https://elsewhere.example/mcp")
+    [srv] = svc.load_servers("alice")
+    assert srv["url"] == DEFAULT_URL and srv["headers"]["Authorization"] == f"Bearer {SECRET}"
+
+
+@pytest.mark.parametrize("value", ["off", "0", "", "none"])
+def test_default_can_be_turned_off(svc, monkeypatch, value):
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", value)
+    mss._DEFAULTS_SEEDED.clear()
+    assert svc.load_servers("alice") == []
+
+
+def test_no_default_when_platform_already_mounts_manna(svc, manna_default, monkeypatch):
+    monkeypatch.setenv("QUASAR_ENABLE_MANNA", "1")
+    assert svc.load_servers("alice") == []
+
+
+def test_marks_table_failure_never_hides_saved_servers(svc, manna_default, monkeypatch):
+    """CX-06: the optional marks table cannot be created -> no default, but
+    the constructor works and saved servers still load."""
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", "off")  # no marks table yet
+    svc.save_server("alice", mss.MCPServerConfig(name="x", transport="streamable_http", url="https://x.example/mcp"))
+    monkeypatch.setenv("QUASAR_DEFAULT_MANNA_URL", DEFAULT_URL)
+    real_conn = svc._conn
+
+    def deny_marks():
+        con = real_conn()
+
+        def authorizer(action, arg1, *_):
+            if action == sqlite3.SQLITE_CREATE_TABLE and arg1 == "user_mcp_default_marks":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        con.set_authorizer(authorizer)
+        return con
+
+    monkeypatch.setattr(mss, "_SCHEMA_READY", set())
+    monkeypatch.setattr(mss.MCPServerService, "_conn", lambda self: deny_marks())
+    fresh = mss.MCPServerService(base_dir=str(svc.base_dir))
+    assert _urls(fresh, "alice") == [("x", "https://x.example/mcp")]
+
+
+def test_stock_default_is_the_hosted_manna(monkeypatch):
+    monkeypatch.delenv("QUASAR_DEFAULT_MANNA_URL", raising=False)
+    monkeypatch.delenv("QUASAR_ENABLE_MANNA", raising=False)
+    [cfg] = mss.default_mcp_servers()
+    assert cfg.name == "manna" and cfg.transport == "streamable_http"
+    assert cfg.url.startswith("https://") and cfg.url.endswith("/manna/mcp")
+
+
+def test_platform_tool_wins_over_a_same_named_user_tool():
+    """CX-03: platform MANNA plus an account's seeded MANNA offer each
+    manna__* name once, and the platform copy is the one kept."""
+    from types import SimpleNamespace
+
+    from core.runner import _merge_user_mcp_tools
+
+    tools = [{"type": "function", "name": "manna__run_adql_query", "description": "platform"}]
+    user_tools: dict = {}
+    offered = [SimpleNamespace(name=n, description="user", parameters={})
+               for n in ("manna__run_adql_query", "manna__list_archives", "manna__list_archives")]
+    _merge_user_mcp_tools(tools, user_tools, offered)
+    names = [t["name"] for t in tools]
+    assert names == ["manna__run_adql_query", "manna__list_archives"]
+    assert tools[0]["description"] == "platform" and set(user_tools) == {"manna__list_archives"}
+
+
+def test_unreadable_marks_table_never_hides_saved_servers(svc, manna_default, monkeypatch):
+    """CX-07: the marks table exists but cannot be read -> saved servers
+    (the seeded row included) still load, just without URL following."""
+    svc.save_server("alice", mss.MCPServerConfig(name="x", transport="streamable_http", url="https://x.example/mcp"))
+    real_conn = svc._conn
+
+    def deny_reads():
+        con = real_conn()
+
+        def authorizer(action, arg1, *_):
+            if action == sqlite3.SQLITE_READ and arg1 == "user_mcp_default_marks":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        con.set_authorizer(authorizer)
+        return con
+
+    monkeypatch.setattr(mss.MCPServerService, "_conn", lambda self: deny_reads())
+    mss._DEFAULTS_SEEDED.clear()
+    assert sorted(n for n, _ in _urls(svc, "alice")) == ["manna", "x"]

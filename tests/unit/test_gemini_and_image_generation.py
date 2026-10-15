@@ -547,3 +547,17 @@ def test_sdk_retries_are_disabled_so_a_call_cannot_outlive_its_deadline(rendered
         ig.generate_image("gemini-3.1-flash-image", "x", client=gllm)
     http = fake.calls[0]["config"]["http_options"]
     assert http["retry_options"] == {"attempts": 1} and http["timeout"] > 0
+
+
+def test_gemini_implicit_cache_hits_reach_the_call_token_log():
+    from core.call_tokens import _usage_fields
+    from core.llm_client import ResponsesShim
+
+    meta = NS(prompt_token_count=20000, tool_use_prompt_token_count=0, candidates_token_count=120,
+              thoughts_token_count=30, cached_content_token_count=14500)
+    u = ResponsesShim._google_usage(NS(usage_metadata=meta))
+    # prompt_token_count already includes the cached part: totals (quota, cost) are unchanged
+    assert (u.input_tokens, u.output_tokens, u.cache_hit_tokens) == (20000, 150, 14500)
+    assert _usage_fields(u) == {"billed_in": 20000, "cached": 14500, "billed_out": 150, "cache_write": None}
+    no_cache = NS(prompt_token_count=900, candidates_token_count=10, thoughts_token_count=0)
+    assert ResponsesShim._google_usage(NS(usage_metadata=no_cache)).cache_hit_tokens is None

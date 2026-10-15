@@ -224,6 +224,167 @@ def test_anthropic_cache_control_breakpoints_move_and_never_exceed_four():
     assert "cache_control" in msgs[0]["content"][0], "caller's list not mutated"
 
 
+def _marks(ck):
+    tools = [t["name"] for t in ck.get("tools") or [] if "cache_control" in t]
+    system = sum(1 for b in ck.get("system") or [] if isinstance(b, dict) and "cache_control" in b)
+    msgs = sum(1 for m in ck.get("messages") or [] if isinstance(m.get("content"), list)
+               for b in m["content"] if isinstance(b, dict) and "cache_control" in b)
+    return tools, system, msgs
+
+
+def test_anthropic_core_breakpoint_placement(monkeypatch):
+    from core.llm_client import ResponsesShim
+
+    for var in ("QUASAR_ANTHROPIC_CORE_BREAKPOINT", "QUASAR_ANTHROPIC_CORE_CACHE_TTL", "QUASAR_ANTHROPIC_PROMPT_CACHE"):
+        monkeypatch.delenv(var, raising=False)  # CX-02: defaults are checked from a clean env
+    tools = [{"name": n} for n in ("find_tools", "web_search", "catalog_query", "pack_a", "pack_b")]
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "old", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": "ok"}, {"role": "user", "content": "new"}]
+    ck = ResponsesShim._apply_anthropic_cache_control(
+        {"tools": tools, "system": "sys", "messages": msgs}, core_tool="catalog_query")
+    t, s, m = _marks(ck)
+    assert t == ["catalog_query", "pack_b"], "last core tool + whole tool block"
+    assert s == 1 and m == 1 and ck["messages"][-1]["content"][-1]["cache_control"]
+    assert len(t) + s + m <= 4, "Anthropic allows at most 4 breakpoints"
+    assert all("cache_control" not in x for x in tools), "caller's tools not mutated"
+
+    # Unmarked callers keep exactly the old placement.
+    old = ResponsesShim._apply_anthropic_cache_control({"tools": tools, "system": "sys", "messages": msgs})
+    assert _marks(old) == (["pack_b"], 1, 1)
+    # A core-only turn: the core tool IS the last tool, one marker.
+    only = ResponsesShim._apply_anthropic_cache_control({"tools": tools[:3], "system": "s", "messages": msgs},
+                                                        core_tool="catalog_query")
+    assert _marks(only)[0] == ["catalog_query"]
+    # An unknown name (tool not offered) changes nothing.
+    gone = ResponsesShim._apply_anthropic_cache_control({"tools": tools, "system": "s", "messages": msgs},
+                                                        core_tool="missing")
+    assert _marks(gone)[0] == ["pack_b"]
+    # Opt-in 1-hour TTL on the core entry only (it is the first breakpoint).
+    assert ck["tools"][2]["cache_control"] == {"type": "ephemeral"}, "default TTL unchanged"
+    monkeypatch.setenv("QUASAR_ANTHROPIC_CORE_CACHE_TTL", "1h")
+    hour = ResponsesShim._apply_anthropic_cache_control({"tools": tools, "system": "s", "messages": msgs},
+                                                        core_tool="catalog_query")
+    assert hour["tools"][2]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert hour["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert hour["system"][0]["cache_control"] == {"type": "ephemeral"}
+    monkeypatch.delenv("QUASAR_ANTHROPIC_CORE_CACHE_TTL")
+    # The A/B switch turns off only the core breakpoint; the global switch everything.
+    monkeypatch.setenv("QUASAR_ANTHROPIC_CORE_BREAKPOINT", "0")
+    off = ResponsesShim._apply_anthropic_cache_control({"tools": tools, "system": "s", "messages": msgs},
+                                                       core_tool="catalog_query")
+    assert _marks(off) == (["pack_b"], 1, 1)
+    monkeypatch.delenv("QUASAR_ANTHROPIC_CORE_BREAKPOINT")
+    monkeypatch.setenv("QUASAR_ANTHROPIC_PROMPT_CACHE", "0")
+    none = ResponsesShim._apply_anthropic_cache_control({"tools": tools, "system": "s", "messages": msgs},
+                                                        core_tool="catalog_query")
+    assert none["tools"] is tools and none["system"] == "s"
+
+
+def test_cache_breakpoint_marker_is_stripped_and_only_anthropic_gets_the_name(monkeypatch):
+    from core.llm_client import CACHE_BREAKPOINT_KEY, LLMClient, LLMResponse, _pop_tool_cache_breakpoint
+
+    marked = [{"type": "function", "name": "find_tools"},
+              {"type": "function", "name": "catalog_query", CACHE_BREAKPOINT_KEY: True},
+              {"type": "function", "name": "pack_a"}]
+    kw = {"tools": marked}
+    assert _pop_tool_cache_breakpoint(kw) == "catalog_query"
+    assert all(CACHE_BREAKPOINT_KEY not in t for t in kw["tools"])
+    assert CACHE_BREAKPOINT_KEY in marked[1], "caller's tool dicts not mutated"
+    plain = [{"type": "function", "name": "a"}]
+    kw = {"tools": plain}
+    assert _pop_tool_cache_breakpoint(kw) is None and kw["tools"] is plain, "unmarked lists untouched"
+
+    import copy
+
+    monkeypatch.setenv("QUASAR_CALL_TOKENS", "0")
+    unmarked = [{k: v for k, v in t.items() if k != CACHE_BREAKPOINT_KEY} for t in marked]
+    # OpenAI streams through _call_openai; the others have a separate stream method.
+    cases = (("gpt-6-luna", "_call_openai", "_call_openai"), ("gpt-oss-120b", "_call_tacc", "_stream_tacc"),
+             ("deepseek-v4-flash", "_call_deepseek", "_stream_deepseek"),
+             ("gemini-3.8-flash", "_call_google", "_stream_google"),
+             ("local/test-model", "_call_local", "_stream_local"),
+             ("claude-haiku-5-5", "_call_anthropic", "_stream_anthropic"))
+    for model, call_meth, stream_meth in cases:
+        for stream in (False, True):
+            sent = []
+            shim = LLMClient(model=model).responses
+
+            def _fake(kwargs, attachments=None, _stream=stream, **extra):  # noqa: B023 (bound per loop)
+                sent.append((copy.deepcopy(kwargs), extra))
+                return iter([]) if _stream else LLMResponse(output_text="ok")
+
+            monkeypatch.setattr(shim, stream_meth if stream else call_meth, _fake)
+            for tools in (list(marked), list(unmarked)):  # marked request, then an unmarked control
+                res = shim.create(model=model, input="hi", tools=tools, stream=stream, _call_meta={})
+                if stream and not isinstance(res, LLMResponse):
+                    list(res)  # drain the usage wrapper
+            (got, extra), (control, control_extra) = sent
+            label = f"{model} stream={stream}"
+            assert got == control, f"{label}: the provider must receive the same request as an unmarked call"
+            assert all(CACHE_BREAKPOINT_KEY not in t for t in got["tools"]), f"{label}: marker reached a provider"
+            if model == "claude-haiku-5-5":
+                assert extra == {"cache_breakpoint_tool": "catalog_query", "instructions_static_len": None}, label
+                assert control_extra == {"cache_breakpoint_tool": None, "instructions_static_len": None}, \
+                    f"{label}: unmarked callers get no name"
+            elif model == "gpt-6-luna":
+                assert extra == {"cache_layout": {"core_tool": "catalog_query", "static_len": None,
+                                                  "own_cache_key": True}}, label
+                assert control_extra == {}, f"{label}: unmarked OpenAI calls are exactly the old call"
+            else:
+                assert extra == control_extra == {}, f"{label}: no new argument outside Anthropic/OpenAI"
+
+
+def test_core_tool_serialization_is_byte_stable_across_questions():
+    from core.llm_client import ResponsesShim
+
+    schemas = {n: {"type": "function", "name": n, "description": f"{n} tool.",
+                   "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}
+               for n in REG}
+
+    def offered(question, registry):
+        sel = tp.select(question, registered=registry)
+        return [tp.find_tools_schema()] + [schemas[n] for n in sel["names"] if n != tp.FIND_TOOLS]
+
+    a = offered("How many ALMA Band 6 projects observed HD 163296?", REG)
+    b = offered("Plot the Gaia DR3 colour-magnitude diagram of M67", list(reversed(REG)))
+    na, nb = tp.core_prefix_len(a), tp.core_prefix_len(b)
+    assert na == nb == len([n for n in tp.CORE if n in REG]), "the core block is the same size"
+    assert len(a) > na and len(b) > nb, "both questions add pack tools after the core"
+    ser = lambda tools: json.dumps(ResponsesShim._translate_tools_for_anthropic(None, tools), ensure_ascii=False)
+    assert ser(a[:na]) == ser(b[:nb]), "core prefix must be byte-identical across questions"
+    assert ser(a) != ser(b)
+    assert tp.core_prefix_len([{"name": "pack_a"}] + a) == 0
+
+
+def test_cache_writes_flow_from_anthropic_usage_to_the_call_log(tmp_path, monkeypatch):
+    from core.llm_client import LLMUsage, _anthropic_usage
+
+    class U:
+        input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens = 100, 7, 9000, 500
+
+    u = _anthropic_usage(U())
+    assert u.cache_write_tokens == 500 and u.input_tokens == 9600, "input_tokens unchanged (quota, cost)"
+
+    class Zero:  # CX-01: a reported zero is a known zero, not "unknown"
+        input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens = 40, 3, 0, 0
+
+    class ReadsOnly:  # ... and a missing write field is unknown, not zero
+        input_tokens, output_tokens, cache_read_input_tokens = 40, 3, 9000
+
+    assert _anthropic_usage(Zero()).cache_write_tokens == 0
+    assert _anthropic_usage(ReadsOnly()).cache_write_tokens is None
+    assert _anthropic_usage(ReadsOnly()).input_tokens == 9040
+    assert call_tokens._usage_fields(u) == {"billed_in": 9600, "cached": 9000, "billed_out": 7, "cache_write": 500}
+    assert call_tokens._usage_fields(LLMUsage(input_tokens=5, output_tokens=1))["cache_write"] is None
+    assert call_tokens._usage_fields(None)["cache_write"] is None
+
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("QUASAR_CALL_TOKENS_LOG", str(log))
+    call_tokens.log_billed("anthropic", "claude-haiku-5-5", {"est": 9000, "n_tools": 3}, u, {"round": 0})
+    rec = json.loads(log.read_text(encoding="utf-8").strip())
+    assert (rec["billed_in"], rec["cached"], rec["cache_write"], rec["round"]) == (9600, 9000, 500, 0)
+
+
 # ── one-shot direct dispatch ───────────────────────────────────────────
 
 def test_dispatch_marks_only_complete_intents_and_rewrites_directive():

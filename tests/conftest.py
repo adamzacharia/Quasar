@@ -60,6 +60,9 @@ _DUMMY_KEYS = {
 # leak refreshes into tests (guard CX-04). Refresh-specific tests opt back in
 # via monkeypatch.
 os.environ["DATALAB_TAP_SCHEMA_AUTOREFRESH"] = "0"
+# No default MANNA server in every test user's MCP list (it would also dial the
+# hosted server from tests). Default-server tests opt back in via monkeypatch.
+os.environ["QUASAR_DEFAULT_MANNA_URL"] = "off"
 # Isolate the TAP-schema disk cache per test session: without this, a developer
 # machine with a real live cache under cache/datalab_tap_schema would flip the
 # SQL governor's column check from soft (curated-only) to authoritative and make

@@ -95,6 +95,31 @@ def manna_enabled() -> bool:
 # whenever upstream publishes.
 _MANNA_DEFAULT_COMMAND = "uvx --from manna-mcp==0.9.0 manna --stdio"
 
+# The MANNA server every account starts with in Settings > MCP Servers (the
+# project's own hosted MANNA, manna 0.9.0, no key needed). QUASAR_DEFAULT_MANNA_URL
+# points it elsewhere; "off" (or 0 / false / none / empty) turns the default off.
+_DEFAULT_MANNA_URL = "https://48a9-129-114-35-124.ngrok-free.app/manna/mcp"
+_OFF_WORDS = {"", "0", "off", "false", "no", "none"}
+
+
+def default_mcp_servers() -> List[MCPServerConfig]:
+    """Servers added to every account's own list the first time it is loaded.
+
+    They are ordinary per-user rows once added: the user can test, edit or
+    remove them, and a removed default is never added back. Skipped when the
+    platform already mounts MANNA for everyone (QUASAR_ENABLE_MANNA), so the
+    same manna__* tool names are never offered twice in one turn.
+    """
+    raw = os.getenv("QUASAR_DEFAULT_MANNA_URL")
+    url = _DEFAULT_MANNA_URL if raw is None else raw.strip()
+    if url.lower() in _OFF_WORDS or manna_enabled():
+        return []
+    try:
+        return [validate_server_config(MCPServerConfig(name="manna", transport="streamable_http", url=url))]
+    except ValueError as e:
+        print(f"[MCPServerService] Ignoring QUASAR_DEFAULT_MANNA_URL: {e}")
+        return []
+
 
 def _split_command(command_line: str) -> List[str]:
     """Split a command line into argv, keeping Windows paths intact.
@@ -202,6 +227,12 @@ _DEFAULT_LEGACY_DIR = "user_tools"
 # comes from services/mcp_oauth_store.py rather than from saved headers.
 KNOWN_AUTH_KINDS = ("none", "oauth")
 _SCHEMA_READY: set = set()
+_MARKS_READY: set = set()
+# (database, user, default names) already seeded by this process, so a chat
+# turn does not pay the seed queries again (each is a round trip on Turso).
+# Safe to memoize: seeding only ever adds a default once, and the URL a seeded
+# row uses is resolved per load (_load_rows), not written here.
+_DEFAULTS_SEEDED: set = set()
 
 
 def mcp_db_path(explicit: Optional[str] = None) -> str:
@@ -279,6 +310,42 @@ class MCPServerService:
         finally:
             conn.close()
         _SCHEMA_READY.add(key)
+
+    def _marks_ready(self) -> bool:
+        """Create the default-server marks table if needed; False if it cannot
+        be created (default servers are then skipped, saved ones still load).
+
+        One row per default server ever offered to a user. It outlives the
+        server row, which is what keeps a removed default from coming back.
+        ``row_stamp`` is set only when the seed itself inserted the server row:
+        it is that row's ``updated_at``, so the row is "never edited" exactly
+        while the two still match (every save or edit rewrites updated_at).
+        """
+        from services.db import is_using_turso
+
+        key = ("turso",) if is_using_turso() else ("sqlite", os.path.abspath(self._db_path))
+        if key in _MARKS_READY:
+            return True
+        try:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS user_mcp_default_marks (
+                        user_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        row_stamp TEXT,
+                        marked_at TEXT NOT NULL,
+                        PRIMARY KEY (user_id, name)
+                    )"""
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001 - optional table, never fatal
+            print(f"[MCPServerService] Default MCP servers disabled (marks table unavailable): {e}")
+            return False
+        _MARKS_READY.add(key)
+        return True
 
     @staticmethod
     def _encrypt_secrets(env: Dict[str, str], headers: Dict[str, str]) -> Optional[str]:
@@ -364,16 +431,88 @@ class MCPServerService:
 
     # ── public API ───────────────────────────────────────────────────────
     def _load_rows(self, user_id: str) -> List[dict]:
+        defaults = {c.name: c for c in default_mcp_servers()}
+        follow = bool(defaults) and self._marks_ready()
+        rows = None
         conn = self._conn()
         try:
-            rows = conn.execute(
-                """SELECT name, transport, url, command, args_json, secrets_enc, auth, updated_at
-                   FROM user_mcp_servers WHERE user_id = ? ORDER BY created_at, name""",
-                (str(user_id),),
-            ).fetchall()
+            if follow:
+                try:
+                    rows = conn.execute(
+                        """SELECT s.name, s.transport, s.url, s.command, s.args_json, s.secrets_enc, s.auth,
+                                  s.updated_at, m.row_stamp
+                           FROM user_mcp_servers s LEFT JOIN user_mcp_default_marks m
+                             ON m.user_id = s.user_id AND m.name = s.name
+                           WHERE s.user_id = ? ORDER BY s.created_at, s.name""",
+                        (str(user_id),),
+                    ).fetchall()
+                except Exception as e:  # noqa: BLE001 - the optional table must never hide saved servers
+                    print(f"[MCPServerService] Default MCP marks unreadable, loading without them: {e}")
+            if rows is None:
+                rows = conn.execute(
+                    """SELECT name, transport, url, command, args_json, secrets_enc, auth, updated_at, NULL
+                       FROM user_mcp_servers WHERE user_id = ? ORDER BY created_at, name""",
+                    (str(user_id),),
+                ).fetchall()
         finally:
             conn.close()
-        return [d for d in (self._row_to_dict(r) for r in rows) if d]
+        out = []
+        for r in rows:
+            d = self._row_to_dict(tuple(r[:8]))
+            if not d:
+                continue
+            # A default this account got by seeding and never edited uses the
+            # CURRENT default URL, resolved here rather than written back, so
+            # moving the hosted server is an env change and workers on
+            # different configs never fight over the stored row.
+            cfg = defaults.get(d["name"])
+            if cfg is not None and r[8] is not None and r[8] == d["revision"] and d["auth"] == "none":
+                d["transport"], d["url"] = cfg.transport, cfg.url
+            out.append(d)
+        return out
+
+    def _seed_defaults(self, user_id: str) -> None:
+        """Add the default servers (default_mcp_servers) to this user's list.
+
+        Each default is offered once per user, decided inside one atomic
+        write: the server row is inserted only while the user has neither a
+        mark nor a row of that name, and the mark records whether this seed
+        made the row. So a removed default stays removed (even against a
+        request that started before the removal), and a server the user
+        already saved under the same name is never touched or taken over.
+        """
+        from services.db import is_using_turso
+
+        defaults = default_mcp_servers()
+        if not defaults or not self._marks_ready():
+            return
+        db = "turso" if is_using_turso() else os.path.abspath(self._db_path)
+        memo = (db, str(user_id), tuple(c.name for c in defaults))
+        if memo in _DEFAULTS_SEEDED:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        uid = str(user_id)
+        conn = self._conn()
+        try:
+            for cfg in defaults:
+                conn.execute(
+                    """INSERT INTO user_mcp_servers (user_id, name, transport, url, command, args_json,
+                           secrets_enc, auth, created_at, updated_at)
+                       SELECT ?, ?, ?, ?, NULL, '[]', NULL, 'none', ?, ?
+                       WHERE NOT EXISTS (SELECT 1 FROM user_mcp_default_marks WHERE user_id = ? AND name = ?)
+                         AND NOT EXISTS (SELECT 1 FROM user_mcp_servers WHERE user_id = ? AND name = ?)""",
+                    (uid, cfg.name, cfg.transport, cfg.url, now, now, uid, cfg.name, uid, cfg.name))
+                # row_stamp is non-NULL only if the row above is ours (it
+                # carries this seed's timestamp); an existing mark is kept.
+                conn.execute(
+                    """INSERT OR IGNORE INTO user_mcp_default_marks (user_id, name, row_stamp, marked_at)
+                       SELECT ?, ?, (SELECT updated_at FROM user_mcp_servers
+                                     WHERE user_id = ? AND name = ? AND updated_at = ? AND auth = 'none'), ?""",
+                    (uid, cfg.name, uid, cfg.name, now, now))
+            conn.commit()
+        finally:
+            conn.close()
+        _DEFAULTS_SEEDED.add(memo)
 
     def load_servers(self, user_id: str) -> List[dict]:
         """All MCP server configs for a user, secrets decrypted."""
@@ -383,6 +522,10 @@ class MCPServerService:
             self._migrate_legacy(user_id)
         except Exception as e:  # noqa: BLE001 - never block loading on the import
             print(f"[MCPServerService] Legacy MCP import failed for {user_id}: {e}")
+        try:
+            self._seed_defaults(user_id)
+        except Exception as e:  # noqa: BLE001 - a default must never hide saved servers
+            print(f"[MCPServerService] Default MCP servers not added for {user_id}: {e}")
         try:
             return self._load_rows(user_id)
         except Exception as e:  # noqa: BLE001

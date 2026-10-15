@@ -138,7 +138,7 @@ def log_estimate(provider: str, model: str, bd: Dict[str, Any]) -> None:
 
 def _usage_fields(usage: Any) -> Dict[str, Optional[int]]:
     if usage is None:
-        return {"billed_in": None, "cached": None, "billed_out": None}
+        return {"billed_in": None, "cached": None, "billed_out": None, "cache_write": None}
     billed_in = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None)
     billed_out = getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None)
     cached = getattr(usage, "cache_hit_tokens", None)
@@ -147,14 +147,24 @@ def _usage_fields(usage: Any) -> Dict[str, Optional[int]]:
         cached = getattr(det, "cached_tokens", None) if det is not None else None
         if cached is None and isinstance(det, dict):
             cached = det.get("cached_tokens")
-    return {"billed_in": billed_in, "cached": cached, "billed_out": billed_out}
+    # Cache writes (1.25x), already part of billed_in; None when the provider
+    # does not report them. Anthropic: LLMUsage.cache_write_tokens; OpenAI
+    # GPT-5.6+: input_tokens_details.cache_write_tokens.
+    cache_write = getattr(usage, "cache_write_tokens", None)
+    if cache_write is None:
+        det = getattr(usage, "input_tokens_details", None)
+        cache_write = getattr(det, "cache_write_tokens", None) if det is not None else None
+        if cache_write is None and isinstance(det, dict):
+            cache_write = det.get("cache_write_tokens")
+    return {"billed_in": billed_in, "cached": cached, "billed_out": billed_out, "cache_write": cache_write}
 
 
 def log_billed(provider: str, model: str, bd: Optional[Dict[str, Any]], usage: Any, meta: Optional[dict] = None) -> None:
     f = _usage_fields(usage)
     if f["billed_in"] is not None:
         est = (bd or {}).get("est")
-        print(f"[CALL BILLED] {provider} {model} input={f['billed_in']} cached={f['cached']} "
+        cw = f" cache_write={f['cache_write']}" if f["cache_write"] is not None else ""
+        print(f"[CALL BILLED] {provider} {model} input={f['billed_in']} cached={f['cached']}{cw} "
               f"output={f['billed_out']} est={est}")
     path = os.getenv("QUASAR_CALL_TOKENS_LOG", "").strip()
     if not path:

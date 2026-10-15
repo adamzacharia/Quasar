@@ -162,6 +162,63 @@ def test_google_contents_ending_on_tool_output_unchanged():
     assert "function_response" in contents[-1]["parts"][0]
 
 
+def test_google_contents_keep_tool_results_apart_from_a_user_note():
+    # The runner's tool-budget compose round appends a user note after the tool
+    # outputs; Vertex 400s one user turn holding function_response + text.
+    _, contents = LLMClient()._responses_shim._google_contents([
+        {"role": "user", "content": "Where is M87?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "resolve_target", "arguments": "{}"}},
+            {"id": "c2", "function": {"name": "ned_lookup", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "{\"ra\": 187.7}"},
+        {"role": "tool", "tool_call_id": "c2", "content": "{\"z\": 0.004}"},
+        {"role": "user", "content": "Tool budget reached: answer now."},
+    ], model="gemini-3.8-flash")
+    assert [c["role"] for c in contents] == ["user", "model", "user", "user"]
+    assert all("function_response" in p for p in contents[2]["parts"]) and len(contents[2]["parts"]) == 2
+    assert contents[3]["parts"] == [{"text": "Tool budget reached: answer now."}]
+
+
+class _Rejected(Exception):
+    code = 400
+
+
+class _AnyRejectingModels:
+    """generate_content(_stream) stand-in that 400s function calling mode ANY, like Vertex on a big toolset."""
+
+    def __init__(self):
+        self.modes = []
+
+    def _check(self, config):
+        mode = config.get("tool_config", {}).get("function_calling_config", {}).get("mode")
+        self.modes.append((mode, config.get("system_instruction", "")))
+        if mode == "ANY":
+            raise _Rejected("400 INVALID_ARGUMENT. Request contains an invalid argument.")
+
+    def generate_content_stream(self, model, contents, config):
+        self._check(config)  # the real SDK raises on the first chunk; same thing for the shim
+        yield from ()
+
+    def generate_content(self, model, contents, config):
+        self._check(config)
+        return "resp"
+
+
+def test_google_required_tool_choice_falls_back_to_auto_plus_nudge():
+    shim = LLMClient()._responses_shim
+    models = _AnyRejectingModels()
+    client = type("C", (), {"models": models})()
+    call = {"model": "gemini-3.8-flash", "contents": [],
+            "config": {"system_instruction": "sys", "tool_config": {"function_calling_config": {"mode": "ANY"}}}}
+    assert list(shim._google_open_stream(client, call)) == []
+    assert [m for m, _ in models.modes] == ["ANY", "AUTO"]
+    assert models.modes[1][1].startswith("sys\n\nTool use is REQUIRED")
+    assert call["config"]["tool_config"]["function_calling_config"]["mode"] == "ANY"  # caller's kwargs untouched
+    # Any other 400 is not retried.
+    call_auto = {**call, "config": {"tool_config": {"function_calling_config": {"mode": "AUTO"}}}}
+    assert not shim._google_any_rejected(_Rejected(), call_auto)
+
+
 def test_byok_client_ignores_sdk_vertex_env(monkeypatch):
     # The SDK reads GOOGLE_GENAI_USE_VERTEXAI; BYOK must still reach AI Studio.
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")

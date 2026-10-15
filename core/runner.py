@@ -126,6 +126,27 @@ MCP_STEP_SENTINEL = "__mcp_step__"
 MCP_SKIPPED_STATE = "skipped"
 
 
+def _merge_user_mcp_tools(tools: list, user_tools: dict, offered) -> None:
+    """Add a user's MCP tools to this turn's schemas (and ``user_tools``).
+
+    A tool already offered under the same name wins, e.g. the default
+    per-user MANNA once QUASAR_ENABLE_MANNA mounts MANNA for everyone: one
+    turn must never offer a name twice.
+    """
+    taken = {t.get("name") for t in tools}
+    for mt in offered:
+        if mt.name in taken:
+            continue
+        taken.add(mt.name)
+        user_tools[mt.name] = mt
+        tools.append({
+            "type": "function",
+            "name": mt.name,
+            "description": mt.description,
+            "parameters": mt.parameters,
+        })
+
+
 def _user_mcp_step_meta(tool, tool_name: str, step_label: str,
                         used_labels: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
     """Timeline metadata for a call to one of the user's own MCP tools, or None.
@@ -2032,14 +2053,7 @@ def _stream_response_api_impl(
             try:
                 from services.user_mcp import get_user_mcp_pool
 
-                for _mt in get_user_mcp_pool().tools_for(user_id):
-                    _user_mcp_tools[_mt.name] = _mt
-                    tools.append({
-                        "type": "function",
-                        "name": _mt.name,
-                        "description": _mt.description,
-                        "parameters": _mt.parameters,
-                    })
+                _merge_user_mcp_tools(tools, _user_mcp_tools, get_user_mcp_pool().tools_for(user_id))
             except Exception as _umcp_err:
                 print(f"[UserMCP] could not load user MCP tools (non-fatal): {_umcp_err}")
             # Personal tools for this request only (search_my_documents),
@@ -2722,6 +2736,19 @@ def _stream_response_api_impl(
                              and t.get("name") not in set(_tp_sel["names"])]
                 _ordered += [t for t in _tp_all if t.get("type") != "function"]
                 tools = [_tool_packs.find_tools_schema()] + [t for t in _ordered if t.get("name") != _tool_packs.FIND_TOOLS]
+                # Anthropic and OpenAI put tools in the cached prefix, so the
+                # varying packs would otherwise make the fixed core (and the
+                # system prompt) miss the prompt cache on every new question.
+                # Mark the last core tool (a copy); the shim strips the marker
+                # and builds each provider's cache layout around it.
+                if detect_provider(selected_model) in ("anthropic", "openai"):
+                    from core.llm_client import CACHE_BREAKPOINT_KEY
+
+                    _core_n = _tool_packs.core_prefix_len(tools)
+                    # Core-only turns too: the same cached prefix (and a
+                    # history with earlier tool additions stays declared).
+                    if _core_n > 0:
+                        tools[_core_n - 1] = {**tools[_core_n - 1], CACHE_BREAKPOINT_KEY: True}
                 print(
                     f"[TOOL PACKS] offered {len(tools)}/{len(_tp_all) + 1} tools; packs={_tp_sel['packs']} "
                     f"extra={_tp_sel['extra_tools'][:8]} reasons={_tp_sel['reasons']}"
@@ -2922,6 +2949,11 @@ def _stream_response_api_impl(
                     "stream": True,
                     "user_id": user_id,
                     "session_id": conversation_id,
+                    # instructions[:n] is the shared system prompt, the rest the
+                    # per-turn tail; the shim caches the two separately.
+                    "_instructions_static_len": (len(agent.system_prompt)
+                                                 if not _bench_ts.active() and agent.system_prompt
+                                                 and _instructions.startswith(agent.system_prompt) else None),
                     # per-call token accounting only (core/call_tokens.py)
                     "_call_meta": {
                         "round": _eff_round,

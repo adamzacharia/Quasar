@@ -1355,22 +1355,22 @@ def test_platform_token_limit_env_override(monkeypatch):
     from services.usage_quota_service import platform_token_limit
 
     monkeypatch.delenv("QUASAR_PLATFORM_TOKEN_LIMITS", raising=False)
-    assert platform_token_limit("tacc") == 1_000_000
+    assert platform_token_limit("tacc") == 20_000_000
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=5000000, openai=0")
     assert platform_token_limit("tacc") == 5_000_000
     assert platform_token_limit("openai") is None
     assert platform_token_limit("deepseek") == 500_000
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=not-a-number")
-    assert platform_token_limit("tacc") == 1_000_000
+    assert platform_token_limit("tacc") == 20_000_000
     # CX-11 edges: infinity must not raise OverflowError, NaN must not raise,
     # and a negative value is malformed (stock limit), NOT an uncap — only
     # the documented 0 removes the cap.
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=inf")
-    assert platform_token_limit("tacc") == 1_000_000
+    assert platform_token_limit("tacc") == 20_000_000
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=nan")
-    assert platform_token_limit("tacc") == 1_000_000
+    assert platform_token_limit("tacc") == 20_000_000
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=-1")
-    assert platform_token_limit("tacc") == 1_000_000
+    assert platform_token_limit("tacc") == 20_000_000
     # Decimal values truncate toward zero (documented int coercion).
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=2000000.9")
     assert platform_token_limit("tacc") == 2_000_000
@@ -1407,7 +1407,7 @@ def test_env_platform_cap_sub_one_decimal_is_not_an_uncap(quota_store, monkeypat
     from services.usage_quota_service import platform_token_limit
 
     monkeypatch.setenv("QUASAR_PLATFORM_TOKEN_LIMITS", "tacc=0.9")
-    assert platform_token_limit("tacc") == 1_000_000
+    assert platform_token_limit("tacc") == 20_000_000
 
 
 def test_start_run_insert_only_mode(runs):

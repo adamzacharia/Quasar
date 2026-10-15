@@ -19,7 +19,10 @@ on TACC, token plan tmp/token-budget-2026-10-01/PLAN.md). A turn now gets:
 
 Order is fixed (core first, then packs in PACK_ORDER, each pack in its own
 order) so the system prompt + core prefix is byte-identical across turns and
-users, which keeps provider prefix caches warm (plan rank 5).
+users, which keeps provider prefix caches warm (plan rank 5). Anthropic puts
+tools BEFORE the system prompt, so there only the core is shared across
+questions; the runner marks its end for a cache breakpoint
+(``core_prefix_len``, core/llm_client.py CACHE_BREAKPOINT_KEY).
 
 Guards against a missing tool: find_tools; a call to a registered tool that
 was not offered still executes and its pack is added (runner); a round-0
@@ -491,6 +494,23 @@ def order_names(registered: Sequence[str], packs: Sequence[str], extra: Iterable
     return out
 
 
+def core_prefix_len(tools: Sequence[Any]) -> int:
+    """How many leading entries of an offered tool list are CORE tools.
+
+    The runner builds find_tools + core + packs, so this is where the fixed
+    part ends. That boundary is the cross-question prompt-cache prefix for
+    Anthropic, which renders tools BEFORE the system prompt (the docstring's
+    "system prompt + core prefix" only holds for providers that put the
+    system prompt first)."""
+    core = set(CORE)
+    n = 0
+    for t in tools:
+        if not isinstance(t, dict) or t.get("name") not in core:
+            break
+        n += 1
+    return n
+
+
 # ── find_tools meta-tool ─────────────────────────────────────────────────
 
 def find_tools_schema() -> Dict[str, Any]:
@@ -589,5 +609,5 @@ def says_lacks_tool(text: str) -> bool:
 __all__ = [
     "ENV", "FIND_TOOLS", "CORE", "PACKS", "PACK_ORDER", "enabled", "select", "order_names", "packs_for_tool",
     "packs_from_text", "tool_names_in_text", "remember_called", "recently_called", "find_tools_schema",
-    "resolve_find_tools", "says_lacks_tool",
+    "resolve_find_tools", "says_lacks_tool", "core_prefix_len",
 ]

@@ -22,7 +22,7 @@ _LOCAL_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 PLATFORM_TOKEN_LIMITS = {
     "deepseek": 500_000,
     "openai": 100_000,
-    "tacc": 1_000_000,
+    "tacc": 20_000_000,
     # Per 30-day window (PLATFORM_PROVIDER_WINDOW_DAYS); spends Google Cloud credits.
     "google": 1_000_000,
 }
