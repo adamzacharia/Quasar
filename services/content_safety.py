@@ -379,4 +379,18 @@ def sanitize_web_payload(payload: Any) -> Any:
 def safe_assistant_text(text: Any) -> str:
     """Last-resort guard for complete, non-streaming generated text."""
     value = str(text or "")
-    return FILTER_NOTICE if looks_explicit_text(value) else value
+    if not looks_explicit_text(value):
+        return value
+    # Log WHAT matched (pattern + a short context), so a false positive on a science answer can be diagnosed
+    # (ALMAbench round 5: a whole Perseus protostar answer became the notice and nothing said why).
+    try:
+        hits = [(p.pattern, m.start()) for p in _EXPLICIT_PATTERNS for m in [p.search(value)] if m]
+        if not hits:
+            m = _XXX_RE.search(value)
+            hits = [("xxx", m.start())] if m else []
+        for pat, pos in hits[:3]:
+            ctx = value[max(0, pos - 60):pos + 60].replace("\n", " ")
+            print(f"[SAFETY] final answer withheld: pattern {pat!r} near {ctx!r}")
+    except Exception:
+        pass
+    return FILTER_NOTICE

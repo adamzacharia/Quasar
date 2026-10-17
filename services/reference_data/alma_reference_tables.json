@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "verified_on": "2026-09-22",
+  "sources": {
+    "configurations": {"title": "ALMA Cycle 13 Proposer's Guide, Table A-1", "url": "https://almascience.nrao.edu/documents-and-tools/cycle13/alma-proposers-guide", "section": "Table A-1; Chapter 7 of the Technical Handbook", "cycle": 13},
+    "bands": {"title": "ALMA Cycle 13 Proposer's Guide, Table A-4", "url": "https://almascience.nrao.edu/documents-and-tools/cycle13/alma-proposers-guide", "section": "Table A-4; Chapter 4 of the Technical Handbook", "cycle": 13},
+    "cycle12": {"title": "ALMA Cycle 12 Proposer's Guide", "url": "https://almascience.nrao.edu/proposing/proposers-guide-12", "section": "Table 1 and section 4.2", "cycle": 12},
+    "cycle13": {"title": "ALMA Cycle 13 Proposer's Guide", "url": "https://almascience.nrao.edu/proposing/proposers-guide", "section": "Table 1 and section 4.2", "cycle": 13},
+    "cycles": {"title": "ALMA cycle capabilities reference", "url": "https://almascience.nrao.edu/documents-and-tools", "local_reference": "alma-data-skill-main/references/cycle-capabilities.md", "section": "Cycle and project-code year"}
+  },
+  "configuration_reference_frequency_ghz": 100.0,
+  "configuration_cycle": 13,
+  "configuration_rows": [
+    {"configuration": "C-1", "maximum_baseline_km": 0.161, "resolution_min_arcsec": 3.07, "resolution_max_arcsec": 3.31},
+    {"configuration": "C-2", "maximum_baseline_km": 0.314, "resolution_min_arcsec": 2.92, "resolution_max_arcsec": 3.18},
+    {"configuration": "C-3", "maximum_baseline_km": 0.5, "resolution_min_arcsec": 1.91, "resolution_max_arcsec": 2.39},
+    {"configuration": "C-4", "maximum_baseline_km": 0.784, "resolution_min_arcsec": 1.20, "resolution_max_arcsec": 1.41},
+    {"configuration": "C-5", "maximum_baseline_km": 1.4, "resolution_min_arcsec": 0.72, "resolution_max_arcsec": 0.89},
+    {"configuration": "C-6", "maximum_baseline_km": 2.5, "resolution_min_arcsec": 0.40, "resolution_max_arcsec": 0.54},
+    {"configuration": "C-7", "maximum_baseline_km": 3.6, "resolution_min_arcsec": 0.27, "resolution_max_arcsec": 0.30},
+    {"configuration": "C-8", "maximum_baseline_km": 8.5, "resolution_min_arcsec": 0.12, "resolution_max_arcsec": 0.20},
+    {"configuration": "C-9", "maximum_baseline_km": 13.9, "resolution_min_arcsec": 0.062, "resolution_max_arcsec": 0.074},
+    {"configuration": "C-10", "maximum_baseline_km": 16.2, "resolution_min_arcsec": 0.051, "resolution_max_arcsec": 0.057}
+  ],
+  "aca_7m_resolution_arcsec_at_100ghz": 12.7,
+  "bands": [
+    {"band": 1, "frequency_min_ghz": 35, "frequency_max_ghz": 50},
+    {"band": 2, "frequency_min_ghz": 67, "frequency_max_ghz": 116},
+    {"band": 3, "frequency_min_ghz": 84, "frequency_max_ghz": 116},
+    {"band": 4, "frequency_min_ghz": 125, "frequency_max_ghz": 163},
+    {"band": 5, "frequency_min_ghz": 158, "frequency_max_ghz": 211},
+    {"band": 6, "frequency_min_ghz": 211, "frequency_max_ghz": 275},
+    {"band": 7, "frequency_min_ghz": 275, "frequency_max_ghz": 373},
+    {"band": 8, "frequency_min_ghz": 385, "frequency_max_ghz": 500},
+    {"band": 9, "frequency_min_ghz": 602, "frequency_max_ghz": 720},
+    {"band": 10, "frequency_min_ghz": 787, "frequency_max_ghz": 950}
+  ],
+  "offered_bands": {"12": [1,3,4,5,6,7,8,9,10], "13": [1,2,3,4,5,6,7,8,9,10]},
+  "cycles": [
+    {"cycle": 0, "project_code_prefixes": ["2011.0"]},
+    {"cycle": 1, "project_code_prefixes": ["2012.1"]},
+    {"cycle": 2, "project_code_prefixes": ["2013.1"]},
+    {"cycle": 3, "project_code_prefixes": ["2015.1"]},
+    {"cycle": 4, "project_code_prefixes": ["2016.1"]},
+    {"cycle": 5, "project_code_prefixes": ["2017.1"]},
+    {"cycle": 6, "project_code_prefixes": ["2018.1"]},
+    {"cycle": 7, "project_code_prefixes": ["2019.1", "2019.2"]},
+    {"cycle": 8, "project_code_prefixes": ["2021.1"]},
+    {"cycle": 9, "project_code_prefixes": ["2022.1"]},
+    {"cycle": 10, "project_code_prefixes": ["2023.1"]},
+    {"cycle": 11, "project_code_prefixes": ["2024.1"]},
+    {"cycle": 12, "project_code_prefixes": ["2025.1"], "planned_start": "2025-10-01", "planned_end": "2026-09-30"},
+    {"cycle": 13, "project_code_prefixes": ["2026.1"], "planned_start": "2026-10-01"}
+  ]
+}

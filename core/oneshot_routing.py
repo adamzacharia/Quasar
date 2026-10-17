@@ -110,9 +110,33 @@ def _code_task(query: str) -> str:
     return "query by object name"
 
 
+# Every archive one-shot answer: smaller models (gpt-oss-120b, ALMAbench round 2) quoted the headline number and
+# dropped the items, the method and the caveats the tool returned ("Provide answer... No extra"). Generic.
+RESULT_ANSWER_NOTE = (
+    " From the tool result, report: the answer itself (counts AND the items: ids, names, dates), how it was obtained "
+    "(the method, and the reproducible query or link when the result gives one), and every caveat, limit, reason or "
+    "completeness statement the result states (notes, warnings, method_caveats). Then answer any how/why part of the "
+    "question from standard knowledge. Do not shorten the answer to the headline."
+)
+
+
+def with_result_note(directive: str) -> str:
+    """Append RESULT_ANSWER_NOTE once to a non-empty directive."""
+    if not directive or RESULT_ANSWER_NOTE in directive:
+        return directive
+    return directive + RESULT_ANSWER_NOTE
+
+
 def detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
     """The one-shot tool a question maps to, with suggested arguments and the
-    MANDATORY directive text; None when no one-shot tool applies."""
+    MANDATORY directive text (plus RESULT_ANSWER_NOTE); None when no one-shot tool applies."""
+    route = _detect_oneshot_intent(query)
+    if route and route.get("directive"):
+        route = dict(route, directive=with_result_note(route["directive"]))
+    return route
+
+
+def _detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
     q = str(query or "")
     if not q.strip():
         return None
@@ -182,7 +206,11 @@ def detect_oneshot_intent(query: str) -> Optional[Dict[str, Any]]:
                 "\n\nMANDATORY INSTRUCTION: The user wants code to query the ALMA Science Archive. You MUST call `code_recipe` "
                 f"now -- once per library: {json.dumps(calls)}. Present each returned snippet VERBATIM in a ```python block "
                 "and explain it briefly; use ONLY the function names in the returned code (they are tested). Cite the "
-                "returned documentation URL. Do NOT invent API calls such as Alma.get_data_links or Alma.query_sql."
+                "returned documentation URL. When a result has `nearest_recipe`, follow its note: the tested snippet "
+                "verbatim, then a labelled adapted version. Do NOT invent API calls such as Alma.get_data_links or Alma.query_sql. "
+                "If a call returns no snippet, still give working code for that library: write a short standard snippet "
+                "with the documented calls and ivoa.obscore columns its `fallback` lists, and say it is written from the "
+                "library documentation, not a tested recipe. Never answer a code request without code."
             ),
         }
     if not alma:
@@ -661,6 +689,15 @@ def census_arguments(route: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     return None
 
 
+# "Do NOT answer from memory" is about archive facts. Unscoped, it also dropped
+# the method half of mixed questions (ALMAbench 2026-10-15 A29: nu_obs =
+# nu_rest / (1 + z), CO rest frequencies, which line lands in which band).
+_CENSUS_METHOD_NOTE = (
+    " That rule covers archive counts, lists and identifiers only: if the user also asks how or why (a formula, a method, "
+    "which lines or bands apply, caveats), answer that part fully from standard astronomy knowledge after the tool result."
+)
+
+
 def census_directive(route: Optional[Dict[str, Any]]) -> str:
     plan = census_arguments(route)
     if plan is None:
@@ -668,7 +705,8 @@ def census_directive(route: Optional[Dict[str, Any]]) -> str:
             "\n\nMANDATORY INSTRUCTION: The user is asking a live ALMA Science Archive count/filter question. Call the one-shot "
             "tool that fits: `alma_project_census` (constraint.type solar | arrays | lines | redshift | bandwidth_switching; "
             "counts computed at the archive server) or `alma_source_summary` (a target's data with band/resolution filters). "
-            "Quote the tool's `headline` count and its completeness statement. Do NOT answer from memory."
+            "Quote the tool's `headline` count and its completeness statement. Do NOT answer from memory." + _CENSUS_METHOD_NOTE
+            + RESULT_ANSWER_NOTE
         )
     extra = ""
     if plan["tool"] == "alma_source_summary":
@@ -680,6 +718,7 @@ def census_directive(route: Optional[Dict[str, Any]]) -> str:
         "count), its completeness statement ('complete' or 'partial: ... not scanned'), and the per-project table from the "
         "data card. Science scans only: never present a calibrator (e.g. a quasar phase calibrator) as the observed target. "
         "For redshift questions the z range is coverage-compatible, NOT a measured redshift. Do NOT answer from memory."
+        + _CENSUS_METHOD_NOTE + RESULT_ANSWER_NOTE
     )
 
 
@@ -690,6 +729,7 @@ def cross_archive_directive(route: Optional[Dict[str, Any]]) -> str:
         f"now with these arguments: {route_text}. It queries ALMA with one point cone per source and MAST per source, and "
         "returns a per-archive status column. Report its `headline`; if `alma_status_unknown_for` > 0, say plainly that the "
         "ALMA status of those sources is UNKNOWN (the phase timed out) -- never that they lack ALMA data."
+        + RESULT_ANSWER_NOTE
     )
 
 
@@ -704,6 +744,7 @@ def overlay_directive(query: str) -> str:
         "\n\nMANDATORY INSTRUCTION: The user wants ALMA contours over a JWST/HST colourscale image. You MUST call "
         f"`archive_overlay` now (arguments: {json.dumps(args)}; set `field` to the named region or pass ra/dec). If it returns "
         "status='coverage_gap', do NOT search further: tell the user which side is missing and offer the alternatives it lists."
+        + RESULT_ANSWER_NOTE
     )
 
 

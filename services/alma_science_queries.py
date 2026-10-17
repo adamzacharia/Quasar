@@ -404,7 +404,13 @@ def wavelength_overlap_where(nu_lo_ghz: float, nu_hi_ghz: float) -> str:
     return f"(em_min <= {lam_max:.12g} AND em_max >= {lam_min:.12g})"
 
 
-def alma_cone_where(ra: float, dec: float, radius_deg: float, *, footprint: bool = True) -> str:
+# Extra radius searched for pointing centres in the extent-sized ("contains") cone mode: fields up to 1 degree
+# across whose centre lies outside the cone still reach it. Larger fields centred further out are not searched.
+EXTENT_CENTRE_PAD_DEG = 0.5
+OVERLAP_TOLERANCE_DEG = 2.0 / 3600.0
+
+
+def alma_cone_where(ra: float, dec: float, radius_deg: float, *, footprint: Any = True) -> str:
     """Cone predicate over the s_region FOOTPRINT unioned with the representative
     point (s_ra, s_dec).
 
@@ -418,6 +424,29 @@ def alma_cone_where(ra: float, dec: float, radius_deg: float, *, footprint: bool
     """
     circle = f"CIRCLE('ICRS', {float(ra):.8f}, {float(dec):.8f}, {float(radius_deg):.8f})"
     point = f"CONTAINS(POINT('ICRS', s_ra, s_dec), {circle}) = 1"
+    if footprint == "contains":
+        # Field overlap computed AT THE SERVER (guard CX-04/CX-09): a pointing centre within radius + its field
+        # radius (s_fov/2), searched among centres inside radius + EXTENT_CENTRE_PAD_DEG (indexed CONTAINS), plus
+        # pointing centres in the cone (NULL s_fov) and footprints containing the centre position. The overlap test is
+        # flat-sky with the RA offset scaled at the mean declination (see dra below). Live
+        # 2026-10-16: same MOUS sets as INTERSECTS (NGC 253 Band 3 15': 34; an 8.6' galaxy cone: 44) in 8-13 s
+        # against 30-54 s. ADQL DISTANCE() is not usable on ALMA TAP (it returned ~49.9 for a 2" separation).
+        # Near a pole or across RA 0/360 the flat test breaks, so the footprint INTERSECTS form is used there.
+        outer = float(radius_deg) + EXTENT_CENTRE_PAD_DEG
+        cos_dec = math.cos(math.radians(float(dec)))
+        if abs(float(dec)) + outer >= 80.0 or float(ra) - outer / cos_dec < 0.0 or float(ra) + outer / cos_dec >= 360.0:
+            return f"(INTERSECTS({circle}, s_region) = 1 OR {point})"
+        # RA offset scaled by cos of the MEAN declination of the pair (guard CX-04: cos of the source declination
+        # alone was 3" off at dec -70 for a 0.3-deg separation). ADQL here runs on Oracle: COS exists, RADIANS does
+        # not, so the degree-to-radian factor is a literal. Error well under 0.1" for separations below 1 degree.
+        dra = f"((s_ra - {float(ra):.8f}) * COS((s_dec + ({float(dec):.8f})) * {math.pi / 360.0:.15f}))"
+        ddec = f"(s_dec - ({float(dec):.8f}))"
+        # Inclusive by OVERLAP_TOLERANCE_DEG (2"): the flat form is up to ~0.3" off near |dec| 75 at 0.75 deg
+        # separations (guard CX-04), so a true overlap is never rejected; a field up to 2" short of the cone may be kept.
+        reach = f"({float(radius_deg) + OVERLAP_TOLERANCE_DEG:.8f} + s_fov / 2.0)"
+        overlap = (f"(CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {float(ra):.8f}, {float(dec):.8f}, {outer:.8f})) = 1 "
+                   f"AND {dra} * {dra} + {ddec} * {ddec} <= {reach} * {reach})")
+        return f"({point} OR {overlap} OR CONTAINS(POINT('ICRS', {float(ra):.8f}, {float(dec):.8f}), s_region) = 1)"
     if not footprint:
         return point
     return f"(INTERSECTS({circle}, s_region) = 1 OR {point})"
@@ -433,8 +462,12 @@ def alma_cone_filters_where(
     band: Any = None,
     max_resolution_arcsec: Optional[float] = None,
     science_only: bool = False,
+    released_before: Optional[str] = None,
 ) -> str:
     """Cone predicate PLUS the user's structured filters, all in ADQL.
+
+    ``released_before`` (ISO date) keeps rows with obs_release_date before that date, in the query: ALMAbench
+    2026-10-15 A22 ('released before Jan 1 2026') had models hand-write a slow date-cut query that timed out.
 
     UI benchmark 2026-09-22 (D16): "Band 6 observations of M83" ran a TOP 100
     cone with no band filter and kept whatever Band 6 rows fell in the first
@@ -456,6 +489,12 @@ def alma_cone_filters_where(
         where += f" AND spatial_resolution <= {threshold:g}"
     if science_only:
         where += " AND science_observation = 'T'"
+    if released_before:
+        try:
+            cut = date.fromisoformat(str(released_before).strip()[:10]).isoformat()
+        except ValueError:
+            raise ValueError("released_before must be an ISO date (YYYY-MM-DD)")
+        where += f" AND obs_release_date < '{cut}'"
     return where
 
 
@@ -471,11 +510,12 @@ def alma_cone_adql(
     band: Any = None,
     max_resolution_arcsec: Optional[float] = None,
     science_only: bool = False,
+    released_before: Optional[str] = None,
 ) -> str:
     """The cone query the ALMA client executes (and what provenance reports)."""
     where = alma_cone_filters_where(
         ra, dec, radius_deg, public=public, footprint=footprint, band=band,
-        max_resolution_arcsec=max_resolution_arcsec, science_only=science_only,
+        max_resolution_arcsec=max_resolution_arcsec, science_only=science_only, released_before=released_before,
     )
     top_clause = f"TOP {max(1, min(int(top), 20000))} " if top else ""
     return f"SELECT {top_clause}{', '.join(columns)} FROM ivoa.obscore WHERE {where}"
@@ -491,14 +531,31 @@ def alma_cone_count_adql(
     band: Any = None,
     max_resolution_arcsec: Optional[float] = None,
     science_only: bool = False,
+    released_before: Optional[str] = None,
 ) -> str:
     """Companion ``SELECT COUNT(*)`` for the same cone + filters, so a
     TOP-capped result can say "N rows total, showing M"."""
     where = alma_cone_filters_where(
         ra, dec, radius_deg, public=public, footprint=footprint, band=band,
-        max_resolution_arcsec=max_resolution_arcsec, science_only=science_only,
+        max_resolution_arcsec=max_resolution_arcsec, science_only=science_only, released_before=released_before,
     )
     return f"SELECT COUNT(*) AS total_rows, COUNT(DISTINCT member_ous_uid) AS total_mous FROM ivoa.obscore WHERE {where}"
+
+
+QUALITY_CUTS = ("max_resolution_arcsec",)
+
+
+def alma_cone_funnel_adql(ra: float, dec: float, radius_deg: float, **filters: Any) -> Optional[str]:
+    """MOUS and project counts for the same cone and scope filters (band, public, release date) WITHOUT the quality
+    cut (the resolution limit), or None when it is not set (science-only is a tool default, not a user cut, so it
+    stays). Lets an answer give the funnel ("N
+    datasets on the target in this band, M of them pass the resolution limit"), ALMAbench round 5."""
+    if not any(filters.get(k) not in (None, False) for k in QUALITY_CUTS):
+        return None
+    scope = {k: v for k, v in filters.items() if k not in QUALITY_CUTS}
+    where = alma_cone_filters_where(ra, dec, radius_deg, **scope)
+    return ("SELECT COUNT(DISTINCT member_ous_uid) AS n_mous, COUNT(DISTINCT proposal_id) AS n_projects "
+            f"FROM ivoa.obscore WHERE {where}")
 
 
 def science_cone_query(ra, dec, radius_arcsec=60.0, *, band=None,
@@ -731,14 +788,26 @@ def infer_arrays(text: Any) -> List[str]:
     are still recognised as a fallback for display-shaped values. This is a
     heuristic, not an identity contract: heterogeneous EBs can mix 7-m and
     12-m antennas and the result then lists both.
+
+    PM antennas are 12-m dishes and are often scheduled into 12-m (and some
+    7-m) interferometric arrays: live Cycle 9 ObsCore (2026-10-16) has 713
+    ``_TM1``/``_TM2`` rows whose antenna list includes a PM antenna. So a PM
+    antenna means Total Power ONLY when every antenna of the row is PM.
     """
     raw = as_text(text)
-    arrays: List[str] = []
+    prefixes: List[str] = []
     for match in _ANTENNA_PREFIX_RE.finditer(raw):
-        label = _ANTENNA_PREFIX_TO_ARRAY[match.group(1).upper()]
-        if label not in arrays:
-            arrays.append(label)
-    if arrays:
+        prefix = match.group(1).upper()
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+    arrays: List[str] = []
+    if prefixes:
+        if prefixes == ["PM"]:
+            return ["TP"]
+        for prefix in prefixes:
+            label = _ANTENNA_PREFIX_TO_ARRAY[prefix]
+            if label != "TP" and label not in arrays:
+                arrays.append(label)
         return arrays
     clean = raw.lower()
     if re.search(r"\b12\s*m\b|12m|array.*twelve|_tm[12]\b|tm[12]", clean):
@@ -751,20 +820,42 @@ def infer_arrays(text: Any) -> List[str]:
 
 
 def infer_arrays_from_schedblock(name: Any) -> List[str]:
-    """``_TM1``/``_TM2`` -> 12m, ``_7M`` -> 7m, ``_TP`` -> TP (SB-name heuristic)."""
-    clean = as_text(name).upper()
-    arrays: List[str] = []
-    if re.search(r"_TM[12]\b", clean):
-        arrays.append("12m")
-    if re.search(r"_7M\b", clean):
-        arrays.append("7m")
-    if re.search(r"_TP\b", clean):
-        arrays.append("TP")
-    return arrays
+    """``_TM1``/``_TM2`` -> 12m, ``_7M`` -> 7m, ``_TP`` -> TP (SB-name heuristic).
+
+    Only the FINAL suffix counts: a token such as ``_TP-cal`` inside a 12m SB name is not an array (guard CX-10).
+    Every Cycle 9 SB name in live ObsCore (2983, 2026-10-16) ends in _TM1/_TM2/_7M/_TP or _INT."""
+    m = re.search(r"_(TM[12]|7M|TP)$", as_text(name).strip().upper())
+    if not m:
+        return []
+    return ["12m" if m.group(1).startswith("TM") else ("7m" if m.group(1) == "7M" else "TP")]
+
+
+def classify_array_row(antenna_arrays: Any, schedblock_name: Any = "") -> List[str]:
+    """Array label(s) of one ObsCore row. The scheduling-block suffix
+    (``_TM1``/``_TM2``/``_7M``/``_TP``) names the array the SB was built for
+    and wins when present; otherwise the antenna list decides (see
+    :func:`infer_arrays`: PM-only = TP, PM inside a 12-m/7-m list is not TP)."""
+    from_sb = infer_arrays_from_schedblock(schedblock_name)
+    if from_sb:
+        return from_sb
+    return infer_arrays(antenna_arrays)
+
+
+ARRAY_DEFINITION_NOTE = (
+    "Array of each row: the scheduling-block name suffix (_TM1/_TM2 = 12m, _7M = 7m, _TP = Total Power) when present, "
+    "else the antenna names (DV/DA = 12m, CM = 7m). PM antennas are 12-m dishes that also join 12m and 7m "
+    "interferometric arrays, so a row counts as Total Power only when ALL its antennas are PM: a PM antenna in a "
+    "12m or 7m antenna list does not make the data Total Power. ObsCore rows are finer than datasets (one row per "
+    "spectral window / execution), so rows are grouped by member_ous_uid, then by proposal_id."
+)
 
 
 def detect_arrays(row: pd.Series) -> List[str]:
-    """Union of antenna-prefix and SB-name heuristics for one ObsCore row."""
+    """Array label(s) of one ObsCore row (SB-name suffix first, then antennas)."""
+    sb = row.get("schedblock_name") if "schedblock_name" in row.index else ""
+    from_sb = infer_arrays_from_schedblock(sb)
+    if from_sb:
+        return from_sb
     arrays: List[str] = []
     for key in ("antenna_arrays", "array", "arrays"):
         if key in row.index:
@@ -855,7 +946,7 @@ def projects_with_array_combo(df: pd.DataFrame, required_arrays: Sequence[str]) 
                 "rows": int(len(group)),
                 "n_mous": _nunique(group, "member_ous_uid"),
                 "n_eb": _nunique(group, "asdm_uid"),
-                "array_inference": "heuristic: antenna prefixes DV/DA=12m, CM=7m, PM=TP (+ SB-name suffix); the archive delivers per-MOUS and has not combined arrays",
+                "array_inference": "heuristic: SB-name suffix, else antenna prefixes DV/DA=12m, CM=7m, PM-only=TP; the archive delivers per-MOUS and has not combined arrays",
                 "target_name": first_nonempty(group["target_name"].tolist()) if "target_name" in group.columns else "",
                 "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group.columns else "",
                 "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group.columns else "",

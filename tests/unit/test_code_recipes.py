@@ -55,6 +55,32 @@ def test_alminer_recipe_only_names_real_functions():
     assert missing == [], f"alminer recipe names non-existent functions: {missing}"
 
 
+def test_recipe_keyword_arguments_exist_in_the_installed_libraries():
+    """2026-10-16: the ALMiner recipe called run_query(adql, print_targets=False), which the installed alminer
+    rejects (TypeError), so the 'tested' snippet stopped at step 3. Every keyword a recipe passes to an alminer.* or
+    Alma method must be in that function's signature."""
+    import inspect
+
+    alminer = pytest.importorskip("alminer")
+    from astroquery.alma import Alma
+
+    bad = []
+    for path in RECIPES:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)):
+                continue
+            owner, attr = node.func.value.id, node.func.attr
+            fn = getattr(alminer, attr, None) if owner == "alminer" else getattr(Alma, attr, None) if owner == "alma" else None
+            if fn is None or not callable(fn):
+                continue
+            params = inspect.signature(fn).parameters
+            if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                continue
+            bad += [f"{path.name}: {owner}.{attr}({kw.arg}=...)" for kw in node.keywords if kw.arg and kw.arg not in params]
+    assert bad == [], bad
+
+
 def test_pyvo_recipes_use_tapservice_search():
     for path in RECIPES:
         if path.name.startswith("pyvo_"):
@@ -76,12 +102,18 @@ def test_code_recipe_tool_serves_the_files():
     assert out["recipes"][0]["file"].endswith("alminer_alminer.py")
     out = cap.run(cap.InputModel(task="ADQL via TAP", library="pyvo"), CallContext()).to_native()
     assert out["recipes"][0]["file"].endswith("pyvo_adql.py")
+    out = cap.run(cap.InputModel(task="list all observations of a galaxy in Band 3 released before a date", library="pyvo"),
+                  CallContext()).to_native()
+    assert out["recipes"][0]["file"].endswith("pyvo_dataset_list.py") and out["recipes"][0]["task"] == "dataset_list"
+    out = cap.run(cap.InputModel(task="list every MOUS released before 2025", library="astroquery"), CallContext()).to_native()
+    assert out["recipes"][0]["file"].endswith("astroquery_dataset_list.py")
     bad = cap.run(cap.InputModel(task="anything", library="fortran"), CallContext()).to_native()
     assert bad["success"] is False
 
 
 @pytest.mark.skipif(os.getenv("RUN_LIVE_RECIPE_TESTS") != "1", reason="live archive; set RUN_LIVE_RECIPE_TESTS=1")
-@pytest.mark.parametrize("name", ["astroquery_object_search.py", "astroquery_adql.py", "pyvo_adql.py", "pyvo_cone_search.py"])
+@pytest.mark.parametrize("name", ["astroquery_object_search.py", "astroquery_adql.py", "pyvo_adql.py", "pyvo_cone_search.py",
+                                  "pyvo_dataset_list.py", "astroquery_dataset_list.py"])
 def test_recipes_run_live(name):
     path = next(p for p in RECIPES if p.name == name)
     ns: dict = {}
@@ -106,3 +138,34 @@ def test_code_recipe_returns_runnable_code_without_the_metadata_docstring():
             ast.parse(r["code"])
             assert '"""' not in r["code"].split("\n", 3)[1] and "tests/unit" not in r["code"]
             assert r["last_tested"]
+
+
+@pytest.mark.parametrize("name", ["pyvo_dataset_list.py", "astroquery_dataset_list.py"])
+def test_dataset_list_recipes_refuse_an_overflowed_answer(name, monkeypatch):
+    """Guard CX-12: pyvo stays silent when the answer is exactly the requested cap; the recipe must check OVERFLOW."""
+    import astropy.coordinates
+    import pyvo
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+
+    class _Res:
+        query_status = "OVERFLOW"
+
+        def to_table(self):
+            return Table({"member_ous_uid": ["uid://A001/X1/X1"], "proposal_id": ["2019.1.00001.S"]})
+
+    class _Svc:
+        def __init__(self, *a, **k):
+            pass
+
+        def search(self, *a, **k):
+            return _Res()
+
+    monkeypatch.setattr(astropy.coordinates.SkyCoord, "from_name", classmethod(lambda cls, name: SkyCoord(10.0, -20.0, unit="deg")))
+    monkeypatch.setattr(pyvo.dal, "TAPService", _Svc)
+    from astroquery.alma.core import AlmaClass  # `Alma` is an instance; Alma() returns a fresh AlmaClass
+
+    monkeypatch.setattr(AlmaClass, "query_tap", lambda self, q, **k: _Res())
+    path = next(p for p in RECIPES if p.name == name)
+    with pytest.raises(SystemExit, match="row cap reached"):
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), {})  # noqa: S102

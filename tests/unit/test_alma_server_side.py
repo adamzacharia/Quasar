@@ -59,31 +59,47 @@ def test_solar_projects_aggregate_is_grouped_by_project_and_science_only():
     assert out.complete and out.unit == "projects" and out.n_units == 1
     row = out.frame.iloc[0]
     assert row["proposal_id"] == "2023.1.01040.S" and row["target_name"] == "Sun" and row["n_mous"] == 7
-    assert "12m" in row["arrays"] and "7m" in row["arrays"] and "TP" in row["arrays"]
+    assert "12m" in row["arrays"] and "7m" in row["arrays"] and "TP" not in row["arrays"], "a PM dish in a 12m list is not TP"
     assert "complete" in out.completeness_note()
 
 
-def test_array_combo_intersects_one_distinct_query_per_array():
-    def distinct(pattern_projects):
-        return lambda q: pd.DataFrame({"proposal_id": pattern_projects})
-
+def test_array_combo_classifies_rows_and_groups_by_mous_then_project():
+    rows = [
+        # 2022.1.00007.S: 12m SB (with a PM dish in it), 7m SB, a PM-only TP row -> all three arrays, one group OUS.
+        ("2022.1.00007.S", "g7", "m1", "X_a_06_TM1", "A001:DV01 A002:DA45 N601:PM03"),
+        ("2022.1.00007.S", "g7", "m2", "X_a_06_7M", "J501:CM01 J502:CM02 N602:PM02"),
+        ("2022.1.00007.S", "g7", "m3", "X_a_06_TP", "N601:PM01 N602:PM04"),
+        # 2022.1.00005.S: 12m + 7m, and PM antennas only ever inside the 12m list -> NOT Total Power.
+        ("2022.1.00005.S", "g5", "m4", "Y_a_06_TM1", "A001:DV01 N601:PM02"),
+        ("2022.1.00005.S", "g5", "m5", "Y_a_06_7M", "J501:CM01"),
+        # 2022.1.00012.S: all three, but TP sits in a different group OUS; no SB suffix (antennas decide).
+        ("2022.1.00012.S", "g12a", "m6", "Z", "A001:DV01"),
+        ("2022.1.00012.S", "g12a", "m7", "Z", "J501:CM01"),
+        ("2022.1.00012.S", "g12b", "m8", "Z", "N601:PM01"),
+        # 2022.1.00049.S: heterogeneous 12m SB with 7m antennas + TP: only counts under the loose definition.
+        ("2022.1.00049.S", "g49", "m9", "S_a_03_TM1", "A001:DV01 J501:CM01"),
+        ("2022.1.00049.S", "g49", "m10", "S_a_03_TP", "N601:PM01"),
+    ]
     rec = _Recorder({
-        r"antenna_arrays LIKE '%:DV%'": distinct(["2022.1.00005.S", "2022.1.00007.S", "2022.1.00012.S"]),
-        r"antenna_arrays LIKE '%:CM%'": distinct(["2022.1.00007.S", "2022.1.00049.S"]),
-        r"antenna_arrays LIKE '%:PM%'": distinct(["2022.1.00007.S", "2022.1.00005.S"]),
+        r"SELECT DISTINCT proposal_id, group_ous_uid, member_ous_uid": lambda q: pd.DataFrame(
+            rows, columns=["proposal_id", "group_ous_uid", "member_ous_uid", "schedblock_name", "antenna_arrays"]),
         r"GROUP BY proposal_id": lambda q: pd.DataFrame([
             {"proposal_id": p, "n_mous": i + 2, "n_eb": i + 3, "n_rows": 10 * (i + 1), "target_name": f"T{i}", "pi_name": "PI", "obs_title": "t", "band_list": "6"}
             for i, p in enumerate(["2022.1.00005.S", "2022.1.00007.S", "2022.1.00012.S", "2022.1.00049.S"])
         ]),
     })
     out = ss.array_combo_projects_server_side(rec, 9, ["12m", "7m", "TP"])
-    assert len(rec.queries) == 4
-    assert sum("SELECT DISTINCT proposal_id" in q for q in rec.queries) == 3
+    assert len(rec.queries) == 2
     assert all("(proposal_id LIKE '2022.1.%' OR proposal_id LIKE '2022.2.%' OR proposal_id LIKE '2022.A.%')" in q for q in rec.queries)
-    assert list(out.frame["proposal_id"]) == ["2022.1.00007.S"], "only the project in ALL three sets"
-    assert out.frame.iloc[0]["n_mous"] == 3
-    assert out.extras["projects_in_window"] == 4 and out.extras["matching_projects"] == 1
-    assert out.extras["per_array_project_counts"] == {"12m": 3, "7m": 2, "TP": 2}
+    assert list(out.frame["proposal_id"]) == ["2022.1.00007.S", "2022.1.00012.S"]
+    assert out.frame.iloc[0]["n_mous"] == 3 and out.frame.iloc[0]["mous_per_array"] == "12m=1, 7m=1, TP=1"
+    assert list(out.frame["all_in_one_group_ous"]) == [True, False]
+    assert out.extras["projects_in_window"] == 4 and out.extras["matching_projects"] == 2
+    assert out.extras["matching_project_ids"] == ["2022.1.00007.S", "2022.1.00012.S"]
+    assert out.extras["per_array_project_counts"] == {"12m": 4, "7m": 3, "TP": 3}
+    assert out.extras["alternative_counts"] == {"all_arrays_in_one_group_ous": 1, "heterogeneous_rows_count_as_both": 3,
+                                                "naive_any_pm_antenna_is_tp": 4}
+    assert "PM antenna in a 12m or 7m antenna list does not make the data Total Power" in out.extras["array_definition"]
     assert out.complete
 
 
@@ -274,12 +290,11 @@ def test_capability_array_combo_headline_is_the_matching_count_not_the_window_co
     from tests.unit.test_alma_capability import _run
 
     def answer(q):
-        if "SELECT DISTINCT proposal_id" in q:
-            if ":DV%" in q:
-                return pd.DataFrame({"proposal_id": ["A", "B", "C"]})
-            if ":CM%" in q:
-                return pd.DataFrame({"proposal_id": ["B", "C"]})
-            return pd.DataFrame({"proposal_id": ["C"]})
+        if "SELECT DISTINCT proposal_id, group_ous_uid" in q:
+            rows = [("A", "a", "a1", "A_TM1", "A001:DV01"), ("B", "b", "b1", "B_TM1", "A001:DV01 N601:PM01"),
+                    ("B", "b", "b2", "B_7M", "J501:CM01"), ("C", "c", "c1", "C_TM1", "A001:DV01"),
+                    ("C", "c", "c2", "C_7M", "J501:CM01"), ("C", "c", "c3", "C_TP", "N601:PM01")]
+            return pd.DataFrame(rows, columns=["proposal_id", "group_ous_uid", "member_ous_uid", "schedblock_name", "antenna_arrays"])
         return pd.DataFrame([{"proposal_id": p, "n_mous": 2, "n_eb": 2, "n_rows": 5, "target_name": "t", "pi_name": "p", "obs_title": "o", "band_list": "6"} for p in "ABCDEFGH"])
 
     ctx, _, _ = _capability_ctx(answer)

@@ -1,0 +1,690 @@
+{
+ "name": "VANDAM Perseus protostars",
+ "n_sources": 97,
+ "citation": "Tobin et al. 2016, ApJ 818, 73 (VLA Nascent Disk and Multiplicity survey of Perseus protostars), Table 1",
+ "source_url": "https://vizier.cds.unistra.fr/viz-bin/VizieR?-source=J/ApJ/818/73",
+ "retrieved": "2026-10-16",
+ "coordinates": "ICRS degrees (J2000 from the catalogue)",
+ "sources": [
+  {
+   "source_name": "Per-emb-1",
+   "ra": 55.986692,
+   "dec": 32.013945,
+   "other_names": "HH211-MMS",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-2",
+   "ra": 53.0747,
+   "dec": 30.829951,
+   "other_names": "IRAS 03292+3039",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-3",
+   "ra": 52.252396,
+   "dec": 31.200057,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-4",
+   "ra": 52.162921,
+   "dec": 31.1005,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-5",
+   "ra": 52.837246,
+   "dec": 30.758409,
+   "other_names": "IRAS 03282+3035",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-6",
+   "ra": 53.310017,
+   "dec": 31.119643,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-7",
+   "ra": 52.636171,
+   "dec": 30.440689,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-8",
+   "ra": 56.183258,
+   "dec": 32.026447,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-9",
+   "ra": 52.465967,
+   "dec": 31.65164,
+   "other_names": "IRAS 03267+3128, Perseus5",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-10",
+   "ra": 53.318433,
+   "dec": 31.114462,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-11",
+   "ra": 55.987771,
+   "dec": 32.05133,
+   "other_names": "IC348MMS",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-12",
+   "ra": 52.293904,
+   "dec": 31.225259,
+   "other_names": "NGC 1333 IRAS4A",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-13",
+   "ra": 52.300067,
+   "dec": 31.218897,
+   "other_names": "NGC 1333 IRAS4B",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-14",
+   "ra": 52.30645,
+   "dec": 31.232819,
+   "other_names": "NGC 1333 IRAS4C",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-15",
+   "ra": 52.266896,
+   "dec": 31.246177,
+   "other_names": "RNO15-FIR",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-16",
+   "ra": 55.962408,
+   "dec": 32.056695,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-17",
+   "ra": 51.912937,
+   "dec": 30.217519,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-18",
+   "ra": 52.296908,
+   "dec": 31.308631,
+   "other_names": "NGC 1333 IRAS7",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-19",
+   "ra": 52.347908,
+   "dec": 31.558104,
+   "other_names": "",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-20",
+   "ra": 51.930317,
+   "dec": 30.207995,
+   "other_names": "L1455-IRS4",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-21",
+   "ra": 52.29445,
+   "dec": 31.305609,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-22",
+   "ra": 51.343371,
+   "dec": 30.753683,
+   "other_names": "L1448-IRS2",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-23",
+   "ra": 52.321712,
+   "dec": 31.462862,
+   "other_names": "ASR 30",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-24",
+   "ra": 52.188737,
+   "dec": 31.094915,
+   "other_names": "",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-25",
+   "ra": 51.656296,
+   "dec": 30.257726,
+   "other_names": "",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-26",
+   "ra": 51.411979,
+   "dec": 30.734801,
+   "other_names": "L1448C, L1448-mm",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-27",
+   "ra": 52.231538,
+   "dec": 31.243618,
+   "other_names": "NGC 1333 IRAS2A",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-28",
+   "ra": 55.962533,
+   "dec": 32.052234,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-29",
+   "ra": 53.324487,
+   "dec": 31.158838,
+   "other_names": "B1-c",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-30",
+   "ra": 53.363762,
+   "dec": 31.119489,
+   "other_names": "",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-31",
+   "ra": 52.135612,
+   "dec": 31.184764,
+   "other_names": "",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-32",
+   "ra": 56.010012,
+   "dec": 32.034648,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-33",
+   "ra": 51.401579,
+   "dec": 30.754091,
+   "other_names": "L1448IRS3B, L1448N",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-34",
+   "ra": 52.563179,
+   "dec": 30.397009,
+   "other_names": "IRAS 03271+3013",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-35",
+   "ra": 52.154542,
+   "dec": 31.225219,
+   "other_names": "NGC 1333 IRAS1",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-36",
+   "ra": 52.239058,
+   "dec": 31.237714,
+   "other_names": "NGC 1333 IRAS2B",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-37",
+   "ra": 52.329021,
+   "dec": 31.387307,
+   "other_names": "",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-emb-38",
+   "ra": 53.121654,
+   "dec": 31.044655,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-39",
+   "ra": 53.307421,
+   "dec": 31.334779,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-40",
+   "ra": 53.319454,
+   "dec": 31.131917,
+   "other_names": "B1-a",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-41",
+   "ra": 53.334754,
+   "dec": 31.122599,
+   "other_names": "B1-b",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-42",
+   "ra": 51.413062,
+   "dec": 30.732752,
+   "other_names": "L1448C-S",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-43",
+   "ra": 55.509,
+   "dec": 31.800578,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-44",
+   "ra": 52.265683,
+   "dec": 31.267724,
+   "other_names": "SVS13A",
+   "class": "0/I"
+  },
+  {
+   "source_name": "Per-emb-45",
+   "ra": 53.289871,
+   "dec": 31.091998,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-46",
+   "ra": 52.001729,
+   "dec": 30.133615,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-47",
+   "ra": 52.143779,
+   "dec": 31.014164,
+   "other_names": "IRAS 03254+3050",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-48",
+   "ra": 51.90945,
+   "dec": 30.232902,
+   "other_names": "L1455-FIR2",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-49",
+   "ra": 52.303987,
+   "dec": 31.303974,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-50",
+   "ra": 52.282367,
+   "dec": 31.365869,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-51",
+   "ra": 52.1439,
+   "dec": 31.1182,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-52",
+   "ra": 52.165412,
+   "dec": 31.292189,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-53",
+   "ra": 56.923296,
+   "dec": 32.862131,
+   "other_names": "B5-IRS1",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-54",
+   "ra": 52.256454,
+   "dec": 31.339027,
+   "other_names": "NGC 1333 IRAS6",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-55",
+   "ra": 56.180408,
+   "dec": 32.025343,
+   "other_names": "IRAS 03415+3152",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-56",
+   "ra": 56.772708,
+   "dec": 32.718956,
+   "other_names": "IRAS 03439+3233",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-57",
+   "ra": 52.263879,
+   "dec": 31.387381,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-58",
+   "ra": 52.243425,
+   "dec": 31.371523,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-59",
+   "ra": 52.146,
+   "dec": 30.336079,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-60",
+   "ra": 52.333617,
+   "dec": 31.40208,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-61",
+   "ra": 56.088987,
+   "dec": 31.992365,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-62",
+   "ra": 56.054071,
+   "dec": 32.026505,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-63",
+   "ra": 52.180296,
+   "dec": 31.292481,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-64",
+   "ra": 53.30355,
+   "dec": 31.356672,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-65",
+   "ra": 52.23465,
+   "dec": 31.374388,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-emb-66",
+   "ra": 55.938125,
+   "dec": 32.06628,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "Per-bolo-58",
+   "ra": 52.3561,
+   "dec": 31.4708,
+   "other_names": "Per-Bolo-58",
+   "class": "0"
+  },
+  {
+   "source_name": "Per-bolo-45",
+   "ra": 52.282083,
+   "dec": 31.288,
+   "other_names": "Per-Bolo-45",
+   "class": "0"
+  },
+  {
+   "source_name": "L1451-MMS",
+   "ra": 51.292687,
+   "dec": 30.398627,
+   "other_names": "L1451-MMS",
+   "class": "0"
+  },
+  {
+   "source_name": "L1448IRS2E",
+   "ra": 51.356917,
+   "dec": 30.749082,
+   "other_names": "L1448IRS2E",
+   "class": "0"
+  },
+  {
+   "source_name": "B1-bN",
+   "ra": 53.338371,
+   "dec": 31.128796,
+   "other_names": "B1-bN",
+   "class": "0"
+  },
+  {
+   "source_name": "B1-bS",
+   "ra": 53.338979,
+   "dec": 31.123992,
+   "other_names": "B1-bS",
+   "class": "0"
+  },
+  {
+   "source_name": "L1448IRS1",
+   "ra": 51.289371,
+   "dec": 30.772759,
+   "other_names": "L1448IRS1",
+   "class": "I"
+  },
+  {
+   "source_name": "L1448NW",
+   "ra": 51.398629,
+   "dec": 30.759498,
+   "other_names": "L1448IRS3C",
+   "class": "0"
+  },
+  {
+   "source_name": "L1448IRS3A",
+   "ra": 51.402079,
+   "dec": 30.756078,
+   "other_names": "",
+   "class": "I"
+  },
+  {
+   "source_name": "SVS13C",
+   "ra": 52.258208,
+   "dec": 31.26057,
+   "other_names": "SVS13C",
+   "class": "0"
+  },
+  {
+   "source_name": "SVS13B",
+   "ra": 52.262825,
+   "dec": 31.264372,
+   "other_names": "SVS13B",
+   "class": "0"
+  },
+  {
+   "source_name": "IRAS 03363+3207",
+   "ra": 54.856446,
+   "dec": 32.285303,
+   "other_names": "",
+   "class": "I?"
+  },
+  {
+   "source_name": "EDJ2009-161",
+   "ra": 52.2145,
+   "dec": 30.7501,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-263",
+   "ra": 52.613171,
+   "dec": 30.474892,
+   "other_names": "",
+   "class": "Flat"
+  },
+  {
+   "source_name": "EDJ2009-285",
+   "ra": 53.195592,
+   "dec": 30.988277,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "IRAS 03295+3050",
+   "ra": 53.141942,
+   "dec": 31.01545,
+   "other_names": "EDJ2009-282",
+   "class": "II"
+  },
+  {
+   "source_name": "L1455IRS2",
+   "ra": 51.948708,
+   "dec": 30.201198,
+   "other_names": "EDJ2009-133",
+   "class": "Flat"
+  },
+  {
+   "source_name": "EDJ2009-333",
+   "ra": 55.732383,
+   "dec": 31.978996,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-385",
+   "ra": 56.0757,
+   "dec": 32.082474,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-366",
+   "ra": 55.998546,
+   "dec": 32.031669,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-269",
+   "ra": 52.683392,
+   "dec": 30.546337,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-268",
+   "ra": 52.659296,
+   "dec": 30.536574,
+   "other_names": "",
+   "class": "Flat"
+  },
+  {
+   "source_name": "EDJ2009-183",
+   "ra": 52.247071,
+   "dec": 31.263447,
+   "other_names": "ASR 106",
+   "class": "Flat"
+  },
+  {
+   "source_name": "EDJ2009-164",
+   "ra": 52.224837,
+   "dec": 31.302597,
+   "other_names": "ASR 40",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-156",
+   "ra": 52.212621,
+   "dec": 31.305114,
+   "other_names": "ASR 122",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-172",
+   "ra": 52.236042,
+   "dec": 31.309847,
+   "other_names": "ASR 120",
+   "class": "II"
+  },
+  {
+   "source_name": "IRAS4B'",
+   "ra": 52.303508,
+   "dec": 31.218581,
+   "other_names": "NGC 1333 IRAS4B'",
+   "class": "0"
+  },
+  {
+   "source_name": "EDJ2009-233",
+   "ra": 52.323646,
+   "dec": 31.379145,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-235",
+   "ra": 52.326079,
+   "dec": 31.388822,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "SVS3",
+   "ra": 52.293417,
+   "dec": 31.366409,
+   "other_names": "",
+   "class": "II"
+  },
+  {
+   "source_name": "EDJ2009-173",
+   "ra": 52.23735,
+   "dec": 31.272833,
+   "other_names": "ASR 118, SVS15",
+   "class": "II"
+  }
+ ],
+ "selection": "Table 1 rows with a protostellar class (0, I, Flat, II); the catalogue's extragalactic/unclassified rows are excluded."
+}

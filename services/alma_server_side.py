@@ -338,7 +338,7 @@ def solar_projects_server_side(run_query: RunQuery, cycle: int, *, science_only:
 # ── 2. Cycle array-combination projects (D11) ────────────────────────────
 
 _ARRAY_PATTERNS: Dict[str, str] = {
-    # antenna_arrays is 'Pad:Antenna Pad:Antenna ...'; DV/DA = 12-m, CM = 7-m, PM = Total Power.
+    # antenna_arrays is 'Pad:Antenna Pad:Antenna ...'; DV/DA = 12-m, CM = 7-m, PM = Total Power dish (PM-only rows; see classify_array_row).
     "12m": "(antenna_arrays LIKE '%:DV%' OR antenna_arrays LIKE '%:DA%' OR schedblock_name LIKE '%_TM1' OR schedblock_name LIKE '%_TM2')",
     "7m": "(antenna_arrays LIKE '%:CM%' OR schedblock_name LIKE '%_7M')",
     "TP": "(antenna_arrays LIKE '%:PM%' OR schedblock_name LIKE '%_TP')",
@@ -359,10 +359,20 @@ def _normalize_array(label: str) -> str:
 def array_combo_projects_server_side(
     run_query: RunQuery, cycle: int, arrays: Sequence[str], *, science_only: bool = True, extra_where: str = ""
 ) -> ServerSideResult:
-    """Projects of one cycle that used EVERY requested array: one DISTINCT
-    proposal_id query per array (antenna-name prefixes are the archive's own
-    array signature), intersected, plus one per-project aggregate for the
-    counts. Complete for the cycle unless a page truncated."""
+    """Projects of one cycle that used EVERY requested array.
+
+    One DISTINCT pull of (project, group OUS, member OUS, SB name, antenna
+    list) for the cycle (one cycle is a few thousand rows, ~12 s live on
+    2026-10-16), classified per row by :func:`classify_array_row` (SB-name
+    suffix first; PM counts as Total Power only when every antenna is PM),
+    grouped by member_ous_uid and then by proposal_id; plus one per-project
+    aggregate for the counts. Also reports two stated alternative
+    definitions (all arrays inside ONE group OUS; heterogeneous 12m-SB rows
+    with 7m antennas counted as both) and how many projects the naive "any PM
+    antenna = TP" rule would give. Complete for the cycle unless a page
+    truncated."""
+    from services.alma_science_queries import ARRAY_DEFINITION_NOTE, classify_array_row
+
     t0 = time.perf_counter()
     wanted = [_normalize_array(a) for a in (arrays or ["12m", "7m", "TP"])]
     unknown = [a for a in wanted if a not in _ARRAY_PATTERNS]
@@ -370,57 +380,128 @@ def array_combo_projects_server_side(
         raise ValueError(f"unknown array label(s): {', '.join(unknown)}; use 12m, 7m, TP")
     cyc = project_prefix_where(int(cycle))
     sci = _science_where(science_only) + (f" AND {extra_where}" if extra_where else "")
-    per_array_queries = {
-        a: f"SELECT DISTINCT proposal_id FROM ivoa.obscore WHERE {cyc} AND {sci} AND {_ARRAY_PATTERNS[a]}" for a in wanted
-    }
+    rows_q = (
+        "SELECT DISTINCT proposal_id, group_ous_uid, member_ous_uid, schedblock_name, antenna_arrays "
+        f"FROM ivoa.obscore WHERE {cyc} AND {sci}"
+    )
     agg = (
         "SELECT proposal_id, COUNT(DISTINCT member_ous_uid) AS n_mous, COUNT(DISTINCT asdm_uid) AS n_eb, COUNT(*) AS n_rows, "
         "MIN(target_name) AS target_name, MIN(pi_name) AS pi_name, MIN(obs_title) AS obs_title, MIN(band_list) AS band_list "
         f"FROM ivoa.obscore WHERE {cyc} AND {sci} GROUP BY proposal_id"
     )
-    fns = [(lambda q=q: run_query(q)) for q in per_array_queries.values()] + [lambda: run_query(agg)]
-    outputs = run_concurrently(fns, wall_seconds=150.0)
-    queries = list(per_array_queries.values()) + [agg]
-    sets: Dict[str, Set[str]] = {}
-    truncated = False
-    failures: List[str] = []
-    for a, out in zip(wanted, outputs[:-1]):
-        if isinstance(out, BaseException):
-            failures.append(f"{a}: {type(out).__name__}: {str(out)[:160]}")
-            continue
-        sets[a] = set(out["proposal_id"].map(as_text)) if out is not None and not out.empty else set()
-        truncated |= _truncated(out)
-    if failures:
-        raise RuntimeError("array-membership query failed: " + "; ".join(failures))
-    agg_out = outputs[-1]
+    outputs = run_concurrently([lambda: run_query(rows_q), lambda: run_query(agg)], wall_seconds=150.0)
+    queries = [rows_q, agg]
+    rows_out, agg_out = outputs
+    if isinstance(rows_out, BaseException):
+        raise RuntimeError(f"array-membership query failed: {type(rows_out).__name__}: {str(rows_out)[:160]}")
     if isinstance(agg_out, BaseException):
         raise RuntimeError(f"per-project aggregate failed: {type(agg_out).__name__}: {str(agg_out)[:160]}")
-    truncated |= _truncated(agg_out)
-    matched = set.intersection(*sets.values()) if sets else set()
+    truncated = _truncated(rows_out) or _truncated(agg_out)
+
+    want = set(wanted)
+    project_arrays: Dict[str, Set[str]] = {}
+    project_arrays_loose: Dict[str, Set[str]] = {}
+    project_arrays_naive: Dict[str, Set[str]] = {}
+    goal_arrays: Dict[Tuple[str, str], Set[str]] = {}
+    mous_arrays: Dict[Tuple[str, str], Set[str]] = {}
+    if rows_out is not None and not rows_out.empty:
+        for row in rows_out.to_dict("records"):
+            pid = as_text(row.get("proposal_id"))
+            ants = row.get("antenna_arrays")
+            labels = set(classify_array_row(ants, row.get("schedblock_name")))
+            loose = labels | set(infer_arrays(ants))
+            naive = loose | ({"TP"} if ":PM" in as_text(ants).upper() else set())
+            project_arrays.setdefault(pid, set()).update(labels)
+            project_arrays_loose.setdefault(pid, set()).update(loose)
+            project_arrays_naive.setdefault(pid, set()).update(naive)
+            gid = as_text(row.get("group_ous_uid")).strip()
+            if gid:  # a missing group id is an unknown science goal, never a shared one (guard CX-11)
+                goal_arrays.setdefault((pid, gid), set()).update(labels)
+            mous_arrays.setdefault((pid, as_text(row.get("member_ous_uid"))), set()).update(labels)
+    matched = {p for p, s in project_arrays.items() if want <= s}
+    same_goal = {p for (p, _g), s in goal_arrays.items() if want <= s}
+    loose_matched = {p for p, s in project_arrays_loose.items() if want <= s}
+    naive_matched = {p for p, s in project_arrays_naive.items() if want <= s}
+    per_array_counts = {a: sum(1 for s in project_arrays.values() if a in s) for a in wanted}
+    mous_per_array: Dict[str, Dict[str, int]] = {}
+    for (pid, _m), labels in mous_arrays.items():
+        for a in labels:
+            mous_per_array.setdefault(pid, {}).setdefault(a, 0)
+            mous_per_array[pid][a] += 1
+
     frame = pd.DataFrame(columns=["proposal_id", "arrays_found", "n_mous", "n_eb", "n_rows", "target_name", "pi_name", "obs_title"])
     if matched:
         base = agg_out[agg_out["proposal_id"].map(as_text).isin(matched)].copy() if agg_out is not None and not agg_out.empty else pd.DataFrame({"proposal_id": sorted(matched)})
         base["arrays_found"] = ", ".join(wanted)
-        base["array_inference"] = "server-side: antenna names DV/DA = 12 m, CM = 7 m, PM = Total Power (+ SB-name suffix)"
+        base["mous_per_array"] = base["proposal_id"].map(
+            lambda p: ", ".join(f"{a}={mous_per_array.get(as_text(p), {}).get(a, 0)}" for a in wanted))
+        base["all_in_one_group_ous"] = base["proposal_id"].map(lambda p: as_text(p) in same_goal)
         frame = base.sort_values(["proposal_id"]).reset_index(drop=True)
-    per_array_counts = {a: len(s) for a, s in sets.items()}
     n_cycle_projects = int(len(agg_out)) if agg_out is not None else 0
     notes = [
         cycle_periods_disclosure(int(cycle)),
-        "Array membership from the archive's antenna names (DV/DA = 12-m, CM = 7-m, PM = Total Power); "
-        "the archive delivers per-MOUS data and has not combined the arrays.",
+        ARRAY_DEFINITION_NOTE,
         f"Projects in the cycle window: {n_cycle_projects}; using each array: "
         + ", ".join(f"{a}={n}" for a, n in per_array_counts.items()) + f"; using ALL of {', '.join(wanted)}: {len(matched)}.",
+        f"Alternative definitions: all of {', '.join(wanted)} inside ONE group OUS (one science goal's combined data): "
+        f"{len(same_goal)} project(s); also counting heterogeneous rows (a 12m SB that includes 7m antennas) as 7m: "
+        f"{len(loose_matched)} project(s). Treating any PM antenna as Total Power (wrong, see above) would give "
+        f"{len(naive_matched)} project(s).",
+        "The archive delivers per-MOUS data and has not combined the arrays.",
     ]
     return ServerSideResult(
         frame=frame, queries=queries, complete=not truncated, scanned=f"Cycle {int(cycle)}", n_units=n_cycle_projects,
         unit="projects", notes=notes, elapsed_s=time.perf_counter() - t0,
         extras={"projects_in_window": n_cycle_projects, "per_array_project_counts": per_array_counts,
-                "matching_projects": len(matched), "method": "server-side DISTINCT per array + GROUP BY proposal_id"},
+                "matching_projects": len(matched), "matching_project_ids": sorted(matched),
+                "alternative_counts": {"all_arrays_in_one_group_ous": len(same_goal),
+                                       "heterogeneous_rows_count_as_both": len(loose_matched),
+                                       "naive_any_pm_antenna_is_tp": len(naive_matched)},
+                "array_definition": ARRAY_DEFINITION_NOTE,
+                "method": "server-side DISTINCT (project, group OUS, MOUS, SB name, antennas) per cycle, classified per row, "
+                          "grouped by member_ous_uid then proposal_id; + GROUP BY proposal_id counts"},
     )
 
 
 # ── 3. Line-set projects (D21) ────────────────────────────────────────────
+
+POSITION_GROUP_ARCSEC = 30.0
+POSITION_GROUP_MAX_POINTS = 5000
+
+
+def position_groups(frame: pd.DataFrame, radius_arcsec: float = POSITION_GROUP_ARCSEC) -> Dict[str, int]:
+    """member_ous_uid -> object id, merging pointings closer than ``radius_arcsec`` (single-linkage, union-find).
+    Rows without a position get no id."""
+    pts: List[Tuple[str, float, float]] = []
+    for row in frame.to_dict("records") if frame is not None and not frame.empty else []:
+        try:
+            ra, dec = float(row.get("s_ra")), float(row.get("s_dec"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(ra) and math.isfinite(dec):
+            pts.append((as_text(row.get("member_ous_uid")), ra, dec))
+    parent = list(range(len(pts)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    if len(pts) > POSITION_GROUP_MAX_POINTS:
+        return {}   # too many pointings to group within the tool budget: the object count is reported as unknown
+    r_deg = radius_arcsec / 3600.0
+    cos_r = math.cos(math.radians(r_deg))
+    order = sorted(range(len(pts)), key=lambda i: pts[i][2])
+    for a_i, i in enumerate(order):
+        for j in order[a_i + 1:]:
+            if pts[j][2] - pts[i][2] > r_deg:   # dec difference is a lower bound on the separation
+                break
+            d1, d2 = math.radians(pts[i][2]), math.radians(pts[j][2])
+            cos_sep = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(math.radians(pts[i][1] - pts[j][1]))
+            if cos_sep >= cos_r:   # exact great-circle test, valid at the poles (guard CX-07)
+                parent[find(i)] = find(j)
+    return {pts[i][0]: find(i) for i in range(len(pts))}
+
 
 def line_set_projects_server_side(
     run_query: RunQuery,
@@ -459,7 +540,7 @@ def line_set_projects_server_side(
         per_line[name] = (
             "SELECT member_ous_uid, proposal_id, MIN(target_name) AS target_name, MIN(band_list) AS band_list, "
             "MIN(pi_name) AS pi_name, MIN(obs_title) AS obs_title, MIN(science_keyword) AS science_keyword, "
-            "COUNT(DISTINCT frequency) AS n_spw_hits "
+            "COUNT(DISTINCT frequency) AS n_spw_hits, MIN(s_ra) AS s_ra, MIN(s_dec) AS s_dec "
             f"FROM ivoa.obscore WHERE {base_where} AND {coverage_where(nu)} GROUP BY member_ous_uid, proposal_id"
         )
     outputs = run_concurrently([(lambda q=q: run_query(q)) for q in per_line.values()], wall_seconds=150.0)
@@ -477,10 +558,12 @@ def line_set_projects_server_side(
     mous_sets = {name: set(df["member_ous_uid"].map(as_text)) if not df.empty else set() for name, df in frames.items()}
     covered_all = set.intersection(*mous_sets.values()) if mous_sets else set()
     rows: List[Dict[str, Any]] = []
+    object_of: Dict[str, int] = {}
     if covered_all:
         merged = pd.concat([df for df in frames.values() if not df.empty], ignore_index=True)
         merged["member_ous_uid"] = merged["member_ous_uid"].map(as_text)
         merged = merged[merged["member_ous_uid"].isin(covered_all)]
+        object_of = position_groups(merged.drop_duplicates("member_ous_uid"))
         for pid, group in merged.groupby(merged["proposal_id"].map(as_text)):
             mous = sorted(set(group["member_ous_uid"]))
             rows.append({
@@ -494,6 +577,7 @@ def line_set_projects_server_side(
                 "pi_name": first_nonempty(group["pi_name"].tolist()) if "pi_name" in group else "",
                 "obs_title": first_nonempty(group["obs_title"].tolist()) if "obs_title" in group else "",
                 "science_keyword": first_nonempty(group["science_keyword"].tolist()) if "science_keyword" in group else "",
+                "n_objects_by_position": len({object_of[m] for m in mous if m in object_of}) or None,
                 "member_ous_uids": "; ".join(mous[:6]) + (" …" if len(mous) > 6 else ""),
                 "coverage_basis": "all requested lines within the SAME MOUS (server-side SPW coverage)",
             })
@@ -501,10 +585,22 @@ def line_set_projects_server_side(
     if not frame.empty:
         frame = frame.sort_values(["n_mous_covering_all_lines", "proposal_id"], ascending=[False, True]).reset_index(drop=True)
     per_line_counts = {name: len(s) for name, s in mous_sets.items()}
+    # Objects are counted only when every matching MOUS has a position (guard CX-08); otherwise unknown.
+    if not covered_all:
+        n_objects: Optional[int] = 0
+    elif len(object_of) == len(covered_all):
+        n_objects = len(set(object_of.values()))
+    else:
+        n_objects = None
     notes = [
         "Coverage is computed per spectral window at the server (frequency ± bandwidth/2 contains the rest frequency); "
         "a MOUS must cover every requested line to count.",
         "MOUS covering each line: " + ", ".join(f"{n}={c}" for n, c in per_line_counts.items()) + f"; all lines: {len(covered_all)}.",
+        (f"Distinct objects by position (pointings within {POSITION_GROUP_ARCSEC:g} arcsec merged, whatever the target "
+         f"name): {n_objects}." if n_objects is not None else
+         "Distinct objects by position: unknown (some matching MOUS have no position, or too many to group).")
+        + " The same object often appears under different names in different projects.",
+        "Spectral coverage is not a detection: a covered line may be undetected; science keywords are chosen by the PI.",
     ]
     if cycle is not None:
         notes.append(cycle_periods_disclosure(int(cycle)))
@@ -516,6 +612,7 @@ def line_set_projects_server_side(
             "lines": names,
             "rest_frequencies_ghz": {n: LINE_REST_FREQ_GHZ[n] for n in names},
             "mous_per_line": per_line_counts,
+            "distinct_objects_by_position": n_objects,
             "method": "server-side GROUP BY member_ous_uid per line; intersection; per-project aggregation",
         },
     )

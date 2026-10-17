@@ -284,6 +284,21 @@ def overlay_fits_images(
 
             base_wcs = WCS(base_hdul[base_idx].header, naxis=2)
             cont_wcs = WCS(cont_hdul[cont_idx].header, naxis=2)
+            cont_hdr = cont_hdul[cont_idx].header
+            beam = None
+            try:
+                if cont_hdr.get("BMAJ") and cont_hdr.get("BMIN"):
+                    beam = {"bmaj_arcsec": round(float(cont_hdr["BMAJ"]) * 3600.0, 3),
+                            "bmin_arcsec": round(float(cont_hdr["BMIN"]) * 3600.0, 3),
+                            "bpa_deg": round(float(cont_hdr.get("BPA") or 0.0), 1)}
+            except (TypeError, ValueError):
+                beam = None
+            try:
+                from astropy.wcs.utils import proj_plane_pixel_scales
+
+                base_pixel_arcsec = round(float(np.mean(proj_plane_pixel_scales(base_wcs))) * 3600.0, 4)
+            except Exception:
+                base_pixel_arcsec = None
 
             # Reproject contour onto base WCS
             try:
@@ -293,9 +308,11 @@ def overlay_fits_images(
                     base_wcs,
                     shape_out=base_data.shape,
                 )
+                reprojected = True
             except ImportError:
                 logger.warning("[FITS] reproject not installed, skipping alignment")
                 cont_reproj = cont_data
+                reprojected = False
 
             # Render
             norm = ImageNormalize(
@@ -355,7 +372,10 @@ def overlay_fits_images(
             "image_path": f"/api/images/{img_name}",
             "caption": caption,
             "contours": {"note": contour_note, "sigmas": sig.get("sigmas"), "rms": sig.get("rms"),
-                         "peak_snr": sig.get("peak_snr")},
+                         "peak_snr": sig.get("peak_snr"), "negative_contours": bool(sig.get("negative"))},
+            "contour_beam": beam,
+            "base_pixel_arcsec": base_pixel_arcsec,
+            "reprojected": reprojected,
         }
 
     except Exception as e:

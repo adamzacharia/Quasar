@@ -597,6 +597,61 @@ def stream_response_api(agent, *args, **kwargs):
             print(f"[TURN EXIT] turn finalisation failed (non-fatal): {_fin_err}")
 
 
+class _PostPassHeartbeat:
+    """Send the same `__tool_heartbeat__` status a long tool sends, every 15 s, while a post-answer pass (completeness
+    review, code check) runs. Without it the stream goes quiet after the draft and the chat inactivity watchdog
+    (CHAT_INACTIVITY_TIMEOUT_SECONDS, 90 s) ended two finished round-5 ALMAbench answers mid-repair."""
+
+    def __init__(self, on_status, name: str, label: str, interval: float = 15.0):
+        self.on_status, self.name, self.label, self.interval = on_status, name, label, interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _beat(self) -> None:
+        try:
+            self.on_status(f"__tool_heartbeat__{self.name}::{self.label}", "meta")
+        except Exception:
+            pass
+
+    def __enter__(self):
+        if self.on_status is not None:
+            self._beat()
+
+            def loop():
+                while not self._stop.wait(self.interval):
+                    self._beat()
+
+            self._thread = threading.Thread(target=loop, name=f"heartbeat-{self.name}", daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        return False
+
+
+def _turn_model(agent) -> str:
+    """The model this turn runs on (set where the turn starts, after failover), else the agent default."""
+    return str(getattr(getattr(agent, "_tls", None), "turn_model", None)
+               or getattr(getattr(agent, "config", None), "model", "") or "")
+
+
+def _post_pass_deadline(agent) -> Optional[float]:
+    """Deadline for the post-answer passes (completeness, code check): the turn's hard deadline, but no later than
+    QUASAR_POST_PASS_TURN_CAP seconds (default 400) after the turn started, so the extra checks never turn a
+    finished answer into a 7-minute wait."""
+    tls = getattr(agent, "_tls", None)
+    deadline = getattr(tls, "turn_deadline", None)
+    hard = float(getattr(tls, "turn_hard_seconds", 0.0) or 0.0)
+    try:
+        cap = float(os.getenv("QUASAR_POST_PASS_TURN_CAP", "") or 400.0)
+    except ValueError:
+        cap = 400.0
+    if deadline is None or hard <= 0 or cap <= 0:
+        return deadline
+    return min(deadline, deadline - hard + cap)
+
+
 def _finalize_answer_text(
     agent,
     output_text: str,
@@ -607,6 +662,7 @@ def _finalize_answer_text(
     all_tool_results: Optional[List[Any]] = None,
     had_tool_calls: bool = False,
     web_registry: Any = None,
+    on_status=None,
 ) -> str:
     """Post-process a final answer, identically for the standard tool loop
     and the Conductor return (guard CX-24: the Conductor path used to skip all
@@ -756,6 +812,65 @@ def _finalize_answer_text(
             output_text = _clean_text
     except Exception as _hyg_err:
         print(f"[HYGIENE] prose hygiene failed (non-fatal): {_hyg_err}")
+
+    # 7d-complete. Expert completeness pass (core/answer_completeness.py,
+    # ALMAbench round 5): for a how-to / concept question the same model gets
+    # one review call that lists only the important points the draft leaves
+    # out (caveats, dependencies, checks), appended as "Additional points".
+    if output_text:
+        try:
+            from core.rag_routing import knowledge_question as _kq
+
+            if _kq(user_query or ""):
+                from core.answer_completeness import complete_answer
+
+                _before = output_text
+                with _PostPassHeartbeat(on_status, "completeness_review", "Reviewing the answer for missing points"):
+                    output_text, _cp_info = complete_answer(
+                        output_text,
+                        question=user_query or "",
+                        model=_turn_model(agent),
+                        deadline=_post_pass_deadline(agent),
+                    )
+                if output_text != _before and on_token:
+                    on_token(output_text[len(_before.rstrip()):])
+                print(f"[COMPLETENESS] {_cp_info}")
+        except Exception as _cp_err:
+            print(f"[COMPLETENESS] failed (non-fatal): {_cp_err}")
+
+    # 7d-code. Run-once code check (core/code_check.py, ALMAbench round 5): an
+    # archive script in the answer is run once in a sandboxed child interpreter
+    # (archive hosts only, no secrets, no downloads); on failure the same model
+    # gets one repair call and the repaired script is run again. The answer keeps
+    # the version that ran and ends with a short note on the result.
+    if output_text and "```" in output_text:
+        try:
+            from core.code_check import check_answer_code
+
+            with _PostPassHeartbeat(on_status, "code_check", "Running the script once to check it"):
+                _cc = check_answer_code(
+                    output_text,
+                    question=user_query or "",
+                    model=_turn_model(agent),
+                    reference_text=json.dumps(
+                        [list(all_tool_results or []), list(getattr(agent, "_accumulated_run_results", None) or [])],
+                        default=str,
+                    )[:2_000_000],
+                    deadline=_post_pass_deadline(agent),
+                )
+            if _cc.status != "skipped":
+                output_text = _cc.text
+                if on_token and _cc.note:
+                    on_token(_cc.note)
+                agent._record_tool_trace(
+                    "code_check",
+                    {"source": "run-once code check", "status": _cc.status},
+                    json.dumps(_cc.info, default=str)[:4000],
+                    result_obj=_cc.info,
+                )
+            print(f"[CODE CHECK] status={_cc.status} info={json.dumps(_cc.info, default=str)[:300]}")
+        except Exception as _cc_err:
+            print(f"[CODE CHECK] failed (non-fatal): {_cc_err}")
 
     # 7e. Answer-versus-trace verifier (core/answer_verifier.py): the
     # prose must match what the tools ran. Deterministic; on violation
@@ -991,6 +1106,9 @@ def _stream_response_api_impl(
         # that actually answers. No-op unless QUASAR_MODEL_FAILOVER=1 — see
         # _maybe_failover_model for the full gate conditions.
         selected_model = _maybe_failover_model(agent, selected_model, on_status, attachments)
+        # The turn's model for the post-answer passes (completeness, code check): config.model is the
+        # backend default, not what the request selected (round-5 dev run used gpt-oss for every arm).
+        agent._tls.turn_model = selected_model
         agent._begin_response_run(conversation_id, selected_model, run_token)
 
         # Periodic cleanup to prevent unbounded memory growth
@@ -1886,7 +2004,12 @@ def _stream_response_api_impl(
                     if _rag_min_year is None or _cycle_yr > _rag_min_year:
                         _rag_min_year = _cycle_yr
 
-                docs, _rag_diag = agent.rag_service.search_with_diagnostics(
+                # Whole question + one search per sub-question, junk chunks dropped, at most 2 chunks per
+                # source document, up to 6 chunks (core/rag_retrieval.py; QUASAR_RAG_MULTI_QUERY=0 = old top 3).
+                from core.rag_retrieval import retrieve as _rag_retrieve
+
+                docs, _rag_diag = _rag_retrieve(
+                    agent.rag_service,
                     _user_query,
                     min_year=_rag_min_year,
                     min_score=0.35,
@@ -1913,7 +2036,7 @@ def _stream_response_api_impl(
                 docs = [d for d in docs if (_rag_doc_score(d) is None or _rag_doc_score(d) >= 0.15)]
                 if docs:
                     context_pieces = []
-                    for chunk_idx, d in enumerate(docs[:3], 1):
+                    for chunk_idx, d in enumerate(docs[:6], 1):
                         # Prefer source_file (clean filename) over source (full path)
                         src = d.metadata.get("source_file", d.metadata.get("source", "Unknown"))
                         if "/" in src or "\\" in src:
@@ -2667,6 +2790,7 @@ def _stream_response_api_impl(
                         # in its answer is valid: an empty registry strips them
                         # (guard CX-03).
                         web_registry=_web_evidence.EvidenceRegistry(),
+                        on_status=on_status,
                     )
 
                     return safe_assistant_text(conductor_answer)
@@ -4257,6 +4381,7 @@ def _stream_response_api_impl(
                 all_tool_results=_all_tool_results,
                 had_tool_calls=_had_tool_calls,
                 web_registry=_web_registry,
+                on_status=on_status,
             )
             # 7f. Final numbered source listing: cited sources first, in the order
             # the answer cites them, with the cited flags the UI renders (PLAN 1.5).

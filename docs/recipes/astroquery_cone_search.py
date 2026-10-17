@@ -14,6 +14,8 @@ alma = Alma()
 alma.archive_url = "https://almascience.nrao.edu"
 
 center = SkyCoord(204.2538, -29.8658, unit="deg", frame="icrs")   # M83
+# Radius: for an extended source cover the whole object (about its catalogued semi-major axis plus a margin);
+# 1 arcmin only covers the nucleus of a nearby galaxy.
 table = alma.query_region(center, radius=1.0 * u.arcmin, public=True)
 
 print(len(table), "coverage rows;", len(set(table["member_ous_uid"])), "datasets (MOUS)")

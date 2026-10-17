@@ -1108,7 +1108,8 @@ ONE-SHOT TOOLS (prefer them — each answers a whole question in one call, with 
   query + total count), alma_public_band_status (bands with public data, as of a date), alma_archive_link
   (verified ASA/TAP URLs — never compose an archive URL yourself), alma_bibliography (papers that used ALMA
   data), cross_archive_match (ALMA + JWST/HST per source), archive_overlay (ALMA contours on JWST/HST),
-  code_recipe (tested astroquery/pyvo/ALMiner code — never improvise API names), alma_reference (Handbook
+  code_recipe (tested astroquery/pyvo/ALMiner code; with no recipe, write standard code from its `fallback`
+  calls, never invented API names), alma_reference (Handbook
   tables and documentation passages with citations for bands, configurations, correlator, BWSW, policy,
   data products, weblog, CASA version).
 - Data Lab: datalab_healpix_density_map (wide stellar density maps), datalab_stream_selection (proper-motion

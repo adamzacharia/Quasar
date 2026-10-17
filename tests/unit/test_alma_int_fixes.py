@@ -198,7 +198,8 @@ def test_bandwidth_switching_counts_each_mous_setup_once():
 # INT-1/3 · array inference from live antenna_arrays strings (A-01)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_infer_arrays_from_pad_antenna_pairs():
-    assert infer_arrays("A004:DV07 A025:CM03 J505:PM03") == ["12m", "7m", "TP"]
+    # A PM dish inside a 12m/7m antenna list is not Total Power data; PM-only rows are.
+    assert infer_arrays("A004:DV07 A025:CM03 J505:PM03") == ["12m", "7m"]
     assert infer_arrays("A109:DV09 J504:DV02 J505:DV05") == ["12m"]
     assert infer_arrays("J501:CM01 J502:CM02 J503:CM03") == ["7m"]
     assert infer_arrays("N601:PM02 N602:PM03") == ["TP"]

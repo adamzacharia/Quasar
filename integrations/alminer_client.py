@@ -207,10 +207,20 @@ class ALminerClient:
         # Step 2: TAP then ALminer, each bounded
         # 1 arcmin: ALminer's documented default target search radius
         # (alminer.target(search_radius=1.0)); the old 0.05 deg (3 arcmin) pulled
-        # in unrelated neighbours for compact targets.
-        return self._parallel_search(ra_deg, dec_deg, radius=1.0 / 60, target_name=target_name,
-                                     public=public, max_results=max_results, band=band,
-                                     max_resolution_arcsec=max_resolution_arcsec, science_only=science_only)
+        # in unrelated neighbours for compact targets. Extended sources get a
+        # cone sized from their catalogued extent (ALMAbench 2026-10-15 A22: a
+        # 1 arcmin cone found half of the M83 Band 6 MOUS).
+        from services.target_extent import extent_radius_arcsec
+
+        sized = extent_radius_arcsec(target_name, 60.0)
+        df = self._parallel_search(ra_deg, dec_deg, radius=float(sized["radius_arcsec"]) / 3600.0, target_name=target_name,
+                                   public=public, max_results=max_results, band=band,
+                                   max_resolution_arcsec=max_resolution_arcsec, science_only=science_only)
+        if isinstance(getattr(df, "attrs", None), dict):
+            df.attrs["radius_basis"] = sized["basis"]
+            if isinstance(df.attrs.get("quasar_cone"), dict):
+                df.attrs["quasar_cone"]["radius_basis"] = sized["basis"]
+        return df
 
     def _parallel_search(self, ra: float, dec: float, radius: float = 0.05, target_name: str = "",
                          public: bool = True, max_results: Optional[int] = None, *, band: Any = None,

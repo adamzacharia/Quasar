@@ -226,14 +226,17 @@ def test_hanging_alma_phase_is_abandoned_at_the_deadline_with_partial_mast_resul
 
 
 def test_mast_loop_stops_when_budget_is_spent():
-    alma = pd.DataFrame([_alma_row(s["source_name"], s["ra"], s["dec"]) for s in SOURCES])
+    # 2026-10-16: MAST queries run 16 at a time after a one-source probe, so the budget has to cover fewer batches
+    # than a 40-source catalogue needs: probe (0.35 s) + one batch (0.35 s) leaves < 3 s of the inner 3.4 s.
+    sources = [{"source_name": f"S{i}", "ra": 51.0 + i * 0.01, "dec": 30.7} for i in range(40)]
+    alma = pd.DataFrame([_alma_row(s["source_name"], s["ra"], s["dec"]) for s in sources])
     tap = _Tap(bulk=alma)
     mast = _Mast(pd.DataFrame([_mast_row("x")]), delay=0.35)
     ctx, _ = _ctx(_Search(tap), mast)
-    begin_tool_deadline("match_cross_archive_sources", 3.4 + 15.0)  # inner 3.4 s: room for ~1 MAST call (<3 s left after it)
-    out = _run(MatchCrossArchiveSources(), ctx, catalog_name="inline", sources=SOURCES, archives=["ALMA", "JWST"])
+    begin_tool_deadline("match_cross_archive_sources", 3.4 + 15.0)
+    out = _run(MatchCrossArchiveSources(), ctx, catalog_name="inline", sources=sources, archives=["ALMA", "JWST"])
     assert out["success"] and out["partial"]
-    assert len(mast.calls) < 3
+    assert len(mast.calls) < 40
     assert any("MAST not queried for" in e and "tool budget exhausted" in e for e in out["archive_errors"])
 
 

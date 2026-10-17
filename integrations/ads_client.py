@@ -205,6 +205,31 @@ class ADSService:
         docs = data.get("response", {}).get("docs", [])
         return self._format_papers(docs)
 
+    def search_raw(
+        self,
+        query: str,
+        *,
+        rows: int = 200,
+        sort: str = "date desc",
+        fields: Optional[List[str]] = None,
+        filters: Optional[List[str]] = None,
+        start: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """ADS documents exactly as the API returns them (full author lists, pubdate, keyword). search_papers()
+        formats for display and shortens author lists, which breaks author-based checks (alma_bibliography)."""
+        if not query:
+            return []
+        if not self.api_key:
+            raise ADSServiceError("NASA ADS API key is not configured; the literature archive cannot be searched.")
+        params: Dict[str, Union[str, int, List[str]]] = {
+            "q": query, "fl": ",".join(fields or self._DEFAULT_FIELDS), "rows": max(1, min(int(rows), 200)),
+            "sort": sort, "start": max(0, int(start)),
+        }
+        if filters:
+            params["fq"] = filters
+        data = self._perform_get("/search/query", params)
+        return list(data.get("response", {}).get("docs", []))
+
     def search_natural_language(
         self,
         question: str,

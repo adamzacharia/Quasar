@@ -248,6 +248,8 @@ def test_hier_001_pkg_001_arrays_are_heuristic_and_not_combined():
 
     assert infer_arrays("A001:DV01 J501:CM01") == ["12m", "7m"]   # heterogeneous EB keeps both
     df = pd.DataFrame([{"proposal_id": "P", "antenna_arrays": "A001:DV01 J501:CM01 N601:PM01",
-                        "member_ous_uid": "uid://A001/X1/X1", "asdm_uid": "uid://A002/X1/X1"}])
+                        "member_ous_uid": "uid://A001/X1/X1", "asdm_uid": "uid://A002/X1/X1"},
+                       {"proposal_id": "P", "antenna_arrays": "N601:PM01 N602:PM02",
+                        "member_ous_uid": "uid://A001/X1/X2", "asdm_uid": "uid://A002/X1/X2"}])
     out = projects_with_array_combo(df, ["12m", "7m", "TP"])
     assert "heuristic" in out.iloc[0]["array_inference"] and "not combined" in out.iloc[0]["array_inference"]

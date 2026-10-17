@@ -190,7 +190,7 @@ def test_archive_link_uses_documented_parameters_and_verifies(monkeypatch):
     ctx, _, _ = _alma_ctx(lambda q: pd.DataFrame())
     out = _run(alma_tools.AlmaArchiveLink(), ctx, target="M83", band=6)
     assert out["success"] and out["asa_url"].startswith("https://almascience.nrao.edu/aq/?")
-    assert "sourceNameResolver=M83" in out["asa_url"] and "bandList=6" in out["asa_url"] and "target=" not in out["asa_url"]
+    assert "sourceNameResolver=M83" in out["asa_url"] and "band=6" in out["asa_url"] and "bandList" not in out["asa_url"] and "target=" not in out["asa_url"]
     assert out["asa_url_verified"] is True and out["tap_sync_url"].startswith("https://almascience.nrao.edu/tap/sync?")
     assert "band_list+%3D+%276%27" in out["tap_sync_url"] or "band_list = '6'" in out["tap_adql"]
     assert len(probed) == 2 and out["links"][0] == out["asa_url"]
@@ -199,25 +199,7 @@ def test_archive_link_uses_documented_parameters_and_verifies(monkeypatch):
 # ── alma_bibliography ────────────────────────────────────────────────────
 
 
-def test_bibliography_queries_the_alma_bibgroup_and_extracts_project_codes():
-    class _Ads:
-        def __init__(self):
-            self.calls = []
-
-        def search_papers(self, query, max_results=10, sort="date desc", fields=None, filters=None, start=0):
-            self.calls.append((query, max_results, sort, filters))
-            return [{"bibcode": "2026ApJ...900..1X", "title": ["Outflows"], "author": ["Doe, J.", "Roe, R."], "year": "2026", "pub": "ApJ",
-                     "abstract": "We use ALMA data (project 2019.1.00123.S) to study outflows. Second sentence. Third.", "doi": ["10.1/x"]}]
-
-    ads = _Ads()
-    ctx, state, _ = _alma_ctx(lambda q: pd.DataFrame(), ads_client=ads)
-    out = _run(alma_tools.AlmaBibliography(), ctx, topic="protostellar outflows", n=10, since=2024)
-    assert out["success"] and out["n_returned"] == 1
-    q, n, sort, filters = ads.calls[0]
-    assert q.startswith("bibgroup:ALMA") and n == 10 and sort == "date desc" and "property:refereed" in filters and "year:2024-" in filters
-    row = out["results"][0]
-    assert row["first_author"] == "Doe, J. et al." and row["alma_project_codes"] == "2019.1.00123.S" and row["summary"].endswith("Second sentence.")
-    assert state.last_run_result["type"] == "papers"
+# The bibgroup query, topic filter and archival classification are tested in tests/unit/test_alma_bibliography.py.
 
 
 def test_bibliography_without_ads_is_an_infrastructure_failure():
@@ -493,7 +475,9 @@ def test_point_only_mode_queries_every_source_concurrently_without_the_footprint
     finally:
         end_tool_deadline()
     assert out["success"] and out["matched_sources"] == 9 and out["footprint_mode"] == "point_only"
-    assert len(tap.queries) == 9 and active["max"] > 1, "cones must run concurrently"
+    # 2026-10-16: a compact catalogue first tries ONE box query (here the fake TAP rejects it), then the cones.
+    assert tap.queries[0].startswith("SELECT DISTINCT member_ous_uid") and "s_ra BETWEEN" in tap.queries[0]
+    assert len(tap.queries) == 10 and active["max"] > 1, "cones must run concurrently"
     assert not any("not queried" in e for e in out["archive_errors"])
 
 

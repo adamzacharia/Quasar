@@ -99,8 +99,11 @@ from services.alma_science_queries import (
     wavelength_overlap_where,
 )
 from services.cross_archive_matcher import (
+    alma_box_adql,
     alma_bulk_cone_adql,
+    attach_covering_sources,
     attach_nearest_source,
+    catalog_box,
     normalize_source_catalog,
     summarize_cross_archive_matches,
 )
@@ -273,11 +276,27 @@ def _provenance_from_frame(ctx: CallContext, df: Any) -> bool:
     _set_alma_cone_provenance(
         ctx, cone.get("ra"), cone.get("dec"), cone.get("radius_deg"),
         public=bool(cone.get("public", False)),
-        note=cone.get("note"),
+        note="; ".join(str(n) for n in (cone.get("note"), cone.get("radius_basis")) if n) or None,
         footprint=(cone.get("footprint_mode") != "point_only"),
         adql=cone.get("adql"),
     )
     return True
+
+
+def _cone_radius_fields(df: Any) -> Dict[str, Any]:
+    """The cone radius a target search ran with and why: ``search_radius_arcsec``
+    + ``radius_basis`` for one target, ``radius_by_target`` for several
+    (ALMAbench 2026-10-15 A22 sizes cones from the source extent; guard CX-08)."""
+    per = _frame_attr(df, "radius_by_target")
+    if isinstance(per, list) and per:
+        return {"radius_by_target": per}
+    out: Dict[str, Any] = {}
+    cone = _frame_attr(df, "quasar_cone") or {}
+    if isinstance(cone, dict) and isinstance(cone.get("radius_deg"), (int, float)):
+        out["search_radius_arcsec"] = round(float(cone["radius_deg"]) * 3600.0, 1)
+    if _frame_attr(df, "radius_basis"):
+        out["radius_basis"] = str(_frame_attr(df, "radius_basis"))
+    return out
 
 
 def _frame_attr(df: Any, key: str, default=None):
@@ -751,6 +770,7 @@ class SearchByTarget(BaseCapability):
                 # Per-target band mode: search each target with its own band filter
                 all_frames = []
                 searched_names = []
+                _radius_info = []  # per-target cone radius (guard CX-08)
                 _sub_errs = []  # archive errors per target (C3 — don't mask outages)
                 _sub_meta = None  # first failed sub-search's outage meta (retry hint)
                 for _tgt, _tgt_bands in _per_target_specs:
@@ -760,6 +780,7 @@ class SearchByTarget(BaseCapability):
                         df = search_service.search_by_target(
                             _tgt, facility, date_range, max_results, **_svc_kw
                         )
+                        _radius_info.append({"target": _tgt, **_cone_radius_fields(df)})
                         _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
                         if _e:
                             _sub_errs.append(f"{_tgt}: {_e}")
@@ -789,6 +810,7 @@ class SearchByTarget(BaseCapability):
                         results.attrs["quasar_error"] = "; ".join(_sub_errs)
                         if _sub_meta:
                             results.attrs["quasar_error_meta"] = _sub_meta
+                results.attrs["radius_by_target"] = _radius_info
                 # Skip shared band filtering below — bands already applied per target
                 band_list_input = []
 
@@ -796,6 +818,7 @@ class SearchByTarget(BaseCapability):
                 # Search each target independently, concatenate results
                 all_frames = []
                 searched_names = []
+                _radius_info = []  # per-target cone radius (guard CX-08)
                 _sub_errs = []  # archive errors per target (C3 — don't mask outages)
                 _sub_meta = None  # first failed sub-search's outage meta (retry hint)
                 for name in raw_names[:10]:  # Cap at 10 targets
@@ -803,6 +826,7 @@ class SearchByTarget(BaseCapability):
                         df = search_service.search_by_target(
                             name, facility, date_range, max_results, **_svc_kw
                         )
+                        _radius_info.append({"target": name, **_cone_radius_fields(df)})
                         _e = df.attrs.get("quasar_error") if hasattr(df, "attrs") else None
                         if _e:
                             _sub_errs.append(f"{name}: {_e}")
@@ -826,6 +850,7 @@ class SearchByTarget(BaseCapability):
                         results.attrs["quasar_error"] = "; ".join(_sub_errs)
                         if _sub_meta:
                             results.attrs["quasar_error_meta"] = _sub_meta
+                results.attrs["radius_by_target"] = _radius_info
             else:
                 results = search_service.search_by_target(
                     target_name, facility, date_range, max_results, **_svc_kw
@@ -915,6 +940,7 @@ class SearchByTarget(BaseCapability):
                 _dr = _frame_attr(results, "date_range")
                 if isinstance(_dr, dict):
                     empty_out["date_range"] = _dr
+                empty_out.update(_cone_radius_fields(results))
                 return _native(empty_out)
 
             # ── Tier 2: Pandas post-filters (non-band) ─────────────────
@@ -1091,6 +1117,9 @@ class SearchByTarget(BaseCapability):
             }
             if isinstance(_dr, dict):
                 out["date_range"] = _dr
+            # The cone is sized from the source's extent (ALMAbench 2026-10-15
+            # A22); say how big it was and why (guard CX-08).
+            out.update(_cone_radius_fields(results))
             return _native(out)
         except Exception as e:
             return _native({"success": False, "error": str(e)})
@@ -1958,16 +1987,15 @@ class QueryAlmaScienceArchive(BaseCapability):
                     df = _tap_obscore_dataframe(project_prefix_where(int(cycle)), max_results=max_results, ctx=ctx)
                     result_df = projects_with_array_combo(df, required_arrays)
                     warnings.append(cycle_periods_disclosure(int(cycle)))
-                    warnings.append(
-                        "Array membership is inferred heuristically from antenna_arrays name prefixes "
-                        "(DV/DA = 12-m, CM = 7-m, PM = Total Power) and schedblock_name suffixes; the archive "
-                        "delivers per-MOUS data and has not combined the arrays."
-                    )
+                    from services.alma_science_queries import ARRAY_DEFINITION_NOTE
+
+                    warnings.append(ARRAY_DEFINITION_NOTE)
                 source = f"ALMA Cycle {cycle} array combo projects"
                 mode = "cycle_array_combo_projects"
                 query_summary = (
                     f"Cycle {cycle} projects using ALL of {', '.join(required_arrays)}: one DISTINCT proposal_id query per array "
-                    "at the server (antenna names DV/DA = 12 m, CM = 7 m, PM = TP), intersected; counts per proposal_id via GROUP BY."
+                    "at the server: one DISTINCT (project, group OUS, MOUS, SB name, antennas) pull per cycle, each row classified by its "
+                    "SB-name suffix, else its antennas (PM-only = TP), grouped by member_ous_uid then proposal_id; counts via GROUP BY."
                 )
 
             elif query_type == "high_resolution_band_data":
@@ -2357,7 +2385,7 @@ def _match_cross_archive_sources_impl(
     sources: Optional[List[Dict[str, Any]]] = None,
     archives: Optional[List[str]] = None,
     radius_arcsec: float = 5.0,
-    max_sources: int = 12,
+    max_sources: int = 100,
     max_alma_rows: int = 5000,
     max_mast_results_per_source: int = 80,
     require_all_archives: Any = False,
@@ -2462,6 +2490,35 @@ def _match_cross_archive_sources_impl(
                 query times out on every mirror (UI benchmark 2026-09-22 D18,
                 293 s) while point cones answer in 2-5 s -- go straight to them."""
 
+            # A compact catalogue (one cloud / one field, > 8 sources) is answered by ONE box query plus a
+            # field-of-view coverage match: 9 s for the 97-source VANDAM Perseus list, where per-source point cones
+            # left 65 sources unqueried at the budget (2026-10-16). Any failure falls through to the cones.
+            box = catalog_box(source_catalog) if len(source_catalog) > 8 else None
+            if box is not None and deadline.remaining() > 20.0:
+                box_q = alma_box_adql(box)
+                try:
+                    prov_state["query"] = box_q
+                    box_res = service.search(box_q, maxrec=50000)
+                    box_df = box_res.to_table().to_pandas()
+                    if getattr(box_res, "query_status", "") == "OVERFLOW" or len(box_df) >= 50000:
+                        # A capped box answer is not a complete one (guard CX-02): say so, keep what came back.
+                        _note(f"ALMA box query hit the {len(box_df)}-row cap: pointings beyond it are missing, so "
+                              "ALMA matches are a lower bound")
+                        with lock:
+                            if "ALMA box query" not in exhausted:
+                                exhausted.append("ALMA box query")
+                    with lock:
+                        alma_box.update(df=box_df, mode="box_fov", queried=len(source_catalog))
+                    prov_state["note"] = ("-- ONE box query for every science pointing around the catalogue; a source "
+                                          "matches a pointing whose field (s_fov) or the match radius contains it.")
+                    return
+                except HostCircuitOpen as exc:
+                    _dead(exc.host, exc.retry_after)
+                    _note(f"ALMA TAP unreachable ({exc.host}): {exc.reason[:120]}")
+                    return
+                except Exception as exc:
+                    _note(f"ALMA box query failed ({type(exc).__name__}: {str(exc)[:120]}); fell back to per-source point cones")
+                    prov_state["query"] = None
             try:
                 if str(alma_mode or "").lower() in {"point_only", "points", "point"}:
                     raise _SkipBulk("per-source point cones requested")
@@ -2596,40 +2653,58 @@ def _match_cross_archive_sources_impl(
         mast_client = ctx.service("mast_client")
         not_queried: List[str] = []
         host_down: Optional[str] = None
-        for source in source_catalog:
-            name = source["source_name"]
+        # Sixteen MAST position queries at a time under child deadlines (services/alma_server_side.run_concurrently):
+        # one by one, a 97-source catalogue left 68 sources unqueried at the budget (2026-10-16).
+        from services.alma_server_side import run_concurrently
+
+        def _mast_query(src: Dict[str, Any]) -> Any:
+            return mast_client.search_by_position(float(src["ra"]), float(src["dec"]), radius_arcmin=radius_arcsec / 60.0,
+                                                  mission=mission, max_results=max_mast_results_per_source)
+
+        pending_mast = list(source_catalog)
+        while pending_mast:
             if host_down is not None or deadline.remaining() < 3.0:
-                not_queried.append(name)
-                mast_by_source[name] = pd.DataFrame()
+                for src in pending_mast:
+                    not_queried.append(src["source_name"])
+                    mast_by_source[src["source_name"]] = pd.DataFrame()
                 if host_down is None:
                     with lock:
                         if "MAST queries" not in exhausted:
                             exhausted.append("MAST queries")
-                continue
-            try:
-                frame = mast_client.search_by_position(
-                    float(source["ra"]),
-                    float(source["dec"]),
-                    radius_arcmin=radius_arcsec / 60.0,
-                    mission=mission,
-                    max_results=max_mast_results_per_source,
-                )
-                err = (getattr(frame, "attrs", None) or {}).get("error")
-                if err:
-                    if "HostCircuitOpen" in str(err) or "circuit breaker open" in str(err):
-                        host_down = str(err)
-                        _dead(_host_from_breaker_text(str(err)) or "mast.stsci.edu")
-                    _note(f"MAST query failed for {name}: {str(err)[:160]}")
-                mast_by_source[name] = frame if frame is not None else pd.DataFrame()
-            except HostCircuitOpen as exc:
-                host_down = str(exc)
-                _dead(exc.host, exc.retry_after)
-                _note(f"MAST unreachable ({exc.host}): {exc.reason[:120]}")
-                mast_by_source[name] = pd.DataFrame()
-            except Exception as exc:
-                logger.error("MAST cross-match query failed for %s: %s", name, exc)
-                _note(f"MAST query failed for {name}: {exc}")
-                mast_by_source[name] = pd.DataFrame()
+                break
+            # The first source goes alone as a probe, so an open host breaker or a nearly spent budget stops the
+            # loop after one refusal instead of a whole batch.
+            size = 1 if len(pending_mast) == len(source_catalog) else 16
+            batch, pending_mast = pending_mast[:size], pending_mast[size:]
+            _left = deadline.remaining()
+            outs = run_concurrently([(lambda src=src: _mast_query(src)) for src in batch],
+                                    wall_seconds=max(1.0, (_left - 2.0) if _left != float("inf") else 120.0))
+            for source, out in zip(batch, outs):
+                name = source["source_name"]
+                if isinstance(out, HostCircuitOpen):
+                    host_down = str(out)
+                    _dead(out.host, out.retry_after)
+                    _note(f"MAST unreachable ({out.host}): {out.reason[:120]}")
+                    mast_by_source[name] = pd.DataFrame()
+                elif isinstance(out, BaseException):
+                    if isinstance(out, TimeoutError) and "not finished within the budget" in str(out):
+                        not_queried.append(name)
+                        with lock:
+                            if "MAST queries" not in exhausted:
+                                exhausted.append("MAST queries")
+                    else:
+                        logger.error("MAST cross-match query failed for %s: %s", name, out)
+                        _note(f"MAST query failed for {name}: {out}")
+                    mast_by_source[name] = pd.DataFrame()
+                else:
+                    frame = out
+                    err = (getattr(frame, "attrs", None) or {}).get("error")
+                    if err:
+                        if "HostCircuitOpen" in str(err) or "circuit breaker open" in str(err):
+                            host_down = str(err)
+                            _dead(_host_from_breaker_text(str(err)) or "mast.stsci.edu")
+                        _note(f"MAST query failed for {name}: {str(err)[:160]}")
+                    mast_by_source[name] = frame if frame is not None else pd.DataFrame()
         if not_queried:
             why = "MAST host unreachable (circuit open)" if host_down else "tool budget exhausted"
             _note(
@@ -2657,10 +2732,12 @@ def _match_cross_archive_sources_impl(
     with lock:
         alma_df = alma_box["df"] if alma_box["df"] is not None else pd.DataFrame()
         footprint_mode = alma_box["mode"]
-    alma_matches = (
-        attach_nearest_source(alma_df, source_catalog, radius_arcsec=radius_arcsec)
-        if not alma_df.empty else pd.DataFrame()
-    )
+    if alma_df.empty:
+        alma_matches = pd.DataFrame()
+    elif footprint_mode == "box_fov":
+        alma_matches = attach_covering_sources(alma_df, source_catalog, radius_arcsec=radius_arcsec)
+    else:
+        alma_matches = attach_nearest_source(alma_df, source_catalog, radius_arcsec=radius_arcsec)
 
     summary = summarize_cross_archive_matches(
         source_catalog,
@@ -2710,7 +2787,8 @@ def _match_cross_archive_sources_impl(
         "type": "data",
         "data": summary,
         "source": f"{' + '.join(sorted(requested_archives))} {catalog_label} Cross-match",
-        "filter_label": f"{catalog_label} within {radius_arcsec:g} arcsec",
+        "filter_label": (f"{catalog_label}: an ALMA pointing's field of view (or {radius_arcsec:g} arcsec) contains the source"
+                         if footprint_mode == "box_fov" else f"{catalog_label} within {radius_arcsec:g} arcsec"),
         "tool_name": "match_cross_archive_sources",
         "warnings": archive_errors,
         "partial": bool(archive_errors),
@@ -2756,7 +2834,7 @@ class MatchCrossArchiveSourcesInput(_In):
     sources: Optional[List[Dict[str, Any]]] = None
     archives: Optional[List[str]] = None
     radius_arcsec: Optional[float] = 5.0
-    max_sources: Optional[int] = 12
+    max_sources: Optional[int] = 100
     max_alma_rows: Optional[int] = 5000
     max_mast_results_per_source: Optional[int] = 80
     require_all_archives: Any = False  # bool(...) truthiness in the impl — Any
@@ -2790,7 +2868,7 @@ class MatchCrossArchiveSources(BaseCapability):
 
 class MatchPerseusProtostarsAlmaJwstInput(_In):
     radius_arcsec: Optional[float] = 5.0
-    max_sources: Optional[int] = 12
+    max_sources: Optional[int] = 100
     max_alma_rows: Optional[int] = 5000
     max_mast_results_per_source: Optional[int] = 80
 

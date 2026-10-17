@@ -277,12 +277,25 @@ def knowledge_question(user_query: str) -> bool:
 
 # Round-0 note appended when documentation context was injected and no other
 # route directive fired (core/runner.py).
+# "Answer it from the DOCUMENTATION CONTEXT" alone kept concept answers to what
+# the excerpts said: ALMAbench 2026-10-15 Quasar answers were ~30% shorter than
+# the bare model's and missed checklist points the excerpts did not cover (A03
+# noise RMS, A29 CO lines at z = 1-2). The documentation leads; standard
+# astronomy knowledge fills the rest; archive specifics are never invented.
 KNOWLEDGE_DIRECTIVE = (
-    "\n\n[SYSTEM NOTE: This is a how-to / policy / procedure question. Answer it from the DOCUMENTATION "
-    "CONTEXT above, with its citations. Do NOT call `search_papers`: the user is not asking for papers. "
-    "If part of the question needs a live archive fact (a PI, project code, count, coverage, public data, "
-    "release date or catalogue value), call the archive tool for that part instead of saying the "
-    "documentation does not contain it.]"
+    "\n\n[SYSTEM NOTE: This is a how-to / policy / procedure question. Ground it in the DOCUMENTATION "
+    "CONTEXT above, with its citations, and answer EVERY part of the question completely: where the "
+    "excerpts do not cover a point, explain it from standard radio-astronomy and interferometry knowledge "
+    "(no citation for those parts) rather than leaving it out. For each part, cover what an expert would: what "
+    "the term or product is, how to do it step by step, what can bias or break the result and how to check "
+    "it, typical values with units, how it depends on frequency, array configuration, cycle or software "
+    "version, and where the user finds the information (which file, product, archive page or tool). Never "
+    "invent archive-specific names that "
+    "are in neither the excerpts nor a tool result (ObsCore columns, URL parameters, API calls, document "
+    "section numbers). Do NOT call `search_papers`: the user is not asking for papers. If part of the "
+    "question needs a live archive fact (a PI, project code, count, coverage, public data, release date or "
+    "catalogue value), call the archive tool for that part instead of saying the documentation does not "
+    "contain it.]"
 )
 BACKGROUND_DIRECTIVE = (
     "\n\n[SYSTEM NOTE: The DOCUMENTATION CONTEXT above is background only, not the source of the answer. "

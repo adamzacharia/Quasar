@@ -7,6 +7,9 @@ notes: Alma.query_object resolves the name with SESAME and runs a cone search (d
 notes: result is an astropy Table with one row per (MOUS, target, spectral window) coverage record; 'member_ous_uid' is the
 notes: dataset identifier. There is no Alma.query_sql or Alma.get_data_links -- use query_tap and get_data_info (see the other recipes).
 notes: public is three-state: True = public only, False = PROPRIETARY only, None = both (ALminer uses the same convention).
+notes: query_object takes no radius: it is a position search (fixed 10 arcmin cone around the resolved coordinates), so it
+notes: also returns pointings near the object, and finds data whatever name the PI typed (a Messier name, the NGC number, NGC_nnnn). A
+notes: target_name string match misses renamed data. For another radius use query_region (see the cone recipe).
 """
 from astroquery.alma import Alma
 

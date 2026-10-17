@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any
 
 
-REFERENCE_PATH = Path(__file__).resolve().parents[1] / "alma-data-skill-main" / "references" / "reference-tables.json"
+# Tracked in git next to this module. It used to live in alma-data-skill-main/,
+# which .gitignore excludes, so deployments and benchmark snapshots had no
+# tables and every bands/configurations/cycles lookup failed (ALMAbench 2026-10-15).
+REFERENCE_PATH = Path(__file__).resolve().parent / "reference_data" / "alma_reference_tables.json"
 
 
 def load_reference_tables() -> dict[str, Any]:

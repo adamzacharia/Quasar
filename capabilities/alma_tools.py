@@ -37,6 +37,7 @@ from services.alma_science_queries import (
     aggregate_counts,
     alma_cone_adql,
     alma_cone_count_adql,
+    alma_cone_funnel_adql,
     as_text,
     band_tokens,
     counts_note,
@@ -54,6 +55,122 @@ _ASA_BASE = "https://almascience.nrao.edu/aq/"
 
 def _native(out: Dict[str, Any]) -> ToolResult:
     return ToolResult(success=bool(out.get("success")), error=(None if out.get("success") else out.get("error")), native=out)
+
+
+def _norm_name(name: Any) -> str:
+    """Source / field name reduced to lowercase letters and digits ('UDF_mosaic_1mm' -> 'udfmosaic1mm')."""
+    return re.sub(r"[^a-z0-9]", "", as_text(name).lower())
+
+
+def _source_key(name: Any) -> str:
+    """Source name for matching an ObsCore target_name to a product filename, compared for EQUALITY: lowercase, signs,
+    dots and hyphens kept (J1234+0100 and J1234-0100 stay distinct), spaces, underscores and other punctuation
+    dropped, since product filenames write 'NGC 1068' as 'NGC1068' or 'NGC_1068' (guard CX-12)."""
+    return re.sub(r"[^a-z0-9+.\-]", "", as_text(name).lower())
+
+
+# What a redshift census can and cannot say (ALMAbench 2026-10-15 A29: answers gave the census count and the
+# formula but never said how to get from coverage to galaxies at that redshift).
+_REDSHIFT_METHOD_NOTE = (
+    "ivoa.obscore has no redshift column: these projects have spectral windows that WOULD cover the line at some z in "
+    "the range, not targets with a measured redshift there. To list galaxies at that redshift, cross-match the ALMA "
+    "pointings by position with a redshift catalogue (NED, or the survey catalogue of the field), prefer spectroscopic "
+    "redshifts (a photometric error can move the line out of the window), and for each galaxy compute nu_obs = "
+    "nu_rest/(1+z) per transition (allowing for the redshift error and line width) and check it against each spectral "
+    "window in frequency_support, not the aggregate band range. band_mapping gives the ALMA band each transition falls "
+    "in across the requested z range."
+)
+
+
+# Caveats every census answer can quote (ObsCore semantics, not facts about any one query).
+_CENSUS_CAVEATS_COMMON = [
+    "ivoa.obscore rows are finer than datasets (one per spectral window and execution block), so counts here are "
+    "DISTINCT member_ous_uid (datasets) grouped by proposal_id (projects), never raw rows.",
+    "A cycle is selected by project-code prefix (main call YYYY.1, supplemental call YYYY.2, DDT YYYY.A; see the "
+    "warnings for which were included); the archive only lists data that exist, so projects not yet observed are absent.",
+]
+_CENSUS_CAVEATS = {
+    "solar": [
+        "The Sun is an ephemeris (moving) target, so a position or cone search cannot find solar data; select by the "
+        "ALMA scientific category 'Sun'.",
+        "Free-text matching on 'sun' or 'solar' gives false hits (Sunyaev-Zel'dovich projects, 'Solar system' bodies, "
+        "names containing the letters), so text matches are only a word-anchored fallback here.",
+    ],
+    "arrays": [
+        "Array per dataset comes from the scheduling-block suffix or the antenna names; a PM (Total Power) antenna that "
+        "appears in a 12m or 7m antenna list does not make the data Total Power (see array_definition).",
+    ],
+    "lines": [
+        "Coverage is decided per spectral window (frequency_support), not from the overall frequency range; covering a "
+        "line is not a detection, and science keywords are chosen by the PI.",
+        "The same object can appear under different target names; group by project and target position before "
+        "counting objects.",
+    ],
+}
+
+
+def _census_reproduce(kind: str, cycle: Optional[int], *, science_only: bool = True, public_only: bool = False) -> Dict[str, str]:
+    """A short query a user can run themselves for the SAME population the census counted (every project-code
+    prefix of the cycle, the same science/public filters; guard CX-06), and the ASA web-interface equivalent (checked
+    in the ASA on 2026-10-16: projectCode=2021.1.*%7C2021.2.*%7C2021.A.*&observationsScientificCategory=Sun filtered
+    the Observations table to 8 rows; a raw '|' in the URL is rejected with HTTP 400; the Projects tab count ignores
+    column filters)."""
+    if kind != "solar" or cycle is None:
+        return {}
+    from services.alma_science_queries import cycle_project_prefixes
+
+    prefixes = cycle_project_prefixes(int(cycle))
+    codes = " OR ".join(f"proposal_id LIKE '{p}%'" for p in prefixes)
+    filters = (" AND science_observation = 'T'" if science_only else "") + (" AND data_rights = 'Public'" if public_only else "")
+    asa_codes = "|".join(f"{p}*" for p in prefixes)
+    return {
+        "simple_adql": f"SELECT DISTINCT proposal_id FROM ivoa.obscore WHERE scientific_category = 'Sun' AND ({codes}){filters}",
+        "asa_web": (f"In the ASA set Project code = {asa_codes} ('|' = or) and filter the Observations table's Scientific "
+                    f"category column to Sun (https://almascience.org/aq/?projectCode={asa_codes.replace('|', '%7C')}"
+                    f"&observationsScientificCategory=Sun{'&publicData=true' if public_only else ''}); count distinct "
+                    "project codes in the Observations table, because the Projects tab count ignores column filters. "
+                    "The census also accepts word-anchored Sun/solar text matches, so its count can be slightly larger."),
+    }
+
+
+def _redshift_band_mapping(windows: List[Dict[str, Any]], z_min: float, z_max: float) -> List[Dict[str, Any]]:
+    """For each transition window, the ALMA receiver band(s) its observed frequency falls in and the z sub-range for
+    each, from the reference band table (nominal edges)."""
+    try:
+        from services.alma_reference import load_reference_tables
+
+        bands = load_reference_tables()["bands"]
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for w in windows:
+        nu = float(w.get("rest_frequency_ghz") or 0)
+        if nu <= 0:
+            continue
+        parts = []
+        for b in bands:
+            lo, hi = float(b["frequency_min_ghz"]), float(b["frequency_max_ghz"])
+            z_lo, z_hi = max(z_min, nu / hi - 1.0), min(z_max, nu / lo - 1.0)
+            if z_lo <= z_hi:
+                parts.append({"band": int(b["band"]), "z_min": round(z_lo, 3), "z_max": round(z_hi, 3)})
+        out.append({"transition": w.get("transition"), "rest_frequency_ghz": round(nu, 4),
+                    "observed_ghz": [round(nu / (1 + z_max), 2), round(nu / (1 + z_min), 2)],
+                    "bands": parts or "outside the ALMA bands over this z range"})
+    return out
+
+
+# Names a field's ALMA pointings go by (normalised). The HUDF is "HUDF" in the
+# Dunlop et al. mosaic but "UDF_mosaic_1mm" / "UDF_mosaic_3mm" in ASPECS.
+_UDF_NAMES = {"hudf", "udf", "hubbleultradeepfield"}
+_FIELD_NAME_ALIASES = {"hudf": _UDF_NAMES, "hubbleultradeepfield": _UDF_NAMES, "ultradeepfield": _UDF_NAMES}
+
+
+def _sep_arcmin(ra: float, dec: float, ras: pd.Series, decs: pd.Series) -> pd.Series:
+    """Great-circle separation (arcmin) from (ra, dec) to each (ras, decs), all in degrees."""
+    r0, d0 = math.radians(ra), math.radians(dec)
+    r1, d1 = ras.map(math.radians), decs.map(math.radians)
+    cos = (d1.map(math.sin) * math.sin(d0) + d1.map(math.cos) * math.cos(d0) * (r1 - r0).map(math.cos)).clip(-1.0, 1.0)
+    return cos.map(lambda c: math.degrees(math.acos(c)) * 60.0)
 
 
 class _In(BaseModel):
@@ -185,6 +302,10 @@ class AlmaProjectCensus(BaseCapability):
 
         frame = res.frame
         warnings = list(res.notes) + [("Completeness: " if res.complete else "INCOMPLETE: ") + res.completeness_note()]
+        redshift_extras: Dict[str, Any] = {}
+        if kind == "redshift":
+            redshift_extras = {"band_mapping": _redshift_band_mapping(res.extras.get("windows") or [], float(c.zmin), float(c.zmax)),
+                               "method_note": _REDSHIFT_METHOD_NOTE}
         _data_card(ctx, frame, source=f"ALMA project census ({kind})", tool_name=self.name,
                    label=f"{kind}" + (f" Cycle {inp.cycle}" if inp.cycle is not None else " (whole archive)"),
                    warnings=warnings, partial=not res.complete)
@@ -213,9 +334,14 @@ class AlmaProjectCensus(BaseCapability):
                 "Counts are computed at the archive server; 'partial' means some cycles were not scanned within the "
                 "tool budget and counts are lower bounds. The full table is in the UI data card."
             ),
+            "method_caveats": _CENSUS_CAVEATS.get(kind, []) + _CENSUS_CAVEATS_COMMON,
+            **({"reproduce": _census_reproduce(kind, inp.cycle, science_only=inp.science_only, public_only=inp.public_only)}
+               if kind == "solar" and inp.cycle is not None else {}),
+            **redshift_extras,
         }
-        for key in ("rest_frequencies_ghz", "lines", "mous_per_line", "windows", "threshold_mhz", "citation",
-                    "projects_in_window", "per_array_project_counts", "matching_projects", "cycles_scanned"):
+        for key in ("rest_frequencies_ghz", "lines", "mous_per_line", "distinct_objects_by_position", "windows", "threshold_mhz", "citation",
+                    "projects_in_window", "per_array_project_counts", "matching_projects", "matching_project_ids",
+                    "alternative_counts", "array_definition", "cycles_scanned"):
             if key in res.extras:
                 out[key] = res.extras[key]
         return _native(out)
@@ -228,12 +354,20 @@ class SourceSummaryInput(_In):
     target: Optional[str] = Field(default=None, description="Target name (SIMBAD-resolvable), or give ra/dec")
     ra: Optional[float] = None
     dec: Optional[float] = None
-    radius_arcsec: float = 60.0
+    radius_arcsec: Optional[float] = None  # None: sized from the source's catalogued extent, at least 60 arcsec
+    released_before: Optional[str] = None  # ISO date: keep rows released before it (filter in the ADQL)
     bands: Optional[List[int]] = Field(default=None, description="ALMA bands to keep (in the ADQL), e.g. [7]")
     max_resolution_arcsec: Optional[float] = Field(default=None, description="keep MOUS with spatial_resolution <= this (arcsec)")
     public_only: bool = False
     science_only: bool = True
     max_rows: int = 2000
+
+
+_EXTENT_CONE_MODE = (
+    "fields overlapping the cone, computed at the archive: pointings whose field (s_fov/2) reaches the cone, or whose "
+    "footprint contains the source position (field footprints treated as circles of diameter s_fov, inclusive by 2 "
+    "arcsec). Complete for fields up to 1 degree across; a larger mosaic centred more than 30 arcmin outside the cone "
+    "would not be found.")
 
 
 class AlmaSourceSummary(BaseCapability):
@@ -242,8 +376,8 @@ class AlmaSourceSummary(BaseCapability):
         "ONE-CALL per-MOUS summary of the ALMA data on a source: band, spatial resolution, aggregate bandwidth, continuum "
         "sensitivity, integration time, release date, data rights, PI and project, with the band/resolution/public/science "
         "filters applied IN the ADQL (so a row cap never hides matching data) and a server-side total count when the cap "
-        "is hit. Also returns the nominal frequency edges of the requested bands. Use for 'summarise the Band 7 data on "
-        "HH212 usable for a deep <1 arcsec continuum image' or 'Band 6 observations of M83'. Target <= 30 s."
+        "is hit, and the band frequency edges. Omit radius_arcsec to search the source's whole catalogued extent; "
+        "released_before=YYYY-MM-DD for 'released before'. Target <= 30 s."
     )
     category = "archive"
     InputModel = SourceSummaryInput
@@ -251,6 +385,13 @@ class AlmaSourceSummary(BaseCapability):
 
     def run(self, inp, ctx) -> ToolResult:
         started = time.perf_counter()
+        if inp.released_before:
+            try:
+                _dt.date.fromisoformat(str(inp.released_before).strip()[:10])
+            except ValueError:
+                # Caller input, not an archive outage (guard CX-07): no query is sent.
+                return _native({"success": False, "status": "invalid_input",
+                                "error": f"released_before must be an ISO date (YYYY-MM-DD), got {inp.released_before!r}"})
         prov_state = ctx.service("alma_tap_provenance")
         try:
             ra, dec, label = inp.ra, inp.dec, (inp.target or "").strip()
@@ -263,11 +404,26 @@ class AlmaSourceSummary(BaseCapability):
                 ra, dec = resolved.get("ra_deg"), resolved.get("dec_deg")
                 if ra is None or dec is None:
                     return _native({"success": False, "status": "coverage_gap", "error": f"could not resolve target {label!r}"})
+            radius_basis = None
+            if inp.radius_arcsec is not None:
+                radius_arcsec = float(inp.radius_arcsec)
+            elif label:
+                from services.target_extent import extent_radius_arcsec
+
+                sized = extent_radius_arcsec(label, 60.0)
+                radius_arcsec, radius_basis = float(sized["radius_arcsec"]), sized["basis"]
+            else:
+                radius_arcsec = 60.0
             label = label or f"RA={float(ra):.5f}, Dec={float(dec):.5f}"
-            radius_deg = max(1.0, float(inp.radius_arcsec)) / 3600.0
+            radius_deg = max(1.0, radius_arcsec) / 3600.0
             top = max(50, min(int(inp.max_rows), 20000))
+            # A cone sized from an extended source's extent is searched on pointing centres plus footprints that
+            # contain the source position: the full s_region INTERSECTS form took 54 s for an 8.6-arcmin M83 cone
+            # (ReadTimeouts in the 2026-10-16 re-run); this form 34 s, same 44 MOUS (guard CX-04).
+            footprint: Any = "contains" if (radius_basis and radius_arcsec > 120.0) else True
             kw = dict(public=bool(inp.public_only), band=inp.bands or None,
-                      max_resolution_arcsec=inp.max_resolution_arcsec, science_only=bool(inp.science_only))
+                      max_resolution_arcsec=inp.max_resolution_arcsec, science_only=bool(inp.science_only),
+                      released_before=inp.released_before or None, footprint=footprint)
             query = alma_cone_adql(float(ra), float(dec), radius_deg, top=top, columns=OBSCORE_BASE_COLUMNS, **kw)
             prov_state["query"] = query
             prov_state["url"] = _ALMA_TAP_URL
@@ -295,6 +451,7 @@ class AlmaSourceSummary(BaseCapability):
                 cdf = cres.to_table().to_pandas()
                 if not cdf.empty:
                     total_rows, total_mous = int(cdf.iloc[0]["total_rows"]), int(cdf.iloc[0]["total_mous"])
+            before_cuts = self._before_quality_cuts(service, float(ra), float(dec), radius_deg, kw, prov_state, query)
         except Exception as exc:
             out = {"success": False, "error": f"{type(exc).__name__}: {str(exc)[:300]}", "status": "infrastructure_failure"}
             return _native(_infra_failure(out, exc))
@@ -303,7 +460,10 @@ class AlmaSourceSummary(BaseCapability):
         if df.empty:
             out = {
                 "success": True, "status": "coverage_gap", "target": label, "ra": float(ra), "dec": float(dec),
-                "n_mous": 0, "n_rows": 0, "filters_in_adql": {k: v for k, v in kw.items() if v not in (None, False)},
+                "radius_arcsec": round(radius_arcsec, 1), **({"radius_basis": radius_basis} if radius_basis else {}),
+                "n_mous": 0, "n_rows": 0, "filters_in_adql": {k: v for k, v in kw.items() if k != "footprint" and v not in (None, False)},
+                **({"before_quality_cuts": before_cuts} if before_cuts else {}),
+                "cone_mode": (_EXTENT_CONE_MODE if kw.get("footprint") == "contains" else "footprint (s_region) or pointing centre"),
                 "band_frequency_edges": band_edges,
                 "note": "No ALMA rows match this cone with these filters (the query completed; this is a real empty result).",
                 "provenance": {"tap_url": prov_state.get("url"), "adql": query, "elapsed_s": round(time.perf_counter() - started, 1)},
@@ -318,7 +478,16 @@ class AlmaSourceSummary(BaseCapability):
         texp: Dict[str, float] = {}
         rel: Dict[str, str] = {}
         rights: Dict[str, str] = {}
+        arrays_of: Dict[str, str] = {}
+        from services.alma_science_queries import classify_array_row
+
         for uid, g in df.groupby(df["member_ous_uid"].map(as_text)):
+            labels: List[str] = []
+            for sb, ants in zip(g.get("schedblock_name", pd.Series([""] * len(g))), g.get("antenna_arrays", pd.Series([""] * len(g)))):
+                for lab in classify_array_row(ants, sb):
+                    if lab not in labels:
+                        labels.append(lab)
+            arrays_of[uid] = "+".join(labels)
             widths = set()
             for fs in g.get("frequency_support", pd.Series(dtype=str)).dropna().astype(str).unique():
                 for lo, hi in parse_frequency_support_intervals(fs):
@@ -349,6 +518,7 @@ class AlmaSourceSummary(BaseCapability):
             "pi_name": mous.get("pi_name", ""),
             "target_name": mous.get("target_name", ""),
             "band_list": mous.get("band_list", ""),
+            "array": mous["member_ous_uid"].map(arrays_of),
             "spatial_resolution_arcsec": pd.to_numeric(mous.get("spatial_resolution"), errors="coerce").round(3),
             "aggregate_bandwidth_mhz": mous["member_ous_uid"].map(agg_bw),
             "cont_sensitivity_mjy_beam": mous["member_ous_uid"].map(sens),
@@ -372,9 +542,20 @@ class AlmaSourceSummary(BaseCapability):
         out = {
             "success": True,
             "status": "partial" if truncated else "ok",
-            "target": label, "ra": float(ra), "dec": float(dec), "radius_arcsec": float(inp.radius_arcsec),
-            "filters_in_adql": {k: v for k, v in kw.items() if v not in (None, False)},
+            "target": label, "ra": float(ra), "dec": float(dec), "radius_arcsec": round(radius_arcsec, 1),
+            **({"radius_basis": radius_basis} if radius_basis else {}),
+            "filters_in_adql": {k: v for k, v in kw.items() if k != "footprint" and v not in (None, False)},
+            "cone_mode": (_EXTENT_CONE_MODE if kw.get("footprint") == "contains" else "footprint (s_region) or pointing centre"),
             "n_mous": int(len(table)), "n_rows": int(len(df)),
+            # Every MOUS id, compactly: 'find all observations' answers must list the datasets, and results stop at 40
+            # rows (ALMAbench 2026-10-15 A22: 44 MOUS, answers gave the count only or the first 40). Placed before the
+            # verbose rows so a truncated tool result still carries the whole list.
+            "mous_list": [f"{r.member_ous_uid} {r.proposal_id} {as_text(r.obs_release_date)[:10]} {as_text(r.array)} "
+                          f"{'' if pd.isna(r.spatial_resolution_arcsec) else str(r.spatial_resolution_arcsec) + chr(34)}".strip()
+                          for r in table.head(500).itertuples()],
+            "n_projects": int(table["proposal_id"].map(as_text).nunique()),
+            **({"before_quality_cuts": before_cuts} if before_cuts else {}),
+            "by_array": self._by_array(table),
             "total_rows_in_archive": total_rows, "total_mous_in_archive": total_mous,
             "counts": counts, "count_summary": counts_note(counts),
             "band_frequency_edges": band_edges,
@@ -383,9 +564,54 @@ class AlmaSourceSummary(BaseCapability):
             "results_returned": min(40, len(table)),
             "warnings": warnings,
             "provenance": {"tap_url": prov_state.get("url"), "adql": prov_state.get("query"), "elapsed_s": round(time.perf_counter() - started, 1)},
-            "note": "One row per MOUS (dataset). aggregate_bandwidth_mhz sums the distinct spectral windows; cont_sensitivity is the archive's estimate (mJy/beam). Full table in the UI data card.",
+            "note": ("One row per MOUS (dataset). aggregate_bandwidth_mhz sums the distinct spectral windows; cont_sensitivity "
+                     "is the archive's estimate (mJy/beam). Full table in the UI data card. When the user asks to find or list "
+                     "observations, list every MOUS in mous_list (uid, project, release date, array, resolution), not only "
+                     "the count; by_array splits the counts by array."),
         }
         return _native(out)
+
+    @staticmethod
+    def _before_quality_cuts(service, ra: float, dec: float, radius_deg: float, kw: Dict[str, Any],
+                             prov_state: Dict[str, Any], query: str) -> Optional[Dict[str, Any]]:
+        """Counts for the same cone and scope without the user's resolution limit, so the answer can give
+        the funnel (how many datasets the target has in this band, and how many pass the user's cut). None when no
+        cut is set, the turn is short of time, or the count fails (the main result stands on its own)."""
+        from services.tool_budgets import remaining_seconds as _remaining
+
+        funnel_q = alma_cone_funnel_adql(ra, dec, radius_deg, **kw)
+        left = _remaining()
+        if not funnel_q or (left is not None and left < 8.0):
+            return None
+        try:
+            try:
+                fres = service.search(funnel_q, maxrec=5)
+            except TypeError:
+                fres = service.search(funnel_q)
+            fdf = fres.to_table().to_pandas()
+            n_mous, n_projects = int(fdf.iloc[0]["n_mous"]), int(fdf.iloc[0]["n_projects"])
+        except Exception as exc:  # noqa: BLE001 - optional context
+            print(f"[ALMA SOURCE SUMMARY] before-cuts count failed (non-fatal): {type(exc).__name__}: {str(exc)[:120]}")
+            return None
+        prov_state["query"] = (prov_state.get("query") or query) + "\n\n" + funnel_q
+        cuts = [k for k in ("max_resolution_arcsec",) if kw.get(k) not in (None, False)]
+        return {
+            "cuts_removed": cuts,
+            "n_mous": n_mous,
+            "n_projects": n_projects,
+            "note": ("Counts for the same target, band and scope BEFORE the quality cuts listed in cuts_removed. "
+                     "Report both: how many datasets (MOUS) and projects the target has, then how many pass the cut."),
+        }
+
+    @staticmethod
+    def _by_array(table: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+        """MOUS / project counts and the resolution range per array (12m, 7m, TP, or a '+' mix)."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for arr, g in table.groupby(table["array"].map(lambda v: as_text(v) or "unknown")):
+            res = pd.to_numeric(g["spatial_resolution_arcsec"], errors="coerce").dropna()
+            out[arr] = {"n_mous": int(len(g)), "n_projects": int(g["proposal_id"].map(as_text).nunique()),
+                        "resolution_arcsec_range": [float(res.min()), float(res.max())] if not res.empty else None}
+        return out
 
     @staticmethod
     def _band_edges(bands: Optional[List[int]]) -> List[Dict[str, Any]]:
@@ -456,13 +682,15 @@ class AlmaPublicBandStatus(BaseCapability):
         multi = sorted({as_text(v) for v in df["band_list"] if len(band_tokens(v)) > 1}) if not df.empty else []
         table = pd.DataFrame([{"band": int(b), **per_band[b]} for b in bands_sorted])
         reference = {}
+        without: List[Dict[str, Any]] = []
         try:
             from services.alma_reference import alma_reference_table
 
             ref = alma_reference_table("bands")
             reference = {"receiver_band_count": ref.get("receiver_band_count"),
                          "bands": [{"band": r.get("band"), "frequency_min_ghz": r.get("frequency_min_ghz"), "frequency_max_ghz": r.get("frequency_max_ghz")} for r in ref.get("bands", [])],
-                         "verified_on": ref.get("verified_on"), "sources": ref.get("sources")}
+                         "verified_on": ref.get("verified_on"), "sources": ref.get("sources"), "notes": ref.get("notes")}
+            without = self._bands_without_public_data(ref, {int(b) for b in bands_sorted})
         except Exception:
             pass
         _data_card(ctx, table, source="ALMA public data by band" + (f" (released by {as_of})" if as_of else ""), tool_name=self.name)
@@ -474,6 +702,7 @@ class AlmaPublicBandStatus(BaseCapability):
             "n_bands_with_public_data": len(bands_sorted),
             "per_band": {int(b): per_band[b] for b in bands_sorted},
             "band_to_band_combinations": multi,
+            "bands_without_public_data": without,
             "reference": reference,
             "results": table.to_dict("records"),
             "provenance": {"tap_url": _ALMA_TAP_URL, "adql": executed, "elapsed_s": round(time.perf_counter() - started, 1)},
@@ -485,6 +714,29 @@ class AlmaPublicBandStatus(BaseCapability):
         }
         return _native(out)
 
+    @staticmethod
+    def _bands_without_public_data(ref: Dict[str, Any], with_data: set) -> List[Dict[str, Any]]:
+        """Each receiver band with no public rows, with the cycles the reference tables offer it in. A band first
+        offered in the latest tabulated cycle had not operated for science before it, which explains the empty archive
+        (ALMAbench 2026-10-15 A14: once the tables loaded, answers said 'Band 2 has none' and dropped the reason)."""
+        offered = {int(c): {int(b) for b in bands} for c, bands in (ref.get("offered_bands_by_cycle") or {}).items()}
+        out: List[Dict[str, Any]] = []
+        for row in ref.get("bands", []):
+            band = int(row.get("band"))
+            if band in with_data:
+                continue
+            cycles = sorted(c for c, bands in offered.items() if band in bands)
+            entry: Dict[str, Any] = {"band": band, "offered_in_tabulated_cycles": cycles,
+                                     "tabulated_cycles": sorted(offered)}
+            if offered and cycles and min(cycles) > min(offered):
+                entry["explanation"] = (f"Band {band} is first offered in Cycle {min(cycles)} (not in Cycle "
+                                        f"{', '.join(str(c) for c in sorted(offered) if c < min(cycles))}), so it had not been "
+                                        "operating for science observations long enough for data to be public.")
+            elif offered and not cycles:
+                entry["explanation"] = f"Band {band} is not offered in the tabulated cycles {sorted(offered)}."
+            out.append(entry)
+        return out
+
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4. alma_archive_link
@@ -493,19 +745,44 @@ class ArchiveLinkInput(_In):
     target: Optional[str] = Field(default=None, description="Source name for the ASA name resolver (sourceNameResolver)")
     ra: Optional[float] = None
     dec: Optional[float] = None
-    radius_arcmin: Optional[float] = Field(default=None, description="cone radius for ra/dec links (arcmin)")
-    band: Any = Field(default=None, description="ALMA band(s) for bandList, e.g. 6 or [6,7]")
+    radius_arcmin: Optional[float] = Field(default=None, description="cone radius in arcmin (ASA default 10)")
+    band: Any = Field(default=None, description="ALMA band(s), e.g. 6 or [6,7]")
     public_only: bool = False
+    released_before: Optional[str] = None  # ISO date -> observationsReleaseDate=<date filter
     extra: Dict[str, Any] = Field(default_factory=dict, description="additional documented ASA URL parameters, verbatim")
+
+
+# Read from the ASA application (almascience.eso.org/aq/main.js) and checked live in a browser on 2026-10-16:
+# sourceName=NGC253&band=3,7&observationsReleaseDate=%3C2025-01-01 applied all three filters (the page showed
+# "ALMA source name: NGC253", "Band: 3, 7", "Release date: <2025-01-01"); almascience.org/aq/ answered 302 to a mirror.
+_ASA_LINK_NOTES = {
+    "url_structure": (
+        "Base: the ASA query page https://almascience.org/aq/ (redirects to the nearest mirror: almascience.nrao.edu, "
+        ".eso.org or .nao.ac.jp). Filters follow the '?' as key=value pairs joined by '&'."),
+    "url_encoding": (
+        "Values are URL-encoded: '<' is %3C, '>' %3E, a space %20 or '+', so 'release date < 2026-01-01' is "
+        "observationsReleaseDate=%3C2026-01-01. Several values of one filter are comma-separated (band=6,7); the "
+        "column filters take the ASA operators '<', '>', '..' (range) and '|' (or)."),
+    "name_vs_resolver": (
+        "sourceNameResolver resolves the name (SIMBAD/NED) to a position and returns every observation whose footprint "
+        "overlaps a cone around it (10 arcmin default, ', N' = N arcmin), whatever name the PI typed, so it can also "
+        "return pointings near the source. sourceName matches the source name the PI entered (wildcards '*', '?'), so "
+        "it misses data registered under another name (a catalogue number, underscores) and finds nothing for a "
+        "renamed target. The two searches can therefore give different results."),
+    "sharing": (
+        "The ASA writes every active filter into the page URL, so the address bar after setting a query in the "
+        "interface is the shareable link. Opening it re-runs the query live, so the results can change as data are "
+        "added or released; record the date with any result list."),
+}
 
 
 class AlmaArchiveLink(BaseCapability):
     name = "alma_archive_link"
     description = (
-        "Build the ALMA Science Archive (ASA) query-interface deep link for a target/position and band using the DOCUMENTED "
-        "URL parameter names (sourceNameResolver, sourceNameAlma, raDec, bandList, publicData, resultView), plus the equivalent "
+        "Build the ALMA Science Archive (ASA) query-interface deep link for a target/position and band using the ASA "
+        "filter parameter names (sourceNameResolver, sourceName, raDec, band, publicData), plus the equivalent "
         "TAP sync URL. Both are HEAD-verified live and returned with a verified/unverified label. Use whenever the user asks "
-        "for a URL/link into the ALMA archive (e.g. 'the ASA URL for M83 in Band 6')."
+        "for a URL/link into the ALMA archive (a source or position, bands, public data, a release-date cut)."
     )
     category = "archive"
     InputModel = ArchiveLinkInput
@@ -514,27 +791,41 @@ class AlmaArchiveLink(BaseCapability):
     def run(self, inp, ctx) -> ToolResult:
         from capabilities.alma_science_helpers import head_verify  # local helper module (below)
 
+        # Filter ids read from the ASA application (almascience.eso.org/aq/main.js, 2026-10-16) and checked live: the
+        # band filter is `band` (comma list); `bandList` and `resultView` are silently ignored (ALMAbench A24: the old
+        # link returned every band). A trailing ", N" on sourceNameResolver / raDec is the radius in ARCMIN (default 10).
         params: Dict[str, str] = {}
         if inp.target:
-            params["sourceNameResolver"] = str(inp.target).strip()
+            params["sourceNameResolver"] = str(inp.target).strip() + (f", {float(inp.radius_arcmin):g}" if inp.radius_arcmin else "")
         if inp.ra is not None and inp.dec is not None:
             r = float(inp.radius_arcmin) if inp.radius_arcmin else 1.0
-            params["raDec"] = f"{float(inp.ra):.6f} {float(inp.dec):+.6f}, {r / 60.0:.5f}"
+            params["raDec"] = f"{float(inp.ra):.6f} {float(inp.dec):+.6f}, {r:g}"
         bands: List[str] = []
         if inp.band is not None:
             raw = inp.band if isinstance(inp.band, (list, tuple)) else re.split(r"[,\s]+", str(inp.band))
             bands = [str(int(b)) for b in raw if str(b).strip().isdigit() and 1 <= int(b) <= 10]
             if bands:
-                params["bandList"] = ",".join(bands)
+                params["band"] = ",".join(bands)
         if inp.public_only:
             params["publicData"] = "true"
-        params["resultView"] = "observations"
+        if inp.released_before:
+            try:
+                params["observationsReleaseDate"] = "<" + _dt.date.fromisoformat(str(inp.released_before).strip()[:10]).isoformat()
+            except ValueError:
+                return _native({"success": False, "status": "invalid_input",
+                                "error": f"released_before must be an ISO date (YYYY-MM-DD), got {inp.released_before!r}"})
         for k, v in (inp.extra or {}).items():
             if k and v is not None:
                 params[str(k)] = str(v)
         if not (inp.target or (inp.ra is not None and inp.dec is not None)):
             return _native({"success": False, "error": "target or ra/dec is required"})
-        asa_url = _ASA_BASE + "?" + urlencode(params, quote_via=quote_plus)
+        asa_url = _ASA_BASE + "?" + urlencode(params, quote_via=quote_plus, safe=",")
+        # The same filters with a PI-name match instead of the resolver (see _ASA_LINK_NOTES name_vs_resolver).
+        name_url = None
+        if inp.target and "sourceNameResolver" in params:
+            name_params = {("sourceName" if k == "sourceNameResolver" else k): (str(inp.target).strip() if k == "sourceNameResolver" else v)
+                           for k, v in params.items()}
+            name_url = _ASA_BASE + "?" + urlencode(name_params, quote_via=quote_plus, safe=",")
 
         # TAP equivalent: needs coordinates.
         tap_url = None
@@ -553,7 +844,7 @@ class AlmaArchiveLink(BaseCapability):
             adql = alma_cone_adql(float(ra), float(dec), radius_deg, public=bool(inp.public_only), top=500,
                                   columns=("proposal_id", "member_ous_uid", "target_name", "band_list", "s_ra", "s_dec",
                                            "spatial_resolution", "obs_release_date", "data_rights"),
-                                  band=[int(b) for b in bands] or None)
+                                  band=[int(b) for b in bands] or None, released_before=inp.released_before or None)
             tap_url = _ALMA_TAP_URL + "/sync?" + urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql}, quote_via=quote_plus)
 
         checks = {"asa": head_verify(asa_url), "tap": head_verify(tap_url) if tap_url else None}
@@ -565,9 +856,14 @@ class AlmaArchiveLink(BaseCapability):
             "tap_sync_url": tap_url, "tap_url_verified": (checks["tap"][0] if checks["tap"] else None),
             "tap_url_check": (checks["tap"][1] if checks["tap"] else None), "tap_adql": adql,
             "resolved": resolved_note,
-            "links": [asa_url] + ([tap_url] if tap_url else []),
+            "asa_name_match_url": name_url,
+            "links": [asa_url] + ([name_url] if name_url else []) + ([tap_url] if tap_url else []),
+            "url_notes": _ASA_LINK_NOTES,
             "note": (
-                "Parameter names follow the ASA URL-query documentation (sourceNameResolver, raDec, bandList, publicData, resultView). "
+                "Parameter names are the ASA filter ids (sourceNameResolver = name resolved to a position, 10 arcmin default "
+                "radius or ', N' arcmin; sourceName = the PI's source name; raDec = 'ra dec, radius_arcmin'; band = comma list; "
+                "publicData=true; observationsReleaseDate='<YYYY-MM-DD'), checked live in the ASA application on 2026-10-16; "
+                "see url_notes for the URL structure, encoding, resolver vs name match and sharing. "
                 "'verified' means the endpoint answered the URL with an HTTP 2xx/3xx; the ASA is a browser application, so the server "
                 "does not validate individual parameters in that response — the TAP link is the mechanically checkable equivalent."
             ),
@@ -583,88 +879,153 @@ _PROJECT_CODE_RE = re.compile(r"\b(20\d{2}\.[0-9A-Z]\.\d{5}\.[A-Z])\b")
 
 class BibliographyInput(_In):
     topic: str
+    synonyms: Optional[List[str]] = None  # spelling / acronym variants ADS does not map
     n: int = 10
     since: Optional[int] = Field(default=None, description="earliest publication year")
+    archival: str = Field(default="any", description="any | only | ignore (archival use of ALMA data)")
     refereed_only: bool = True
 
 
 class AlmaBibliography(BaseCapability):
     name = "alma_bibliography"
     description = (
-        "Publications that USED ALMA DATA on a topic, from the ADS ALMA bibliographic group (bibgroup:ALMA = the ALMA "
-        "telbib), newest first: title, first author + et al., year, journal, bibcode, ALMA project code(s) quoted in the "
-        "abstract (or 'not stated'), and an abstract-based summary. Use for 'the 10 most recent papers on protostellar "
-        "outflows that used ALMA archive data'."
+        "Refereed papers on a topic that USED ALMA DATA (ADS bibgroup:ALMA = the ALMA telescope bibliography), newest "
+        "first, each classified for ARCHIVAL use the way ALMA's publication statistics define it (no author is PI or "
+        "co-I of the ALMA project the paper used; projects, PIs and co-Is from the ALMA archive). Per paper: bibcode, "
+        "title, date, first author, ALMA projects with PI, topic evidence, archival class + confidence, and the abstract (whole sentences; give each paper a short summary of its target, data and main result from it). "
+        "archival='any' (default) keeps archival only + archival+PI papers, 'only' archival only, 'ignore' all. The list "
+        "is closed: never add papers that are not in it."
     )
     category = "literature"
     InputModel = BibliographyInput
     annotations = {"read_only": True, "cost": "network"}
 
     def run(self, inp, ctx) -> ToolResult:
+        from services import alma_bibliography as ab
+
         ads = ctx.services.get("ads_client")
         if ads is None:
             return _native({"success": False, "status": "infrastructure_failure", "error": "ADS client is not configured"})
         topic = str(inp.topic or "").strip()
         if not topic:
             return _native({"success": False, "error": "topic is required"})
+        mode = str(inp.archival or "any").strip().lower()
+        if mode not in {"any", "only", "ignore"}:
+            return _native({"success": False, "status": "invalid_input", "error": "archival must be any | only | ignore"})
         n = max(1, min(int(inp.n), 50))
-        q = f'bibgroup:ALMA abs:"{topic}"' if " " in topic else f"bibgroup:ALMA abs:{topic}"
-        filters = []
+        phrases = [topic] + [str(x).strip() for x in (inp.synonyms or []) if str(x).strip()][:8]
+        q = ab.ads_query(phrases)
+        filters = ["doctype:article"]
         if inp.refereed_only:
             filters.append("property:refereed")
         if inp.since:
             filters.append(f"year:{int(inp.since)}-")
+        started = time.perf_counter()
+
+        mapping: Dict[str, List[Dict[str, Any]]] = {}
+        map_note = ""
+        map_complete = True
+        if True:  # classify in every mode (the map is cached); `archival` only decides what is kept
+            executed: List[str] = []
+            try:
+                mapping, built, map_complete = ab.bib_map(_run_adql_factory(ctx, executed))
+                map_note = f"ALMA paper-project map from ObsCore bib_reference ({len(mapping)} papers), built {built}."
+                if not map_complete:
+                    map_note += " The map query hit its row cap: some paper-project links may be missing, so archival classes are provisional."
+            except Exception as exc:  # noqa: BLE001 - without the map the archival class is unknown, said so below
+                map_note = f"ALMA paper-project map unavailable ({type(exc).__name__}): archival use could not be classified."
+
+        patterns = ab.topic_patterns(phrases)
+        kept: List[Dict[str, Any]] = []
+        scanned = off_topic = wrong_class = 0
+        fields = ["bibcode", "title", "author", "pubdate", "year", "pub", "abstract", "doi", "keyword"]
         try:
-            papers = ads.search_papers(
-                q, max_results=n, sort="date desc",
-                fields=["bibcode", "title", "author", "year", "pub", "abstract", "doi", "citation_count", "keyword", "pubdate"],
-                filters=filters or None,
-            )
+            raw = getattr(ads, "search_raw", None)
+            for start in (0, 200, 400):
+                if raw is not None:   # full author lists (search_papers shortens them for display; guard CX-01)
+                    page = raw(q, rows=200, sort="date desc", fields=fields, filters=filters, start=start)
+                else:
+                    page = ads.search_papers(q, max_results=200, sort="date desc", fields=fields, filters=filters, start=start)
+                for p in page:
+                    scanned += 1
+                    evidence = ab.topic_evidence(p, patterns)
+                    if evidence is None:
+                        off_topic += 1
+                        continue
+                    authors = p.get("author") if isinstance(p.get("author"), list) else None
+                    full_authors = authors is not None
+                    if authors is None:   # display-formatted record ('A et al.'): cannot be checked author by author
+                        shown = p.get("authors") or p.get("author") or ""
+                        authors = [shown] if isinstance(shown, str) else list(shown)
+                    cls, proj = ab.classify(authors, mapping.get(str(p.get("bibcode") or ""), []))
+                    if not full_authors and cls != ab.UNKNOWN:
+                        cls = ab.UNKNOWN
+                    if mode == "any" and cls not in (ab.ARCHIVAL_ONLY, ab.ARCHIVAL_PLUS_PI):
+                        wrong_class += 1
+                        continue
+                    if mode == "only" and cls != ab.ARCHIVAL_ONLY:
+                        wrong_class += 1
+                        continue
+                    kept.append(self._row(p, authors, cls, proj, evidence))
+                    if len(kept) >= n:
+                        break
+                if len(kept) >= n or len(page) < 200 or time.perf_counter() - started > 40.0:
+                    break
         except Exception as exc:
-            out = {"success": False, "error": f"ADS search failed: {type(exc).__name__}: {str(exc)[:200]}", "status": "infrastructure_failure", "query": q}
+            out = {"success": False, "error": f"ADS search failed: {type(exc).__name__}: {str(exc)[:200]}",
+                   "status": "infrastructure_failure", "query": q}
             return _native(_infra_failure(out, exc))
-        rows = []
-        for p in papers[:n]:
-            title = p.get("title")
-            if isinstance(title, list):
-                title = title[0] if title else ""
-            authors = p.get("authors") or p.get("author") or []
-            if isinstance(authors, str):
-                authors = [authors]
-            first = authors[0] if authors else ""
-            abstract = str(p.get("abstract") or "")
-            codes = sorted(set(_PROJECT_CODE_RE.findall(abstract + " " + " ".join(str(k) for k in (p.get("keyword") or [])))))
-            sentences = re.split(r"(?<=[.!?])\s+", abstract.strip())
-            summary = " ".join(sentences[:2])[:400] if abstract else "(no abstract in ADS record)"
-            rows.append({
-                "title": title, "first_author": (f"{first} et al." if len(authors) > 1 else first),
-                "year": p.get("year"), "journal": p.get("pub") or p.get("journal"), "bibcode": p.get("bibcode"),
-                "alma_project_codes": ", ".join(codes) if codes else "not stated in abstract",
-                "summary": summary, "doi": (p.get("doi") or [None])[0] if isinstance(p.get("doi"), list) else p.get("doi"),
-                "citations": p.get("citation_count"), "ads_url": f"https://ui.adsabs.harvard.edu/abs/{p.get('bibcode')}/abstract" if p.get("bibcode") else None,
-            })
-        table = pd.DataFrame(rows)
+
+        table = pd.DataFrame(kept)
         _data_card(ctx, table, source=f"ALMA bibliography: {topic}", tool_name=self.name)
         try:
-            ctx.service("set_last_run_result")({"type": "papers", "papers": papers[:n], "source": "ADS bibgroup:ALMA", "tool_name": self.name})
+            ctx.service("set_last_run_result")({"type": "papers", "papers": kept, "source": "ADS bibgroup:ALMA", "tool_name": self.name})
         except Exception:
             pass
+        as_of = _dt.date.today().isoformat()
         return _native({
-            "success": True, "status": "ok", "topic": topic, "n_returned": len(rows), "query": q, "filters": filters,
-            "results": rows, "source": "NASA ADS, bibgroup:ALMA (papers tagged by the ALMA telbib as using ALMA data)",
-            "note": "Project codes are extracted from the abstract text only; 'not stated in abstract' does not mean the paper used no archive data.",
+            "success": True, "status": "ok" if (mapping and map_complete) else "partial",
+            "topic": topic, "phrases": phrases, "archival_filter": mode, "as_of": as_of,
+            "n_returned": len(kept), "results": kept,
+            "search": {"ads_query": q, "filters": filters, "papers_scanned": scanned, "off_topic_dropped": off_topic,
+                       "dropped_by_archival_class": wrong_class},
+            "source": "NASA ADS bibgroup:ALMA (the ALMA telescope bibliography) + ALMA archive ObsCore bib_reference",
+            "method_note": ab.METHOD_NOTE + (" " + map_note if map_note else ""),
+            "note": (f"Search run {as_of}, newest first; 'most recent' depends on that date and on the ALMA bibliography's "
+                     "curation lag. These are the ONLY papers found: do not add, rename or describe any paper that is not "
+                     "in results, and quote each archival_class with its confidence."),
         })
+
+    @staticmethod
+    def _row(p: Dict[str, Any], authors: List[str], cls: str, proj: List[Dict[str, Any]], evidence: str) -> Dict[str, Any]:
+        from services import alma_bibliography as ab
+
+        title = p.get("title")
+        title = (title[0] if title else "") if isinstance(title, list) else title
+        first = authors[0] if authors else ""
+        abstract = str(p.get("abstract") or "")
+        codes = [e["project"] for e in proj] or sorted(set(_PROJECT_CODE_RE.findall(abstract)))
+        doi = p.get("doi")
+        return {
+            "bibcode": p.get("bibcode"), "title": title, "pubdate": str(p.get("pubdate") or p.get("year") or "")[:7],
+            "first_author": f"{first} et al." if len(authors) > 1 else first, "journal": p.get("pub") or p.get("journal"),
+            "alma_project_codes": ", ".join(codes) if codes else "not linked",
+            "alma_projects": proj, "archival_class": cls, "confidence": ab.CONFIDENCE[cls],
+            "topic_evidence": evidence, "summary": ab.summarize(abstract),
+            "doi": (doi[0] if doi else None) if isinstance(doi, list) else doi,
+            "ads_url": f"https://ui.adsabs.harvard.edu/abs/{p.get('bibcode')}/abstract" if p.get("bibcode") else None,
+        }
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # 6. cross_archive_match
 # ═════════════════════════════════════════════════════════════════════════
 class CrossArchiveMatchInput(_In):
-    catalog_name: Optional[str] = Field(default="perseus_protostars", description="built-in catalog name, or 'inline' with sources")
+    catalog_name: Optional[str] = Field(default="perseus_protostars", description="'vizier:<catalogue id>' (any published list), a built-in name, or 'inline' with sources")
     sources: Optional[List[Dict[str, Any]]] = Field(default=None, description="[{source_name, ra, dec}, ...]")
     archives: Optional[List[str]] = Field(default=None, description="e.g. ['ALMA','JWST','HST']")
     radius_arcsec: float = 5.0
-    max_sources: int = 12
+    max_sources: int = 100  # the built-in Perseus list is the 97-source VANDAM sample
     require_all_archives: Any = False
 
 
@@ -675,7 +1036,7 @@ class CrossArchiveMatch(BaseCapability):
         "(never the many-source footprint query that times out on every mirror) and one MAST query per source, run "
         "concurrently under the tool budget. Returns a per-source table with a STATUS COLUMN PER ARCHIVE (ok | no_match | "
         "timeout | skipped | unreachable), a map card labelled ALMA-only / JWST-only / both, and an explicit 'ALMA status "
-        "unknown for k sources' line when a phase failed. Use for 'protostars in Perseus observed with ALMA and JWST'. Target <= 90 s."
+        "unknown for k sources' line when a phase failed. Use for 'which sources of a catalogue or region have both ALMA and JWST data'. Target <= 90 s."
     )
     category = "archive"
     InputModel = CrossArchiveMatchInput
@@ -722,6 +1083,9 @@ class CrossArchiveMatch(BaseCapability):
             if any(a in h.lower() or ("alma" == a and "almascience" in h.lower()) or ("mast" in h.lower() and a != "alma") for h in dead):
                 return "unreachable"
             if a == "alma":
+                if "alma box query hit the" in texts:
+                    # Capped box answer (guard CX-02 reopen): a zero count is unknown, not absence.
+                    return "truncated"
                 if "alma phase did not finish" in texts or "alma not queried" in texts or "alma point cones" in texts:
                     return "timeout"
                 if "alma tap failed" in texts or "alma tap unreachable" in texts:
@@ -761,9 +1125,14 @@ class CrossArchiveMatch(BaseCapability):
                     # every returned row matched EVERY archive by construction.
                     row[key] = "ok" if require_all else ("unknown" if st == "ok" else st)
                 else:
-                    row[key] = "ok" if n > 0 else ("no_match" if st == "ok" else st)
+                    row[key] = "ok" if n > 0 else ("no_match" if st == "ok" else ("unknown_truncated" if st == "truncated" else st))
                 if n is not None:
                     row[f"{a.lower()}_n_observations"] = n
+        if phase_status.get("ALMA") == "truncated":
+            # Under a capped box answer every source WITHOUT a returned ALMA match is unknown, including the ones a
+            # require_all_archives filter already dropped from `results` (guard CX-02 reopen): an upper bound.
+            alma_known = sum(1 for row in results if row.get("alma_status") == "ok")
+            unknown_alma = max(unknown_alma, n_sources - alma_known)
         status = "ok"
         if raw.get("success") is False:
             status = "infrastructure_failure" if (dead or raw.get("infrastructure_failure")) else "partial"
@@ -775,19 +1144,25 @@ class CrossArchiveMatch(BaseCapability):
             if require_all_h else f"{raw.get('matched_sources', 0)} of {n_sources} sources have data in at least one of {', '.join(archives)}"
         ]
         if unknown_alma:
-            headline_bits.append(f"ALMA status unknown for {unknown_alma} source(s) (phase timed out / not queried)")
+            headline_bits.append(f"ALMA status unknown for {'up to ' if phase_status.get('ALMA') == 'truncated' else ''}"
+                                 f"{unknown_alma} source(s) ("
+                                 + ("ALMA box query hit its row cap" if phase_status.get("ALMA") == "truncated"
+                                    else "phase timed out / not queried") + ")")
         out = dict(raw)
         out.update({
             "status": status,
             "phase_status": phase_status,
             "alma_status_unknown_for": unknown_alma,
-            "alma_query_mode": "one point cone per source (footprint INTERSECTS deliberately not used)",
+            "alma_query_mode": ("one box query for every science pointing around the catalogue; a source matches when a "
+                                "pointing's field of view (or the match radius) contains it"
+                                if raw.get("footprint_mode") == "box_fov" else
+                                "one point cone per source (footprint INTERSECTS deliberately not used)"),
             "headline": "; ".join(headline_bits),
             "map_legend": {"ALMA-only": "sources with ALMA rows only", "JWST-only": "sources with JWST/MAST rows only", "both": "sources with both"},
             "results": results,
         })
         if unknown_alma:
-            out["note"] = (out.get("note") or "") + f" ALMA status is UNKNOWN for {unknown_alma} source(s): do not state that they lack ALMA data."
+            out["note"] = (out.get("note") or "") + f" ALMA status is UNKNOWN for {'up to ' if phase_status.get('ALMA') == 'truncated' else ''}{unknown_alma} source(s): do not state that they lack ALMA data."
         # Relabel the card with the per-archive legend.
         try:
             lrr = ctx.service("get_last_run_result")()
@@ -826,7 +1201,7 @@ class ArchiveOverlay(BaseCapability):
         "product by size (<= max_product_mb), otherwise falls back to a hips2fits cutout of the mission's HiPS, fetches the "
         "ALMA continuum product via DataLink, reprojects with WCS, and renders colourbar + contour legend. Returns "
         "status='coverage_gap' naming the missing side when either image is unavailable, instead of looping. "
-        "Use for 'show ALMA contours on the JWST image of the HUDF'. Target <= 120 s."
+        "Use for 'show ALMA contours on a JWST/HST image of a field or source'. Target <= 120 s."
     )
     category = "analysis"
     InputModel = ArchiveOverlayInput
@@ -939,10 +1314,44 @@ class ArchiveOverlay(BaseCapability):
         result.update({
             "status": "ok" if result.get("success") else "infrastructure_failure", "field": label, "ra": ra, "dec": dec,
             "base_source": base_source, "contour_product": {"filename": contour.get("filename"), "access_url": contour.get("access_url"),
-                                                            "member_ous_uid": contour.get("member_ous_uid"), "proposal_id": contour.get("proposal_id")},
+                                                            "member_ous_uid": contour.get("member_ous_uid"), "proposal_id": contour.get("proposal_id"),
+                                                            "target_name": contour.get("target_name"),
+                                                            "field_of_view_arcmin": contour.get("field_of_view_arcmin"),
+                                                            "footprint_check": contour.get("footprint_check")},
             "gaps": gaps, "elapsed_s": round(time.perf_counter() - started, 1),
         })
+        if result.get("success"):
+            result["checks"] = self._overlay_checks(result, base_mission)
         return _native(result)
+
+    @staticmethod
+    def _overlay_checks(result: Dict[str, Any], base_mission: str) -> List[str]:
+        """What a careful overlay answer reports (ALMAbench 2026-10-15 A26: the tool drew noise-based contours but the
+        answers never said so, nor discussed resolution or registration)."""
+        cont = result.get("contours") or {}
+        beam = result.get("contour_beam") or {}
+        checks = []
+        if cont.get("rms"):
+            checks.append(f"Contours are at {', '.join(f'{s:g}' for s in cont.get('sigmas') or [])} x the ALMA rms "
+                          f"({cont['rms']:.3g} map units, robust MAD over the map)"
+                          + ("; dashed contours are -3 rms, which show the noise and any negative sidelobes" if cont.get("negative_contours") else "")
+                          + (". The ALMA image is primary-beam corrected, so its noise rises toward the field edge: judge "
+                             "significance near the centre or on the uncorrected image." if ".pbcor." in str((result.get("contour_product") or {}).get("filename") or "").lower() else "."))
+        if beam.get("bmaj_arcsec"):
+            checks.append(f"Resolution: the ALMA beam is {beam['bmaj_arcsec']:g} x {beam['bmin_arcsec']:g} arcsec (PA {beam['bpa_deg']:g} deg)"
+                          + (f" against {result['base_pixel_arcsec']:g} arcsec pixels in the {base_mission} image" if result.get("base_pixel_arcsec") else "")
+                          + "; compare like with like (smooth the sharper image to the ALMA beam before comparing sizes or fluxes).")
+        if result.get("reprojected") is False:
+            # The renderer could not reproject (reproject missing): the contours are NOT aligned (guard CX-06).
+            checks.append("Alignment: the ALMA image could NOT be reprojected onto the base image here, so the contours "
+                          "are drawn in their own pixel grid and are not aligned; do not read positions from this figure.")
+        else:
+            checks.append("Registration: the ALMA image was reprojected onto the base image's WCS; check the astrometry "
+                          "against a common frame (Gaia) using bright compact sources before reading offsets. Older "
+                          "HST-based astrometry in deep fields can be offset from ALMA positions by a few tenths of an arcsec.")
+        checks.append("Headers: ALMA images carry degenerate frequency and Stokes axes, dropped here (2-D celestial WCS) before "
+                      "reprojection; both images must be in the same frame (ICRS).")
+        return checks
 
     @classmethod
     def _covering_hips(cls, ra: float, dec: float, mission: str) -> Optional[str]:
@@ -969,12 +1378,27 @@ class ArchiveOverlay(BaseCapability):
         except Exception:
             return candidates[0]  # coverage check unavailable: try the first map
 
+    # member.uid___A001_X2fe_Xb2a.ari_l.HUDF-JVLA-ALMA_sci.spw0_1_2_3_262521MHz.12m.cont.I.pbcor.fits: the source
+    # sits between the uid token (and the optional ari_l. prefix) and "_sci"; it may itself contain dots (G31.41+0.31).
+    _FILE_SOURCE_RE = re.compile(r"^(?:member\.)?uid___[a-z0-9]+_[a-z0-9]+_[a-z0-9]+\.(?:ari_l\.)?(.+?)_sci[._]", re.I)
+
     @staticmethod
-    def _pick_science_continuum(files: List[Dict[str, Any]], max_mb: float) -> Optional[Dict[str, Any]]:
+    def _file_target(filename: str) -> Optional[str]:
+        """The source key (:func:`_source_key`) of an ALMA product filename, or None when it is not a science image
+        (``member.uid___A001_X1_X1.HUDF_sci.spw25.cont.I.pbcor.fits`` -> ``hudf``)."""
+        m = ArchiveOverlay._FILE_SOURCE_RE.search(str(filename or ""))
+        return _source_key(m.group(1)) if m else None
+
+    @staticmethod
+    def _pick_science_continuum(files: List[Dict[str, Any]], max_mb: float,
+                                target: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """The best SCIENCE continuum image of a MOUS: ``_sci`` target, a
         continuum product (``.cont.`` or ``.mfs.``), primary-beam corrected,
         never a calibrator (``_bp``/``_ph``/``_chk``/``_flux``/``_pol``) or a
-        diagnostic (mask/pb/psf/residual/model), within the size limit."""
+        diagnostic (mask/pb/psf/residual/model), within the size limit.
+        ``target`` (a :func:`_source_key`) keeps only that source's images, by
+        exact key: one MOUS can hold dozens of pointings (2016.1.01079.S has 64),
+        and a file whose source cannot be parsed or differs is never taken."""
         def name(f):
             return str(f.get("filename") or "").lower()
 
@@ -984,6 +1408,8 @@ class ArchiveOverlay(BaseCapability):
             if not (n.endswith(".fits") or n.endswith(".fits.gz")) or not f.get("access_url"):
                 continue
             if "_sci." not in n and "_sci_" not in n:
+                continue
+            if target is not None and ArchiveOverlay._file_target(n) != target:
                 continue
             if any(tok in n for tok in (".mask.", ".pb.", ".psf.", ".residual.", ".model.", ".weight.", ".sumwt.")):
                 continue
@@ -1001,55 +1427,137 @@ class ArchiveOverlay(BaseCapability):
 
     @staticmethod
     def _find_alma_contour(ctx: CallContext, ra: float, dec: float, size_arcmin: float, max_mb: float, label: str) -> Dict[str, Any]:
-        """Bounded ALMA continuum-product lookup: one point-cone TAP query (no
-        ORDER BY -- it stalls the NRAO proxy), science image rows, at most 3
-        MOUS listed via DataLink, each only while budget remains."""
+        """Bounded ALMA continuum-product lookup whose image COVERS the field.
+
+        One TAP query for science pointings whose footprint (``s_region``)
+        contains the field centre (no ORDER BY -- it stalls the NRAO proxy;
+        2.6 s for the HUDF where the old point cone took 22 s), ranked per
+        (MOUS, source) by a source-name match with the field, then by a field of
+        view known to span the requested size, then by resolution. At most 4
+        MOUS are listed via DataLink, each only while budget remains, and in
+        each the covering sources are tried in rank order, taking only files
+        whose parsed source name equals that source. ALMAbench 2026-10-15 A26:
+        a point cone on s_ra/s_dec plus "any _sci image of the MOUS" picked
+        scuba2-035, one of 64 17-arcsec pointings in 2016.1.01079.S, about 6
+        arcmin from the HUDF. If the footprint query fails, a point cone is used
+        and each pointing's s_fov is checked against the centre instead; a
+        pointing without s_fov or coordinates is unverifiable, not absent."""
         from services.tool_budgets import remaining_seconds
 
         notes: List[str] = []
+        cols = ("member_ous_uid, proposal_id, target_name, s_ra, s_dec, s_fov, band_list, spatial_resolution, "
+                "dataproduct_type, data_rights")
+        where = "science_observation = 'T' AND data_rights = 'Public'"
+        footprint_q = (f"SELECT TOP 500 {cols} FROM ivoa.obscore WHERE "
+                       f"CONTAINS(POINT('ICRS', {ra:.8f}, {dec:.8f}), s_region) = 1 AND {where}")
         radius_deg = max(size_arcmin / 2.0, 0.25) / 60.0
-        q = (
-            "SELECT TOP 200 member_ous_uid, proposal_id, target_name, band_list, spatial_resolution, dataproduct_type, data_rights "
-            "FROM ivoa.obscore WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
-            f"CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius_deg:.8f})) = 1 AND science_observation = 'T' AND data_rights = 'Public'"
-        )
+        cone_q = (f"SELECT TOP 500 {cols} FROM ivoa.obscore WHERE CONTAINS(POINT('ICRS', s_ra, s_dec), "
+                  f"CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius_deg:.8f})) = 1 AND {where}")
         prov = ctx.service("alma_tap_provenance")
-        prov["query"] = q
         prov["url"] = _ALMA_TAP_URL
-        try:
+
+        def search(q: str) -> pd.DataFrame:
+            prov["query"] = q
             service = ctx.service("search_service").alminer_client._get_tap_service()
             try:
-                df = service.search(q, maxrec=200).to_table().to_pandas()
+                return service.search(q, maxrec=500).to_table().to_pandas()
             except TypeError:
-                df = service.search(q).to_table().to_pandas()
+                return service.search(q).to_table().to_pandas()
+
+        footprint = True
+        try:
+            df = search(footprint_q)
         except Exception as exc:
-            notes.append(f"ALMA archive query did not complete ({type(exc).__name__}: {str(exc)[:100]}): ALMA coverage UNKNOWN")
-            return {"product": None, "notes": notes, "unknown": True}
+            left = remaining_seconds()
+            if left is not None and left < 30:
+                notes.append(f"ALMA archive query did not complete ({type(exc).__name__}: {str(exc)[:100]}): ALMA coverage UNKNOWN")
+                return {"product": None, "notes": notes, "unknown": True}
+            footprint = False
+            try:
+                df = search(cone_q)
+            except Exception as exc2:
+                notes.append(f"ALMA archive query did not complete ({type(exc2).__name__}: {str(exc2)[:100]}): ALMA coverage UNKNOWN")
+                return {"product": None, "notes": notes, "unknown": True}
+            notes.append(f"footprint query failed ({type(exc).__name__}); used a {radius_deg * 60:.2f} arcmin point cone and each pointing's field of view")
         if df.empty:
-            notes.append(f"the ALMA archive lists no public science observations within {radius_deg * 60:.2f} arcmin of {label}")
+            notes.append(f"no public ALMA science pointing covers the centre of {label}" if footprint
+                         else f"the ALMA archive lists no public science observations within {radius_deg * 60:.2f} arcmin of {label}")
             return {"product": None, "notes": notes, "unknown": False}
-        for column in ("member_ous_uid", "proposal_id"):
-            df[column] = df[column].map(lambda v: v.decode() if isinstance(v, bytes) else v)
+        for column in ("member_ous_uid", "proposal_id", "target_name"):
+            if column in df:
+                df[column] = df[column].map(lambda v: v.decode() if isinstance(v, bytes) else v)
+        if "target_name" not in df:
+            df["target_name"] = ""
         df["_res"] = pd.to_numeric(df.get("spatial_resolution"), errors="coerce")
-        mous = df.sort_values("_res").drop_duplicates("member_ous_uid")
+        fov = pd.to_numeric(df["s_fov"], errors="coerce") * 60.0 if "s_fov" in df else pd.Series(float("nan"), index=df.index)
+        if {"s_ra", "s_dec"} <= set(df.columns):
+            sep = _sep_arcmin(ra, dec, pd.to_numeric(df["s_ra"], errors="coerce"), pd.to_numeric(df["s_dec"], errors="coerce"))
+        else:
+            sep = pd.Series(float("nan"), index=df.index)
+        if not footprint:
+            verifiable = sep.notna() & fov.notna()
+            covers = verifiable & (sep <= fov / 2.0)
+            if not covers.any():
+                n_unverifiable = int((~verifiable).sum())
+                if n_unverifiable:
+                    notes.append(f"{n_unverifiable} ALMA pointing(s) near {label} lack a field of view or position, so whether "
+                                 "ALMA covers its centre is UNKNOWN")
+                    return {"product": None, "notes": notes, "unknown": True}
+                notes.append(f"{df['member_ous_uid'].nunique()} ALMA MOUS have pointings near {label}, but none covers its centre")
+                return {"product": None, "notes": notes, "unknown": False}
+            df, fov = df[covers], fov[covers]
+        df["_key"] = df["target_name"].map(_source_key)
+        unnamed = df["_key"] == ""
+        if unnamed.all():
+            notes.append(f"the ALMA pointings covering {label} carry no source name, so their images cannot be matched: ALMA product UNKNOWN")
+            return {"product": None, "notes": notes, "unknown": True}
+        df, fov = df[~unnamed], fov[~unnamed]
+        want = _FIELD_NAME_ALIASES.get(_norm_name(label), {_norm_name(label)}) - {""}
+
+        def name_rank(target: Any) -> int:
+            t = _norm_name(target)
+            return 0 if t and any(w in t or (len(t) >= 3 and t in w) for w in want) else 1
+
+        df["_name"] = df["target_name"].map(name_rank)
+        # A missing field of view is not evidence that it spans the request.
+        df["_span"] = (~(fov.notna() & (fov >= 0.8 * float(size_arcmin)))).astype(int)
+        df["_fov"] = fov
+        ranked = df.sort_values(["_name", "_span", "_res"], na_position="last").drop_duplicates(["member_ous_uid", "_key"])
         datalink = ctx.services.get("datalink_client")
         if datalink is None:
             notes.append("DataLink client unavailable: cannot list ALMA products")
             return {"product": None, "notes": notes, "unknown": True}
-        listed = 0
-        for _, row in mous.head(3).iterrows():
-            left = remaining_seconds()
-            if left is not None and left < 25:
-                notes.append(f"stopped listing ALMA products after {listed} MOUS (tool budget)")
-                break
-            listing = datalink.list_files(mous_uid=str(row["member_ous_uid"]))
-            listed += 1
-            if not listing.get("success"):
+        # Sources are tried in GLOBAL rank order (a better source in another
+        # MOUS beats a worse one in a MOUS already listed; guard CX-13), each
+        # MOUS listed once. At most four MOUS are listed, not three: early-cycle
+        # MOUS (the 2012.1.00173.S HUDF mosaic) carry no imaging products.
+        listings: Dict[str, Optional[List[Dict[str, Any]]]] = {}
+        stopped = False
+        for _, row in ranked.iterrows():
+            uid = row["member_ous_uid"]
+            if uid not in listings:
+                if len(listings) >= 4 or stopped:
+                    continue
+                left = remaining_seconds()
+                if left is not None and left < 25:
+                    notes.append(f"stopped listing ALMA products after {len(listings)} MOUS (tool budget)")
+                    stopped = True
+                    continue
+                listing = datalink.list_files(mous_uid=str(uid))
+                listings[uid] = listing.get("files", []) if listing.get("success") else None
+            if not listings[uid]:
                 continue
-            pick = ArchiveOverlay._pick_science_continuum(listing.get("files", []), max_mb)
+            pick = ArchiveOverlay._pick_science_continuum(listings[uid], max_mb, target=row["_key"])
             if pick is not None:
-                return {"product": {**pick, "member_ous_uid": row["member_ous_uid"], "proposal_id": row.get("proposal_id")}, "notes": notes, "unknown": False}
-        notes.append(f"{len(mous)} ALMA MOUS cover {label} but none of the {listed} listed has a continuum FITS <= {max_mb:g} MB")
+                return {"product": {**pick, "member_ous_uid": uid, "proposal_id": row.get("proposal_id"),
+                                    "target_name": row.get("target_name"),
+                                    "field_of_view_arcmin": None if pd.isna(row["_fov"]) else round(float(row["_fov"]), 2),
+                                    "covers_field_centre": True,
+                                    "footprint_check": "s_region contains the field centre" if footprint else "pointing s_fov covers the field centre"},
+                        "notes": notes, "unknown": False}
+        listed = len(listings)
+        n_mous = ranked["member_ous_uid"].nunique()
+        notes.append(f"{n_mous} ALMA MOUS cover {label} but none of the {listed} listed has a continuum FITS of the covering source <= {max_mb:g} MB")
         return {"product": None, "notes": notes, "unknown": False}
 
 
@@ -1064,7 +1572,47 @@ _RECIPE_TASKS = {
     "adql": ["adql", "tap", "sql", "query_tap", "custom query"],
     "datalink": ["datalink", "files", "list files", "download", "products", "fits"],
     "alminer": ["alminer", "conesearch", "run_query", "keysearch"],
+    "dataset_list": ["list", "dataset", "mous", "released", "release date", "before", "all observations", "every observation"],
 }
+# Recipes of the same library tried when nothing matches the task.
+_LIBRARY_DEFAULT_RECIPES = {
+    "astroquery": ["object_search", "adql"],
+    "pyvo": ["adql", "cone_search"],
+    "alminer": ["alminer"],
+}
+_RECIPE_DOCS = {
+    "astroquery": "https://astroquery.readthedocs.io/en/latest/alma/alma.html",
+    "pyvo": "https://pyvo.readthedocs.io/en/latest/dal/index.html#tap",
+    "alminer": "https://alminer.readthedocs.io/en/latest/",
+}
+# Documented public calls (checked against the installed libraries in
+# tests/unit/test_code_recipes.py) and real ivoa.obscore columns. Without a
+# recipe the model refused to write any code (ALMAbench 2026-10-15 A19-A21);
+# standard calls from this list are fine, invented ones are not.
+_STANDARD_API_CALLS = {
+    "astroquery": ["Alma.query_object(name, public=...)", "Alma.query_region(SkyCoord, radius=Quantity, public=...)",
+                   "Alma.query_tap(adql)", "Alma.get_data_info(member_ous_uids)", "Alma.download_files(urls)"],
+    "pyvo": ["pyvo.dal.TAPService('https://almascience.nrao.edu/tap')", "service.search(adql, maxrec=N)",
+             "result.to_table()"],
+    "alminer": ["alminer.target([names], search_radius=arcmin, public=...)", "alminer.conesearch(ra=, dec=, search_radius=arcmin)",
+                "alminer.keysearch({'column': [values]})", "alminer.run_query(adql)", "alminer.summary(df)",
+                "alminer.download_data(df, fitsonly=True, dryrun=True)"],
+}
+OBSCORE_STANDARD_COLUMNS = ["proposal_id", "member_ous_uid", "target_name", "s_ra", "s_dec", "s_fov", "band_list",
+                            "frequency", "spatial_resolution", "t_exptime", "obs_release_date", "data_rights",
+                            "science_observation", "pi_name", "scientific_category", "antenna_arrays"]
+
+
+def _standard_api_fallback(lib: str) -> Dict[str, Any]:
+    return {
+        "documentation": _RECIPE_DOCS.get(lib),
+        "standard_calls": _STANDARD_API_CALLS.get(lib, []),
+        "obscore_columns": OBSCORE_STANDARD_COLUMNS,
+        "instruction": ("No tested recipe fits, but you SHOULD still give working code: write a short, standard snippet with "
+                        "the documented calls listed here and real ivoa.obscore columns (table ivoa.obscore; band_list is a "
+                        "space-separated token list). Do not use any other API name. Say it is written from the library "
+                        "documentation, not a tested recipe. If a Python execution tool is available, run it once first."),
+    }
 
 
 class CodeRecipeInput(_In):
@@ -1077,8 +1625,9 @@ class CodeRecipe(BaseCapability):
     description = (
         "Return a TESTED, curated Python snippet for querying the ALMA Science Archive (astroquery.alma, pyvo TAP, or "
         "ALMiner): cone/object search, ADQL via query_tap, DataLink listing and download, ALMiner target/conesearch/"
-        "run_query. Snippets come from docs/recipes/*.py which are exercised by the test suite (recorded responses; live "
-        "weekly) -- never improvise API names such as Alma.get_data_links or query_sql. Use for 'how do I query ALMA "
+        "run_query, and a complete 'list every dataset (MOUS) of a source in a band released before a date' script. Snippets come from docs/recipes/*.py which are exercised by the test suite (recorded responses; live "
+        "weekly) -- never invent API names such as Alma.get_data_links or query_sql. When no recipe fits, the result "
+        "names the library's documented calls so you can still write standard code. Use for 'how do I query ALMA "
         "with Python / astroquery / TAP / ALMiner'."
     )
     category = "general"
@@ -1089,11 +1638,48 @@ class CodeRecipe(BaseCapability):
         lib = str(inp.library or "astroquery").strip().lower()
         if lib not in {"astroquery", "pyvo", "alminer"}:
             return _native({"success": False, "error": "library must be astroquery, pyvo or alminer"})
+        if not RECIPES_DIR.is_dir() or not any(RECIPES_DIR.glob("*.py")):
+            # A deployment without docs/recipes is broken, not a coverage gap
+            # (ALMAbench 2026-10-15: the benchmark snapshots had no docs/ and
+            # every code question came back "no curated recipe").
+            return _native({"success": False, "status": "infrastructure_failure",
+                            "error": f"the recipe library {RECIPES_DIR} is missing from this deployment",
+                            "fallback": _standard_api_fallback(lib)})
         task_text = str(inp.task or "").lower()
         scores = {k: sum(1 for kw in kws if kw in task_text) for k, kws in _RECIPE_TASKS.items()}
-        ordered = [k for k, s in sorted(scores.items(), key=lambda kv: -kv[1]) if s > 0] or ["object_search"]
-        recipes = []
-        for key in ordered:
+        ordered = [k for k, s in sorted(scores.items(), key=lambda kv: -kv[1]) if s > 0]
+        recipes = self._load_recipes(lib, ordered)
+        nearest = False
+        if not recipes:
+            # No recipe for this task in this library (or no task keyword at
+            # all): the library's own recipes come next, flagged as nearest (a
+            # pyvo cone or ADQL recipe answers "query by object name" with pyvo
+            # better than no code; ALMAbench 2026-10-15 A21; guard CX-10).
+            recipes = self._load_recipes(lib, [k for k in _LIBRARY_DEFAULT_RECIPES[lib] if k not in ordered])
+            nearest = bool(recipes)
+        if not recipes:
+            return _native({"success": False, "status": "coverage_gap", "error": f"no curated recipe for library={lib} task={inp.task!r}",
+                            "available": sorted(p.name for p in RECIPES_DIR.glob("*.py")),
+                            "fallback": _standard_api_fallback(lib)})
+        out = {
+            "success": True, "status": "ok", "library": lib, "recipes": recipes[:2],
+            "documentation": _RECIPE_DOCS[lib],
+            "note": ("Return each `code` VERBATIM in a ```python block (it is complete and runnable); do not rename functions or "
+                     "re-type any metadata. API names in these files are the tested ones."),
+        }
+        if nearest:
+            out["nearest_recipe"] = True
+            out["note"] += (f" No recipe matches the task {inp.task!r} exactly; these are the closest tested {lib} recipes. "
+                            "Show the tested recipe verbatim first, then, if the task needs it, an adapted version labelled "
+                            "'adapted from the tested recipe' that uses the same calls (only the target, columns or WHERE "
+                            "clause change) and says what changed.")
+        return _native(out)
+
+    @staticmethod
+    def _load_recipes(lib: str, keys: List[str]) -> List[Dict[str, Any]]:
+        recipes: List[Dict[str, Any]] = []
+        seen: set = set()
+        for key in keys:
             path = RECIPES_DIR / f"{lib}_{key}.py"
             if not path.exists():
                 if lib == "alminer":
@@ -1102,6 +1688,9 @@ class CodeRecipe(BaseCapability):
                     path = RECIPES_DIR / "astroquery_adql.py"
                 if not path.exists():
                     continue
+            if path.name in seen:
+                continue
+            seen.add(path.name)
             text = path.read_text(encoding="utf-8")
             header = re.search(r'"""(.*?)"""', text, re.S)
             meta = {}
@@ -1109,7 +1698,9 @@ class CodeRecipe(BaseCapability):
                 for line in header.group(1).splitlines():
                     if ":" in line:
                         k, _, v = line.partition(":")
-                        meta[k.strip().lower()] = v.strip()
+                        mkey = k.strip().lower()  # own name: `key` is the recipe task id (guard CX-08)
+                        # Repeated keys (multi-line 'notes:') accumulate; only the last line used to survive (guard CX-03).
+                        meta[mkey] = f"{meta[mkey]} {v.strip()}" if mkey in meta and mkey == "notes" else v.strip()
             # The user-facing snippet is the RUNNABLE code only: the metadata
             # docstring stays in its own fields. Live 2026-09-23 D15: the model
             # re-typed the docstring header and dropped its closing quotes, so
@@ -1125,19 +1716,7 @@ class CodeRecipe(BaseCapability):
                             "last_tested": meta.get("last_tested"), "tested_against": meta.get("tested_against"),
                             "library_requirement": meta.get("library"),
                             "notes": meta.get("notes")})
-        if not recipes:
-            return _native({"success": False, "status": "coverage_gap", "error": f"no curated recipe for library={lib} task={inp.task!r}",
-                            "available": sorted(p.name for p in RECIPES_DIR.glob("*.py")) if RECIPES_DIR.exists() else []})
-        return _native({
-            "success": True, "status": "ok", "library": lib, "recipes": recipes[:2],
-            "documentation": {
-                "astroquery": "https://astroquery.readthedocs.io/en/latest/alma/alma.html",
-                "pyvo": "https://pyvo.readthedocs.io/en/latest/dal/index.html#tap",
-                "alminer": "https://alminer.readthedocs.io/en/latest/",
-            }[lib],
-            "note": ("Return each `code` VERBATIM in a ```python block (it is complete and runnable); do not rename functions or "
-                     "re-type any metadata. API names in these files are the tested ones."),
-        })
+        return recipes
 
 
 # ═════════════════════════════════════════════════════════════════════════
