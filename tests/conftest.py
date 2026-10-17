@@ -63,6 +63,9 @@ os.environ["DATALAB_TAP_SCHEMA_AUTOREFRESH"] = "0"
 # No default MANNA server in every test user's MCP list (it would also dial the
 # hosted server from tests). Default-server tests opt back in via monkeypatch.
 os.environ["QUASAR_DEFAULT_MANNA_URL"] = "off"
+# No SIMBAD source-size lookup when a target cone is sized (services/
+# target_extent.py): sources keep the default radius. Size tests opt back in.
+os.environ["QUASAR_TARGET_EXTENT_LOOKUP"] = "0"
 # Isolate the TAP-schema disk cache per test session: without this, a developer
 # machine with a real live cache under cache/datalab_tap_schema would flip the
 # SQL governor's column check from soft (curated-only) to authoritative and make
@@ -128,6 +131,23 @@ def _reset_host_breaker_and_tool_deadline():
     yield
     HostBreaker.reset()
     end_tool_deadline()
+
+
+@pytest.fixture(autouse=True)
+def _reset_web_search_breakers():
+    """WebSearchService keeps class-level Brave and Tavily circuit breakers.
+    A test that drives a provider into a 401 / 429 / out-of-credits answer
+    must not make every later web test skip that provider."""
+    try:
+        from services.web_search_service import WebSearchService
+    except Exception:  # pragma: no cover - module absent in a partial checkout
+        yield
+        return
+    WebSearchService._brave_down_until = 0.0
+    WebSearchService._tavily_down_until = 0.0
+    yield
+    WebSearchService._brave_down_until = 0.0
+    WebSearchService._tavily_down_until = 0.0
 
 
 @pytest.fixture(autouse=True)

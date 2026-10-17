@@ -2441,25 +2441,38 @@ Date: {datetime.now().strftime("%Y-%m-%d")}
             print(f"[SEARCH ROUTER] Router execution failed: {e}. Falling back to basic BrowserService.")
 
         # -- Ultimate Fallback: BrowserService --
-        if not ret_val or not ret_val.get("success"):
+        # Only when the router itself crashed. A router failure has already
+        # tried the scraper and names what each provider said; replacing it
+        # with an empty "success" read as "nothing found" (2026-10-16).
+        if ret_val is None:
             try:
                 search_query = self._expand_astro_query(query)
                 fallback = self.browser_service.web_search(query=search_query)
-                fallback_results = (
-                    fallback.get("results", [])
-                    if isinstance(fallback, dict)
-                    else fallback
-                )
-                if not isinstance(fallback_results, list):
-                    fallback_results = []
-                ret_val = {
-                    "success": True,
-                    "provider": "BrowserService (fallback)",
-                    "query": query,
-                    "results": fallback_results,
-                    "raw_text": fallback.get("raw_text", "") if isinstance(fallback, dict) else "",
-                    "images": [],
-                }
+                if isinstance(fallback, dict) and fallback.get("error"):
+                    ret_val = {"success": False, "error": f"Search failed: BrowserService: {fallback['error']}"}
+                else:
+                    fallback_results = (
+                        fallback.get("results", [])
+                        if isinstance(fallback, dict)
+                        else fallback
+                    )
+                    if not isinstance(fallback_results, list):
+                        fallback_results = []
+                    raw_text = fallback.get("raw_text", "") if isinstance(fallback, dict) else ""
+                    raw_text = raw_text if isinstance(raw_text, str) else ""
+                    if raw_text.startswith("[Error extracting text"):
+                        raw_text = ""
+                    if fallback_results or raw_text.strip():
+                        ret_val = {
+                            "success": True,
+                            "provider": "BrowserService (fallback)",
+                            "query": query,
+                            "results": fallback_results,
+                            "raw_text": raw_text,
+                            "images": [],
+                        }
+                    else:
+                        ret_val = {"success": False, "error": "Search failed: BrowserService returned no results"}
             except Exception:
                 ret_val = {"success": False, "error": "Search failed"}
 

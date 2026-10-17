@@ -23,6 +23,12 @@ def isolated_usage_file(monkeypatch, tmp_path):
     return usage_file
 
 
+def block_tavily_sdk(monkeypatch):
+    """Make ``from tavily import TavilyClient`` fail with ImportError, so the
+    REST path runs without the real SDK reaching the network."""
+    monkeypatch.setitem(sys.modules, "tavily", None)
+
+
 def install_fake_tavily(monkeypatch, fake_client_cls):
     monkeypatch.setitem(
         sys.modules,
@@ -238,7 +244,7 @@ def test_exa_routes_deep_for_simple_documentation_searches(monkeypatch, isolated
 def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
-    monkeypatch.delitem(sys.modules, "tavily", raising=False)
+    block_tavily_sdk(monkeypatch)
     calls = {}
 
     def fake_tavily_post(self, endpoint, payload, timeout=60):
@@ -282,7 +288,7 @@ def test_tavily_search_uses_rest_fallback_and_returns_images(monkeypatch):
 def test_tavily_search_prefers_source_linked_result_images(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
-    monkeypatch.delitem(sys.modules, "tavily", raising=False)
+    block_tavily_sdk(monkeypatch)
 
     def fake_tavily_post(self, endpoint, payload, timeout=60):
         return {
@@ -548,7 +554,7 @@ def test_route_skips_brave_and_prefetch_while_breaker_open(
 def test_tavily_payload_omits_answer_by_default(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setenv("QUASAR_WEB_IMAGES_ENABLED", "true")
-    monkeypatch.delitem(sys.modules, "tavily", raising=False)
+    block_tavily_sdk(monkeypatch)
     calls = {}
 
     def fake_tavily_post(self, endpoint, payload, timeout=60):

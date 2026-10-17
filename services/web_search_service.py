@@ -5,13 +5,17 @@ Web Search Router — Unified search service that routes queries to the optimal 
 - Brave Search API (Primary): For general info, real-time facts, and context.
 - Brave LLM Context API: Optimized machine-readable grounding context.
 - Tavily: Fallback for clean LLM summaries and images with descriptions.
-- Exa: Specialist for deep technical documentation and literature lookup.
+- Exa: Specialist for deep technical documentation and literature lookup,
+  and the general fallback when Tavily is out of credits or failing.
 - BrowserService: Ultimate local/scraping fallback.
 
 USAGE TRACKING & RATE LIMITS:
 - Tracks requests locally in ./data/search_usage.json.
 - Resets counts automatically at the beginning of each calendar month.
 - Caps Brave and Exa at 1,000 monthly free requests, auto-falling back to Tavily or local scraping.
+- Brave and Tavily each have a circuit breaker: an account that refuses
+  requests (out of credits, bad key, rate limited) is skipped for a cooldown
+  instead of being retried on every search.
 """
 
 import os
@@ -22,7 +26,7 @@ import tempfile
 import threading
 import requests
 import requests.adapters
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 from services.content_safety import (
     blocked_query_result,
@@ -205,6 +209,69 @@ class WebSearchService:
             f"{int(cls._BRAVE_COOLDOWN_SECONDS)}s — {why}"
         )
 
+    # ── Tavily circuit breaker ───────────────────────────────────────────
+    # An out-of-credits account (432 plan limit, 433 pay-as-you-go limit), a
+    # rejected key (401 / 403) or a rate limit (429) refuses every request the
+    # same way, yet every search still paid for the dead call (an SDK attempt
+    # and then a REST retry) before falling through. Account refusals do not
+    # clear on their own, so they cool down longer than a rate limit.
+    _TAVILY_ACCOUNT_STATUSES = frozenset({401, 403, 432, 433})
+    _TAVILY_RATE_STATUSES = frozenset({429})
+    _TAVILY_ACCOUNT_COOLDOWN_SECONDS = 1800.0
+    _TAVILY_RATE_COOLDOWN_SECONDS = 60.0
+    # tavily-python 0.7.x raises these for the statuses above (it folds
+    # 403 / 432 / 433 into ForbiddenError, so its exact status is lost).
+    _TAVILY_SDK_ERROR_STATUS = {
+        "UsageLimitExceededError": 429,
+        "ForbiddenError": 432,
+        "InvalidAPIKeyError": 401,
+    }
+    _tavily_down_until = 0.0
+
+    @classmethod
+    def _tavily_cooling_down(cls) -> bool:
+        return time.time() < cls._tavily_down_until
+
+    @staticmethod
+    def _tavily_breaker_result() -> Dict[str, Any]:
+        return {"success": False, "error": "Tavily circuit breaker open"}
+
+    @classmethod
+    def _tavily_failure_status(cls, failure: Any) -> Optional[int]:
+        """The HTTP status behind a Tavily failure: an SDK exception or a REST
+        error dict from ``_tavily_post`` / ``_tavily_post_bounded``."""
+        if isinstance(failure, dict):
+            try:
+                return int(failure.get("status_code"))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(failure, BaseException):
+            for klass in type(failure).__mro__:
+                status = cls._TAVILY_SDK_ERROR_STATUS.get(klass.__name__)
+                if status is not None:
+                    return status
+        return None
+
+    @classmethod
+    def _note_tavily_failure(cls, failure: Any) -> bool:
+        """Open the Tavily breaker when ``failure`` is an account refusal or a
+        rate limit. Returns True when it did (retrying elsewhere would get the
+        same answer)."""
+        status = cls._tavily_failure_status(failure)
+        if status in cls._TAVILY_ACCOUNT_STATUSES:
+            cooldown = cls._TAVILY_ACCOUNT_COOLDOWN_SECONDS
+        elif status in cls._TAVILY_RATE_STATUSES:
+            cooldown = cls._TAVILY_RATE_COOLDOWN_SECONDS
+        else:
+            return False
+        # a rate limit never shortens an open account cooldown
+        cls._tavily_down_until = max(cls._tavily_down_until, time.time() + cooldown)
+        print(
+            f"[SEARCH ROUTER] Tavily circuit OPEN for {int(cooldown)}s "
+            f"(status {status}): {str(failure)[:200]}"
+        )
+        return True
+
     def __init__(self, browser_service: Optional[Any] = None):
         self.browser_service = browser_service
         self.brave_key = os.getenv("BRAVE_API_KEY", "").strip()
@@ -246,6 +313,7 @@ class WebSearchService:
             return {
                 "success": False,
                 "error": f"Tavily {endpoint} returned status code {response.status_code}",
+                "status_code": response.status_code,
                 "details": response.text[:1000],
             }
         return response.json()
@@ -309,6 +377,7 @@ class WebSearchService:
                     box["result"] = {
                         "success": False,
                         "error": f"Tavily {endpoint} returned status code {response.status_code}",
+                        "status_code": response.status_code,
                         "details": body[:1000],
                     }
                     return
@@ -353,6 +422,7 @@ class WebSearchService:
             return {
                 "success": False,
                 "error": f"Tavily {endpoint} returned status code {response.status_code}",
+                "status_code": response.status_code,
                 "details": response.text[:1000],
             }
         return response.json()
@@ -535,11 +605,17 @@ class WebSearchService:
         search and the tiles were then dropped (D7).
 
         Planner hints (web search redesign, Phase 2): ``include_domains``
-        restricts the search to a domain pack (Tavily only: Brave has no site
-        restriction, so a restricted query never falls back to Brave);
-        ``freshness`` (day|week|month|year) becomes Tavily ``time_range`` and
-        Brave ``freshness``; ``topic`` "news" selects Tavily's news index. With
-        no hints the routing is exactly Phase 1."""
+        restricts the search to a domain pack (Tavily, then Exa: Brave has no
+        site restriction, so a restricted query never falls back to Brave);
+        ``freshness`` (day|week|month|year) becomes Tavily ``time_range``, Exa
+        ``startPublishedDate`` and Brave ``freshness``; ``topic`` "news"
+        selects Tavily's news index (Exa's news category). With no hints the
+        routing is exactly Phase 1.
+
+        Order: Exa (literature intent) -> Brave -> Tavily -> Exa (general
+        fallback, when not already tried) -> BrowserService scraping. A
+        failure from every provider comes back as ``success: False`` naming
+        what each one said, never as an empty success."""
         if is_explicit_query(query):
             return blocked_query_result(query)
 
@@ -557,23 +633,69 @@ class WebSearchService:
         brave_fresh = _brave_fresh(freshness) if freshness else None
         news_topic = "news" if str(topic or "").lower() == "news" else None
 
-        if domains:
-            # Restricted (domain pack) query: Tavily is the only provider that
-            # honours include_domains. No Brave fallback (it would ignore the
-            # restriction and the unrestricted companion query covers recall).
+        usage = self._get_usage()
+        exa_available = bool(self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT)
+        # "Provider: reason" for each provider that was skipped or failed, so
+        # an all-down search says why instead of looking like no results.
+        failures: List[str] = []
+
+        def _tavily_skip_reason() -> Optional[str]:
             if not self.tavily_key:
-                return {"success": False, "error": "Tavily API key missing (domain-restricted search)"}
-            print(f"[SEARCH ROUTER] Routing to Tavily (include_domains={domains[:4]}{'…' if len(domains) > 4 else ''}) for: {query!r}")
-            res = self.search_tavily(
+                return "Tavily: API key missing"
+            if self._tavily_cooling_down():
+                return "Tavily: circuit breaker open (out of credits, bad key or rate limited)"
+            return None
+
+        def _exa_fallback(restrict: Optional[List[str]]) -> Optional[Dict[str, Any]]:
+            if not exa_available:
+                failures.append(
+                    "Exa: monthly free limit reached" if self.exa_key else "Exa: API key missing"
+                )
+                return None
+            print(f"[SEARCH ROUTER] Falling back to Exa for: {query!r}")
+            res = self.search_exa(
                 query,
-                max_results=max_results,
-                search_depth=search_depth,
-                include_images=False,
-                include_domains=domains,
+                num_results=max_results,
+                search_type="auto",
+                include_domains=restrict,
                 time_range=time_range,
-                topic=news_topic,
+                category=news_topic,
             )
-            return sanitize_web_payload(res) if res.get("success") else res
+            if res.get("success"):
+                return res
+            failures.append(f"Exa: {res.get('error') or 'failed'}")
+            return None
+
+        if domains:
+            # Restricted (domain pack) query: Tavily and Exa honour the domain
+            # list. No Brave fallback (it would ignore the restriction and the
+            # unrestricted companion query covers recall).
+            skip = _tavily_skip_reason()
+            if skip:
+                failures.append(skip)
+            else:
+                print(f"[SEARCH ROUTER] Routing to Tavily (include_domains={domains[:4]}{'…' if len(domains) > 4 else ''}) for: {query!r}")
+                res = self.search_tavily(
+                    query,
+                    max_results=max_results,
+                    search_depth=search_depth,
+                    include_images=False,
+                    include_domains=domains,
+                    time_range=time_range,
+                    topic=news_topic,
+                )
+                if res.get("success"):
+                    return sanitize_web_payload(res)
+                failures.append(f"Tavily: {res.get('error') or 'failed'}")
+            if not self.tavily_key and not self.exa_key:
+                return {"success": False, "error": "Tavily API key missing (domain-restricted search)"}
+            exa_res = _exa_fallback(domains)
+            if exa_res is not None:
+                return sanitize_web_payload(exa_res)
+            return {
+                "success": False,
+                "error": "Domain-restricted search failed: " + "; ".join(failures),
+            }
 
         # 1. Explicit picture request -> Image Search
         if image_request and want_images:
@@ -588,10 +710,8 @@ class WebSearchService:
         # separate Tavily call. It used to run SERIALLY after the text search
         # (+2.7 s measured 2026-07-18); prefetch it concurrently instead, and
         # only when the answer will show images.
-        usage = self._get_usage()
-        exa_eligible = bool(
-            exa_intent and self.exa_key and usage.get("exa_count", 0) < MAX_FREE_LIMIT
-        )
+        exa_eligible = bool(exa_intent and exa_available)
+        exa_tried = False
         brave_eligible = bool(
             self.brave_key
             and usage.get("brave_count", 0) < MAX_FREE_LIMIT
@@ -610,6 +730,8 @@ class WebSearchService:
                     return sanitize_web_payload(
                         self._attach_prefetched_images(res, img_thread, img_holder)
                     )
+                exa_tried = True
+                failures.append(f"Exa: {res.get('error') or 'failed'}")
                 print("[SEARCH ROUTER] Exa failed, falling back to Brave/Tavily")
             elif self.exa_key:
                 print("[SEARCH ROUTER] Exa monthly free limit (1000) reached. Falling back.")
@@ -622,14 +744,22 @@ class WebSearchService:
                 return sanitize_web_payload(
                     self._attach_prefetched_images(res, img_thread, img_holder)
                 )
+            failures.append(f"Brave: {res.get('error') or 'failed'}")
             print("[SEARCH ROUTER] Brave failed, falling back to Tavily")
         elif self.brave_key and self._brave_cooling_down():
+            failures.append("Brave: circuit breaker open")
             print("[SEARCH ROUTER] Brave circuit breaker open. Falling back to Tavily.")
         elif self.brave_key:
+            failures.append("Brave: monthly free limit reached")
             print("[SEARCH ROUTER] Brave monthly free limit (1000) reached. Falling back.")
 
         # 4. Fallback: Tavily Search
-        if self.tavily_key:
+        tavily_skip = _tavily_skip_reason()
+        if tavily_skip:
+            failures.append(tavily_skip)
+            if self.tavily_key:
+                print("[SEARCH ROUTER] Tavily circuit breaker open. Falling back.")
+        else:
             print(f"[SEARCH ROUTER] Routing to Tavily for: {query!r}")
             # When a prefetch is in flight, reuse those tiles instead of asking
             # the search call for images+descriptions (the slow combination).
@@ -645,12 +775,29 @@ class WebSearchService:
                 if img_thread is not None:
                     res = self._attach_prefetched_images(res, img_thread, img_holder)
                 return sanitize_web_payload(res)
-                
-        # 5. Ultimate Fallback: Local Scraping / BrowserService
+            failures.append(f"Tavily: {res.get('error') or 'failed'}")
+
+        # 5. Fallback: Exa as a general search, unless it already failed above
+        if not exa_tried:
+            res = _exa_fallback(None)
+            if res is not None:
+                return sanitize_web_payload(
+                    self._attach_prefetched_images(res, img_thread, img_holder)
+                )
+
+        # 6. Ultimate Fallback: Local Scraping / BrowserService
         if self.browser_service:
             print(f"[SEARCH ROUTER] All APIs failed/limited. Falling back to BrowserService scraping for: {query!r}")
             try:
                 fallback = self.browser_service.web_search(query=query)
+            except Exception as e:
+                fallback = {"error": str(e)}
+            if isinstance(fallback, dict) and fallback.get("error"):
+                # BrowserService reports its own failures (no Playwright, page
+                # timeout) as {"error": ...}; that used to come back as a
+                # success with zero results, which reads as "nothing found".
+                failures.append(f"BrowserService: {fallback['error']}")
+            else:
                 fallback_results = (
                     fallback.get("results", [])
                     if isinstance(fallback, dict)
@@ -658,25 +805,34 @@ class WebSearchService:
                 )
                 if not isinstance(fallback_results, list):
                     fallback_results = []
-                if img_thread is not None:
-                    img_thread.join(timeout=4.0)
-                    fallback_images = (img_holder or {}).get("images") or []
-                elif want_images and self.tavily_key:
-                    fallback_images = self._fetch_tavily_images(query)
-                else:
-                    fallback_images = []
-                return sanitize_web_payload({
-                    "success": True,
-                    "provider": "BrowserService (fallback)",
-                    "query": query,
-                    "results": fallback_results,
-                    "raw_text": fallback.get("raw_text", "") if isinstance(fallback, dict) else "",
-                    "images": fallback_images
-                })
-            except Exception as e:
-                return {"success": False, "error": f"Scraping fallback failed: {e}"}
-                
-        return {"success": False, "error": "No search providers available or all quotas exceeded"}
+                raw_text = fallback.get("raw_text", "") if isinstance(fallback, dict) else ""
+                raw_text = raw_text if isinstance(raw_text, str) else ""
+                if raw_text.startswith("[Error extracting text"):
+                    raw_text = ""
+                if fallback_results or raw_text.strip():
+                    if img_thread is not None:
+                        img_thread.join(timeout=4.0)
+                        fallback_images = (img_holder or {}).get("images") or []
+                    elif want_images and self.tavily_key:
+                        fallback_images = self._fetch_tavily_images(query)
+                    else:
+                        fallback_images = []
+                    return sanitize_web_payload({
+                        "success": True,
+                        "provider": "BrowserService (fallback)",
+                        "query": query,
+                        "results": fallback_results,
+                        "raw_text": raw_text,
+                        "images": fallback_images
+                    })
+                failures.append("BrowserService: no results")
+
+        detail = "; ".join(failures)
+        return {
+            "success": False,
+            "error": "No search providers available or all quotas exceeded"
+            + (f" ({detail})" if detail else ""),
+        }
 
     def search_plan(
         self,
@@ -1020,7 +1176,12 @@ class WebSearchService:
 
     def _fetch_tavily_images(self, query: str, max_images: int = 6) -> List[Dict[str, str]]:
         """Fetch image tiles for a search result using Tavily's REST API."""
-        if not web_images_enabled() or not self.tavily_key or is_explicit_query(query):
+        if (
+            not web_images_enabled()
+            or not self.tavily_key
+            or self._tavily_cooling_down()
+            or is_explicit_query(query)
+        ):
             return []
 
         payload = {
@@ -1032,6 +1193,7 @@ class WebSearchService:
         }
         response = self._tavily_post("search", payload, timeout=30)
         if isinstance(response, dict) and response.get("success") is False:
+            self._note_tavily_failure(response)
             return []
         self._increment_usage("tavily")
         return self._collect_tavily_images(response, max_images=max_images)
@@ -1040,9 +1202,14 @@ class WebSearchService:
         """Start the Tavily image fetch on a thread, concurrent with a text search.
 
         Returns ``(thread, holder)`` or ``(None, None)`` when images are
-        unavailable (no key, images disabled, blocked query).
+        unavailable (no key, Tavily breaker open, images disabled, blocked query).
         """
-        if not self.tavily_key or not web_images_enabled() or is_explicit_query(query):
+        if (
+            not self.tavily_key
+            or self._tavily_cooling_down()
+            or not web_images_enabled()
+            or is_explicit_query(query)
+        ):
             return None, None
         holder: Dict[str, Any] = {}
 
@@ -1236,6 +1403,8 @@ class WebSearchService:
             return blocked_query_result(query)
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
+        if self._tavily_cooling_down():
+            return self._tavily_breaker_result()
 
         max_results = max(1, min(int(max_results), 10))
         include_images = bool(include_images and web_images_enabled())
@@ -1260,10 +1429,14 @@ class WebSearchService:
                 client = self._get_tavily_client()
                 response = client.search(**payload)
             except Exception as sdk_error:
+                if self._note_tavily_failure(sdk_error):
+                    # the account refused it: a REST retry gets the same answer
+                    return {"success": False, "error": f"Tavily search failed: {sdk_error}"}
                 print(f"[SEARCH ROUTER] Tavily SDK search unavailable, using REST: {sdk_error}")
                 response = self._tavily_post("search", payload, timeout=25)
 
             if isinstance(response, dict) and response.get("success") is False:
+                self._note_tavily_failure(response)
                 return response
             self._increment_usage("tavily")
 
@@ -1322,6 +1495,8 @@ class WebSearchService:
             }
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
+        if self._tavily_cooling_down():
+            return self._tavily_breaker_result()
 
         kwargs: Dict[str, Any] = {
             "extract_depth": extract_depth,
@@ -1345,6 +1520,7 @@ class WebSearchService:
                     response = self._tavily_post("extract", payload, timeout=60)
 
             if isinstance(response, dict) and response.get("success") is False:
+                self._note_tavily_failure(response)
                 return response
             self._increment_usage("tavily_extract")
             response = self._truncate_result_content(response, max_content_chars)
@@ -1356,6 +1532,7 @@ class WebSearchService:
                 "results": response.get("results", []) if isinstance(response, dict) else response,
             })
         except Exception as e:
+            self._note_tavily_failure(e)
             return {"success": False, "error": f"Tavily extract failed: {e}"}
 
     def map_tavily(
@@ -1378,6 +1555,8 @@ class WebSearchService:
             return {"success": False, "error": "The requested URL was blocked by the web safety filter."}
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
+        if self._tavily_cooling_down():
+            return self._tavily_breaker_result()
 
         kwargs: Dict[str, Any] = {
             "max_depth": max(1, min(int(max_depth), 5)),
@@ -1405,6 +1584,7 @@ class WebSearchService:
                 response = self._tavily_post("map", {"url": url, **kwargs}, timeout=60)
 
             if isinstance(response, dict) and response.get("success") is False:
+                self._note_tavily_failure(response)
                 return response
             self._increment_usage("tavily_other")
             return sanitize_web_payload({
@@ -1415,6 +1595,7 @@ class WebSearchService:
                 "results": response.get("results", []) if isinstance(response, dict) else response,
             })
         except Exception as e:
+            self._note_tavily_failure(e)
             return {"success": False, "error": f"Tavily map failed: {e}"}
 
     def crawl_tavily(
@@ -1442,6 +1623,8 @@ class WebSearchService:
             return {"success": False, "error": "The requested URL was blocked by the web safety filter."}
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
+        if self._tavily_cooling_down():
+            return self._tavily_breaker_result()
 
         kwargs: Dict[str, Any] = {
             "max_depth": max(1, min(int(max_depth), 5)),
@@ -1473,6 +1656,7 @@ class WebSearchService:
                 response = self._tavily_post("crawl", {"url": url, **kwargs}, timeout=150)
 
             if isinstance(response, dict) and response.get("success") is False:
+                self._note_tavily_failure(response)
                 return response
             self._increment_usage("tavily_other")
             response = self._truncate_result_content(response, max_content_chars)
@@ -1484,6 +1668,7 @@ class WebSearchService:
                 "results": response.get("results", []) if isinstance(response, dict) else response,
             })
         except Exception as e:
+            self._note_tavily_failure(e)
             return {"success": False, "error": f"Tavily crawl failed: {e}"}
 
     def research_tavily(
@@ -1503,6 +1688,8 @@ class WebSearchService:
             return blocked_query_result(research_input, provider="Tavily Research")
         if not self.tavily_key:
             return {"success": False, "error": "Tavily API key missing"}
+        if self._tavily_cooling_down():
+            return self._tavily_breaker_result()
 
         kwargs = {
             "model": model,
@@ -1522,6 +1709,7 @@ class WebSearchService:
                 )
 
             if isinstance(response, dict) and response.get("success") is False:
+                self._note_tavily_failure(response)
                 return response
             self._increment_usage("tavily_other")
 
@@ -1559,6 +1747,7 @@ class WebSearchService:
                 "response": response,
             })
         except Exception as e:
+            self._note_tavily_failure(e)
             return {"success": False, "error": f"Tavily research failed: {e}"}
 
     def get_tavily_research_status(
@@ -1595,14 +1784,29 @@ class WebSearchService:
         except Exception as e:
             return {"success": False, "error": f"Tavily research status failed: {e}"}
 
-    def search_exa(self, query: str, num_results: int = DEFAULT_MAX_RESULTS, search_type: str = "deep") -> Dict[str, Any]:
-        """Perform semantic research search using Exa."""
+    # Tavily ``time_range`` -> look-back window for Exa ``startPublishedDate``.
+    _EXA_TIME_RANGE_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
+
+    def search_exa(
+        self,
+        query: str,
+        num_results: int = DEFAULT_MAX_RESULTS,
+        search_type: str = "deep",
+        include_domains: Optional[List[str]] = None,
+        time_range: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Perform semantic research search using Exa.
+
+        ``include_domains`` / ``time_range`` / ``category`` carry the domain
+        pack, freshness and news hints when Exa stands in for Tavily; they are
+        sent only when given, so the specialist payload is unchanged."""
         if is_explicit_query(query):
             return blocked_query_result(query)
         if not self.exa_key:
             return {"success": False, "error": "Exa API key missing"}
         num_results = max(1, min(int(num_results), 10))
-            
+
         try:
             # We can use direct requests to remain lightweight and fully custom
             url = "https://api.exa.ai/search"
@@ -1618,6 +1822,15 @@ class WebSearchService:
                     "highlights": True
                 }
             }
+            domains = [str(d).strip() for d in (include_domains or []) if str(d).strip()]
+            if domains:
+                payload["includeDomains"] = domains[:30]
+            days = self._EXA_TIME_RANGE_DAYS.get(str(time_range or "").lower())
+            if days:
+                start = datetime.now(timezone.utc) - timedelta(days=days)
+                payload["startPublishedDate"] = start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            if category:
+                payload["category"] = category
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             if response.status_code == 200:
                 self._increment_usage("exa")
@@ -1670,7 +1883,7 @@ class WebSearchService:
             }
         max_results = max(1, min(int(max_results), 10))
         # 1. Primary: Tavily Image Search (gives rich descriptions)
-        if self.tavily_key:
+        if self.tavily_key and not self._tavily_cooling_down():
             try:
                 payload = {
                     "query": query,
@@ -1682,10 +1895,14 @@ class WebSearchService:
                     client = self._get_tavily_client()
                     response = client.search(**payload)
                 except Exception as sdk_error:
-                    print(f"[SEARCH ROUTER] Tavily SDK image search unavailable, using REST: {sdk_error}")
-                    response = self._tavily_post("search", payload, timeout=60)
+                    if self._note_tavily_failure(sdk_error):
+                        response = {"success": False, "error": str(sdk_error)}
+                    else:
+                        print(f"[SEARCH ROUTER] Tavily SDK image search unavailable, using REST: {sdk_error}")
+                        response = self._tavily_post("search", payload, timeout=60)
 
                 if isinstance(response, dict) and response.get("success") is False:
+                    self._note_tavily_failure(response)
                     response = {}
                 else:
                     self._increment_usage("tavily")
